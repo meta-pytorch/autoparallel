@@ -4,7 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import torch
-from torch.utils._pytree import tree_map_only
+from torch.utils._pytree import tree_flatten, tree_map_only
 from torch.utils.flop_counter import FlopCounterMode
 
 
@@ -59,12 +59,20 @@ def estimate_strategy_runtime_cost(node, strategy):
 
     args = tree_map_only(torch.fx.Node, lambda x: x.meta["val"], node.args)
     kwargs = tree_map_only(torch.fx.Node, lambda x: x.meta["val"], node.kwargs)
-    fake_mode = next(
+
+    fake_modes = [
         arg.fake_mode
-        for arg in args
+        for arg in tree_flatten(args)[0]
         if isinstance(arg, torch._subclasses.fake_tensor.FakeTensor)
-    )
-    assert len(kwargs) == 0
+    ]
+    if len(fake_modes) == 0:
+        return 0
+
+    assert all(fm == fake_modes[0] for fm in fake_modes)
+    fake_mode = fake_modes[0]
+    if len(kwargs) > 0:
+        for k, v in kwargs.items():
+            assert not isinstance(v, torch.Tensor), f"{node} {v}"
     args_shapes = tuple(_get_sharded_shape(spec) for spec in strategy.input_specs)
 
     counter = 0
@@ -87,6 +95,9 @@ def estimate_strategy_runtime_cost(node, strategy):
     # TODO: fix this
     dtype = strategy.input_specs[0].tensor_meta.dtype
 
+    # TODO: better handle this case
+    if dtype.is_complex:
+        return 0
     # TODO: use PyTorch's version once it's giving correct results
     gpu_flops = _get_device_tflops(dtype) * 10**12
 

@@ -43,12 +43,14 @@ def propagate_tensor_meta(op, user_args, out_strat):
                         else:
                             assert tm is None
         if strat.input_specs is None:
-            assert op in {
+            supported_ops = {
                 torch.ops.prims.convert_element_type.default,
+                torch.ops.aten.clone.default,
                 torch.ops.aten.slice.Tensor,
-            }, (
+            }
+            assert op in supported_ops, (
                 f"{op} strategy doesn't have input_specs, only harcoded "
-                "prims.convert_element_type.default and aten.slice.Tensor for now"
+                "{supported_ops} for now"
             )
             strat.input_specs = (strat.output_specs,)
             assert strat.redistribute_cost is None

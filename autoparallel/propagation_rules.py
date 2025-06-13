@@ -678,7 +678,14 @@ def expand_rule(mesh, op_schema_):
         for i, (s1, s2) in enumerate(zip(orig_shape, dest_shape))
         if s1 == 1 and s2 != s1
     ]
-    assert len(expand_dim) == 1
+    if len(expand_dim) != 1:
+        assert len(expand_dim) == 0
+        return torch.distributed.tensor.DTensor._op_dispatcher.sharding_propagator.op_strategy_funcs[
+            op
+        ](
+            op_schema
+        )
+    assert len(expand_dim) == 1, f"{expand_dim}"
     expand_dim = expand_dim[0]
     to_remove = []
     for i, ss in enumerate(input_strat.strategies):
