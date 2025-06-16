@@ -1,9 +1,15 @@
+# Copyright (c) Facebook, Inc. and its affiliates. All rights reserved.
+#
+# This source code is licensed under the BSD license found in the
+# LICENSE file in the root directory of this source tree.
+
 import torch
-from .propagation_rules import _op_partial_rules, _op_rules
 from torch.distributed._tensor.placement_types import TensorMeta
 from torch.distributed.tensor._op_schema import OpSchema, OpStrategy, TupleStrategy
 from torch.distributed.tensor._ops.utils import generate_redistribute_costs
 from torch.utils._pytree import tree_flatten, tree_map_only
+
+from .propagation_rules import _op_partial_rules, _op_rules
 
 
 def propagate_tensor_meta(op, user_args, out_strat):
@@ -28,14 +34,23 @@ def propagate_tensor_meta(op, user_args, out_strat):
         else:
             for ospec, tm in zip(strat.output_specs, new_tensor_meta):
                 if ospec is not None:
-                    ospec.tensor_meta = tm
+                    if ospec.tensor_meta != tm:
+                        # This is overcoming some limitations of the lack of
+                        # tensor_meta for sdpa which returns None
+                        # we should just fix this all across the board
+                        if ospec.tensor_meta is None:
+                            ospec.tensor_meta = tm
+                        else:
+                            assert tm is None
         if strat.input_specs is None:
-            assert op in {
+            supported_ops = {
                 torch.ops.prims.convert_element_type.default,
+                torch.ops.aten.clone.default,
                 torch.ops.aten.slice.Tensor,
-            }, (
+            }
+            assert op in supported_ops, (
                 f"{op} strategy doesn't have input_specs, only harcoded "
-                "prims.convert_element_type.default and aten.slice.Tensor for now"
+                "{supported_ops} for now"
             )
             strat.input_specs = (strat.output_specs,)
             assert strat.redistribute_cost is None

@@ -1,8 +1,14 @@
+# Copyright (c) Facebook, Inc. and its affiliates. All rights reserved.
+#
+# This source code is licensed under the BSD license found in the
+# LICENSE file in the root directory of this source tree.
+
 import pytest
 import torch
-from autoparallel.export_module import aot_export_module, apply_node_renaming
 from torch import nn
 from torch._subclasses import FakeTensorMode
+
+from autoparallel.export_module import aot_export_module, apply_node_renaming
 
 
 @pytest.mark.parametrize("requires_grad_1", [False, True])

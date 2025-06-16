@@ -1,11 +1,18 @@
+# Copyright (c) Facebook, Inc. and its affiliates. All rights reserved.
+#
+# This source code is licensed under the BSD license found in the
+# LICENSE file in the root directory of this source tree.
+
 import math
 
 import pulp
 import torch
-from .propagation_rules import _create_all_options
 from torch.distributed.tensor._dtensor_spec import DTensorSpec
 from torch.distributed.tensor.placement_types import Replicate, Shard
 from torch.utils._pytree import tree_flatten, tree_map_only
+
+from .compute_estimation import _get_sharded_shape, estimate_strategy_runtime_cost
+from .propagation_rules import _create_all_options
 from .utils import get_placement_options
 
 
@@ -19,7 +26,7 @@ def _debug_node(node):
     print(tree_map_only(torch.fx.Node, my_print, node.args))
 
 
-_GLOBAL_NAMES = {}
+_GLOBAL_NAMES: dict[str, int] = {}
 
 
 def _get_next_name(name):
@@ -84,15 +91,16 @@ class ShardingOptimizer:
                     "num_output_strat": len(s.strategies),
                 }
             for ss, ssi in enumerate(s.strategies):
+                compute_cost = estimate_strategy_runtime_cost(node, ssi)
                 for argi, xxi in enumerate(ssi.redistribute_cost):
-                    for ii, input_p in enumerate(xxi):
+                    for ii, comm_cost in enumerate(xxi):
                         va = pulp.LpVariable(
                             f"n={node},s={s_i},arg={argi},output_p={ss},input_p={ii}",
                             cat=pulp.LpBinary,
                         )
                         ds[(s_i, argi, ss, ii)] = {
                             "va": va,
-                            "cost": input_p,
+                            "cost": comm_cost + compute_cost / num_args[s_i],
                             "full_strat": ssi,
                             "out_strat": ssi.output_specs,
                             "inp_strat": ssi.input_specs[argi],
@@ -373,7 +381,7 @@ class ShardingOptimizer:
         self.print_violated_constraints()
 
     def print_costs_for_node(self, node, arg=0, **kwargs):
-        from tabulate import tabulate
+        from tabulate import tabulate  # type: ignore
         from torch.distributed.tensor._op_schema import _pretty_print_spec
 
         tgt_strat = self.strats[node]
@@ -409,7 +417,7 @@ class ShardingOptimizer:
             opt.setdefault(nodes[x[0]], []).append(self.ds[x])
 
         # Let's simplify the output representation
-        # and just return a single PlacementStrategy
+        # and just return a single OpSpec
         # for each node
         for k in opt.values():
             assert all(
@@ -533,20 +541,8 @@ class ShardingOptimizer:
             for ii in range(vv["num_output_strat"]):
                 data = self.ds[(s_i, 0, ii, 0)]
                 spec = data["inp_strat"]
-                mesh = spec.mesh
                 tensor_shape = spec.tensor_meta.shape
-                # TODO: take dtype into account as well
-                # tensor_dtype = spec.tensor_meta.dtype
-                placements = spec.placements
-                # TODO: find a better heuristic other than
-                # running DTensor
-                new_tensor_shape = list(tensor_shape)
-                for mesh_size, placement in zip(mesh.shape, placements):
-                    if placement.is_shard():
-                        dim = placement.dim
-                        new_tensor_shape[dim] = (
-                            new_tensor_shape[dim] + mesh_size - 1
-                        ) // mesh_size
+                new_tensor_shape = _get_sharded_shape(spec)
                 new_size = math.prod(new_tensor_shape)
                 old_size = math.prod(tensor_shape)
                 elms.append(data["va"] * new_size / old_size)

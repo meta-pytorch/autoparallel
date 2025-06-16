@@ -1,17 +1,23 @@
+# Copyright (c) Facebook, Inc. and its affiliates. All rights reserved.
+#
+# This source code is licensed under the BSD license found in the
+# LICENSE file in the root directory of this source tree.
+
 import copy
 from collections import OrderedDict
 from contextlib import suppress
 
 import torch
 import torch.utils._pytree as pytree
-from .apply_sharding import apply_sharding_to_model
-from .export_module import aot_export_module, apply_node_renaming
-from .optimize_sharding import ShardingOptimizer
 from torch._functorch.partitioners import default_partition
 from torch._inductor.decomposition import select_decomp_table
 from torch._inductor.fx_passes.joint_graph import joint_graph_passes
 from torch._inductor.fx_passes.post_grad import remove_assert_ops
 from torch._subclasses import FakeTensorMode
+
+from .apply_sharding import apply_sharding_to_model
+from .export_module import aot_export_module, apply_node_renaming
+from .optimize_sharding import ShardingOptimizer
 
 
 def _add_alias(gm):
@@ -167,7 +173,7 @@ def _get_decomp_table():
     decomp_table.pop(torch.ops.aten.threshold_backward.default)
     decomp_table.pop(torch.ops.aten.native_layer_norm.default)
     decomp_table.pop(torch.ops.aten.embedding_dense_backward.default)
-    # decomp_table.pop(torch.ops.aten.native_layer_norm_backward.default)
+    decomp_table.pop(torch.ops.aten.native_layer_norm_backward.default)
 
     # decompose addmm to allow for TP on mm
     decomp_table.pop(torch.ops.aten.addmm.default)

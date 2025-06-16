@@ -1,0 +1,8 @@
+torch >= 2.7.0
+pulp
+
+black == 22.3.0
+flake8 == 6.1.0
+flake8-copyright
+isort == 5.7.0
+mypy == 1.10.0

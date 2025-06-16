@@ -1,8 +1,14 @@
+# Copyright (c) Facebook, Inc. and its affiliates. All rights reserved.
+#
+# This source code is licensed under the BSD license found in the
+# LICENSE file in the root directory of this source tree.
+
 import torch
-from autoparallel.api import AutoParallel
 from torch import nn
 from torch.distributed.tensor.placement_types import Replicate, Shard
 from torch.testing._internal.distributed.fake_pg import FakeStore
+
+from autoparallel.api import AutoParallel
 
 
 class Block(nn.Module):

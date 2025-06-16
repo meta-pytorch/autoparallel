@@ -1,0 +1,39 @@
+name: lint
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - release/*
+
+jobs:
+  linters:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v2
+        with:
+          python-version: '3.9'
+      - name: Install deps
+        run: |
+          pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cpu
+          pip install -r requirements-test.txt
+      - name: isort
+        if: success() || failure()
+        run: python -m isort . --check --profile black
+      - name: black
+        if: success() || failure()
+        run: python -m black --check .
+      - name: mypy
+        if: success() || failure()
+        run: |
+          python -m mypy --version
+          python -m mypy --ignore-missing-imports --scripts-are-modules --pretty --exclude "(docs|examples)" .
+      - name: flake8
+        if: success() || failure()
+        run: python -m flake8 --config .flake8 --show-source --statistics

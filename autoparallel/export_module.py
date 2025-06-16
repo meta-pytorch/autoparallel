@@ -1,3 +1,8 @@
+# Copyright (c) Facebook, Inc. and its affiliates. All rights reserved.
+#
+# This source code is licensed under the BSD license found in the
+# LICENSE file in the root directory of this source tree.
+
 # Copied from
 # https://github.com/pytorch/pytorch/blob/1cc5f6b623907579a0e3e172b061391b171b9fa5/torch/_functorch/aot_autograd.py#L1211
 # with modifications to support passing the gradients
@@ -82,8 +87,8 @@ def aot_export_module(
         **dict(named_parameters),
         **dict(named_buffers),
     }
-    params_and_buffers_flat, params_spec = pytree.tree_flatten(params_and_buffers)
-    params_and_buffers_flat = tuple(params_and_buffers_flat)
+    params_and_buffers_flat_l, params_spec = pytree.tree_flatten(params_and_buffers)
+    params_and_buffers_flat = tuple(params_and_buffers_flat_l)
     params_len = len(params_and_buffers_flat)
     buffer_len = sum([not isinstance(x, nn.Parameter) for x in params_and_buffers_flat])
 
@@ -96,20 +101,20 @@ def aot_export_module(
     ctx = nullcontext
     fn_to_trace = functional_call
 
-    full_args = []
+    full_args0: list[torch.Tensor] = []
     # First, the params
     # NB: It is REQUIRED that parameters come first, Inductor infers "fixed"
     # parameters by looking at the difference in parameter count outside
     # and inside AOTAutograd, and assumes the prefix of arguments are fixed
     # arguments
-    full_args.extend(params_and_buffers_flat)
+    full_args0.extend(params_and_buffers_flat)
     # Next, the input args
-    full_args.extend(args)
+    full_args0.extend(args)
 
     with ctx():
         fx_g, metadata, in_spec, out_spec = _aot_export_function(
             fn_to_trace,
-            full_args,
+            full_args0,
             decompositions=decompositions,
             num_params_buffers=params_len,
             no_tangents=False,
@@ -117,6 +122,7 @@ def aot_export_module(
             dynamic_shapes=dynamic_shapes,
             kwargs=kwargs,
         )
+
     if trace_joint:
 
         @wraps(functional_call)
@@ -140,7 +146,7 @@ https://github.com/pytorch/pytorch/issues/101192
                     assert grad is None
             return *fw_outs, *output_gradients
 
-        full_args = []
+        full_args: list[torch.Tensor] = []
         full_args.extend(params_and_buffers_flat)
         full_args.extend(pytree.tree_flatten(args)[0])
         full_args.extend(metadata.traced_tangents)
