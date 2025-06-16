@@ -44,6 +44,7 @@ def _add_alias(gm):
 
             node.replace_all_uses_with(alias_node, delete_user_cb=delete_user_cb)
 
+    """
     for node in nodes:
         # skip ops which return tuple
         if not isinstance(node.meta["val"], torch.Tensor):
@@ -56,16 +57,19 @@ def _add_alias(gm):
                 return n != alias_node
 
             node.replace_all_uses_with(alias_node, delete_user_cb=delete_user_cb)
+
     """
 
     for node in graph.find_nodes(op="output")[0].all_input_nodes:
         with graph.inserting_after(node):
             alias_node = graph.call_function(torch.ops.aten.alias.default, args=(node,))
             alias_node.meta.update(node.meta)
+
             def delete_user_cb(n):
                 return n != alias_node
+
             node.replace_all_uses_with(alias_node, delete_user_cb=delete_user_cb)
-    """
+
     gm.recompile()
     return gm
 
