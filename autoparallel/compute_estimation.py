@@ -4,7 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import torch
-from torch.utils._pytree import tree_flatten, tree_map_only
+from torch.utils._pytree import tree_map_only
 from torch.utils.flop_counter import FlopCounterMode
 
 
@@ -54,22 +54,16 @@ def estimate_strategy_runtime_cost(node, strategy):
     if not isinstance(node.target, torch._ops.OpOverload):
         return 0
 
+    assert not isinstance(node.target, torch._ops.OpOverloadPacket), f"{node.target}"
+
     if node.target.is_view:
         return 0
 
     args = tree_map_only(torch.fx.Node, lambda x: x.meta["val"], node.args)
     kwargs = tree_map_only(torch.fx.Node, lambda x: x.meta["val"], node.kwargs)
 
-    fake_modes = [
-        arg.fake_mode
-        for arg in tree_flatten(args)[0]
-        if isinstance(arg, torch._subclasses.fake_tensor.FakeTensor)
-    ]
-    if len(fake_modes) == 0:
-        return 0
+    fake_mode = torch._guards.detect_fake_mode(args)
 
-    assert all(fm == fake_modes[0] for fm in fake_modes)
-    fake_mode = fake_modes[0]
     if len(kwargs) > 0:
         for k, v in kwargs.items():
             assert not isinstance(v, torch.Tensor), f"{node} {v}"
