@@ -11,7 +11,10 @@ pip install git+ssh://git@github.com/pytorch-labs/autoparallel.git
 ```
 
 ## Developing it
-You can skip `pip install` and run the examples from the `autoparallel` folder.
+```
+cd autoparallel
+pip install -e .
+```
 Modified Python files will be reflected immediately.
 
 Run linter before submitting the PR
