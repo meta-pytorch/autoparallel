@@ -124,7 +124,9 @@ def _get_device_tflops(dtype):
     # Find matching device limit
     device_limit = None
     for limit in DEVICE_LIMITS:
-        if limit.name in device_name:
+        if limit.name in device_name or (
+            limit.name == "A100" and "PG509" in device_name
+        ):
             device_limit = limit
             break
 
