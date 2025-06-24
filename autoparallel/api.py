@@ -231,8 +231,6 @@ class AutoParallel:
     """
     Args:
         mesh: Defines placement options.
-        For DP, use mesh_dim_names=("dp",)
-        For DP + TP, use mesh_dim_names=("dp", "tp")
         The meta model is moved to a fake device based on mesh.device_type.
     """
 
