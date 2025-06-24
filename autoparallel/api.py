@@ -79,7 +79,9 @@ def _add_alias(gm):
 def try_convert_fake_to_real(tensors):
     out = {}
     for k, t in tensors.items():
-        out[k] = torch.randn(t.shape, dtype=t.dtype, device=t.device)
+        out[k] = torch.distributed.tensor.randn(
+            t.shape, dtype=t.dtype, device_mesh=t.device_mesh, placements=t.placements
+        )
     return out
 
 
@@ -163,9 +165,9 @@ def prepare_module(parallel_gm, spec, num_fwd_outputs):
 
         def forward(self, *x):
             x = pytree.tree_flatten(x)[0]
-            out = AutoParallelFunc.apply(
-                *(list(self.params.values()) + list(self.buffers_.values()) + list(x))
-            )
+            params = [p.to_local() for p in self.params.values()]
+            buffers = [b.to_local() for b in self.buffers_.values()]
+            out = AutoParallelFunc.apply(*(params + buffers + list(x)))
             return out
 
     return AutoParallelModule, fwd_gm, bwd_gm
