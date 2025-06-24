@@ -52,7 +52,9 @@ def test_from_meta_model(device_mesh_1d):
         return inputs
 
     auto_p = AutoParallel(
-        model, input_fn, device_mesh_1d, device=device_mesh_1d.device_type
+        model,
+        input_fn,
+        device_mesh_1d,
     )
     assert isinstance(
         auto_p.model.get_parameter("linear.weight"), torch._subclasses.FakeTensor

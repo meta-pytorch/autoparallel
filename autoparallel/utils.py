@@ -5,6 +5,7 @@
 
 import torch
 from torch.distributed._tensor.placement_types import TensorMeta
+from torch.distributed.device_mesh import _get_device_handle
 from torch.distributed.tensor._op_schema import OpSchema, OpStrategy, TupleStrategy
 from torch.distributed.tensor._ops.utils import generate_redistribute_costs
 from torch.utils._pytree import tree_flatten, tree_map_only
@@ -119,3 +120,10 @@ def get_placement_options(mesh, op, specs, user_args):
     propagate_tensor_meta(op, user_args, out_strat)
     fill_missing_redistribute_cost(op, specs, out_strat)
     return out_strat
+
+
+def _get_device_from_mesh(mesh):
+    if mesh.device_type == "cpu":
+        return torch.device("cpu")
+    device_handle = _get_device_handle(mesh.device_type)
+    return torch.device(mesh.device_type, device_handle.current_device())

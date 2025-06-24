@@ -12,7 +12,8 @@ from torch.testing._internal.distributed.fake_pg import FakeStore
 from autoparallel.api import AutoParallel
 
 
-@pytest.fixture(scope="module", autouse=True)
+# autouse=False: avoid initializing the default pg twice
+@pytest.fixture(scope="module", autouse=False)
 def init_pg():
     world_size = 256
     fake_store = FakeStore()
@@ -131,7 +132,7 @@ def test_optimization_finds_fsdp_and_ddp_1d(device_mesh_1d, high_mem, model_type
     with torch.device("meta"):
         model = model_fn()
 
-    autop = AutoParallel(model, input_fn, device_mesh_1d, device=device)
+    autop = AutoParallel(model, input_fn, device_mesh_1d)
     autop.add_parameter_memory_constraint(low=low_mem, high=high_mem)
 
     sharding_placement = autop.optimize_placement()
@@ -260,7 +261,7 @@ def test_optimization_finds_fsdp_tp_2d(
     with torch.device("meta"):
         model = model_fn()
 
-    autop = AutoParallel(model, input_fn, device_mesh_2d, device)
+    autop = AutoParallel(model, input_fn, device_mesh_2d)
     autop.add_parameter_memory_constraint(low=low_mem, high=high_mem)
 
     sharding_placement = autop.optimize_placement()

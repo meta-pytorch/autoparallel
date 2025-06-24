@@ -82,7 +82,7 @@ def input_fn():
 # parallelize the model
 with torch.device("meta"):
     model = model_fn()
-autop = AutoParallel(model, input_fn, mesh, device="cuda")
+autop = AutoParallel(model, input_fn, mesh)
 autop.add_parameter_memory_constraint(low=None, high=None)
 
 x_sharding = (Shard(0), Replicate())

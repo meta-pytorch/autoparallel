@@ -14,10 +14,12 @@ from torch._inductor.decomposition import select_decomp_table
 from torch._inductor.fx_passes.joint_graph import joint_graph_passes
 from torch._inductor.fx_passes.post_grad import remove_assert_ops
 from torch._subclasses import FakeTensorMode
+from torch.distributed.tensor import DeviceMesh
 
 from .apply_sharding import apply_sharding_to_model
 from .export_module import aot_export_module, apply_node_renaming
 from .optimize_sharding import ShardingOptimizer
+from .utils import _get_device_from_mesh
 
 
 def _add_alias(gm):
@@ -226,8 +228,17 @@ def move_to_fake(model: torch.nn.Module, mode: FakeTensorMode, device: torch.dev
 
 
 class AutoParallel:
-    def __init__(self, model, input_fn, mesh, device):
+    """
+    Args:
+        mesh: Defines placement options.
+        For DP, use mesh_dim_names=("dp",)
+        For DP + TP, use mesh_dim_names=("dp", "tp")
+        The meta model is moved to a fake device based on mesh.device_type.
+    """
+
+    def __init__(self, model, input_fn, mesh: DeviceMesh):
         self.fake_mode = FakeTensorMode()
+        device = _get_device_from_mesh(mesh)
         self.model = move_to_fake(model, self.fake_mode, device)
         self.input_fn = input_fn
         self.mesh = mesh
