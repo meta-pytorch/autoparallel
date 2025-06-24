@@ -191,6 +191,165 @@ def _get_decomp_table():
     return decomp_table
 
 
+def _get_node_hash0(node):
+    if "val" not in node.meta:
+        return (node.op,)
+    if isinstance(node.meta["val"], torch.Tensor):
+        shape = node.meta["val"].shape
+    else:
+        shape = tuple(x.shape for x in node.meta["val"] if isinstance(x, torch.Tensor))
+    return (str(node.target), shape)
+
+def _get_node_hash(node):
+    h1 = tuple(_get_node_hash0(x) for x in node.all_input_nodes)
+    h2 = _get_node_hash0(node)
+    return h1 + h2
+
+def get_graph_clusters(gm):
+    from collections import defaultdict
+
+    """
+    groups = defaultdict(list)
+    node_map = {}
+
+    for node in gm.graph.nodes:
+        if hashval := _get_node_hash(node):
+            groups[hashval].append(node)
+            node_map[node] = groups[hashval]
+
+    new_groups = {}
+    for k, v in groups.items():
+        if len(v) > 1:
+            new_groups[k] = v
+
+
+    anchor_op = str(torch.ops.aten.mm.default)
+    anchor_groups = [g for k, g in new_groups.items() if k[2] == anchor_op]
+    picked_group = anchor_groups[min(len(g) for g in anchor_groups)]
+    picked_group = anchor_groups[0]
+
+    from collections import deque
+    queues = [deque([x]) for x in picked_group]
+    clusters = [[] for _ in picked_group]
+    counter = 0
+    ended = [False] * len(queues)
+    while any(len(queue) > 0 for queue in queues):
+        counter += 1
+        if counter > 110:
+            break
+        currs = [queue.popleft() if queue else None for queue in queues]
+        # print(currs)
+        hashes = defaultdict(list)
+        maxsize = 0
+        for i, n in enumerate(currs):
+            if n is None:
+                ended[i] = True
+                continue
+            hashval = _get_node_hash0(n)
+            hashes[hashval].append((i, n))
+            maxsize = max(maxsize, len(hashes[hashval]))
+
+        if maxsize < 2:
+            #print(f"breaking at {currs}")
+            print("breaking")
+            break
+        if all(ended):
+            print("ended, breaking")
+            break
+        for cls in hashes.values():
+            if len(cls) < 2:
+                continue
+            for cl_id, cl in cls:
+                if cl in clusters[cl_id]:
+                    ended[cl_id] = True
+                    continue
+                clusters[cl_id].append(cl)
+                queues[cl_id].extend(cl.all_input_nodes)
+
+        unique_clusters = list(set(tuple(c) for c in clusters))
+
+        cc = defaultdict(list)
+        for cl_id, cl in enumerate(unique_clusters):
+            h = hash(tuple(_get_node_hash0(x) for x in cl))
+            cc[h].append(cl)
+    """
+    picked_group = [n for n in gm.graph.nodes if n.op == "call_function" and n.target == torch.ops.aten.mm.default]
+    g = [[p] for p in picked_group]
+    ended = [False] * len(picked_group)
+    counter = 0
+
+    def get_sequence_hash(seq):
+        return hash(tuple(_get_node_hash0(x) for x in seq))
+
+
+    while not all(ended):
+        print(counter)
+        counter += 1
+        if counter > 1010:
+            break
+        lasts = [p[-1] for p in g]
+        nexts = [p.next if p.op != "output" else None for p in lasts]
+
+
+        new_seq = [p + [p[-1].next] if p[-1].op != "output" else p for p in g]
+
+        hashes = defaultdict(list)
+        for i, s in enumerate(new_seq):
+            hashes[get_sequence_hash(s)].append((i, s[-1]))
+
+        for cls in hashes.values():
+            if len(cls) < 2:
+                assert len(cls) == 1
+                ended[cls[0][0]] = True
+                continue
+
+            for cl_id, cl in cls:
+                for cl_id2, _ in cls:
+                    if cl in g[cl_id2]:
+                        ended[cl_id] = True
+                        break
+
+            for cl_id, cl in cls:
+                if ended[cl_id]:
+                    continue
+                g[cl_id].append(cl)
+
+    clusters = defaultdict(list)
+    for cl in g:
+        clusters[get_sequence_hash(cl)].append(cl)
+
+    clusters = [v for v in clusters.values() if len(v) > 1]
+
+    nodes = list(gm.graph.nodes)
+    node_map = {n: i for i, n in enumerate(nodes)}
+    covered = [[-1, -1, -1] for _ in nodes]
+    num_per_cluster = [(i, len(cl[0])) for i, cl in enumerate(clusters)]
+    num_per_cluster = reversed(sorted(num_per_cluster, key=lambda x: x[1]))
+
+
+    for cl_i, _ in num_per_cluster:
+        cl = clusters[cl_i]
+        for ni, n in enumerate(cl):
+            for ng in n:
+                i = node_map[ng]
+                if covered[i][0] < len(n):
+                    covered[i][0] = len(n)
+                    covered[i][1] = cl_i
+                    covered[i][2] = ni
+    """
+    for cl_i, cl in enumerate(clusters):
+        for ni, n in enumerate(cl):
+            for ng in n:
+                i = node_map[ng]
+                if covered[i][0] < len(n) and covered[i][1]:
+                    covered[i][0] = len(n)
+                    covered[i][1] = cl_i
+                    covered[i][2] = ni
+    """
+    from IPython import embed; embed(); sys.sdf
+    return groups
+
+
 class AutoParallel:
     def __init__(self, model_fn, input_fn, mesh):
         self.fake_mode = FakeTensorMode()
@@ -244,6 +403,7 @@ class AutoParallel:
         _add_alias(gm)
         apply_node_renaming(gm, self.params_len, self.buffer_len, self.metadata)
 
+        get_graph_clusters(gm)
         self.gm = gm
 
     def add_parameter_memory_constraint(self, low=None, high=None):
