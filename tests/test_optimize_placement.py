@@ -12,7 +12,7 @@ from torch.testing._internal.distributed.fake_pg import FakeStore
 from autoparallel.api import AutoParallel
 
 
-@pytest.fixture(scope="module", autouse=False)
+@pytest.fixture(scope="module", autouse=True)
 def init_pg():
     world_size = 256
     fake_store = FakeStore()
