@@ -15,6 +15,8 @@ from autoparallel.api import AutoParallel
 def init_pg():
     world_size = 256
     fake_store = FakeStore()
+    if torch.distributed.is_initialized():
+        return
     torch.distributed.init_process_group(
         "fake", store=fake_store, rank=0, world_size=world_size
     )

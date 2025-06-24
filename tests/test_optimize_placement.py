@@ -12,11 +12,12 @@ from torch.testing._internal.distributed.fake_pg import FakeStore
 from autoparallel.api import AutoParallel
 
 
-# autouse=False: avoid initializing the default pg twice
 @pytest.fixture(scope="module", autouse=False)
 def init_pg():
     world_size = 256
     fake_store = FakeStore()
+    if torch.distributed.is_initialized():
+        return
     torch.distributed.init_process_group(
         "fake", store=fake_store, rank=0, world_size=world_size
     )
