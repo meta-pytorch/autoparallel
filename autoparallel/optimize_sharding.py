@@ -617,6 +617,27 @@ class ShardingOptimizer:
                 node, placement, constraint_name="grad_output_constraint"
             )
 
+    def add_cluster_constraint(self, clusters):
+        for cluster_group in clusters:
+            cluster0 = cluster_group[0]
+            for cluster_i in cluster_group[1:]:
+                for n0, ni in zip(cluster0, cluster_i):
+                    s0 = self.node_map[n0]
+                    s1 = self.node_map[ni]
+                    for argi, oi, ii in self.walk_over_options(n0):
+                        va0 = self.ds[(s0, argi, oi, ii)]["va"]
+                        va1 = self.ds[(s1, argi, oi, ii)]["va"]
+                        self.prob += va0 == va1, _get_next_name("cluster_constraint")
+        """
+        vars_per_arg = {}
+        for argi, oi_, ii in self.walk_over_options(node):
+            if oi_ == oi:
+                va = self.ds[(s_i, argi, oi, ii)]["va"]
+                vars_per_arg.setdefault(argi, []).append(va)
+        for eqs in vars_per_arg.values():
+            self.prob += (pulp.lpSum(eqs) == 1, _get_next_name(constraint_name))
+        """
+
     def validate(self):
         for node in self.graph.nodes:
             if node.op != "call_function":

@@ -37,6 +37,7 @@ def _add_alias(gm):
             # node is not used, don't add alias for it
             continue
         first_user = nodes[min(node_map[n] for n in node.users)]
+        first_user = inputs[-1].next
         with graph.inserting_before(first_user):
             alias_node = graph.call_function(torch.ops.aten.alias.default, args=(node,))
             alias_node.meta.update(node.meta)
@@ -212,114 +213,130 @@ def _get_node_hash(node):
 def get_graph_clusters(gm):
     from collections import defaultdict
 
-    """
-    groups = defaultdict(list)
-    node_map = {}
-
-    for node in gm.graph.nodes:
-        if hashval := _get_node_hash(node):
-            groups[hashval].append(node)
-            node_map[node] = groups[hashval]
-
-    new_groups = {}
-    for k, v in groups.items():
-        if len(v) > 1:
-            new_groups[k] = v
-
-
-    anchor_op = str(torch.ops.aten.mm.default)
-    anchor_groups = [g for k, g in new_groups.items() if k[2] == anchor_op]
-    picked_group = anchor_groups[min(len(g) for g in anchor_groups)]
-    picked_group = anchor_groups[0]
-
-    from collections import deque
-    queues = [deque([x]) for x in picked_group]
-    clusters = [[] for _ in picked_group]
-    counter = 0
-    ended = [False] * len(queues)
-    while any(len(queue) > 0 for queue in queues):
-        counter += 1
-        if counter > 110:
-            break
-        currs = [queue.popleft() if queue else None for queue in queues]
-        # print(currs)
-        hashes = defaultdict(list)
-        maxsize = 0
-        for i, n in enumerate(currs):
-            if n is None:
-                ended[i] = True
-                continue
-            hashval = _get_node_hash0(n)
-            hashes[hashval].append((i, n))
-            maxsize = max(maxsize, len(hashes[hashval]))
-
-        if maxsize < 2:
-            #print(f"breaking at {currs}")
-            print("breaking")
-            break
-        if all(ended):
-            print("ended, breaking")
-            break
-        for cls in hashes.values():
-            if len(cls) < 2:
-                continue
-            for cl_id, cl in cls:
-                if cl in clusters[cl_id]:
-                    ended[cl_id] = True
-                    continue
-                clusters[cl_id].append(cl)
-                queues[cl_id].extend(cl.all_input_nodes)
-
-        unique_clusters = list(set(tuple(c) for c in clusters))
-
-        cc = defaultdict(list)
-        for cl_id, cl in enumerate(unique_clusters):
-            h = hash(tuple(_get_node_hash0(x) for x in cl))
-            cc[h].append(cl)
-    """
+    the_ops = {
+        torch.ops.aten._scaled_dot_product_efficient_attention.default,
+        # torch.ops.aten._scaled_dot_product_efficient_attention_backward.default,
+        # torch.ops.aten.mm.default,
+    }
     picked_group = [
         n
         for n in gm.graph.nodes
-        if n.op == "call_function" and n.target == torch.ops.aten.mm.default
+        # if n.op == "call_function" and n.target == torch.ops.aten.mm.default
+        if n.op == "call_function" and n.target in the_ops
     ]
+
+    node_map = {n: i for i, n in enumerate(gm.graph.nodes)}
+    node_locs = [node_map[n] for n in picked_group]
+    diff = node_locs[1] - node_locs[0]
+    assert all(
+        diff == (node_locs[i + 1] - node_locs[i]) for i in range(len(picked_group) - 1)
+    )
+
     g = [[p] for p in picked_group]
     ended = [False] * len(picked_group)
-    counter = 0
+    # ended = torch.zeros(len(picked_group), len(picked_group), dtype=torch.bool)
 
     def get_sequence_hash(seq):
         return hash(tuple(_get_node_hash0(x) for x in seq))
 
-    while not all(ended):
-        print(counter)
-        counter += 1
-        if counter > 1010:
-            break
-        lasts = [p[-1] for p in g]
-        nexts = [p.next if p.op != "output" else None for p in lasts]
+    next_elm = True
+    for i in range(diff):
+        if next_elm:
+            new_seq = [p + [p[-1].next] if p[-1].op != "output" else p for p in g]
+        else:
+            new_seq = [[p[0].prev] + p if p[0].op != "placeholder" else p for p in g]
 
-        new_seq = [p + [p[-1].next] if p[-1].op != "output" else p for p in g]
+        def get_elm(s):
+            if next_elm:
+                return s[-1]
+            return s[0]
 
         hashes = defaultdict(list)
         for i, s in enumerate(new_seq):
-            hashes[get_sequence_hash(s)].append((i, s[-1]))
+            hashes[get_sequence_hash(s)].append((i, get_elm(s)))
+
+        if len(hashes) != 1:
+            next_elm = False
+            continue
 
         for cls in hashes.values():
             if len(cls) < 2:
                 assert len(cls) == 1
+                print(cls[0][0], picked_group[cls[0][0]])
+                # ended[cls[0][0]][cls[0][0]] = True
                 ended[cls[0][0]] = True
                 continue
 
             for cl_id, cl in cls:
                 for cl_id2, _ in cls:
                     if cl in g[cl_id2]:
+                        # ended[cl_id][cl_id2] = True
                         ended[cl_id] = True
                         break
 
             for cl_id, cl in cls:
+                # if ended[cl_id].all():
                 if ended[cl_id]:
                     continue
-                g[cl_id].append(cl)
+                if next_elm:
+                    g[cl_id].append(cl)
+                else:
+                    g[cl_id].insert(0, cl)
 
+    """
+    counter = 0
+    while not all(ended):
+    #while not ended.all():
+        print(counter)
+        counter += 1
+        if counter > 1010:
+            break
+        #lasts = [p[-1] for p in g]
+        #nexts = [p.next if p.op != "output" else None for p in lasts]
+
+        next_elm = counter % 2 == 0
+        if next_elm:
+            new_seq = [p + [p[-1].next] if p[-1].op != "output" else p for p in g]
+        else:
+            new_seq = [[p[0].prev] + p if p[0].op != "placeholder" else p for p in g]
+
+        def get_elm(s):
+            if next_elm:
+                return s[-1]
+            return s[0]
+
+        hashes = defaultdict(list)
+        for i, s in enumerate(new_seq):
+            hashes[get_sequence_hash(s)].append((i, get_elm(s)))
+
+        if len(hashes) != 2:
+            from IPython import embed; embed(); sys.sdf
+
+        for cls in hashes.values():
+            if len(cls) < 2:
+                assert len(cls) == 1
+                from IPython import embed; embed(); sys.sdf
+                print(cls[0][0], picked_group[cls[0][0]])
+                #ended[cls[0][0]][cls[0][0]] = True
+                ended[cls[0][0]] = True
+                continue
+
+            for cl_id, cl in cls:
+                for cl_id2, _ in cls:
+                    if cl in g[cl_id2]:
+                        #ended[cl_id][cl_id2] = True
+                        ended[cl_id] = True
+                        break
+
+            for cl_id, cl in cls:
+                #if ended[cl_id].all():
+                if ended[cl_id]:
+                    continue
+                if next_elm:
+                    g[cl_id].append(cl)
+                else:
+                    g[cl_id].insert(0, cl)
+    """
     clusters = defaultdict(list)
     for cl in g:
         clusters[get_sequence_hash(cl)].append(cl)
@@ -341,21 +358,9 @@ def get_graph_clusters(gm):
                     covered[i][0] = len(n)
                     covered[i][1] = cl_i
                     covered[i][2] = ni
-    """
-    for cl_i, cl in enumerate(clusters):
-        for ni, n in enumerate(cl):
-            for ng in n:
-                i = node_map[ng]
-                if covered[i][0] < len(n) and covered[i][1]:
-                    covered[i][0] = len(n)
-                    covered[i][1] = cl_i
-                    covered[i][2] = ni
-    """
-    from IPython import embed
 
-    embed()
-    sys.sdf
-    return groups
+    # from IPython import embed; embed(); sys.sdf
+    return clusters
 
 
 def move_to_fake(model: torch.nn.Module, mode: FakeTensorMode, device: torch.device):
@@ -412,6 +417,9 @@ class AutoParallel:
         sharding_optimizer.add_grad_param_constraints()
         self.sharding_optimizer = sharding_optimizer
 
+        clusters = get_graph_clusters(self.gm)
+        self.sharding_optimizer.add_cluster_constraint(clusters)
+
         self.input_constraints = None
         self.output_constraints = None
 
@@ -450,8 +458,6 @@ class AutoParallel:
         # give more room for optimizations
         _add_alias(gm)
         apply_node_renaming(gm, self.params_len, self.buffer_len, self.metadata)
-
-        get_graph_clusters(gm)
         self.gm = gm
 
     def add_parameter_memory_constraint(self, low=None, high=None):
@@ -491,7 +497,7 @@ class AutoParallel:
                 [None] * len(self.sharding_optimizer.get_fn_output_nodes())
             )
 
-        self.sharding_placement = self.sharding_optimizer.get_solution(verbose=False)
+        self.sharding_placement = self.sharding_optimizer.get_solution(verbose=True)
 
         if verbose:
             self.sharding_optimizer.print()
