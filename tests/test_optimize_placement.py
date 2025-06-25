@@ -16,6 +16,8 @@ from autoparallel.api import AutoParallel
 def init_pg():
     world_size = 256
     fake_store = FakeStore()
+    if torch.distributed.is_initialized():
+        return
     torch.distributed.init_process_group(
         "fake", store=fake_store, rank=0, world_size=world_size
     )
@@ -91,17 +93,19 @@ class TransformerBlock(nn.Module):
         return o
 
 
-def _make_model_and_input_fn(mesh, model_type="ffn_with_multiple_input_output"):
+def _make_model_and_input_fn(
+    mesh, model_type="ffn_with_multiple_input_output", device="cuda"
+):
     if model_type == "ffn_with_multiple_input_output":
         bs = 2048 * mesh.shape[0]
         dim1 = 1024
         dim2 = 4096
 
         def model_fn():
-            return FFN(dim1, dim2).cuda()
+            return FFN(dim1, dim2)
 
         def input_fn():
-            return torch.randn(bs, dim1).cuda(), torch.randn(bs, 1).cuda()
+            return torch.randn(bs, dim1).to(device), torch.randn(bs, 1).to(device)
 
     elif model_type == "transformer_block":
         bs = 8 * mesh.shape[0]
@@ -110,10 +114,10 @@ def _make_model_and_input_fn(mesh, model_type="ffn_with_multiple_input_output"):
         nheads = 48
 
         def model_fn():
-            return TransformerBlock(nheads, dim1, dim2).cuda()
+            return TransformerBlock(nheads, dim1, dim2)
 
         def input_fn():
-            return torch.randn(bs, 256, dim1, device="cuda", requires_grad=True)
+            return torch.randn(bs, 256, dim1, device=device, requires_grad=True)
 
     return model_fn, input_fn
 
@@ -124,9 +128,12 @@ def _make_model_and_input_fn(mesh, model_type="ffn_with_multiple_input_output"):
 @pytest.mark.parametrize("high_mem", [None, 1.0])
 def test_optimization_finds_fsdp_and_ddp_1d(device_mesh_1d, high_mem, model_type):
     low_mem = 0
-    model_fn, input_fn = _make_model_and_input_fn(device_mesh_1d, model_type)
+    device = "cuda"
+    model_fn, input_fn = _make_model_and_input_fn(device_mesh_1d, model_type, device)
+    with torch.device("meta"):
+        model = model_fn()
 
-    autop = AutoParallel(model_fn, input_fn, device_mesh_1d)
+    autop = AutoParallel(model, input_fn, device_mesh_1d)
     autop.add_parameter_memory_constraint(low=low_mem, high=high_mem)
 
     sharding_placement = autop.optimize_placement()
@@ -250,9 +257,12 @@ def test_optimization_finds_fsdp_tp_2d(
 ):
     low_mem = 0
     high_mem = None
-    model_fn, input_fn = _make_model_and_input_fn(device_mesh_2d, model_type)
+    device = "cuda"
+    model_fn, input_fn = _make_model_and_input_fn(device_mesh_2d, model_type, device)
+    with torch.device("meta"):
+        model = model_fn()
 
-    autop = AutoParallel(model_fn, input_fn, device_mesh_2d)
+    autop = AutoParallel(model, input_fn, device_mesh_2d)
     autop.add_parameter_memory_constraint(low=low_mem, high=high_mem)
 
     sharding_placement = autop.optimize_placement()

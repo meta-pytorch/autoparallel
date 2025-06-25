@@ -14,10 +14,12 @@ from torch._inductor.decomposition import select_decomp_table
 from torch._inductor.fx_passes.joint_graph import joint_graph_passes
 from torch._inductor.fx_passes.post_grad import remove_assert_ops
 from torch._subclasses import FakeTensorMode
+from torch.distributed.tensor import DeviceMesh
 
 from .apply_sharding import apply_sharding_to_model
 from .export_module import aot_export_module, apply_node_renaming
 from .optimize_sharding import ShardingOptimizer
+from .utils import _get_device_from_mesh
 
 
 def _add_alias(gm):
@@ -200,10 +202,12 @@ def _get_node_hash0(node):
         shape = tuple(x.shape for x in node.meta["val"] if isinstance(x, torch.Tensor))
     return (str(node.target), shape)
 
+
 def _get_node_hash(node):
     h1 = tuple(_get_node_hash0(x) for x in node.all_input_nodes)
     h2 = _get_node_hash0(node)
     return h1 + h2
+
 
 def get_graph_clusters(gm):
     from collections import defaultdict
@@ -273,14 +277,17 @@ def get_graph_clusters(gm):
             h = hash(tuple(_get_node_hash0(x) for x in cl))
             cc[h].append(cl)
     """
-    picked_group = [n for n in gm.graph.nodes if n.op == "call_function" and n.target == torch.ops.aten.mm.default]
+    picked_group = [
+        n
+        for n in gm.graph.nodes
+        if n.op == "call_function" and n.target == torch.ops.aten.mm.default
+    ]
     g = [[p] for p in picked_group]
     ended = [False] * len(picked_group)
     counter = 0
 
     def get_sequence_hash(seq):
         return hash(tuple(_get_node_hash0(x) for x in seq))
-
 
     while not all(ended):
         print(counter)
@@ -289,7 +296,6 @@ def get_graph_clusters(gm):
             break
         lasts = [p[-1] for p in g]
         nexts = [p.next if p.op != "output" else None for p in lasts]
-
 
         new_seq = [p + [p[-1].next] if p[-1].op != "output" else p for p in g]
 
@@ -326,7 +332,6 @@ def get_graph_clusters(gm):
     num_per_cluster = [(i, len(cl[0])) for i, cl in enumerate(clusters)]
     num_per_cluster = reversed(sorted(num_per_cluster, key=lambda x: x[1]))
 
-
     for cl_i, _ in num_per_cluster:
         cl = clusters[cl_i]
         for ni, n in enumerate(cl):
@@ -346,14 +351,58 @@ def get_graph_clusters(gm):
                     covered[i][1] = cl_i
                     covered[i][2] = ni
     """
-    from IPython import embed; embed(); sys.sdf
+    from IPython import embed
+
+    embed()
+    sys.sdf
     return groups
 
 
+def move_to_fake(model: torch.nn.Module, mode: FakeTensorMode, device: torch.device):
+    """
+    Move the model to the fake mode and move the weights to the fake device
+    """
+
+    def assert_is_meta_tensor(name, t):
+        assert isinstance(t, torch.Tensor) and t.device == torch.device(
+            "meta"
+        ), f"tensor {name} must be on meta device, not {t.device}"
+
+    def _move_to_fake(module, k, device, parameter=True):
+        # lots of ways you might try to swap params with fake params do not work, but this one does
+        submod = module
+        while len(k.split(".")) > 1:
+            submod_name, k = k.split(".", 1)
+            submod = getattr(submod, submod_name)
+
+        fake_tensor = mode.from_tensor(getattr(submod, k)).to(device)
+        if parameter:
+            fake_tensor = torch.nn.Parameter(fake_tensor)
+
+        setattr(submod, k, fake_tensor)
+
+    with mode:
+        for k, p in model.named_parameters():
+            assert_is_meta_tensor(k, p)
+            _move_to_fake(model, k, device, parameter=True)
+        for k, b in model.named_buffers():
+            assert_is_meta_tensor(k, b)
+            _move_to_fake(model, k, device, parameter=False)
+
+    return model
+
+
 class AutoParallel:
-    def __init__(self, model_fn, input_fn, mesh):
+    """
+    Args:
+        mesh: Defines placement options.
+        The meta model is moved to a fake device based on mesh.device_type.
+    """
+
+    def __init__(self, model, input_fn, mesh: DeviceMesh):
         self.fake_mode = FakeTensorMode()
-        self.model_fn = model_fn
+        device = _get_device_from_mesh(mesh)
+        self.model = move_to_fake(model, self.fake_mode, device)
         self.input_fn = input_fn
         self.mesh = mesh
         self.build_model_graph()
@@ -371,7 +420,6 @@ class AutoParallel:
         # needed because of https://github.com/pytorch/pytorch/issues/148977
         torch.__future__.set_swap_module_params_on_conversion(True)
         with self.fake_mode:
-            self.model = self.model_fn()
             inputs = self.input_fn()
             if not isinstance(inputs, tuple):
                 inputs = (inputs,)

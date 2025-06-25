@@ -72,7 +72,7 @@ dim2 = dim1 * 4
 
 
 def model_fn():
-    return Block(nheads, dim1, dim2).cuda()
+    return Block(nheads, dim1, dim2)
 
 
 def input_fn():
@@ -80,7 +80,9 @@ def input_fn():
 
 
 # parallelize the model
-autop = AutoParallel(model_fn, input_fn, mesh)
+with torch.device("meta"):
+    model = model_fn()
+autop = AutoParallel(model, input_fn, mesh)
 autop.add_parameter_memory_constraint(low=None, high=None)
 
 x_sharding = (Shard(0), Replicate())
