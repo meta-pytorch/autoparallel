@@ -211,6 +211,11 @@ def _get_node_hash(node):
 
 
 def get_graph_clusters(gm):
+    """
+    Super hacky, only works for the case where we have a single sdpa per block
+    Don't handle backward, just a POC to see if the solver will have speedups
+    with those constraints added
+    """
     from collections import defaultdict
 
     the_ops = {
@@ -219,10 +224,7 @@ def get_graph_clusters(gm):
         # torch.ops.aten.mm.default,
     }
     picked_group = [
-        n
-        for n in gm.graph.nodes
-        # if n.op == "call_function" and n.target == torch.ops.aten.mm.default
-        if n.op == "call_function" and n.target in the_ops
+        n for n in gm.graph.nodes if n.op == "call_function" and n.target in the_ops
     ]
 
     node_map = {n: i for i, n in enumerate(gm.graph.nodes)}
@@ -233,8 +235,6 @@ def get_graph_clusters(gm):
     )
 
     g = [[p] for p in picked_group]
-    ended = [False] * len(picked_group)
-    # ended = torch.zeros(len(picked_group), len(picked_group), dtype=torch.bool)
 
     def get_sequence_hash(seq):
         return hash(tuple(_get_node_hash0(x) for x in seq))
@@ -260,106 +260,17 @@ def get_graph_clusters(gm):
             continue
 
         for cls in hashes.values():
-            if len(cls) < 2:
-                assert len(cls) == 1
-                print(cls[0][0], picked_group[cls[0][0]])
-                # ended[cls[0][0]][cls[0][0]] = True
-                ended[cls[0][0]] = True
-                continue
-
             for cl_id, cl in cls:
-                for cl_id2, _ in cls:
-                    if cl in g[cl_id2]:
-                        # ended[cl_id][cl_id2] = True
-                        ended[cl_id] = True
-                        break
-
-            for cl_id, cl in cls:
-                # if ended[cl_id].all():
-                if ended[cl_id]:
-                    continue
                 if next_elm:
                     g[cl_id].append(cl)
                 else:
                     g[cl_id].insert(0, cl)
 
-    """
-    counter = 0
-    while not all(ended):
-    #while not ended.all():
-        print(counter)
-        counter += 1
-        if counter > 1010:
-            break
-        #lasts = [p[-1] for p in g]
-        #nexts = [p.next if p.op != "output" else None for p in lasts]
-
-        next_elm = counter % 2 == 0
-        if next_elm:
-            new_seq = [p + [p[-1].next] if p[-1].op != "output" else p for p in g]
-        else:
-            new_seq = [[p[0].prev] + p if p[0].op != "placeholder" else p for p in g]
-
-        def get_elm(s):
-            if next_elm:
-                return s[-1]
-            return s[0]
-
-        hashes = defaultdict(list)
-        for i, s in enumerate(new_seq):
-            hashes[get_sequence_hash(s)].append((i, get_elm(s)))
-
-        if len(hashes) != 2:
-            from IPython import embed; embed(); sys.sdf
-
-        for cls in hashes.values():
-            if len(cls) < 2:
-                assert len(cls) == 1
-                from IPython import embed; embed(); sys.sdf
-                print(cls[0][0], picked_group[cls[0][0]])
-                #ended[cls[0][0]][cls[0][0]] = True
-                ended[cls[0][0]] = True
-                continue
-
-            for cl_id, cl in cls:
-                for cl_id2, _ in cls:
-                    if cl in g[cl_id2]:
-                        #ended[cl_id][cl_id2] = True
-                        ended[cl_id] = True
-                        break
-
-            for cl_id, cl in cls:
-                #if ended[cl_id].all():
-                if ended[cl_id]:
-                    continue
-                if next_elm:
-                    g[cl_id].append(cl)
-                else:
-                    g[cl_id].insert(0, cl)
-    """
     clusters = defaultdict(list)
     for cl in g:
         clusters[get_sequence_hash(cl)].append(cl)
 
     clusters = [v for v in clusters.values() if len(v) > 1]
-
-    nodes = list(gm.graph.nodes)
-    node_map = {n: i for i, n in enumerate(nodes)}
-    covered = [[-1, -1, -1] for _ in nodes]
-    num_per_cluster = [(i, len(cl[0])) for i, cl in enumerate(clusters)]
-    num_per_cluster = reversed(sorted(num_per_cluster, key=lambda x: x[1]))
-
-    for cl_i, _ in num_per_cluster:
-        cl = clusters[cl_i]
-        for ni, n in enumerate(cl):
-            for ng in n:
-                i = node_map[ng]
-                if covered[i][0] < len(n):
-                    covered[i][0] = len(n)
-                    covered[i][1] = cl_i
-                    covered[i][2] = ni
-
-    # from IPython import embed; embed(); sys.sdf
     return clusters
 
 
