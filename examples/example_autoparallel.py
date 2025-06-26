@@ -23,6 +23,13 @@ class Block(nn.Module):
         self.w1 = nn.Linear(dim1, dim2, bias=bias)
         self.w2 = nn.Linear(dim2, dim1, bias=bias)
 
+    def init_weights(self):
+        for lin in [self.wq, self.wk, self.wv, self.wo, self.w1, self.w2]:
+            breakpoint()
+            torch.nn.init.normal_(lin.weight)
+            if lin.bias is not None:
+                torch.nn.init.normal_(lin.bias)
+
     def forward(self, x):
         q = self.wq(x)
         k = self.wk(x)
