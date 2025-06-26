@@ -13,6 +13,7 @@ from torch._functorch.partitioners import default_partition
 from torch._inductor.decomposition import select_decomp_table
 from torch._inductor.fx_passes.joint_graph import joint_graph_passes
 from torch._inductor.fx_passes.post_grad import remove_assert_ops
+from torch._logging import trace_structured
 from torch._subclasses import FakeTensorMode
 from torch.distributed.tensor import DeviceMesh
 
@@ -287,6 +288,14 @@ class AutoParallel:
         # give more room for optimizations
         _add_alias(gm)
         apply_node_renaming(gm, self.params_len, self.buffer_len, self.metadata)
+        trace_structured(
+            "artifact",
+            metadata_fn=lambda: {
+                "name": "autoparallel_joint_graph",
+                "encoding": "string",
+            },
+            payload_fn=lambda: str(gm.graph),
+        )
 
         self.gm = gm
 
@@ -330,7 +339,16 @@ class AutoParallel:
         self.sharding_placement = self.sharding_optimizer.get_solution(verbose=False)
 
         if verbose:
-            self.sharding_optimizer.print()
+            print(self.sharding_optimizer.get_log())
+
+        trace_structured(
+            "artifact",
+            metadata_fn=lambda: {
+                "name": "autoparallel_sharding_optimizer_log",
+                "encoding": "string",
+            },
+            payload_fn=lambda: self.sharding_optimizer.get_log(colored=False),
+        )
 
         if self.sharding_optimizer.prob.status == -1:
             raise RuntimeError("Didn't find solution")
@@ -347,6 +365,14 @@ class AutoParallel:
         # clean it up by removing the added aliases from previous pass
         # as well as redundant views
         parallel_gm = joint_graph_passes(parallel_gm)
+        trace_structured(
+            "artifact",
+            metadata_fn=lambda: {
+                "name": "autoparallel_parallel_graph",
+                "encoding": "string",
+            },
+            payload_fn=lambda: str(parallel_gm.graph),
+        )
         # now rename input/param/tangent/output/grad_param/grad_input nodes following
         # our convention
         apply_node_renaming(

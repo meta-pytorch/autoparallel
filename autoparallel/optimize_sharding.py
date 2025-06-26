@@ -313,15 +313,16 @@ class ShardingOptimizer:
                                 # penalize case P -> S(1) as there are additional compute cost
                                 self.ds[(s_i, counter, oi, ii)]["cost"] *= 4
 
-    def print_violated_constraints(self):
+    def get_violated_constraints_log(self):
         violated_constraints = [
             (k, c) for k, c in self.prob.constraints.items() if not c.valid()
         ]
-        print(f"Violated constraints: {[x[0] for x in violated_constraints]}")
+        log_str = f"Violated constraints: {[x[0] for x in violated_constraints]}"
         for cname, c in violated_constraints:
-            print(f"========= {cname} =============")
+            log_str += f"\n========= {cname} ============="
             for cc, v in c.items():
-                print(f"{cc}, coeff={v}, value={cc.value()}")
+                log_str += f"\n{cc}, coeff={v}, value={cc.value()}"
+        return log_str
 
     def print_old(self):
         ds = self.ds
@@ -335,9 +336,10 @@ class ShardingOptimizer:
         )
         total_cost = sum(ds[x]["cost"] for x in res)
         print(f"total_cost: {total_cost:.2f}")
-        self.print_violated_constraints()
+        print(self.get_violated_constraints_log())
 
-    def print(self, colored=False):
+    def get_log(self, colored=False):
+
         from torch.fx.graph import _color_fns, _identity
 
         opt = {}
@@ -375,10 +377,10 @@ class ShardingOptimizer:
             code[l_id] += line
             l_id += 1
         code = "\n".join(code)
-        print(code)
         total_cost = sum(self.ds[x]["cost"] for x in self.res)
-        print(f"total_cost: {total_cost:.2f}")
-        self.print_violated_constraints()
+        code += f"\ntotal_cost: {total_cost:.2f}"
+        code += "\n" + self.get_violated_constraints_log()
+        return code
 
     def print_costs_for_node(self, node, arg=0, **kwargs):
         from tabulate import tabulate  # type: ignore
