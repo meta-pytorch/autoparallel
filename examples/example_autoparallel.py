@@ -25,7 +25,6 @@ class Block(nn.Module):
 
     def init_weights(self):
         for lin in [self.wq, self.wk, self.wv, self.wo, self.w1, self.w2]:
-            breakpoint()
             torch.nn.init.normal_(lin.weight)
             if lin.bias is not None:
                 torch.nn.init.normal_(lin.bias)
