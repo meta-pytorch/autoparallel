@@ -570,7 +570,9 @@ def index_rule(mesh, op_schema):
             kspc = [x for x in strat[1].childs if x is not None]
             s = OpSpec(output_specs=ospec, input_specs=[ispec] + idxs_strats)
 
-            redistribute_costs = [generate_redistribute_costs(specs[0], ospec),] + [
+            redistribute_costs = [
+                generate_redistribute_costs(specs[0], ospec),
+            ] + [
                 generate_redistribute_costs(kk, idxs_strat)
                 for kk, idxs_strat in zip(kspc, idxs_strats)
             ]

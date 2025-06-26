@@ -67,7 +67,6 @@ def fill_missing_redistribute_cost(op, specs, out_strat):
     for strat in out_strat.strategies:
         # TODO: check me
         if strat.redistribute_cost is None:
-
             # TODO: the torch.ops.aten.slice.Tensor is wrong here and in the input_spec!!!!!
             handled_ops = {
                 torch.ops.aten.ones_like.default,

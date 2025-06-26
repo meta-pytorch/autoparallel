@@ -388,10 +388,16 @@ class AutoParallel:
         assert len(param_names) == len(sharded_weights)
         assert len(buffer_names) == len(sharded_buffers)
 
-        sharded_weights_no_fqns = {k: v for k, v in zip(param_names_no_fqns, sharded_weights)}
-        sharded_buffers_no_fqns = {k: v for k, v in zip(buffer_names_no_fqns, sharded_buffers)}
+        sharded_weights_no_fqns = {
+            k: v for k, v in zip(param_names_no_fqns, sharded_weights)
+        }
+        sharded_buffers_no_fqns = {
+            k: v for k, v in zip(buffer_names_no_fqns, sharded_buffers)
+        }
         sharded_weights_with_fqns = {k: v for k, v in zip(param_names, sharded_weights)}
-        sharded_buffers_with_fqns = {k: v for k, v in zip(buffer_names, sharded_buffers)}
+        sharded_buffers_with_fqns = {
+            k: v for k, v in zip(buffer_names, sharded_buffers)
+        }
 
         # TODO: preserve state dict properly in the generated nn.module
         self.sharded_weights = sharded_weights_no_fqns
@@ -407,8 +413,11 @@ class AutoParallel:
         sharded_buffers = try_convert_fake_to_real(sharded_buffers_no_fqns)
         # Right now we require a convention that the user model provides an init_weights method,
         # although we could snoop for other methods too.
-        if hasattr(self.model, 'init_weights') is not None:
-            sharded_params_buffers = {**sharded_weights_with_fqns, **sharded_buffers_with_fqns}
+        if hasattr(self.model, "init_weights") is not None:
+            sharded_params_buffers = {
+                **sharded_weights_with_fqns,
+                **sharded_buffers_with_fqns,
+            }
             with stateless._reparametrize_module(self.model, sharded_params_buffers):
                 self.model.init_weights()
 
