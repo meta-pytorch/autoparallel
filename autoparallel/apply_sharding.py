@@ -167,10 +167,8 @@ def shard_nodes_given_placements(gm, sharding_placement, node_prefix):
         # all tensors start as replicated
         curr_placement = (Replicate(),) * mesh.ndim
         tensor = node.meta["val"]
-        sharded_tensor = (
-            DTensor.from_local(tensor, mesh, curr_placement)
-            .redistribute(mesh, tgt_spec.placements)
-            .to_local()
+        sharded_tensor = DTensor.from_local(tensor, mesh, curr_placement).redistribute(
+            mesh, tgt_spec.placements
         )
         sharded_tensors.append(sharded_tensor)
     return sharded_tensors
@@ -188,6 +186,7 @@ def apply_sharding_to_model(gm, sharding_placement):
     interp = ApplyShardingInterpreter(gm, sharding_placement)
 
     args = sharded_params + sharded_buffers + sharded_inputs + sharded_tangents
+    args = [x.to_local() for x in args]
     parallel_gm = make_fx(interp.run)(*args)
 
     return parallel_gm, sharded_params, sharded_buffers

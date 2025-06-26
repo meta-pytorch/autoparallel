@@ -319,6 +319,7 @@ def cat_rule(mesh, specs):
 
 @register_rule(torch.ops.prims.iota.default)
 def iota_rule(mesh, specs):
+    raise NotImplementedError("Needs hardening, only tested on a few cases")
     shape = [specs[0]]
     tensor_meta = _gen_tensor_meta(shape, dtype=torch.int64)
     placement = (Replicate(),) * mesh.ndim
@@ -329,6 +330,7 @@ def iota_rule(mesh, specs):
 
 @register_rule(torch.ops.aten.randperm.default)
 def randperm_rule(mesh, specs):
+    raise NotImplementedError("Needs hardening, only tested on a few cases")
     shape = [specs[0]]
     tensor_meta = _gen_tensor_meta(shape, dtype=torch.int64)
     placement = (Replicate(),) * mesh.ndim
@@ -338,6 +340,7 @@ def randperm_rule(mesh, specs):
 
 @register_rule(torch.ops.aten.full.default)
 def full_rule(mesh, specs):
+    raise NotImplementedError("Needs hardening, only tested on a few cases")
     shape = specs[0]
     # TODO: get the dtype
     tensor_meta = _gen_tensor_meta(shape)
@@ -539,6 +542,7 @@ def _unsafe_index_rule(mesh, op_schema):
 
 @register_opschema_rule(torch.ops.aten.index.Tensor)
 def index_rule(mesh, op_schema):
+    raise NotImplementedError("Needs hardening, only tested on a few cases")
     strat = op_schema.args_schema
     specs = strat  # TODO: clean this up
     res = []
@@ -579,6 +583,7 @@ def index_rule(mesh, op_schema):
 
 @register_opschema_rule(torch.ops.aten.index_put.default)
 def index_put_rule(mesh, op_schema):
+    raise NotImplementedError("Needs hardening, only tested on a few cases")
     strat = op_schema.args_schema
     specs = strat  # TODO: clean this up
     res = []
