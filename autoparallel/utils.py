@@ -131,7 +131,6 @@ def get_placement_options(mesh, op, specs, user_args):
                     if shape[dim] % mesh_shape == 0:
                         shape[dim] /= mesh_shape
                     else:
-                        print(f"removing invalid config {strategy} for {op}")
                         is_valid = False
                         break
         if is_valid:

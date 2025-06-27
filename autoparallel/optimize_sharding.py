@@ -262,7 +262,6 @@ class ShardingOptimizer:
                                 if shape[dim] % mesh_shape == 0:
                                     shape[dim] /= mesh_shape
                                 else:
-                                    # print(f"adding constraint {node}, {str(spec.placements)}, {str(curr_spec.placements)}, {shape}, {mesh_shape}")
                                     self.prob += (
                                         self.ds[(s_i, counter, oi, ii)]["va"] == 0,
                                         _get_next_name("invalid_view"),
