@@ -7,20 +7,18 @@
 # Copyright (c) Meta Platforms, Inc. All Rights Reserved.
 
 
+import time
 from dataclasses import dataclass
-from typing import Callable, ClassVar
+from typing import ClassVar
 
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.distributed.tensor.placement_types import Replicate, Shard
+from torch.nn.attention import SDPBackend, sdpa_kernel
+from torch.testing._internal.distributed.fake_pg import FakeStore
 
-#from torchtitan.components.tokenizer import Tokenizer
-#from torchtitan.config_manager import JobConfig
-# from torchtitan.models.attention import build_attention, init_attention_mask
-# from torchtitan.protocols.train_spec import BaseModelArgs, ModelProtocol
-
-
-from torch.nn.attention import sdpa_kernel, SDPBackend
+from autoparallel.api import AutoParallel
 
 
 def has_cuda_capability(major: int, minor: int) -> bool:
@@ -28,6 +26,7 @@ def has_cuda_capability(major: int, minor: int) -> bool:
         major,
         minor,
     )
+
 
 class ScaledDotProductAttention(torch.nn.Module):
     backends: ClassVar[list[SDPBackend]] = []
@@ -67,7 +66,8 @@ def build_attention(
     use_flex_attn: bool, attn_mask_type: str, fixed_block_size: int | None = None
 ):
     if use_flex_attn:
-        return FlexAttention(attn_mask_type, fixed_block_size)
+        raise NotImplementedError()
+        # return FlexAttention(attn_mask_type, fixed_block_size)
     else:
         if fixed_block_size is not None:
             raise ValueError(
@@ -86,7 +86,7 @@ class TransformerModelArgs:
     n_layers: int = 32
     n_heads: int = 32
     n_kv_heads: int | None = None
-    vocab_size: int = 64000  #-1  # defined later by tokenizer
+    vocab_size: int = 64000  # -1  # defined later by tokenizer
     multiple_of: int = 256  # make SwiGLU hidden layer size multiple of large power of 2
     ffn_dim_multiplier: float | None = None
     norm_eps: float = 1e-5
@@ -402,7 +402,6 @@ class TransformerBlock(nn.Module):
             ffn_dim_multiplier=model_args.ffn_dim_multiplier,
         )
         self.attention_norm = nn.RMSNorm(model_args.dim, eps=model_args.norm_eps)
-        #self.attention_norm = nn.LayerNorm(model_args.dim, eps=model_args.norm_eps)
         self.ffn_norm = nn.RMSNorm(model_args.dim, eps=model_args.norm_eps)
 
         if model_args.depth_init:
@@ -428,10 +427,6 @@ class TransformerBlock(nn.Module):
         """
         h = x + self.attention(self.attention_norm(x), freqs_cis)
         out = h + self.feed_forward(self.ffn_norm(h))
-        #h = self.attention(self.attention_norm(x), freqs_cis)
-        #h = self.attention(x, freqs_cis)
-        #h = self.attention_norm(x)
-        #out = h
         return out
 
     def init_weights(self):
@@ -501,7 +496,7 @@ class Transformer(nn.Module):
         ``init_weights``. We only call it in the constructor of this
         ``Transformer`` root module to avoid reinitializing tensors.
         """
-        buffer_device = buffer_device or self.freqs_cis.device
+        buffer_device = buffer_device or self.freqs_cis.device  # type: ignore
         with torch.device(buffer_device):
             self.freqs_cis = self._precompute_freqs_cis()
         if self.tok_embeddings is not None:
@@ -550,11 +545,6 @@ class Transformer(nn.Module):
             torch.Tensor: Output logits after applying the Transformer model.
 
         """
-        if self.model_args.use_flex_attn:
-            init_attention_mask(
-                input_batch if input_batch is not None else tokens, eos_id=self.eos_id
-            )
-
         # passthrough for nonexistent layers, allows easy configuration of pipeline parallel stages
         h = self.tok_embeddings(tokens) if self.tok_embeddings else tokens
 
@@ -565,7 +555,10 @@ class Transformer(nn.Module):
         output = self.output(h) if self.output else h
         return output
 
-from torch.testing._internal.distributed.fake_pg import FakeStore
+
+# ==============================================================
+# AutoParallel code starts here
+# ==============================================================
 
 world_size = 256
 
@@ -573,8 +566,13 @@ fake_store = FakeStore()
 torch.distributed.init_process_group(
     "fake", store=fake_store, rank=0, world_size=world_size
 )
-if False:
-    mesh = torch.distributed.device_mesh.init_device_mesh("cuda", (world_size,), mesh_dim_names=("dp",))
+
+use_1d_mesh = False
+
+if use_1d_mesh:
+    mesh = torch.distributed.device_mesh.init_device_mesh(
+        "cuda", (world_size,), mesh_dim_names=("dp",)
+    )
 else:
     mesh = torch.distributed.device_mesh.init_device_mesh(
         "cuda",
@@ -586,34 +584,20 @@ else:
     )
 
 batch_size = 8 * mesh.shape[0]
-# TODO: investigate why 256 adds TP but 1024 doesn't
-seqlen = 1024 # 256 # 2048
+seqlen = 2048
 vocab_size = 64000
 device = torch.device("cuda")
-#device = torch.device("cpu")
 
 
 def model_fn():
     model_args = TransformerModelArgs(n_layers=32, vocab_size=vocab_size)
-    with torch.device("meta"):
-        m = Transformer(model_args)
-
-    #m.to_empty(device=device)
+    m = Transformer(model_args)
     return m
-    #print(m.freqs_cis.shape, m.freqs_cis.dtype)
-    #return m.layers['0']
-    #return m.layers['0'].attention
-    #return m.layers['0'].feed_forward
+
 
 def input_fn():
     x = torch.randint(0, vocab_size, (batch_size, seqlen), device=device)
     return x
-    #return torch.randn((batch_size, seqlen, 4096), device=device), torch.randn(2048, 64, dtype=torch.complex64, device=device)
-    #return torch.randn((batch_size, seqlen, 4096), device=torch.device("cuda"))
-
-
-from autoparallel.api import AutoParallel
-from torch.distributed.tensor.placement_types import Replicate, Shard, Partial
 
 
 # parallelize the model
@@ -624,42 +608,37 @@ with torch.device("meta"):
 autop = AutoParallel(model, input_fn, mesh)
 autop.add_parameter_memory_constraint(low=None, high=None)
 
-x_sharding = (Shard(0), Replicate())
-#x_sharding = (Shard(0),)
+x_sharding = (Shard(0),) + (Replicate(),) * (mesh.ndim - 1)
 
 autop.add_input_constraints([x_sharding])
-#autop.add_input_constraints([x_sharding, (Replicate(), Replicate())])
 autop.add_output_constraints([x_sharding])
 
-mm_nodes = autop.gm.graph.find_nodes(op="call_function", target=torch.ops.aten.mm.default)
-view_nodes = autop.gm.graph.find_nodes(op="call_function", target=torch.ops.aten.view.default)
-out_nodes = [n for n in autop.gm.graph.nodes if "output" in n.name]
+# example of how to add manual constraints
+if use_1d_mesh:
+    # add constraint on the output sharding of embedding bag
+    # otherwise it might decide that it's ok to replicate both inputs. This is indeed fine
+    # for 1d but the current cost model doesn't take output memory into account, so it thinks
+    # it is not expensive. I should add an activation memory constraint as well to avoid
+    # those cases
+    embedding_nodes = autop.gm.graph.find_nodes(
+        op="call_function", target=torch.ops.aten.embedding.default
+    )
+    autop.sharding_optimizer.add_node_constraint(embedding_nodes[0], x_sharding)
 
-#autop.sharding_optimizer.add_node_constraint(mm_nodes[0], (Shard(0), Shard(1)))
-#autop.sharding_optimizer.add_node_constraint(mm_nodes[1], (Shard(0), Shard(1)))
-#autop.sharding_optimizer.add_node_constraint(mm_nodes[2], (Shard(0), Shard(1)))
-
-#autop.sharding_optimizer.add_node_constraint(mm_nodes[3], (Shard(0), Partial()))
-
-
-#autop.sharding_optimizer.add_node_constraint(view_nodes[6], (Shard(0), Shard(2)))
-#autop.sharding_optimizer.add_node_constraint(mm_nodes[7], (Shard(0), Shard(1)))
-#autop.sharding_optimizer.add_node_constraint(out_nodes[0], (Shard(0), Replicate()))
-
-n = [x for x in autop.gm.graph.nodes if "dot" in x.name]
-# autop.sharding_optimizer.add_node_constraint(n[0], ...)
-
-import time
 t = time.time()
 sharding_placement = autop.optimize_placement()
 print(f"Took {time.time() - t:.2f} s")
 parallel_mod = autop.apply_placement(sharding_placement)
 
-# from IPython import embed; embed(); sys.sdf
-
 # now let's run it
-x = (torch.randint(0, vocab_size, (batch_size // mesh.shape[0], seqlen), device=torch.device("cuda")),)
+x = (
+    torch.randint(
+        0,
+        vocab_size,
+        (batch_size // mesh.shape[0], seqlen),
+        device=torch.device("cuda"),
+    ),
+)
 out = parallel_mod(*x)
 out.backward(torch.randn_like(out))
-
-# from IPython import embed; embed();
+print("All good!")
