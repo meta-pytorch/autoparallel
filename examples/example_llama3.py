@@ -579,14 +579,16 @@ else:
         ),
     )
 
-batch_size = 8 * mesh.shape[0]
-seqlen = 2048
+batch_size = 1 * mesh.shape[0]
+seqlen = 2048 * 4
 vocab_size = 64000
 device = torch.device("cuda")
 
 
 def model_fn():
-    model_args = TransformerModelArgs(n_layers=32, vocab_size=vocab_size)
+    model_args = TransformerModelArgs(
+        n_layers=32, vocab_size=vocab_size, max_seq_len=seqlen
+    )
     m = Transformer(model_args)
     return m
 
