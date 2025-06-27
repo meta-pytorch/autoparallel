@@ -15,6 +15,13 @@ from torch.utils._pytree import tree_flatten, tree_map_only
 
 
 def my_redistribute_local_tensor(arg, curr_spec, tgt_spec):
+    complex = False
+    if arg.dtype in (torch.complex32, torch.complex64, torch.complex128):
+        complex = True
+        if arg.is_conj():
+            arg = arg.resolve_conj()
+        arg = torch.view_as_real(arg)
+
     if curr_spec.placements == (Shard(0), Shard(0)) and tgt_spec.placements == (
         Replicate(),
         Shard(0),
@@ -34,6 +41,8 @@ def my_redistribute_local_tensor(arg, curr_spec, tgt_spec):
     #    from IPython import embed; embed(); sys.sdf
     else:
         x = redistribute_local_tensor(arg, curr_spec, tgt_spec)
+    if complex:
+        x = torch.view_as_complex(x)
     return x
 
 
