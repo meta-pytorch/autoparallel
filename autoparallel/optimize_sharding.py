@@ -206,66 +206,7 @@ class ShardingOptimizer:
         self.add_output_input_consistent_constraint()
         self.add_inf_cost_constraint()
 
-        self.remove_invalid_configurations()
         self.penalize_inefficient_collectives()
-
-    def remove_invalid_configurations(self):
-        """
-        Remove shardings that could yield invalid configurations,
-        for example, when sharding a view on a dimension that would yield
-        an empty size. Maybe this should be fixed in the returned specs from PyTorch
-        though, but removing those invalid cases here for now
-        """
-        for s_i, node in enumerate(self.graph.nodes):
-            if node.op != "call_function":
-                continue
-            # only targetting view for now
-            if node.target != torch.ops.aten.view.default:
-                continue
-            orig_shape = node.args[0].meta["val"].shape
-            shape = list(node.args[1])
-            if len(orig_shape) > len(shape):
-                # TODO: FIXME as I think we should also handle this case
-                continue
-            # print("in heeeererereer", orig_shape, shape)
-            tgt_op_strat = self.strats[node]
-            for counter, parent in enumerate(node.all_input_nodes):
-                curr_op_strat = self.strats[parent]
-
-                for oi, tgt_strat in enumerate(tgt_op_strat.strategies):
-                    spec = tgt_strat.input_specs[counter]
-                    if not isinstance(spec, DTensorSpec):
-                        # TODO: check if this is correct
-                        continue
-
-                    for ii, curr_strat in enumerate(curr_op_strat.strategies):
-                        curr_spec = curr_strat.output_specs
-                        if not isinstance(curr_spec, DTensorSpec):
-                            continue
-                        shape = list(node.args[1])
-                        if -1 in shape:
-                            # handle cases where we need to infer the size
-                            numel = math.prod(orig_shape)
-                            index_loc = shape.index(-1)
-                            # this works because the shape we infer is -1
-                            # and there is a single one
-                            visible_numel = -math.prod(shape)
-                            shape[index_loc] = numel // visible_numel
-                        for mesh_shape, tgt_plc, curr_plc in zip(
-                            spec.mesh.shape, spec.placements, curr_spec.placements
-                        ):
-                            # only keep view shardings that don't yield empty shapes
-                            # which could happen with S(0)S(0) on a dimension whose shape
-                            # is smaller than world_size
-                            if tgt_plc.is_shard():
-                                dim = tgt_plc.dim
-                                if shape[dim] % mesh_shape == 0:
-                                    shape[dim] /= mesh_shape
-                                else:
-                                    self.prob += (
-                                        self.ds[(s_i, counter, oi, ii)]["va"] == 0,
-                                        _get_next_name("invalid_view"),
-                                    )
 
     def penalize_inefficient_collectives(self):
         """
