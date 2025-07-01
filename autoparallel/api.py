@@ -419,11 +419,11 @@ class AutoParallel:
                 **sharded_buffers_with_fqns,
             }
 
-            def init_weights():
+            def init_weights(*args, **kwargs):
                 with stateless._reparametrize_module(
                     self.model, sharded_params_buffers
                 ):
-                    self.model.init_weights()
+                    self.model.init_weights(*args, **kwargs)
 
         else:
             init_weights = None
