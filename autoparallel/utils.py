@@ -119,6 +119,25 @@ def get_placement_options(mesh, op, specs, user_args):
 
     propagate_tensor_meta(op, user_args, out_strat)
     fill_missing_redistribute_cost(op, specs, out_strat)
+
+    kept = []
+    for strategy in out_strat.strategies:
+        is_valid = True
+        for input_spec in strategy.input_specs:
+            shape = list(input_spec.tensor_meta.shape)
+            for mesh_shape, plc in zip(mesh.shape, input_spec.placements):
+                if plc.is_shard():
+                    dim = plc.dim
+                    if shape[dim] % mesh_shape == 0:
+                        shape[dim] /= mesh_shape
+                    else:
+                        is_valid = False
+                        break
+        if is_valid:
+            kept.append(strategy)
+
+    out_strat = OpStrategy(kept)
+
     return out_strat
 
 
