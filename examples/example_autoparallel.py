@@ -100,6 +100,9 @@ autop.add_output_constraints([x_sharding])
 sharding_placement = autop.optimize_placement()
 parallel_mod = autop.apply_placement(sharding_placement)
 
+# run weight init on our sharded DTensor params
+parallel_mod.init_weights()
+
 # now let's run it
 x = (torch.rand(bs // mesh.shape[0], seq_len, dim1, device="cuda"),)
 out = parallel_mod(*x)

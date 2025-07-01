@@ -418,9 +418,20 @@ class AutoParallel:
                 **sharded_weights_with_fqns,
                 **sharded_buffers_with_fqns,
             }
-            with stateless._reparametrize_module(self.model, sharded_params_buffers):
-                self.model.init_weights()
+
+            def init_weights():
+                with stateless._reparametrize_module(
+                    self.model, sharded_params_buffers
+                ):
+                    self.model.init_weights()
+
+        else:
+            init_weights = None
 
         self.parallel_model = self.parallel_model_fn(sharded_weights, sharded_buffers)
+        # assign an init_weights method onto the output mod.
+        # all it does is sneakily run the original user mod's init_weights method,
+        # but with our new DTensor sharded params attached to the user module.
+        self.parallel_model.init_weights = init_weights
 
         return self.parallel_model
