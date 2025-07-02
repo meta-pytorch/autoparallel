@@ -402,13 +402,9 @@ class AutoParallel:
             parallel_gm, self.spec, self.metadata.num_outputs
         )
 
-        # allocate empty (or randomly initialized tensors for each param/buffer).
-        # If the user passes in an init_fn, we will then use that init fn to initialize the tensors properly.
-        # As a followup we could kill the random init completely and require this init_fn to be passed in
-        sharded_weights = try_convert_fake_to_real(sharded_weights_no_fqns)
-        sharded_buffers = try_convert_fake_to_real(sharded_buffers_no_fqns)
-
-        self.parallel_model = self.parallel_model_fn(sharded_weights, sharded_buffers)
+        self.parallel_model = self.parallel_model_fn(
+            sharded_weights_no_fqns, sharded_buffers_no_fqns
+        )
 
         # Right now we require a convention that the user model provides an init_weights method,
         # although we could snoop for other methods too.
