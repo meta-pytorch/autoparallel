@@ -37,12 +37,14 @@ def _get_next_name(name):
 
 
 class ShardingOptimizer:
-    def __init__(self, gm, mesh):
+    def __init__(self, gm, mesh, clusters):
         self.gm = gm
         self.graph = gm.graph
         self.mesh = mesh
         self.node_map = {node: i for i, node in enumerate(self.graph.nodes)}
         self.strats = self.build_sharding_metadata()
+
+        self.build_cluster_links(clusters)
         self.ds, self.num_inp_out, self.num_args = self.build_ds()
         self.validate()
         self.prob = pulp.LpProblem("AutoParallel", pulp.LpMinimize)
@@ -76,6 +78,18 @@ class ShardingOptimizer:
                 raise ValueError(f"Oups {node.op}")
         return strats
 
+    def build_cluster_links(self, clusters):
+        self.cluster_links = {}
+        # return
+        for cluster_group in clusters:
+            cluster0 = cluster_group[0]
+            for cluster_i in cluster_group[1:]:
+                for n0, ni in zip(cluster0, cluster_i):
+                    s0 = self.node_map[n0]
+                    s1 = self.node_map[ni]
+                    for argi, oi, ii in self.walk_over_options(n0):
+                        self.cluster_links[(s1, argi, oi, ii)] = (s0, argi, oi, ii)
+
     def build_ds(self):
         strats = self.strats
         ds = {}
@@ -94,11 +108,15 @@ class ShardingOptimizer:
                 compute_cost = estimate_strategy_runtime_cost(node, ssi)
                 for argi, xxi in enumerate(ssi.redistribute_cost):
                     for ii, comm_cost in enumerate(xxi):
-                        va = pulp.LpVariable(
-                            f"n={node},s={s_i},arg={argi},output_p={ss},input_p={ii}",
-                            cat=pulp.LpBinary,
-                        )
-                        ds[(s_i, argi, ss, ii)] = {
+                        key = (s_i, argi, ss, ii)
+                        if key in self.cluster_links:
+                            va = ds[self.cluster_links[key]]["va"]
+                        else:
+                            va = pulp.LpVariable(
+                                f"n={node},s={s_i},arg={argi},output_p={ss},input_p={ii}",
+                                cat=pulp.LpBinary,
+                            )
+                        ds[key] = {
                             "va": va,
                             "cost": comm_cost + compute_cost / num_args[s_i],
                             "full_strat": ssi,
@@ -130,7 +148,10 @@ class ShardingOptimizer:
                 continue
             arg_vars = {}
             for arg, oi, ii in self.walk_over_options(node):
-                va = self.ds[(s_i, arg, oi, ii)]["va"]
+                key = (s_i, arg, oi, ii)
+                if key in self.cluster_links:
+                    continue
+                va = self.ds[key]["va"]
                 arg_vars.setdefault(arg, []).append(va)
             for eqs in arg_vars.values():
                 self.prob += (pulp.lpSum(eqs) == 1, _get_next_name("unique_decision"))
@@ -145,7 +166,10 @@ class ShardingOptimizer:
                 continue
             vars_per_output = {}
             for arg, oi, ii in self.walk_over_options(node):
-                va = self.ds[(s_i, arg, oi, ii)]["va"]
+                key = (s_i, arg, oi, ii)
+                if key in self.cluster_links:
+                    continue
+                va = self.ds[key]["va"]
                 vars_per_output.setdefault((arg, oi), []).append(va)
             eqs_per_arg = [[] for _ in self._all_input_nodes(node)]
             for (arg, oi), value in vars_per_output.items():
@@ -177,15 +201,42 @@ class ShardingOptimizer:
 
                 vars_s_i = {}
                 for _, s_i_oi, s_i_ii in self.walk_over_options(node, argi):
-                    va = self.ds[(s_i, argi, s_i_oi, s_i_ii)]["va"]
+                    key = (s_i, argi, s_i_oi, s_i_ii)
+                    if key in self.cluster_links:
+                        continue
+                    va = self.ds[key]["va"]
                     vars_s_i.setdefault(s_i_oi, []).append(va)
 
                 vars_s_j = {}
                 for _, s_j_oi, s_j_ii in self.walk_over_options(user, argj):
-                    va = self.ds[(s_j, argj, s_j_oi, s_j_ii)]["va"]
+                    key = (s_j, argj, s_j_oi, s_j_ii)
+                    if key in self.cluster_links:
+                        continue
+                    va = self.ds[key]["va"]
                     vars_s_j.setdefault(s_j_ii, []).append(va)
 
-                assert vars_s_i.keys() == vars_s_j.keys()
+                if vars_s_i.keys() != vars_s_j.keys():
+                    vars_s_j = {}
+                    for _, s_j_oi, s_j_ii in self.walk_over_options(user, argj):
+                        key = (s_j, argj, s_j_oi, s_j_ii)
+                        if key in self.cluster_links:
+                            va = self.ds[self.cluster_links[key]]["va"]
+                        else:
+                            va = self.ds[key]["va"]
+                        vars_s_j.setdefault(s_j_ii, []).append(va)
+
+                if vars_s_i.keys() != vars_s_j.keys():
+                    vars_s_i = {}
+                    for _, s_i_oi, s_i_ii in self.walk_over_options(node, argi):
+                        key = (s_i, argi, s_i_oi, s_i_ii)
+                        if key in self.cluster_links:
+                            va = self.ds[self.cluster_links[key]]["va"]
+                        else:
+                            va = self.ds[key]["va"]
+                        vars_s_i.setdefault(s_i_oi, []).append(va)
+
+                assert vars_s_i.keys() == vars_s_j.keys(), f"{vars_s_i}, {vars_s_j}"
+
                 for k in vars_s_i:
                     self.prob += (
                         pulp.lpSum(vars_s_i[k]) == pulp.lpSum(vars_s_j[k]),

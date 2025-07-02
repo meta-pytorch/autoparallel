@@ -326,13 +326,13 @@ class AutoParallel:
         self.mesh = mesh
         self.build_model_graph()
 
-        sharding_optimizer = ShardingOptimizer(self.gm, self.mesh)
+        clusters = get_graph_clusters(self.gm)
+        sharding_optimizer = ShardingOptimizer(self.gm, self.mesh, clusters)
         # makes sharding of params and gradients the same
         sharding_optimizer.add_grad_param_constraints()
         self.sharding_optimizer = sharding_optimizer
 
-        clusters = get_graph_clusters(self.gm)
-        self.sharding_optimizer.add_cluster_constraint(clusters)
+        # self.sharding_optimizer.add_cluster_constraint(clusters)
 
         self.input_constraints = None
         self.output_constraints = None
