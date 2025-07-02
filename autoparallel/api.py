@@ -394,10 +394,6 @@ class AutoParallel:
         sharded_buffers_no_fqns = {
             k: v for k, v in zip(buffer_names_no_fqns, sharded_buffers)
         }
-        sharded_weights_with_fqns = {k: v for k, v in zip(param_names, sharded_weights)}
-        sharded_buffers_with_fqns = {
-            k: v for k, v in zip(buffer_names, sharded_buffers)
-        }
 
         # TODO: preserve state dict properly in the generated nn.module
         self.sharded_weights = sharded_weights_no_fqns
@@ -411,6 +407,13 @@ class AutoParallel:
         # As a followup we could kill the random init completely and require this init_fn to be passed in
         sharded_weights = try_convert_fake_to_real(sharded_weights_no_fqns)
         sharded_buffers = try_convert_fake_to_real(sharded_buffers_no_fqns)
+
+        sharded_weights_with_fqns = {
+            k: v for k, (flat_key, v) in zip(param_names, sharded_weights.items())
+        }
+        sharded_buffers_with_fqns = {
+            k: v for k, (flat_key, v) in zip(param_names, sharded_buffers.items())
+        }
         # Right now we require a convention that the user model provides an init_weights method,
         # although we could snoop for other methods too.
         if hasattr(self.model, "init_weights") is not None:
