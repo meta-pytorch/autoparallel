@@ -408,21 +408,22 @@ class AutoParallel:
         sharded_weights = try_convert_fake_to_real(sharded_weights_no_fqns)
         sharded_buffers = try_convert_fake_to_real(sharded_buffers_no_fqns)
 
-        sharded_weights_with_fqns = {
-            k: v for k, (flat_key, v) in zip(param_names, sharded_weights.items())
-        }
-        sharded_buffers_with_fqns = {
-            k: v for k, (flat_key, v) in zip(param_names, sharded_buffers.items())
-        }
+        self.parallel_model = self.parallel_model_fn(sharded_weights, sharded_buffers)
+
         # Right now we require a convention that the user model provides an init_weights method,
         # although we could snoop for other methods too.
         if hasattr(self.model, "init_weights") is not None:
-            sharded_params_buffers = {
-                **sharded_weights_with_fqns,
-                **sharded_buffers_with_fqns,
-            }
 
             def init_weights(*args, **kwargs):
+                # TODO: once we have proper FQN support we should remove thi
+                # Replace 'params.tok_embeddings/weight' -> 'tok_embeddings.weight'
+                # Replace 'buffers_.freqs_cis' -> 'freqs_cis'
+                sharded_params_buffers = {
+                    k.replace("params.", "")
+                    .replace("buffers_.", "")
+                    .replace("/", "."): v
+                    for k, v in self.parallel_model.state_dict().items()
+                }
                 with stateless._reparametrize_module(
                     self.model, sharded_params_buffers
                 ):
@@ -431,7 +432,6 @@ class AutoParallel:
         else:
             init_weights = None
 
-        self.parallel_model = self.parallel_model_fn(sharded_weights, sharded_buffers)
         # assign an init_weights method onto the output mod.
         # all it does is sneakily run the original user mod's init_weights method,
         # but with our new DTensor sharded params attached to the user module.
