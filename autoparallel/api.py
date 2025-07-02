@@ -408,10 +408,10 @@ class AutoParallel:
 
         # Right now we require a convention that the user model provides an init_weights method,
         # although we could snoop for other methods too.
-        if hasattr(self.model, "init_weights") is not None:
+        if hasattr(self.model, "init_weights"):
 
             def init_weights(*args, **kwargs):
-                # TODO: once we have proper FQN support we should remove thi
+                # TODO: once we have proper FQN support we should remove this
                 # Replace 'params.tok_embeddings/weight' -> 'tok_embeddings.weight'
                 # Replace 'buffers_.freqs_cis' -> 'freqs_cis'
                 sharded_params_buffers = {
