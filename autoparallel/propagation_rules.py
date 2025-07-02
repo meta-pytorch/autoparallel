@@ -712,3 +712,13 @@ def expand_rule(mesh, op_schema_):
         for remov in to_remove:
             ss.redistribute_cost[0].insert(remov, math.inf)
     return out_strat
+
+
+@register_opschema_rule(torch.ops.aten.matmul.default)
+def matmul_rule(mesh, op_schema):
+    # from torch.distributed.tensor._ops._einsum_strategy import gen_einsum_strategies
+    from torch.distributed.tensor._ops._matrix_ops import _mm_like_strategy
+
+    # a_strat, b_strat = op_schema.args_schema
+    # from IPython import embed; embed(); sys.sdf
+    return _mm_like_strategy("bmk,kn->bmn", mesh, op_schema)
