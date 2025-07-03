@@ -4,6 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import math
+from collections import defaultdict
 
 import pulp
 import torch
@@ -450,7 +451,12 @@ class ShardingOptimizer:
 
     def get_solution(self, verbose=False):
         # add cost
-        self.prob += pulp.lpSum([x["va"] * x["cost"] for x in self.ds.values()])
+        opt_target = defaultdict(int)
+        # let's remove potentially duplicate variables in the program and just
+        # add their costs
+        for x in self.ds.values():
+            opt_target[x["va"]] += x["cost"]
+        self.prob += pulp.lpSum([va * cost for va, cost in opt_target.items()])
 
         # solver = pulp.HiGHS(msg=verbose)
         solver = pulp.PULP_CBC_CMD(msg=verbose)
