@@ -37,3 +37,5 @@ jobs:
         pip install --no-input --quiet --pre torch --index-url https://download.pytorch.org/whl/nightly/cu126
         pip install --quiet .
         pytest tests
+        python examples/example_autoparallel.py
+        python examples/example_llama3.py
