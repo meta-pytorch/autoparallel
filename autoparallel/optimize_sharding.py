@@ -38,14 +38,16 @@ def _get_next_name(name):
 
 
 class ShardingOptimizer:
-    def __init__(self, gm, mesh, clusters):
+    def __init__(self, gm, mesh, clusters=None):
         self.gm = gm
         self.graph = gm.graph
         self.mesh = mesh
         self.node_map = {node: i for i, node in enumerate(self.graph.nodes)}
         self.strats = self.build_sharding_metadata()
 
-        self.build_cluster_links(clusters)
+        self.cluster_links = {}
+        if clusters is not None:
+            self.create_cluster_links(clusters)
         self.ds, self.num_inp_out, self.num_args = self.build_ds()
         self.validate()
         self.prob = pulp.LpProblem("AutoParallel", pulp.LpMinimize)
@@ -79,9 +81,7 @@ class ShardingOptimizer:
                 raise ValueError(f"Oups {node.op}")
         return strats
 
-    def build_cluster_links(self, clusters):
-        self.cluster_links = {}
-        # return
+    def create_cluster_links(self, clusters):
         for cluster_group in clusters:
             cluster0 = cluster_group[0]
             for cluster_i in cluster_group[1:]:
@@ -675,18 +675,6 @@ class ShardingOptimizer:
             self.add_node_constraint(
                 node, placement, constraint_name="grad_output_constraint"
             )
-
-    def add_cluster_constraint(self, clusters):
-        for cluster_group in clusters:
-            cluster0 = cluster_group[0]
-            for cluster_i in cluster_group[1:]:
-                for n0, ni in zip(cluster0, cluster_i):
-                    s0 = self.node_map[n0]
-                    s1 = self.node_map[ni]
-                    for argi, oi, ii in self.walk_over_options(n0):
-                        va0 = self.ds[(s0, argi, oi, ii)]["va"]
-                        va1 = self.ds[(s1, argi, oi, ii)]["va"]
-                        self.prob += va0 == va1, _get_next_name("cluster_constraint")
 
     def validate(self):
         for node in self.graph.nodes:

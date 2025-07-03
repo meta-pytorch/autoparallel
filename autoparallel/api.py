@@ -197,22 +197,6 @@ def _get_decomp_table():
     return decomp_table
 
 
-def _get_node_hash0(node):
-    if "val" not in node.meta:
-        return (node.op,)
-    if isinstance(node.meta["val"], torch.Tensor):
-        shape = node.meta["val"].shape
-    else:
-        shape = tuple(x.shape for x in node.meta["val"] if isinstance(x, torch.Tensor))
-    return (str(node.target), shape)
-
-
-def _get_node_hash(node):
-    h1 = tuple(_get_node_hash0(x) for x in node.all_input_nodes)
-    h2 = _get_node_hash0(node)
-    return h1 + h2
-
-
 def get_graph_clusters(gm):
     """
     Super hacky, only works for the case where we have a single sdpa per block
@@ -245,8 +229,19 @@ def get_graph_clusters_one_op(gm, the_op):
 
     g = [[p] for p in picked_group]
 
+    def _get_node_hash(node):
+        if "val" not in node.meta:
+            return (node.op,)
+        if isinstance(node.meta["val"], torch.Tensor):
+            shape = node.meta["val"].shape
+        else:
+            shape = tuple(
+                x.shape for x in node.meta["val"] if isinstance(x, torch.Tensor)
+            )
+        return (str(node.target), shape)
+
     def get_sequence_hash(seq):
-        return hash(tuple(_get_node_hash0(x) for x in seq))
+        return hash(tuple(_get_node_hash(x) for x in seq))
 
     next_elm = True
     for i in range(diff):
@@ -327,7 +322,7 @@ class AutoParallel:
         The meta model is moved to a fake device based on mesh.device_type.
     """
 
-    def __init__(self, model, input_fn, mesh: DeviceMesh):
+    def __init__(self, model, input_fn, mesh: DeviceMesh, **kwargs):
         self.fake_mode = FakeTensorMode()
         device = _get_device_from_mesh(mesh)
         self.model = move_to_fake(model, self.fake_mode, device)
@@ -335,13 +330,13 @@ class AutoParallel:
         self.mesh = mesh
         self.build_model_graph()
 
-        clusters = get_graph_clusters(self.gm)
+        clusters = None
+        if kwargs.get("repeated_subgraphs", False):
+            clusters = get_graph_clusters(self.gm)
         sharding_optimizer = ShardingOptimizer(self.gm, self.mesh, clusters)
         # makes sharding of params and gradients the same
         sharding_optimizer.add_grad_param_constraints()
         self.sharding_optimizer = sharding_optimizer
-
-        # self.sharding_optimizer.add_cluster_constraint(clusters)
 
         self.input_constraints = None
         self.output_constraints = None
