@@ -3,9 +3,11 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+import contextlib
 import operator
 
 import torch
+from torch._subclasses.fake_tensor import FakeTensor, unset_fake_temporarily
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor._dtensor_spec import DTensorSpec
 from torch.distributed.tensor._redistribute import redistribute_local_tensor
@@ -155,7 +157,7 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
         return out
 
 
-def shard_nodes_given_placements(gm, sharding_placement, node_prefix):
+def shard_nodes_given_placements(gm, sharding_placement, node_prefix, *, meta=False):
     # NOTE: this relies my customized export_module
     nodes = [
         x for x in gm.graph.find_nodes(op="placeholder") if node_prefix in x.target
@@ -167,9 +169,21 @@ def shard_nodes_given_placements(gm, sharding_placement, node_prefix):
         # all tensors start as replicated
         curr_placement = (Replicate(),) * mesh.ndim
         tensor = node.meta["val"]
-        sharded_tensor = DTensor.from_local(tensor, mesh, curr_placement).redistribute(
-            mesh, tgt_spec.placements
-        )
+
+        if meta:
+            assert isinstance(
+                tensor, FakeTensor
+            ), f"only FakeTensor params supported for now, got {type(tensor)}"
+            ctx = unset_fake_temporarily
+            with ctx():
+                tensor = torch.randn(tensor.shape, dtype=tensor.dtype, device="meta")
+        else:
+            ctx = contextlib.nullcontext
+
+        with ctx():
+            sharded_tensor = DTensor.from_local(
+                tensor, mesh, curr_placement
+            ).redistribute(mesh, tgt_spec.placements)
         sharded_tensors.append(sharded_tensor)
     return sharded_tensors
 
@@ -189,4 +203,13 @@ def apply_sharding_to_model(gm, sharding_placement):
     args = [x.to_local() for x in args]
     parallel_gm = make_fx(interp.run)(*args)
 
-    return parallel_gm, sharded_params, sharded_buffers
+    # We put DTensor(meta_tensor) tensors in the state dict, as the user expects to be
+    # able to call parallel_mod.to_empty(device='cuda'). This does not work with FakeTensors.
+    sharded_meta_params = shard_nodes_given_placements(
+        gm, sharding_placement, "param", meta=True
+    )
+    sharded_meta_buffers = shard_nodes_given_placements(
+        gm, sharding_placement, "buffer", meta=True
+    )
+
+    return parallel_gm, sharded_meta_params, sharded_meta_buffers

@@ -76,6 +76,32 @@ def _build_meta_tensor(tensor_meta):
     )
 
 
+def remove_invalid_configs(out_strat, mesh):
+    kept = []
+    for strategy in out_strat.strategies:
+        is_valid = True
+        output_specs = strategy.output_specs
+        if isinstance(output_specs, DTensorSpec):
+            output_specs = [output_specs]
+        specs = list(strategy.input_specs) + list(output_specs)
+        for spec in specs:
+            if spec is None:
+                continue
+            shape = list(spec.tensor_meta.shape)
+            for mesh_shape, plc in zip(mesh.shape, spec.placements):
+                if plc.is_shard():
+                    dim = plc.dim
+                    if shape[dim] % mesh_shape == 0:
+                        shape[dim] //= mesh_shape
+                    else:
+                        is_valid = False
+                        break
+        if is_valid:
+            kept.append(strategy)
+
+    return OpStrategy(kept)
+
+
 def _create_all_options_no_nested_sharding(mesh, shape, tensor_meta=None):
     if tensor_meta is None:
         tensor_meta = _gen_tensor_meta(shape)
@@ -94,7 +120,9 @@ def _create_all_options_no_nested_sharding(mesh, shape, tensor_meta=None):
             continue
         spec = DTensorSpec.from_dim_map(mesh, op, [], tensor_meta)
         strats.append(OpSpec(spec, input_specs=[spec], redistribute_cost=[[0.0]]))
-    return OpStrategy(strats)
+    out_strats = OpStrategy(strats)
+    out_strats = remove_invalid_configs(out_strats, mesh)
+    return out_strats
 
 
 def _create_all_options(mesh, shape, tensor_meta=None, tensor=None):
@@ -112,7 +140,9 @@ def _create_all_options(mesh, shape, tensor_meta=None, tensor=None):
     for placement in all_options:
         spec = DTensorSpec(mesh, placement, tensor_meta=tensor_meta)
         strats.append(OpSpec(spec, input_specs=[spec], redistribute_cost=[[0.0]]))
-    return OpStrategy(strats)
+    out_strats = OpStrategy(strats)
+    out_strats = remove_invalid_configs(out_strats, mesh)
+    return out_strats
 
 
 @register_rule(operator.getitem)

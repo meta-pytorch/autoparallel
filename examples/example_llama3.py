@@ -475,7 +475,6 @@ class Transformer(nn.Module):
             self.layers[str(layer_id)] = TransformerBlock(layer_id, model_args)
         self.norm = nn.RMSNorm(model_args.dim, eps=model_args.norm_eps)
         self.output = nn.Linear(model_args.dim, model_args.vocab_size, bias=False)
-        self.init_weights()
 
     def init_weights(
         self,
@@ -627,6 +626,9 @@ t = time.time()
 sharding_placement = autop.optimize_placement()
 print(f"Took {time.time() - t:.2f} s")
 parallel_mod = autop.apply_placement(sharding_placement)
+
+# run weight init on our sharded DTensor params
+parallel_mod.init_weights()
 
 # now let's run it
 x = (

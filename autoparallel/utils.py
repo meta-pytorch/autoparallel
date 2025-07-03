@@ -10,7 +10,7 @@ from torch.distributed.tensor._op_schema import OpSchema, OpStrategy, TupleStrat
 from torch.distributed.tensor._ops.utils import generate_redistribute_costs
 from torch.utils._pytree import tree_flatten, tree_map_only
 
-from .propagation_rules import _op_partial_rules, _op_rules
+from .propagation_rules import _op_partial_rules, _op_rules, remove_invalid_configs
 
 
 def propagate_tensor_meta(op, user_args, out_strat):
@@ -67,7 +67,6 @@ def fill_missing_redistribute_cost(op, specs, out_strat):
     for strat in out_strat.strategies:
         # TODO: check me
         if strat.redistribute_cost is None:
-
             # TODO: the torch.ops.aten.slice.Tensor is wrong here and in the input_spec!!!!!
             handled_ops = {
                 torch.ops.aten.ones_like.default,
@@ -90,7 +89,9 @@ def get_placement_options(mesh, op, specs, user_args):
     # print(op)
 
     if op in _op_rules:
-        return _op_rules[op](mesh, specs)
+        out_strat = _op_rules[op](mesh, specs)
+        out_strat = remove_invalid_configs(out_strat, mesh)
+        return out_strat
 
     strat = []
     for spec in specs:
@@ -119,24 +120,7 @@ def get_placement_options(mesh, op, specs, user_args):
 
     propagate_tensor_meta(op, user_args, out_strat)
     fill_missing_redistribute_cost(op, specs, out_strat)
-
-    kept = []
-    for strategy in out_strat.strategies:
-        is_valid = True
-        for input_spec in strategy.input_specs:
-            shape = list(input_spec.tensor_meta.shape)
-            for mesh_shape, plc in zip(mesh.shape, input_spec.placements):
-                if plc.is_shard():
-                    dim = plc.dim
-                    if shape[dim] % mesh_shape == 0:
-                        shape[dim] /= mesh_shape
-                    else:
-                        is_valid = False
-                        break
-        if is_valid:
-            kept.append(strategy)
-
-    out_strat = OpStrategy(kept)
+    out_strat = remove_invalid_configs(out_strat, mesh)
 
     return out_strat
 

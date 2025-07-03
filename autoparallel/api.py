@@ -16,6 +16,7 @@ from torch._inductor.fx_passes.post_grad import remove_assert_ops
 from torch._logging import trace_structured
 from torch._subclasses import FakeTensorMode
 from torch.distributed.tensor import DeviceMesh
+from torch.nn.utils import stateless
 
 from .apply_sharding import apply_sharding_to_model
 from .export_module import aot_export_module, apply_node_renaming
@@ -403,21 +404,56 @@ class AutoParallel:
         )
         self.parallel_gm = parallel_gm
 
-        param_names = [k.replace(".", "/") for k, _ in self.model.named_parameters()]
-        buffer_names = [k.replace(".", "/") for k, _ in self.model.named_buffers()]
+        param_names = [k for k, _ in self.model.named_parameters()]
+        buffer_names = [k for k, _ in self.model.named_buffers()]
+        param_names_no_fqns = [k.replace(".", "/") for k in param_names]
+        buffer_names_no_fqns = [k.replace(".", "/") for k in buffer_names]
         assert len(param_names) == len(sharded_weights)
         assert len(buffer_names) == len(sharded_buffers)
-        sharded_weights = {k: v for k, v in zip(param_names, sharded_weights)}
-        sharded_buffers = {k: v for k, v in zip(buffer_names, sharded_buffers)}
 
-        self.sharded_weights = sharded_weights
-        self.sharded_buffers = sharded_buffers
+        sharded_weights_no_fqns = {
+            k: v for k, v in zip(param_names_no_fqns, sharded_weights)
+        }
+        sharded_buffers_no_fqns = {
+            k: v for k, v in zip(buffer_names_no_fqns, sharded_buffers)
+        }
+
+        # TODO: preserve state dict properly in the generated nn.module
+        self.sharded_weights = sharded_weights_no_fqns
+        self.sharded_buffers = sharded_buffers_no_fqns
         self.parallel_model_fn, self.fwd_gm, self.bwd_gm = prepare_module(
             parallel_gm, self.spec, self.metadata.num_outputs
         )
 
-        sharded_weights = try_convert_fake_to_real(sharded_weights)
-        sharded_buffers = try_convert_fake_to_real(sharded_buffers)
-        self.parallel_model = self.parallel_model_fn(sharded_weights, sharded_buffers)
+        self.parallel_model = self.parallel_model_fn(
+            sharded_weights_no_fqns, sharded_buffers_no_fqns
+        )
+
+        # Right now we require a convention that the user model provides an init_weights method,
+        # although we could snoop for other methods too.
+        if hasattr(self.model, "init_weights"):
+
+            def init_weights(*args, **kwargs):
+                # TODO: once we have proper FQN support we should remove this
+                # Replace 'params.tok_embeddings/weight' -> 'tok_embeddings.weight'
+                # Replace 'buffers_.freqs_cis' -> 'freqs_cis'
+                sharded_params_buffers = {
+                    k.replace("params.", "")
+                    .replace("buffers_.", "")
+                    .replace("/", "."): v
+                    for k, v in self.parallel_model.state_dict().items()
+                }
+                with stateless._reparametrize_module(
+                    self.model, sharded_params_buffers
+                ):
+                    self.model.init_weights(*args, **kwargs)
+
+        else:
+            init_weights = None
+
+        # assign an init_weights method onto the output mod.
+        # all it does is sneakily run the original user mod's init_weights method,
+        # but with our new DTensor sharded params attached to the user module.
+        self.parallel_model.init_weights = init_weights
 
         return self.parallel_model
