@@ -23,6 +23,12 @@ class Block(nn.Module):
         self.w1 = nn.Linear(dim1, dim2, bias=bias)
         self.w2 = nn.Linear(dim2, dim1, bias=bias)
 
+    def init_weights(self):
+        for lin in [self.wq, self.wk, self.wv, self.wo, self.w1, self.w2]:
+            torch.nn.init.normal_(lin.weight)
+            if lin.bias is not None:
+                torch.nn.init.normal_(lin.bias)
+
     def forward(self, x):
         q = self.wq(x)
         k = self.wk(x)
@@ -93,6 +99,9 @@ autop.add_output_constraints([x_sharding])
 
 sharding_placement = autop.optimize_placement()
 parallel_mod = autop.apply_placement(sharding_placement)
+
+# run weight init on our sharded DTensor params
+parallel_mod.init_weights()
 
 # now let's run it
 x = (torch.rand(bs // mesh.shape[0], seq_len, dim1, device="cuda"),)
