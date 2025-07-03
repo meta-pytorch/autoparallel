@@ -1,5 +1,7 @@
 torch >= 2.7.0
+numpy
 pulp
+pytest
 
 black == 22.3.0
 flake8 == 6.1.0

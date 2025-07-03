@@ -1,0 +1,39 @@
+name: Test CUDA
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - release/*
+
+concurrency:
+  group: test-cuda-${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.run_number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-cuda:
+    name: Test CUDA (cuda12.6-py3.10)
+    uses: pytorch/test-infra/.github/workflows/linux_job_v2.yml@main
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - name: 4xlargegpu
+            runs-on: linux.g5.4xlarge.nvidia.gpu
+            torch-spec: '--pre torch --index-url https://download.pytorch.org/whl/nightly/cu126'
+            gpu-arch-type: "cuda"
+            gpu-arch-version: "12.6"
+    with:
+      timeout: 60
+      runner: ${{ matrix.runs-on }}
+      gpu-arch-type: ${{ matrix.gpu-arch-type }}
+      gpu-arch-version: ${{ matrix.gpu-arch-version }}
+      submodules: recursive
+      script: |
+        pip install --quiet -r requirements-test.txt
+        # For some reason the spec above isnt working
+        pip uninstall -y torch
+        pip install --no-input --quiet --pre torch --index-url https://download.pytorch.org/whl/nightly/cu126
+        pip install --quiet .
+        pytest tests
