@@ -219,15 +219,21 @@ def get_graph_clusters(gm):
     Don't handle backward, just a POC to see if the solver will have speedups
     with those constraints added
     """
+    the_ops = [
+        torch.ops.aten._scaled_dot_product_efficient_attention.default,
+        torch.ops.aten._scaled_dot_product_efficient_attention_backward.default,
+    ]
+    clusters = []
+    for op in the_ops:
+        clusters += get_graph_clusters_one_op(gm, op)
+    return clusters
+
+
+def get_graph_clusters_one_op(gm, the_op):
     from collections import defaultdict
 
-    the_ops = {
-        torch.ops.aten._scaled_dot_product_efficient_attention.default,
-        # torch.ops.aten._scaled_dot_product_efficient_attention_backward.default,
-        # torch.ops.aten.mm.default,
-    }
     picked_group = [
-        n for n in gm.graph.nodes if n.op == "call_function" and n.target in the_ops
+        n for n in gm.graph.nodes if n.op == "call_function" and n.target == the_op
     ]
 
     node_map = {n: i for i, n in enumerate(gm.graph.nodes)}
@@ -235,7 +241,7 @@ def get_graph_clusters(gm):
     diff = node_locs[1] - node_locs[0]
     assert all(
         diff == (node_locs[i + 1] - node_locs[i]) for i in range(len(picked_group) - 1)
-    )
+    ), "Very basic graph clustering for now, this model isn't handled by it"
 
     g = [[p] for p in picked_group]
 
@@ -274,6 +280,9 @@ def get_graph_clusters(gm):
         clusters[get_sequence_hash(cl)].append(cl)
 
     clusters = [v for v in clusters.values() if len(v) > 1]
+    assert (
+        len(clusters) == 1
+    ), "Very basic graph clustering, this model isn't handled by it"
     return clusters
 
 
@@ -420,7 +429,7 @@ class AutoParallel:
                 [None] * len(self.sharding_optimizer.get_fn_output_nodes())
             )
 
-        self.sharding_placement = self.sharding_optimizer.get_solution(verbose=True)
+        self.sharding_placement = self.sharding_optimizer.get_solution(verbose=False)
 
         if verbose:
             print(self.sharding_optimizer.get_log())
