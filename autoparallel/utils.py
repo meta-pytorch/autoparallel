@@ -13,8 +13,8 @@ from torch.utils._pytree import tree_flatten, tree_map_only
 from .propagation_rules import _op_partial_rules, _op_rules, remove_invalid_configs
 
 
-def propagate_tensor_meta(op, user_args, out_strat):
-    out_t = op(*user_args)
+def propagate_tensor_meta(op, user_args, user_kwargs, out_strat):
+    out_t = op(*user_args, **user_kwargs)
 
     if isinstance(out_t, torch.Tensor):
         new_tensor_meta = TensorMeta(out_t.shape, out_t.stride(), out_t.dtype)
@@ -85,7 +85,7 @@ def fill_missing_redistribute_cost(op, specs, out_strat):
             strat.redistribute_cost = redistribute_costs
 
 
-def get_placement_options(mesh, op, specs, user_args):
+def get_placement_options(mesh, op, specs, user_args, user_kwargs):
     # print(op)
 
     if op in _op_rules:
@@ -118,7 +118,7 @@ def get_placement_options(mesh, op, specs, user_args):
             op_schema
         )
 
-    propagate_tensor_meta(op, user_args, out_strat)
+    propagate_tensor_meta(op, user_args, user_kwargs, out_strat)
     fill_missing_redistribute_cost(op, specs, out_strat)
     out_strat = remove_invalid_configs(out_strat, mesh)
 
