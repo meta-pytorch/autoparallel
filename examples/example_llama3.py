@@ -586,7 +586,7 @@ device = torch.device("cuda")
 
 def model_fn():
     model_args = TransformerModelArgs(
-        n_layers=32, vocab_size=vocab_size, max_seq_len=seqlen
+        n_layers=8, vocab_size=vocab_size, max_seq_len=seqlen
     )
     m = Transformer(model_args)
     return m
@@ -628,6 +628,7 @@ print(f"Took {time.time() - t:.2f} s")
 parallel_mod = autop.apply_placement(sharding_placement)
 
 # run weight init on our sharded DTensor params
+parallel_mod.to_empty(device="cuda")
 parallel_mod.init_weights()
 
 # now let's run it

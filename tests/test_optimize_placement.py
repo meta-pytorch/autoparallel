@@ -3,6 +3,8 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+from unittest.mock import patch
+
 import pytest
 import torch
 from torch import nn
@@ -122,6 +124,8 @@ def _make_model_and_input_fn(
     return model_fn, input_fn
 
 
+@patch("torch.cuda.device_count", lambda: 8)
+@patch("torch.cuda.get_device_name", lambda device: "H100")
 @pytest.mark.parametrize(
     "model_type", ["ffn_with_multiple_input_output", "transformer_block"]
 )
@@ -237,6 +241,8 @@ _expected_node_placements_transformer_block = [
 ]
 
 
+@patch("torch.cuda.device_count", lambda: 8)
+@patch("torch.cuda.get_device_name", lambda device: "H100")
 @pytest.mark.parametrize(
     "model_type,expected_param_placements,expected_node_placements",
     [

@@ -74,6 +74,18 @@ DEVICE_LIMITS: Tuple[DeviceLimit, ...] = (
         },
     ),
     DeviceLimit(
+        "A10G",
+        "https://www.nvidia.com/content/dam/en-zz/Solutions/Data-Center/a10/pdf/a10-datasheet.pdf",
+        sm=(8, 0),
+        gmem_bandwidth=933 * (1024**3),
+        gemm_tflops={
+            torch.float32: 31.2,
+            torch.float16: 125,
+            torch.bfloat16: 125,
+            torch.int8: 250,
+        },
+    ),
+    DeviceLimit(
         "T4",
         "https://www.nvidia.com/content/dam/en-zz/Solutions/Data-Center/tesla-t4/t4-tensor-core-datasheet-951643.pdf",
         sm=(7, 5),
@@ -113,7 +125,7 @@ DEVICE_LIMITS: Tuple[DeviceLimit, ...] = (
 def _get_device_tflops(dtype):
     # for some reason the function from PyTorch is giving
     # wildly different TFlops compared to the specs. I'm
-    # using had-coded values for now that I pulled from xFormers
+    # using hard-coded values for now that I pulled from xFormers
     # https://github.com/fairinternal/xformers/blob/main/xformers/profiler/device_limits.py
     # TODO: fix PyTorch's implementation
     # from torch._inductor.utils import get_device_tflops

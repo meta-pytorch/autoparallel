@@ -77,17 +77,13 @@ dim1 = 6144
 dim2 = dim1 * 4
 
 
-def model_fn():
-    return Block(nheads, dim1, dim2)
-
-
 def input_fn():
     return torch.rand(bs, seq_len, dim1, device="cuda")
 
 
 # parallelize the model
 with torch.device("meta"):
-    model = model_fn()
+    model = Block(nheads, dim1, dim2)
 autop = AutoParallel(model, input_fn, mesh)
 autop.add_parameter_memory_constraint(low=None, high=None)
 
@@ -96,11 +92,11 @@ x_sharding = (Shard(0), Replicate())
 autop.add_input_constraints([x_sharding])
 autop.add_output_constraints([x_sharding])
 
-
 sharding_placement = autop.optimize_placement()
-parallel_mod = autop.apply_placement(sharding_placement)
 
-# run weight init on our sharded DTensor params
+# AutoParallel produces a module with meta-DTensor parameters that need to be initialized
+parallel_mod = autop.apply_placement(sharding_placement)
+parallel_mod.to_empty(device="cuda")
 parallel_mod.init_weights()
 
 # now let's run it
