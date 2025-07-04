@@ -63,8 +63,11 @@ class ShardingOptimizer:
                 user_args = tree_map_only(
                     torch.fx.Node, lambda x: x.meta["val"], node.args
                 )
+                user_kwargs = tree_map_only(
+                    torch.fx.Node, lambda x: x.meta["val"], node.kwargs
+                )
                 strat = get_placement_options(
-                    self.mesh, node.target, user_strats, user_args
+                    self.mesh, node.target, user_strats, user_args, user_kwargs
                 )
                 strats[node] = strat
             elif node.op == "output":
