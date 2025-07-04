@@ -134,7 +134,11 @@ def get_placement_options(mesh, op, specs, user_args, user_kwargs):
     elif (
         op
         in torch.distributed.tensor.DTensor._op_dispatcher.sharding_propagator.op_strategy_funcs
-        and op != torch.ops.aten.slice_scatter.default
+        and op
+        not in {
+            torch.ops.aten.slice_scatter.default,
+            torch.ops.aten._softmax_backward_data.default,
+        }
     ):
         out_strat = torch.distributed.tensor.DTensor._op_dispatcher.sharding_propagator.op_strategy_funcs[
             op
@@ -146,6 +150,7 @@ def get_placement_options(mesh, op, specs, user_args, user_kwargs):
         from .propagation_rules import _create_all_options
 
         tensor_meta = strat[0].strategies[0].output_spec.tensor_meta
+        num_strats = len(strat[0].strategies)
         if op == torch.ops.aten.sort.stable:
             out_strat = torch.distributed.tensor.DTensor._op_dispatcher.sharding_propagator.op_strategy_funcs[
                 torch.ops.aten.topk.default
@@ -157,10 +162,11 @@ def get_placement_options(mesh, op, specs, user_args, user_kwargs):
             torch.ops.aten.scatter_add.default,
             torch.ops.prims.fma.default,
         }:
-            num_strats = len(strat[0].strategies)
             out_strat = _generate_dummy_strategy(mesh, tensor_meta, 3, num_strats)
-        elif op == torch.ops.aten.slice_scatter.default:
-            num_strats = len(strat[0].strategies)
+        elif op in {
+            torch.ops.aten.slice_scatter.default,
+            torch.ops.aten._softmax_backward_data.default,
+        }:
             out_strat = _generate_dummy_strategy(mesh, tensor_meta, 2, num_strats)
         else:
             out_strat = _create_all_options(mesh, tensor_meta.shape, tensor_meta)
