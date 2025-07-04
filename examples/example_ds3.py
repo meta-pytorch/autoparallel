@@ -4,21 +4,19 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-import torch
-import torch.nn.functional as F
-from torch import nn
-
-from torch.distributed.tensor.placement_types import Replicate, Shard
-from torch.testing._internal.distributed.fake_pg import FakeStore
-
-from torch.distributed.tensor import DTensor
-
-
-from autoparallel.api import AutoParallel
-
 from dataclasses import dataclass
 from typing import Literal
 
+import torch
+import torch.nn.functional as F
+import triton
+import triton.language as tl
+from torch import nn
+from torch.distributed.tensor import DTensor
+from torch.distributed.tensor.placement_types import Replicate, Shard
+from torch.testing._internal.distributed.fake_pg import FakeStore
+
+from autoparallel.api import AutoParallel
 
 
 # Reference: https://github.com/deepseek-ai/DeepSeek-V3/blob/main/inference/model.py
@@ -134,10 +132,10 @@ class DeepSeekV3ModelArgs:
             + nparams_experts * self.n_activated_experts // self.n_routed_experts
         )
 
-        #logger.info(
+        # logger.info(
         #    f"Total parameter count: dense {nparams_dense:,}, "
         #    f"sparse {nparams_sparse:,}, active {nparams_dense + nparams_sparse_active:,}"
-        #)
+        # )
 
         l, h, q, t = (
             self.n_layers,
@@ -157,18 +155,6 @@ class DeepSeekV3ModelArgs:
         )
 
         return nparams, num_flops_per_token
-
-
-
-
-
-
-import torch
-import triton
-import triton.language as tl
-
-
-__all__ = ["generate_permute_indices"]
 
 
 # parallelized kernel
@@ -743,11 +729,9 @@ class MoE(nn.Module):
 
         # top_scores and selected_indices shape (bs*slen*top_k,)
         # num_tokens_per_expert shape (num_experts,)
-        (
-            top_scores,
-            token_indices,
-            num_tokens_per_expert,
-        ) = self.router(x.reshape(bs * slen, dim), self.expert_bias)
+        (top_scores, token_indices, num_tokens_per_expert,) = self.router(
+            x.reshape(bs * slen, dim), self.expert_bias
+        )
 
         # tokens_per_expert will be used to update the expert bias for load balancing.
         # Prevent extra local tokens accumulation on evaluation or activation recomputation.
@@ -824,8 +808,10 @@ bs = 1
 seqlen = 1024
 dim = 4096
 
+
 def input_fn():
     return torch.randn(bs, seqlen, dim, dtype=torch.bfloat16, device="cuda")
+
 
 args = DeepSeekV3ModelArgs(dim=dim, n_layers=1)
 
