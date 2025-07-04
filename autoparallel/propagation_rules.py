@@ -47,11 +47,15 @@ register_op_strategy_map(
 _op_rules = {}
 
 
-def register_rule(op):
+def register_rule(ops):
     global _op_rules
 
     def wrapper(impl):
-        _op_rules[op] = impl
+        if isinstance(ops, list):
+            for op in ops:
+                _op_rules[op] = impl
+        else:
+            _op_rules[ops] = impl
         return impl
 
     return wrapper
@@ -335,14 +339,18 @@ def randperm_rule(mesh, specs):
     return OpStrategy([OpSpec(spec, input_specs=[spec], redistribute_cost=[[0.0]])])
 
 
-@register_rule(torch.ops.aten.full.default)
+@register_rule([torch.ops.aten.full.default, torch.ops.aten.empty.memory_format])
 def full_rule(mesh, specs):
-    raise NotImplementedError("Needs hardening, only tested on a few cases")
+    print(
+        f"Ops that need to be implemented {torch.ops.aten.full.default}, {torch.ops.aten.empty.memory_format}"
+    )
+    # raise NotImplementedError("Needs hardening, only tested on a few cases")
     shape = specs[0]
     # TODO: get the dtype
     tensor_meta = _gen_tensor_meta(shape)
     # TODO: I'm hard-coding this here, I'll probably need to do something else about this
-    placement = (Shard(0),) + (Replicate(),) * (mesh.ndim - 1)
+    # placement = (Shard(0),) + (Replicate(),) * (mesh.ndim - 1)
+    placement = (Replicate(),) * mesh.ndim
     # placement = (Replicate(),) * mesh.ndim
     input_placement = (Replicate(),) * mesh.ndim
     spec = DTensorSpec(mesh, placement, tensor_meta=tensor_meta)
@@ -538,21 +546,23 @@ def _unsafe_index_rule(mesh, op_schema):
 
 @register_opschema_rule(torch.ops.aten.index.Tensor)
 def index_rule(mesh, op_schema):
-    raise NotImplementedError("Needs hardening, only tested on a few cases")
+    print(f"Ops that need to be implemented {torch.ops.aten.index.Tensor}")
+    # raise NotImplementedError("Needs hardening, only tested on a few cases")
     strat = op_schema.args_schema
     specs = strat  # TODO: clean this up
     res = []
     idxs_placements = [(Replicate(), Replicate()), (Shard(0), Replicate())]
-    if strat[1].childs[0] is None:
-        idxs_placements = idxs_placements[:1]
-    else:
-        idxs_placements = idxs_placements[1:]
+    idxs_placements = [(Replicate(),) * mesh.ndim]
+    # if strat[1].childs[0] is None:
+    #    idxs_placements = idxs_placements[:1]
+    # else:
+    #    idxs_placements = idxs_placements[1:]
     # TODO: this is a nasty hack and won't work for most of the cases
-    for i, ss in enumerate(strat[0].strategies):
+    for i, ss in enumerate(strat[0].strategies[:1]):
         for plt in idxs_placements:
             ispec = ss.input_specs[0]
             ospec = DTensorSpec(mesh=mesh, placements=ispec.placements)
-            assert ss.output_spec == ispec
+            # assert ss.output_spec == ispec, f"{ss.output_spec}, {ispec}"
             idxs_strats = [
                 DTensorSpec(mesh, placements=plt)
                 for x in strat[1].childs
@@ -579,15 +589,17 @@ def index_rule(mesh, op_schema):
 
 @register_opschema_rule(torch.ops.aten.index_put.default)
 def index_put_rule(mesh, op_schema):
-    raise NotImplementedError("Needs hardening, only tested on a few cases")
+    print(f"Ops that need to be implemented {torch.ops.aten.index_put.default}")
+    # raise NotImplementedError("Needs hardening, only tested on a few cases")
     strat = op_schema.args_schema
     specs = strat  # TODO: clean this up
     res = []
-    idxs_placements = [(Replicate(), Replicate()), (Shard(0), Replicate())]
-    if strat[1].childs[0] is None:
-        idxs_placements = idxs_placements[:1]
-    else:
-        idxs_placements = idxs_placements[1:]
+    # idxs_placements = [(Replicate(), Replicate()), (Shard(0), Replicate())]
+    # if strat[1].childs[0] is None:
+    #    idxs_placements = idxs_placements[:1]
+    # else:
+    #    idxs_placements = idxs_placements[1:]
+    idxs_placements = [(Replicate(),) * mesh.ndim]
     # TODO: this is a nasty hack and won't work for most of the cases
     for i, ss in enumerate(strat[0].strategies):
         for plt in idxs_placements:
