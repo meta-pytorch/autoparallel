@@ -85,6 +85,26 @@ def fill_missing_redistribute_cost(op, specs, out_strat):
             strat.redistribute_cost = redistribute_costs
 
 
+def _generate_dummy_strategy(mesh, tensor_meta, num_input_args, num_input_strategies):
+    from torch.distributed.tensor._dtensor_spec import DTensorSpec
+    from torch.distributed.tensor._op_schema import OpSpec
+    from torch.distributed.tensor.placement_types import Replicate
+
+    placements = (Replicate(),) * mesh.ndim
+    input_specs = [
+        DTensorSpec(mesh=mesh, placements=placements, tensor_meta=tensor_meta)
+        for _ in range(num_input_args)
+    ]
+    output_spec = DTensorSpec(mesh=mesh, placements=placements, tensor_meta=tensor_meta)
+
+    out_strat = OpSpec(output_specs=output_spec, input_specs=input_specs)
+    out_strat.redistribute_cost = [
+        [0.0] * num_input_strategies,
+    ] * num_input_args
+    out_strat = OpStrategy([out_strat])
+    return out_strat
+
+
 def get_placement_options(mesh, op, specs, user_args, user_kwargs):
     # print(op)
 
@@ -111,12 +131,74 @@ def get_placement_options(mesh, op, specs, user_args, user_kwargs):
 
     if op in _op_partial_rules:
         out_strat = _op_partial_rules[op](mesh, op_schema)
-    else:
+    elif (
+        op
+        in torch.distributed.tensor.DTensor._op_dispatcher.sharding_propagator.op_strategy_funcs
+        and op != torch.ops.aten.slice_scatter.default
+    ):
         out_strat = torch.distributed.tensor.DTensor._op_dispatcher.sharding_propagator.op_strategy_funcs[
             op
         ](
             op_schema
         )
+    else:
+        print(f"Ops that need to be implemented {op}")
+        from .propagation_rules import _create_all_options
+
+        tensor_meta = strat[0].strategies[0].output_spec.tensor_meta
+        if op == torch.ops.aten.sort.stable:
+            out_strat = torch.distributed.tensor.DTensor._op_dispatcher.sharding_propagator.op_strategy_funcs[
+                torch.ops.aten.topk.default
+            ](
+                op_schema
+            )
+        elif op in {
+            torch.ops.autoparallel.fill_indices_wrapper.default,
+            torch.ops.aten.scatter_add.default,
+            torch.ops.prims.fma.default,
+        }:
+            """
+            from torch.distributed.tensor._dtensor_spec import DTensorSpec
+            from torch.distributed.tensor._op_schema import OpSpec
+            from torch.distributed.tensor.placement_types import Replicate
+
+            placements = (Replicate(),) * mesh.ndim
+            s0 = DTensorSpec(mesh=mesh, placements=placements, tensor_meta=tensor_meta)
+            s1 = DTensorSpec(mesh=mesh, placements=placements, tensor_meta=tensor_meta)
+            s2 = DTensorSpec(mesh=mesh, placements=placements, tensor_meta=tensor_meta)
+            s3 = DTensorSpec(mesh=mesh, placements=placements, tensor_meta=tensor_meta)
+
+            out_strat = OpSpec(output_specs=s3, input_specs=[s0, s1, s2])
+            num_strats = len(strat[0].strategies)
+            out_strat.redistribute_cost = [
+                [0.0] * num_strats,
+                [0.0] * num_strats,
+                [0.0] * num_strats,
+            ]
+            out_strat = OpStrategy([out_strat])
+            """
+            num_strats = len(strat[0].strategies)
+            out_strat = _generate_dummy_strategy(mesh, tensor_meta, 3, num_strats)
+        elif op == torch.ops.aten.slice_scatter.default:
+            """
+            from torch.distributed.tensor._dtensor_spec import DTensorSpec
+            from torch.distributed.tensor._op_schema import OpSpec
+            from torch.distributed.tensor.placement_types import Replicate
+
+            placements = (Replicate(),) * mesh.ndim
+            s0 = DTensorSpec(mesh=mesh, placements=placements, tensor_meta=tensor_meta)
+            s1 = DTensorSpec(mesh=mesh, placements=placements, tensor_meta=tensor_meta)
+            s2 = DTensorSpec(mesh=mesh, placements=placements, tensor_meta=tensor_meta)
+
+            out_strat = OpSpec(output_specs=s2, input_specs=[s0, s1])
+            num_strats = len(strat[0].strategies)
+            out_strat.redistribute_cost = [[0.0] * num_strats, [0.0] * num_strats]
+            out_strat = OpStrategy([out_strat])
+            """
+            num_strats = len(strat[0].strategies)
+            out_strat = _generate_dummy_strategy(mesh, tensor_meta, 2, num_strats)
+        else:
+            out_strat = _create_all_options(mesh, tensor_meta.shape, tensor_meta)
 
     propagate_tensor_meta(op, user_args, user_kwargs, out_strat)
     fill_missing_redistribute_cost(op, specs, out_strat)

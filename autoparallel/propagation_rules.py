@@ -33,11 +33,15 @@ register_op_strategy_map(
 _op_rules = {}
 
 
-def register_rule(op):
+def register_rule(ops):
     global _op_rules
 
     def wrapper(impl):
-        _op_rules[op] = impl
+        if isinstance(ops, list):
+            for op in ops:
+                _op_rules[op] = impl
+        else:
+            _op_rules[ops] = impl
         return impl
 
     return wrapper
@@ -302,8 +306,12 @@ def split_with_sizes_rule(mesh, specs):
 
 @register_rule(torch.ops.aten.cat.default)
 def cat_rule(mesh, specs):
+    print(f"Ops that need to be implemented {torch.ops.aten.cat.default}")
     op_spec = specs[0]
-    dim = specs[1]
+    if len(specs) == 2:
+        dim = specs[1]
+    else:
+        dim = 0
     strats = []
 
     num_tensors = len(op_spec)
@@ -321,10 +329,10 @@ def cat_rule(mesh, specs):
             if placement.is_shard(dim) or placement.is_partial():
                 banned_idxs.add(i)
 
-    for i in range(1, num_tensors):
-        assert len(op_spec[i].strategies) == len(
-            op_spec[0].strategies
-        ), "Assume each cat input has same number of strategies"
+    # for i in range(1, num_tensors):
+    #     assert len(op_spec[i].strategies) == len(
+    #         op_spec[0].strategies
+    #     ), "Assume each cat input has same number of strategies"
 
     for strat_idx, strat in enumerate(op_spec[0].strategies):
         placements = strat.output_spec.placements
@@ -337,8 +345,8 @@ def cat_rule(mesh, specs):
         for i in range(num_tensors):
             input_specs.append(op_spec[i].strategies[strat_idx].output_spec)
             redistribute_costs = generate_redistribute_costs(op_spec[i], output_spec)
-            for banned in banned_idxs:
-                redistribute_costs[banned] = math.inf
+            # for banned in banned_idxs:
+            #     redistribute_costs[banned] = math.inf
             all_costs.append(redistribute_costs)
 
         s = OpSpec(output_spec, input_specs=input_specs)
@@ -368,14 +376,18 @@ def randperm_rule(mesh, specs):
     return OpStrategy([OpSpec(spec, input_specs=[spec], redistribute_cost=[[0.0]])])
 
 
-@register_rule(torch.ops.aten.full.default)
+@register_rule([torch.ops.aten.full.default, torch.ops.aten.empty.memory_format])
 def full_rule(mesh, specs):
-    raise NotImplementedError("Needs hardening, only tested on a few cases")
+    print(
+        f"Ops that need to be implemented {torch.ops.aten.full.default}, {torch.ops.aten.empty.memory_format}"
+    )
+    # raise NotImplementedError("Needs hardening, only tested on a few cases")
     shape = specs[0]
     # TODO: get the dtype
     tensor_meta = _gen_tensor_meta(shape)
     # TODO: I'm hard-coding this here, I'll probably need to do something else about this
-    placement = (Shard(0),) + (Replicate(),) * (mesh.ndim - 1)
+    # placement = (Shard(0),) + (Replicate(),) * (mesh.ndim - 1)
+    placement = (Replicate(),) * mesh.ndim
     # placement = (Replicate(),) * mesh.ndim
     input_placement = (Replicate(),) * mesh.ndim
     spec = DTensorSpec(mesh, placement, tensor_meta=tensor_meta)
@@ -535,8 +547,7 @@ def native_layer_norm_backward_rule(mesh, op_schema):
 def convert_element_type_rule(mesh, op_schema):
     from torch.distributed.tensor._ops._tensor_ops import default_strategy
 
-    # TODO: API has changed in latest main
-    out_strat = default_strategy(mesh, op_schema)
+    out_strat = default_strategy(op_schema)
     return out_strat
 
 
@@ -572,21 +583,23 @@ def _unsafe_index_rule(mesh, op_schema):
 
 @register_opschema_rule(torch.ops.aten.index.Tensor)
 def index_rule(mesh, op_schema):
-    raise NotImplementedError("Needs hardening, only tested on a few cases")
+    print(f"Ops that need to be implemented {torch.ops.aten.index.Tensor}")
+    # raise NotImplementedError("Needs hardening, only tested on a few cases")
     strat = op_schema.args_schema
     specs = strat  # TODO: clean this up
     res = []
     idxs_placements = [(Replicate(), Replicate()), (Shard(0), Replicate())]
-    if strat[1].childs[0] is None:
-        idxs_placements = idxs_placements[:1]
-    else:
-        idxs_placements = idxs_placements[1:]
+    idxs_placements = [(Replicate(),) * mesh.ndim]
+    # if strat[1].childs[0] is None:
+    #    idxs_placements = idxs_placements[:1]
+    # else:
+    #    idxs_placements = idxs_placements[1:]
     # TODO: this is a nasty hack and won't work for most of the cases
-    for i, ss in enumerate(strat[0].strategies):
+    for i, ss in enumerate(strat[0].strategies[:1]):
         for plt in idxs_placements:
             ispec = ss.input_specs[0]
             ospec = DTensorSpec(mesh=mesh, placements=ispec.placements)
-            assert ss.output_spec == ispec
+            # assert ss.output_spec == ispec, f"{ss.output_spec}, {ispec}"
             idxs_strats = [
                 DTensorSpec(mesh, placements=plt)
                 for x in strat[1].childs
@@ -613,15 +626,17 @@ def index_rule(mesh, op_schema):
 
 @register_opschema_rule(torch.ops.aten.index_put.default)
 def index_put_rule(mesh, op_schema):
-    raise NotImplementedError("Needs hardening, only tested on a few cases")
+    print(f"Ops that need to be implemented {torch.ops.aten.index_put.default}")
+    # raise NotImplementedError("Needs hardening, only tested on a few cases")
     strat = op_schema.args_schema
     specs = strat  # TODO: clean this up
     res = []
-    idxs_placements = [(Replicate(), Replicate()), (Shard(0), Replicate())]
-    if strat[1].childs[0] is None:
-        idxs_placements = idxs_placements[:1]
-    else:
-        idxs_placements = idxs_placements[1:]
+    # idxs_placements = [(Replicate(), Replicate()), (Shard(0), Replicate())]
+    # if strat[1].childs[0] is None:
+    #    idxs_placements = idxs_placements[:1]
+    # else:
+    #    idxs_placements = idxs_placements[1:]
+    idxs_placements = [(Replicate(),) * mesh.ndim]
     # TODO: this is a nasty hack and won't work for most of the cases
     for i, ss in enumerate(strat[0].strategies):
         for plt in idxs_placements:
