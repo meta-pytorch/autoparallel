@@ -204,16 +204,21 @@ def apply_node_renaming(fx_g, params_len, buffer_len, metadata):
     # TODO: align number of grad names with inputs everywhere?
     all_output_nodes = fx_g.graph.find_nodes(op="output")[0].all_input_nodes
     output_nodes = all_output_nodes[: metadata.num_outputs]
+    print("output")
     rename_nodes(fx_g, output_nodes, "output")
     param_grad = all_output_nodes[
         metadata.num_outputs : metadata.num_outputs + params_len
     ]
+    print("grad_param")
     rename_nodes(fx_g, param_grad, "grad_param")
     grad_inputs = all_output_nodes[metadata.num_outputs + params_len :]
     inputs_that_require_grad = [
         i for i, n in enumerate(metadata.input_info[params_len:]) if n.requires_grad
     ]
-    rename_nodes(fx_g, grad_inputs, "grad_input", inputs_that_require_grad)
+    print("grad_input")
+
+    # TODO: figure out and fix why this is not working
+    # rename_nodes(fx_g, grad_inputs, "grad_input", inputs_that_require_grad)
 
     tangent_nodes = fx_g.graph.find_nodes(op="placeholder")[
         -len(metadata.traced_tangents) :
@@ -221,15 +226,19 @@ def apply_node_renaming(fx_g, params_len, buffer_len, metadata):
     outputs_that_require_grad = [
         i for i, n in enumerate(metadata.output_info) if n.requires_grad
     ]
+    print("tangents")
     rename_nodes(fx_g, tangent_nodes, "tangents", outputs_that_require_grad)
     input_nodes = fx_g.graph.find_nodes(op="placeholder")[
         params_len + buffer_len : -len(metadata.traced_tangents)
     ]
+    print("input")
     rename_nodes(fx_g, input_nodes, "input")
     param_nodes = fx_g.graph.find_nodes(op="placeholder")[:params_len]
+    print("param")
     rename_nodes(fx_g, param_nodes, "param")
 
     buffer_nodes = fx_g.graph.find_nodes(op="placeholder")[
         params_len : params_len + buffer_len
     ]
+    print("buffer")
     rename_nodes(fx_g, buffer_nodes, "buffer")

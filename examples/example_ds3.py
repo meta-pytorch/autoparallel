@@ -211,6 +211,7 @@ def _fill_indices_kernel(
 # ==============
 
 
+@torch.library.custom_op("autoparallel::fill_indices_wrapper", mutates_args=())
 def fill_indices_wrapper(
     tokens_per_expert_group: torch.Tensor,
     start_index_values: torch.Tensor,
@@ -220,7 +221,7 @@ def fill_indices_wrapper(
     max_len: int,
     block_size: int = 128,
     max_blocks: int = 1024,  # cap on total number of blocks to launch
-):
+) -> torch.Tensor:
     # preallocate output
     permuted_indices = torch.full(
         (max_len,), -1, dtype=torch.int32, device=tokens_per_expert_group.device
@@ -240,6 +241,24 @@ def fill_indices_wrapper(
         experts_per_rank,
         num_ranks,
         BLOCK_SIZE=block_size,
+    )
+    return permuted_indices
+
+
+@fill_indices_wrapper.register_fake
+def _(
+    tokens_per_expert_group: torch.Tensor,
+    start_index_values: torch.Tensor,
+    write_offsets: torch.Tensor,
+    experts_per_rank: int,
+    num_ranks: int,
+    max_len: int,
+    block_size: int = 128,
+    max_blocks: int = 1024,  # cap on total number of blocks to launch
+):
+    # preallocate output
+    permuted_indices = torch.empty(
+        (max_len,), dtype=torch.int32, device=tokens_per_expert_group.device
     )
     return permuted_indices
 
@@ -729,9 +748,11 @@ class MoE(nn.Module):
 
         # top_scores and selected_indices shape (bs*slen*top_k,)
         # num_tokens_per_expert shape (num_experts,)
-        (top_scores, token_indices, num_tokens_per_expert,) = self.router(
-            x.reshape(bs * slen, dim), self.expert_bias
-        )
+        (
+            top_scores,
+            token_indices,
+            num_tokens_per_expert,
+        ) = self.router(x.reshape(bs * slen, dim), self.expert_bias)
 
         # tokens_per_expert will be used to update the expert bias for load balancing.
         # Prevent extra local tokens accumulation on evaluation or activation recomputation.
@@ -810,7 +831,9 @@ dim = 4096
 
 
 def input_fn():
-    return torch.randn(bs, seqlen, dim, dtype=torch.bfloat16, device="cuda")
+    return torch.randn(
+        bs, seqlen, dim, dtype=torch.bfloat16, device="cuda", requires_grad=True
+    )
 
 
 args = DeepSeekV3ModelArgs(dim=dim, n_layers=1)
