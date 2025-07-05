@@ -147,12 +147,13 @@ def _get_device_tflops(dtype):
             f"Unsupported device: {device_name}. Supported devices: {[limit.name for limit in DEVICE_LIMITS]}"
         )
 
-    if dtype not in device_limit.gemm_tflops:
-        raise ValueError(
-            f"Dtype {dtype} not supported on {device_limit.name}. Supported dtypes: {list(device_limit.gemm_tflops.keys())}"
-        )
+    # TODO: add proper support for int64 etc
+    # if dtype not in device_limit.gemm_tflops:
+    #     raise ValueError(
+    #         f"Dtype {dtype} not supported on {device_limit.name}. Supported dtypes: {list(device_limit.gemm_tflops.keys())}"
+    #     )
 
-    return device_limit.gemm_tflops[dtype]
+    return device_limit.gemm_tflops.get(dtype, 1)
 
 
 def _get_sharded_shape_stride(spec):
@@ -213,10 +214,16 @@ def estimate_strategy_runtime_cost(node, strategy):
 
     # TODO: maybe cache the flop_counter to avoid recreating it
     # all the time
-    with FlopCounterMode(display=False) as flop_counter:
-        node.target(*args, **kwargs)
+    try:
+        with FlopCounterMode(display=False) as flop_counter:
+            node.target(*args, **kwargs)
 
-    flops = flop_counter.get_total_flops()
+        flops = flop_counter.get_total_flops()
+    except RuntimeError as exc:
+        if node.target == torch.ops.aten._grouped_mm.default:
+            flops = float("inf")
+        else:
+            raise exc
 
     # TODO: fix this
     dtype = strategy.input_specs[0].tensor_meta.dtype
