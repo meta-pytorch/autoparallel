@@ -127,10 +127,12 @@ def _generate_dummy_strategy(mesh, op, user_args, user_kwargs, input_strategies)
     assert num_input_args == len(
         input_strategies_flat
     ), f"{op}, {num_input_args}, {len(input_strategies_flat)}"
-    # TODO: fix redistribute cost
-    out_strat.redistribute_cost = [
-        [0.0] * len(x.strategies) for x in input_strategies_flat
+    redistribute_cost = [
+        generate_redistribute_costs(input_strategies_flat[i], input_specs[i])
+        for i in range(num_input_args)
     ]
+    out_strat.redistribute_cost = redistribute_cost
+
     assert len(out_strat.redistribute_cost) == num_input_args
     out_strat = OpStrategy([out_strat])
     return out_strat
