@@ -825,7 +825,7 @@ mesh = torch.distributed.device_mesh.init_device_mesh(
     ),
 )
 
-bs = 1
+bs = 8 * mesh.shape[0]
 seqlen = 1024
 dim = 4096
 
