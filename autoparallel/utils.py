@@ -184,7 +184,13 @@ def get_placement_options(mesh, op, specs, user_args, user_kwargs):
 
     propagate_tensor_meta(op, user_args, user_kwargs, out_strat)
     fill_missing_redistribute_cost(op, specs, out_strat)
-    out_strat = remove_invalid_configs(out_strat, mesh)
+
+    required_alignment = 1
+    if op == torch.ops.aten._grouped_mm.default:
+        required_alignment = 16
+    out_strat = remove_invalid_configs(
+        out_strat, mesh, required_alignment=required_alignment
+    )
 
     return out_strat
 

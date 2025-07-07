@@ -80,7 +80,7 @@ def _build_meta_tensor(tensor_meta):
     )
 
 
-def remove_invalid_configs(out_strat, mesh):
+def remove_invalid_configs(out_strat, mesh, required_alignment=1):
     kept = []
     for strategy in out_strat.strategies:
         is_valid = True
@@ -100,6 +100,13 @@ def remove_invalid_configs(out_strat, mesh):
                     else:
                         is_valid = False
                         break
+                    if required_alignment != 1:
+                        if shape[dim] % required_alignment != 0:
+                            is_valid = False
+                            print(
+                                f"Removing strategy due to alignment: {strategy} becuase of {dim=}, {shape[dim]=} {mesh_shape=}"
+                            )
+                            break
         if is_valid:
             kept.append(strategy)
 

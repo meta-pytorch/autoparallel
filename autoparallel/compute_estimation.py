@@ -206,16 +206,10 @@ def estimate_strategy_runtime_cost(node, strategy):
 
     # TODO: maybe cache the flop_counter to avoid recreating it
     # all the time
-    try:
-        with FlopCounterMode(display=False) as flop_counter:
-            node.target(*args, **kwargs)
+    with FlopCounterMode(display=False) as flop_counter:
+        node.target(*args, **kwargs)
 
-        flops = flop_counter.get_total_flops()
-    except RuntimeError as exc:
-        if node.target == torch.ops.aten._grouped_mm.default:
-            flops = float("inf")
-        else:
-            raise exc
+    flops = flop_counter.get_total_flops()
 
     # TODO: fix this
     dtype = strategy.input_specs[0].tensor_meta.dtype
