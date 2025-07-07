@@ -120,6 +120,7 @@ def aot_export_module(
             no_tangents=False,
             pre_dispatch=pre_dispatch,
             dynamic_shapes=dynamic_shapes,
+            keep_input_mutations=True,
             kwargs=kwargs,
         )
 
