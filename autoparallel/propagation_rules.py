@@ -3,6 +3,20 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+"""
+Custom sharding propagation rules for automatic parallelization.
+
+This module extends and overrides PyTorch's DTensor operation rules to provide
+custom sharding strategies specifically for autoparallel. All of these should
+eventually be upstreamed to PyTorch proper.
+
+Based on PyTorch DTensor implementation:
+- Core DTensor ops: torch/distributed/tensor/_ops/
+- Sharding propagation: torch/distributed/tensor/_sharding_prop.py
+- Op strategies: torch/distributed/tensor/_op_schema.py
+- Reference: https://pytorch.org/docs/stable/distributed.tensor.html
+"""
+
 import collections
 import copy
 import itertools
