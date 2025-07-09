@@ -134,13 +134,8 @@ def aot_export_module(
             output_gradients = []
             for a, grad in zip(args, gradients):
                 if isinstance(a, torch.Tensor) and a.requires_grad:
-                    assert (
-                        grad is not None
-                    ), """\
-Found a parameter that did not receive a gradient.
-"This is most likely a bug, but if this needs to be supported please comment on this Github issue:
-https://github.com/pytorch/pytorch/issues/101192
-"""
+                    if grad is None:
+                        grad = torch.zeros_like(a)
                     output_gradients.append(grad)
                 else:
                     assert grad is None
