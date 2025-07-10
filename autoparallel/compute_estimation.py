@@ -164,11 +164,15 @@ def _get_sharded_shape(spec):
     # TODO: find a better heuristic other than
     # running DTensor
     new_tensor_shape = list(tensor_shape)
+    new_tensor_stride = list(spec.tensor_meta.stride)
     for mesh_size, placement in zip(mesh.shape, placements):
         if placement.is_shard():
             dim = placement.dim
             new_tensor_shape[dim] = (new_tensor_shape[dim] + mesh_size - 1) // mesh_size
-    return new_tensor_shape
+            new_tensor_stride[dim] = (
+                new_tensor_stride[dim] + mesh_size - 1
+            ) // mesh_size
+    return new_tensor_shape, new_tensor_stride
 
 
 def estimate_strategy_runtime_cost(node, strategy):
@@ -191,15 +195,18 @@ def estimate_strategy_runtime_cost(node, strategy):
     if len(kwargs) > 0:
         for k, v in kwargs.items():
             assert not isinstance(v, torch.Tensor), f"{node} {v}"
-    args_shapes = tuple(_get_sharded_shape(spec) for spec in strategy.input_specs)
+    args_sizes_strides = tuple(
+        _get_sharded_shape(spec) for spec in strategy.input_specs
+    )
 
     counter = 0
     args = list(args)
     for i, arg in enumerate(args):
         if isinstance(arg, torch.Tensor):
             with fake_mode:
-                args[i] = torch.empty(
-                    args_shapes[counter], device=arg.device, dtype=arg.dtype
+                sizes, strides = args_sizes_strides[counter]
+                args[i] = torch.empty_strided(
+                    sizes, strides, device=arg.device, dtype=arg.dtype
                 )
             counter += 1
 
