@@ -70,8 +70,6 @@ def fill_missing_redistribute_cost(op, specs, out_strat):
             # TODO: the torch.ops.aten.slice.Tensor is wrong here and in the input_spec!!!!!
             handled_ops = {
                 torch.ops.aten.ones_like.default,
-                torch.ops.aten.detach.default,
-                torch.ops.aten.clone.default,
                 torch.ops.aten.full_like.default,
                 torch.ops.aten.empty_like.default,
                 torch.ops.prims.convert_element_type.default,
