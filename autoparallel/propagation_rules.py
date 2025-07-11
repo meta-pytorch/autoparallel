@@ -314,53 +314,6 @@ def split_with_sizes_rule(mesh, specs):
     return OpStrategy(strats)
 
 
-@register_rule(torch.ops.aten.cat.default)
-def cat_rule(mesh, specs):
-    op_spec = specs[0]
-    dim = specs[1]
-    strats = []
-
-    num_tensors = len(op_spec)
-
-    inp_ts = []
-    for i in range(num_tensors):
-        tm = op_spec[i].strategies[0].output_spec.tensor_meta
-        inp_ts.append(_build_meta_tensor(tm))
-
-    out_t = torch.cat(inp_ts, dim)
-
-    banned_idxs = set()
-    for i, ss in enumerate(op_spec[0].strategies):
-        for placement in ss.output_spec.placements:
-            if placement.is_shard(dim) or placement.is_partial():
-                banned_idxs.add(i)
-
-    for i in range(1, num_tensors):
-        assert len(op_spec[i].strategies) == len(
-            op_spec[0].strategies
-        ), "Assume each cat input has same number of strategies"
-
-    for strat_idx, strat in enumerate(op_spec[0].strategies):
-        placements = strat.output_spec.placements
-        if any(p.is_shard(dim) or p.is_partial() for p in placements):
-            continue
-        output_spec = DTensorSpec(mesh, placements, tensor_meta=_gen_tensor_meta(out_t))
-
-        all_costs = []
-        input_specs = []
-        for i in range(num_tensors):
-            input_specs.append(op_spec[i].strategies[strat_idx].output_spec)
-            redistribute_costs = generate_redistribute_costs(op_spec[i], output_spec)
-            for banned in banned_idxs:
-                redistribute_costs[banned] = math.inf
-            all_costs.append(redistribute_costs)
-
-        s = OpSpec(output_spec, input_specs=input_specs)
-        s.redistribute_cost = all_costs
-        strats.append(s)
-    return OpStrategy(strats)
-
-
 @register_rule(torch.ops.prims.iota.default)
 def iota_rule(mesh, specs):
     raise NotImplementedError("Needs hardening, only tested on a few cases")
