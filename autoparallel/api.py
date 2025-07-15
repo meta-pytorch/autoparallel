@@ -280,8 +280,10 @@ class AutoParallel:
         # we basically want to remove noops in here
         prev = torch._inductor.config.pattern_matcher
         torch._inductor.config.pattern_matcher = False
-        gm = joint_graph_passes(gm)
-        torch._inductor.config.pattern_matcher = prev
+        try:
+            gm = joint_graph_passes(gm)
+        finally:
+            torch._inductor.config.pattern_matcher = prev
         remove_assert_ops(gm.graph)
         gm.graph.eliminate_dead_code()
         gm.recompile()
