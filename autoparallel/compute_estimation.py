@@ -155,7 +155,7 @@ def _get_device_tflops(dtype):
     return device_limit.gemm_tflops[dtype]
 
 
-def _get_sharded_shape(spec):
+def _get_sharded_shape_stride(spec):
     mesh = spec.mesh
     tensor_shape = spec.tensor_meta.shape
     # TODO: take dtype into account as well
@@ -196,7 +196,7 @@ def estimate_strategy_runtime_cost(node, strategy):
         for k, v in kwargs.items():
             assert not isinstance(v, torch.Tensor), f"{node} {v}"
     args_sizes_strides = tuple(
-        _get_sharded_shape(spec) for spec in strategy.input_specs
+        _get_sharded_shape_stride(spec) for spec in strategy.input_specs
     )
 
     counter = 0

@@ -11,7 +11,10 @@ from torch.distributed.tensor._dtensor_spec import DTensorSpec
 from torch.distributed.tensor.placement_types import Replicate, Shard
 from torch.utils._pytree import tree_flatten, tree_map_only
 
-from .compute_estimation import _get_sharded_shape, estimate_strategy_runtime_cost
+from .compute_estimation import (
+    _get_sharded_shape_stride,
+    estimate_strategy_runtime_cost,
+)
 from .propagation_rules import _create_all_options
 from .utils import get_placement_options
 
@@ -488,7 +491,7 @@ class ShardingOptimizer:
                 data = self.ds[(s_i, 0, ii, 0)]
                 spec = data["inp_strat"]
                 tensor_shape = spec.tensor_meta.shape
-                new_tensor_shape = _get_sharded_shape(spec)
+                new_tensor_shape, _ = _get_sharded_shape_stride(spec)
                 new_size = math.prod(new_tensor_shape)
                 old_size = math.prod(tensor_shape)
                 elms.append(data["va"] * new_size / old_size)
