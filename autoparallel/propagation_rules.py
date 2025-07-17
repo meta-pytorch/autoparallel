@@ -500,9 +500,11 @@ def native_layer_norm_backward_rule(mesh, op_schema):
 
 @register_opschema_rule(torch.ops.prims.convert_element_type.default)
 def convert_element_type_rule(mesh, op_schema):
-    from torch.distributed.tensor._ops._tensor_ops import default_strategy
+    from torch.distributed.tensor._ops._tensor_ops import (
+        propagate_single_input_strategy,
+    )
 
-    out_strat = default_strategy(op_schema)
+    out_strat = propagate_single_input_strategy(op_schema)
     return out_strat
 
 
