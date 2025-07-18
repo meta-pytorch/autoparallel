@@ -14,6 +14,7 @@ from torch.distributed.tensor._redistribute import redistribute_local_tensor
 from torch.distributed.tensor.placement_types import Partial, Replicate, Shard  # noqa
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.utils._pytree import tree_flatten, tree_map_only
+from .propagation_rules import TENSOR_FACTORY_OPS
 
 
 def my_redistribute_local_tensor(arg, curr_spec, tgt_spec):
@@ -129,7 +130,7 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
             new_args = self.redistribute_args(args)
 
         # apply sharding to constructor functions as well
-        if target == torch.ops.aten.full.default:
+        if target in TENSOR_FACTORY_OPS:
             val = list(new_args[0])
             spec = self.sharding_placement[node].output_specs
             for mesh_size, placement in zip(spec.mesh.shape, spec.placements):
