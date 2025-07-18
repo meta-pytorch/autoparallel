@@ -577,46 +577,6 @@ def index_rule(mesh, op_schema):
     return out_strat
 
 
-@register_opschema_rule(torch.ops.aten.index_put.default)
-def index_put_rule(mesh, op_schema):
-    raise NotImplementedError("Needs hardening, only tested on a few cases")
-    strat = op_schema.args_schema
-    specs = strat  # TODO: clean this up
-    res = []
-    idxs_placements = [(Replicate(), Replicate()), (Shard(0), Replicate())]
-    if strat[1].childs[0] is None:
-        idxs_placements = idxs_placements[:1]
-    else:
-        idxs_placements = idxs_placements[1:]
-    # TODO: this is a nasty hack and won't work for most of the cases
-    for i, ss in enumerate(strat[0].strategies):
-        for plt in idxs_placements:
-            ispec = ss.input_specs[0]
-            ospec = DTensorSpec(mesh=mesh, placements=ispec.placements)
-            assert ss.output_spec == ispec, f"{ss.output_spec}, {ispec}"
-            idxs_strats = [
-                DTensorSpec(mesh, placements=plt)
-                for x in strat[1].childs
-                if x is not None
-            ]
-            kspc = [x for x in strat[1].childs if x is not None]
-            t_strats = [DTensorSpec(mesh, placements=ispec.placements)]
-            s = OpSpec(output_specs=ospec, input_specs=[ispec] + idxs_strats + t_strats)
-
-            redistribute_costs = (
-                [generate_redistribute_costs(specs[0], ospec)]
-                + [
-                    generate_redistribute_costs(kk, idxs_strat)
-                    for kk, idxs_strat in zip(kspc, idxs_strats)
-                ]
-                + [generate_redistribute_costs(specs[2], t_strats[0])]
-            )
-            s.redistribute_cost = redistribute_costs
-            res.append(s)
-    out_strat = OpStrategy(res)
-    return out_strat
-
-
 @register_opschema_rule(torch.ops.aten._scaled_dot_product_efficient_attention.default)
 def sdpa_rule(mesh, op_schema):
     op = torch.ops.aten._scaled_dot_product_efficient_attention.default
