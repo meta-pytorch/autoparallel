@@ -10,7 +10,12 @@ from torch.distributed.tensor._op_schema import OpSchema, OpStrategy, TupleStrat
 from torch.distributed.tensor._ops.utils import generate_redistribute_costs
 from torch.utils._pytree import tree_flatten, tree_map_only
 
-from .propagation_rules import _op_partial_rules, _op_rules, remove_invalid_configs
+from .propagation_rules import (
+    TENSOR_FACTORY_OPS,
+    _op_partial_rules,
+    _op_rules,
+    remove_invalid_configs,
+)
 
 
 def propagate_tensor_meta(op, user_args, user_kwargs, out_strat):
@@ -44,6 +49,10 @@ def propagate_tensor_meta(op, user_args, user_kwargs, out_strat):
                         else:
                             assert tm is None
         if strat.input_specs is None:
+            if op in TENSOR_FACTORY_OPS:
+                # there isn't an input spec bc the op has no input!
+                continue
+
             supported_ops = {
                 torch.ops.prims.convert_element_type.default,
                 torch.ops.aten.clone.default,
