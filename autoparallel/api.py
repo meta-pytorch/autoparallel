@@ -3,12 +3,17 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+import itertools
 import copy
 from collections import OrderedDict
-from contextlib import suppress
+from contextlib import ExitStack, suppress
 
 import torch
 import torch.utils._pytree as pytree
+from torch._functorch.aot_autograd import (
+    aot_compile_joint_with_descriptors,
+    aot_export_joint_with_descriptors,
+)
 from torch._functorch.partitioners import default_partition
 from torch._inductor.decomposition import select_decomp_table
 from torch._inductor.fx_passes.joint_graph import joint_graph_passes
@@ -16,10 +21,11 @@ from torch._inductor.fx_passes.post_grad import remove_assert_ops
 from torch._logging import trace_structured
 from torch._subclasses import FakeTensorMode
 from torch.distributed.tensor import DeviceMesh
+from torch.export._unlift import _assign_attr
+from torch.export.unflatten import _AttrKind
 from torch.nn.utils import stateless
 
 from .apply_sharding import apply_sharding_to_model
-from .export_module import aot_export_module, apply_node_renaming
 from .optimize_sharding import ShardingOptimizer
 from .utils import _get_device_from_mesh
 
@@ -87,94 +93,6 @@ def try_convert_fake_to_real(tensors):
     return out
 
 
-class BufferDict(torch.nn.Module):
-    def __init__(self, buffers):
-        super().__init__()
-        self._keys = {}
-        for name, buffer in buffers.items():
-            persistent = True  # TODO: fixme
-            self.register_buffer(name, buffer, persistent=persistent)
-            self._keys[name] = None
-
-    def values(self):
-        return (getattr(self, k) for k in self._keys)
-
-    def extra_repr(self):
-        lines = []
-        for k in self._keys:
-            b = getattr(self, k)
-            size_str = "x".join(str(size) for size in b.size())
-            device_str = f" ({b.device})"
-            lines.append(
-                f"({k}): Buffer containing [{torch.typename(b)} of size {size_str} {device_str}]"
-            )
-        return "\n".join(lines)
-
-
-def prepare_module(parallel_gm, spec, num_fwd_outputs):
-    """
-    This function takes the parallelized joint graph and splits it in
-    fwd + bwd, wraps it in an autograd.Function and returns a nn.Module that perform
-    the computation
-    TODO: need to let the user specify the weight initialization
-    """
-    # TODO: this should be present elsewhere in the stack, it's a hack for
-    # properly splitting fwd/bwd. This seems to be an issue with aot_export_module
-    # TODO: This doesn't seem needed anymore?
-    # for users in parallel_gm.graph.find_nodes(op="output")[0].all_input_nodes[0].users:
-    #     users.meta["partitioner_tag"] = "must_be_in_backward"
-
-    # let's remove those otherwise we can't clean the backward graph properly
-    with suppress(KeyError):
-        torch.fx.node._side_effectful_functions.remove(
-            torch.ops._c10d_functional.wait_tensor
-        )
-    with suppress(KeyError):
-        torch.fx.node._side_effectful_functions.remove(
-            torch.ops._c10d_functional.wait_tensor.default
-        )
-    fwd_gm, bwd_gm = default_partition(
-        parallel_gm, None, num_fwd_outputs=num_fwd_outputs
-    )
-
-    class AutoParallelFunc(torch.autograd.Function):
-        @staticmethod
-        def forward(ctx, *args):
-            out = fwd_gm(*args)
-            ctx.num_inputs = len(args)
-            ctx.save_for_backward(*out[num_fwd_outputs:])
-            ctx.set_materialize_grads(False)
-            out = out[:num_fwd_outputs]
-            return pytree.tree_unflatten(out, spec)
-
-        @staticmethod
-        def backward(ctx, *grad):
-            flat_grad, _ = pytree.tree_flatten(grad)
-            saved_tensors = ctx.saved_tensors
-            # remove tensors that don't need gradient
-            flat_grad = [x for x in flat_grad if x is not None]
-            grads = bwd_gm(*(saved_tensors + tuple(flat_grad)))
-            # TODO: handle buffers
-            return grads + (None,) * ctx.num_inputs
-
-    class AutoParallelModule(torch.nn.Module):
-        def __init__(self, parameters, buffers):
-            super().__init__()
-            # need to use OrderedDict due to constraints from nn.ParameterDict
-            # on ordering
-            self.params = torch.nn.ParameterDict(OrderedDict(parameters))
-            self.buffers_ = BufferDict(buffers)
-
-        def forward(self, *x):
-            x = pytree.tree_flatten(x)[0]
-            params = [p.to_local() for p in self.params.values()]
-            buffers = [b.to_local() for b in self.buffers_.values()]
-            out = AutoParallelFunc.apply(*(params + buffers + list(x)))
-            return out
-
-    return AutoParallelModule, fwd_gm, bwd_gm
-
-
 def _get_decomp_table():
     decomp_table = copy.copy(select_decomp_table())
     # TODO: removing those as they cause missing DTensor propagation rules
@@ -238,9 +156,14 @@ class AutoParallel:
         The meta model is moved to a fake device based on mesh.device_type.
     """
 
-    def __init__(self, model, input_fn, mesh: DeviceMesh):
-        self.fake_mode = FakeTensorMode()
+    def __init__(self, stack: ExitStack, model, input_fn, mesh: DeviceMesh):
+        self.stack = stack
+        self.fake_mode = (
+            FakeTensorMode()
+        )  # TODO: maybe need to reuse the model's fake mode
         device = _get_device_from_mesh(mesh)
+        # TODO: in principle, it shouldn't be necessary to destructively
+        # modify the user model here?  Not sure!
         self.model = move_to_fake(model, self.fake_mode, device)
         self.input_fn = input_fn
         self.mesh = mesh
@@ -257,23 +180,23 @@ class AutoParallel:
     def build_model_graph(self):
         decomp_table = _get_decomp_table()
         # needed because of https://github.com/pytorch/pytorch/issues/148977
+        # TODO: Don't do a global setting for this, this will unpredictably
+        # affect user code
         torch.__future__.set_swap_module_params_on_conversion(True)
+
         with self.fake_mode:
             inputs = self.input_fn()
             if not isinstance(inputs, tuple):
                 inputs = (inputs,)
 
-            (
-                gm,
-                self.spec,
-                self.params_len,
-                self.buffer_len,
-                self.metadata,
-            ) = aot_export_module(
-                self.model, inputs, decompositions=decomp_table, trace_joint=True
-            )
+        self.joint_with_descriptors = aot_export_joint_with_descriptors(
+            self.stack, self.model, inputs, decompositions=decomp_table
+        )
+        gm = self.joint_with_descriptors.graph_module
 
         # cleanup graph
+        # TODO: Make the DCE match exactly the AOTAutograd logic, I don't
+        # think I trust the default FX DCE logic
         gm.graph.eliminate_dead_code()
         gm.recompile()
         # disable pattern_matcher as it gets on our way
@@ -281,27 +204,30 @@ class AutoParallel:
         prev = torch._inductor.config.pattern_matcher
         torch._inductor.config.pattern_matcher = False
         try:
+            # TODO: Double check if this is what we want to do
             gm = joint_graph_passes(gm)
         finally:
             torch._inductor.config.pattern_matcher = prev
+        # TODO: We shouldn't actually remove these
         remove_assert_ops(gm.graph)
         gm.graph.eliminate_dead_code()
         gm.recompile()
         # now add aliases nodes to the graph to
         # give more room for optimizations
         _add_alias(gm)
-        apply_node_renaming(gm, self.params_len, self.buffer_len, self.metadata)
         trace_structured(
             "artifact",
             metadata_fn=lambda: {
                 "name": "autoparallel_joint_graph",
                 "encoding": "string",
             },
+            # TODO: Use print_readable instead with useful options
             payload_fn=lambda: str(gm.graph),
         )
 
         self.gm = gm
 
+    # TODO: Specify what the low/high meaning is (percentage?)
     def add_parameter_memory_constraint(self, low=None, high=None):
         # by default, divide the parameters by the world size
         if low is None:
@@ -329,6 +255,7 @@ class AutoParallel:
     def optimize_placement(self, verbose=True):
         if self.input_constraints is None:
             # forces sharding of input to be S(0) on first dimension and R on others
+            # TODO: This doesn't actually force S(0) on the first dimension?
             self.add_input_constraints(
                 [None] * len(self.sharding_optimizer.get_input_nodes())
             )
@@ -361,9 +288,25 @@ class AutoParallel:
     def apply_placement(self, sharding_placement=None):
         if sharding_placement is None:
             sharding_placement = self.sharding_placement
+        # TODO: what kind of updates do we have to do?
+        #  - graph obvs
+        #  - flat_args / updated_flat_args
+        # OTHER THINGS
+        #  - subclass_meta
+        #  - wrappers
+        #    - contains another instance of subclass info in self
+        #    - quite a lot of use of runtime_metadata
+        #
         with self.fake_mode:
-            parallel_gm, sharded_weights, sharded_buffers = apply_sharding_to_model(
-                self.gm, sharding_placement
+            (
+                parallel_gm,
+                sharded_param_dict,
+                sharded_buffer_dict,
+            ) = apply_sharding_to_model(
+                self.gm,
+                sharding_placement,
+                self.joint_with_descriptors.params_spec,
+                self.joint_with_descriptors.buffers_spec,
             )
         # clean it up by removing the added aliases from previous pass
         # as well as redundant views
@@ -378,52 +321,56 @@ class AutoParallel:
         )
         # now rename input/param/tangent/output/grad_param/grad_input nodes following
         # our convention
-        apply_node_renaming(
-            parallel_gm, self.params_len, self.buffer_len, self.metadata
-        )
+        # apply_node_renaming(
+        #    parallel_gm, self.params_len, self.buffer_len, self.metadata
+        # )
         self.parallel_gm = parallel_gm
+        self.joint_with_descriptors.graph_module = parallel_gm
 
-        param_names = [k for k, _ in self.model.named_parameters()]
-        buffer_names = [k for k, _ in self.model.named_buffers()]
-        param_names_no_fqns = [k.replace(".", "/") for k in param_names]
-        buffer_names_no_fqns = [k.replace(".", "/") for k in buffer_names]
-        assert len(param_names) == len(sharded_weights)
-        assert len(buffer_names) == len(sharded_buffers)
-
-        sharded_weights_no_fqns = {
-            k: v for k, v in zip(param_names_no_fqns, sharded_weights)
-        }
-        sharded_buffers_no_fqns = {
-            k: v for k, v in zip(buffer_names_no_fqns, sharded_buffers)
-        }
-
-        # TODO: preserve state dict properly in the generated nn.module
-        self.sharded_weights = sharded_weights_no_fqns
-        self.sharded_buffers = sharded_buffers_no_fqns
-        self.parallel_model_fn, self.fwd_gm, self.bwd_gm = prepare_module(
-            parallel_gm, self.spec, self.metadata.num_outputs
+        # NB: so this function takes in the parameters at the beginning
+        self.parallel_model_fn = aot_compile_joint_with_descriptors(
+            self.joint_with_descriptors
         )
 
-        self.parallel_model = self.parallel_model_fn(
-            sharded_weights_no_fqns, sharded_buffers_no_fqns
-        )
+        outer_self = self
+
+        # TODO: this probably belongs in the AOTAutograd API
+        # TODO: pytree handling
+        class AutoParallelModule(torch.nn.Module):
+            def forward(self, *args):
+                # NB: don't close over the parameters/buffers, as the user may
+                # reassign the module!
+                # TODO: It's this to just exactly match
+                # prepare_aot_module_simplified, this seems like an API gap
+                params = [
+                    v.to_local()
+                    for k, v in
+                    # TODO: this is very slow
+                    itertools.chain(
+                        dict(self.named_parameters(remove_duplicate=False)).items(),
+                        dict(self.named_buffers(remove_duplicate=False)).items(),
+                    )
+                ]
+                boxed_args = [*params, *args]
+                del params
+                out = outer_self.parallel_model_fn(boxed_args)
+                return out
+
+        self.parallel_model = AutoParallelModule()
+
+        for k, v in sharded_param_dict.items():
+            _assign_attr(v, self.parallel_model, k, attr_kind=_AttrKind.PARAMETER)
+
+        for k, v in sharded_buffer_dict.items():
+            _assign_attr(v, self.parallel_model, k, attr_kind=_AttrKind.BUFFER)
 
         # Right now we require a convention that the user model provides an init_weights method,
         # although we could snoop for other methods too.
         if hasattr(self.model, "init_weights"):
 
             def init_weights(*args, **kwargs):
-                # TODO: once we have proper FQN support we should remove this
-                # Replace 'params.tok_embeddings/weight' -> 'tok_embeddings.weight'
-                # Replace 'buffers_.freqs_cis' -> 'freqs_cis'
-                sharded_params_buffers = {
-                    k.replace("params.", "")
-                    .replace("buffers_.", "")
-                    .replace("/", "."): v
-                    for k, v in self.parallel_model.state_dict().items()
-                }
                 with stateless._reparametrize_module(
-                    self.model, sharded_params_buffers
+                    self.model, {**sharded_param_dict, **sharded_buffer_dict}
                 ):
                     self.model.init_weights(*args, **kwargs)
 

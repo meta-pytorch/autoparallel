@@ -3,6 +3,8 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+import contextlib
+
 import torch
 from torch import nn
 from torch.distributed.tensor.placement_types import Replicate, Shard
@@ -51,7 +53,7 @@ class Block(nn.Module):
 
         o = o0 + o
 
-        return o
+        return (o,)  # NB: if you torch.export this won't be a problem? Maybe.
 
 
 world_size = 256
@@ -84,24 +86,31 @@ def input_fn():
 # parallelize the model
 with torch.device("meta"):
     model = Block(nheads, dim1, dim2)
-autop = AutoParallel(model, input_fn, mesh)
-autop.add_parameter_memory_constraint(low=None, high=None)
 
-x_sharding = (Shard(0), Replicate())
+# TODO: make AutoParallel a context manager
+with contextlib.ExitStack() as stack:
+    autop = AutoParallel(stack, model, input_fn, mesh)
 
-autop.add_input_constraints([x_sharding])
-autop.add_output_constraints([x_sharding])
+    autop.gm.print_readable(expanded_def=True)
 
-sharding_placement = autop.optimize_placement()
+    autop.add_parameter_memory_constraint(low=None, high=None)
 
-# AutoParallel produces a module with meta-DTensor parameters that need to be initialized
-parallel_mod = autop.apply_placement(sharding_placement)
+    x_sharding = (Shard(0), Replicate())
+
+    autop.add_input_constraints([x_sharding])
+    autop.add_output_constraints([x_sharding])
+
+    sharding_placement = autop.optimize_placement()
+
+    # AutoParallel produces a module with meta-DTensor parameters that need to be initialized
+    parallel_mod = autop.apply_placement(sharding_placement)
+
 parallel_mod.to_empty(device="cuda")
 parallel_mod.init_weights()
 
 # now let's run it
 x = (torch.rand(bs // mesh.shape[0], seq_len, dim1, device="cuda"),)
-out = parallel_mod(*x)
+out, = parallel_mod(*x)
 out.backward(torch.randn_like(out))
 
 print("All good!")

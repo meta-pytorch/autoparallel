@@ -78,11 +78,25 @@ runtime cost while satisfying all constraints.
 """
 
 import math
+from typing import Optional
 
 import pulp
 import torch
+from torch._functorch._aot_autograd.descriptors import (
+    GradAOTOutput,
+    ParamAOTInput,
+    PlainAOTInput,
+    PlainAOTOutput,
+    TangentAOTInput,
+)
+from torch._functorch._aot_autograd.fx_utils import (
+    get_param_and_grad_nodes,
+    get_param_nodes,
+    get_plain_input_and_grad_nodes,
+    get_plain_output_and_tangent_nodes_indexed,
+)
 from torch.distributed.tensor._dtensor_spec import DTensorSpec
-from torch.distributed.tensor.placement_types import Replicate, Shard
+from torch.distributed.tensor.placement_types import Placement, Replicate, Shard
 from torch.utils._pytree import tree_flatten, tree_map_only
 
 from .compute_estimation import (
@@ -522,54 +536,6 @@ class ShardingOptimizer:
         for eqs in vars_per_arg.values():
             self.prob += (pulp.lpSum(eqs) == 1, _get_next_name(constraint_name))
 
-    def get_param_nodes(self):
-        # NOTE: this relies my customized export_module
-        param_nodes = [
-            x for x in self.graph.find_nodes(op="placeholder") if "param" in x.target
-        ]
-        return param_nodes
-
-    def get_input_nodes(self):
-        # NOTE: this relies my customized export_module
-        input_nodes = [
-            x for x in self.graph.find_nodes(op="placeholder") if "input" in x.target
-        ]
-        return input_nodes
-
-    def get_tangent_nodes(self):
-        # NOTE: this relies my customized export_module
-        tangent_nodes = [
-            x for x in self.graph.find_nodes(op="placeholder") if "tangent" in x.target
-        ]
-        return tangent_nodes
-
-    def get_fn_output_nodes(self):
-        # NOTE: this relies my customized export_module
-        output_nodes = [
-            x
-            for x in self.graph.find_nodes(op="output")[0].all_input_nodes
-            if "output" in x.name
-        ]
-        return output_nodes
-
-    def get_grad_input_nodes(self):
-        # NOTE: this relies my customized export_module
-        grad_input_nodes = [
-            x
-            for x in self.graph.find_nodes(op="output")[0].all_input_nodes
-            if "grad_input" in x.name
-        ]
-        return grad_input_nodes
-
-    def get_grad_param_nodes(self):
-        # NOTE: this relies my customized export_module
-        grad_param_nodes = [
-            x
-            for x in self.graph.find_nodes(op="output")[0].all_input_nodes
-            if "grad_param" in x.name
-        ]
-        return grad_param_nodes
-
     def add_grad_param_constraints(self):
         """
         USER CONSTRAINTS (Category 6c): Parameter-gradient consistency constraints.
@@ -577,15 +543,9 @@ class ShardingOptimizer:
 
         Mathematical form: x_{param} = x_{grad_param}
         """
-        # TODO: need to make sure that the params and grads are aligned, which are not always the case
-        # and we might have fewer gradients than parameters
-
-        # suppose joint graph case
-        param_nodes = self.get_param_nodes()
-        grad_nodes = self.get_grad_param_nodes()
-        # assert len(param_nodes) == len(grad_nodes)
-
-        for param, grad in zip(param_nodes, grad_nodes):
+        for param, grad in get_param_and_grad_nodes(self.graph):
+            if grad is None:
+                continue
             s_i = self.node_map[param]
             s_j = self.node_map[grad]
             # parameters have a single input strat, so remove one loop
@@ -622,7 +582,7 @@ class ShardingOptimizer:
         Mathematical form: Σ_{params} (size_ratio * x_{param}) ≤ memory_limit
         """
         # get all parameters
-        param_nodes = self.get_param_nodes()
+        param_nodes = get_param_nodes(self.graph)
         elms = []
         for node in param_nodes:
             s_i = self.node_map[node]
@@ -648,6 +608,7 @@ class ShardingOptimizer:
 
         Mathematical form: x_{i,a,o*,j*} = 1 for specified (o*,j*)
         """
+        assert node in self.strats, (node, self.strats.keys())
         strat = self.strats[node]
         if placement is None:
             # default is Shard(0) to parallelize on the batch
@@ -662,34 +623,44 @@ class ShardingOptimizer:
             )
         self._add_node_constraint(node, oi=oi, constraint_name=constraint_name)
 
-    def add_sharded_input_constraint(self, input_placements=None):
+    def add_sharded_input_constraint(
+        self, input_placements: Optional[list[Optional[tuple[Placement, ...]]]] = None
+    ):
         """
         USER CONSTRAINTS (Category 6a): Input placement constraints.
         Force specific placements for input nodes and their corresponding gradient inputs.
 
         Mathematical form: x_{i,a,o*,j*} = 1 for specified input placements (o*,j*)
         """
-        input_nodes = self.get_input_nodes()
-        if input_placements is None:
-            input_placements = [None] * len(input_nodes)
+        mut_ips = None
+        if input_placements is not None:
+            mut_ips = {i: p for i, p in enumerate(input_placements)}
 
-        assert len(input_placements) == len(
-            input_nodes
-        ), f"number of input placements {len(input_placements)} doesn't match number of input nodes {len(input_nodes)}"
-        for node, placement in zip(input_nodes, input_placements):
+        input_and_grad_nodes = get_plain_input_and_grad_nodes(self.graph)
+        for node, grad_node in input_and_grad_nodes:
+            desc = node.meta["desc"]
+            if input_placements is None:
+                placement = None
+            else:
+                assert isinstance(desc, PlainAOTInput)
+                placement = mut_ips.pop(desc.idx)
+
             self.add_node_constraint(
                 node, placement, constraint_name="input_constraint"
             )
+            if grad_node is not None:
+                self.add_node_constraint(
+                    grad_node, placement, constraint_name="grad_input_constraint"
+                )
 
-        # ensure gradients of inputs have same sharding as input
-        grad_input_nodes = self.get_grad_input_nodes()
-        for node in grad_input_nodes:
-            # grad_input nodes are numbered according to input, so
-            # get the index corresponding to the output
-            input_idx = int(node.name.split("_")[-1])
-            placement = input_placements[input_idx]
-            self.add_node_constraint(
-                node, placement, constraint_name="grad_input_constraint"
+        ignored_placements = []
+        for i, p in mut_ips.items():
+            if p is not None:
+                ignored_placements.append(i)
+
+        if ignored_placements:
+            raise RuntimeError(
+                f"We were unable to respect placements for inputs at indices {illegal_placements}.  This is because the traced joint graph did not actually have a dedicated placeholder node for these inputs.  This typically occurs because some inputs aliased each other; inspect the joint graph from tlparse for more details.  You can either remove an explicit placement for this input (replace it with None) or clone the inputs before tracing to remove aliasing."
             )
 
     def add_sharded_output_constraint(self, output_placements=None):
@@ -699,29 +670,37 @@ class ShardingOptimizer:
 
         Mathematical form: x_{i,a,o*,j*} = 1 for specified output placements (o*,j*)
         """
-        # add final constraint on the output strategy
-        output_nodes = self.get_fn_output_nodes()
+        mut_ops = None
+        if output_placements is not None:
+            mut_ops = {i: p for i, p in enumerate(output_placements)}
 
-        if output_placements is None:
-            output_placements = [None] * len(output_nodes)
+        output_and_tangent_nodes_index = get_plain_output_and_tangent_nodes_indexed(
+            self.graph
+        )
+        for desc, (node, tangent_node) in output_and_tangent_nodes_index.items():
+            if output_placements is None:
+                placement = None
+            elif isinstance(desc, PlainAOTOutput):
+                placement = mut_ops.pop(desc.idx)
+            else:
+                placement = None
 
-        assert len(output_placements) == len(
-            output_nodes
-        ), f"number of output placements {len(output_placements)} doesn't match number of output nodes {len(output_nodes)}"
-        for node, placement in zip(output_nodes, output_placements):
             self.add_node_constraint(
                 node, placement, constraint_name="output_constraint"
             )
+            if tangent_node is None:
+                self.add_node_constraint(
+                    tangent_node, placement, constraint_name="grad_output_constraint"
+                )
 
-        # ensure gradients of outputs have same sharding as output
-        tangent_nodes = self.get_tangent_nodes()
-        for node in tangent_nodes:
-            # tangent nodes are numbered according to output, so
-            # get the index corresponding to the output
-            output_idx = int(node.name.split("_")[-1])
-            placement = output_placements[output_idx]
-            self.add_node_constraint(
-                node, placement, constraint_name="grad_output_constraint"
+        ignored_placements = []
+        for i, p in mut_ops.items():
+            if p is not None:
+                ignored_placements.append(i)
+
+        if ignored_placements:
+            raise RuntimeError(
+                f"We were unable to respect placements for outputs at indices {illegal_placements}.  This is because the traced joint graph did not actually have a dedicated output node for these inputs.  This typically occurs because some outputs aliased each other; inspect the joint graph from tlparse for more details.  You can either remove an explicit placement for this output (replace it with None), stop the model from returning aliases of the tensor or clone the outputs before returning them from the graph to avoid aliasing."
             )
 
     def validate(self):
