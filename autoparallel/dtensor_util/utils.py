@@ -6,10 +6,9 @@
 
 import itertools
 from contextlib import contextmanager
-from typing import Callable, Optional, TypeVar
+from typing import Callable, TypeVar
 
 import torch
-from torch.distributed.tensor.placement_types import Placement
 from torch.distributed.tensor._dtensor_spec import DTensorSpec
 from torch.distributed.tensor._op_schema import (
     OpSchema,
@@ -25,7 +24,7 @@ from torch.distributed.tensor._ops.utils import (
     generate_redistribute_costs,
     is_tensor_shardable,
 )
-from torch.distributed.tensor.placement_types import Replicate, Shard
+from torch.distributed.tensor.placement_types import Placement, Replicate, Shard
 
 try:
     from torch.utils._cxx_pytree import register_pytree_node, tree_leaves
