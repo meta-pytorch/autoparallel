@@ -3,21 +3,19 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
-import autoparallel
-import pytest
 import functools
+from contextlib import contextmanager
+
+import numpy as np
 import torch
 from torch.distributed.tensor import (
-    distribute_tensor,
     DTensor,
-    init_device_mesh,
-    Shard,
     Replicate,
+    Shard,
+    distribute_tensor,
+    init_device_mesh,
 )
-
-
 from torch.distributed.tensor._dtensor_spec import DTensorSpec, TensorMeta
-
 from torch.distributed.tensor._op_schema import (
     OpInfo,
     OpSchema,
@@ -27,14 +25,11 @@ from torch.distributed.tensor._op_schema import (
     OutputSpecType,
     TupleStrategy,
 )
-
 from torch.testing._internal.common_utils import run_tests
 from torch.testing._internal.distributed._tensor.common_dtensor import (
     DTensorTestBase,
     with_comms,
 )
-from contextlib import contextmanager
-import numpy as np
 
 from autoparallel.dtensor_util import strategy_pool
 from autoparallel.dtensor_util.utils import batch_shard_strategy
@@ -44,6 +39,8 @@ aten = torch.ops.aten
 # -------------Test op strategy registration-------------
 # custom op without List[Tensor] as input
 # reference: https://docs.pytorch.org/docs/stable/library.html#torch.library.register_autograd
+
+
 @torch.library.custom_op("mylib::numpy_sin", mutates_args=())
 def numpy_sin(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     x_np = x.cpu().numpy()
@@ -118,7 +115,9 @@ def op_strategy_context(op_overload, strategy_func, schema_info=None):
     """
     try:
         # register the op strategy
-        strategy_pool.register_op_strategy(op_overload, schema_info=schema_info)(strategy_func)
+        strategy_pool.register_op_strategy(op_overload, schema_info=schema_info)(
+            strategy_func
+        )
         yield
     finally:
         # clear this op strategy cache
@@ -131,7 +130,9 @@ def op_strategy_context(op_overload, strategy_func, schema_info=None):
 # overwrite _op_dispatcher.sharding_propagator with customized
 # sharding_propagator. Feel like it's easier to modify the class here instead of
 # doing a mock patch.
-class CustomShardingPropagator(torch.distributed.tensor._sharding_prop.ShardingPropagator):
+class CustomShardingPropagator(
+    torch.distributed.tensor._sharding_prop.ShardingPropagator
+):
     def __init__(self):
         super().__init__()
         self.propagate_op_sharding.cache.cache_clear()
@@ -367,6 +368,7 @@ dispatcher = DTensor._op_dispatcher
 # change to the customized sharding_propagator for testing implicit fallback
 dispatcher.sharding_propagator = CustomShardingPropagator()
 
+
 class ImplicitRegistrationTest(DTensorTestBase):
     @with_comms
     def test_implicit_registration(self):
@@ -400,7 +402,9 @@ class DimShardingTest(DTensorTestBase):
     def test_batch_sharding(self):
         mesh = init_device_mesh(self.device_type, (2, self.world_size // 2))
         test_op = torch.ops.mylib.numpy_sin.default
-        shard_on_first_dim_strategy = functools.partial(batch_shard_strategy, input_shard_dim=[-1, 0], output_shard_dim=[0])
+        shard_on_first_dim_strategy = functools.partial(
+            batch_shard_strategy, input_shard_dim=[-1, 0], output_shard_dim=[0]
+        )
         with op_strategy_context(test_op, shard_on_first_dim_strategy):
             input_x = torch.randn([4, 4], device=self.device_type)
             input_y = torch.randn([8, 4], device=self.device_type)
@@ -412,11 +416,7 @@ class DimShardingTest(DTensorTestBase):
             # split the batch dim to test correctness
             input_y_1, input_y_2 = input_y.split(4)
             output = torch.cat(
-                (
-                    test_op(input_x, input_y_1),
-                    test_op(input_x, input_y_2)
-                ),
-                dim=0
+                (test_op(input_x, input_y_1), test_op(input_x, input_y_2)), dim=0
             )
             self.assertEqual(output_dt.full_tensor(), output)
             # below test won't work because it doesn't know batch dim to concentrate the final result

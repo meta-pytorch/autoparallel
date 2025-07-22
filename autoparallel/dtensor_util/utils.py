@@ -5,37 +5,34 @@
 
 
 import itertools
-from operator import is_
-import torch
-from torch.distributed.tensor.placement_types import (
-    Partial,
-    Placement,
-    Replicate,
-    Shard,
-)
-import warnings
 from contextlib import contextmanager
+from typing import Callable, Optional, TypeVar
 
+import torch
 from torch.distributed.tensor._dtensor_spec import DTensorSpec
-from typing_extensions import ParamSpec
 from torch.distributed.tensor._op_schema import (
-    OpInfo,
     OpSchema,
     OpSpec,
     OpStrategy,
-    OutputSharding,
-    OutputSpecType,
+    PlacementList,
     RuntimeSchemaInfo,
     StrategyType,
     TupleStrategy,
-    PlacementList,
 )
-from typing import Callable, cast, Optional, Union, TypeVar
+from torch.distributed.tensor._ops.utils import (
+    expand_to_full_mesh_op_strategy,
+    generate_redistribute_costs,
+    is_tensor_shardable,
+)
+from torch.distributed.tensor.placement_types import Replicate, Shard
 
-from torch.distributed.tensor._ops.utils import expand_to_full_mesh_op_strategy, is_tensor_shardable, generate_redistribute_costs
+try:
+    from torch.utils._cxx_pytree import register_pytree_node, tree_leaves
+except ImportError:
+    from torch.utils._pytree import tree_leaves, register_pytree_node  # type: ignore[no-redef]
 
+from typing_extensions import ParamSpec
 
-from torch.utils._cxx_pytree import register_pytree_node, tree_leaves
 # TODO: remove once https://github.com/pytorch/pytorch/pull/158046 is merged
 register_pytree_node(
     TupleStrategy,
@@ -48,8 +45,6 @@ aten = torch.ops.aten
 
 _T = TypeVar("_T")
 _P = ParamSpec("_P")
-
-
 
 
 # -------------define universal op strategy-------------
@@ -80,7 +75,12 @@ def replicate_op_strategy(op_schema: OpSchema) -> OpStrategy:
     return expand_to_full_mesh_op_strategy(mesh, op_schema, single_dim_placement)
 
 
-def batch_shard_strategy(op_schema: OpSchema, input_shard_dim: list[int], output_shard_dim:list[int], enable_shard_batch_dim_over_multiple_axis: bool = False) -> OpStrategy:
+def batch_shard_strategy(
+    op_schema: OpSchema,
+    input_shard_dim: list[int],
+    output_shard_dim: list[int],
+    enable_shard_batch_dim_over_multiple_axis: bool = False,
+) -> OpStrategy:
     """
     Shard the input tensor over the specified dimensions. The strategy will map
     batch dim of input/output tensors to the same device mesh axis (or same
@@ -136,7 +136,11 @@ def batch_shard_strategy(op_schema: OpSchema, input_shard_dim: list[int], output
     output_strategy = OpStrategy([])
     mesh = inputs_strategy[0].mesh
     device_axis = list(range(mesh.ndim))
-    use_how_many_axis = [i+1 for i in range(mesh.ndim)] if enable_shard_batch_dim_over_multiple_axis else [1]
+    use_how_many_axis = (
+        [i + 1 for i in range(mesh.ndim)]
+        if enable_shard_batch_dim_over_multiple_axis
+        else [1]
+    )
     # number of device axises to shard on for the batch dim
     for num_axis in use_how_many_axis:
         device_combinations = list(itertools.combinations(device_axis, num_axis))
@@ -172,23 +176,41 @@ def batch_shard_strategy(op_schema: OpSchema, input_shard_dim: list[int], output
                 )
                 output_specs_list.append(output_spec)
 
-            output_specs = output_specs_list[0] if len(output_specs_list) == 1 else tuple(output_specs_list)
+            output_specs = (
+                output_specs_list[0]
+                if len(output_specs_list) == 1
+                else tuple(output_specs_list)
+            )
             input_specs = input_specs_list
-            redistribute_cost = [generate_redistribute_costs(strat, input_specs_list[i])  for i, strat in enumerate(inputs_strategy)]
-            output_strategy.strategies.append(OpSpec(output_specs, input_specs, redistribute_cost))
+            redistribute_cost = [
+                generate_redistribute_costs(strat, input_specs_list[i])
+                for i, strat in enumerate(inputs_strategy)
+            ]
+            output_strategy.strategies.append(
+                OpSpec(output_specs, input_specs, redistribute_cost)
+            )
     return output_strategy
 
 
-class StrategyPool():
+class StrategyPool:
     def __init__(self) -> None:
         # collect the existing strategy from the DTensor upstream
-        self.op_strategy_funcs: dict[torch._ops.OpOverload, Callable[[OpSchema], StrategyType]] = torch.distributed.tensor.DTensor._op_dispatcher.sharding_propagator.op_strategy_funcs
-        self.op_to_schema_info: dict[torch._ops.OpOverload, Optional[RuntimeSchemaInfo]] = torch.distributed.tensor.DTensor._op_dispatcher.sharding_propagator.op_to_schema_info
+        self.op_strategy_funcs: dict[
+            torch._ops.OpOverload, Callable[[OpSchema], StrategyType]
+        ] = (
+            torch.distributed.tensor.DTensor._op_dispatcher.sharding_propagator.op_strategy_funcs
+        )
+        self.op_to_schema_info: dict[
+            torch._ops.OpOverload, Optional[RuntimeSchemaInfo]
+        ] = (
+            torch.distributed.tensor.DTensor._op_dispatcher.sharding_propagator.op_to_schema_info
+        )
         self.enable_implicit_replication: bool = False
         self.implicit_strategy_op_tracker: list[torch._ops.OpOverload] = []
 
-
-    def get_op_strategy(self, op: torch._ops.OpOverload,  op_schema: OpSchema) -> StrategyType:
+    def get_op_strategy(
+        self, op: torch._ops.OpOverload, op_schema: OpSchema
+    ) -> StrategyType:
         if op not in self.op_strategy_funcs:
             if not self.enable_implicit_replication:
                 raise NotImplementedError(
@@ -198,8 +220,6 @@ class StrategyPool():
                 self.implicit_strategy_op_tracker.append(op)
                 self.register_op_strategy(op)(replicate_op_strategy)
         return self.op_strategy_funcs[op](op_schema)
-
-
 
     def register_op_strategy(
         self, op: torch._ops.OpOverload, schema_info=None
@@ -217,7 +237,6 @@ class StrategyPool():
             return impl
 
         return wrapper
-
 
     @contextmanager
     def implicit_strategy_context(self):
@@ -240,7 +259,9 @@ class StrategyPool():
     # `fill_missing_redistribute_cost` in autoparallel/utils.py, which is a hack
     # to generate redistribute cost given input specs, and only tested on
     # certain ops. We can potentially make an improvement.
-    def fill_missing_redistribute_cost(self, op: torch._ops.OpOverload, op_schema: OpSchema):
+    def fill_missing_redistribute_cost(
+        self, op: torch._ops.OpOverload, op_schema: OpSchema
+    ):
         """
         Fill missing redistribute cost for strategies.
         """
