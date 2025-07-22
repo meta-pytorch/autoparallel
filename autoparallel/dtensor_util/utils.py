@@ -9,6 +9,7 @@ from contextlib import contextmanager
 from typing import Callable, Optional, TypeVar
 
 import torch
+from torch.distributed.tensor.placement_types import Placement
 from torch.distributed.tensor._dtensor_spec import DTensorSpec
 from torch.distributed.tensor._op_schema import (
     OpSchema,
@@ -151,7 +152,7 @@ def batch_shard_strategy(
             is_shardable = True
             for op_stratgy, dim in zip(inputs_strategy, input_shard_dim):
                 # create a new list of shard_dim_option
-                new_placements = [Replicate()] * mesh.ndim
+                new_placements: list[Placement] = [Replicate()] * mesh.ndim
                 for axis in comb:
                     new_placements[axis] = Shard(dim) if dim >= 0 else Replicate()
                 tensor_meta = op_stratgy.strategies[0].output_spec.tensor_meta
@@ -187,7 +188,7 @@ def batch_shard_strategy(
                 for i, strat in enumerate(inputs_strategy)
             ]
             output_strategy.strategies.append(
-                OpSpec(output_specs, input_specs, redistribute_cost)
+                OpSpec(output_specs, input_specs, redistribute_cost)  # type: ignore
             )
     return output_strategy
 
@@ -201,7 +202,7 @@ class StrategyPool:
             torch.distributed.tensor.DTensor._op_dispatcher.sharding_propagator.op_strategy_funcs
         )
         self.op_to_schema_info: dict[
-            torch._ops.OpOverload, Optional[RuntimeSchemaInfo]
+            torch._ops.OpOverload, RuntimeSchemaInfo
         ] = (
             torch.distributed.tensor.DTensor._op_dispatcher.sharding_propagator.op_to_schema_info
         )
