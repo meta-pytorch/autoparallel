@@ -10,6 +10,7 @@ from torch.distributed.tensor._op_schema import OpSchema, OpStrategy, TupleStrat
 from torch.distributed.tensor._ops.utils import generate_redistribute_costs
 from torch.utils._pytree import tree_flatten, tree_map_only
 
+from .dtensor_util import strategy_pool
 from .propagation_rules import _op_partial_rules, _op_rules, remove_invalid_configs
 
 
@@ -110,11 +111,7 @@ def get_placement_options(mesh, op, specs, user_args, user_kwargs):
     if op in _op_partial_rules:
         out_strat = _op_partial_rules[op](mesh, op_schema)
     else:
-        out_strat = torch.distributed.tensor.DTensor._op_dispatcher.sharding_propagator.op_strategy_funcs[
-            op
-        ](
-            op_schema
-        )
+        out_strat = strategy_pool.get_op_strategy(op, op_schema)
 
     propagate_tensor_meta(op, user_args, user_kwargs, out_strat)
     fill_missing_redistribute_cost(op, specs, out_strat)
