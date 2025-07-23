@@ -23,8 +23,8 @@ from torch.distributed.tensor._op_schema import (
     OpStrategy,
     OutputSharding,
     OutputSpecType,
-    TupleStrategy,
     RuntimeSchemaInfo,
+    TupleStrategy,
 )
 from torch.testing._internal.common_utils import run_tests
 from torch.testing._internal.distributed._tensor.common_dtensor import (
@@ -478,11 +478,15 @@ class DimShardingTest(DTensorTestBase):
         # 1. strategy that will try shard dim 0 into one devices axis.
         shard_first_dim_to_multiple_devices_strategy = functools.partial(
             batch_shard_strategy,
-            input_shard_dim=[0, 0, 0, 0, 0], # flatten input_y
+            input_shard_dim=[0, 0, 0, 0, 0],  # flatten input_y
             output_shard_dim=[0],
             enable_shard_batch_dim_over_multiple_axis=True,
         )
-        with op_strategy_context(test_op, shard_first_dim_to_multiple_devices_strategy, schema_info=RuntimeSchemaInfo(needs_pytree=True)):
+        with op_strategy_context(
+            test_op,
+            shard_first_dim_to_multiple_devices_strategy,
+            schema_info=RuntimeSchemaInfo(needs_pytree=True),
+        ):
             # dim 0 is the batch dim. Here we shard 16 over one device axis
             input_x = torch.randn([16, 8, 4], device=self.device_type)
             input_y = [

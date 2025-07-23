@@ -4,10 +4,11 @@
 # LICENSE file in the root directory of this source tree.
 
 
+import copy
 import itertools
+import warnings
 from contextlib import contextmanager
 from typing import Callable, Optional, TypeVar
-import warnings
 
 import torch
 from torch.distributed.tensor._dtensor_spec import DTensorSpec
@@ -204,12 +205,15 @@ class StrategyPool:
         # collect the existing strategy from the DTensor upstream
         self.op_strategy_funcs: dict[
             torch._ops.OpOverload, Callable[[OpSchema], StrategyType]
-        ] = (
+        ] = copy.deepcopy(
             torch.distributed.tensor.DTensor._op_dispatcher.sharding_propagator.op_strategy_funcs
         )
-        self.op_to_schema_info: dict[
-            torch._ops.OpOverload, Optional[RuntimeSchemaInfo]
-        ] = {k: v for k, v in torch.distributed.tensor.DTensor._op_dispatcher.sharding_propagator.op_to_schema_info.items() if v is not None}
+        # we probably don't need to care about existing op_to_schema_info for AP
+        self.op_to_schema_info = {
+            k: copy.deepcopy(v)
+            for k, v in torch.distributed.tensor.DTensor._op_dispatcher.sharding_propagator.op_to_schema_info.items()
+            if v is not None
+        }
 
         self.enable_implicit_replication: bool = False
         self.implicit_strategy_op_tracker: list[torch._ops.OpOverload] = []
@@ -224,13 +228,19 @@ class StrategyPool:
                 )
             else:
                 self.implicit_strategy_op_tracker.append(op)
+                warnings.warn(
+                    f"implicitly register sharding strategy op {op.name()} using {replicate_op_strategy.__name__}"
+                )
                 self.register_op_strategy(op)(replicate_op_strategy)
         return self.op_strategy_funcs[op](op_schema)
 
     def register_op_strategy(
-        self, op: torch._ops.OpOverload, schema_info=None
+        self,
+        op: torch._ops.OpOverload,
+        schema_info=RuntimeSchemaInfo(needs_pytree=True),
     ) -> Callable[[Callable[_P, _T]], Callable[_P, _T]]:
         # pyre-fixme[2]: Parameter must be annotated.
+        # always enable pytree as dispatching overhead is not a concern in AP.
         def wrapper(impl):
             if isinstance(op, list):
                 overloads = op
