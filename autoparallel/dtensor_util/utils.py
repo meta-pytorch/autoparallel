@@ -210,7 +210,9 @@ class StrategyPool:
             torch.distributed.tensor.DTensor._op_dispatcher.sharding_propagator.op_strategy_funcs
         )
         # collect existing rules
-        self.op_to_rules: dict[torch._ops.OpOverload, Callable[[OpSchema], OutputSharding]] = copy.deepcopy(
+        self.op_to_rules: dict[
+            torch._ops.OpOverload, Callable[[OpSchema], OutputSharding]
+        ] = copy.deepcopy(
             torch.distributed.tensor.DTensor._op_dispatcher.sharding_propagator.op_to_rules
         )
         # we probably don't need to care about existing op_to_schema_info for AP
