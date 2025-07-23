@@ -141,6 +141,7 @@ class CustomShardingPropagator(
     def __init__(self):
         super().__init__()
         self.propagate_op_sharding.cache.cache_clear()
+        self.op_to_rules = strategy_pool.op_to_rules
         self.op_strategy_funcs = strategy_pool.op_strategy_funcs
         self.op_to_schema_info = strategy_pool.op_to_schema_info
 
