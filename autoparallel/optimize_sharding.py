@@ -463,6 +463,9 @@ class ShardingOptimizer:
                 code.insert(l_id, line)
                 l_id += 1
                 continue
+            # LOL
+            while not code[l_id].lstrip().startswith(repr(node)):
+                l_id += 1
             code[l_id] += line
             l_id += 1
         code = "\n".join(code)
@@ -680,15 +683,14 @@ class ShardingOptimizer:
         for desc, (node, tangent_node) in output_and_tangent_nodes_index.items():
             if output_placements is None:
                 placement = None
-            elif isinstance(desc, PlainAOTOutput):
-                placement = mut_ops.pop(desc.idx)
             else:
-                placement = None
+                assert isinstance(desc, PlainAOTOutput)
+                placement = mut_ops.pop(desc.idx)
 
             self.add_node_constraint(
                 node, placement, constraint_name="output_constraint"
             )
-            if tangent_node is None:
+            if tangent_node is not None:
                 self.add_node_constraint(
                     tangent_node, placement, constraint_name="grad_output_constraint"
                 )
