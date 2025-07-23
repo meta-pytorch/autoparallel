@@ -399,28 +399,70 @@ class ImplicitRegistrationTest(DTensorTestBase):
 
 class DimShardingTest(DTensorTestBase):
     @with_comms
-    def test_batch_sharding(self):
+    def test_simple_batch_sharding(self):
+        # both input tensors batch on dim 0
+        mesh = init_device_mesh(self.device_type, (2, self.world_size // 2))
+        test_op = torch.ops.mylib.numpy_sin.default
+
+        # 1. strategy that will try shard dim 0 into one devices axis.
+        shard_first_dim_strategy = functools.partial(
+            batch_shard_strategy, input_shard_dim=[0, 0], output_shard_dim=[0]
+        )
+        with op_strategy_context(test_op, shard_first_dim_strategy):
+            # dim 0 is the batch dim. Here we shard 16 over one device axis
+            input_x = torch.randn([16, 1, 4], device=self.device_type)
+            input_y = torch.randn([16, 1, 4], device=self.device_type)
+            # any sharding below should work
+            input_x_dt = distribute_tensor(input_x, mesh, [Shard(1), Replicate()])
+            input_y_dt = distribute_tensor(input_y, mesh, [Replicate(), Shard(0)])
+            self._test_op_on_dtensor(test_op, input_x_dt, input_y_dt)
+
+        # 2. strategy that will try shard dim 0 into multiple devices.
+        shard_first_dim_to_multiple_devices_strategy = functools.partial(
+            batch_shard_strategy,
+            input_shard_dim=[0, 0],
+            output_shard_dim=[0],
+            enable_shard_batch_dim_over_multiple_axis=True,
+        )
+        with op_strategy_context(test_op, shard_first_dim_to_multiple_devices_strategy):
+            # dim 0 is the batch dim. Here we potentially shard 16 over multiple device axises
+            input_x = torch.randn([16, 1, 4], device=self.device_type)
+            input_y = torch.randn([16, 1, 4], device=self.device_type)
+            # any sharding below should work
+            input_x_dt = distribute_tensor(input_x, mesh, [Shard(1), Replicate()])
+            input_y_dt = distribute_tensor(input_y, mesh, [Replicate(), Shard(0)])
+            self._test_op_on_dtensor(test_op, input_x_dt, input_y_dt)
+
+    @with_comms
+    def test_broadcast_batch_sharding(self):
+        # Not recommended, user need to make sure the op supports input with
+        # broadcast first. If not supported, try unsqueeze inputs first to match
+        # each other's dimensions and and use the example in the
+        # test_simple_batch_sharding test.
         mesh = init_device_mesh(self.device_type, (2, self.world_size // 2))
         test_op = torch.ops.mylib.numpy_sin.default
         shard_on_first_dim_strategy = functools.partial(
-            batch_shard_strategy, input_shard_dim=[-1, 0], output_shard_dim=[0]
+            batch_shard_strategy, input_shard_dim=[None, 0], output_shard_dim=[0]
         )
         with op_strategy_context(test_op, shard_on_first_dim_strategy):
-            input_x = torch.randn([4, 4], device=self.device_type)
-            input_y = torch.randn([8, 4], device=self.device_type)
+            input_x = torch.randn([1, 4], device=self.device_type)
+            # input_y's 16 locates on the batch dim
+            input_y = torch.randn([16, 1, 4], device=self.device_type)
             # any sharding below should work
             input_x_dt = distribute_tensor(input_x, mesh, [Shard(1), Replicate()])
             input_y_dt = distribute_tensor(input_y, mesh, [Replicate(), Shard(0)])
 
             output_dt = test_op(input_x_dt, input_y_dt)
+
             # split the batch dim to test correctness
-            input_y_1, input_y_2 = input_y.split(4)
+            input_y_chucks = torch.chunk(input_y, 4, dim=0)
             output = torch.cat(
-                (test_op(input_x, input_y_1), test_op(input_x, input_y_2)), dim=0
+                [test_op(input_x, input_y_part) for input_y_part in input_y_chucks]
             )
             self.assertEqual(output_dt.full_tensor(), output)
-            # below test won't work because it doesn't know batch dim to concentrate the final result
-            # self._test_op_on_dtensor(test_op, input_x_dt, input_y_dt)
+
+            # or we can test directly since the op support broadcast.
+            self._test_op_on_dtensor(test_op, input_x_dt, input_y_dt)
 
 
 if __name__ == "__main__":

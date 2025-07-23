@@ -6,7 +6,7 @@
 
 import itertools
 from contextlib import contextmanager
-from typing import Callable, TypeVar
+from typing import Callable, Optional, TypeVar
 
 import torch
 from torch.distributed.tensor._dtensor_spec import DTensorSpec
@@ -77,8 +77,8 @@ def replicate_op_strategy(op_schema: OpSchema) -> OpStrategy:
 
 def batch_shard_strategy(
     op_schema: OpSchema,
-    input_shard_dim: list[int],
-    output_shard_dim: list[int],
+    input_shard_dim: list[Optional[int]],
+    output_shard_dim: list[Optional[int]],
     enable_shard_batch_dim_over_multiple_axis: bool = False,
 ) -> OpStrategy:
     """
@@ -93,8 +93,8 @@ def batch_shard_strategy(
     Args:
         op_schema (OpSchema): the op schema
 
-        input_shard_dim (list[int]): the list of canonical normalized shard
-        dimensions to consider for each input tensor argument. Use `-1` if no
+        input_shard_dim (list[Optional[int]]): the list of canonical normalized shard
+        dimensions to consider for each input tensor argument. Use `None` if no
         batch dim of the input arg. If an arg is List[Tenor], we flatten it
         first and then match with input_shard_dim. Since the dim is not specific
         to the device mesh axis, it can be a combination of any device axises.
@@ -102,14 +102,14 @@ def batch_shard_strategy(
         input_shard_dim = [1,1], it can shard A's dim 0 over device axis X,
         shard B's dim 0 over device axis X. X can be an any of device axises.
         The output follow the same sharding as input. Example 2: input tensor
-        A[64,8], B[64,16,1024], C[64,8], with input_shard_dim = [-1,2,-1], it
+        A[64,8], B[64,16,1024], C[64,8], with input_shard_dim = [None,2,None], it
         will Replicate A,C over all device dim and only shard B's dim 2 over the
         device mesh. Assume the device mesh has 3 axis, then tensor B's
         placement can be (Shard(2), Shard(2), Replicate()), (Shard(2),
         Replicate(), Shard(2)), (Replicate(), Shard(2), Shard(2)).
 
-        output_shard_dim (list[int]): the list of canonical normalized shard
-        dimensions to consider for each output tensor argument. Use `-1` if no
+        output_shard_dim (list[Optional[int]]): the list of canonical normalized shard
+        dimensions to consider for each output tensor argument. Use `None` if no
         batch dim of the output arg. For example, if the output is a single
         tensor and is sharded on dim 0, pass in [0] then.
 
@@ -153,7 +153,7 @@ def batch_shard_strategy(
                 # create a new list of shard_dim_option
                 new_placements: list[Placement] = [Replicate()] * mesh.ndim
                 for axis in comb:
-                    new_placements[axis] = Shard(dim) if dim >= 0 else Replicate()
+                    new_placements[axis] = Shard(dim) if dim else Replicate()
                 tensor_meta = op_stratgy.strategies[0].output_spec.tensor_meta
                 new_input_spec = DTensorSpec(
                     mesh,
@@ -169,7 +169,7 @@ def batch_shard_strategy(
             for dim in output_shard_dim:
                 new_placements = [Replicate()] * mesh.ndim
                 for axis in comb:
-                    new_placements[axis] = Shard(dim) if dim >= 0 else Replicate()
+                    new_placements[axis] = Shard(dim) if dim else Replicate()
                 output_spec = DTensorSpec(
                     mesh,
                     tuple(new_placements),
