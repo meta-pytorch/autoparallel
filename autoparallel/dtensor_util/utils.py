@@ -7,6 +7,7 @@
 import itertools
 from contextlib import contextmanager
 from typing import Callable, Optional, TypeVar
+import warnings
 
 import torch
 from torch.distributed.tensor._dtensor_spec import DTensorSpec
@@ -34,11 +35,15 @@ except ImportError:
 from typing_extensions import ParamSpec
 
 # TODO: remove once https://github.com/pytorch/pytorch/pull/158046 is merged
-register_pytree_node(
-    TupleStrategy,
-    lambda node: (node.children, None),
-    lambda children, _: TupleStrategy(tuple(children)),
-)
+try:
+    register_pytree_node(
+        TupleStrategy,
+        lambda node: (node.children, None),
+        lambda children, _: TupleStrategy(tuple(children)),
+    )
+except ValueError:
+    # already registered TupleStrategy, skip
+    pass
 
 
 aten = torch.ops.aten
@@ -91,27 +96,27 @@ def batch_shard_strategy(
     batch dim size are all the same. Output should always have a batch dim.
 
     Args:
-        op_schema (OpSchema): the op schema
+        op_schema (OpSchema): the op schema.
 
-        input_shard_dim (list[Optional[int]]): the list of canonical normalized shard
-        dimensions to consider for each input tensor argument. Use `None` if no
-        batch dim of the input arg. If an arg is List[Tenor], we flatten it
-        first and then match with input_shard_dim. Since the dim is not specific
-        to the device mesh axis, it can be a combination of any device axises.
-        Example 1: input tensor A[1024,64,8], B[1024,64,16], with
-        input_shard_dim = [1,1], it can shard A's dim 0 over device axis X,
-        shard B's dim 0 over device axis X. X can be an any of device axises.
-        The output follow the same sharding as input. Example 2: input tensor
-        A[64,8], B[64,16,1024], C[64,8], with input_shard_dim = [None,2,None], it
-        will Replicate A,C over all device dim and only shard B's dim 2 over the
-        device mesh. Assume the device mesh has 3 axis, then tensor B's
-        placement can be (Shard(2), Shard(2), Replicate()), (Shard(2),
-        Replicate(), Shard(2)), (Replicate(), Shard(2), Shard(2)).
+        input_shard_dim (list[Optional[int]]): the list of shard dimensions to
+        consider for each input tensor argument. Use `None` if no batch dim of
+        the input arg. If an arg is List[Tenor], we flatten it first and then
+        match with input_shard_dim. Since the dim is not specific to the device
+        mesh axis, it can be a combination of any device axises. Example 1:
+        input tensor A[1024,64,8], B[1024,64,16], with input_shard_dim = [1,1],
+        it can shard A's dim 0 over device axis X, and shard B's dim 0 over
+        device axis X. X can be any of device axises. The output follow the same
+        sharding as input. Example 2: input tensor A[64,8], B[64,16,1024],
+        C[64,8], with input_shard_dim = [None,2,None], it will Replicate A,C
+        over all device dim and only shard B's dim 2 over the device mesh.
+        Assume the device mesh has 3 axis, then tensor B's placement can be
+        (Shard(2), Shard(2), Replicate()), (Shard(2), Replicate(), Shard(2)),
+        (Replicate(), Shard(2), Shard(2)).
 
-        output_shard_dim (list[Optional[int]]): the list of canonical normalized shard
-        dimensions to consider for each output tensor argument. Use `None` if no
-        batch dim of the output arg. For example, if the output is a single
-        tensor and is sharded on dim 0, pass in [0] then.
+        output_shard_dim (list[Optional[int]]): the list of shard dimensions to
+        consider for each output tensor argument. Use `None` if no batch dim of
+        the output arg. For example, if the output is a single tensor and is
+        sharded on dim 0, pass in [0] then.
 
         enable_shard_batch_dim_over_multiple_axis (bool): if True, the strategy
         will try also map batch dim to multiple device axis. Default is False.
@@ -144,7 +149,9 @@ def batch_shard_strategy(
     # number of device axises to shard on for the batch dim
     for num_axis in use_how_many_axis:
         device_combinations = list(itertools.combinations(device_axis, num_axis))
-        # e.g., if num_axis == 2, device_combinations = [(0,1), (0,2), (1,2), ...]
+        # e.g., if num_axis == 2, device_combinations = [(0,1), (0,2), (1,2),
+        # ...]. Then One feasible strategy is to shard tensor dim on both axis
+        # (0,1). We check all combinations in device_combinations below.
         for comb in device_combinations:
             input_specs_list: list[DTensorSpec] = []
             output_specs_list: list[DTensorSpec] = []
@@ -201,10 +208,9 @@ class StrategyPool:
             torch.distributed.tensor.DTensor._op_dispatcher.sharding_propagator.op_strategy_funcs
         )
         self.op_to_schema_info: dict[
-            torch._ops.OpOverload, RuntimeSchemaInfo
-        ] = (
-            torch.distributed.tensor.DTensor._op_dispatcher.sharding_propagator.op_to_schema_info
-        )
+            torch._ops.OpOverload, Optional[RuntimeSchemaInfo]
+        ] = {k: v for k, v in torch.distributed.tensor.DTensor._op_dispatcher.sharding_propagator.op_to_schema_info.items() if v is not None}
+
         self.enable_implicit_replication: bool = False
         self.implicit_strategy_op_tracker: list[torch._ops.OpOverload] = []
 
@@ -239,11 +245,15 @@ class StrategyPool:
         return wrapper
 
     @contextmanager
-    def implicit_strategy_context(self):
+    def replicate_for_unsupported_operators(self):
         """
         Context manager for setting and clearing implicit strategy.
         """
         try:
+            if self.enable_implicit_replication:
+                raise RuntimeError(
+                    "Implicit strategy is already enabled. Cannot enable it again."
+                )
             self.enable_implicit_replication = True
             yield
         finally:

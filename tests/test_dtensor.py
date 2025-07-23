@@ -24,6 +24,7 @@ from torch.distributed.tensor._op_schema import (
     OutputSharding,
     OutputSpecType,
     TupleStrategy,
+    RuntimeSchemaInfo,
 )
 from torch.testing._internal.common_utils import run_tests
 from torch.testing._internal.distributed._tensor.common_dtensor import (
@@ -127,9 +128,13 @@ def op_strategy_context(op_overload, strategy_func, schema_info=None):
             del strategy_pool.op_to_schema_info[op_overload]
 
 
-# overwrite _op_dispatcher.sharding_propagator with customized
-# sharding_propagator. Feel like it's easier to modify the class here instead of
-# doing a mock patch.
+# Overwrite upstream `_op_dispatcher.sharding_propagator` with customized
+# sharding_propagator. This is for testing purpose under eager mode and
+# AutoParallel won't use the propagate function. The main changes are 1) Skip
+# the LRU cache for strategies, which makes it easier to update/delete
+# strategies; 2) don't necessarily trigger runtime error if an op doesn't have
+# rule or strategy registered. Instead, check if we want to use implicit
+# replication strategy fallback.
 class CustomShardingPropagator(
     torch.distributed.tensor._sharding_prop.ShardingPropagator
 ):
@@ -386,7 +391,7 @@ class ImplicitRegistrationTest(DTensorTestBase):
             self._test_op_on_dtensor(test_op, input_x_dt, input_y_dt)
 
         # 2. test_op strategy implicitly registered under context manager
-        with strategy_pool.implicit_strategy_context():
+        with strategy_pool.replicate_for_unsupported_operators():
             self._test_op_on_dtensor(test_op, input_x_dt, input_y_dt)
 
         # 3. remove registration after exiting the context manager
@@ -448,7 +453,7 @@ class DimShardingTest(DTensorTestBase):
             input_x = torch.randn([1, 4], device=self.device_type)
             # input_y's 16 locates on the batch dim
             input_y = torch.randn([16, 1, 4], device=self.device_type)
-            # any sharding below should work
+            # any sharding below should work as long as the tensor dim it is shardable
             input_x_dt = distribute_tensor(input_x, mesh, [Shard(1), Replicate()])
             input_y_dt = distribute_tensor(input_y, mesh, [Replicate(), Shard(0)])
 
@@ -463,6 +468,34 @@ class DimShardingTest(DTensorTestBase):
 
             # or we can test directly since the op support broadcast.
             self._test_op_on_dtensor(test_op, input_x_dt, input_y_dt)
+
+    @with_comms
+    def test_simple_tuple_batch_sharding(self):
+        # both input tensors batch on dim 0
+        mesh = init_device_mesh(self.device_type, (2, self.world_size // 2))
+        test_op = torch.ops.mylib.numpy_tuple_sin.default
+
+        # 1. strategy that will try shard dim 0 into one devices axis.
+        shard_first_dim_to_multiple_devices_strategy = functools.partial(
+            batch_shard_strategy,
+            input_shard_dim=[0, 0, 0, 0, 0], # flatten input_y
+            output_shard_dim=[0],
+            enable_shard_batch_dim_over_multiple_axis=True,
+        )
+        with op_strategy_context(test_op, shard_first_dim_to_multiple_devices_strategy, schema_info=RuntimeSchemaInfo(needs_pytree=True)):
+            # dim 0 is the batch dim. Here we shard 16 over one device axis
+            input_x = torch.randn([16, 8, 4], device=self.device_type)
+            input_y = [
+                torch.randn([16, 8, 4], device=self.device_type) for _ in range(3)
+            ]
+            input_z = torch.randn([16, 8, 4], device=self.device_type)
+            # any sharding below should work as long as the tensor dim it is shardable
+            input_x_dt = distribute_tensor(input_x, mesh, [Shard(0), Shard(1)])
+            input_y_dt = [
+                distribute_tensor(i, mesh, [Shard(1), Shard(1)]) for i in input_y
+            ]
+            input_z_dt = distribute_tensor(input_z, mesh, [Shard(1), Shard(0)])
+            self._test_op_on_dtensor(test_op, input_x_dt, input_y_dt, input_z_dt)
 
 
 if __name__ == "__main__":
