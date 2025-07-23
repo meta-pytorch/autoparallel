@@ -115,7 +115,7 @@ _GLOBAL_NAMES: dict[str, int] = {}
 
 
 def _get_next_name(name):
-    global _GLOBAL_NAMEs
+    global _GLOBAL_NAMES  # noqa: F824
     idx = _GLOBAL_NAMES.setdefault(name, 0)
     _GLOBAL_NAMES[name] += 1
     return name + f"_{idx:03}"
@@ -640,6 +640,7 @@ class ShardingOptimizer:
                 placement = None
             else:
                 assert isinstance(desc, PlainAOTInput)
+                assert mut_ips is not None
                 placement = mut_ips.pop(desc.idx)
 
             self.add_node_constraint(
@@ -651,9 +652,10 @@ class ShardingOptimizer:
                 )
 
         ignored_placements = []
-        for i, p in mut_ips.items():
-            if p is not None:
-                ignored_placements.append(i)
+        if mut_ips is not None:
+            for i, p in mut_ips.items():
+                if p is not None:
+                    ignored_placements.append(i)
 
         if ignored_placements:
             raise RuntimeError(
@@ -681,6 +683,7 @@ class ShardingOptimizer:
                 placement = None
             else:
                 assert isinstance(desc, PlainAOTOutput)
+                assert mut_ops is not None
                 placement = mut_ops.pop(desc.idx)
 
             self.add_node_constraint(
@@ -692,9 +695,10 @@ class ShardingOptimizer:
                 )
 
         ignored_placements = []
-        for i, p in mut_ops.items():
-            if p is not None:
-                ignored_placements.append(i)
+        if mut_ops is not None:
+            for i, p in mut_ops.items():
+                if p is not None:
+                    ignored_placements.append(i)
 
         if ignored_placements:
             raise RuntimeError(
