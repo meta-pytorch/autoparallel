@@ -254,6 +254,7 @@ class StrategyPool:
                     del self.op_strategy_funcs[op_overload]
                 if op_overload in self.op_to_schema_info:
                     del self.op_to_schema_info[op_overload]
+            self.implicit_strategy_op_tracker.clear()
 
     # TODO: automatic generate redistribute cost for strategies. There exists a
     # `fill_missing_redistribute_cost` in autoparallel/utils.py, which is a hack
