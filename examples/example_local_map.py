@@ -3,312 +3,16 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
-import functools
-from typing import Callable, Optional, Union
-
 import torch
-import torch.utils._pytree as pytree
-from torch import Tensor, nn
-from torch._ops import HigherOrderOperator
-from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
-from torch.distributed._tensor.experimental import local_map
-from torch.distributed.device_mesh import _mesh_resources
-from torch.distributed.tensor import DeviceMesh, DTensor, Placement, Replicate
-from torch.distributed.tensor.experimental._func_map import (
-    InputPlacements,
-    OutputPlacements,
-)
+from torch import nn
 from torch.distributed.tensor.placement_types import Replicate, Shard
-from torch.fx.experimental.proxy_tensor import (
-    ProxyTorchDispatchMode,
-    disable_proxy_modes_tracing,
-    get_proxy_slot,
-    track_tensor_tree,
-)
 from torch.testing._internal.distributed.fake_pg import FakeStore
 
 from autoparallel.api import AutoParallel
+from autoparallel.local_map_hop import apply_local_map
 
-# just to dump tlparse
+# just to force dump tlparse
 torch.compile(lambda x: x + 1, backend="eager")(torch.rand(10))
-
-
-class LocalMapAOTExportModule(HigherOrderOperator):
-    """
-    A HOP that integrates with autoparallel's current frontend (aot_export_module).
-    This HOP exists starting the pre-solver graph and lives until we apply sharding.
-    During which, runtime_func will be inlined into the post-solver graph.
-    """
-
-    def __init__(self):
-        super().__init__("local_map_hop")
-
-    def __call__(self, runtime_func, *args, **kwargs):
-        return super().__call__(runtime_func, *args, **kwargs)
-
-
-local_map_hop = LocalMapAOTExportModule()
-
-# def fn(x):
-#     return x
-
-# local_map_hop(fn, torch.randn(10, 10))
-# breakpoint()
-
-from torch._higher_order_ops.utils import (
-    _maybe_run_with_interpreter,
-    _set_compilation_env,
-    materialize_as_graph,
-    reenter_make_fx,
-    save_tensors_and_symints_for_backward,
-    saved_tensors_and_symints,
-    unique_graph_id,
-    validate_subgraph_args_types,
-)
-
-
-def create_fw_bw_graph(
-    fw_func,
-    *_args,
-):
-    # See Note:[HOP create fw_bw graph]
-
-    # All of these imports need to be here in order to avoid circular dependencies
-    from torch._dispatch.python import suspend_functionalization
-    from torch._functorch.aot_autograd import AOTConfig, create_joint
-    from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
-    from torch._subclasses.functional_tensor import disable_functional_mode
-    from torch.fx.experimental.proxy_tensor import disable_proxy_modes_tracing
-
-    dummy_aot_config = AOTConfig(
-        fw_compiler=None,  # type: ignore[arg-type]
-        bw_compiler=None,  # type: ignore[arg-type]
-        partition_fn=None,  # type: ignore[arg-type]
-        decompositions={},
-        num_params_buffers=0,
-        aot_id=0,
-        keep_inference_input_mutations=False,
-    )
-
-    with suspend_functionalization(), disable_functional_mode():
-        with disable_proxy_modes_tracing():
-
-            def _from_fun(
-                t: Union[Tensor, torch.SymInt, int],
-            ) -> Union[Tensor, torch.SymInt, int]:
-                if isinstance(t, torch.Tensor):
-                    return torch.empty_strided(
-                        t.size(),
-                        t.stride(),
-                        device=t.device,
-                        dtype=t.dtype,
-                        requires_grad=t.requires_grad,
-                    )
-                return t
-
-            # If someone runs this hop under the default compiler backend ("eager")
-            # Then this path will be run with the actual user inputs. We convert them
-            # to fake tensors in order to not perform any actual compute.
-            from torch._guards import detect_fake_mode
-
-            fake_mode = detect_fake_mode(_args)
-            if fake_mode is None:
-                fake_mode = FakeTensorMode(allow_non_fake_inputs=True)
-
-            with fake_mode:
-                fw_inputs = pytree.tree_map(_from_fun, _args)
-
-            assert all(
-                isinstance(t, (FakeTensor, int, torch.SymInt)) for t in fw_inputs
-            )
-
-            # redundant? we already _from_fun'd the inputs
-            example_flat_out = pytree.tree_map(
-                _from_fun,
-                fw_func(*fw_inputs),
-            )
-            example_grad = _from_fun(example_flat_out)
-
-        from torch.fx.experimental.proxy_tensor import make_fx
-
-        def joint_f(
-            example_grad,
-            *fw_inputs,
-        ):
-            def run_fwd(*fw_inputs):
-                outs = fw_func(*fw_inputs)
-                if not isinstance(outs, (list, tuple)):
-                    outs = (outs,)
-                masks = [o.requires_grad for o in outs]
-                return (outs, masks)
-
-            joint = create_joint(run_fwd, aot_config=dummy_aot_config)
-            optional_grad = [example_grad] if example_grad.requires_grad else []
-            _, grads = joint(fw_inputs, optional_grad)
-
-            return grads
-
-        joint_graph = make_fx(joint_f)(example_grad, *fw_inputs)
-        # do i need to return fw_graph here? by definition it is traceable, so should be fine to run again with runtime_func
-        return None, joint_graph
-
-
-# def create_fw_bw_graph(
-#     runtime_wrapper,
-#     *args,
-# ):
-#     from torch._dispatch.python import suspend_functionalization
-#     from torch._functorch.aot_autograd import AOTConfig, create_joint
-#     from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
-#     from torch._subclasses.functional_tensor import disable_functional_mode
-#     from torch.fx.experimental.proxy_tensor import disable_proxy_modes_tracing
-#     from typing import Union
-
-#     with suspend_functionalization(), disable_functional_mode():
-#         with disable_proxy_modes_tracing():
-#             def _from_fun(
-#                 t: Union[torch.Tensor, torch.SymInt, int],
-#             ) -> Union[torch.Tensor, torch.SymInt, int]:
-#                 if isinstance(t, torch.Tensor):
-#                     return torch.empty_strided(
-#                         t.size(),
-#                         t.stride(),
-#                         device=t.device,
-#                         dtype=t.dtype,
-#                         requires_grad=t.requires_grad,
-#                     )
-#                 return t
-
-
-#             fw_inputs = pytree.tree_map(_from_fun, args)
-#             assert all(
-#                 isinstance(t, (FakeTensor, int, torch.SymInt))
-#                 for t in fw_inputs
-#             )
-
-#             out = runtime_wrapper(*fw_inputs)
-#             example_flat_out = pytree.tree_map(
-#                 _from_fun,
-#                 out,
-#             )
-#             example_grad = _from_fun(example_flat_out)
-#             breakpoint()
-
-#         return None
-
-
-class LocalMapAutogradOp(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, runtime_func, bwd_func, *args, **kwargs):
-        ctx.save_for_backward(*args)
-
-        save_tensors_and_symints_for_backward(ctx, args)
-        ctx._bwd_func = bwd_func
-
-        with torch._C._AutoDispatchBelowAutograd():  # why
-            return local_map_hop(runtime_func, *args, **kwargs)
-
-    @staticmethod
-    def backward(ctx, *grads):
-        args = saved_tensors_and_symints(ctx)
-        grad_ins = ctx._bwd_func(*grads, *args)
-        # TODO: hopify to make opaque
-        # grad_ins = local_map_backward_hop(ctx._bwd_func, *grads, *args)
-        return None, None, *grad_ins
-
-
-@local_map_hop.py_impl(torch._C.DispatchKey.Autograd)
-def autograd_key(
-    runtime_func,
-    *args,
-    **kwargs,
-):
-    if "_inline" in kwargs:
-        del kwargs["_inline"]
-        return runtime_func(*args, **kwargs)
-
-    # else trace
-    # trace joint, pass to .apply
-    _, bw_graph = create_fw_bw_graph(runtime_func, *args)
-    return LocalMapAutogradOp.apply(runtime_func, bw_graph, *args, **kwargs)
-
-
-@local_map_hop.py_functionalize_impl
-def functional_mode_key(ctx, runtime_func, *args, **kwargs):
-    assert not kwargs
-
-    unwrapped_inputs = ctx.unwrap_tensors(args)
-    with ctx.redispatch_to_next():
-        # TODO: local_map mutation checks
-        out = local_map_hop(runtime_func, *unwrapped_inputs)
-        return ctx.wrap_tensors(out)
-
-
-@local_map_hop.py_impl(FakeTensorMode)
-def fake_mode_key(
-    mode,
-    runtime_func,
-    *args,
-    **kwargs,
-):
-    with mode:
-        return runtime_func(*args, **kwargs)
-
-
-@local_map_hop.py_impl(ProxyTorchDispatchMode)
-def proxy_mode_key(
-    proxy_mode,
-    runtime_func,
-    *args,
-    **kwargs,
-):
-    assert (
-        proxy_mode is not None
-    ), "Mode should always be enabled for python fallback key"
-    assert len(kwargs) == 0
-
-    example_out = local_map_hop(runtime_func, *args, **kwargs)
-    proxy_args = pytree.tree_map(proxy_mode.tracer.unwrap_proxy, args)
-
-    def another_wrapper(*another_args, **another_kwargs):
-        return functools.partial(local_map_hop, runtime_func)(
-            *another_args, **another_kwargs
-        )
-
-    out_proxy = proxy_mode.tracer.create_proxy(
-        "call_function", another_wrapper, proxy_args, {}
-    )
-    out_proxy.node.meta["custom"] = {
-        "local_map_kwargs": runtime_func.local_map_kwargs,
-    }
-    return track_tensor_tree(
-        example_out, out_proxy, constant=None, tracer=proxy_mode.tracer
-    )
-
-
-def apply_local_map(*local_map_args, **local_map_kwargs):
-    assert local_map_kwargs[
-        "redistribute_inputs"
-    ], "Autoparallel should always be allowed to redistribute inputs"
-
-    # manually issue the hop, which will not be not necessary with a dynamo frontend
-    def decorator(fn):
-        @functools.wraps(fn)
-        def wrapped(*args, **kwargs):
-            def runtime_func(*runtime_args, **runtime_kwargs):
-                # hop doesn't like the functools.partial created by local_map
-                return local_map(
-                    fn,
-                    *local_map_args,
-                    **local_map_kwargs,
-                )(*runtime_args, **runtime_kwargs)
-
-            runtime_func.local_map_kwargs = local_map_kwargs
-            return local_map_hop(runtime_func, *args, **kwargs)
-
-        return wrapped
-
-    return decorator
 
 
 @apply_local_map(
@@ -318,18 +22,34 @@ def apply_local_map(*local_map_args, **local_map_kwargs):
     in_placements=(
         [Replicate(), Replicate()],
         [Replicate(), Replicate()],
-    ),  # intentionally suboptimal, just to test
+        [Replicate(), Replicate()],
+    ),
     redistribute_inputs=True,
+    in_grad_placements=None,
+    device_mesh=None,
 )
-def boosted(w, x):
-    return torch.matmul(x, w.t()) * 12345
+def replicate_linear(w, bias, x):
+    return torch.matmul(x, w.t()) + bias
+
+
+@apply_local_map(
+    out_placements=[
+        [Shard(0), Shard(0)],
+    ],
+    in_placements=([Shard(0), Shard(0)],),
+    redistribute_inputs=True,
+    in_grad_placements=None,
+    device_mesh=None,
+)
+def sharded_pointwise(x):
+    return x + 10
 
 
 class Block(nn.Module):
     def __init__(self, nheads, dim1, dim2):
         super().__init__()
         self.nheads = nheads
-        bias = False
+        bias = True
         self.wq = nn.Linear(dim1, dim1, bias=bias)
         self.wk = nn.Linear(dim1, dim1, bias=bias)
         self.wv = nn.Linear(dim1, dim1, bias=bias)
@@ -344,9 +64,10 @@ class Block(nn.Module):
                 torch.nn.init.normal_(lin.bias)
 
     def forward(self, x):
-        q = self.wq(x)
-        k = boosted(self.wk.weight, x)
-        # k = self.wk(x)
+        boosted_weight = sharded_pointwise(self.wq.weight)
+        q = replicate_linear(boosted_weight, self.wq.bias, x)
+        # q = self.wq(x)
+        k = self.wk(x)
         v = self.wv(x)
 
         q = q.unflatten(-1, (self.nheads, -1)).permute(0, 2, 1, 3)

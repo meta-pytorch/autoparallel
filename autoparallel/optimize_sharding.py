@@ -81,7 +81,7 @@ import math
 
 import pulp
 import torch
-from torch.distributed.tensor._dtensor_spec import DTensorSpec, TensorMeta
+from torch.distributed.tensor._dtensor_spec import DTensorSpec
 from torch.distributed.tensor.placement_types import Replicate, Shard
 from torch.utils._pytree import tree_flatten, tree_map_only
 
@@ -90,7 +90,7 @@ from .compute_estimation import (
     estimate_strategy_runtime_cost,
 )
 from .propagation_rules import _create_all_options
-from .utils import get_placement_options
+from .utils import get_local_map_placement_option, get_placement_options
 
 
 def _debug_node(node):
@@ -147,91 +147,24 @@ class ShardingOptimizer:
                     torch.fx.Node, lambda x: x.meta["val"], node.kwargs
                 )
                 if local_map_kwargs := node.meta.get("custom", {}).get(
-                    "local_map_kwargs"
+                    "dtensor_local_map_kwargs"
                 ):
+                    strat = get_local_map_placement_option(
+                        self.mesh,
+                        node.target,
+                        user_strats,
+                        user_args,
+                        user_kwargs,
+                        node.meta["val"],
+                        local_map_kwargs["in_placements"],
+                        local_map_kwargs["out_placements"],
+                    )
+
                     assert not node.kwargs
-                    node.kwargs = {"_inline": True}
-                    in_placements = local_map_kwargs["in_placements"]
-                    out_placements = local_map_kwargs["out_placements"]
-                    in_specs = []
-                    for input_arg, placement in zip(node.args, in_placements):
-                        if placement is None:
-                            # not a dtensor
-                            assert (
-                                False
-                            ), "Not sure how to create DTensorSpec for this input"
+                    node.kwargs = {
+                        "_inline": True
+                    }  # notify the HOP to desugar in the next trace
 
-                        assert isinstance(placement, list), "Not implemented"
-                        example = input_arg.meta["val"]
-                        in_specs.append(
-                            DTensorSpec(
-                                mesh=self.mesh,
-                                placements=placement,
-                                tensor_meta=TensorMeta(
-                                    shape=example.shape,
-                                    stride=example.stride(),
-                                    dtype=example.dtype,
-                                ),
-                            )
-                        )
-
-                    out_specs = []
-                    assert isinstance(node.meta["val"], (torch.Tensor, list, tuple))
-                    outs = (
-                        node.meta["val"]
-                        if isinstance(node.meta["val"], (list, tuple))
-                        else [node.meta["val"]]
-                    )
-                    for example, placement in zip(outs, out_placements):
-                        from torch.distributed.tensor.placement_types import Placement
-
-                        if placement is None:
-                            # not a dtensor
-                            assert (
-                                False
-                            ), "Not sure how to create DTensorSpec for this output"
-                        elif isinstance(placement, Placement):
-                            placement = [placement]
-
-                        assert isinstance(placement, (list, tuple)), "Not implemented"
-                        out_specs.append(
-                            DTensorSpec(
-                                mesh=self.mesh,
-                                placements=placement,
-                                tensor_meta=TensorMeta(
-                                    shape=example.shape,
-                                    stride=example.stride(),
-                                    dtype=example.dtype,
-                                ),
-                            )
-                        )
-
-                    from torch.distributed.tensor._op_schema import OpSpec, OpStrategy
-                    from torch.distributed.tensor._ops.utils import (
-                        generate_redistribute_costs,
-                    )
-
-                    redistribute_costs = []
-                    for input_arg, input_spec in zip(node.args, in_specs):
-                        assert isinstance(input_arg, torch.fx.Node)
-                        input_node_strategy = strats[input_arg]
-                        costs = generate_redistribute_costs(
-                            input_node_strategy, input_spec
-                        )
-                        redistribute_costs.append(costs)
-
-                    if len(out_specs) == 1:
-                        out_specs = out_specs[0]
-
-                    strat = OpStrategy(
-                        [
-                            OpSpec(
-                                output_specs=out_specs,
-                                input_specs=in_specs,
-                                redistribute_cost=redistribute_costs,
-                            )
-                        ]
-                    )
                     strats[node] = strat
                 else:
                     strat = get_placement_options(
