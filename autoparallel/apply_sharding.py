@@ -8,16 +8,9 @@ import operator
 
 import torch
 import torch.nn as nn
-from torch._functorch._aot_autograd.descriptors import (
-    GradAOTOutput,
-    ParamAOTInput,
-    PlainAOTInput,
-    PlainAOTOutput,
-    TangentAOTInput,
-)
 from torch._functorch._aot_autograd.fx_utils import (
-    named_buffer_nodes,
-    named_param_nodes,
+    get_named_buffer_nodes,
+    get_named_param_nodes,
 )
 from torch._subclasses.fake_tensor import FakeTensor, unset_fake_temporarily
 from torch.distributed.tensor import DTensor
@@ -221,9 +214,12 @@ def apply_sharding_to_model(gm, sharding_placement, params_spec, buffers_spec):
     parallel_gm.print_readable(expanded_def=True)
 
     # Copy descriptors over to new graph
-    for n1, n2 in zip((n for n in gm.graph.nodes if n.op in ('placeholder', 'output')), (n for n in parallel_gm.graph.nodes if n.op in ('placeholder', 'output'))):
-        n2.meta['desc'] = n1.meta['desc']
-        if n2.op == 'placeholder':
+    for n1, n2 in zip(
+        (n for n in gm.graph.nodes if n.op in ("placeholder", "output")),
+        (n for n in parallel_gm.graph.nodes if n.op in ("placeholder", "output")),
+    ):
+        n2.meta["desc"] = n1.meta["desc"]
+        if n2.op == "placeholder":
             n2.target = n1.target
             # TODO: would be nice to also do name as well
 
@@ -232,8 +228,8 @@ def apply_sharding_to_model(gm, sharding_placement, params_spec, buffers_spec):
 
     # NB: ok to NOT use the parallel_gm here because we will just reapply the
     # correct sharding placement via sharding_placement
-    fqn_to_param = named_param_nodes(gm.graph)
-    fqn_to_buffer = named_buffer_nodes(gm.graph)
+    fqn_to_param = get_named_param_nodes(gm.graph)
+    fqn_to_buffer = get_named_buffer_nodes(gm.graph)
 
     for fqn in params_spec:
         n = fqn_to_param[fqn]

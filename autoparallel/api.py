@@ -3,18 +3,15 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
-import itertools
 import copy
-from collections import OrderedDict
-from contextlib import ExitStack, suppress
+import itertools
+from contextlib import ExitStack
 
 import torch
-import torch.utils._pytree as pytree
 from torch._functorch.aot_autograd import (
     aot_compile_joint_with_descriptors,
     aot_export_joint_with_descriptors,
 )
-from torch._functorch.partitioners import default_partition
 from torch._inductor.decomposition import select_decomp_table
 from torch._inductor.fx_passes.joint_graph import joint_graph_passes
 from torch._inductor.fx_passes.post_grad import remove_assert_ops
@@ -156,8 +153,8 @@ class AutoParallel:
         The meta model is moved to a fake device based on mesh.device_type.
     """
 
-    def __init__(self, stack: ExitStack, model, input_fn, mesh: DeviceMesh):
-        self.stack = stack
+    def __init__(self, model, input_fn, mesh: DeviceMesh):
+        self.stack = ExitStack()
         self.fake_mode = (
             FakeTensorMode()
         )  # TODO: maybe need to reuse the model's fake mode
@@ -167,6 +164,14 @@ class AutoParallel:
         self.model = move_to_fake(model, self.fake_mode, device)
         self.input_fn = input_fn
         self.mesh = mesh
+
+        # NB: rest of the construction happens in __enter__
+
+        self.active = False
+
+    def __enter__(self):
+        assert self.active is False
+
         self.build_model_graph()
 
         sharding_optimizer = ShardingOptimizer(self.gm, self.mesh)
@@ -176,6 +181,26 @@ class AutoParallel:
 
         self.input_constraints = None
         self.output_constraints = None
+
+        self.active = True
+
+        self.stack.__enter__()
+
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.active = None
+        return self.stack.__exit__(exc_type, exc_val, exc_tb)
+
+    def _assert_entered(self):
+        if self.active is False:
+            raise RuntimeError(
+                "You must use AutoParallel as a context manager: with AutoParallel() as p: ..."
+            )
+        if self.active is None:
+            raise RuntimeError(
+                "AutoParallel is not reentrant, please file a bug report if you need this functionality"
+            )
 
     def build_model_graph(self):
         decomp_table = _get_decomp_table()
@@ -229,6 +254,8 @@ class AutoParallel:
 
     # TODO: Specify what the low/high meaning is (percentage?)
     def add_parameter_memory_constraint(self, low=None, high=None):
+        self._assert_entered()
+
         # by default, divide the parameters by the world size
         if low is None:
             low = 0.0
@@ -240,11 +267,15 @@ class AutoParallel:
         self.sharding_optimizer.add_parameter_memory_constraint(low, high)
 
     def add_input_constraints(self, constraints):
+        self._assert_entered()
+
         assert self.input_constraints is None, "Input constraints have already been set"
         self.sharding_optimizer.add_sharded_input_constraint(constraints)
         self.input_constraints = constraints
 
     def add_output_constraints(self, constraints):
+        self._assert_entered()
+
         assert (
             self.output_constraints is None
         ), "Output constraints have already been set"
@@ -253,6 +284,8 @@ class AutoParallel:
         self.output_constraints = constraints
 
     def optimize_placement(self, verbose=True):
+        self._assert_entered()
+
         if self.input_constraints is None:
             # forces sharding of input to be S(0) on first dimension and R on others
             # TODO: This doesn't actually force S(0) on the first dimension?
@@ -286,6 +319,8 @@ class AutoParallel:
         return self.sharding_placement
 
     def apply_placement(self, sharding_placement=None):
+        self._assert_entered()
+
         if sharding_placement is None:
             sharding_placement = self.sharding_placement
         # TODO: what kind of updates do we have to do?

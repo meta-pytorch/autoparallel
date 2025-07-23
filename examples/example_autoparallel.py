@@ -3,7 +3,6 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
-import contextlib
 
 import torch
 from torch import nn
@@ -53,7 +52,7 @@ class Block(nn.Module):
 
         o = o0 + o
 
-        return (o,)  # NB: if you torch.export this won't be a problem? Maybe.
+        return o
 
 
 world_size = 256
@@ -87,10 +86,7 @@ def input_fn():
 with torch.device("meta"):
     model = Block(nheads, dim1, dim2)
 
-# TODO: make AutoParallel a context manager
-with contextlib.ExitStack() as stack:
-    autop = AutoParallel(stack, model, input_fn, mesh)
-
+with AutoParallel(model, input_fn, mesh) as autop:
     autop.gm.print_readable(expanded_def=True)
 
     autop.add_parameter_memory_constraint(low=None, high=None)
@@ -110,7 +106,7 @@ parallel_mod.init_weights()
 
 # now let's run it
 x = (torch.rand(bs // mesh.shape[0], seq_len, dim1, device="cuda"),)
-out, = parallel_mod(*x)
+out = parallel_mod(*x)
 out.backward(torch.randn_like(out))
 
 print("All good!")

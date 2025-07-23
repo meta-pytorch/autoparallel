@@ -82,18 +82,12 @@ from typing import Optional
 
 import pulp
 import torch
-from torch._functorch._aot_autograd.descriptors import (
-    GradAOTOutput,
-    ParamAOTInput,
-    PlainAOTInput,
-    PlainAOTOutput,
-    TangentAOTInput,
-)
+from torch._functorch._aot_autograd.descriptors import PlainAOTInput, PlainAOTOutput
 from torch._functorch._aot_autograd.fx_utils import (
     get_param_and_grad_nodes,
     get_param_nodes,
     get_plain_input_and_grad_nodes,
-    get_plain_output_and_tangent_nodes_indexed,
+    get_plain_output_and_tangent_nodes,
 )
 from torch.distributed.tensor._dtensor_spec import DTensorSpec
 from torch.distributed.tensor.placement_types import Placement, Replicate, Shard
@@ -546,7 +540,7 @@ class ShardingOptimizer:
 
         Mathematical form: x_{param} = x_{grad_param}
         """
-        for param, grad in get_param_and_grad_nodes(self.graph):
+        for param, grad in get_param_and_grad_nodes(self.graph).values():
             if grad is None:
                 continue
             s_i = self.node_map[param]
@@ -639,9 +633,9 @@ class ShardingOptimizer:
         if input_placements is not None:
             mut_ips = {i: p for i, p in enumerate(input_placements)}
 
-        input_and_grad_nodes = get_plain_input_and_grad_nodes(self.graph)
-        for node, grad_node in input_and_grad_nodes:
-            desc = node.meta["desc"]
+        for desc, (node, grad_node) in get_plain_input_and_grad_nodes(
+            self.graph
+        ).items():
             if input_placements is None:
                 placement = None
             else:
@@ -663,7 +657,11 @@ class ShardingOptimizer:
 
         if ignored_placements:
             raise RuntimeError(
-                f"We were unable to respect placements for inputs at indices {illegal_placements}.  This is because the traced joint graph did not actually have a dedicated placeholder node for these inputs.  This typically occurs because some inputs aliased each other; inspect the joint graph from tlparse for more details.  You can either remove an explicit placement for this input (replace it with None) or clone the inputs before tracing to remove aliasing."
+                f"We were unable to respect placements for inputs at indices {ignored_placements}.  "
+                f"This is because the traced joint graph did not actually have a dedicated placeholder node for these inputs.  "
+                f"This typically occurs because some inputs aliased each other; inspect the joint graph from tlparse for more details.  "
+                f"You can either remove an explicit placement for this input (replace it with None) or clone "
+                "the inputs before tracing to remove aliasing."
             )
 
     def add_sharded_output_constraint(self, output_placements=None):
@@ -677,9 +675,7 @@ class ShardingOptimizer:
         if output_placements is not None:
             mut_ops = {i: p for i, p in enumerate(output_placements)}
 
-        output_and_tangent_nodes_index = get_plain_output_and_tangent_nodes_indexed(
-            self.graph
-        )
+        output_and_tangent_nodes_index = get_plain_output_and_tangent_nodes(self.graph)
         for desc, (node, tangent_node) in output_and_tangent_nodes_index.items():
             if output_placements is None:
                 placement = None
@@ -702,7 +698,12 @@ class ShardingOptimizer:
 
         if ignored_placements:
             raise RuntimeError(
-                f"We were unable to respect placements for outputs at indices {illegal_placements}.  This is because the traced joint graph did not actually have a dedicated output node for these inputs.  This typically occurs because some outputs aliased each other; inspect the joint graph from tlparse for more details.  You can either remove an explicit placement for this output (replace it with None), stop the model from returning aliases of the tensor or clone the outputs before returning them from the graph to avoid aliasing."
+                f"We were unable to respect placements for outputs at indices {ignored_placements}.  "
+                f"This is because the traced joint graph did not actually have a dedicated output node for these inputs.  "
+                f"This typically occurs because some outputs aliased each other; inspect the joint graph from tlparse for more details.  "
+                f"You can either remove an explicit placement for this output (replace it with None),"
+                "stop the model from returning aliases of the tensor or clone the outputs before returning "
+                "them from the graph to avoid aliasing."
             )
 
     def validate(self):
