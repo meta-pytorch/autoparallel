@@ -146,14 +146,20 @@ class ShardingOptimizer:
                 user_kwargs = tree_map_only(
                     torch.fx.Node, lambda x: x.meta["val"], node.kwargs
                 )
-                if local_map_kwargs := node.meta.get("custom", {}).get("local_map_kwargs"):
+                if local_map_kwargs := node.meta.get("custom", {}).get(
+                    "local_map_kwargs"
+                ):
+                    assert not node.kwargs
+                    node.kwargs = {"_inline": True}
                     in_placements = local_map_kwargs["in_placements"]
                     out_placements = local_map_kwargs["out_placements"]
                     in_specs = []
                     for input_arg, placement in zip(node.args, in_placements):
                         if placement is None:
                             # not a dtensor
-                            assert False, "Not sure how to create DTensorSpec for this input"
+                            assert (
+                                False
+                            ), "Not sure how to create DTensorSpec for this input"
 
                         assert isinstance(placement, list), "Not implemented"
                         example = input_arg.meta["val"]
@@ -165,18 +171,25 @@ class ShardingOptimizer:
                                     shape=example.shape,
                                     stride=example.stride(),
                                     dtype=example.dtype,
-                                )
+                                ),
                             )
                         )
 
                     out_specs = []
                     assert isinstance(node.meta["val"], (torch.Tensor, list, tuple))
-                    outs = node.meta["val"] if isinstance(node.meta["val"], (list, tuple)) else [node.meta["val"]]
+                    outs = (
+                        node.meta["val"]
+                        if isinstance(node.meta["val"], (list, tuple))
+                        else [node.meta["val"]]
+                    )
                     for example, placement in zip(outs, out_placements):
                         from torch.distributed.tensor.placement_types import Placement
+
                         if placement is None:
                             # not a dtensor
-                            assert False, "Not sure how to create DTensorSpec for this output"
+                            assert (
+                                False
+                            ), "Not sure how to create DTensorSpec for this output"
                         elif isinstance(placement, Placement):
                             placement = [placement]
 
@@ -189,30 +202,36 @@ class ShardingOptimizer:
                                     shape=example.shape,
                                     stride=example.stride(),
                                     dtype=example.dtype,
-                                )
+                                ),
                             )
                         )
 
-                    from torch.distributed.tensor._op_schema import OpStrategy, OpSpec
-                    from torch.distributed.tensor._ops.utils import generate_redistribute_costs
-                    
+                    from torch.distributed.tensor._op_schema import OpSpec, OpStrategy
+                    from torch.distributed.tensor._ops.utils import (
+                        generate_redistribute_costs,
+                    )
+
                     redistribute_costs = []
                     for input_arg, input_spec in zip(node.args, in_specs):
                         assert isinstance(input_arg, torch.fx.Node)
                         input_node_strategy = strats[input_arg]
-                        costs = generate_redistribute_costs(input_node_strategy, input_spec)
+                        costs = generate_redistribute_costs(
+                            input_node_strategy, input_spec
+                        )
                         redistribute_costs.append(costs)
 
                     if len(out_specs) == 1:
                         out_specs = out_specs[0]
-                    
-                    strat = OpStrategy([
-                        OpSpec(
-                            output_specs=out_specs,
-                            input_specs=in_specs,
-                            redistribute_cost=redistribute_costs
-                        )
-                    ])
+
+                    strat = OpStrategy(
+                        [
+                            OpSpec(
+                                output_specs=out_specs,
+                                input_specs=in_specs,
+                                redistribute_cost=redistribute_costs,
+                            )
+                        ]
+                    )
                     strats[node] = strat
                 else:
                     strat = get_placement_options(
