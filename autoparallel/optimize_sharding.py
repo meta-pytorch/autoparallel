@@ -149,12 +149,12 @@ class ShardingOptimizer:
                 if local_map_kwargs := node.meta.get("custom", {}).get(
                     "dtensor_local_map_kwargs"
                 ):
+                    assert "call_local_map" in str(node.target)
+                    assert not user_kwargs
                     strat = get_local_map_placement_option(
                         self.mesh,
-                        node.target,
                         user_strats,
                         user_args,
-                        user_kwargs,
                         node.meta["val"],
                         local_map_kwargs["in_placements"],
                         local_map_kwargs["out_placements"],

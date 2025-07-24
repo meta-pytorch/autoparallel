@@ -3,9 +3,12 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+from typing import Union
+
 import torch
 from torch.distributed._tensor.placement_types import Placement, TensorMeta
 from torch.distributed.device_mesh import _get_device_handle
+from torch.distributed.tensor import DeviceMesh
 from torch.distributed.tensor._dtensor_spec import DTensorSpec
 from torch.distributed.tensor._op_schema import (
     OpSchema,
@@ -14,6 +17,10 @@ from torch.distributed.tensor._op_schema import (
     TupleStrategy,
 )
 from torch.distributed.tensor._ops.utils import generate_redistribute_costs
+from torch.distributed.tensor.experimental._func_map import (
+    InputPlacements,
+    OutputPlacements,
+)
 from torch.utils._pytree import tree_flatten, tree_map_only
 
 from .propagation_rules import _op_partial_rules, _op_rules, remove_invalid_configs
@@ -130,7 +137,12 @@ def get_placement_options(mesh, op, specs, user_args, user_kwargs):
 
 
 def get_local_map_placement_option(
-    mesh, op, specs, user_args, user_kwargs, output_val, in_placements, out_placements
+    mesh: DeviceMesh,
+    specs: tuple[OpStrategy],
+    user_args: tuple[torch.Tensor],
+    output_val: Union[torch.Tensor, tuple[torch.Tensor]],
+    in_placements: InputPlacements,
+    out_placements: OutputPlacements,
 ):
     in_specs = []
     for example, placement in zip(user_args, in_placements):
