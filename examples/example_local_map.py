@@ -117,6 +117,16 @@ def input_fn():
     return torch.rand(bs, seq_len, dim1, device="cuda")
 
 
+# HOP runs in eager with fake tensors
+# from torch._subclasses import FakeTensorMode
+# with FakeTensorMode():
+#     model = Block(nheads, dim1, dim2).cuda()
+#     model(input_fn())
+
+# HOP runs in eager with real tensors
+# model = Block(nheads, dim1, dim2).cuda()
+# model(input_fn())
+
 # parallelize the model
 with torch.device("meta"):
     model = Block(nheads, dim1, dim2)

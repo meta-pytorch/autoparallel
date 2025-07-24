@@ -210,6 +210,17 @@ def proxy_mode_key(
     )
 
 
+# Running HOP in eager with real tensors
+@local_map_hop.py_impl(torch._C.DispatchKey.CPU)
+@local_map_hop.py_impl(torch._C.DispatchKey.CUDA)
+def real_impl(
+    orig_fwd,
+    *args,
+    **kwargs,
+):
+    return orig_fwd(*args, **kwargs)
+
+
 def apply_local_map(*local_map_args, **local_map_kwargs):
     # NOTE: We manually issue the hop, which will not be not necessary with a dynamo frontend.
     # 1. Same as local_map, must be applied on a function, not a method.
