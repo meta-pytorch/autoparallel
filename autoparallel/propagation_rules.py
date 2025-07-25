@@ -381,7 +381,7 @@ def factory_rule(mesh, op_schema: OpSchema) -> OpStrategy:
     This util applies to any factory function that takes 'size' as the first argument,
     and supports Replication and Shard placements all at zero cost.
     """
-    assert isinstance(op_schema.args_schema[0], torch.Size)
+    assert isinstance(op_schema.args_schema[0], (torch.Size, list))
     shape = op_schema.args_schema[0]
     x = torch.empty(shape, device="meta")
     stride = x.stride()
@@ -423,8 +423,11 @@ def factory_rule(mesh, op_schema: OpSchema) -> OpStrategy:
             * len(strategy_combs)
         ]
 
+        # TODO: should we add an input_spec here, so that we can ensure we always
+        # have input and output specs? For now I hacked it in utils.py
         strategy = OpSpec(
             output_specs=output_specs,
+            input_specs=[output_specs],
             redistribute_cost=redistribute_cost,
         )
         all_strategies.append(strategy)
@@ -616,7 +619,8 @@ def _unsafe_index_rule(mesh, op_schema):
     raise NotImplementedError()
 
 
-@register_opschema_rule(torch.ops.aten.index.Tensor)
+# Disable this rule as it's implementation is inferior than the baseline
+# @register_opschema_rule(torch.ops.aten.index.Tensor)
 def index_rule(mesh, op_schema):
     print(f"Ops that need to be implemented {torch.ops.aten.index.Tensor}")
     # raise NotImplementedError("Needs hardening, only tested on a few cases")
