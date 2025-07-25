@@ -89,6 +89,23 @@ class MOEBatched(nn.Module):
         return out.reshape(shape)
 
 
+class MOEBatchedDebug(nn.Module):
+    def __init__(self, in_channels, inter_channels, num_experts):
+        super().__init__()
+        self.num_experts = num_experts
+        self.experts = BatchFFN(in_channels, inter_channels, num_experts)
+
+    def init_weights(self):
+        pass
+
+    def forward(self, x):
+        assert x.ndim == 3
+        shape = x.shape
+        xs = x.unflatten(1, (self.num_experts, -1)).permute(1, 0, 2, 3).flatten(1, 2)
+        out = self.experts(xs)
+        return out.reshape(shape)
+
+
 """
 
 in_channels = 64
@@ -111,7 +128,7 @@ from torch.testing._internal.distributed.fake_pg import FakeStore
 
 from autoparallel.api import AutoParallel
 
-world_size = 256
+world_size = 2048
 
 fake_store = FakeStore()
 torch.distributed.init_process_group(
@@ -120,7 +137,7 @@ torch.distributed.init_process_group(
 # mesh = torch.distributed.device_mesh.init_device_mesh("cuda", (world_size,), mesh_dim_names=("dp",))
 mesh = torch.distributed.device_mesh.init_device_mesh(
     "cuda",
-    (world_size // 8, 8),
+    (world_size // 64, 64),
     mesh_dim_names=(
         "dp",
         "tp",
@@ -128,12 +145,12 @@ mesh = torch.distributed.device_mesh.init_device_mesh(
 )
 
 
-in_channels = 4096
-inter_channels = 4096 * 2
-num_experts = 64
+in_channels = 7168
+inter_channels = 2048
+num_experts = 128
 
-bs = 8 * mesh.shape[0]
-seqlen = 2048
+bs = 8 * mesh.shape[0] * mesh.shape[1]
+seqlen = 2048 * 2
 
 
 def input_fn():
@@ -141,7 +158,8 @@ def input_fn():
 
 
 def model_fn():
-    return MOEBatched(in_channels, inter_channels, num_experts)
+    # return MOEBatched(in_channels, inter_channels, num_experts)
+    return MOEBatchedDebug(in_channels, inter_channels, num_experts)
 
 
 with torch.device("meta"):
@@ -152,7 +170,7 @@ autop.add_parameter_memory_constraint(low=None, high=None)
 
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
-x_sharding = (Shard(0), Replicate())
+x_sharding = (Shard(0), Shard(0))
 
 autop.add_input_constraints([x_sharding])
 autop.add_output_constraints([x_sharding])
