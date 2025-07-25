@@ -48,12 +48,12 @@ def sharded_pointwise(x):
 
 @apply_local_map(
     out_placements=[
-        [Replicate(), Replicate(), Shard(2)],
+        [Shard(0), Shard(1), Shard(2)],
     ],
     in_placements=(
-        [Replicate(), Replicate(), Shard(2)],
-        [Replicate(), Replicate(), Shard(2)],
-        [Replicate(), Replicate(), Shard(2)],
+        [Shard(0), Shard(1), Shard(2)],
+        [Shard(0), Shard(1), Replicate()],
+        [Shard(0), Shard(1), Replicate()],
     ),
     redistribute_inputs=True,
     in_grad_placements=None,
@@ -61,7 +61,7 @@ def sharded_pointwise(x):
 )
 def context_parallel_attention(query, key, value):
     out = F.scaled_dot_product_attention(
-        query=query, key=key, value=value, is_causal=True
+        query=query, key=key, value=value, is_causal=False
     )
     return out
 

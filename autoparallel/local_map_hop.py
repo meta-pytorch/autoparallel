@@ -62,6 +62,7 @@ def create_hop_joint_graph(
     with suspend_functionalization(), disable_functional_mode():
         with disable_proxy_modes_tracing():
 
+            # create a tensor (fake) from a compiler wrapped FunctionalTensor
             def _from_fun(t):
                 if isinstance(t, torch.Tensor):
                     return torch.empty_strided(
@@ -131,7 +132,7 @@ class LocalMapAutogradOp(torch.autograd.Function):
         save_tensors_and_symints_for_backward(ctx, args)
         ctx.joint_graph = joint_graph
 
-        with torch._C._AutoDispatchBelowAutograd():  # why
+        with torch._C._AutoDispatchBelowAutograd():
             return local_map_hop(orig_fwd, *args, **kwargs)
 
     @staticmethod
