@@ -130,7 +130,7 @@ mesh = torch.distributed.device_mesh.init_device_mesh(
 
 in_channels = 4096
 inter_channels = 4096 * 2
-num_experts = 8
+num_experts = 64
 
 bs = 8 * mesh.shape[0]
 seqlen = 2048
