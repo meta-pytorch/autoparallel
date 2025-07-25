@@ -33,7 +33,10 @@ from torch.distributed.tensor._ops._view_ops import (
     propagate_shape_and_sharding,
     register_op_strategy_map,
 )
-from torch.distributed.tensor._ops.utils import generate_redistribute_costs, is_tensor_shardable
+from torch.distributed.tensor._ops.utils import (
+    generate_redistribute_costs,
+    is_tensor_shardable,
+)
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
 # TODO: move this to PyTorch
@@ -108,6 +111,7 @@ def remove_invalid_configs(out_strat, mesh):
         if strategy.input_specs is not None:
             specs = list(strategy.input_specs) + list(output_specs)
         else:
+            # special case for ops like full, empty, which have no inputs. See further comments by `TENSOR_FACTORY_OPS`
             specs = list(output_specs)
 
         for spec in specs:
@@ -352,13 +356,14 @@ def randperm_rule(mesh, specs):
 # - fake that they have input schemas so the solver doesn't freak out
 # - convert their sizes to 'local tensor sizes' (divide by mesh dim) during ApplySharding
 TENSOR_FACTORY_OPS = [
-        torch.ops.aten.zeros.default,
-        torch.ops.aten.ones.default,
-        torch.ops.aten.full.default,
-        torch.ops.aten.empty.memory_format,
-        torch.ops.aten.rand.default,
-        torch.ops.aten.randn.default,
+    torch.ops.aten.zeros.default,
+    torch.ops.aten.ones.default,
+    torch.ops.aten.full.default,
+    torch.ops.aten.empty.memory_format,
+    torch.ops.aten.rand.default,
+    torch.ops.aten.randn.default,
 ]
+
 
 @register_opschema_rule(TENSOR_FACTORY_OPS)
 def factory_rule(mesh, op_schema: OpSchema) -> OpStrategy:
@@ -376,18 +381,22 @@ def factory_rule(mesh, op_schema: OpSchema) -> OpStrategy:
     This util applies to any factory function that takes 'size' as the first argument,
     and supports Replication and Shard placements all at zero cost.
     """
+    assert isinstance(op_schema.args_schema[0], torch.Size)
     shape = op_schema.args_schema[0]
     x = torch.empty(shape, device="meta")
-    stride = x.stride() 
+    stride = x.stride()
     dtype = torch.get_default_dtype()
     if len(op_schema.args_schema) >= 3:
-        # Todo didn't really verify this 
+        assert isinstance(op_schema.args_schema[2], torch.dtype)
         dtype = op_schema.args_schema[2]
         assert isinstance(dtype, torch.dtype), dtype
-    
+
     # TODO: ensure the solver knows that it is more expensive to Replicate factory functions than shard
-    # for now, put replicate last since this might encourage sharding :?
-    single_mesh_dim_strategies = [[Shard(i)] for i in range(len(shape))] + [[Replicate()]]
+    # for now, put replicate last since this might encourage sharding.  (Experimentally it seemed so, but definitely
+    # this is not a stable gaurantee and we should fix this properly.)
+    single_mesh_dim_strategies = [[Shard(i)] for i in range(len(shape))] + [
+        [Replicate()]
+    ]
 
     """
     Expand the single_mesh_dim_strategies to full mesh dim strategies.
@@ -407,10 +416,11 @@ def factory_rule(mesh, op_schema: OpSchema) -> OpStrategy:
             continue
 
         redistribute_cost = [
-            # TODO: there shouldn't actually be a row here, since there is no input to the op and the rows correspond 
+            # TODO: there shouldn't actually be a row here, since there is no input to the op and the rows correspond
             # to the inputs. However, the optimization code is not set up to tolerate input-less ops, so hack around it
             # (see "/data/users/whc/autoparallel/autoparallel/optimize_sharding.py", line 226, in walk_over_options)
-            [0.0] * len(strategy_combs)
+            [0.0]
+            * len(strategy_combs)
         ]
 
         strategy = OpSpec(
@@ -419,6 +429,7 @@ def factory_rule(mesh, op_schema: OpSchema) -> OpStrategy:
         )
         all_strategies.append(strategy)
     return OpStrategy(all_strategies)
+
 
 # ======================================
 # the following ops require meta_tensor fix
@@ -646,48 +657,6 @@ def index_rule(mesh, op_schema):
             res.append(s)
     out_strat = OpStrategy(res)
     return out_strat
-
-
-# @register_opschema_rule(torch.ops.aten.index_put.default)
-# def index_put_rule(mesh, op_schema):
-#     print(f"Ops that need to be implemented {torch.ops.aten.index_put.default}")
-#     # raise NotImplementedError("Needs hardening, only tested on a few cases")
-#     strat = op_schema.args_schema
-#     specs = strat  # TODO: clean this up
-#     res = []
-#     # idxs_placements = [(Replicate(), Replicate()), (Shard(0), Replicate())]
-#     # if strat[1].childs[0] is None:
-#     #    idxs_placements = idxs_placements[:1]
-#     # else:
-#     #    idxs_placements = idxs_placements[1:]
-#     idxs_placements = [(Replicate(),) * mesh.ndim]
-#     # TODO: this is a nasty hack and won't work for most of the cases
-#     for i, ss in enumerate(strat[0].strategies):
-#         for plt in idxs_placements:
-#             ispec = ss.input_specs[0]
-#             ospec = DTensorSpec(mesh=mesh, placements=ispec.placements)
-#             assert ss.output_spec == ispec, f"{ss.output_spec}, {ispec}"
-#             idxs_strats = [
-#                 DTensorSpec(mesh, placements=plt)
-#                 for x in strat[1].childs
-#                 if x is not None
-#             ]
-#             kspc = [x for x in strat[1].childs if x is not None]
-#             t_strats = [DTensorSpec(mesh, placements=ispec.placements)]
-#             s = OpSpec(output_specs=ospec, input_specs=[ispec] + idxs_strats + t_strats)
-
-#             redistribute_costs = (
-#                 [generate_redistribute_costs(specs[0], ospec)]
-#                 + [
-#                     generate_redistribute_costs(kk, idxs_strat)
-#                     for kk, idxs_strat in zip(kspc, idxs_strats)
-#                 ]
-#                 + [generate_redistribute_costs(specs[2], t_strats[0])]
-#             )
-#             s.redistribute_cost = redistribute_costs
-#             res.append(s)
-#     out_strat = OpStrategy(res)
-#     return out_strat
 
 
 @register_opschema_rule(torch.ops.aten._scaled_dot_product_efficient_attention.default)

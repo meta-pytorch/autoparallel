@@ -3,7 +3,6 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
-from re import I
 import torch
 from torch.distributed._tensor.placement_types import TensorMeta
 from torch.distributed.device_mesh import _get_device_handle
@@ -11,7 +10,12 @@ from torch.distributed.tensor._op_schema import OpSchema, OpStrategy, TupleStrat
 from torch.distributed.tensor._ops.utils import generate_redistribute_costs
 from torch.utils._pytree import tree_flatten, tree_map_only
 
-from .propagation_rules import _op_partial_rules, _op_rules, remove_invalid_configs
+from .propagation_rules import (
+    TENSOR_FACTORY_OPS,
+    _op_partial_rules,
+    _op_rules,
+    remove_invalid_configs,
+)
 
 
 def _get_meta_tensors_for_op(op, user_args, user_kwargs):
@@ -54,21 +58,8 @@ def propagate_tensor_meta(op, user_args, user_kwargs, out_strat):
                         else:
                             assert tm is None
         if strat.input_specs is None:
-            if op in [
-                # TODO import the list of registered factories, but it would be circular the way it is now
-                torch.ops.aten.zeros.default,
-                torch.ops.aten.ones.default,
-                torch.ops.aten.full.default,
-                torch.ops.aten.empty.memory_format,
-                torch.ops.aten.rand.default,
-                torch.ops.aten.randn.default,
-            ]:
+            if op in TENSOR_FACTORY_OPS:
                 # there isn't an input spec bc the op has no input!
-                # continue
-
-                # but index_put op insists on looking at 'input_specs' of its input, which seems absurd.
-                # so just copy it for now and fix later
-                strat.input_specs = (strat.output_specs,)
                 continue
 
             supported_ops = {
