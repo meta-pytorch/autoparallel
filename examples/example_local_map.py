@@ -4,6 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from torch.distributed.tensor.placement_types import Replicate, Shard
 from torch.testing._internal.distributed.fake_pg import FakeStore
@@ -17,12 +18,12 @@ torch.compile(lambda x: x + 1, backend="eager")(torch.rand(10))
 
 @apply_local_map(
     out_placements=[
-        [Replicate(), Replicate()],
+        [Replicate(), Replicate(), Replicate()],
     ],
     in_placements=(
-        [Replicate(), Replicate()],
-        [Replicate(), Replicate()],
-        [Replicate(), Replicate()],
+        [Replicate(), Replicate(), Replicate()],
+        [Replicate(), Replicate(), Replicate()],
+        [Replicate(), Replicate(), Replicate()],
     ),
     redistribute_inputs=True,
     in_grad_placements=None,
@@ -34,15 +35,35 @@ def replicate_linear(w, bias, x):
 
 @apply_local_map(
     out_placements=[
-        [Shard(0), Shard(0)],
+        [Shard(0), Shard(0), Replicate()],
     ],
-    in_placements=([Shard(0), Shard(0)],),
+    in_placements=([Shard(0), Shard(0), Replicate()],),
     redistribute_inputs=True,
     in_grad_placements=None,
     device_mesh=None,
 )
 def sharded_pointwise(x):
     return x + 10
+
+
+@apply_local_map(
+    out_placements=[
+        [Replicate(), Replicate(), Shard(2)],
+    ],
+    in_placements=(
+        [Replicate(), Replicate(), Shard(2)],
+        [Replicate(), Replicate(), Shard(2)],
+        [Replicate(), Replicate(), Shard(2)],
+    ),
+    redistribute_inputs=True,
+    in_grad_placements=None,
+    device_mesh=None,
+)
+def context_parallel_attention(query, key, value):
+    out = F.scaled_dot_product_attention(
+        query=query, key=key, value=value, is_causal=True
+    )
+    return out
 
 
 class Block(nn.Module):
@@ -74,7 +95,7 @@ class Block(nn.Module):
         k = k.unflatten(-1, (self.nheads, -1)).permute(0, 2, 1, 3)
         v = v.unflatten(-1, (self.nheads, -1)).permute(0, 2, 1, 3)
 
-        o = nn.functional.scaled_dot_product_attention(q, k, v)
+        o = context_parallel_attention(q, k, v)
         o = o.permute(0, 2, 1, 3).flatten(-2)
 
         o = self.wo(o)
@@ -99,10 +120,11 @@ torch.distributed.init_process_group(
 # mesh = torch.distributed.device_mesh.init_device_mesh("cuda", (world_size,), mesh_dim_names=("dp",))
 mesh = torch.distributed.device_mesh.init_device_mesh(
     "cuda",
-    (world_size // 8, 8),
+    (world_size // 32, 8, 4),
     mesh_dim_names=(
         "dp",
         "tp",
+        "cp",
     ),
 )
 
@@ -133,7 +155,7 @@ with torch.device("meta"):
 autop = AutoParallel(model, input_fn, mesh)
 autop.add_parameter_memory_constraint(low=None, high=None)
 
-x_sharding = (Shard(0), Replicate())
+x_sharding = (Shard(0), Replicate(), Shard(1))
 
 autop.add_input_constraints([x_sharding])
 autop.add_output_constraints([x_sharding])
@@ -146,7 +168,7 @@ parallel_mod.to_empty(device="cuda")
 parallel_mod.init_weights()
 
 # now let's run it
-x = (torch.rand(bs // mesh.shape[0], seq_len, dim1, device="cuda"),)
+x = (torch.rand(bs // mesh.shape[0], seq_len // mesh.shape[2], dim1, device="cuda"),)
 out = parallel_mod(*x)
 out.backward(torch.randn_like(out))
 
