@@ -94,6 +94,7 @@ class MOEBatchedDebug(nn.Module):
         super().__init__()
         self.num_experts = num_experts
         self.experts = BatchFFN(in_channels, inter_channels, num_experts)
+        self.top_k = 4
 
     def init_weights(self):
         pass
@@ -101,8 +102,14 @@ class MOEBatchedDebug(nn.Module):
     def forward(self, x):
         assert x.ndim == 3
         shape = x.shape
-        xs = x.unflatten(1, (self.num_experts, -1)).permute(1, 0, 2, 3).flatten(1, 2)
+        xs = (
+            x.unflatten(1, (self.num_experts, -1))
+            .permute(1, 0, 2, 3)
+            .repeat(1, 1, self.top_k, 1)
+            .flatten(1, 2)
+        )
         out = self.experts(xs)
+        out = out.unflatten(1, (-1, self.top_k)).sum(2)
         return out.reshape(shape)
 
 
