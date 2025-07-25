@@ -17,13 +17,11 @@ torch.compile(lambda x: x + 1, backend="eager")(torch.rand(10))
 
 
 @apply_local_map(
-    out_placements=[
-        [Replicate(), Replicate(), Replicate()],
-    ],
+    out_placements=((Replicate(), Replicate(), Replicate()),),
     in_placements=(
-        [Replicate(), Replicate(), Replicate()],
-        [Replicate(), Replicate(), Replicate()],
-        [Replicate(), Replicate(), Replicate()],
+        (Replicate(), Replicate(), Replicate()),
+        (Replicate(), Replicate(), Replicate()),
+        (Replicate(), Replicate(), Replicate()),
     ),
     redistribute_inputs=True,
     in_grad_placements=None,
@@ -34,10 +32,8 @@ def replicate_linear(w, bias, x):
 
 
 @apply_local_map(
-    out_placements=[
-        [Shard(0), Shard(0), Replicate()],
-    ],
-    in_placements=([Shard(0), Shard(0), Replicate()],),
+    out_placements=((Shard(0), Shard(0), Replicate()),),
+    in_placements=((Shard(0), Shard(0), Replicate()),),
     redistribute_inputs=True,
     in_grad_placements=None,
     device_mesh=None,
@@ -47,13 +43,11 @@ def sharded_pointwise(x):
 
 
 @apply_local_map(
-    out_placements=[
-        [Shard(0), Shard(1), Shard(2)],
-    ],
+    out_placements=((Shard(0), Shard(1), Shard(2)),),
     in_placements=(
-        [Shard(0), Shard(1), Shard(2)],
-        [Shard(0), Shard(1), Replicate()],
-        [Shard(0), Shard(1), Replicate()],
+        (Shard(0), Shard(1), Shard(2)),
+        (Shard(0), Shard(1), Replicate()),
+        (Shard(0), Shard(1), Replicate()),
     ),
     redistribute_inputs=True,
     in_grad_placements=None,
