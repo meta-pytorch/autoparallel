@@ -23,6 +23,12 @@ class Block(nn.Module):
         self.w1 = nn.Linear(dim1, dim2, bias=bias)
         self.w2 = nn.Linear(dim2, dim1, bias=bias)
 
+    def init_weights(self):
+        for lin in [self.wq, self.wk, self.wv, self.wo, self.w1, self.w2]:
+            torch.nn.init.normal_(lin.weight)
+            if lin.bias is not None:
+                torch.nn.init.normal_(lin.bias)
+
     def forward(self, x):
         q = self.wq(x)
         k = self.wk(x)
@@ -71,16 +77,14 @@ dim1 = 6144
 dim2 = dim1 * 4
 
 
-def model_fn():
-    return Block(nheads, dim1, dim2).cuda()
-
-
 def input_fn():
     return torch.rand(bs, seq_len, dim1, device="cuda")
 
 
 # parallelize the model
-autop = AutoParallel(model_fn, input_fn, mesh)
+with torch.device("meta"):
+    model = Block(nheads, dim1, dim2)
+autop = AutoParallel(model, input_fn, mesh)
 autop.add_parameter_memory_constraint(low=None, high=None)
 
 x_sharding = (Shard(0), Replicate())
@@ -88,9 +92,12 @@ x_sharding = (Shard(0), Replicate())
 autop.add_input_constraints([x_sharding])
 autop.add_output_constraints([x_sharding])
 
-
 sharding_placement = autop.optimize_placement()
+
+# AutoParallel produces a module with meta-DTensor parameters that need to be initialized
 parallel_mod = autop.apply_placement(sharding_placement)
+parallel_mod.to_empty(device="cuda")
+parallel_mod.init_weights()
 
 # now let's run it
 x = (torch.rand(bs // mesh.shape[0], seq_len, dim1, device="cuda"),)

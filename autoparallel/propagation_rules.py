@@ -3,6 +3,20 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+"""
+Custom sharding propagation rules for automatic parallelization.
+
+This module extends and overrides PyTorch's DTensor operation rules to provide
+custom sharding strategies specifically for autoparallel. All of these should
+eventually be upstreamed to PyTorch proper.
+
+Based on PyTorch DTensor implementation:
+- Core DTensor ops: torch/distributed/tensor/_ops/
+- Sharding propagation: torch/distributed/tensor/_sharding_prop.py
+- Op strategies: torch/distributed/tensor/_op_schema.py
+- Reference: https://pytorch.org/docs/stable/distributed.tensor.html
+"""
+
 import collections
 import copy
 import itertools
@@ -19,7 +33,10 @@ from torch.distributed.tensor._ops._view_ops import (
     propagate_shape_and_sharding,
     register_op_strategy_map,
 )
-from torch.distributed.tensor._ops.utils import generate_redistribute_costs
+from torch.distributed.tensor._ops.utils import (
+    generate_redistribute_costs,
+    is_tensor_shardable,
+)
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
 # TODO: move this to PyTorch
@@ -46,11 +63,15 @@ def register_rule(op):
 _op_partial_rules = {}
 
 
-def register_opschema_rule(op):
+def register_opschema_rule(ops):
     global _op_partial_rules
 
     def wrapper(impl):
-        _op_partial_rules[op] = impl
+        if isinstance(ops, list):
+            for op in ops:
+                _op_partial_rules[op] = impl
+        else:
+            _op_partial_rules[ops] = impl
         return impl
 
     return wrapper
@@ -76,6 +97,37 @@ def _build_meta_tensor(tensor_meta):
     )
 
 
+def remove_invalid_configs(out_strat, mesh):
+    kept = []
+    for strategy in out_strat.strategies:
+        is_valid = True
+        output_specs = strategy.output_specs
+        if isinstance(output_specs, DTensorSpec):
+            output_specs = [output_specs]
+        if strategy.input_specs is not None:
+            specs = list(strategy.input_specs) + list(output_specs)
+        else:
+            # special case for ops like full, empty, which have no inputs. See further comments by `TENSOR_FACTORY_OPS`
+            specs = list(output_specs)
+
+        for spec in specs:
+            if spec is None:
+                continue
+            shape = list(spec.tensor_meta.shape)
+            for mesh_shape, plc in zip(mesh.shape, spec.placements):
+                if plc.is_shard():
+                    dim = plc.dim
+                    if shape[dim] % mesh_shape == 0:
+                        shape[dim] //= mesh_shape
+                    else:
+                        is_valid = False
+                        break
+        if is_valid:
+            kept.append(strategy)
+
+    return OpStrategy(kept)
+
+
 def _create_all_options_no_nested_sharding(mesh, shape, tensor_meta=None):
     if tensor_meta is None:
         tensor_meta = _gen_tensor_meta(shape)
@@ -94,7 +146,9 @@ def _create_all_options_no_nested_sharding(mesh, shape, tensor_meta=None):
             continue
         spec = DTensorSpec.from_dim_map(mesh, op, [], tensor_meta)
         strats.append(OpSpec(spec, input_specs=[spec], redistribute_cost=[[0.0]]))
-    return OpStrategy(strats)
+    out_strats = OpStrategy(strats)
+    out_strats = remove_invalid_configs(out_strats, mesh)
+    return out_strats
 
 
 def _create_all_options(mesh, shape, tensor_meta=None, tensor=None):
@@ -112,7 +166,9 @@ def _create_all_options(mesh, shape, tensor_meta=None, tensor=None):
     for placement in all_options:
         spec = DTensorSpec(mesh, placement, tensor_meta=tensor_meta)
         strats.append(OpSpec(spec, input_specs=[spec], redistribute_cost=[[0.0]]))
-    return OpStrategy(strats)
+    out_strats = OpStrategy(strats)
+    out_strats = remove_invalid_configs(out_strats, mesh)
+    return out_strats
 
 
 @register_rule(operator.getitem)
@@ -270,55 +326,9 @@ def split_with_sizes_rule(mesh, specs):
     return OpStrategy(strats)
 
 
-@register_rule(torch.ops.aten.cat.default)
-def cat_rule(mesh, specs):
-    op_spec = specs[0]
-    dim = specs[1]
-    strats = []
-
-    num_tensors = len(op_spec)
-
-    inp_ts = []
-    for i in range(num_tensors):
-        tm = op_spec[i].strategies[0].output_spec.tensor_meta
-        inp_ts.append(_build_meta_tensor(tm))
-
-    out_t = torch.cat(inp_ts, dim)
-
-    banned_idxs = set()
-    for i, ss in enumerate(op_spec[0].strategies):
-        for placement in ss.output_spec.placements:
-            if placement.is_shard(dim) or placement.is_partial():
-                banned_idxs.add(i)
-
-    for i in range(1, num_tensors):
-        assert len(op_spec[i].strategies) == len(
-            op_spec[0].strategies
-        ), "Assume each cat input has same number of strategies"
-
-    for strat_idx, strat in enumerate(op_spec[0].strategies):
-        placements = strat.output_spec.placements
-        if any(p.is_shard(dim) or p.is_partial() for p in placements):
-            continue
-        output_spec = DTensorSpec(mesh, placements, tensor_meta=_gen_tensor_meta(out_t))
-
-        all_costs = []
-        input_specs = []
-        for i in range(num_tensors):
-            input_specs.append(op_spec[i].strategies[strat_idx].output_spec)
-            redistribute_costs = generate_redistribute_costs(op_spec[i], output_spec)
-            for banned in banned_idxs:
-                redistribute_costs[banned] = math.inf
-            all_costs.append(redistribute_costs)
-
-        s = OpSpec(output_spec, input_specs=input_specs)
-        s.redistribute_cost = all_costs
-        strats.append(s)
-    return OpStrategy(strats)
-
-
 @register_rule(torch.ops.prims.iota.default)
 def iota_rule(mesh, specs):
+    raise NotImplementedError("Needs hardening, only tested on a few cases")
     shape = [specs[0]]
     tensor_meta = _gen_tensor_meta(shape, dtype=torch.int64)
     placement = (Replicate(),) * mesh.ndim
@@ -329,6 +339,7 @@ def iota_rule(mesh, specs):
 
 @register_rule(torch.ops.aten.randperm.default)
 def randperm_rule(mesh, specs):
+    raise NotImplementedError("Needs hardening, only tested on a few cases")
     shape = [specs[0]]
     tensor_meta = _gen_tensor_meta(shape, dtype=torch.int64)
     placement = (Replicate(),) * mesh.ndim
@@ -336,21 +347,84 @@ def randperm_rule(mesh, specs):
     return OpStrategy([OpSpec(spec, input_specs=[spec], redistribute_cost=[[0.0]])])
 
 
-@register_rule(torch.ops.aten.full.default)
-def full_rule(mesh, specs):
-    shape = specs[0]
-    # TODO: get the dtype
-    tensor_meta = _gen_tensor_meta(shape)
-    # TODO: I'm hard-coding this here, I'll probably need to do something else about this
-    placement = (Shard(0),) + (Replicate(),) * (mesh.ndim - 1)
-    # placement = (Replicate(),) * mesh.ndim
-    input_placement = (Replicate(),) * mesh.ndim
-    spec = DTensorSpec(mesh, placement, tensor_meta=tensor_meta)
-    input_spec = DTensorSpec(mesh, input_placement, tensor_meta=tensor_meta)
-    # return OpStrategy([OpSpec(spec, input_specs=[spec], redistribute_cost=[[0.0]])])
-    return OpStrategy(
-        [OpSpec(spec, input_specs=[input_spec], redistribute_cost=[[0.0]])]
-    )
+# We do a few special things for factory ops
+# - use the factory rule below
+# - fake that they have input schemas so the solver doesn't freak out
+# - convert their sizes to 'local tensor sizes' (divide by mesh dim) during ApplySharding
+TENSOR_FACTORY_OPS = [
+    torch.ops.aten.zeros.default,
+    torch.ops.aten.ones.default,
+    torch.ops.aten.full.default,
+    torch.ops.aten.empty.memory_format,
+    torch.ops.aten.rand.default,
+    torch.ops.aten.randn.default,
+]
+
+
+@register_opschema_rule(TENSOR_FACTORY_OPS)
+def factory_rule(mesh, op_schema: OpSchema) -> OpStrategy:
+    """
+    This is an auto-parallel specific util that won't be upstreamed becuase of a UX mismatch.
+
+    In regular DTensor programs, a user has to either call `torch.full` to get a regular tensor, or
+    `torch.distributed.tensor.full` (with placements specified) to get a DTensor.
+
+    There is no point registering a strategy in DTensor for factories like 'full' since there is no way they
+    could be used by DTensor's dispatching logic.  (Note: DTensor does provide strategies for similar ops like
+    'new_full' and 'full_like', the difference being there is an input tensor to trigger dispatch off of and to
+    use to direct the placement options.)
+
+    This util applies to any factory function that takes 'size' as the first argument,
+    and supports Replication and Shard placements all at zero cost.
+    """
+    assert isinstance(op_schema.args_schema[0], torch.Size)
+    shape = op_schema.args_schema[0]
+    x = torch.empty(shape, device="meta")
+    stride = x.stride()
+    dtype = torch.get_default_dtype()
+    if len(op_schema.args_schema) >= 3:
+        assert isinstance(op_schema.args_schema[2], torch.dtype)
+        dtype = op_schema.args_schema[2]
+        assert isinstance(dtype, torch.dtype), dtype
+
+    # TODO: ensure the solver knows that it is more expensive to Replicate factory functions than shard
+    # for now, put replicate last since this might encourage sharding.  (Experimentally it seemed so, but definitely
+    # this is not a stable gaurantee and we should fix this properly.)
+    single_mesh_dim_strategies = [[Shard(i)] for i in range(len(shape))] + [
+        [Replicate()]
+    ]
+
+    """
+    Expand the single_mesh_dim_strategies to full mesh dim strategies.
+    see docs for `expand_to_full_mesh_op_strategy` in _tensor_ops.py in pytorch
+    """
+    all_mesh_dim_strategies = [single_mesh_dim_strategies] * mesh.ndim
+
+    strategy_combs = list(itertools.product(*all_mesh_dim_strategies))
+
+    all_strategies = []
+    for strategy_comb in strategy_combs:
+        spec_list = [DTensorSpec(mesh, specs) for specs in zip(*strategy_comb)]
+        output_specs = spec_list[0]
+        output_specs.tensor_meta = TensorMeta(shape, stride, dtype)
+
+        if not is_tensor_shardable(shape, output_specs):
+            continue
+
+        redistribute_cost = [
+            # TODO: there shouldn't actually be a row here, since there is no input to the op and the rows correspond
+            # to the inputs. However, the optimization code is not set up to tolerate input-less ops, so hack around it
+            # (see "/data/users/whc/autoparallel/autoparallel/optimize_sharding.py", line 226, in walk_over_options)
+            [0.0]
+            * len(strategy_combs)
+        ]
+
+        strategy = OpSpec(
+            output_specs=output_specs,
+            redistribute_cost=redistribute_cost,
+        )
+        all_strategies.append(strategy)
+    return OpStrategy(all_strategies)
 
 
 # ======================================
@@ -500,10 +574,11 @@ def native_layer_norm_backward_rule(mesh, op_schema):
 
 @register_opschema_rule(torch.ops.prims.convert_element_type.default)
 def convert_element_type_rule(mesh, op_schema):
-    from torch.distributed.tensor._ops._tensor_ops import default_strategy
+    from torch.distributed.tensor._ops._tensor_ops import (
+        propagate_single_input_strategy,
+    )
 
-    # TODO: API has changed in latest main
-    out_strat = default_strategy(mesh, op_schema)
+    out_strat = propagate_single_input_strategy(op_schema)
     return out_strat
 
 
@@ -539,6 +614,7 @@ def _unsafe_index_rule(mesh, op_schema):
 
 @register_opschema_rule(torch.ops.aten.index.Tensor)
 def index_rule(mesh, op_schema):
+    raise NotImplementedError("Needs hardening, only tested on a few cases")
     strat = op_schema.args_schema
     specs = strat  # TODO: clean this up
     res = []
@@ -572,45 +648,6 @@ def index_rule(mesh, op_schema):
             ]
             s.redistribute_cost = redistribute_costs
 
-            res.append(s)
-    out_strat = OpStrategy(res)
-    return out_strat
-
-
-@register_opschema_rule(torch.ops.aten.index_put.default)
-def index_put_rule(mesh, op_schema):
-    strat = op_schema.args_schema
-    specs = strat  # TODO: clean this up
-    res = []
-    idxs_placements = [(Replicate(), Replicate()), (Shard(0), Replicate())]
-    if strat[1].childs[0] is None:
-        idxs_placements = idxs_placements[:1]
-    else:
-        idxs_placements = idxs_placements[1:]
-    # TODO: this is a nasty hack and won't work for most of the cases
-    for i, ss in enumerate(strat[0].strategies):
-        for plt in idxs_placements:
-            ispec = ss.input_specs[0]
-            ospec = DTensorSpec(mesh=mesh, placements=ispec.placements)
-            assert ss.output_spec == ispec, f"{ss.output_spec}, {ispec}"
-            idxs_strats = [
-                DTensorSpec(mesh, placements=plt)
-                for x in strat[1].childs
-                if x is not None
-            ]
-            kspc = [x for x in strat[1].childs if x is not None]
-            t_strats = [DTensorSpec(mesh, placements=ispec.placements)]
-            s = OpSpec(output_specs=ospec, input_specs=[ispec] + idxs_strats + t_strats)
-
-            redistribute_costs = (
-                [generate_redistribute_costs(specs[0], ospec)]
-                + [
-                    generate_redistribute_costs(kk, idxs_strat)
-                    for kk, idxs_strat in zip(kspc, idxs_strats)
-                ]
-                + [generate_redistribute_costs(specs[2], t_strats[0])]
-            )
-            s.redistribute_cost = redistribute_costs
             res.append(s)
     out_strat = OpStrategy(res)
     return out_strat

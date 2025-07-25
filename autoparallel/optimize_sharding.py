@@ -3,6 +3,80 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+"""
+Sharding optimization using Integer Linear Programming (ILP).
+
+This module solves the optimal sharding strategy problem by formulating it as an ILP
+where each binary variable x_{i,a,o,j} ∈ {0,1} represents a choice of input placement j
+and output placement o for operation i and argument a. The objective minimizes total cost:
+
+    minimize: Σ_{i,a,o,j} c_{i,a,o,j} * x_{i,a,o,j}
+
+where:
+- x_{i,a,o,j}: binary decision variable (1 if strategy selected, 0 otherwise)
+- c_{i,a,o,j}: total cost (communication + computation) for this strategy choice
+
+subject to the following constraint categories:
+
+1. UNIQUENESS CONSTRAINTS: Each operation-argument pair must select exactly one
+   input-output placement combination.
+
+   ∀i,a: Σ_{o,j} x_{i,a,o,j} = 1
+
+   → Implemented in: add_unique_decision_constraint()
+
+2. CONSISTENCY CONSTRAINTS: For multi-argument operations, all arguments must agree
+   on the same output placement to ensure the operation can execute correctly.
+
+   ∀i,o: Σ_j x_{i,0,o,j} = Σ_j x_{i,1,o,j} = ... = Σ_j x_{i,A_i-1,o,j}
+   where A_i is the number of arguments for operation i.
+
+   → Implemented in: add_same_output_across_args_constraint()
+
+3. FLOW CONSTRAINTS: The output placement of producer operations must match the
+   input placement of consumer operations (dataflow consistency).
+
+   ∀(i→k): Σ_j x_{i,0,o,j} = Σ_j x_{k,a,j,o}
+   where operation i feeds into operation k at argument position a.
+
+   → Implemented in: add_output_input_consistent_constraint()
+
+4. COST CONSTRAINTS: Variables with infinite cost (invalid configurations) are
+   forced to zero.
+
+   ∀i,a,o,j: c_{i,a,o,j} = ∞ ⟹ x_{i,a,o,j} = 0
+
+   → Implemented in: add_inf_cost_constraint()
+
+5. EFFICIENCY CONSTRAINTS: Penalize inefficient collective operations like
+   non-batch dimension shard-to-replicate conversions and forbid invalid
+   transitions like replicate-to-partial.
+
+   - Shard(dim≠0) → Replicate: multiply cost by 4
+   - Replicate → Partial: x_{i,a,o,j} = 0 (forbidden)
+   - Partial → Shard(dim≠0): multiply cost by 4
+
+   → Implemented in: penalize_inefficient_collectives()
+
+6. USER CONSTRAINTS (optional): Force specific placements for inputs, outputs,
+   parameters, or memory usage bounds.
+
+   6a. Input/Output constraints: x_{i,a,o*,j*} = 1 for specified (o*,j*)
+       → Implemented in: add_sharded_input_constraint(), add_sharded_output_constraint()
+
+   6b. Memory constraints: Σ_{params} (size_ratio * x_{param}) ≤ memory_limit
+       → Implemented in: add_parameter_memory_constraint()
+
+   6c. Parameter-gradient consistency: x_{param} = x_{grad_param}
+       → Implemented in: add_grad_param_constraints()
+
+   6d. General node constraints: Force specific placement for any node
+       → Implemented in: add_node_constraint()
+
+The solver finds the globally optimal sharding strategy that minimizes total
+runtime cost while satisfying all constraints.
+"""
+
 import math
 
 import pulp
@@ -11,7 +85,10 @@ from torch.distributed.tensor._dtensor_spec import DTensorSpec
 from torch.distributed.tensor.placement_types import Replicate, Shard
 from torch.utils._pytree import tree_flatten, tree_map_only
 
-from .compute_estimation import _get_sharded_shape, estimate_strategy_runtime_cost
+from .compute_estimation import (
+    _get_sharded_shape_stride,
+    estimate_strategy_runtime_cost,
+)
 from .propagation_rules import _create_all_options
 from .utils import get_placement_options
 
@@ -43,6 +120,9 @@ class ShardingOptimizer:
         self.mesh = mesh
         self.node_map = {node: i for i, node in enumerate(self.graph.nodes)}
         self.strats = self.build_sharding_metadata()
+        # ds: Decision variables dictionary mapping (s_i, argi, ss, ii) -> ILP variable data
+        # Each key represents a choice of input placement ii and output placement ss
+        # for operation s_i and argument argi (corresponds to x_{i,a,o,j} in math notation)
         self.ds, self.num_inp_out, self.num_args = self.build_ds()
         self.validate()
         self.prob = pulp.LpProblem("AutoParallel", pulp.LpMinimize)
@@ -63,8 +143,11 @@ class ShardingOptimizer:
                 user_args = tree_map_only(
                     torch.fx.Node, lambda x: x.meta["val"], node.args
                 )
+                user_kwargs = tree_map_only(
+                    torch.fx.Node, lambda x: x.meta["val"], node.kwargs
+                )
                 strat = get_placement_options(
-                    self.mesh, node.target, user_strats, user_args
+                    self.mesh, node.target, user_strats, user_args, user_kwargs
                 )
                 strats[node] = strat
             elif node.op == "output":
@@ -77,6 +160,26 @@ class ShardingOptimizer:
         return strats
 
     def build_ds(self):
+        """
+        Build decision variables (ds) for the ILP optimization.
+
+        Creates binary variables x_{i,a,o,j} for each valid combination of:
+        - s_i: operation index
+        - argi: argument index
+        - ss: output placement strategy index (o in math notation)
+        - ii: input placement strategy index (j in math notation)
+
+        Returns:
+            ds: Dictionary mapping (s_i, argi, ss, ii) -> {
+                "va": PuLP binary variable,
+                "cost": communication + computation cost,
+                "full_strat": complete strategy object,
+                "out_strat": output placement specification,
+                "inp_strat": input placement specification
+            }
+            num_inp_out: Metadata about strategy counts per operation-argument
+            num_args: Number of arguments per operation
+        """
         strats = self.strats
         ds = {}
         num_inp_out = {}
@@ -124,6 +227,12 @@ class ShardingOptimizer:
                     yield argi, oi, ii
 
     def add_unique_decision_constraint(self):
+        """
+        UNIQUENESS CONSTRAINTS (Category 1): Each operation-argument pair must select exactly one
+        input-output placement combination.
+
+        Mathematical form: ∀i,a: Σ_{o,j} x_{i,a,o,j} = 1
+        """
         # a single pair of input-output policy is chosen
         for s_i, node in enumerate(self.graph.nodes):
             if node.op not in {"placeholder", "call_function"}:
@@ -136,6 +245,12 @@ class ShardingOptimizer:
                 self.prob += (pulp.lpSum(eqs) == 1, _get_next_name("unique_decision"))
 
     def add_same_output_across_args_constraint(self):
+        """
+        CONSISTENCY CONSTRAINTS (Category 2): For multi-argument operations, all arguments must agree
+        on the same output placement to ensure the operation can execute correctly.
+
+        Mathematical form: ∀i,o: Σ_j x_{i,0,o,j} = Σ_j x_{i,1,o,j} = ... = Σ_j x_{i,A_i-1,o,j}
+        """
         # enforce that the same output policy is chosen
         # across arguments
         for s_i, node in enumerate(self.graph.nodes):
@@ -160,6 +275,12 @@ class ShardingOptimizer:
                     )
 
     def add_output_input_consistent_constraint(self):
+        """
+        FLOW CONSTRAINTS (Category 3): The output placement of producer operations must match the
+        input placement of consumer operations (dataflow consistency).
+
+        Mathematical form: ∀(i→k): Σ_j x_{i,0,o,j} = Σ_j x_{k,a,j,o}
+        """
         # enforce that the input of strat_{i+1} == output of strat_{i}
         for s_i, node in enumerate(self.graph.nodes):
             if node.op == "output":
@@ -193,6 +314,12 @@ class ShardingOptimizer:
                     )
 
     def add_inf_cost_constraint(self):
+        """
+        COST CONSTRAINTS (Category 4): Variables with infinite cost (invalid configurations) are
+        forced to zero.
+
+        Mathematical form: ∀i,a,o,j: c_{i,a,o,j} = ∞ ⟹ x_{i,a,o,j} = 0
+        """
         # force inf cost values to be 0, as the solver doesn't accept inf
         for x in self.ds.values():
             if not math.isfinite(x["cost"]):
@@ -206,69 +333,17 @@ class ShardingOptimizer:
         self.add_output_input_consistent_constraint()
         self.add_inf_cost_constraint()
 
-        self.remove_invalid_configurations()
         self.penalize_inefficient_collectives()
-
-    def remove_invalid_configurations(self):
-        """
-        Remove shardings that could yield invalid configurations,
-        for example, when sharding a view on a dimension that would yield
-        an empty size. Maybe this should be fixed in the returned specs from PyTorch
-        though, but removing those invalid cases here for now
-        """
-        for s_i, node in enumerate(self.graph.nodes):
-            if node.op != "call_function":
-                continue
-            # only targetting view for now
-            if node.target != torch.ops.aten.view.default:
-                continue
-            orig_shape = node.args[0].meta["val"].shape
-            shape = list(node.args[1])
-            if len(orig_shape) > len(shape):
-                # TODO: FIXME as I think we should also handle this case
-                continue
-            # print("in heeeererereer", orig_shape, shape)
-            tgt_op_strat = self.strats[node]
-            for counter, parent in enumerate(node.all_input_nodes):
-                curr_op_strat = self.strats[parent]
-
-                for oi, tgt_strat in enumerate(tgt_op_strat.strategies):
-                    spec = tgt_strat.input_specs[counter]
-                    if not isinstance(spec, DTensorSpec):
-                        # TODO: check if this is correct
-                        continue
-
-                    for ii, curr_strat in enumerate(curr_op_strat.strategies):
-                        curr_spec = curr_strat.output_specs
-                        if not isinstance(curr_spec, DTensorSpec):
-                            continue
-                        shape = list(node.args[1])
-                        if -1 in shape:
-                            # handle cases where we need to infer the size
-                            numel = math.prod(orig_shape)
-                            index_loc = shape.index(-1)
-                            # this works because the shape we infer is -1
-                            # and there is a single one
-                            visible_numel = -math.prod(shape)
-                            shape[index_loc] = numel // visible_numel
-                        for mesh_shape, tgt_plc, curr_plc in zip(
-                            spec.mesh.shape, spec.placements, curr_spec.placements
-                        ):
-                            # only keep view shardings that don't yield empty shapes
-                            # which could happen with S(0)S(0) on a dimension whose shape
-                            # is smaller than world_size
-                            if tgt_plc.is_shard():
-                                dim = tgt_plc.dim
-                                if shape[dim] % mesh_shape == 0:
-                                    shape[dim] /= mesh_shape
-                                else:
-                                    self.prob += (
-                                        self.ds[(s_i, counter, oi, ii)]["va"] == 0,
-                                        _get_next_name("invalid_view"),
-                                    )
 
     def penalize_inefficient_collectives(self):
         """
+        EFFICIENCY CONSTRAINTS (Category 5): Penalize inefficient collective operations like
+        non-batch dimension shard-to-replicate conversions and forbid invalid transitions.
+
+        - Shard(dim≠0) → Replicate: multiply cost by 4
+        - Replicate → Partial: x_{i,a,o,j} = 0 (forbidden)
+        - Partial → Shard(dim≠0): multiply cost by 4
+
         When performing shard_{n} -> replicate (for n != 0), there is additional
         computation cost associated. Let's penalize it here while we don't add
         the computation cost together in the comm cost
@@ -313,15 +388,16 @@ class ShardingOptimizer:
                                 # penalize case P -> S(1) as there are additional compute cost
                                 self.ds[(s_i, counter, oi, ii)]["cost"] *= 4
 
-    def print_violated_constraints(self):
+    def get_violated_constraints_log(self):
         violated_constraints = [
             (k, c) for k, c in self.prob.constraints.items() if not c.valid()
         ]
-        print(f"Violated constraints: {[x[0] for x in violated_constraints]}")
+        log_str = f"Violated constraints: {[x[0] for x in violated_constraints]}"
         for cname, c in violated_constraints:
-            print(f"========= {cname} =============")
+            log_str += f"\n========= {cname} ============="
             for cc, v in c.items():
-                print(f"{cc}, coeff={v}, value={cc.value()}")
+                log_str += f"\n{cc}, coeff={v}, value={cc.value()}"
+        return log_str
 
     def print_old(self):
         ds = self.ds
@@ -335,9 +411,10 @@ class ShardingOptimizer:
         )
         total_cost = sum(ds[x]["cost"] for x in res)
         print(f"total_cost: {total_cost:.2f}")
-        self.print_violated_constraints()
+        print(self.get_violated_constraints_log())
 
-    def print(self, colored=False):
+    def get_log(self, colored=False):
+
         from torch.fx.graph import _color_fns, _identity
 
         opt = {}
@@ -375,10 +452,10 @@ class ShardingOptimizer:
             code[l_id] += line
             l_id += 1
         code = "\n".join(code)
-        print(code)
         total_cost = sum(self.ds[x]["cost"] for x in self.res)
-        print(f"total_cost: {total_cost:.2f}")
-        self.print_violated_constraints()
+        code += f"\ntotal_cost: {total_cost:.2f}"
+        code += "\n" + self.get_violated_constraints_log()
+        return code
 
     def print_costs_for_node(self, node, arg=0, **kwargs):
         from tabulate import tabulate  # type: ignore
@@ -408,7 +485,7 @@ class ShardingOptimizer:
         self.res = [k for k, v in sol.items() if v == 1]
 
         if self.prob.status == -1:
-            self.print()
+            print(self.get_log())
             raise RuntimeError("Unsolvable problem")
 
         opt = {}
@@ -494,6 +571,12 @@ class ShardingOptimizer:
         return grad_param_nodes
 
     def add_grad_param_constraints(self):
+        """
+        USER CONSTRAINTS (Category 6c): Parameter-gradient consistency constraints.
+        Ensures parameters and their gradients have matching sharding strategies.
+
+        Mathematical form: x_{param} = x_{grad_param}
+        """
         # TODO: need to make sure that the params and grads are aligned, which are not always the case
         # and we might have fewer gradients than parameters
 
@@ -532,6 +615,12 @@ class ShardingOptimizer:
                 )
 
     def add_parameter_memory_constraint(self, memory_factor_low, memory_factor_high):
+        """
+        USER CONSTRAINTS (Category 6b): Memory constraints for parameters.
+        Ensures total parameter memory usage stays within specified bounds.
+
+        Mathematical form: Σ_{params} (size_ratio * x_{param}) ≤ memory_limit
+        """
         # get all parameters
         param_nodes = self.get_param_nodes()
         elms = []
@@ -542,7 +631,7 @@ class ShardingOptimizer:
                 data = self.ds[(s_i, 0, ii, 0)]
                 spec = data["inp_strat"]
                 tensor_shape = spec.tensor_meta.shape
-                new_tensor_shape = _get_sharded_shape(spec)
+                new_tensor_shape, _ = _get_sharded_shape_stride(spec)
                 new_size = math.prod(new_tensor_shape)
                 old_size = math.prod(tensor_shape)
                 elms.append(data["va"] * new_size / old_size)
@@ -553,6 +642,12 @@ class ShardingOptimizer:
         self.prob += (pulp.lpSum(elms) >= memory_factor_low, "memory_constraint_low")
 
     def add_node_constraint(self, node, placement=None, constraint_name=None):
+        """
+        USER CONSTRAINTS (Category 6d): General node constraints.
+        Force specific placement for any node.
+
+        Mathematical form: x_{i,a,o*,j*} = 1 for specified (o*,j*)
+        """
         strat = self.strats[node]
         if placement is None:
             # default is Shard(0) to parallelize on the batch
@@ -568,6 +663,12 @@ class ShardingOptimizer:
         self._add_node_constraint(node, oi=oi, constraint_name=constraint_name)
 
     def add_sharded_input_constraint(self, input_placements=None):
+        """
+        USER CONSTRAINTS (Category 6a): Input placement constraints.
+        Force specific placements for input nodes and their corresponding gradient inputs.
+
+        Mathematical form: x_{i,a,o*,j*} = 1 for specified input placements (o*,j*)
+        """
         input_nodes = self.get_input_nodes()
         if input_placements is None:
             input_placements = [None] * len(input_nodes)
@@ -592,6 +693,12 @@ class ShardingOptimizer:
             )
 
     def add_sharded_output_constraint(self, output_placements=None):
+        """
+        USER CONSTRAINTS (Category 6a): Output placement constraints.
+        Force specific placements for output nodes and their corresponding gradient outputs.
+
+        Mathematical form: x_{i,a,o*,j*} = 1 for specified output placements (o*,j*)
+        """
         # add final constraint on the output strategy
         output_nodes = self.get_fn_output_nodes()
 

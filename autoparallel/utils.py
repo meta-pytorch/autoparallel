@@ -5,15 +5,21 @@
 
 import torch
 from torch.distributed._tensor.placement_types import TensorMeta
+from torch.distributed.device_mesh import _get_device_handle
 from torch.distributed.tensor._op_schema import OpSchema, OpStrategy, TupleStrategy
 from torch.distributed.tensor._ops.utils import generate_redistribute_costs
 from torch.utils._pytree import tree_flatten, tree_map_only
 
-from .propagation_rules import _op_partial_rules, _op_rules
+from .propagation_rules import (
+    TENSOR_FACTORY_OPS,
+    _op_partial_rules,
+    _op_rules,
+    remove_invalid_configs,
+)
 
 
-def propagate_tensor_meta(op, user_args, out_strat):
-    out_t = op(*user_args)
+def propagate_tensor_meta(op, user_args, user_kwargs, out_strat):
+    out_t = op(*user_args, **user_kwargs)
 
     if isinstance(out_t, torch.Tensor):
         new_tensor_meta = TensorMeta(out_t.shape, out_t.stride(), out_t.dtype)
@@ -43,6 +49,10 @@ def propagate_tensor_meta(op, user_args, out_strat):
                         else:
                             assert tm is None
         if strat.input_specs is None:
+            if op in TENSOR_FACTORY_OPS:
+                # there isn't an input spec bc the op has no input!
+                continue
+
             supported_ops = {
                 torch.ops.prims.convert_element_type.default,
                 torch.ops.aten.clone.default,
@@ -66,12 +76,9 @@ def fill_missing_redistribute_cost(op, specs, out_strat):
     for strat in out_strat.strategies:
         # TODO: check me
         if strat.redistribute_cost is None:
-
             # TODO: the torch.ops.aten.slice.Tensor is wrong here and in the input_spec!!!!!
             handled_ops = {
                 torch.ops.aten.ones_like.default,
-                torch.ops.aten.detach.default,
-                torch.ops.aten.clone.default,
                 torch.ops.aten.full_like.default,
                 torch.ops.aten.empty_like.default,
                 torch.ops.prims.convert_element_type.default,
@@ -85,11 +92,13 @@ def fill_missing_redistribute_cost(op, specs, out_strat):
             strat.redistribute_cost = redistribute_costs
 
 
-def get_placement_options(mesh, op, specs, user_args):
+def get_placement_options(mesh, op, specs, user_args, user_kwargs):
     # print(op)
 
     if op in _op_rules:
-        return _op_rules[op](mesh, specs)
+        out_strat = _op_rules[op](mesh, specs)
+        out_strat = remove_invalid_configs(out_strat, mesh)
+        return out_strat
 
     strat = []
     for spec in specs:
@@ -116,6 +125,15 @@ def get_placement_options(mesh, op, specs, user_args):
             op_schema
         )
 
-    propagate_tensor_meta(op, user_args, out_strat)
+    propagate_tensor_meta(op, user_args, user_kwargs, out_strat)
     fill_missing_redistribute_cost(op, specs, out_strat)
+    out_strat = remove_invalid_configs(out_strat, mesh)
+
     return out_strat
+
+
+def _get_device_from_mesh(mesh):
+    if mesh.device_type == "cpu":
+        return torch.device("cpu")
+    device_handle = _get_device_handle(mesh.device_type)
+    return torch.device(mesh.device_type, device_handle.current_device())

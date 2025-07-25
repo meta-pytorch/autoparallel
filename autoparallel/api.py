@@ -13,11 +13,15 @@ from torch._functorch.partitioners import default_partition
 from torch._inductor.decomposition import select_decomp_table
 from torch._inductor.fx_passes.joint_graph import joint_graph_passes
 from torch._inductor.fx_passes.post_grad import remove_assert_ops
+from torch._logging import trace_structured
 from torch._subclasses import FakeTensorMode
+from torch.distributed.tensor import DeviceMesh
+from torch.nn.utils import stateless
 
 from .apply_sharding import apply_sharding_to_model
 from .export_module import aot_export_module, apply_node_renaming
 from .optimize_sharding import ShardingOptimizer
+from .utils import _get_device_from_mesh
 
 
 def _add_alias(gm):
@@ -44,6 +48,7 @@ def _add_alias(gm):
 
             node.replace_all_uses_with(alias_node, delete_user_cb=delete_user_cb)
 
+    """
     for node in nodes:
         # skip ops which return tuple
         if not isinstance(node.meta["val"], torch.Tensor):
@@ -56,16 +61,19 @@ def _add_alias(gm):
                 return n != alias_node
 
             node.replace_all_uses_with(alias_node, delete_user_cb=delete_user_cb)
+
     """
 
     for node in graph.find_nodes(op="output")[0].all_input_nodes:
         with graph.inserting_after(node):
             alias_node = graph.call_function(torch.ops.aten.alias.default, args=(node,))
             alias_node.meta.update(node.meta)
+
             def delete_user_cb(n):
                 return n != alias_node
+
             node.replace_all_uses_with(alias_node, delete_user_cb=delete_user_cb)
-    """
+
     gm.recompile()
     return gm
 
@@ -73,7 +81,9 @@ def _add_alias(gm):
 def try_convert_fake_to_real(tensors):
     out = {}
     for k, t in tensors.items():
-        out[k] = torch.randn(t.shape, dtype=t.dtype, device=t.device)
+        out[k] = torch.distributed.tensor.randn(
+            t.shape, dtype=t.dtype, device_mesh=t.device_mesh, placements=t.placements
+        )
     return out
 
 
@@ -157,9 +167,9 @@ def prepare_module(parallel_gm, spec, num_fwd_outputs):
 
         def forward(self, *x):
             x = pytree.tree_flatten(x)[0]
-            out = AutoParallelFunc.apply(
-                *(list(self.params.values()) + list(self.buffers_.values()) + list(x))
-            )
+            params = [p.to_local() for p in self.params.values()]
+            buffers = [b.to_local() for b in self.buffers_.values()]
+            out = AutoParallelFunc.apply(*(params + buffers + list(x)))
             return out
 
     return AutoParallelModule, fwd_gm, bwd_gm
@@ -187,10 +197,51 @@ def _get_decomp_table():
     return decomp_table
 
 
+def move_to_fake(model: torch.nn.Module, mode: FakeTensorMode, device: torch.device):
+    """
+    Move the model to the fake mode and move the weights to the fake device
+    """
+
+    def assert_is_meta_tensor(name, t):
+        assert isinstance(t, torch.Tensor) and t.device == torch.device(
+            "meta"
+        ), f"tensor {name} must be on meta device, not {t.device}"
+
+    def _move_to_fake(module, k, device, parameter=True):
+        # lots of ways you might try to swap params with fake params do not work, but this one does
+        submod = module
+        while len(k.split(".")) > 1:
+            submod_name, k = k.split(".", 1)
+            submod = getattr(submod, submod_name)
+
+        fake_tensor = mode.from_tensor(getattr(submod, k)).to(device)
+        if parameter:
+            fake_tensor = torch.nn.Parameter(fake_tensor)
+
+        setattr(submod, k, fake_tensor)
+
+    with mode:
+        for k, p in model.named_parameters():
+            assert_is_meta_tensor(k, p)
+            _move_to_fake(model, k, device, parameter=True)
+        for k, b in model.named_buffers():
+            assert_is_meta_tensor(k, b)
+            _move_to_fake(model, k, device, parameter=False)
+
+    return model
+
+
 class AutoParallel:
-    def __init__(self, model_fn, input_fn, mesh):
+    """
+    Args:
+        mesh: Defines placement options.
+        The meta model is moved to a fake device based on mesh.device_type.
+    """
+
+    def __init__(self, model, input_fn, mesh: DeviceMesh):
         self.fake_mode = FakeTensorMode()
-        self.model_fn = model_fn
+        device = _get_device_from_mesh(mesh)
+        self.model = move_to_fake(model, self.fake_mode, device)
         self.input_fn = input_fn
         self.mesh = mesh
         self.build_model_graph()
@@ -208,7 +259,6 @@ class AutoParallel:
         # needed because of https://github.com/pytorch/pytorch/issues/148977
         torch.__future__.set_swap_module_params_on_conversion(True)
         with self.fake_mode:
-            self.model = self.model_fn()
             inputs = self.input_fn()
             if not isinstance(inputs, tuple):
                 inputs = (inputs,)
@@ -230,8 +280,10 @@ class AutoParallel:
         # we basically want to remove noops in here
         prev = torch._inductor.config.pattern_matcher
         torch._inductor.config.pattern_matcher = False
-        gm = joint_graph_passes(gm)
-        torch._inductor.config.pattern_matcher = prev
+        try:
+            gm = joint_graph_passes(gm)
+        finally:
+            torch._inductor.config.pattern_matcher = prev
         remove_assert_ops(gm.graph)
         gm.graph.eliminate_dead_code()
         gm.recompile()
@@ -239,6 +291,14 @@ class AutoParallel:
         # give more room for optimizations
         _add_alias(gm)
         apply_node_renaming(gm, self.params_len, self.buffer_len, self.metadata)
+        trace_structured(
+            "artifact",
+            metadata_fn=lambda: {
+                "name": "autoparallel_joint_graph",
+                "encoding": "string",
+            },
+            payload_fn=lambda: str(gm.graph),
+        )
 
         self.gm = gm
 
@@ -282,7 +342,16 @@ class AutoParallel:
         self.sharding_placement = self.sharding_optimizer.get_solution(verbose=False)
 
         if verbose:
-            self.sharding_optimizer.print()
+            print(self.sharding_optimizer.get_log())
+
+        trace_structured(
+            "artifact",
+            metadata_fn=lambda: {
+                "name": "autoparallel_sharding_optimizer_log",
+                "encoding": "string",
+            },
+            payload_fn=lambda: self.sharding_optimizer.get_log(colored=False),
+        )
 
         if self.sharding_optimizer.prob.status == -1:
             raise RuntimeError("Didn't find solution")
@@ -299,6 +368,14 @@ class AutoParallel:
         # clean it up by removing the added aliases from previous pass
         # as well as redundant views
         parallel_gm = joint_graph_passes(parallel_gm)
+        trace_structured(
+            "artifact",
+            metadata_fn=lambda: {
+                "name": "autoparallel_parallel_graph",
+                "encoding": "string",
+            },
+            payload_fn=lambda: str(parallel_gm.graph),
+        )
         # now rename input/param/tangent/output/grad_param/grad_input nodes following
         # our convention
         apply_node_renaming(
@@ -306,21 +383,56 @@ class AutoParallel:
         )
         self.parallel_gm = parallel_gm
 
-        param_names = [k.replace(".", "/") for k, _ in self.model.named_parameters()]
-        buffer_names = [k.replace(".", "/") for k, _ in self.model.named_buffers()]
+        param_names = [k for k, _ in self.model.named_parameters()]
+        buffer_names = [k for k, _ in self.model.named_buffers()]
+        param_names_no_fqns = [k.replace(".", "/") for k in param_names]
+        buffer_names_no_fqns = [k.replace(".", "/") for k in buffer_names]
         assert len(param_names) == len(sharded_weights)
         assert len(buffer_names) == len(sharded_buffers)
-        sharded_weights = {k: v for k, v in zip(param_names, sharded_weights)}
-        sharded_buffers = {k: v for k, v in zip(buffer_names, sharded_buffers)}
 
-        self.sharded_weights = sharded_weights
-        self.sharded_buffers = sharded_buffers
+        sharded_weights_no_fqns = {
+            k: v for k, v in zip(param_names_no_fqns, sharded_weights)
+        }
+        sharded_buffers_no_fqns = {
+            k: v for k, v in zip(buffer_names_no_fqns, sharded_buffers)
+        }
+
+        # TODO: preserve state dict properly in the generated nn.module
+        self.sharded_weights = sharded_weights_no_fqns
+        self.sharded_buffers = sharded_buffers_no_fqns
         self.parallel_model_fn, self.fwd_gm, self.bwd_gm = prepare_module(
             parallel_gm, self.spec, self.metadata.num_outputs
         )
 
-        sharded_weights = try_convert_fake_to_real(sharded_weights)
-        sharded_buffers = try_convert_fake_to_real(sharded_buffers)
-        self.parallel_model = self.parallel_model_fn(sharded_weights, sharded_buffers)
+        self.parallel_model = self.parallel_model_fn(
+            sharded_weights_no_fqns, sharded_buffers_no_fqns
+        )
+
+        # Right now we require a convention that the user model provides an init_weights method,
+        # although we could snoop for other methods too.
+        if hasattr(self.model, "init_weights"):
+
+            def init_weights(*args, **kwargs):
+                # TODO: once we have proper FQN support we should remove this
+                # Replace 'params.tok_embeddings/weight' -> 'tok_embeddings.weight'
+                # Replace 'buffers_.freqs_cis' -> 'freqs_cis'
+                sharded_params_buffers = {
+                    k.replace("params.", "")
+                    .replace("buffers_.", "")
+                    .replace("/", "."): v
+                    for k, v in self.parallel_model.state_dict().items()
+                }
+                with stateless._reparametrize_module(
+                    self.model, sharded_params_buffers
+                ):
+                    self.model.init_weights(*args, **kwargs)
+
+        else:
+            init_weights = None
+
+        # assign an init_weights method onto the output mod.
+        # all it does is sneakily run the original user mod's init_weights method,
+        # but with our new DTensor sharded params attached to the user module.
+        self.parallel_model.init_weights = init_weights
 
         return self.parallel_model
