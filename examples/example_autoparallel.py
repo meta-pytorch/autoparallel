@@ -87,8 +87,6 @@ with torch.device("meta"):
     model = Block(nheads, dim1, dim2)
 
 with AutoParallel(model, input_fn, mesh) as autop:
-    autop.gm.print_readable(expanded_def=True)
-
     autop.add_parameter_memory_constraint(low=None, high=None)
 
     x_sharding = (Shard(0), Replicate())

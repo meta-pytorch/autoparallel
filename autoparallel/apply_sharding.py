@@ -210,9 +210,6 @@ def apply_sharding_to_model(gm, sharding_placement, params_spec, buffers_spec):
     # TODO: make_fx here is suspicious in case of dynamic shapes
     parallel_gm = make_fx(interp.run)(*args)
 
-    # TODO: tlparse this
-    parallel_gm.print_readable(expanded_def=True)
-
     # Copy descriptors over to new graph
     for n1, n2 in zip(
         (n for n in gm.graph.nodes if n.op in ("placeholder", "output")),
