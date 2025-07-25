@@ -147,7 +147,7 @@ mesh = torch.distributed.device_mesh.init_device_mesh(
     (world_size // 64, 64),
     mesh_dim_names=(
         "dp",
-        "tp",
+        "ep",
     ),
 )
 
