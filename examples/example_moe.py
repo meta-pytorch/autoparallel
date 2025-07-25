@@ -18,13 +18,17 @@ class MOE(nn.Module):
     def __init__(self, in_channels, inter_channels, num_experts):
         super().__init__()
         self.num_experts = num_experts
-        self.experts = nn.ModuleList(FFN(in_channels, inter_channels) for _ in range(num_experts))
+        self.experts = nn.ModuleList(
+            FFN(in_channels, inter_channels) for _ in range(num_experts)
+        )
 
     def forward(self, x):
         assert x.ndim == 3
         shape = x.shape
         x = x.flatten(0, 1)
-        indices = torch.randint(0, self.num_experts, (x.shape[0],), dtype=torch.int64, device=x.device)
+        indices = torch.randint(
+            0, self.num_experts, (x.shape[0],), dtype=torch.int64, device=x.device
+        )
         output = torch.zeros_like(x)
         for i, expert in enumerate(self.experts):
             idx = torch.where(indices == i)
@@ -60,13 +64,19 @@ class MOEBatched(nn.Module):
         self.num_experts = num_experts
         self.experts = BatchFFN(in_channels, inter_channels, num_experts)
 
+    def init_weights(self):
+        pass
+
     def forward(self, x):
         assert x.ndim == 3
         shape = x.shape
         x = x.flatten(0, 1)
         assert x.shape[0] % self.num_experts == 0
         # force balanced indices
-        indices = torch.randperm(x.shape[0], dtype=torch.int64, device=x.device) % self.num_experts
+        indices = (
+            torch.randperm(x.shape[0], dtype=torch.int64, device=x.device)
+            % self.num_experts
+        )
         # put all tokens corresponding to the same expert together
         idxs = indices.argsort()
         xs = x[idxs].unflatten(0, (self.num_experts, -1))
@@ -77,6 +87,7 @@ class MOEBatched(nn.Module):
         new_idxs = idxs.argsort()
         out = out[new_idxs]
         return out.reshape(shape)
+
 
 """
 
@@ -96,9 +107,9 @@ o = m(x)
 o = m2(x)
 """
 
-from autoparallel.api import AutoParallel
-
 from torch.testing._internal.distributed.fake_pg import FakeStore
+
+from autoparallel.api import AutoParallel
 
 world_size = 256
 
@@ -124,17 +135,23 @@ num_experts = 8
 bs = 8 * mesh.shape[0]
 seqlen = 2048
 
+
 def input_fn():
     return torch.rand(bs, seqlen, in_channels).cuda()
 
+
 def model_fn():
-    return MOEBatched(in_channels, inter_channels, num_experts).cuda()
+    return MOEBatched(in_channels, inter_channels, num_experts)
 
 
-autop = AutoParallel(model_fn, input_fn, mesh)
+with torch.device("meta"):
+    model = model_fn()
+
+autop = AutoParallel(model, input_fn, mesh)
 autop.add_parameter_memory_constraint(low=None, high=None)
 
 from torch.distributed.tensor.placement_types import Replicate, Shard
+
 x_sharding = (Shard(0), Replicate())
 
 autop.add_input_constraints([x_sharding])
@@ -142,5 +159,3 @@ autop.add_output_constraints([x_sharding])
 
 
 sharding_placement = autop.optimize_placement()
-
-from IPython import embed; embed(); sys.sdf
