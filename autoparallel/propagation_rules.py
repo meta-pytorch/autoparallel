@@ -210,6 +210,7 @@ def view_rule(mesh, specs):
     in_tensor = _build_meta_tensor(op_spec.strategies[0].output_specs.tensor_meta)
     out_tensor = torch.ops.aten.view.default(in_tensor, shape)
     out_tensor_meta = _gen_tensor_meta(out_tensor)
+    added = set()
     for strat in op_spec.strategies:
         input_specs = strat.output_specs
         input_tgt_placements, output_placements = propagate_shape_and_sharding(
@@ -226,6 +227,10 @@ def view_rule(mesh, specs):
             placements=tuple(output_placements),
             tensor_meta=out_tensor_meta,
         )
+        key = (input_tgt_spec, output_spec)
+        if key in added:
+            continue
+        added.add(key)
 
         redistribute_costs = [generate_redistribute_costs(op_spec, input_tgt_spec)]
         s = OpSpec(
