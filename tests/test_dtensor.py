@@ -383,7 +383,7 @@ class ImplicitRegistrationTest(DTensorTestBase):
             self._test_op_on_dtensor(test_op, input_x_dt, input_y_dt)
 
         # 2. test_op strategy implicitly registered under context manager
-        with strategy_pool.replicate_for_unsupported_operators():
+        with strategy_pool.with_implicit_strategies():
             self._test_op_on_dtensor(test_op, input_x_dt, input_y_dt)
 
         # 3. remove registration after exiting the context manager

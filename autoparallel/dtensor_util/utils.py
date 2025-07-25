@@ -5,17 +5,13 @@
 
 
 import logging
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from typing import Callable, TypeVar
 
 import torch
 from torch.distributed.tensor import DTensor
-from torch.distributed.tensor._op_schema import (
-    OpSchema,
-    OutputSharding,
-    RuntimeSchemaInfo,
-    StrategyType,
-)
+from torch.distributed.tensor._op_schema import OpSchema, OutputSharding, StrategyType
+from torch.distributed.tensor._ops.utils import register_op_strategy
 from typing_extensions import ParamSpec
 
 logger = logging.getLogger(__name__)
@@ -24,6 +20,34 @@ aten = torch.ops.aten
 
 _T = TypeVar("_T")
 _P = ParamSpec("_P")
+
+
+# TODO: remove and refer to
+# https://github.com/pytorch/pytorch/blob/9c107606629de6383f55e3b48b42e594d23407b1/test/distributed/tensor/test_op_strategy.py#L446
+# once the function is moved outside of the test folder in upstream
+@contextmanager
+def op_strategy_context(op_overload, strategy_func, schema_info=None):
+    """
+    Context manager for setting and clearing op strategies.
+    Args:
+        op_overload: The operator overload to set or clear the strategy for.
+        strategy_func: The strategy function to set for the operator overload.
+        schema_info: Optional schema information for the operator overload.
+    Yields:
+        None
+    """
+    propagator = DTensor._op_dispatcher.sharding_propagator
+    try:
+        # register the op strategy
+        register_op_strategy(op_overload, schema_info=schema_info)(strategy_func)
+        yield
+    finally:
+        # clear this op strategy cache
+        if op_overload in propagator.op_strategy_funcs:
+            del propagator.op_strategy_funcs[op_overload]
+        if op_overload in propagator.op_to_schema_info:
+            del propagator.op_to_schema_info[op_overload]
+        propagator.propagate_op_sharding.cache.cache_clear()
 
 
 # -------------define universal op strategy-------------
@@ -44,9 +68,8 @@ class StrategyPool:
         self.op_to_schema_info = (
             DTensor._op_dispatcher.sharding_propagator.op_to_schema_info
         )
-
         self.enable_implicit_replication: bool = False
-        self.implicit_strategy_op_tracker: list[torch._ops.OpOverload] = []
+        self._current_stack = None
 
     def get_op_strategy(
         self, op: torch._ops.OpOverload, op_schema: OpSchema
@@ -57,54 +80,37 @@ class StrategyPool:
                     f"Operator {op} does not have a sharding strategy registered."
                 )
             else:
-                self.implicit_strategy_op_tracker.append(op)
+                # Use the instance's current stack if available
+                if self._current_stack is not None:
+                    self._current_stack.enter_context(
+                        op_strategy_context(op, replicate_op_strategy)
+                    )
+                else:
+                    # No stack available, just register permanently
+                    register_op_strategy(op)(replicate_op_strategy)
                 logger.warning(
-                    f"implicitly register sharding strategy op {op.name()} using {replicate_op_strategy.__name__}"
+                    f"implicitly registering `{op}` with `{replicate_op_strategy.__name__}`"
                 )
-                self.register_op_strategy(op)(replicate_op_strategy)
         return self.op_strategy_funcs[op](op_schema)
 
-    def register_op_strategy(
-        self,
-        op: torch._ops.OpOverload,
-        schema_info=RuntimeSchemaInfo(needs_pytree=True),
-    ) -> Callable[[Callable[_P, _T]], Callable[_P, _T]]:
-        # pyre-fixme[2]: Parameter must be annotated.
-        # always enable pytree as dispatching overhead is not a concern in AP.
-        def wrapper(impl):
-            if isinstance(op, list):
-                overloads = op
-            else:
-                overloads = [op]
-
-            for overload in overloads:
-                self.op_strategy_funcs[overload] = impl
-                self.op_to_schema_info[overload] = schema_info
-            return impl
-
-        return wrapper
-
     @contextmanager
-    def replicate_for_unsupported_operators(self):
-        """
-        Context manager for setting and clearing implicit strategy.
-        """
-        try:
-            if self.enable_implicit_replication:
-                raise RuntimeError(
-                    "Implicit strategy is already enabled. Cannot enable it again."
-                )
+    def with_implicit_strategies(self):
+        """Context manager to enable implicit replication and clean up strategies."""
+        # Create a fresh ExitStack for this context
+        with ExitStack() as local_stack:
+            # Store the stack as an instance attribute
+            old_stack = self._current_stack
+            self._current_stack = local_stack
+
+            # Enable implicit replication
+            old_value = self.enable_implicit_replication
             self.enable_implicit_replication = True
-            yield
-        finally:
-            self.enable_implicit_replication = False
-            op_to_remove = self.implicit_strategy_op_tracker
-            for op_overload in op_to_remove:
-                if op_overload in self.op_strategy_funcs:
-                    del self.op_strategy_funcs[op_overload]
-                if op_overload in self.op_to_schema_info:
-                    del self.op_to_schema_info[op_overload]
-            self.implicit_strategy_op_tracker.clear()
+            try:
+                yield
+            finally:
+                # Restore the original values
+                self._current_stack = old_stack
+                self.enable_implicit_replication = old_value
 
     # TODO: automatic generate redistribute cost for strategies. There exists a
     # `fill_missing_redistribute_cost` in autoparallel/utils.py, which is a hack
