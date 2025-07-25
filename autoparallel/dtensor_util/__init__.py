@@ -3,7 +3,17 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+# functions to expose
+from .utils import (
+    get_op_strategy,
+    op_strategy_context,
+    replicate_op_strategy,
+    with_implicit_strategies,
+)
 
-from . import utils
-
-strategy_pool = utils.StrategyPool()
+__all__ = [
+    "replicate_op_strategy",
+    "get_op_strategy",
+    "with_implicit_strategies",
+    "op_strategy_context",
+]

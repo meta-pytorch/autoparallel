@@ -3,23 +3,25 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
-
 import logging
 from contextlib import ExitStack, contextmanager
-from typing import Callable, TypeVar
 
 import torch
 from torch.distributed.tensor import DTensor
-from torch.distributed.tensor._op_schema import OpSchema, OutputSharding, StrategyType
+from torch.distributed.tensor._op_schema import OpSchema, StrategyType
 from torch.distributed.tensor._ops.utils import register_op_strategy
-from typing_extensions import ParamSpec
 
 logger = logging.getLogger(__name__)
 
 aten = torch.ops.aten
 
-_T = TypeVar("_T")
-_P = ParamSpec("_P")
+# reference to existing sharding_propagator DTensor upstream
+propagator = DTensor._op_dispatcher.sharding_propagator
+
+enable_implicit_replication = False
+_current_stack = None
+
+replicate_op_strategy = torch.distributed.tensor._ops.utils.replicate_op_strategy
 
 
 # TODO: remove and refer to
@@ -50,76 +52,57 @@ def op_strategy_context(op_overload, strategy_func, schema_info=None):
         propagator.propagate_op_sharding.cache.cache_clear()
 
 
-# -------------define universal op strategy-------------
-replicate_op_strategy = torch.distributed.tensor._ops.utils.replicate_op_strategy
+def get_op_strategy(op: torch._ops.OpOverload, op_schema: OpSchema) -> StrategyType:
+    global enable_implicit_replication, _current_stack
 
-
-class StrategyPool:
-    def __init__(self) -> None:
-        # reference to existing strategy from the DTensor upstream
-        self.op_strategy_funcs: dict[
-            torch._ops.OpOverload, Callable[[OpSchema], StrategyType]
-        ] = DTensor._op_dispatcher.sharding_propagator.op_strategy_funcs
-        # reference to existing rules
-        self.op_to_rules: dict[
-            torch._ops.OpOverload, Callable[[OpSchema], OutputSharding]
-        ] = DTensor._op_dispatcher.sharding_propagator.op_to_rules
-        # we probably don't need to care about existing op_to_schema_info for AP
-        self.op_to_schema_info = (
-            DTensor._op_dispatcher.sharding_propagator.op_to_schema_info
-        )
-        self.enable_implicit_replication: bool = False
-        self._current_stack = None
-
-    def get_op_strategy(
-        self, op: torch._ops.OpOverload, op_schema: OpSchema
-    ) -> StrategyType:
-        if op not in self.op_strategy_funcs:
-            if not self.enable_implicit_replication:
-                raise NotImplementedError(
-                    f"Operator {op} does not have a sharding strategy registered."
+    if op not in propagator.op_strategy_funcs:
+        if not enable_implicit_replication:
+            raise NotImplementedError(
+                f"Operator {op} does not have a sharding strategy registered."
+            )
+        else:
+            # Use the current stack if available
+            if _current_stack is not None:
+                _current_stack.enter_context(
+                    op_strategy_context(op, replicate_op_strategy)
                 )
             else:
-                # Use the instance's current stack if available
-                if self._current_stack is not None:
-                    self._current_stack.enter_context(
-                        op_strategy_context(op, replicate_op_strategy)
-                    )
-                else:
-                    # No stack available, just register permanently
-                    register_op_strategy(op)(replicate_op_strategy)
-                logger.warning(
-                    f"implicitly registering `{op}` with `{replicate_op_strategy.__name__}`"
-                )
-        return self.op_strategy_funcs[op](op_schema)
+                # No stack available, just register permanently
+                register_op_strategy(op)(replicate_op_strategy)
+            logger.warning(
+                f"implicitly registering `{op}` with `{replicate_op_strategy.__name__}`"
+            )
+    return propagator.op_strategy_funcs[op](op_schema)
 
-    @contextmanager
-    def with_implicit_strategies(self):
-        """Context manager to enable implicit replication and clean up strategies."""
-        # Create a fresh ExitStack for this context
-        with ExitStack() as local_stack:
-            # Store the stack as an instance attribute
-            old_stack = self._current_stack
-            self._current_stack = local_stack
 
-            # Enable implicit replication
-            old_value = self.enable_implicit_replication
-            self.enable_implicit_replication = True
-            try:
-                yield
-            finally:
-                # Restore the original values
-                self._current_stack = old_stack
-                self.enable_implicit_replication = old_value
+@contextmanager
+def with_implicit_strategies():
+    """Context manager to enable implicit replication and clean up strategies."""
+    global enable_implicit_replication, _current_stack
 
-    # TODO: automatic generate redistribute cost for strategies. There exists a
-    # `fill_missing_redistribute_cost` in autoparallel/utils.py, which is a hack
-    # to generate redistribute cost given input specs, and only tested on
-    # certain ops. We can potentially make an improvement.
-    def fill_missing_redistribute_cost(
-        self, op: torch._ops.OpOverload, op_schema: OpSchema
-    ):
-        """
-        Fill missing redistribute cost for strategies.
-        """
-        ...
+    # Create a fresh ExitStack for this context
+    with ExitStack() as local_stack:
+        # Store the stack as a global variable
+        old_stack = _current_stack
+        _current_stack = local_stack
+
+        # Enable implicit replication
+        old_value = enable_implicit_replication
+        enable_implicit_replication = True
+        try:
+            yield
+        finally:
+            # Restore the original values
+            _current_stack = old_stack
+            enable_implicit_replication = old_value
+
+
+# TODO: automatic generate redistribute cost for strategies. There exists a
+# `fill_missing_redistribute_cost` in autoparallel/utils.py, which is a hack
+# to generate redistribute cost given input specs, and only tested on
+# certain ops. We can potentially make an improvement.
+def fill_missing_redistribute_cost(op: torch._ops.OpOverload, op_schema: OpSchema):
+    """
+    Fill missing redistribute cost for strategies.
+    """
+    ...

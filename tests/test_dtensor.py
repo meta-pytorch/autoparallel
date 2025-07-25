@@ -3,11 +3,10 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
-from contextlib import contextmanager
-
 import numpy as np
 import torch
-from torch.distributed.tensor import DTensor, Shard, distribute_tensor, init_device_mesh
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import DTensor, Shard, distribute_tensor
 from torch.distributed.tensor._dtensor_spec import DTensorSpec, TensorMeta
 from torch.distributed.tensor._op_schema import (
     OpInfo,
@@ -24,7 +23,9 @@ from torch.testing._internal.distributed._tensor.common_dtensor import (
     with_comms,
 )
 
-from autoparallel.dtensor_util import strategy_pool
+from autoparallel.dtensor_util import get_op_strategy, with_implicit_strategies
+
+propagator = DTensor._op_dispatcher.sharding_propagator
 
 aten = torch.ops.aten
 
@@ -94,31 +95,6 @@ torch.library.register_autograd(
 )
 
 
-@contextmanager
-def op_strategy_context(op_overload, strategy_func, schema_info=None):
-    """
-    Context manager for setting and clearing op strategies in unit tests.
-    Args:
-        op_overload: The operator overload to set or clear the strategy for.
-        strategy_func: The strategy function to set for the operator overload.
-        schema_info: Optional schema information for the operator overload.
-    Yields:
-        None
-    """
-    try:
-        # register the op strategy
-        strategy_pool.register_op_strategy(op_overload, schema_info=schema_info)(
-            strategy_func
-        )
-        yield
-    finally:
-        # clear this op strategy cache
-        if op_overload in strategy_pool.op_strategy_funcs:
-            del strategy_pool.op_strategy_funcs[op_overload]
-        if op_overload in strategy_pool.op_to_schema_info:
-            del strategy_pool.op_to_schema_info[op_overload]
-
-
 # Overwrite upstream `_op_dispatcher.sharding_propagator` with customized
 # sharding_propagator. This is for testing purpose under eager mode and
 # AutoParallel won't use the propagate function. The main changes are 1) Skip
@@ -132,9 +108,9 @@ class CustomShardingPropagator(
     def __init__(self):
         super().__init__()
         self.propagate_op_sharding.cache.cache_clear()
-        self.op_to_rules = strategy_pool.op_to_rules
-        self.op_strategy_funcs = strategy_pool.op_strategy_funcs
-        self.op_to_schema_info = strategy_pool.op_to_schema_info
+        self.op_to_rules = propagator.op_to_rules
+        self.op_strategy_funcs = propagator.op_strategy_funcs
+        self.op_to_schema_info = propagator.op_to_schema_info
 
     def propagate(self, op_info: OpInfo) -> None:
         op_info.output_sharding = self.propagate_op_sharding_non_cached(op_info.schema)
@@ -199,7 +175,7 @@ class CustomShardingPropagator(
             strategy_schema.schema_info = op_schema.schema_info
 
             # assign implicit strategy if enabled
-            strategy_pool.get_op_strategy(strategy_schema.op, strategy_schema)
+            get_op_strategy(strategy_schema.op, strategy_schema)
 
             # run sharding strategy propagation/generation
             op_strategy = self.op_strategy_funcs[op_schema.op](strategy_schema)
@@ -383,7 +359,7 @@ class ImplicitRegistrationTest(DTensorTestBase):
             self._test_op_on_dtensor(test_op, input_x_dt, input_y_dt)
 
         # 2. test_op strategy implicitly registered under context manager
-        with strategy_pool.with_implicit_strategies():
+        with with_implicit_strategies():
             self._test_op_on_dtensor(test_op, input_x_dt, input_y_dt)
 
         # 3. remove registration after exiting the context manager
