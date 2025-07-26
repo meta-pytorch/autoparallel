@@ -653,9 +653,7 @@ def index_rule(mesh, op_schema):
     return out_strat
 
 
-@register_opschema_rule(torch.ops.aten._scaled_dot_product_efficient_attention.default)
-def sdpa_rule(mesh, op_schema):
-    op = torch.ops.aten._scaled_dot_product_efficient_attention.default
+def sdpa_rule(op, mesh, op_schema):
     out_strat = torch.distributed.tensor.DTensor._op_dispatcher.sharding_propagator.op_strategy_funcs[
         op
     ](
@@ -669,19 +667,21 @@ def sdpa_rule(mesh, op_schema):
             torch.distributed.tensor.placement_types.Shard(2)
             not in ss.input_specs[0].placements
         ):
-            os = ss.output_specs
-            new_os = []
-            for s in os:
-                # replace None with Replicate() in the output_spec
-                # as this is done by default but somewhere further
-                # down the line in DTensor
-                if s is None:
-                    s = DTensorSpec(mesh=mesh, placements=(Replicate(),) * mesh.ndim)
-                new_os.append(s)
-            ss.output_specs = tuple(new_os)
             new_strats.append(ss)
     out_strat.strategies = new_strats
     return out_strat
+
+
+@register_opschema_rule(torch.ops.aten._scaled_dot_product_efficient_attention.default)
+def _(mesh, op_schema):
+    op = torch.ops.aten._scaled_dot_product_efficient_attention.default
+    return sdpa_rule(op, mesh, op_schema)
+
+
+@register_opschema_rule(torch.ops.aten._scaled_dot_product_flash_attention.default)
+def _(mesh, op_schema):
+    op = torch.ops.aten._scaled_dot_product_flash_attention.default
+    return sdpa_rule(op, mesh, op_schema)
 
 
 @register_opschema_rule(torch.ops.aten.reshape.default)
