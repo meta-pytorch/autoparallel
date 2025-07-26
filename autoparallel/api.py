@@ -6,6 +6,7 @@
 import copy
 from collections import OrderedDict
 from contextlib import suppress
+from typing import Optional
 
 import torch
 import torch.utils._pytree as pytree
@@ -245,7 +246,7 @@ class AutoParallel:
         model,
         input_fn,
         mesh: DeviceMesh,
-        mp_policy: MixedPrecisionPolicy | None = None,
+        mp_policy: Optional[MixedPrecisionPolicy] = None,
     ):
         self.fake_mode = FakeTensorMode()
         device = _get_device_from_mesh(mesh)
