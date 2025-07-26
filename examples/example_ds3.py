@@ -809,7 +809,7 @@ class MoE(nn.Module):
                 )
 
 
-world_size = 256
+world_size = 2048
 
 fake_store = FakeStore()
 torch.distributed.init_process_group(
@@ -818,14 +818,14 @@ torch.distributed.init_process_group(
 # mesh = torch.distributed.device_mesh.init_device_mesh("cuda", (world_size,), mesh_dim_names=("dp",))
 mesh = torch.distributed.device_mesh.init_device_mesh(
     "cuda",
-    (world_size // 8, 8),
+    (world_size // 32, 32),
     mesh_dim_names=(
         "dp",
-        "tp",
+        "ep",
     ),
 )
 
-bs = 4 * mesh.shape[0]
+bs = 4 * mesh.shape[0] * mesh.shape[1]
 seqlen = 1024
 dim = 4096
 
@@ -845,7 +845,8 @@ with torch.device("meta"):
 autop = AutoParallel(model, input_fn, mesh)
 autop.add_parameter_memory_constraint(low=None, high=None)
 
-x_sharding = (Shard(0), Replicate())
+# x_sharding = (Shard(0), Replicate())
+x_sharding = (Shard(0), Shard(0))
 
 autop.add_input_constraints([x_sharding])
 autop.add_output_constraints([x_sharding])
@@ -855,16 +856,18 @@ parallel_mod = autop.apply_placement(sharding_placement)
 
 # run weight init on our sharded DTensor params
 parallel_mod.to_empty(device="cuda")
-parallel_mod.init_weights(init_std=0.02, buffer_device="cuda")  # maybe not correct value
+parallel_mod.init_weights(
+    init_std=0.02, buffer_device="cuda"
+)  # maybe not correct value
 
 # # now let's run it
 x = (
     torch.randn(
         # 0,
         # args.vocab_size,
-        (bs // mesh.shape[0], seqlen, dim),
+        (bs // mesh.shape[0] // mesh.shape[1], seqlen, dim),
         device=torch.device("cuda"),
-        dtype=torch.bfloat16
+        dtype=torch.bfloat16,
     ),
 )
 out = parallel_mod(*x)
