@@ -14,6 +14,7 @@ from torch.distributed.tensor._op_schema import (
     TupleStrategy,
 )
 from torch.distributed.tensor._ops.utils import generate_redistribute_costs
+from torch.distributed.tensor.placement_types import Replicate
 from torch.utils._pytree import tree_flatten, tree_map_only
 
 from .propagation_rules import (
@@ -44,6 +45,22 @@ def propagate_tensor_meta(op, user_args, user_kwargs, out_strat):
         if isinstance(new_tensor_meta, TensorMeta):
             strat.output_spec.tensor_meta = new_tensor_meta
         else:
+            # This is basically trying to workaround this behavior of DTensor
+            # https://github.com/pytorch/pytorch/pull/159205#issuecomment-3121562920
+            # would be good to have changed in main
+            new_output_specs = []
+            mesh = strat.mesh
+            for ospec, tm in zip(strat.output_specs, new_tensor_meta):
+                # replace None with Replicate() in the output_spec
+                # as this is done by default but somewhere further
+                # down the line in DTensor
+                if ospec is None and isinstance(tm, TensorMeta):
+                    ospec = DTensorSpec(
+                        mesh=mesh, placements=(Replicate(),) * mesh.ndim
+                    )
+                new_output_specs.append(ospec)
+            strat.output_specs = tuple(new_output_specs)
+
             for ospec, tm in zip(strat.output_specs, new_tensor_meta):
                 if ospec is not None:
                     if ospec.tensor_meta != tm:
