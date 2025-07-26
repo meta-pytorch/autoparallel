@@ -8,7 +8,38 @@ from typing import Dict, Tuple
 
 import torch
 from torch.utils._pytree import tree_map_only
-from torch.utils.flop_counter import FlopCounterMode
+from torch.utils.flop_counter import FlopCounterMode, register_flop_formula
+
+
+@register_flop_formula(torch.ops.aten._grouped_mm)
+def gmm_flop(
+    a_shape, b_shape, offs_shape=None, bias_shape=None, out_shape=None, **kwargs
+) -> int:
+    """Count flops for the gmm operation."""
+    # Inputs should be a list of length 2.
+    # Inputs contains the shapes of two tensor
+    if len(a_shape) == 2:
+        assert offs_shape is not None
+        (b,) = offs_shape
+        m0, k = a_shape
+        # assumption: assume roughtly balanced, so falls-back to bmm
+        m = m0 // b
+    else:
+        assert offs_shape is None
+        b, m, k = a_shape
+    if len(b_shape) == 2:
+        assert offs_shape is not None
+        (b2,) = offs_shape
+        k2, n0 = b_shape
+        # assumption: assume roughtly balanced, so falls-back to bmm
+        n = n0 // b2
+    else:
+        b2, k2, n = b_shape
+    assert b == b2
+    assert k == k2
+    # NB(chilli): Should be 2 * k - 1 technically for FLOPs.
+    flop = b * m * n * 2 * k
+    return flop
 
 
 @dataclass
