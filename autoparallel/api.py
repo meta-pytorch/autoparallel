@@ -15,10 +15,12 @@ from torch._inductor.fx_passes.joint_graph import joint_graph_passes
 from torch._inductor.fx_passes.post_grad import remove_assert_ops
 from torch._logging import trace_structured
 from torch._subclasses import FakeTensorMode
+from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor import DeviceMesh
 from torch.nn.utils import stateless
 
 from .apply_sharding import apply_sharding_to_model
+from .cast_parametrization import apply_dtype_cast
 from .export_module import aot_export_module, apply_node_renaming
 from .optimize_sharding import ShardingOptimizer
 from .utils import _get_device_from_mesh
@@ -238,12 +240,20 @@ class AutoParallel:
         The meta model is moved to a fake device based on mesh.device_type.
     """
 
-    def __init__(self, model, input_fn, mesh: DeviceMesh):
+    def __init__(
+        self,
+        model,
+        input_fn,
+        mesh: DeviceMesh,
+        mp_policy: MixedPrecisionPolicy | None = None,
+    ):
         self.fake_mode = FakeTensorMode()
         device = _get_device_from_mesh(mesh)
+        self.mp_policy = mp_policy
         self.model = move_to_fake(model, self.fake_mode, device)
         self.input_fn = input_fn
         self.mesh = mesh
+
         self.build_model_graph()
 
         sharding_optimizer = ShardingOptimizer(self.gm, self.mesh)
@@ -260,6 +270,9 @@ class AutoParallel:
         torch.__future__.set_swap_module_params_on_conversion(True)
         with self.fake_mode:
             inputs = self.input_fn()
+            if self.mp_policy is not None:
+                # TODO: this changes the model in-place, make it out of place
+                apply_dtype_cast(self.model, self.mp_policy)
             if not isinstance(inputs, tuple):
                 inputs = (inputs,)
 

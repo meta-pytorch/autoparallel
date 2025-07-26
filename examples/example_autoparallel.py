@@ -5,6 +5,7 @@
 
 import torch
 from torch import nn
+from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor.placement_types import Replicate, Shard
 from torch.testing._internal.distributed.fake_pg import FakeStore
 
@@ -60,15 +61,22 @@ fake_store = FakeStore()
 torch.distributed.init_process_group(
     "fake", store=fake_store, rank=0, world_size=world_size
 )
-# mesh = torch.distributed.device_mesh.init_device_mesh("cuda", (world_size,), mesh_dim_names=("dp",))
-mesh = torch.distributed.device_mesh.init_device_mesh(
-    "cuda",
-    (world_size // 8, 8),
-    mesh_dim_names=(
-        "dp",
-        "tp",
-    ),
-)
+
+use_1d_mesh = False
+
+if use_1d_mesh:
+    mesh = torch.distributed.device_mesh.init_device_mesh(
+        "cuda", (world_size,), mesh_dim_names=("dp",)
+    )
+else:
+    mesh = torch.distributed.device_mesh.init_device_mesh(
+        "cuda",
+        (world_size // 8, 8),
+        mesh_dim_names=(
+            "dp",
+            "tp",
+        ),
+    )
 
 bs = 8 * mesh.shape[0]
 seq_len = 256
@@ -84,10 +92,13 @@ def input_fn():
 # parallelize the model
 with torch.device("meta"):
     model = Block(nheads, dim1, dim2)
-autop = AutoParallel(model, input_fn, mesh)
+
+autop = AutoParallel(
+    model, input_fn, mesh, MixedPrecisionPolicy(param_dtype=torch.bfloat16)
+)
 autop.add_parameter_memory_constraint(low=None, high=None)
 
-x_sharding = (Shard(0), Replicate())
+x_sharding = (Shard(0),) + (Replicate(),) * (mesh.ndim - 1)
 
 autop.add_input_constraints([x_sharding])
 autop.add_output_constraints([x_sharding])
