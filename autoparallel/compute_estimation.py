@@ -214,7 +214,7 @@ def estimate_strategy_runtime_cost(node, strategy):
 
     # TODO: maybe cache the flop_counter to avoid recreating it
     # all the time
-    with FlopCounterMode(display=False) as flop_counter:
+    with FlopCounterMode(display=False) as flop_counter, fake_mode:
         node.target(*args, **kwargs)
 
     flops = flop_counter.get_total_flops()

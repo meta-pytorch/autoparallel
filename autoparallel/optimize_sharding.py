@@ -114,10 +114,11 @@ def _get_next_name(name):
 
 
 class ShardingOptimizer:
-    def __init__(self, gm, mesh):
+    def __init__(self, gm, mesh, fake_mode):
         self.gm = gm
         self.graph = gm.graph
         self.mesh = mesh
+        self.fake_mode = fake_mode
         self.node_map = {node: i for i, node in enumerate(self.graph.nodes)}
         self.strats = self.build_sharding_metadata()
         # ds: Decision variables dictionary mapping (s_i, argi, ss, ii) -> ILP variable data
@@ -147,7 +148,12 @@ class ShardingOptimizer:
                     torch.fx.Node, lambda x: x.meta["val"], node.kwargs
                 )
                 strat = get_placement_options(
-                    self.mesh, node.target, user_strats, user_args, user_kwargs
+                    self.mesh,
+                    node.target,
+                    user_strats,
+                    user_args,
+                    user_kwargs,
+                    self.fake_mode,
                 )
                 strats[node] = strat
             elif node.op == "output":
@@ -194,7 +200,8 @@ class ShardingOptimizer:
                     "num_output_strat": len(s.strategies),
                 }
             for ss, ssi in enumerate(s.strategies):
-                compute_cost = estimate_strategy_runtime_cost(node, ssi)
+                with self.fake_mode:
+                    compute_cost = estimate_strategy_runtime_cost(node, ssi)
                 for argi, xxi in enumerate(ssi.redistribute_cost):
                     for ii, comm_cost in enumerate(xxi):
                         va = pulp.LpVariable(

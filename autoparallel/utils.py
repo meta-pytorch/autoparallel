@@ -18,8 +18,9 @@ from .propagation_rules import (
 )
 
 
-def _get_meta_tensors_for_op(op, user_args, user_kwargs):
-    out_t = op(*user_args, **user_kwargs)
+def _get_meta_tensors_for_op(op, user_args, user_kwargs, fake_mode):
+    with fake_mode:
+        out_t = op(*user_args, **user_kwargs)
 
     if isinstance(out_t, torch.Tensor):
         out_tensor_meta = TensorMeta(out_t.shape, out_t.stride(), out_t.dtype)
@@ -40,8 +41,10 @@ def _get_meta_tensors_for_op(op, user_args, user_kwargs):
     return out_tensor_meta, input_tensor_metas
 
 
-def propagate_tensor_meta(op, user_args, user_kwargs, out_strat):
-    new_tensor_meta, tensor_metas = _get_meta_tensors_for_op(op, user_args, user_kwargs)
+def propagate_tensor_meta(op, user_args, user_kwargs, out_strat, fake_mode):
+    new_tensor_meta, tensor_metas = _get_meta_tensors_for_op(
+        op, user_args, user_kwargs, fake_mode
+    )
 
     for strat in out_strat.strategies:
         if isinstance(new_tensor_meta, TensorMeta):
@@ -104,7 +107,9 @@ def fill_missing_redistribute_cost(op, specs, out_strat):
             strat.redistribute_cost = redistribute_costs
 
 
-def _generate_dummy_strategy(mesh, op, user_args, user_kwargs, input_strategies):
+def _generate_dummy_strategy(
+    mesh, op, user_args, user_kwargs, input_strategies, fake_mode
+):
     from torch.distributed.tensor._dtensor_spec import DTensorSpec
     from torch.distributed.tensor._op_schema import OpSpec
     from torch.distributed.tensor.placement_types import Replicate
@@ -112,7 +117,7 @@ def _generate_dummy_strategy(mesh, op, user_args, user_kwargs, input_strategies)
     placements = (Replicate(),) * mesh.ndim
 
     out_tensor_meta, input_tensor_metas = _get_meta_tensors_for_op(
-        op, user_args, user_kwargs
+        op, user_args, user_kwargs, fake_mode
     )
 
     input_specs = [
@@ -148,7 +153,7 @@ def _generate_dummy_strategy(mesh, op, user_args, user_kwargs, input_strategies)
     return out_strat
 
 
-def get_placement_options(mesh, op, specs, user_args, user_kwargs):
+def get_placement_options(mesh, op, specs, user_args, user_kwargs, fake_mode):
     # print(op)
 
     if op in _op_rules:
@@ -189,9 +194,11 @@ def get_placement_options(mesh, op, specs, user_args, user_kwargs):
         )
     else:
         print(f"Ops that need to be implemented {op}")
-        out_strat = _generate_dummy_strategy(mesh, op, user_args, user_kwargs, strat)
+        out_strat = _generate_dummy_strategy(
+            mesh, op, user_args, user_kwargs, strat, fake_mode
+        )
 
-    propagate_tensor_meta(op, user_args, user_kwargs, out_strat)
+    propagate_tensor_meta(op, user_args, user_kwargs, out_strat, fake_mode)
     fill_missing_redistribute_cost(op, specs, out_strat)
     out_strat = remove_invalid_configs(out_strat, mesh)
 

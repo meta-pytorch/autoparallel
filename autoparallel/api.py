@@ -247,7 +247,7 @@ class AutoParallel:
         self.mesh = mesh
         self.build_model_graph()
 
-        sharding_optimizer = ShardingOptimizer(self.gm, self.mesh)
+        sharding_optimizer = ShardingOptimizer(self.gm, self.mesh, self.fake_mode)
         # makes sharding of params and gradients the same
         sharding_optimizer.add_grad_param_constraints()
         self.sharding_optimizer = sharding_optimizer
