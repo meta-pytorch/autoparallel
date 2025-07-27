@@ -490,7 +490,12 @@ class ShardingOptimizer:
         from torch.distributed.tensor._op_schema import _pretty_print_spec
 
         tgt_strat = self.strats[node]
-        src_strat = self.strats[node.args[arg]]
+        # Use this instead of node.all_input_nodes because there could be
+        # duplicate nodes that get removed
+        all_input_nodes = [
+            x for x in tree_flatten(node.args)[0] if isinstance(x, torch.fx.Node)
+        ]
+        src_strat = self.strats[all_input_nodes[arg]]
         src_placements = [""] + [
             _pretty_print_spec(x.output_specs) for x in src_strat.strategies
         ]

@@ -19,6 +19,149 @@ from torch.testing._internal.distributed.fake_pg import FakeStore
 from autoparallel.api import AutoParallel
 
 
+@torch.library.custom_op("autoparallel::batched_grouped_mm", mutates_args=())
+def batched_grouped_mm(
+    mat1: torch.Tensor, mat2: torch.Tensor, offs: torch.Tensor
+) -> torch.Tensor:
+    assert offs.ndim == 2
+    assert mat1.ndim == 3
+    assert mat2.ndim == 3, f"{mat2.shape}"
+    res = []
+    for a, off in zip(mat1, offs):
+        res.append(a, mat2, off)
+    return torch.stack(res, 0)
+
+
+def setup_context(ctx, inputs, output) -> torch.Tensor:
+    mat1, mat2, offs = inputs
+    ctx.save_for_backward(mat1, mat2, offs)
+
+
+def backward(ctx, grad):
+    mat1, mat2, offs = ctx.saved_tensors
+    grad1 = batched_grouped_mm(grad, mat2.transpose(-2, -1), offs)
+    grad2 = batched_grouped_mm(mat1.transpose(-2, -1), grad, offs)
+    return grad1, grad2, None
+
+
+torch.library.register_autograd(
+    "autoparallel::batched_grouped_mm", backward, setup_context=setup_context
+)
+
+
+@batched_grouped_mm.register_fake
+def _(mat1: torch.Tensor, mat2: torch.Tensor, offs: torch.Tensor) -> torch.Tensor:
+    out = torch.empty(
+        mat1.shape[0],
+        mat1.shape[1],
+        mat2.shape[2],
+        dtype=mat1.dtype,
+        device=mat1.device,
+    )
+    return out
+
+
+@torch.library.custom_op("autoparallel::batched_histc", mutates_args=())
+def batched_histc(
+    x: torch.Tensor, bins: int = 100, min: int = 0, max: int = 0
+) -> torch.Tensor:
+    assert x.ndim == 2
+    out = []
+    for t in x:
+        out.append(torch.histc(t, bins, min, max))
+    return torch.stack(out, 0)
+
+
+@batched_histc.register_fake
+def batched_histc(
+    x: torch.Tensor, bins: int = 100, min: int = 0, max: int = 0
+) -> torch.Tensor:
+    assert max - min == bins
+    out = torch.empty((x.shape[0], bins), dtype=torch.int64, device=x.device)
+    return out
+
+
+from torch.utils.flop_counter import register_flop_formula
+
+
+@register_flop_formula(torch.ops.autoparallel.batched_grouped_mm)
+def gmm_flop(
+    a_shape, b_shape, offs_shape=None, bias_shape=None, out_shape=None, **kwargs
+) -> int:
+    """Count flops for the gmm operation."""
+    # Inputs should be a list of length 2.
+    # Inputs contains the shapes of two tensor
+    if len(a_shape) == 2:
+        assert offs_shape is not None
+        # b, = offs_shape
+        # m0, k = a_shape
+        # assumption: assume roughtly balanced, so falls-back to bmm
+        # m = m0 // b
+    else:
+        # assert offs_shape is None
+        (
+            b0,
+            bb,
+        ) = offs_shape
+        b, m0, k = a_shape
+        m = m0 // bb
+    if len(b_shape) == 2:
+        assert offs_shape is not None
+        # b2, _ = offs_shape
+        # k2, n0 = b_shape
+        # assumption: assume roughtly balanced, so falls-back to bmm
+        # n = n0 // b2
+    else:
+        b2, k2, n = b_shape
+    assert b0 == b
+    assert bb == b2
+    assert k == k2
+    # NB(chilli): Should be 2 * k - 1 technically for FLOPs.
+    flop = b * m * n * 2 * k
+    return flop
+
+
+from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
+
+from autoparallel.propagation_rules import register_opschema_rule
+
+
+@register_opschema_rule(torch.ops.autoparallel.batched_grouped_mm.default)
+def _(mesh, op_schema):
+    from torch.distributed.tensor._op_schema import PlacementList
+    from torch.distributed.tensor._ops.utils import expand_to_full_mesh_op_strategy
+
+    mat1_strategy = op_schema.args_schema[0]
+    mat2_strategy = op_schema.args_schema[1]
+    index_strategy = op_schema.args_schema[2]
+
+    # input_shape = input_strategy.shape
+    # index_shape = index_strategy.shape
+
+    assert len(mat1_strategy.shape) == 3
+    assert len(mat2_strategy.shape) == 3
+    assert len(index_strategy.shape) == 2
+
+    single_mesh_dim_strategies = []
+
+    # placement list stores placements of [output, mat1, mat2, offs]
+    # first we always have replicate all for inputs and output
+    all_replicate: PlacementList = [Replicate()] * 4
+    single_mesh_dim_strategies.append(all_replicate)
+    single_mesh_dim_strategies.append([Shard(0), Shard(0), Replicate(), Shard(0)])
+    single_mesh_dim_strategies.append([Shard(2), Replicate(), Shard(2), Replicate()])
+    single_mesh_dim_strategies.append([Partial(), Shard(2), Shard(1), Replicate()])
+
+    # FIXME: this is wrong, but approximation for more complex dynamic stuff
+    # we might want to introduce DynamicShard which splits the shards on
+    # dynamic sizes maybe?
+    single_mesh_dim_strategies.append([Shard(1), Shard(1), Shard(0), Shard(1)])
+
+    return expand_to_full_mesh_op_strategy(
+        mesh, op_schema, single_mesh_dim_strategies, input_index=1
+    )
+
+
 # Reference: https://github.com/deepseek-ai/DeepSeek-V3/blob/main/inference/model.py
 @dataclass
 class DeepSeekV3ModelArgs:
@@ -554,7 +697,7 @@ class GroupedExperts(nn.Module):
 
         return out
 
-    @expert_parallel
+    # @expert_parallel
     @staticmethod
     def _run_experts_grouped_mm(
         w1: torch.Tensor,
@@ -564,9 +707,10 @@ class GroupedExperts(nn.Module):
         num_tokens_per_expert: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if num_tokens_per_expert is not None:
-            offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
+            offsets = torch.cumsum(num_tokens_per_expert, dim=-1, dtype=torch.int32)
             # grouped mm between a 2D tensor and a 3D tensor
-            assert x.dim() == 2
+            # assert x.dim() == 2
+            assert x.dim() == 3
         else:
             offsets = None
             # fall back to regular bmm between 3D tensors
@@ -576,9 +720,15 @@ class GroupedExperts(nn.Module):
             x.dtype == w1.dtype == w2.dtype == w3.dtype == torch.bfloat16
         ), "torch._grouped_mm only supports bf16 dtypes"
 
-        h = F.silu(torch._grouped_mm(x, w1, offs=offsets))
-        h = h * torch._grouped_mm(x, w3, offs=offsets)
-        out = torch._grouped_mm(h, w2, offs=offsets)
+        # TODO: maybe introduce batched group_mm ?
+        if offsets is None:
+            h = F.silu(torch._grouped_mm(x, w1, offs=offsets))
+            h = h * torch._grouped_mm(x, w3, offs=offsets)
+            out = torch._grouped_mm(h, w2, offs=offsets)
+        else:
+            h = F.silu(torch.ops.autoparallel.batched_grouped_mm(x, w1, offs=offsets))
+            h = h * torch.ops.autoparallel.batched_grouped_mm(x, w3, offs=offsets)
+            out = torch.ops.autoparallel.batched_grouped_mm(h, w2, offs=offsets)
 
         return out
 
@@ -624,7 +774,7 @@ class TokenChoiceTopKRouter(nn.Module):
         and currently EP is not supporting node limit routing yet.
 
         Args:
-            x (torch.Tensor): Input tensor with shape ``(bs*slen, dim)``.
+            x (torch.Tensor): Input tensor with shape ``(bs, slen, dim)``.
 
         Returns:
             routed_input (torch.Tensor):
@@ -634,31 +784,49 @@ class TokenChoiceTopKRouter(nn.Module):
             num_tokens_per_expert (torch.Tensor):
                 Number of tokens assigned to each expert with shape ``(num_experts,)``.
         """
-        # scores shape (bs*slen, num_experts)
+        # scores shape (bs, slen, num_experts)
+
+        # x = x.reshape(bs * slen, dim)
         scores = self.gate(x)
 
         # By default, sigmoid or softmax is performed in float32 to avoid loss explosion
         if self.use_sigmoid:
             scores = torch.sigmoid(scores.to(torch.float32))
         else:
-            scores = F.softmax(scores.to(torch.float32), dim=1)
+            scores = F.softmax(scores.to(torch.float32), dim=-1)
 
         # top scores shape (bs*slen, top_k)
         # NOTE: The expert_bias is only used for routing. The gating value
         #       top_scores is still derived from the original scores.
         if expert_bias is not None:
             _, selected_experts_indices = torch.topk(
-                scores + expert_bias, k=self.top_k, dim=1
+                scores + expert_bias, k=self.top_k, dim=-1
             )
-            top_scores = scores.gather(dim=1, index=selected_experts_indices)
+            top_scores = scores.gather(dim=-1, index=selected_experts_indices)
         else:
             top_scores, selected_experts_indices = torch.topk(
-                scores, k=self.top_k, dim=1
+                scores, k=self.top_k, dim=-1
             )
 
         # group tokens together by expert indices from 0 to num_experts and pass that to experts forward
-        num_tokens_per_expert = torch.histc(
-            selected_experts_indices.view(-1),
+
+        # TODO: reshape here to allow for group-based routing
+        local_batch_size = 4
+        num_gpus_participating = (
+            32  # 64  # NOTE: I tweaked those values so that batch sharding can be done
+        )
+        num_experts_per_groups = local_batch_size * num_gpus_participating
+
+        # num_tokens_per_expert = torch.histc(
+        #    selected_experts_indices.view(-1),
+        #    bins=self.num_experts,
+        #    min=0,
+        #    max=self.num_experts,
+        # )
+        num_tokens_per_expert = torch.ops.autoparallel.batched_histc(
+            selected_experts_indices.unflatten(0, (-1, num_experts_per_groups)).flatten(
+                1
+            ),
             bins=self.num_experts,
             min=0,
             max=self.num_experts,
@@ -667,17 +835,30 @@ class TokenChoiceTopKRouter(nn.Module):
         # Reorder the token indices to match the order of the experts
         # token_indices_experts_sorted shape (bs*slen*top_k,)
         token_indices_experts_sorted = torch.argsort(
-            selected_experts_indices.view(-1), stable=True
+            # selected_experts_indices.view(-1), stable=True
+            selected_experts_indices.unflatten(0, (-1, num_experts_per_groups)).flatten(
+                1
+            ),
+            dim=-1,
+            stable=True,
         )
 
         # reorder the scores to match the order of the token indices
-        top_scores = top_scores.view(-1)[token_indices_experts_sorted]
+        # TODO: Shard() can have negative dims because of gather rules if we pass a -1 index, is that expected?
+        # we should probably normalize this this, like we do in topk for e.g.
+        # top_scores = top_scores.view(-1)[token_indices_experts_sorted]
+        # top_scores = top_scores.view_as(token_indices_experts_sorted).gather(-1, token_indices_experts_sorted)
+        top_scores = top_scores.view_as(token_indices_experts_sorted).gather(
+            1, token_indices_experts_sorted
+        )
         token_indices_experts_sorted = token_indices_experts_sorted // self.top_k
 
         top_scores = (
             top_scores * self.route_sclaing_factor
         )  # must multiply the scaling factor
         return top_scores, token_indices_experts_sorted, num_tokens_per_expert
+        # return top_scores.flatten(0, 1), token_indices_experts_sorted.flatten(0, 1), num_tokens_per_expert
+        # return top_scores.flatten(0, 1), token_indices_experts_sorted, num_tokens_per_expert
 
     def init_weights(self, init_std: float):
         nn.init.trunc_normal_(self.gate.weight, mean=0.0, std=init_std)
@@ -752,7 +933,8 @@ class MoE(nn.Module):
             top_scores,
             token_indices,
             num_tokens_per_expert,
-        ) = self.router(x.reshape(bs * slen, dim), self.expert_bias)
+            # ) = self.router(x.reshape(bs * slen, dim), self.expert_bias)
+        ) = self.router(x, self.expert_bias)
 
         # tokens_per_expert will be used to update the expert bias for load balancing.
         # Prevent extra local tokens accumulation on evaluation or activation recomputation.
@@ -760,17 +942,25 @@ class MoE(nn.Module):
             with torch.no_grad():
                 self.tokens_per_expert.add_(num_tokens_per_expert)
         # shape (bs*slen*top_k, dim)
-        token_indices = token_indices.reshape(-1, 1).expand(-1, dim)
+        # token_indices = token_indices.reshape(-1, 1).expand(-1, dim)
+        token_indices = token_indices[..., None].expand(-1, -1, dim)
 
         # shape (bs*slen*top_k, dim)
+        # TODO: change here as well to support groups
         routed_input = torch.gather(
-            x.view(-1, dim),
-            dim=0,
+            # x.view(-1, dim),
+            x.view(token_indices.shape[0], -1, dim),
+            dim=1,  # 0,
             index=token_indices,
         )
+        # routed_input = routed_input.flatten(0, 1)
+        # token_indices = token_indices.flatten(0, 1)
 
         # shape (bs*slen*top_k, dim)
         routed_output = self.experts(routed_input, num_tokens_per_expert)
+
+        # routed_output = routed_output.flatten(0, 1)
+        # token_indices = token_indices.flatten(0, 1)
 
         routed_output = (routed_output.to(torch.float32) * top_scores.unsqueeze(-1)).to(
             x.dtype
@@ -778,14 +968,18 @@ class MoE(nn.Module):
 
         # shared expert
         if self.shared_expert is not None:
+            # out = self.shared_expert(x.reshape(1, bs * slen, dim)).reshape(
+            #    bs * slen, dim
+            # )
             out = self.shared_expert(x.reshape(1, bs * slen, dim)).reshape(
-                bs * slen, dim
+                token_indices.shape[0], -1, dim
             )
         else:
             out = torch.zeros_like(x.reshape(bs * slen, dim))
 
         # Accumulate multiple expert results becase each token can be routed to multiple experts
-        out = out.scatter_add(dim=0, index=token_indices, src=routed_output)
+        # out = out.scatter_add(dim=0, index=token_indices, src=routed_output)
+        out = out.scatter_add(dim=1, index=token_indices, src=routed_output)
         out = out.reshape(bs, slen, dim)
         return out
 
@@ -836,7 +1030,7 @@ def input_fn():
     )
 
 
-args = DeepSeekV3ModelArgs(dim=dim, n_layers=1)
+args = DeepSeekV3ModelArgs(dim=dim, n_layers=1, load_balance_coeff=None)
 
 # parallelize the model
 with torch.device("meta"):
