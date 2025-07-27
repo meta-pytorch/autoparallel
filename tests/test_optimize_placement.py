@@ -137,10 +137,10 @@ def test_optimization_finds_fsdp_and_ddp_1d(device_mesh_1d, high_mem, model_type
     with torch.device("meta"):
         model = model_fn()
 
-    autop = AutoParallel(model, input_fn, device_mesh_1d)
-    autop.add_parameter_memory_constraint(low=low_mem, high=high_mem)
+    with AutoParallel(model, input_fn, device_mesh_1d) as autop:
+        autop.add_parameter_memory_constraint(low=low_mem, high=high_mem)
 
-    sharding_placement = autop.optimize_placement()
+        sharding_placement = autop.optimize_placement()
 
     # check parameters are sharded as expected, i.e., either replicated or sharded
     param_nodes = [
@@ -268,10 +268,10 @@ def test_optimization_finds_fsdp_tp_2d(
     with torch.device("meta"):
         model = model_fn()
 
-    autop = AutoParallel(model, input_fn, device_mesh_2d)
-    autop.add_parameter_memory_constraint(low=low_mem, high=high_mem)
+    with AutoParallel(model, input_fn, device_mesh_2d) as autop:
+        autop.add_parameter_memory_constraint(low=low_mem, high=high_mem)
 
-    sharding_placement = autop.optimize_placement()
+        sharding_placement = autop.optimize_placement()
 
     # check parameters are sharded as expected
     param_nodes = [
