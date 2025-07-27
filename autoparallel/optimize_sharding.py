@@ -90,7 +90,7 @@ from .compute_estimation import (
     estimate_strategy_runtime_cost,
 )
 from .propagation_rules import _create_all_options
-from .utils import get_placement_options
+from .utils import get_local_map_placement_option, get_placement_options
 
 
 def _debug_node(node):
@@ -147,15 +147,36 @@ class ShardingOptimizer:
                 user_kwargs = tree_map_only(
                     torch.fx.Node, lambda x: x.meta["val"], node.kwargs
                 )
-                strat = get_placement_options(
-                    self.mesh,
-                    node.target,
-                    user_strats,
-                    user_args,
-                    user_kwargs,
-                    self.fake_mode,
-                )
-                strats[node] = strat
+                if local_map_kwargs := node.meta.get("custom", {}).get(
+                    "dtensor_local_map_kwargs"
+                ):
+                    assert "call_local_map" in str(node.target)
+                    assert not user_kwargs
+                    strat = get_local_map_placement_option(
+                        self.mesh,
+                        user_strats,
+                        user_args,
+                        node.meta["val"],
+                        local_map_kwargs["in_placements"],
+                        local_map_kwargs["out_placements"],
+                    )
+
+                    assert not node.kwargs
+                    node.kwargs = {
+                        "_inline": True
+                    }  # notify the HOP to desugar in the next trace
+
+                    strats[node] = strat
+                else:
+                    strat = get_placement_options(
+                        self.mesh,
+                        node.target,
+                        user_strats,
+                        user_args,
+                        user_kwargs,
+                        self.fake_mode,
+                    )
+                    strats[node] = strat
             elif node.op == "output":
                 user_strats = tree_map_only(
                     torch.fx.Node, lambda x: strats[x], node.args
