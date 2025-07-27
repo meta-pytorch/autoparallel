@@ -5,6 +5,7 @@
 
 import contextlib
 import operator
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -173,6 +174,7 @@ def shard_node_given_placements(node, sharding_placement, *, meta: bool):
     curr_placement = (Replicate(),) * mesh.ndim
     tensor = node.meta["val"]
 
+    ctx: Any
     if meta:
         assert isinstance(
             tensor, FakeTensor
