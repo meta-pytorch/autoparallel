@@ -232,6 +232,10 @@ class ShardingOptimizer:
         return ds, num_inp_out, num_args
 
     def _all_input_nodes(self, node):
+        """
+        Variant of node.all_input_nodes which preserve duplicate nodes
+        """
+        # TODO: add kwargs?
         return [x for x in tree_flatten(node.args)[0] if isinstance(x, torch.fx.Node)]
 
     def walk_over_options(self, node, constrain_arg=None):
@@ -483,7 +487,7 @@ class ShardingOptimizer:
         from torch.distributed.tensor._op_schema import _pretty_print_spec
 
         tgt_strat = self.strats[node]
-        src_strat = self.strats[node.args[arg]]
+        src_strat = self.strats[self._all_input_nodes(node)[arg]]
         src_placements = [""] + [
             _pretty_print_spec(x.output_specs) for x in src_strat.strategies
         ]
@@ -751,11 +755,7 @@ class ShardingOptimizer:
                 continue
             strat = self.strats[node]
             strat0 = strat.strategies[0]
-            # use the following instead of all_input_nodes as all_input_nodes remove duplicate nodes
-            # TODO: add kwargs?
-            all_input_nodes = [
-                x for x in tree_flatten(node.args)[0] if isinstance(x, torch.fx.Node)
-            ]
+            all_input_nodes = self._all_input_nodes(node)
             num_input_nodes = len(all_input_nodes)
             if len(strat0.redistribute_cost) != num_input_nodes:
                 # only constructor functions allowed here
