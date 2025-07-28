@@ -8,6 +8,7 @@ import operator
 from typing import Any
 
 import torch
+import torch.fx.traceback as fx_traceback
 import torch.nn as nn
 from torch._functorch._aot_autograd.fx_utils import (
     get_named_buffer_nodes,
@@ -212,7 +213,8 @@ def apply_sharding_to_model(gm, sharding_placement, params_spec, buffers_spec):
     args = [x.to_local() for x in args]
 
     # TODO: make_fx here is suspicious in case of dynamic shapes
-    parallel_gm = make_fx(interp.run)(*args)
+    with fx_traceback.preserve_node_meta():
+        parallel_gm = make_fx(interp.run)(*args)
 
     # Copy descriptors over to new graph
     for n1, n2 in zip(

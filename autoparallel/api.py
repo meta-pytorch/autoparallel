@@ -24,6 +24,10 @@ from torch.export._unlift import _assign_attr
 from torch.export.unflatten import _AttrKind
 from torch.nn.utils import stateless
 
+from .activation_checkpointing import (
+    force_recompute_fsdp_all_gather,
+    mark_nodes_as_must_save_to_stage_recomputation,
+)
 from .apply_sharding import apply_sharding_to_model
 from .cast_parametrization import apply_dtype_cast, canonicalize_mp, set_dtype_cast
 from .optimize_sharding import ShardingOptimizer
@@ -382,6 +386,38 @@ class AutoParallel:
             },
             payload_fn=lambda: str(parallel_gm.graph),
         )
+
+        # apply activation checkpointing
+        ac_stage_size_in_GiB = 2.0
+        # ac_stage_size_in_GiB = 0.1  # debugmodel..
+        # this is a way to push the AC algorithm to treat the whole model as one large AC region..?
+        torch._functorch.config.activation_memory_budget = 0.01
+        force_recompute_fsdp_all_gather(parallel_gm.graph)
+        mark_nodes_as_must_save_to_stage_recomputation(
+            parallel_gm.graph, stage_size_in_GiB=ac_stage_size_in_GiB
+        )
+
+        def ac_graph_str():
+            # copied from fx graph.py __str__
+            placeholder_names: list[str] = []
+            param_str = ", ".join(placeholder_names)
+            s = f"Activation Checkpointing graph({param_str}):"
+            for node in parallel_gm.graph.nodes:
+                s += "\n" + node.format_node(placeholder_names)
+                recompute_meta = node.meta.get("recompute", None)
+                partitioner_tag = node.meta.get("partitioner_tag", None)
+                s += f"# Meta: {partitioner_tag=}, {recompute_meta=}"
+            return s
+
+        trace_structured(
+            "artifact",
+            metadata_fn=lambda: {
+                "name": "autoparallel_ac_graph",
+                "encoding": "string",
+            },
+            payload_fn=ac_graph_str,
+        )
+
         # now rename input/param/tangent/output/grad_param/grad_input nodes following
         # our convention
         # apply_node_renaming(
