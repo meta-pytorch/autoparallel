@@ -174,7 +174,11 @@ class AutoParallel:
 
         self.build_model_graph()
 
-        sharding_optimizer = ShardingOptimizer(self.gm, self.mesh)
+        from torch._subclasses.fake_tensor import unset_fake_temporarily
+
+        with unset_fake_temporarily():
+            sharding_optimizer = ShardingOptimizer(self.gm, self.mesh)
+
         # makes sharding of params and gradients the same
         sharding_optimizer.add_grad_param_constraints()
         self.sharding_optimizer = sharding_optimizer
