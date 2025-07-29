@@ -102,6 +102,8 @@ with AutoParallel(model, input_fn, mesh) as autop:
 parallel_mod.to_empty(device="cuda")
 parallel_mod.init_weights()
 
+parallel_mod.compile(fullgraph=True)
+
 # now let's run it
 x = (torch.rand(bs // mesh.shape[0], seq_len, dim1, device="cuda"),)
 out = parallel_mod(*x)

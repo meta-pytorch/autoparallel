@@ -373,11 +373,9 @@ class AutoParallel:
             torch.ops._c10d_functional.wait_tensor.default
         )
 
-        self.parallel_model_fn = aot_compile_joint_with_descriptors(
+        self.parallel_model_fn = parallel_model_fn = aot_compile_joint_with_descriptors(
             self.joint_with_descriptors
         )
-
-        outer_self = self
 
         # TODO: this probably belongs in the AOTAutograd API
         # TODO: pytree handling
@@ -398,7 +396,8 @@ class AutoParallel:
                 ]
                 boxed_args = [*params, *args]
                 del params
-                out = outer_self.parallel_model_fn(boxed_args)
+                # NB: don't do self.parallel_model_fn work around Dynamo bug
+                out = parallel_model_fn(boxed_args)
                 return out
 
         self.parallel_model = AutoParallelModule()
