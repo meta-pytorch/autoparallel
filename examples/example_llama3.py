@@ -10,6 +10,7 @@ from typing import ClassVar
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor.placement_types import Replicate, Shard
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.testing._internal.distributed.fake_pg import FakeStore
@@ -586,7 +587,7 @@ device = torch.device("cuda")
 
 def model_fn():
     model_args = TransformerModelArgs(
-        n_layers=8, vocab_size=vocab_size, max_seq_len=seqlen
+        n_layers=2, vocab_size=vocab_size, max_seq_len=seqlen
     )
     m = Transformer(model_args)
     return m
@@ -601,8 +602,10 @@ def input_fn():
 with torch.device("meta"):
     model = model_fn()
 
+mp_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
+
 # parallelize the model
-with AutoParallel(model, input_fn, mesh) as autop:
+with AutoParallel(model, input_fn, mesh, mp_policy) as autop:
     autop.add_parameter_memory_constraint(low=None, high=None)
 
     x_sharding = (Shard(0),) + (Replicate(),) * (mesh.ndim - 1)
