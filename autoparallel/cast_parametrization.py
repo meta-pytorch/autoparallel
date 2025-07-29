@@ -32,27 +32,26 @@ def create_dtype_cast_managed_attr(p_name):
     return property(getter, setter)
 
 
-# taken from https://www.internalfb.com/code/fbsource/[master][history]/fbcode/caffe2/torch/distributed/fb/simple_fsdp/simple_fsdp.py
-# with minor modifications
-def apply_dtype_cast(model_, mp_policy: MixedPrecisionPolicy):
-    # TODO: deepcopy to avoid changing the user-provided model
-    # model = copy.deepcopy(model_)
-    model = model_
+def canonicalize_mp(mp_policy: MixedPrecisionPolicy) -> MixedPrecisionPolicy:
     # try and follow standard FSDP behavior
     # maybe this should be handled in the MixedPrecisionPolicy class itself
     param_dtype = mp_policy.param_dtype
     reduce_dtype = mp_policy.reduce_dtype or param_dtype
     output_dtype = mp_policy.output_dtype or param_dtype  # TODO: check if this is right
     cast_forward_inputs = mp_policy.cast_forward_inputs
-    mp_policy = MixedPrecisionPolicy(
+    return MixedPrecisionPolicy(
         param_dtype, reduce_dtype, output_dtype, cast_forward_inputs
     )
 
-    # TODO: need to handle reduce_dtype. For now the solver will most-likely reduce
-    # in the smallest-precision dtype
-    assert (
-        mp_policy.reduce_dtype == mp_policy.param_dtype
-    ), f"Different reduce_dtype {mp_policy.reduce_dtype} than param_dtype {mp_policy.param_dtype} not supported for now"
+
+# taken from https://www.internalfb.com/code/fbsource/[master][history]/fbcode/caffe2/torch/distributed/fb/simple_fsdp/simple_fsdp.py
+# with minor modifications
+def apply_dtype_cast(model_, mp_policy: MixedPrecisionPolicy):
+    # TODO: deepcopy to avoid changing the user-provided model
+    # model = copy.deepcopy(model_)
+    model = model_
+    mp_policy = canonicalize_mp(mp_policy)
+
     for mod_name, mod in sorted(model.named_modules()):
         params_dict = dict(mod.named_parameters(recurse=False))
 

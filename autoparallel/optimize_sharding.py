@@ -122,10 +122,11 @@ def _get_next_name(name):
 
 
 class ShardingOptimizer:
-    def __init__(self, gm, mesh):
+    def __init__(self, gm, mesh, rescale_grad_comm_cost_for_mp=1.0):
         self.gm = gm
         self.graph = gm.graph
         self.mesh = mesh
+        self.rescale_grad_comm_cost_for_mp = rescale_grad_comm_cost_for_mp
         self.node_map = {node: i for i, node in enumerate(self.graph.nodes)}
         self.strats = self.build_sharding_metadata()
         # ds: Decision variables dictionary mapping (s_i, argi, ss, ii) -> ILP variable data
@@ -213,6 +214,9 @@ class ShardingOptimizer:
         ds = {}
         num_inp_out = {}
         num_args = {}
+        grad_param_nodes = set(
+            x[1] for x in get_param_and_grad_nodes(self.graph).values()
+        )
         for s_i, (node, s) in enumerate(strats.items()):
             if node.op == "output":
                 continue
@@ -226,6 +230,8 @@ class ShardingOptimizer:
                 compute_cost = estimate_strategy_runtime_cost(node, ssi)
                 for argi, xxi in enumerate(ssi.redistribute_cost):
                     for ii, comm_cost in enumerate(xxi):
+                        if node in grad_param_nodes:
+                            comm_cost = comm_cost / self.rescale_grad_comm_cost_for_mp
                         va = pulp.LpVariable(
                             f"n={node},s={s_i},arg={argi},output_p={ss},input_p={ii}",
                             cat=pulp.LpBinary,

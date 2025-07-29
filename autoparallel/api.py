@@ -25,7 +25,7 @@ from torch.export.unflatten import _AttrKind
 from torch.nn.utils import stateless
 
 from .apply_sharding import apply_sharding_to_model
-from .cast_parametrization import apply_dtype_cast
+from .cast_parametrization import apply_dtype_cast, canonicalize_mp
 from .optimize_sharding import ShardingOptimizer
 from .utils import _get_device_from_mesh
 
@@ -168,6 +168,8 @@ class AutoParallel:
             FakeTensorMode()
         )  # TODO: maybe need to reuse the model's fake mode
         device = _get_device_from_mesh(mesh)
+        if mp_policy is not None:
+            mp_policy = canonicalize_mp(mp_policy)
         self.mp_policy = mp_policy
         # TODO: in principle, it shouldn't be necessary to destructively
         # modify the user model here?  Not sure!
@@ -187,7 +189,18 @@ class AutoParallel:
         from torch._subclasses.fake_tensor import unset_fake_temporarily
 
         with unset_fake_temporarily():
-            sharding_optimizer = ShardingOptimizer(self.gm, self.mesh)
+            rescale_grad_comm_cost_for_mp = 1.0
+            if self.mp_policy is not None:
+                param_size = self.mp_policy.param_dtype.itemsize
+                reduce_size = self.mp_policy.reduce_dtype.itemsize
+                if param_size != reduce_size:
+                    rescale_grad_comm_cost_for_mp = reduce_size / param_size
+                    # Tiebreak, favoring performing the comms in the largest
+                    # dtype
+                    rescale_grad_comm_cost_for_mp *= 1.1
+            sharding_optimizer = ShardingOptimizer(
+                self.gm, self.mesh, rescale_grad_comm_cost_for_mp
+            )
 
         # makes sharding of params and gradients the same
         sharding_optimizer.add_grad_param_constraints()
