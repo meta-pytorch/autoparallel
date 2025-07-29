@@ -25,7 +25,7 @@ from torch.export.unflatten import _AttrKind
 from torch.nn.utils import stateless
 
 from .apply_sharding import apply_sharding_to_model
-from .cast_parametrization import apply_dtype_cast, canonicalize_mp
+from .cast_parametrization import apply_dtype_cast, canonicalize_mp, set_dtype_cast
 from .optimize_sharding import ShardingOptimizer
 from .utils import _get_device_from_mesh
 
@@ -171,8 +171,13 @@ class AutoParallel:
         if mp_policy is not None:
             mp_policy = canonicalize_mp(mp_policy)
         self.mp_policy = mp_policy
-        # TODO: in principle, it shouldn't be necessary to destructively
-        # modify the user model here?  Not sure!
+        # copy user model to avoid modifying it in-place
+        # in dtype casting and move_to_fake
+        model = copy.deepcopy(model)
+
+        if self.mp_policy is not None:
+            apply_dtype_cast(model, self.mp_policy)
+
         self.model = move_to_fake(model, self.fake_mode, device)
         self.input_fn = input_fn
         self.mesh = mesh
@@ -238,15 +243,13 @@ class AutoParallel:
 
         with self.fake_mode:
             inputs = self.input_fn()
-            if self.mp_policy is not None:
-                # TODO: this changes the model in-place, make it out of place
-                apply_dtype_cast(self.model, self.mp_policy)
             if not isinstance(inputs, tuple):
                 inputs = (inputs,)
 
-        self.joint_with_descriptors = aot_export_joint_with_descriptors(
-            self.stack, self.model, inputs, decompositions=decomp_table
-        )
+        with set_dtype_cast(True):
+            self.joint_with_descriptors = aot_export_joint_with_descriptors(
+                self.stack, self.model, inputs, decompositions=decomp_table
+            )
         gm = self.joint_with_descriptors.graph_module
 
         # cleanup graph

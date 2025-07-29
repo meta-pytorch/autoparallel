@@ -3,6 +3,7 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+from contextlib import contextmanager
 from typing import Any, Type
 
 import torch
@@ -14,9 +15,6 @@ def _unimplemented_deepcopy(*args: Any, **kwargs: Any):
     raise RuntimeError(
         "DTypeCast does not support deepcopy. Please use state dict for serialization.",
     )
-
-
-cls_key_to_dtype_cast_cls: dict[tuple[Type, str], Type] = {}
 
 
 def create_dtype_cast_managed_attr(p_name):
@@ -44,13 +42,30 @@ def canonicalize_mp(mp_policy: MixedPrecisionPolicy) -> MixedPrecisionPolicy:
     )
 
 
+_active_param = False
+
+
+def active_param():
+    global _active_param
+    return _active_param
+
+
+@contextmanager
+def set_dtype_cast(val):
+    global _active_param
+    prev = _active_param
+    try:
+        _active_param = val
+        yield
+    finally:
+        _active_param = prev
+
+
 # taken from https://www.internalfb.com/code/fbsource/[master][history]/fbcode/caffe2/torch/distributed/fb/simple_fsdp/simple_fsdp.py
 # with minor modifications
-def apply_dtype_cast(model_, mp_policy: MixedPrecisionPolicy):
-    # TODO: deepcopy to avoid changing the user-provided model
-    # model = copy.deepcopy(model_)
-    model = model_
+def apply_dtype_cast(model, mp_policy: MixedPrecisionPolicy):
     mp_policy = canonicalize_mp(mp_policy)
+    cls_key_to_dtype_cast_cls: dict[tuple[Type, str], Type] = {}
 
     for mod_name, mod in sorted(model.named_modules()):
         params_dict = dict(mod.named_parameters(recurse=False))
@@ -65,6 +80,8 @@ def apply_dtype_cast(model_, mp_policy: MixedPrecisionPolicy):
                 _dtype=mp_policy.param_dtype,
             ):
                 _param = self_mod._parameters[_param_name]
+                if not active_param():
+                    return _param
                 return _param.to(_dtype)
 
             param_properties[p_name] = getter
@@ -86,6 +103,7 @@ def apply_dtype_cast(model_, mp_policy: MixedPrecisionPolicy):
         mod.__class__ = new_cls
         mod._name_to_dtype_cast_managed_attr_getter = param_properties
         mod._mp_policy = mp_policy
+
     return model
 
 
