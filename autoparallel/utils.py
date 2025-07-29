@@ -115,12 +115,32 @@ def fill_missing_redistribute_cost(op, specs, out_strat):
             strat.redistribute_cost = redistribute_costs
 
 
+def keep_unique_configs(op_strat: OpStrategy) -> OpStrategy:
+    added = set()
+    filtered_strats = []
+    for strat in op_strat.strategies:
+        input_specs = strat.input_specs
+        output_specs = strat.output_specs
+        if isinstance(input_specs, list):
+            input_specs = tuple(input_specs)
+        if isinstance(output_specs, list):
+            output_specs = tuple(output_specs)
+        key = (input_specs, output_specs)
+        if key in added:
+            continue
+
+        added.add(key)
+        filtered_strats.append(strat)
+    return OpStrategy(filtered_strats)
+
+
 def get_placement_options(mesh, op, specs, user_args, user_kwargs):
     # print(op)
 
     if op in _op_rules:
         out_strat = _op_rules[op](mesh, specs)
         out_strat = remove_invalid_configs(out_strat, mesh)
+        out_strat = keep_unique_configs(out_strat)
         return out_strat
 
     strat = []
@@ -151,6 +171,7 @@ def get_placement_options(mesh, op, specs, user_args, user_kwargs):
     propagate_tensor_meta(op, user_args, user_kwargs, out_strat)
     fill_missing_redistribute_cost(op, specs, out_strat)
     out_strat = remove_invalid_configs(out_strat, mesh)
+    out_strat = keep_unique_configs(out_strat)
 
     return out_strat
 

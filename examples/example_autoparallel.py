@@ -3,6 +3,7 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+
 import torch
 from torch import nn
 from torch.distributed.fsdp import MixedPrecisionPolicy
@@ -93,20 +94,21 @@ def input_fn():
 with torch.device("meta"):
     model = Block(nheads, dim1, dim2)
 
-autop = AutoParallel(
+with AutoParallel(
     model, input_fn, mesh, MixedPrecisionPolicy(param_dtype=torch.bfloat16)
-)
-autop.add_parameter_memory_constraint(low=None, high=None)
+) as autop:
+    autop.add_parameter_memory_constraint(low=None, high=None)
 
-x_sharding = (Shard(0),) + (Replicate(),) * (mesh.ndim - 1)
+    x_sharding = (Shard(0),) + (Replicate(),) * (mesh.ndim - 1)
 
-autop.add_input_constraints([x_sharding])
-autop.add_output_constraints([x_sharding])
+    autop.add_input_constraints([x_sharding])
+    autop.add_output_constraints([x_sharding])
 
-sharding_placement = autop.optimize_placement()
+    sharding_placement = autop.optimize_placement()
 
-# AutoParallel produces a module with meta-DTensor parameters that need to be initialized
-parallel_mod = autop.apply_placement(sharding_placement)
+    # AutoParallel produces a module with meta-DTensor parameters that need to be initialized
+    parallel_mod = autop.apply_placement(sharding_placement)
+
 parallel_mod.to_empty(device="cuda")
 parallel_mod.init_weights()
 
