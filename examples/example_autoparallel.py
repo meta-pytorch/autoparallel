@@ -30,7 +30,7 @@ class Block(nn.Module):
             if lin.bias is not None:
                 torch.nn.init.normal_(lin.bias)
 
-    def forward(self, x):
+    def _compute_attention(self, x):
         q = self.wq(x)
         k = self.wk(x)
         v = self.wv(x)
@@ -43,6 +43,12 @@ class Block(nn.Module):
         o = o.permute(0, 2, 1, 3).flatten(-2)
 
         o = self.wo(o)
+        return o
+
+    def forward(self, x):
+        o = torch.utils.checkpoint.checkpoint(
+            self._compute_attention, x, use_reentrant=False
+        )
 
         o0 = o + x
 
@@ -108,3 +114,12 @@ out = parallel_mod(*x)
 out.backward(torch.randn_like(out))
 
 print("All good!")
+
+mm_nodes = autop.gm.graph.find_nodes(
+    op="call_function", target=torch.ops.aten.mm.default
+)
+
+assert (
+    mm_nodes[0].meta.get("recompute")
+    == torch.utils.checkpoint.CheckpointPolicy.PREFER_RECOMPUTE
+)
