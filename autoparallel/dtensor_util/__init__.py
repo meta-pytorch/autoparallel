@@ -5,6 +5,7 @@
 
 # functions to expose
 from .utils import (
+    batch_shard_strategy,
     get_op_strategy,
     op_strategy_context,
     replicate_op_strategy,
@@ -13,6 +14,7 @@ from .utils import (
 
 __all__ = [
     "replicate_op_strategy",
+    "batch_shard_strategy",
     "get_op_strategy",
     "with_implicit_strategies",
     "op_strategy_context",
