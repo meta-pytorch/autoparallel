@@ -3,6 +3,8 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+from unittest.mock import patch
+
 import pytest
 import torch
 from torch import nn
@@ -122,6 +124,8 @@ def _make_model_and_input_fn(
     return model_fn, input_fn
 
 
+@patch("torch.cuda.device_count", lambda: 8)
+@patch("torch.cuda.get_device_name", lambda device: "H100")
 @pytest.mark.parametrize(
     "model_type", ["ffn_with_multiple_input_output", "transformer_block"]
 )
@@ -133,10 +137,10 @@ def test_optimization_finds_fsdp_and_ddp_1d(device_mesh_1d, high_mem, model_type
     with torch.device("meta"):
         model = model_fn()
 
-    autop = AutoParallel(model, input_fn, device_mesh_1d)
-    autop.add_parameter_memory_constraint(low=low_mem, high=high_mem)
+    with AutoParallel(model, input_fn, device_mesh_1d) as autop:
+        autop.add_parameter_memory_constraint(low=low_mem, high=high_mem)
 
-    sharding_placement = autop.optimize_placement()
+        sharding_placement = autop.optimize_placement()
 
     # check parameters are sharded as expected, i.e., either replicated or sharded
     param_nodes = [
@@ -237,6 +241,8 @@ _expected_node_placements_transformer_block = [
 ]
 
 
+@patch("torch.cuda.device_count", lambda: 8)
+@patch("torch.cuda.get_device_name", lambda device: "H100")
 @pytest.mark.parametrize(
     "model_type,expected_param_placements,expected_node_placements",
     [
@@ -262,10 +268,10 @@ def test_optimization_finds_fsdp_tp_2d(
     with torch.device("meta"):
         model = model_fn()
 
-    autop = AutoParallel(model, input_fn, device_mesh_2d)
-    autop.add_parameter_memory_constraint(low=low_mem, high=high_mem)
+    with AutoParallel(model, input_fn, device_mesh_2d) as autop:
+        autop.add_parameter_memory_constraint(low=low_mem, high=high_mem)
 
-    sharding_placement = autop.optimize_placement()
+        sharding_placement = autop.optimize_placement()
 
     # check parameters are sharded as expected
     param_nodes = [

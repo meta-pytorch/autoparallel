@@ -74,6 +74,18 @@ DEVICE_LIMITS: Tuple[DeviceLimit, ...] = (
         },
     ),
     DeviceLimit(
+        "A10G",
+        "https://www.nvidia.com/content/dam/en-zz/Solutions/Data-Center/a10/pdf/a10-datasheet.pdf",
+        sm=(8, 0),
+        gmem_bandwidth=933 * (1024**3),
+        gemm_tflops={
+            torch.float32: 31.2,
+            torch.float16: 125,
+            torch.bfloat16: 125,
+            torch.int8: 250,
+        },
+    ),
+    DeviceLimit(
         "T4",
         "https://www.nvidia.com/content/dam/en-zz/Solutions/Data-Center/tesla-t4/t4-tensor-core-datasheet-951643.pdf",
         sm=(7, 5),
@@ -113,7 +125,7 @@ DEVICE_LIMITS: Tuple[DeviceLimit, ...] = (
 def _get_device_tflops(dtype):
     # for some reason the function from PyTorch is giving
     # wildly different TFlops compared to the specs. I'm
-    # using had-coded values for now that I pulled from xFormers
+    # using hard-coded values for now that I pulled from xFormers
     # https://github.com/fairinternal/xformers/blob/main/xformers/profiler/device_limits.py
     # TODO: fix PyTorch's implementation
     # from torch._inductor.utils import get_device_tflops
@@ -143,7 +155,7 @@ def _get_device_tflops(dtype):
     return device_limit.gemm_tflops[dtype]
 
 
-def _get_sharded_shape(spec):
+def _get_sharded_shape_stride(spec):
     mesh = spec.mesh
     tensor_shape = spec.tensor_meta.shape
     # TODO: take dtype into account as well
@@ -152,11 +164,16 @@ def _get_sharded_shape(spec):
     # TODO: find a better heuristic other than
     # running DTensor
     new_tensor_shape = list(tensor_shape)
+    new_tensor_stride = list(spec.tensor_meta.stride)
     for mesh_size, placement in zip(mesh.shape, placements):
         if placement.is_shard():
             dim = placement.dim
             new_tensor_shape[dim] = (new_tensor_shape[dim] + mesh_size - 1) // mesh_size
-    return new_tensor_shape
+            if dim - 1 > 0:
+                new_tensor_stride[dim - 1] = (
+                    new_tensor_stride[dim - 1] + mesh_size - 1
+                ) // mesh_size
+    return new_tensor_shape, new_tensor_stride
 
 
 def estimate_strategy_runtime_cost(node, strategy):
@@ -179,15 +196,18 @@ def estimate_strategy_runtime_cost(node, strategy):
     if len(kwargs) > 0:
         for k, v in kwargs.items():
             assert not isinstance(v, torch.Tensor), f"{node} {v}"
-    args_shapes = tuple(_get_sharded_shape(spec) for spec in strategy.input_specs)
+    args_sizes_strides = tuple(
+        _get_sharded_shape_stride(spec) for spec in strategy.input_specs
+    )
 
     counter = 0
     args = list(args)
     for i, arg in enumerate(args):
         if isinstance(arg, torch.Tensor):
             with fake_mode:
-                args[i] = torch.empty(
-                    args_shapes[counter], device=arg.device, dtype=arg.dtype
+                sizes, strides = args_sizes_strides[counter]
+                args[i] = torch.empty_strided(
+                    sizes, strides, device=arg.device, dtype=arg.dtype
                 )
             counter += 1
 

@@ -3,17 +3,102 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+"""
+Sharding optimization using Integer Linear Programming (ILP).
+
+This module solves the optimal sharding strategy problem by formulating it as an ILP
+where each binary variable x_{i,a,o,j} ∈ {0,1} represents a choice of input placement j
+and output placement o for operation i and argument a. The objective minimizes total cost:
+
+    minimize: Σ_{i,a,o,j} c_{i,a,o,j} * x_{i,a,o,j}
+
+where:
+- x_{i,a,o,j}: binary decision variable (1 if strategy selected, 0 otherwise)
+- c_{i,a,o,j}: total cost (communication + computation) for this strategy choice
+
+subject to the following constraint categories:
+
+1. UNIQUENESS CONSTRAINTS: Each operation-argument pair must select exactly one
+   input-output placement combination.
+
+   ∀i,a: Σ_{o,j} x_{i,a,o,j} = 1
+
+   → Implemented in: add_unique_decision_constraint()
+
+2. CONSISTENCY CONSTRAINTS: For multi-argument operations, all arguments must agree
+   on the same output placement to ensure the operation can execute correctly.
+
+   ∀i,o: Σ_j x_{i,0,o,j} = Σ_j x_{i,1,o,j} = ... = Σ_j x_{i,A_i-1,o,j}
+   where A_i is the number of arguments for operation i.
+
+   → Implemented in: add_same_output_across_args_constraint()
+
+3. FLOW CONSTRAINTS: The output placement of producer operations must match the
+   input placement of consumer operations (dataflow consistency).
+
+   ∀(i→k): Σ_j x_{i,0,o,j} = Σ_j x_{k,a,j,o}
+   where operation i feeds into operation k at argument position a.
+
+   → Implemented in: add_output_input_consistent_constraint()
+
+4. COST CONSTRAINTS: Variables with infinite cost (invalid configurations) are
+   forced to zero.
+
+   ∀i,a,o,j: c_{i,a,o,j} = ∞ ⟹ x_{i,a,o,j} = 0
+
+   → Implemented in: add_inf_cost_constraint()
+
+5. EFFICIENCY CONSTRAINTS: Penalize inefficient collective operations like
+   non-batch dimension shard-to-replicate conversions and forbid invalid
+   transitions like replicate-to-partial.
+
+   - Shard(dim≠0) → Replicate: multiply cost by 4
+   - Replicate → Partial: x_{i,a,o,j} = 0 (forbidden)
+   - Partial → Shard(dim≠0): multiply cost by 4
+
+   → Implemented in: penalize_inefficient_collectives()
+
+6. USER CONSTRAINTS (optional): Force specific placements for inputs, outputs,
+   parameters, or memory usage bounds.
+
+   6a. Input/Output constraints: x_{i,a,o*,j*} = 1 for specified (o*,j*)
+       → Implemented in: add_sharded_input_constraint(), add_sharded_output_constraint()
+
+   6b. Memory constraints: Σ_{params} (size_ratio * x_{param}) ≤ memory_limit
+       → Implemented in: add_parameter_memory_constraint()
+
+   6c. Parameter-gradient consistency: x_{param} = x_{grad_param}
+       → Implemented in: add_grad_param_constraints()
+
+   6d. General node constraints: Force specific placement for any node
+       → Implemented in: add_node_constraint()
+
+The solver finds the globally optimal sharding strategy that minimizes total
+runtime cost while satisfying all constraints.
+"""
+
 import math
+from typing import Optional
 
 import pulp
 import torch
+from torch._functorch._aot_autograd.descriptors import PlainAOTInput, PlainAOTOutput
+from torch._functorch._aot_autograd.fx_utils import (
+    get_param_and_grad_nodes,
+    get_param_nodes,
+    get_plain_input_and_grad_nodes,
+    get_plain_output_and_tangent_nodes,
+)
 from torch.distributed.tensor._dtensor_spec import DTensorSpec
-from torch.distributed.tensor.placement_types import Replicate, Shard
+from torch.distributed.tensor.placement_types import Placement, Replicate, Shard
 from torch.utils._pytree import tree_flatten, tree_map_only
 
-from .compute_estimation import _get_sharded_shape, estimate_strategy_runtime_cost
+from .compute_estimation import (
+    _get_sharded_shape_stride,
+    estimate_strategy_runtime_cost,
+)
 from .propagation_rules import _create_all_options
-from .utils import get_placement_options
+from .utils import get_local_map_placement_option, get_placement_options
 
 
 def _debug_node(node):
@@ -30,19 +115,23 @@ _GLOBAL_NAMES: dict[str, int] = {}
 
 
 def _get_next_name(name):
-    global _GLOBAL_NAMEs
+    global _GLOBAL_NAMES  # noqa: F824
     idx = _GLOBAL_NAMES.setdefault(name, 0)
     _GLOBAL_NAMES[name] += 1
     return name + f"_{idx:03}"
 
 
 class ShardingOptimizer:
-    def __init__(self, gm, mesh):
+    def __init__(self, gm, mesh, rescale_grad_comm_cost_for_mp=1.0):
         self.gm = gm
         self.graph = gm.graph
         self.mesh = mesh
+        self.rescale_grad_comm_cost_for_mp = rescale_grad_comm_cost_for_mp
         self.node_map = {node: i for i, node in enumerate(self.graph.nodes)}
         self.strats = self.build_sharding_metadata()
+        # ds: Decision variables dictionary mapping (s_i, argi, ss, ii) -> ILP variable data
+        # Each key represents a choice of input placement ii and output placement ss
+        # for operation s_i and argument argi (corresponds to x_{i,a,o,j} in math notation)
         self.ds, self.num_inp_out, self.num_args = self.build_ds()
         self.validate()
         self.prob = pulp.LpProblem("AutoParallel", pulp.LpMinimize)
@@ -63,10 +152,34 @@ class ShardingOptimizer:
                 user_args = tree_map_only(
                     torch.fx.Node, lambda x: x.meta["val"], node.args
                 )
-                strat = get_placement_options(
-                    self.mesh, node.target, user_strats, user_args
+                user_kwargs = tree_map_only(
+                    torch.fx.Node, lambda x: x.meta["val"], node.kwargs
                 )
-                strats[node] = strat
+                if local_map_kwargs := node.meta.get("custom", {}).get(
+                    "dtensor_local_map_kwargs"
+                ):
+                    assert "call_local_map" in str(node.target)
+                    assert not user_kwargs
+                    strat = get_local_map_placement_option(
+                        self.mesh,
+                        user_strats,
+                        user_args,
+                        node.meta["val"],
+                        local_map_kwargs["in_placements"],
+                        local_map_kwargs["out_placements"],
+                    )
+
+                    assert not node.kwargs
+                    node.kwargs = {
+                        "_inline": True
+                    }  # notify the HOP to desugar in the next trace
+
+                    strats[node] = strat
+                else:
+                    strat = get_placement_options(
+                        self.mesh, node.target, user_strats, user_args, user_kwargs
+                    )
+                    strats[node] = strat
             elif node.op == "output":
                 user_strats = tree_map_only(
                     torch.fx.Node, lambda x: strats[x], node.args
@@ -77,10 +190,33 @@ class ShardingOptimizer:
         return strats
 
     def build_ds(self):
+        """
+        Build decision variables (ds) for the ILP optimization.
+
+        Creates binary variables x_{i,a,o,j} for each valid combination of:
+        - s_i: operation index
+        - argi: argument index
+        - ss: output placement strategy index (o in math notation)
+        - ii: input placement strategy index (j in math notation)
+
+        Returns:
+            ds: Dictionary mapping (s_i, argi, ss, ii) -> {
+                "va": PuLP binary variable,
+                "cost": communication + computation cost,
+                "full_strat": complete strategy object,
+                "out_strat": output placement specification,
+                "inp_strat": input placement specification
+            }
+            num_inp_out: Metadata about strategy counts per operation-argument
+            num_args: Number of arguments per operation
+        """
         strats = self.strats
         ds = {}
         num_inp_out = {}
         num_args = {}
+        grad_param_nodes = set(
+            x[1] for x in get_param_and_grad_nodes(self.graph).values()
+        )
         for s_i, (node, s) in enumerate(strats.items()):
             if node.op == "output":
                 continue
@@ -94,6 +230,8 @@ class ShardingOptimizer:
                 compute_cost = estimate_strategy_runtime_cost(node, ssi)
                 for argi, xxi in enumerate(ssi.redistribute_cost):
                     for ii, comm_cost in enumerate(xxi):
+                        if node in grad_param_nodes:
+                            comm_cost = comm_cost / self.rescale_grad_comm_cost_for_mp
                         va = pulp.LpVariable(
                             f"n={node},s={s_i},arg={argi},output_p={ss},input_p={ii}",
                             cat=pulp.LpBinary,
@@ -108,6 +246,10 @@ class ShardingOptimizer:
         return ds, num_inp_out, num_args
 
     def _all_input_nodes(self, node):
+        """
+        Variant of node.all_input_nodes which preserve duplicate nodes
+        """
+        # TODO: add kwargs?
         return [x for x in tree_flatten(node.args)[0] if isinstance(x, torch.fx.Node)]
 
     def walk_over_options(self, node, constrain_arg=None):
@@ -124,6 +266,12 @@ class ShardingOptimizer:
                     yield argi, oi, ii
 
     def add_unique_decision_constraint(self):
+        """
+        UNIQUENESS CONSTRAINTS (Category 1): Each operation-argument pair must select exactly one
+        input-output placement combination.
+
+        Mathematical form: ∀i,a: Σ_{o,j} x_{i,a,o,j} = 1
+        """
         # a single pair of input-output policy is chosen
         for s_i, node in enumerate(self.graph.nodes):
             if node.op not in {"placeholder", "call_function"}:
@@ -136,6 +284,12 @@ class ShardingOptimizer:
                 self.prob += (pulp.lpSum(eqs) == 1, _get_next_name("unique_decision"))
 
     def add_same_output_across_args_constraint(self):
+        """
+        CONSISTENCY CONSTRAINTS (Category 2): For multi-argument operations, all arguments must agree
+        on the same output placement to ensure the operation can execute correctly.
+
+        Mathematical form: ∀i,o: Σ_j x_{i,0,o,j} = Σ_j x_{i,1,o,j} = ... = Σ_j x_{i,A_i-1,o,j}
+        """
         # enforce that the same output policy is chosen
         # across arguments
         for s_i, node in enumerate(self.graph.nodes):
@@ -160,6 +314,12 @@ class ShardingOptimizer:
                     )
 
     def add_output_input_consistent_constraint(self):
+        """
+        FLOW CONSTRAINTS (Category 3): The output placement of producer operations must match the
+        input placement of consumer operations (dataflow consistency).
+
+        Mathematical form: ∀(i→k): Σ_j x_{i,0,o,j} = Σ_j x_{k,a,j,o}
+        """
         # enforce that the input of strat_{i+1} == output of strat_{i}
         for s_i, node in enumerate(self.graph.nodes):
             if node.op == "output":
@@ -193,6 +353,12 @@ class ShardingOptimizer:
                     )
 
     def add_inf_cost_constraint(self):
+        """
+        COST CONSTRAINTS (Category 4): Variables with infinite cost (invalid configurations) are
+        forced to zero.
+
+        Mathematical form: ∀i,a,o,j: c_{i,a,o,j} = ∞ ⟹ x_{i,a,o,j} = 0
+        """
         # force inf cost values to be 0, as the solver doesn't accept inf
         for x in self.ds.values():
             if not math.isfinite(x["cost"]):
@@ -210,6 +376,13 @@ class ShardingOptimizer:
 
     def penalize_inefficient_collectives(self):
         """
+        EFFICIENCY CONSTRAINTS (Category 5): Penalize inefficient collective operations like
+        non-batch dimension shard-to-replicate conversions and forbid invalid transitions.
+
+        - Shard(dim≠0) → Replicate: multiply cost by 4
+        - Replicate → Partial: x_{i,a,o,j} = 0 (forbidden)
+        - Partial → Shard(dim≠0): multiply cost by 4
+
         When performing shard_{n} -> replicate (for n != 0), there is additional
         computation cost associated. Let's penalize it here while we don't add
         the computation cost together in the comm cost
@@ -315,6 +488,9 @@ class ShardingOptimizer:
                 code.insert(l_id, line)
                 l_id += 1
                 continue
+            # LOL
+            while not code[l_id].lstrip().startswith(repr(node)):
+                l_id += 1
             code[l_id] += line
             l_id += 1
         code = "\n".join(code)
@@ -328,7 +504,7 @@ class ShardingOptimizer:
         from torch.distributed.tensor._op_schema import _pretty_print_spec
 
         tgt_strat = self.strats[node]
-        src_strat = self.strats[node.args[arg]]
+        src_strat = self.strats[self._all_input_nodes(node)[arg]]
         src_placements = [""] + [
             _pretty_print_spec(x.output_specs) for x in src_strat.strategies
         ]
@@ -388,64 +564,16 @@ class ShardingOptimizer:
         for eqs in vars_per_arg.values():
             self.prob += (pulp.lpSum(eqs) == 1, _get_next_name(constraint_name))
 
-    def get_param_nodes(self):
-        # NOTE: this relies my customized export_module
-        param_nodes = [
-            x for x in self.graph.find_nodes(op="placeholder") if "param" in x.target
-        ]
-        return param_nodes
-
-    def get_input_nodes(self):
-        # NOTE: this relies my customized export_module
-        input_nodes = [
-            x for x in self.graph.find_nodes(op="placeholder") if "input" in x.target
-        ]
-        return input_nodes
-
-    def get_tangent_nodes(self):
-        # NOTE: this relies my customized export_module
-        tangent_nodes = [
-            x for x in self.graph.find_nodes(op="placeholder") if "tangent" in x.target
-        ]
-        return tangent_nodes
-
-    def get_fn_output_nodes(self):
-        # NOTE: this relies my customized export_module
-        output_nodes = [
-            x
-            for x in self.graph.find_nodes(op="output")[0].all_input_nodes
-            if "output" in x.name
-        ]
-        return output_nodes
-
-    def get_grad_input_nodes(self):
-        # NOTE: this relies my customized export_module
-        grad_input_nodes = [
-            x
-            for x in self.graph.find_nodes(op="output")[0].all_input_nodes
-            if "grad_input" in x.name
-        ]
-        return grad_input_nodes
-
-    def get_grad_param_nodes(self):
-        # NOTE: this relies my customized export_module
-        grad_param_nodes = [
-            x
-            for x in self.graph.find_nodes(op="output")[0].all_input_nodes
-            if "grad_param" in x.name
-        ]
-        return grad_param_nodes
-
     def add_grad_param_constraints(self):
-        # TODO: need to make sure that the params and grads are aligned, which are not always the case
-        # and we might have fewer gradients than parameters
+        """
+        USER CONSTRAINTS (Category 6c): Parameter-gradient consistency constraints.
+        Ensures parameters and their gradients have matching sharding strategies.
 
-        # suppose joint graph case
-        param_nodes = self.get_param_nodes()
-        grad_nodes = self.get_grad_param_nodes()
-        # assert len(param_nodes) == len(grad_nodes)
-
-        for param, grad in zip(param_nodes, grad_nodes):
+        Mathematical form: x_{param} = x_{grad_param}
+        """
+        for param, grad in get_param_and_grad_nodes(self.graph).values():
+            if grad is None:
+                continue
             s_i = self.node_map[param]
             s_j = self.node_map[grad]
             # parameters have a single input strat, so remove one loop
@@ -475,8 +603,14 @@ class ShardingOptimizer:
                 )
 
     def add_parameter_memory_constraint(self, memory_factor_low, memory_factor_high):
+        """
+        USER CONSTRAINTS (Category 6b): Memory constraints for parameters.
+        Ensures total parameter memory usage stays within specified bounds.
+
+        Mathematical form: Σ_{params} (size_ratio * x_{param}) ≤ memory_limit
+        """
         # get all parameters
-        param_nodes = self.get_param_nodes()
+        param_nodes = get_param_nodes(self.graph)
         elms = []
         for node in param_nodes:
             s_i = self.node_map[node]
@@ -485,7 +619,7 @@ class ShardingOptimizer:
                 data = self.ds[(s_i, 0, ii, 0)]
                 spec = data["inp_strat"]
                 tensor_shape = spec.tensor_meta.shape
-                new_tensor_shape = _get_sharded_shape(spec)
+                new_tensor_shape, _ = _get_sharded_shape_stride(spec)
                 new_size = math.prod(new_tensor_shape)
                 old_size = math.prod(tensor_shape)
                 elms.append(data["va"] * new_size / old_size)
@@ -496,6 +630,13 @@ class ShardingOptimizer:
         self.prob += (pulp.lpSum(elms) >= memory_factor_low, "memory_constraint_low")
 
     def add_node_constraint(self, node, placement=None, constraint_name=None):
+        """
+        USER CONSTRAINTS (Category 6d): General node constraints.
+        Force specific placement for any node.
+
+        Mathematical form: x_{i,a,o*,j*} = 1 for specified (o*,j*)
+        """
+        assert node in self.strats, (node, self.strats.keys())
         strat = self.strats[node]
         if placement is None:
             # default is Shard(0) to parallelize on the batch
@@ -510,54 +651,94 @@ class ShardingOptimizer:
             )
         self._add_node_constraint(node, oi=oi, constraint_name=constraint_name)
 
-    def add_sharded_input_constraint(self, input_placements=None):
-        input_nodes = self.get_input_nodes()
-        if input_placements is None:
-            input_placements = [None] * len(input_nodes)
+    def add_sharded_input_constraint(
+        self, input_placements: Optional[list[Optional[tuple[Placement, ...]]]] = None
+    ):
+        """
+        USER CONSTRAINTS (Category 6a): Input placement constraints.
+        Force specific placements for input nodes and their corresponding gradient inputs.
 
-        assert len(input_placements) == len(
-            input_nodes
-        ), f"number of input placements {len(input_placements)} doesn't match number of input nodes {len(input_nodes)}"
-        for node, placement in zip(input_nodes, input_placements):
+        Mathematical form: x_{i,a,o*,j*} = 1 for specified input placements (o*,j*)
+        """
+        mut_ips = None
+        if input_placements is not None:
+            mut_ips = {i: p for i, p in enumerate(input_placements)}
+
+        for desc, (node, grad_node) in get_plain_input_and_grad_nodes(
+            self.graph
+        ).items():
+            if input_placements is None:
+                placement = None
+            else:
+                assert isinstance(desc, PlainAOTInput)
+                assert mut_ips is not None
+                placement = mut_ips.pop(desc.idx)
+
             self.add_node_constraint(
                 node, placement, constraint_name="input_constraint"
             )
+            if grad_node is not None:
+                self.add_node_constraint(
+                    grad_node, placement, constraint_name="grad_input_constraint"
+                )
 
-        # ensure gradients of inputs have same sharding as input
-        grad_input_nodes = self.get_grad_input_nodes()
-        for node in grad_input_nodes:
-            # grad_input nodes are numbered according to input, so
-            # get the index corresponding to the output
-            input_idx = int(node.name.split("_")[-1])
-            placement = input_placements[input_idx]
-            self.add_node_constraint(
-                node, placement, constraint_name="grad_input_constraint"
+        ignored_placements = []
+        if mut_ips is not None:
+            for i, p in mut_ips.items():
+                if p is not None:
+                    ignored_placements.append(i)
+
+        if ignored_placements:
+            raise RuntimeError(
+                f"We were unable to respect placements for inputs at indices {ignored_placements}.  "
+                f"This is because the traced joint graph did not actually have a dedicated placeholder node for these inputs.  "
+                f"This typically occurs because some inputs aliased each other; inspect the joint graph from tlparse for more details.  "
+                f"You can either remove an explicit placement for this input (replace it with None) or clone "
+                "the inputs before tracing to remove aliasing."
             )
 
     def add_sharded_output_constraint(self, output_placements=None):
-        # add final constraint on the output strategy
-        output_nodes = self.get_fn_output_nodes()
+        """
+        USER CONSTRAINTS (Category 6a): Output placement constraints.
+        Force specific placements for output nodes and their corresponding gradient outputs.
 
-        if output_placements is None:
-            output_placements = [None] * len(output_nodes)
+        Mathematical form: x_{i,a,o*,j*} = 1 for specified output placements (o*,j*)
+        """
+        mut_ops = None
+        if output_placements is not None:
+            mut_ops = {i: p for i, p in enumerate(output_placements)}
 
-        assert len(output_placements) == len(
-            output_nodes
-        ), f"number of output placements {len(output_placements)} doesn't match number of output nodes {len(output_nodes)}"
-        for node, placement in zip(output_nodes, output_placements):
+        output_and_tangent_nodes_index = get_plain_output_and_tangent_nodes(self.graph)
+        for desc, (node, tangent_node) in output_and_tangent_nodes_index.items():
+            if output_placements is None:
+                placement = None
+            else:
+                assert isinstance(desc, PlainAOTOutput)
+                assert mut_ops is not None
+                placement = mut_ops.pop(desc.idx)
+
             self.add_node_constraint(
                 node, placement, constraint_name="output_constraint"
             )
+            if tangent_node is not None:
+                self.add_node_constraint(
+                    tangent_node, placement, constraint_name="grad_output_constraint"
+                )
 
-        # ensure gradients of outputs have same sharding as output
-        tangent_nodes = self.get_tangent_nodes()
-        for node in tangent_nodes:
-            # tangent nodes are numbered according to output, so
-            # get the index corresponding to the output
-            output_idx = int(node.name.split("_")[-1])
-            placement = output_placements[output_idx]
-            self.add_node_constraint(
-                node, placement, constraint_name="grad_output_constraint"
+        ignored_placements = []
+        if mut_ops is not None:
+            for i, p in mut_ops.items():
+                if p is not None:
+                    ignored_placements.append(i)
+
+        if ignored_placements:
+            raise RuntimeError(
+                f"We were unable to respect placements for outputs at indices {ignored_placements}.  "
+                f"This is because the traced joint graph did not actually have a dedicated output node for these inputs.  "
+                f"This typically occurs because some outputs aliased each other; inspect the joint graph from tlparse for more details.  "
+                f"You can either remove an explicit placement for this output (replace it with None),"
+                "stop the model from returning aliases of the tensor or clone the outputs before returning "
+                "them from the graph to avoid aliasing."
             )
 
     def validate(self):
@@ -566,11 +747,7 @@ class ShardingOptimizer:
                 continue
             strat = self.strats[node]
             strat0 = strat.strategies[0]
-            # use the following instead of all_input_nodes as all_input_nodes remove duplicate nodes
-            # TODO: add kwargs?
-            all_input_nodes = [
-                x for x in tree_flatten(node.args)[0] if isinstance(x, torch.fx.Node)
-            ]
+            all_input_nodes = self._all_input_nodes(node)
             num_input_nodes = len(all_input_nodes)
             if len(strat0.redistribute_cost) != num_input_nodes:
                 # only constructor functions allowed here
