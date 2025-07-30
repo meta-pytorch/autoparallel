@@ -17,7 +17,7 @@ from torch.distributed.tensor._ops.utils import generate_redistribute_costs
 from torch.distributed.tensor.placement_types import Replicate
 from torch.utils._pytree import tree_flatten, tree_map_only
 
-from .dtensor_util import get_op_strategy
+from .dtensor_util import get_op_strategy, with_implicit_strategies
 from .propagation_rules import (
     TENSOR_FACTORY_OPS,
     _op_partial_rules,
@@ -128,50 +128,6 @@ def fill_missing_redistribute_cost(op, specs, out_strat):
             strat.redistribute_cost = redistribute_costs
 
 
-def _generate_dummy_strategy(mesh, op, user_args, user_kwargs, input_strategies):
-    from torch.distributed.tensor._dtensor_spec import DTensorSpec
-    from torch.distributed.tensor._op_schema import OpSpec
-    from torch.distributed.tensor.placement_types import Replicate
-
-    placements = (Replicate(),) * mesh.ndim
-
-    out_tensor_meta, input_tensor_metas = _get_meta_tensors_for_op(
-        op, user_args, user_kwargs
-    )
-
-    input_specs = [
-        DTensorSpec(mesh=mesh, placements=placements, tensor_meta=tm)
-        for tm in input_tensor_metas
-    ]
-    if isinstance(out_tensor_meta, TensorMeta):
-        output_spec = DTensorSpec(
-            mesh=mesh, placements=placements, tensor_meta=out_tensor_meta
-        )
-    else:
-        output_spec = tuple(
-            DTensorSpec(mesh=mesh, placements=placements, tensor_meta=tm)
-            for tm in out_tensor_meta
-        )
-
-    out_strat = OpSpec(output_specs=output_spec, input_specs=input_specs)
-    num_input_args = len(input_tensor_metas)
-    input_strategies_flat = [
-        x for x in tree_flatten(input_strategies)[0] if isinstance(x, OpStrategy)
-    ]
-    assert num_input_args == len(
-        input_strategies_flat
-    ), f"{op}, {num_input_args}, {len(input_strategies_flat)}"
-    redistribute_cost = [
-        generate_redistribute_costs(input_strategies_flat[i], input_specs[i])
-        for i in range(num_input_args)
-    ]
-    out_strat.redistribute_cost = redistribute_cost
-
-    assert len(out_strat.redistribute_cost) == num_input_args
-    out_strat = OpStrategy([out_strat])
-    return out_strat
-
-
 def keep_unique_configs(op_strat: OpStrategy) -> OpStrategy:
     added = set()
     filtered_strats = []
@@ -218,18 +174,9 @@ def get_placement_options(mesh, op, specs, user_args, user_kwargs):
 
     if op in _op_partial_rules:
         out_strat = _op_partial_rules[op](mesh, op_schema)
-    elif (
-        op
-        in torch.distributed.tensor.DTensor._op_dispatcher.sharding_propagator.op_strategy_funcs
-        and op
-        not in {
-            torch.ops.aten._softmax_backward_data.default,
-        }
-    ):
-        out_strat = get_op_strategy(op, op_schema)
     else:
-        print(f"Ops that need to be implemented {op}")
-        out_strat = _generate_dummy_strategy(mesh, op, user_args, user_kwargs, strat)
+        with with_implicit_strategies():
+            out_strat = get_op_strategy(op, op_schema)
 
     propagate_tensor_meta(op, user_args, user_kwargs, out_strat)
     fill_missing_redistribute_cost(op, specs, out_strat)

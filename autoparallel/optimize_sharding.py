@@ -177,11 +177,7 @@ class ShardingOptimizer:
                     strats[node] = strat
                 else:
                     strat = get_placement_options(
-                        self.mesh,
-                        node.target,
-                        user_strats,
-                        user_args,
-                        user_kwargs,
+                        self.mesh, node.target, user_strats, user_args, user_kwargs
                     )
                     strats[node] = strat
             elif node.op == "output":
