@@ -3,8 +3,10 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+
 import torch
 from torch import nn
+from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor.placement_types import Replicate, Shard
 from torch.testing._internal.distributed.fake_pg import FakeStore
 
@@ -29,7 +31,7 @@ class Block(nn.Module):
             if lin.bias is not None:
                 torch.nn.init.normal_(lin.bias)
 
-    def forward(self, x):
+    def _compute_attention(self, x):
         q = self.wq(x)
         k = self.wk(x)
         v = self.wv(x)
@@ -42,6 +44,12 @@ class Block(nn.Module):
         o = o.permute(0, 2, 1, 3).flatten(-2)
 
         o = self.wo(o)
+        return o
+
+    def forward(self, x):
+        o = torch.utils.checkpoint.checkpoint(
+            self._compute_attention, x, use_reentrant=False
+        )
 
         o0 = o + x
 
@@ -60,15 +68,22 @@ fake_store = FakeStore()
 torch.distributed.init_process_group(
     "fake", store=fake_store, rank=0, world_size=world_size
 )
-# mesh = torch.distributed.device_mesh.init_device_mesh("cuda", (world_size,), mesh_dim_names=("dp",))
-mesh = torch.distributed.device_mesh.init_device_mesh(
-    "cuda",
-    (world_size // 8, 8),
-    mesh_dim_names=(
-        "dp",
-        "tp",
-    ),
-)
+
+use_1d_mesh = False
+
+if use_1d_mesh:
+    mesh = torch.distributed.device_mesh.init_device_mesh(
+        "cuda", (world_size,), mesh_dim_names=("dp",)
+    )
+else:
+    mesh = torch.distributed.device_mesh.init_device_mesh(
+        "cuda",
+        (world_size // 8, 8),
+        mesh_dim_names=(
+            "dp",
+            "tp",
+        ),
+    )
 
 bs = 8 * mesh.shape[0]
 seq_len = 256
@@ -84,20 +99,30 @@ def input_fn():
 # parallelize the model
 with torch.device("meta"):
     model = Block(nheads, dim1, dim2)
-autop = AutoParallel(model, input_fn, mesh)
-autop.add_parameter_memory_constraint(low=None, high=None)
 
-x_sharding = (Shard(0), Replicate())
+mp_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
+# mp_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16)
+# mp_policy = None
 
-autop.add_input_constraints([x_sharding])
-autop.add_output_constraints([x_sharding])
+with AutoParallel(model, input_fn, mesh, mp_policy) as autop:
+    autop.add_parameter_memory_constraint(low=None, high=None)
 
-sharding_placement = autop.optimize_placement()
+    x_sharding = (Shard(0),) + (Replicate(),) * (mesh.ndim - 1)
 
-# AutoParallel produces a module with meta-DTensor parameters that need to be initialized
-parallel_mod = autop.apply_placement(sharding_placement)
+    autop.add_input_constraints([x_sharding])
+    autop.add_output_constraints([x_sharding])
+
+    sharding_placement = autop.optimize_placement()
+
+    # AutoParallel produces a module with meta-DTensor parameters that need to be initialized
+    parallel_mod = autop.apply_placement(sharding_placement)
+
 parallel_mod.to_empty(device="cuda")
 parallel_mod.init_weights()
+
+# TODO: uncomment when https://github.com/pytorch/pytorch/pull/159337 hits
+# nightly
+# parallel_mod.compile(fullgraph=True)
 
 # now let's run it
 x = (torch.rand(bs // mesh.shape[0], seq_len, dim1, device="cuda"),)
@@ -105,3 +130,15 @@ out = parallel_mod(*x)
 out.backward(torch.randn_like(out))
 
 print("All good!")
+
+mm_nodes = autop.gm.graph.find_nodes(
+    op="call_function", target=torch.ops.aten.mm.default
+)
+
+# assert (
+#     mm_nodes[0].meta.get("recompute")
+#     == torch.utils.checkpoint.CheckpointPolicy.PREFER_RECOMPUTE
+# )
+
+# TODO: change this assert once we fix AC
+assert mm_nodes[0].meta.get("recompute") is None

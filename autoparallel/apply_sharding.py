@@ -5,8 +5,14 @@
 
 import contextlib
 import operator
+from typing import Any
 
 import torch
+import torch.nn as nn
+from torch._functorch._aot_autograd.fx_utils import (
+    get_named_buffer_nodes,
+    get_named_param_nodes,
+)
 from torch._subclasses.fake_tensor import FakeTensor, unset_fake_temporarily
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor._dtensor_spec import DTensorSpec
@@ -159,59 +165,84 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
         return out
 
 
-def shard_nodes_given_placements(gm, sharding_placement, node_prefix, *, meta=False):
-    # NOTE: this relies my customized export_module
-    nodes = [
-        x for x in gm.graph.find_nodes(op="placeholder") if node_prefix in x.target
-    ]
+def shard_node_given_placements(node, sharding_placement, *, meta: bool):
+    # TODO: not sure if we actually guarantee sharding_placement has ever
+    # input node lol
+    tgt_spec = sharding_placement[node].input_specs[0]
+    mesh = tgt_spec.mesh
+    # all tensors start as replicated
+    curr_placement = (Replicate(),) * mesh.ndim
+    tensor = node.meta["val"]
+
+    ctx: Any
+    if meta:
+        assert isinstance(
+            tensor, FakeTensor
+        ), f"only FakeTensor params supported for now, got {type(tensor)}"
+        ctx = unset_fake_temporarily
+        with ctx():
+            tensor = torch.randn(tensor.shape, dtype=tensor.dtype, device="meta")
+    else:
+        ctx = contextlib.nullcontext
+
+    with ctx():
+        sharded_tensor = DTensor.from_local(tensor, mesh, curr_placement).redistribute(
+            mesh, tgt_spec.placements
+        )
+
+    return sharded_tensor
+
+
+def shard_nodes_given_placements(gm, sharding_placement):
+    nodes = [x for x in gm.graph.find_nodes(op="placeholder")]
     sharded_tensors = []
     for node in nodes:
-        tgt_spec = sharding_placement[node].input_specs[0]
-        mesh = tgt_spec.mesh
-        # all tensors start as replicated
-        curr_placement = (Replicate(),) * mesh.ndim
-        tensor = node.meta["val"]
-
-        if meta:
-            assert isinstance(
-                tensor, FakeTensor
-            ), f"only FakeTensor params supported for now, got {type(tensor)}"
-            ctx = unset_fake_temporarily
-            with ctx():
-                tensor = torch.randn(tensor.shape, dtype=tensor.dtype, device="meta")
-        else:
-            ctx = contextlib.nullcontext
-
-        with ctx():
-            sharded_tensor = DTensor.from_local(
-                tensor, mesh, curr_placement
-            ).redistribute(mesh, tgt_spec.placements)
-        sharded_tensors.append(sharded_tensor)
+        sharded_tensors.append(
+            shard_node_given_placements(node, sharding_placement, meta=False)
+        )
     return sharded_tensors
 
 
-def apply_sharding_to_model(gm, sharding_placement):
-    # NOTE: this relies my customized export_module
-    # TODO: maybe make a copy?
-    sharded_inputs = shard_nodes_given_placements(gm, sharding_placement, "input")
-    sharded_tangents = shard_nodes_given_placements(gm, sharding_placement, "tangents")
-    sharded_params = shard_nodes_given_placements(gm, sharding_placement, "param")
-    sharded_buffers = shard_nodes_given_placements(gm, sharding_placement, "buffer")
+def apply_sharding_to_model(gm, sharding_placement, params_spec, buffers_spec):
+    args = shard_nodes_given_placements(gm, sharding_placement)
 
     # run with DTensor to apply the collectives given the graph
     interp = ApplyShardingInterpreter(gm, sharding_placement)
 
-    args = sharded_params + sharded_buffers + sharded_inputs + sharded_tangents
     args = [x.to_local() for x in args]
+
+    # TODO: make_fx here is suspicious in case of dynamic shapes
     parallel_gm = make_fx(interp.run)(*args)
 
-    # We put DTensor(meta_tensor) tensors in the state dict, as the user expects to be
-    # able to call parallel_mod.to_empty(device='cuda'). This does not work with FakeTensors.
-    sharded_meta_params = shard_nodes_given_placements(
-        gm, sharding_placement, "param", meta=True
-    )
-    sharded_meta_buffers = shard_nodes_given_placements(
-        gm, sharding_placement, "buffer", meta=True
-    )
+    # Copy descriptors over to new graph
+    for n1, n2 in zip(
+        (n for n in gm.graph.nodes if n.op in ("placeholder", "output")),
+        (n for n in parallel_gm.graph.nodes if n.op in ("placeholder", "output")),
+    ):
+        n2.meta["desc"] = n1.meta["desc"]
+        if n2.op == "placeholder":
+            n2.target = n1.target
+            # TODO: would be nice to also do name as well
 
-    return parallel_gm, sharded_meta_params, sharded_meta_buffers
+    sharded_param_dict = {}
+    sharded_buffer_dict = {}
+
+    # NB: ok to NOT use the parallel_gm here because we will just reapply the
+    # correct sharding placement via sharding_placement
+    fqn_to_param = get_named_param_nodes(gm.graph)
+    fqn_to_buffer = get_named_buffer_nodes(gm.graph)
+
+    for fqn in params_spec:
+        n = fqn_to_param[fqn]
+        with unset_fake_temporarily():
+            sharded_param_dict[fqn] = nn.Parameter(
+                shard_node_given_placements(n, sharding_placement, meta=True)
+            )
+
+    for fqn in buffers_spec:
+        n = fqn_to_buffer[fqn]
+        sharded_buffer_dict[fqn] = shard_node_given_placements(
+            n, sharding_placement, meta=True
+        )
+
+    return parallel_gm, sharded_param_dict, sharded_buffer_dict

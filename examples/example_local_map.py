@@ -146,18 +146,19 @@ def input_fn():
 # parallelize the model
 with torch.device("meta"):
     model = Block(nheads, dim1, dim2)
-autop = AutoParallel(model, input_fn, mesh)
-autop.add_parameter_memory_constraint(low=None, high=None)
+with AutoParallel(model, input_fn, mesh) as autop:
+    autop.add_parameter_memory_constraint(low=None, high=None)
 
-x_sharding = (Shard(0), Replicate(), Shard(1))
+    x_sharding = (Shard(0), Replicate(), Shard(1))
 
-autop.add_input_constraints([x_sharding])
-autop.add_output_constraints([x_sharding])
+    autop.add_input_constraints([x_sharding])
+    autop.add_output_constraints([x_sharding])
 
-sharding_placement = autop.optimize_placement()
+    sharding_placement = autop.optimize_placement()
 
-# AutoParallel produces a module with meta-DTensor parameters that need to be initialized
-parallel_mod = autop.apply_placement(sharding_placement)
+    # AutoParallel produces a module with meta-DTensor parameters that need to be initialized
+    parallel_mod = autop.apply_placement(sharding_placement)
+
 parallel_mod.to_empty(device="cuda")
 parallel_mod.init_weights()
 

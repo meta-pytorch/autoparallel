@@ -39,6 +39,8 @@ from torch.distributed.tensor._ops.utils import (
 )
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
+from .dtensor_util import get_op_strategy
+
 # TODO: move this to PyTorch
 dim_maps[torch.t] = lambda input: dim_transpose(input.ndim, -2, -1)
 
@@ -214,7 +216,6 @@ def view_rule(mesh, specs):
     in_tensor = _build_meta_tensor(op_spec.strategies[0].output_specs.tensor_meta)
     out_tensor = torch.ops.aten.view.default(in_tensor, shape)
     out_tensor_meta = _gen_tensor_meta(out_tensor)
-    added = set()
     for strat in op_spec.strategies:
         input_specs = strat.output_specs
         input_tgt_placements, output_placements = propagate_shape_and_sharding(
@@ -231,10 +232,6 @@ def view_rule(mesh, specs):
             placements=tuple(output_placements),
             tensor_meta=out_tensor_meta,
         )
-        key = (input_tgt_spec, output_spec)
-        if key in added:
-            continue
-        added.add(key)
 
         redistribute_costs = [generate_redistribute_costs(op_spec, input_tgt_spec)]
         s = OpSpec(
@@ -790,11 +787,7 @@ def slice_scatter_rule(mesh, op_schema):
 
 
 def sdpa_rule(op, mesh, op_schema):
-    out_strat = torch.distributed.tensor.DTensor._op_dispatcher.sharding_propagator.op_strategy_funcs[
-        op
-    ](
-        op_schema
-    )
+    out_strat = get_op_strategy(op, op_schema)
     # remove wrong context-parallel strategy
     # https://github.com/pytorch/pytorch/pull/131351#discussion_r1716164659
     new_strats = []
@@ -823,11 +816,7 @@ def _(mesh, op_schema):
 @register_opschema_rule(torch.ops.aten.reshape.default)
 def reshape_rule(mesh, op_schema):
     op = torch.ops.aten.reshape.default
-    out_strat = torch.distributed.tensor.DTensor._op_dispatcher.sharding_propagator.op_strategy_funcs[
-        op
-    ](
-        op_schema
-    )
+    out_strat = get_op_strategy(op, op_schema)
     if mesh.ndim == 1:
         # remove duplicate strategy
         # TODO: hack, fixme
@@ -842,7 +831,10 @@ def reshape_rule(mesh, op_schema):
 @register_opschema_rule(torch.ops.aten.expand.default)
 def expand_rule(mesh, op_schema_):
     op = torch.ops.aten.expand.default
-    op_schema = copy.deepcopy(op_schema_)
+    from torch._subclasses.fake_tensor import unset_fake_temporarily
+
+    with unset_fake_temporarily():
+        op_schema = copy.deepcopy(op_schema_)
     input_strat = op_schema.args_schema[0]
     orig_shape = input_strat.strategies[0].output_specs.tensor_meta.shape
     dest_shape = op_schema.args_schema[1]
@@ -853,11 +845,7 @@ def expand_rule(mesh, op_schema_):
     ]
     if len(expand_dim) != 1:
         assert len(expand_dim) == 0
-        return torch.distributed.tensor.DTensor._op_dispatcher.sharding_propagator.op_strategy_funcs[
-            op
-        ](
-            op_schema
-        )
+        return get_op_strategy(op, op_schema)
     assert len(expand_dim) == 1, f"{expand_dim}"
     expand_dim = expand_dim[0]
     to_remove = []
@@ -871,11 +859,7 @@ def expand_rule(mesh, op_schema_):
     removed = []
     for i in reversed(to_remove):
         removed.append(input_strat.strategies.pop(i))
-    out_strat = torch.distributed.tensor.DTensor._op_dispatcher.sharding_propagator.op_strategy_funcs[
-        op
-    ](
-        op_schema
-    )
+    out_strat = get_op_strategy(op, op_schema)
     for i, ss in enumerate(out_strat.strategies):
         for remov in to_remove:
             ss.redistribute_cost[0].insert(remov, math.inf)

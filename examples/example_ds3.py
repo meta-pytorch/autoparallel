@@ -1036,17 +1036,17 @@ args = DeepSeekV3ModelArgs(dim=dim, n_layers=1, load_balance_coeff=None)
 with torch.device("meta"):
     model = MoE(args).bfloat16()
 
-autop = AutoParallel(model, input_fn, mesh)
-autop.add_parameter_memory_constraint(low=None, high=None)
+with AutoParallel(model, input_fn, mesh) as autop:
+    autop.add_parameter_memory_constraint(low=None, high=None)
 
-# x_sharding = (Shard(0), Replicate())
-x_sharding = (Shard(0), Shard(0))
+    # x_sharding = (Shard(0), Replicate())
+    x_sharding = (Shard(0), Shard(0))
 
-autop.add_input_constraints([x_sharding])
-autop.add_output_constraints([x_sharding])
+    autop.add_input_constraints([x_sharding])
+    autop.add_output_constraints([x_sharding])
 
-sharding_placement = autop.optimize_placement()
-parallel_mod = autop.apply_placement(sharding_placement)
+    sharding_placement = autop.optimize_placement()
+    parallel_mod = autop.apply_placement(sharding_placement)
 
 # run weight init on our sharded DTensor params
 parallel_mod.to_empty(device="cuda")
