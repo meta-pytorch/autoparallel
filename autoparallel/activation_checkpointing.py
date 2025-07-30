@@ -7,12 +7,20 @@ from collections import defaultdict
 from dataclasses import dataclass
 
 import torch
-from torch._functorch.partitioners import _has_tag_is_backward, _size_of, must_recompute
+from torch._functorch.partitioners import _has_tag_is_backward, _size_of
 from torch.utils._ordered_set import OrderedSet
 from torch.utils.checkpoint import CheckpointPolicy
 
 logger: logging.Logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
+
+# reimplement torch._functorch.partitioners.must_recompute
+# to only check for MUST_RECOMPUTE tag, and not PREFER_RECOMPUTE
+# For now there isn't any distinction in the partitioner between both
+# and I think this is a bug
+def must_recompute(node: torch.fx.Node) -> bool:
+    return node.meta.get("recompute", None) is CheckpointPolicy.MUST_RECOMPUTE
 
 
 def is_graph_input(node: torch.fx.Node) -> bool:
@@ -190,16 +198,15 @@ def mark_nodes_as_must_save_to_stage_recomputation(
 
     fwd_recomputable_nodes = get_all_recomputable_forward_nodes(joint_graph)
 
-    # TODO did not work:
-    #     File "/data/users/whc/pytorch/torch/_functorch/partitioners.py", line 1554, in cleanup_recompute_tags
-    #   and user.meta["ac_graph_id"] > node.meta["ac_graph_id"]
-    #   KeyError: 'ac_graph_id'
     # Initialize all nodes as 'prefer recompute' and then adjust only the must-save ones below
-    # for node in fwd_recomputable_nodes:
-    #     if node.meta.get("recompute", None) is not None:
-    #         # do not mess with allgather nodes that have already been marked recompute!
-    #         continue
-    #     node.meta["recompute"] = CheckpointPolicy.PREFER_RECOMPUTE
+    for node in fwd_recomputable_nodes:
+        if node.meta.get("recompute", None) is not None:
+            # do not mess with allgather nodes that have already been marked recompute!
+            continue
+        node.meta["recompute"] = CheckpointPolicy.PREFER_RECOMPUTE
+        # add an arbitrarily large graph id. I'm assuming 100000 here, which should be fine
+        # and is the same we add for the all-gather nodes
+        node.meta["ac_graph_id"] = 100000
 
     # get the mapping between node name and node
     name_to_node_mapping = {}

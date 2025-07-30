@@ -204,6 +204,14 @@ def shard_nodes_given_placements(gm, sharding_placement):
     return sharded_tensors
 
 
+def rename_node(fx_g: torch.fx.GraphModule, node: torch.fx.Node, new_name: str):
+    with fx_g.graph.inserting_before(node):
+        new_node = fx_g.graph.placeholder(new_name)
+        new_node.meta.update(node.meta)
+        node.replace_all_uses_with(new_node)
+        fx_g.graph.erase_node(node)
+
+
 def apply_sharding_to_model(gm, sharding_placement, params_spec, buffers_spec):
     args = shard_nodes_given_placements(gm, sharding_placement)
 
@@ -224,7 +232,11 @@ def apply_sharding_to_model(gm, sharding_placement, params_spec, buffers_spec):
         n2.meta["desc"] = n1.meta["desc"]
         if n2.op == "placeholder":
             n2.target = n1.target
-            # TODO: would be nice to also do name as well
+            # node renaming is needed for partitioner as it searchs for tangents
+            # nodes. See https://fburl.com/kc4jtc3t for one case where it's used
+            rename_node(parallel_gm, n2, n1.name)
+    # need to recompile after renaming nodes
+    parallel_gm.recompile()
 
     sharded_param_dict = {}
     sharded_buffer_dict = {}

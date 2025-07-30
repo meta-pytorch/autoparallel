@@ -391,7 +391,7 @@ class AutoParallel:
         ac_stage_size_in_GiB = 2.0
         # ac_stage_size_in_GiB = 0.1  # debugmodel..
         # this is a way to push the AC algorithm to treat the whole model as one large AC region..?
-        torch._functorch.config.activation_memory_budget = 0.01
+        # torch._functorch.config.activation_memory_budget = 0.01
         force_recompute_fsdp_all_gather(parallel_gm.graph)
         mark_nodes_as_must_save_to_stage_recomputation(
             parallel_gm.graph, stage_size_in_GiB=ac_stage_size_in_GiB
