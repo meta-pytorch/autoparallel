@@ -28,7 +28,7 @@ def batched_grouped_mm(
     assert mat2.ndim == 3, f"{mat2.shape}"
     res = []
     for a, off in zip(mat1, offs):
-        res.append(a, mat2, off)
+        res.append(torch._grouped_mm(a, mat2, off))
     return torch.stack(res, 0)
 
 
@@ -117,6 +117,31 @@ def gmm_flop(
     assert bb == b2
     assert k == k2
     # NB(chilli): Should be 2 * k - 1 technically for FLOPs.
+    flop = b * m * n * 2 * k
+    return flop
+
+
+@register_flop_formula(torch.ops.aten.matmul)
+def matmul_flop(a_shape, b_shape, out_shape=None, **kwargs) -> int:
+    assert len(a_shape) == 3
+    assert len(b_shape) == 2
+    b, m, k = a_shape
+    k1, n = b_shape
+    assert k == k1
+    flop = b * m * n * 2 * k
+    return flop
+
+
+@register_flop_formula(torch.ops.aten.einsum, get_raw=True)
+def einsum_flop(eq, tensors, out=None, **kwargs) -> int:
+    assert len(tensors) == 2
+    a_shape, b_shape = [x.shape for x in tensors]
+    assert len(a_shape) == 3
+    assert len(b_shape) == 3
+    b, m, k = a_shape
+    b1, k1, n = b_shape
+    assert b == b1
+    assert k == k1
     flop = b * m * n * 2 * k
     return flop
 
@@ -1012,7 +1037,7 @@ torch.distributed.init_process_group(
 # mesh = torch.distributed.device_mesh.init_device_mesh("cuda", (world_size,), mesh_dim_names=("dp",))
 mesh = torch.distributed.device_mesh.init_device_mesh(
     "cuda",
-    (world_size // 32, 32),
+    (world_size // 64, 64),
     mesh_dim_names=(
         "dp",
         "ep",
@@ -1042,10 +1067,21 @@ with AutoParallel(model, input_fn, mesh) as autop:
     # x_sharding = (Shard(0), Replicate())
     x_sharding = (Shard(0), Shard(0))
 
+    mm_nodes = autop.gm.graph.find_nodes(
+        op="call_function", target=torch.ops.aten.matmul.default
+    )
+    autop.sharding_optimizer.add_node_constraint(mm_nodes[0], x_sharding)
+
     autop.add_input_constraints([x_sharding])
     autop.add_output_constraints([x_sharding])
 
     sharding_placement = autop.optimize_placement()
+    from IPython import embed
+
+    embed()
+    import sys
+
+    sys.exit()
     parallel_mod = autop.apply_placement(sharding_placement)
 
 # run weight init on our sharded DTensor params

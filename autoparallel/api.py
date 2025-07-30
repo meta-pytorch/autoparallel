@@ -59,6 +59,8 @@ def _add_alias(gm):
         # skip ops which return tuple
         if not isinstance(node.meta["val"], torch.Tensor):
             continue
+        if node.target != torch.ops.aten.view.default:
+            continue
         with graph.inserting_after(node):
             alias_node = graph.call_function(torch.ops.aten.alias.default, args=(node,))
             alias_node.meta.update(node.meta)
@@ -67,7 +69,6 @@ def _add_alias(gm):
                 return n != alias_node
 
             node.replace_all_uses_with(alias_node, delete_user_cb=delete_user_cb)
-
     """
 
     for node in graph.find_nodes(op="output")[0].all_input_nodes:
@@ -82,6 +83,53 @@ def _add_alias(gm):
 
     gm.recompile()
     return gm
+
+
+def _replace_view_mm_view_with_matmul(gm):
+    mm_nodes = gm.graph.find_nodes(op="call_function", target=torch.ops.aten.mm.default)
+    for node in mm_nodes:
+        first_input, second_input = node.all_input_nodes
+        if first_input.target == torch.ops.aten.view.default:
+            view_input = first_input.all_input_nodes[0]
+            users = list(node.users)
+            if (
+                len(users) == 1
+                and users[0].target == torch.ops.aten.view.default
+                and view_input.meta["val"].shape[:-1] == users[0].meta["val"].shape[:-1]
+            ):
+                print(f"Found matmul node {node}")
+                with gm.graph.inserting_before(node):
+                    new_node = gm.graph.call_function(
+                        torch.ops.aten.matmul.default, args=(view_input, second_input)
+                    )
+                    new_node.meta.update(users[0].meta)
+                    users[0].replace_all_uses_with(new_node)
+
+        elif second_input.target == torch.ops.aten.view.default:
+            if first_input.target != torch.ops.aten.permute.default:
+                continue
+            if first_input.all_input_nodes[0].target != torch.ops.aten.view.default:
+                continue
+            orig_first = first_input.all_input_nodes[0].all_input_nodes[0]
+            orig_second = second_input.all_input_nodes[0]
+            users = list(node.users)
+            if (
+                len(users) == 1
+                and users[0].target == torch.ops.aten.permute.default
+                and orig_first.meta["val"].shape[:-1]
+                == orig_second.meta["val"].shape[:-1]
+            ):
+                print(f"Found matmul node {node}")
+                with gm.graph.inserting_before(node):
+                    # TODO: check einsum equation
+                    new_node = gm.graph.call_function(
+                        torch.ops.aten.einsum.default,
+                        args=("bmn,bmk->nk", [orig_first, orig_second]),
+                    )
+                    new_node.meta.update(users[0].meta)
+                    users[0].replace_all_uses_with(new_node)
+    gm.graph.eliminate_dead_code()
+    gm.recompile()
 
 
 def try_convert_fake_to_real(tensors):
@@ -103,6 +151,7 @@ def _get_decomp_table():
     decomp_table.pop(torch.ops.aten.embedding_dense_backward.default)
     decomp_table.pop(torch.ops.aten.native_layer_norm_backward.default)
     decomp_table.pop(torch.ops.aten._softmax_backward_data.default)
+    decomp_table.pop(torch.ops.aten._softmax.default)
 
     # decompose addmm to allow for TP on mm
     decomp_table.pop(torch.ops.aten.addmm.default)
@@ -255,6 +304,7 @@ class AutoParallel:
         # think I trust the default FX DCE logic
         gm.graph.eliminate_dead_code()
         gm.recompile()
+        _replace_view_mm_view_with_matmul(gm)
         # disable pattern_matcher as it gets on our way
         # we basically want to remove noops in here
         prev = torch._inductor.config.pattern_matcher
