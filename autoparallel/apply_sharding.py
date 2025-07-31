@@ -8,6 +8,7 @@ import operator
 from typing import Any
 
 import torch
+import torch.fx.traceback as fx_traceback
 import torch.nn as nn
 from torch._functorch._aot_autograd.fx_utils import (
     get_named_buffer_nodes,
@@ -203,6 +204,17 @@ def shard_nodes_given_placements(gm, sharding_placement):
     return sharded_tensors
 
 
+def rename_placeholder_node(
+    fx_g: torch.fx.GraphModule, node: torch.fx.Node, new_name: str
+):
+    assert node.op == "placeholder", f"only placeholder node supported, got {node.op}"
+    with fx_g.graph.inserting_before(node):
+        new_node = fx_g.graph.placeholder(new_name)
+        new_node.meta.update(node.meta)
+        node.replace_all_uses_with(new_node)
+        fx_g.graph.erase_node(node)
+
+
 def apply_sharding_to_model(gm, sharding_placement, params_spec, buffers_spec):
     args = shard_nodes_given_placements(gm, sharding_placement)
 
@@ -212,7 +224,8 @@ def apply_sharding_to_model(gm, sharding_placement, params_spec, buffers_spec):
     args = [x.to_local() for x in args]
 
     # TODO: make_fx here is suspicious in case of dynamic shapes
-    parallel_gm = make_fx(interp.run)(*args)
+    with fx_traceback.preserve_node_meta():
+        parallel_gm = make_fx(interp.run)(*args)
 
     # Copy descriptors over to new graph
     for n1, n2 in zip(
@@ -222,7 +235,11 @@ def apply_sharding_to_model(gm, sharding_placement, params_spec, buffers_spec):
         n2.meta["desc"] = n1.meta["desc"]
         if n2.op == "placeholder":
             n2.target = n1.target
-            # TODO: would be nice to also do name as well
+            # node renaming is needed for partitioner as it searchs for tangents
+            # nodes. See https://fburl.com/kc4jtc3t for one case where it's used
+            rename_placeholder_node(parallel_gm, n2, n1.name)
+    # need to recompile after renaming nodes
+    parallel_gm.recompile()
 
     sharded_param_dict = {}
     sharded_buffer_dict = {}
