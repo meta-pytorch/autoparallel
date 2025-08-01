@@ -6,6 +6,7 @@
 import copy
 import itertools
 from contextlib import ExitStack
+from types import MethodType
 from typing import Optional
 
 import torch
@@ -22,10 +23,10 @@ from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor import DeviceMesh
 from torch.export._unlift import _assign_attr
 from torch.export.unflatten import _AttrKind
-from torch.nn.utils import stateless
 
 from .apply_sharding import apply_sharding_to_model
 from .cast_parametrization import apply_dtype_cast, canonicalize_mp, set_dtype_cast
+from .init_weights import hook_params_setters
 from .optimize_sharding import ShardingOptimizer
 from .utils import _get_device_from_mesh
 
@@ -174,6 +175,11 @@ class AutoParallel:
         # copy user model to avoid modifying it in-place
         # in dtype casting and move_to_fake
         model = copy.deepcopy(model)
+
+        # keep a separate copy of the fake orig model to customize for supporting init_weights
+        self.init_weights_model = move_to_fake(
+            copy.deepcopy(model), self.fake_mode, device
+        )
 
         if self.mp_policy is not None:
             apply_dtype_cast(model, self.mp_policy)
@@ -431,6 +437,10 @@ class AutoParallel:
 
         self.parallel_model = AutoParallelModule()
 
+        # We construct an unflattened structure on parallel_mod,
+        # e.g. _assign_attr(v, parallel_model, k="layers.0.weight") will literally
+        # create empty nn.Modules recursively and then stash 'v' so it shows up in the right spot
+        # though, what happened to the original 'flattned' parameters on parallel_mod, did we delete those?
         for k, v in sharded_param_dict.items():
             _assign_attr(v, self.parallel_model, k, attr_kind=_AttrKind.PARAMETER)
 
@@ -439,20 +449,18 @@ class AutoParallel:
 
         # Right now we require a convention that the user model provides an init_weights method,
         # although we could snoop for other methods too.
+        hook_params_setters(self.init_weights_model, self.parallel_model)
         if hasattr(self.model, "init_weights"):
 
-            def init_weights(*args, **kwargs):
-                with stateless._reparametrize_module(
-                    self.model, {**sharded_param_dict, **sharded_buffer_dict}
-                ):
-                    self.model.init_weights(*args, **kwargs)
+            def init_weights(_self, *args, **kwargs):
+                # this is now a deep-fake-copy of orig mod, so we don't have to use reparametrize
+                return self.init_weights_model.init_weights(*args, **kwargs)
 
-        else:
-            init_weights = None
-
-        # assign an init_weights method onto the output mod.
-        # all it does is sneakily run the original user mod's init_weights method,
-        # but with our new DTensor sharded params attached to the user module.
-        self.parallel_model.init_weights = init_weights
+            # assign an init_weights method onto the output mod.
+            # all it does is sneakily run the original user mod's init_weights method,
+            # but with our new DTensor sharded params attached to the user module.
+            self.parallel_model.init_weights = MethodType(
+                init_weights, self.parallel_model
+            )
 
         return self.parallel_model
