@@ -15,6 +15,12 @@ from autoparallel.local_map_hop import apply_local_map
 # just to force dump tlparse
 torch.compile(lambda x: x + 1, backend="eager")(torch.rand(10))
 
+# NOTE: We can only wrap functions that return tuples!!!
+# This is a requirement from fx.Graph, and it's made its way
+# across all our HOP utilities. Without a Dynamo frontend,
+# we can't reliably tell apart a function that returns
+# a tuple of a single tensor vs a single tensor.
+
 
 @apply_local_map(
     out_placements=((Replicate(), Replicate(), Replicate()),),
@@ -28,7 +34,7 @@ torch.compile(lambda x: x + 1, backend="eager")(torch.rand(10))
     device_mesh=None,
 )
 def replicate_linear(w, bias, x):
-    return torch.matmul(x, w.t()) + bias
+    return (torch.matmul(x, w.t()) + bias,)
 
 
 @apply_local_map(
@@ -39,7 +45,7 @@ def replicate_linear(w, bias, x):
     device_mesh=None,
 )
 def sharded_pointwise(x):
-    return x + 10
+    return (x + 10,)
 
 
 @apply_local_map(
@@ -57,7 +63,7 @@ def context_parallel_attention(query, key, value):
     out = F.scaled_dot_product_attention(
         query=query, key=key, value=value, is_causal=False
     )
-    return out
+    return (out,)
 
 
 class Block(nn.Module):
@@ -79,8 +85,8 @@ class Block(nn.Module):
                 torch.nn.init.normal_(lin.bias)
 
     def forward(self, x):
-        boosted_weight = sharded_pointwise(self.wq.weight)
-        q = replicate_linear(boosted_weight, self.wq.bias, x)
+        boosted_weight = sharded_pointwise(self.wq.weight)[0]
+        q = replicate_linear(boosted_weight, self.wq.bias, x)[0]
         # q = self.wq(x)
         k = self.wk(x)
         v = self.wv(x)
@@ -89,7 +95,7 @@ class Block(nn.Module):
         k = k.unflatten(-1, (self.nheads, -1)).permute(0, 2, 1, 3)
         v = v.unflatten(-1, (self.nheads, -1)).permute(0, 2, 1, 3)
 
-        o = context_parallel_attention(q, k, v)
+        o = context_parallel_attention(q, k, v)[0]
         o = o.permute(0, 2, 1, 3).flatten(-2)
 
         o = self.wo(o)

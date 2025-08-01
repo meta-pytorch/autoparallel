@@ -6,16 +6,21 @@
 # NOTE: this file may be removed once we move to a dynamo frontend
 
 import functools
+from typing import Any, Callable, Optional, Union
 
 import torch
 import torch.utils._pytree as pytree
+from torch._functorch._aot_autograd.graph_compile import prepare_for_partitioner
 from torch._higher_order_ops.utils import (
+    clone_outputs_aliasing_inputs,
     save_tensors_and_symints_for_backward,
     saved_tensors_and_symints,
 )
+from torch._inductor.compile_fx import partition_fn
 from torch._ops import HigherOrderOperator
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.distributed._tensor.experimental import local_map
+from torch.fx import GraphModule
 from torch.fx.experimental.proxy_tensor import ProxyTorchDispatchMode, track_tensor_tree
 
 
@@ -29,17 +34,36 @@ class LocalMapAOTExportModule(HigherOrderOperator):
     def __init__(self):
         super().__init__("local_map_hop")
 
-    def __call__(self, orig_fwd, *args, **kwargs):
-        return super().__call__(orig_fwd, *args, **kwargs)
+    def __call__(self, fwd: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        return super().__call__(fwd, *args, **kwargs)
 
 
 local_map_hop = LocalMapAOTExportModule()
 
 
-def create_hop_joint_graph(
-    fw_func,
-    *_args,
-):
+class LocalMapBackwardAOTExportModule(HigherOrderOperator):
+    """
+    For the backward of local_map_hop. To override the proxy key,
+    and trace the whole bwd as a single node in the pre-solver graph.
+    """
+
+    def __init__(self):
+        super().__init__("local_map_hop_backward")
+
+    def __call__(self, bwd: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        return super().__call__(bwd, *args, **kwargs)
+
+
+local_map_hop_backward = LocalMapBackwardAOTExportModule()
+
+
+def create_hop_fw_bw(
+    orig_fwd: Callable[..., Any],
+    *_args: Any,
+) -> tuple[GraphModule, GraphModule, int]:
+    """
+    Traces a joint, applies passes and partitions it
+    """
     # Keeping these imports here
     # Avoid circular dependencies once we upstream with dynamo frontend
     from torch._dispatch.python import suspend_functionalization
@@ -87,127 +111,197 @@ def create_hop_joint_graph(
 
             assert all(
                 isinstance(t, (FakeTensor, int, torch.SymInt)) for t in fw_inputs
-            )
+            ), f"Unexpected element in {fw_inputs=}"
 
             # redundant? we already _from_fun'd the inputs
-            example_flat_out = pytree.tree_map(
+            example_grads = pytree.tree_map(
                 _from_fun,
-                fw_func(*fw_inputs),
+                orig_fwd(*fw_inputs),
             )
-            example_grads = _from_fun(example_flat_out)
             if not isinstance(example_grads, (list, tuple)):
                 example_grads = [example_grads]
+
+            num_fw_inputs = len(fw_inputs)
+            num_fw_outputs = len(example_grads)
 
         def joint_f(
             *primals_and_tangents,
         ):
-            fw_inputs = primals_and_tangents[: len(_args)]
-            example_grads = primals_and_tangents[len(_args) :]
+            primals = primals_and_tangents[:num_fw_inputs]
+            tangents = primals_and_tangents[num_fw_inputs:]
 
-            def run_fwd(*fw_inputs):
-                outs = fw_func(*fw_inputs)
-                if not isinstance(outs, (list, tuple)):
-                    outs = (outs,)
-                masks = [o.requires_grad for o in outs]
-                return (outs, masks)
-
-            joint = create_joint(run_fwd, aot_config=dummy_aot_config)
             optional_grads = []
             for example_grad in example_grads:
                 if example_grad.requires_grad:
                     optional_grads.append(example_grad)
-            _, grads = joint(fw_inputs, optional_grads)
-            return grads
+
+            def prepare_fw_with_masks(fn):
+                def fw_with_masks(*args):
+                    fw_out = fn(*args)
+                    assert isinstance(
+                        fw_out, tuple
+                    ), "apply_local_map'd functions must return tuples! This will be relaxed with a dynamo frontend."
+                    return fw_out, [
+                        True
+                        if isinstance(ret, torch.Tensor) and ret.requires_grad
+                        else False
+                        for ret in fw_out
+                    ]
+
+                return fw_with_masks
+
+            fw_outs, grads = create_joint(
+                prepare_fw_with_masks(orig_fwd), aot_config=dummy_aot_config
+            )(primals, tangents)
+
+            maybe_clone = clone_outputs_aliasing_inputs(primals_and_tangents)
+            # put grads first to work with existing hop utils
+            return pytree.tree_map(maybe_clone, tuple([*grads, *fw_outs]))
 
         primals_and_tangents = [*fw_inputs, *example_grads]
-        joint_graph = make_fx(joint_f)(*primals_and_tangents)
-        return None, joint_graph
+        joint_hop_gm = make_fx(joint_f)(*primals_and_tangents)
+        # Match partitioner convention
+        prepped_joint_hop_gm = prepare_for_partitioner(
+            joint_hop_gm, num_fw_inputs, num_fw_outputs
+        )
+        # Also runs joint passes
+        new_fw_gm, new_bw_gm = partition_fn(
+            prepped_joint_hop_gm,
+            [],
+            num_fwd_outputs=num_fw_outputs,
+            static_lifetime_input_indices=[],
+        )
+
+        # Propagate meta onto fw/bw graphs, later will be set on proxied nodes
+        if "custom" not in new_fw_gm.meta:
+            new_fw_gm.meta["custom"] = {}
+        if "custom" not in new_bw_gm.meta:
+            new_bw_gm.meta["custom"] = {}
+        local_map_kwargs = orig_fwd.local_map_kwargs  # type: ignore[attr-defined]
+        new_fw_gm.meta["custom"]["local_map_kwargs"] = local_map_kwargs
+        new_bw_gm.meta["custom"]["local_map_kwargs"] = {
+            # Okay because Autoparallel assumes same sharding between param and grads
+            "in_placements": local_map_kwargs["out_placements"],
+            "out_placements": local_map_kwargs["in_placements"],
+        }
+
+        return new_fw_gm, new_bw_gm, num_fw_outputs
 
 
 class LocalMapAutogradOp(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, orig_fwd, joint_graph, *args, **kwargs):
-        ctx.save_for_backward(*args)
-
-        save_tensors_and_symints_for_backward(ctx, args)
-        ctx.joint_graph = joint_graph
+    def forward(
+        ctx: Any,
+        fw_gm: GraphModule,
+        bw_gm: GraphModule,
+        num_fw_outs: int,
+        *args: Any,
+        **kwargs: Any,
+    ) -> tuple[Optional[torch.Tensor], ...]:
+        ctx.bw_gm = bw_gm
 
         with torch._C._AutoDispatchBelowAutograd():
-            return local_map_hop(orig_fwd, *args, **kwargs)
+            fw_outs_with_saved_activations = local_map_hop(fw_gm, *args, **kwargs)
+
+        fw_outs = fw_outs_with_saved_activations[:num_fw_outs]
+        saved_activations = fw_outs_with_saved_activations[num_fw_outs:]
+        save_tensors_and_symints_for_backward(ctx, saved_activations)
+
+        return fw_outs
 
     @staticmethod
-    def backward(ctx, *grads):
-        args = saved_tensors_and_symints(ctx)
-        grad_ins = ctx.joint_graph(*args, *grads)
-        # TODO: hopify to support local_map'd function containing custom autograd.Function
-        return None, None, *grad_ins
+    def backward(
+        ctx: Any, *grads: tuple[torch.Tensor]
+    ) -> tuple[Optional[torch.Tensor], ...]:
+        # TODO: prevent double backward
+        saved_activations = saved_tensors_and_symints(ctx)
+        with torch._C._AutoDispatchBelowAutograd():
+            grad_ins = local_map_hop_backward(ctx.bw_gm, *saved_activations, *grads)
+        return None, None, None, *grad_ins
 
 
 @local_map_hop.py_impl(torch._C.DispatchKey.Autograd)
 def autograd_key(
-    orig_fwd,
-    *args,
-    **kwargs,
-):
+    orig_fwd: Callable[..., Any],
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
     if "_inline" in kwargs:
         # Solver pass adds a _inline kwarg, which tells this hop to desugar on the next trace
         del kwargs["_inline"]
         return orig_fwd(*args, **kwargs)
 
-    _, joint_graph = create_hop_joint_graph(orig_fwd, *args)
-    return LocalMapAutogradOp.apply(orig_fwd, joint_graph, *args, **kwargs)
+    fw_gm, bw_gm, num_fw_outs = create_hop_fw_bw(orig_fwd, *args)
+    return LocalMapAutogradOp.apply(fw_gm, bw_gm, num_fw_outs, *args, **kwargs)
 
 
 @local_map_hop.py_functionalize_impl
-def functional_mode_key(ctx, orig_fwd, *args, **kwargs):
+def functional_mode_key(
+    ctx: Any, fw_gm: GraphModule, *args: Any, **kwargs: Any
+) -> tuple[torch.Tensor]:
     assert not kwargs
 
     unwrapped_inputs = ctx.unwrap_tensors(args)
     with ctx.redispatch_to_next():
-        # TODO: dynamo safety checks on orig_fwd
-        out = local_map_hop(orig_fwd, *unwrapped_inputs)
+        # TODO: dynamo safety checks on fw_gm
+        out = local_map_hop(fw_gm, *unwrapped_inputs)
         return ctx.wrap_tensors(out)
 
 
 @local_map_hop.py_impl(FakeTensorMode)
 def fake_mode_key(
-    mode,
-    orig_fwd,
-    *args,
-    **kwargs,
-):
+    mode: FakeTensorMode,
+    fw_gm: GraphModule,
+    *args: Any,
+    **kwargs: Any,
+) -> tuple[torch.Tensor]:
     with mode:
-        return orig_fwd(*args, **kwargs)
+        return fw_gm(*args, **kwargs)
 
 
-@local_map_hop.py_impl(ProxyTorchDispatchMode)
-def proxy_mode_key(
-    proxy_mode,
-    orig_fwd,
-    *args,
-    **kwargs,
-):
+def proxy_mode_key_common(
+    hop: Union[LocalMapAOTExportModule, LocalMapBackwardAOTExportModule],
+    call_hop: Callable[..., Any],
+    proxy_mode: ProxyTorchDispatchMode,
+    gm: GraphModule,
+    *args: Any,
+    **kwargs: Any,
+) -> tuple[torch.Tensor]:
     assert (
         proxy_mode is not None
     ), "Mode should always be enabled for python fallback key"
     assert len(kwargs) == 0
 
-    example_out = local_map_hop(orig_fwd, *args, **kwargs)
-    proxy_args = pytree.tree_map(proxy_mode.tracer.unwrap_proxy, args)
-
-    def call_local_map(*another_args, **another_kwargs):
-        return functools.partial(local_map_hop, orig_fwd)(
-            *another_args, **another_kwargs
-        )
+    example_out = hop(gm, *args, **kwargs)
+    proxy_args = pytree.tree_map(proxy_mode.tracer.unwrap_proxy, args)  # type: ignore[union-attr]
 
     out_proxy = proxy_mode.tracer.create_proxy(
-        "call_function", call_local_map, proxy_args, {}
+        "call_function", call_hop, proxy_args, {}
     )
-    out_proxy.node.meta["custom"] = {
-        "dtensor_local_map_kwargs": orig_fwd.local_map_kwargs,
-    }
+    # Propagate meta for proxied node
+    assert gm.meta["custom"]["local_map_kwargs"]
+    if "custom" not in out_proxy.node.meta:
+        out_proxy.node.meta["custom"] = {}
+    out_proxy.node.meta["custom"]["local_map_kwargs"] = gm.meta["custom"][
+        "local_map_kwargs"
+    ]
     return track_tensor_tree(
         example_out, out_proxy, constant=None, tracer=proxy_mode.tracer
+    )
+
+
+@local_map_hop.py_impl(ProxyTorchDispatchMode)
+def proxy_mode_key(
+    proxy_mode: ProxyTorchDispatchMode,
+    fw_gm: GraphModule,
+    *args: Any,
+    **kwargs: Any,
+) -> tuple[torch.Tensor]:
+    def call_local_map(*another_args, **another_kwargs):
+        return functools.partial(local_map_hop, fw_gm)(*another_args, **another_kwargs)
+
+    return proxy_mode_key_common(
+        local_map_hop, call_local_map, proxy_mode, fw_gm, *args, **kwargs
     )
 
 
@@ -215,11 +309,82 @@ def proxy_mode_key(
 @local_map_hop.py_impl(torch._C.DispatchKey.CPU)
 @local_map_hop.py_impl(torch._C.DispatchKey.CUDA)
 def real_impl(
-    orig_fwd,
-    *args,
-    **kwargs,
-):
-    return orig_fwd(*args, **kwargs)
+    fw_gm: GraphModule,
+    *args: Any,
+    **kwargs: Any,
+) -> tuple[torch.Tensor]:
+    return fw_gm(*args, **kwargs)
+
+
+@local_map_hop_backward.py_impl(torch._C.DispatchKey.Autograd)
+def bw_autograd_key(
+    bw_gm: GraphModule,
+    *args: Any,
+    **kwargs: Any,
+) -> tuple[torch.Tensor]:
+    if "_inline" in kwargs:
+        # Solver pass adds a _inline kwarg, which tells this hop to desugar on the next trace
+        del kwargs["_inline"]
+        # TODO: prevent double backward
+        return bw_gm(*args, **kwargs)
+
+    assert False, "Shouldn't get here"
+
+
+@local_map_hop_backward.py_functionalize_impl
+def bw_functional_mode_key(
+    ctx: Any, bw_gm: GraphModule, *args: Any, **kwargs: Any
+) -> tuple[torch.Tensor]:
+    assert not kwargs
+
+    unwrapped_inputs = ctx.unwrap_tensors(args)
+    with ctx.redispatch_to_next():
+        # TODO: dynamo safety checks on bw_gm
+        out = local_map_hop_backward(bw_gm, *unwrapped_inputs)
+        return ctx.wrap_tensors(out)
+
+
+@local_map_hop_backward.py_impl(FakeTensorMode)
+def bw_fake_mode_key(
+    mode: FakeTensorMode,
+    bw_gm: GraphModule,
+    *args: Any,
+    **kwargs: Any,
+) -> tuple[torch.Tensor]:
+    with mode:
+        return bw_gm(*args, **kwargs)
+
+
+@local_map_hop_backward.py_impl(ProxyTorchDispatchMode)
+def bw_proxy_mode_key(
+    proxy_mode: ProxyTorchDispatchMode,
+    bw_gm: GraphModule,
+    *args: Any,
+    **kwargs: Any,
+) -> tuple[torch.Tensor]:
+    def call_local_map_backward(*another_args, **another_kwargs):
+        return functools.partial(local_map_hop_backward, bw_gm)(
+            *another_args, **another_kwargs
+        )
+
+    return proxy_mode_key_common(
+        local_map_hop_backward,
+        call_local_map_backward,
+        proxy_mode,
+        bw_gm,
+        *args,
+        **kwargs,
+    )
+
+
+@local_map_hop.py_impl(torch._C.DispatchKey.CPU)
+@local_map_hop.py_impl(torch._C.DispatchKey.CUDA)
+def bw_real_impl(
+    bw_gm: GraphModule,
+    *args: Any,
+    **kwargs: Any,
+) -> tuple[torch.Tensor]:
+    return bw_gm(*args, **kwargs)
 
 
 def apply_local_map(*local_map_args, **local_map_kwargs):
@@ -231,11 +396,15 @@ def apply_local_map(*local_map_args, **local_map_kwargs):
     # know which tensors to apply _from_fun to. For instance, don't pass nn.Modules to local_map.
     # In dynamo frontend, tensors will be lifted, and will modify the wrapped function's signature.
 
+    assert len(local_map_args) == 0, "Please pass as kwargs, no Dynamo frontend"
     assert local_map_kwargs[
         "redistribute_inputs"
     ], "Autoparallel should always be allowed to redistribute inputs"
     assert local_map_kwargs["in_grad_placements"] is None, "Not yet implemented"
     assert local_map_kwargs["device_mesh"] is None, "Must be provided by Autoparallel"
+    assert local_map_kwargs["in_placements"] is not None
+    assert local_map_kwargs["out_placements"] is not None
+    assert len(local_map_kwargs) == 5, "Got unexpected kwargs, no Dynamo frontend"
 
     def decorator(fn):
         @functools.wraps(fn)

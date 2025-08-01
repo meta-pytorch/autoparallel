@@ -189,7 +189,24 @@ def get_local_map_placement_option(
     out_placements,
 ):
     in_specs = []
-    for example, placement in zip(user_args, in_placements):
+    num_activation_inputs = len(user_args) - len(in_placements)
+    # activations are always replicated
+    replicated = tuple(Replicate() for _ in range(mesh.ndim))
+    for activation in user_args[:num_activation_inputs]:
+        # only in bwd do we have activation inputs
+        in_specs.append(
+            DTensorSpec(
+                mesh=mesh,
+                placements=replicated,
+                tensor_meta=TensorMeta(
+                    shape=activation.shape,
+                    stride=activation.stride(),
+                    dtype=activation.dtype,
+                ),
+            )
+        )
+
+    for example, placement in zip(user_args[num_activation_inputs:], in_placements):
         if placement is None:
             # not a dtensor
             assert False, "Not sure how to create DTensorSpec for this input"
@@ -210,6 +227,11 @@ def get_local_map_placement_option(
     assert isinstance(output_val, (torch.Tensor, list, tuple))
     outs = output_val if isinstance(output_val, (list, tuple)) else [output_val]
     for example, placement in zip(outs, out_placements):
+        if example is None:
+            # if the HOP returns None, just ignore it
+            out_specs.append(None)
+            continue
+
         if placement is None:
             # not a dtensor
             assert False, "Not sure how to create DTensorSpec for this output"
@@ -229,8 +251,23 @@ def get_local_map_placement_option(
             )
         )
 
-    if len(out_specs) == 1:
-        out_specs = out_specs[0]
+    for example in outs[len(out_placements) :]:
+        # only in fwd hop do we have activation outputs
+        out_specs.append(
+            DTensorSpec(
+                mesh=mesh,
+                placements=replicated,
+                tensor_meta=TensorMeta(
+                    shape=example.shape,
+                    stride=example.stride(),
+                    dtype=example.dtype,
+                ),
+            )
+        )
+
+    # does local_map allow returning tuple of len 1?
+    # if len(out_specs) == 1:
+    #     out_specs = out_specs[0]
 
     redistribute_costs = []
     for user_strategy, input_spec in zip(specs, in_specs):
