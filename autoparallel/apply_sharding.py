@@ -14,6 +14,7 @@ from torch._functorch._aot_autograd.fx_utils import (
     get_named_buffer_nodes,
     get_named_param_nodes,
 )
+from torch._inductor.decomposition import select_decomp_table
 from torch._subclasses.fake_tensor import FakeTensor, unset_fake_temporarily
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor._dtensor_spec import DTensorSpec
@@ -49,9 +50,12 @@ def my_redistribute_local_tensor(arg, curr_spec, tgt_spec):
 
 
 class ApplyShardingInterpreter(torch.fx.Interpreter):
-    def __init__(self, module, sharding_placement):
+    def __init__(self, module, sharding_placement, decomp_table=None):
         super().__init__(module, garbage_collect_values=True, graph=None)
         self.sharding_placement = sharding_placement
+        if decomp_table is None:
+            decomp_table = {}
+        self.decomp_table = decomp_table
 
     def run_node(self, n):
         self._curr_node = n
@@ -161,8 +165,33 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
             # TODO: see if we can remove this contiguous properly
             new_args[0] = new_args[0].contiguous()
 
+        if target in self.decomp_table:
+            new_target = self.decomp_table[target]
+            out = super().call_function(new_target, tuple(new_args), kwargs)
+            # NOTE: is there a canonical way of handling this?
+            if out is not NotImplemented:
+                out = tree_map_only(DTensor, lambda x: x.to_local(), out)
+                return out
         out = super().call_function(target, tuple(new_args), kwargs)
         out = tree_map_only(DTensor, lambda x: x.to_local(), out)
+        return out
+
+
+class ApplyDecompInterpreter(torch.fx.Interpreter):
+    def __init__(self, module, decomp_table=None):
+        super().__init__(module, garbage_collect_values=True, graph=None)
+        if decomp_table is None:
+            decomp_table = {}
+        self.decomp_table = decomp_table
+
+    def call_function(self, target, args, kwargs):
+        if target in self.decomp_table:
+            new_target = self.decomp_table[target]
+            out = super().call_function(new_target, args, kwargs)
+            # NOTE: is there a canonical way of handling this?
+            if out is not NotImplemented:
+                return out
+        out = super().call_function(target, args, kwargs)
         return out
 
 
@@ -215,17 +244,43 @@ def rename_placeholder_node(
         fx_g.graph.erase_node(node)
 
 
+def _cleanup_graph(gm):
+    gm.graph.eliminate_dead_code()
+    gm.recompile()
+    prev = torch._inductor.config.pattern_matcher
+    torch._inductor.config.pattern_matcher = False
+    prev_pass = torch._inductor.config.joint_custom_post_pass
+    torch._inductor.config.joint_custom_post_pass = None
+    from torch._inductor.fx_passes.joint_graph import joint_graph_passes
+
+    try:
+        # TODO: Double check if this is what we want to do
+        gm = joint_graph_passes(gm)
+    finally:
+        torch._inductor.config.pattern_matcher = prev
+        torch._inductor.config.joint_custom_post_pass = prev_pass
+    gm.graph.eliminate_dead_code()
+    gm.recompile()
+
+
 def apply_sharding_to_model(gm, sharding_placement, params_spec, buffers_spec):
     args = shard_nodes_given_placements(gm, sharding_placement)
 
+    decomp_table = select_decomp_table()
     # run with DTensor to apply the collectives given the graph
-    interp = ApplyShardingInterpreter(gm, sharding_placement)
+    interp = ApplyShardingInterpreter(gm, sharding_placement, decomp_table)
 
     args = [x.to_local() for x in args]
 
     # TODO: make_fx here is suspicious in case of dynamic shapes
     with fx_traceback.preserve_node_meta():
-        parallel_gm = make_fx(interp.run)(*args)
+        parallel_gm0 = make_fx(interp.run)(*args)
+
+    _cleanup_graph(parallel_gm0)
+    interp2 = ApplyDecompInterpreter(parallel_gm0, decomp_table)
+    with fx_traceback.preserve_node_meta():
+        parallel_gm = make_fx(interp2.run)(*args)
+    _cleanup_graph(parallel_gm)
 
     # Copy descriptors over to new graph
     for n1, n2 in zip(
