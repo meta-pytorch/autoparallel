@@ -634,6 +634,8 @@ with AutoParallel(model, input_fn, mesh, mp_policy) as autop:
 parallel_mod.to_empty(device="cuda")
 parallel_mod.init_weights()
 
+parallel_mod.compile(fullgraph=True)
+
 # now let's run it
 x = (
     torch.randint(
