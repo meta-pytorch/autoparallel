@@ -1,40 +1,48 @@
 name: Test TorchTitan Integration
 
 on:
-  push:
-    branches: [ main ]
   pull_request:
-    branches: [ main ]
-  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - release/*
+
+concurrency:
+  group: test-torchtitan-${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.run_number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test-torchtitan:
-    runs-on: linux.g5.12xlarge.nvidia.gpu
-    timeout-minutes: 60
-
-    steps:
-    - uses: actions/checkout@v4
-
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: '3.10'
-
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install -e .
-        pip install -r requirements-test.txt
-
-    - name: Clone TorchTitan on autoparallel branch
-      run: |
+    name: Test TorchTitan Integration (cuda12.6-py3.10)
+    uses: pytorch/test-infra/.github/workflows/linux_job_v2.yml@main
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - name: 12xlargegpu
+            runs-on: linux.g5.12xlarge.nvidia.gpu
+            torch-spec: '--pre torch --index-url https://download.pytorch.org/whl/nightly/cu126'
+            gpu-arch-type: "cuda"
+            gpu-arch-version: "12.6"
+    with:
+      timeout: 60
+      runner: ${{ matrix.runs-on }}
+      gpu-arch-type: ${{ matrix.gpu-arch-type }}
+      gpu-arch-version: ${{ matrix.gpu-arch-version }}
+      submodules: recursive
+      script: |
+        pip install --quiet -r requirements-test.txt
+        # For some reason the spec above isnt working
+        pip uninstall -y torch
+        pip install --no-input --quiet --pre torch --index-url https://download.pytorch.org/whl/nightly/cu126
+        pip install --quiet .
+        
+        # Clone TorchTitan on autoparallel branch
         git clone --branch autoparallel https://github.com/pytorch/torchtitan.git
         cd torchtitan
-        pip install -r requirements.txt
-
-    - name: Run TorchTitan training with AutoParallel
-      run: |
-        cd torchtitan
+        pip install --quiet -r requirements.txt
+        
+        # Run TorchTitan training with AutoParallel
         CONFIG_FILE="./torchtitan/models/llama3/train_configs/debug_model.toml" ./run_train.sh \
           --model.name llama3_auto_parallel \
           --parallelism.tensor_parallel_degree 4 \
