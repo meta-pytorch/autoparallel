@@ -700,7 +700,10 @@ def reshape_rule(mesh, op_schema):
 @register_opschema_rule(torch.ops.aten.expand.default)
 def expand_rule(mesh, op_schema_):
     op = torch.ops.aten.expand.default
-    op_schema = copy.deepcopy(op_schema_)
+    from torch._subclasses.fake_tensor import unset_fake_temporarily
+
+    with unset_fake_temporarily():
+        op_schema = copy.deepcopy(op_schema_)
     input_strat = op_schema.args_schema[0]
     orig_shape = input_strat.strategies[0].output_specs.tensor_meta.shape
     dest_shape = op_schema.args_schema[1]

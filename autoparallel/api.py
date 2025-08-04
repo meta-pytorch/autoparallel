@@ -191,21 +191,18 @@ class AutoParallel:
 
         self.build_model_graph()
 
-        from torch._subclasses.fake_tensor import unset_fake_temporarily
-
-        with unset_fake_temporarily():
-            rescale_grad_comm_cost_for_mp = 1.0
-            if self.mp_policy is not None:
-                param_size = self.mp_policy.param_dtype.itemsize
-                reduce_size = self.mp_policy.reduce_dtype.itemsize
-                if param_size != reduce_size:
-                    rescale_grad_comm_cost_for_mp = reduce_size / param_size
-                    # Tiebreak, favoring performing the comms in the largest
-                    # dtype
-                    rescale_grad_comm_cost_for_mp *= 1.1
-            sharding_optimizer = ShardingOptimizer(
-                self.gm, self.mesh, rescale_grad_comm_cost_for_mp
-            )
+        rescale_grad_comm_cost_for_mp = 1.0
+        if self.mp_policy is not None:
+            param_size = self.mp_policy.param_dtype.itemsize
+            reduce_size = self.mp_policy.reduce_dtype.itemsize
+            if param_size != reduce_size:
+                rescale_grad_comm_cost_for_mp = reduce_size / param_size
+                # Tiebreak, favoring performing the comms in the largest
+                # dtype
+                rescale_grad_comm_cost_for_mp *= 1.1
+        sharding_optimizer = ShardingOptimizer(
+            self.gm, self.mesh, rescale_grad_comm_cost_for_mp
+        )
 
         # makes sharding of params and gradients the same
         sharding_optimizer.add_grad_param_constraints()
