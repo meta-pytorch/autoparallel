@@ -36,14 +36,14 @@ jobs:
         pip uninstall -y torch
         pip install --no-input --quiet --pre torch --index-url https://download.pytorch.org/whl/nightly/cu126
         pip install --quiet .
-        
+
         # Clone TorchTitan on autoparallel branch
         git clone --branch autoparallel https://github.com/pytorch/torchtitan.git
         cd torchtitan
         pip install --quiet -r requirements.txt
-        
+
         # Run TorchTitan training with AutoParallel
-        CONFIG_FILE="./torchtitan/models/llama3/train_configs/debug_model.toml" ./run_train.sh \
+        NGPU=4 CONFIG_FILE="./torchtitan/models/llama3/train_configs/debug_model.toml" ./run_train.sh \
           --model.name llama3_auto_parallel \
           --parallelism.tensor_parallel_degree 4 \
           --training.dataset c4 \
