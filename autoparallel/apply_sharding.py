@@ -265,21 +265,20 @@ def _cleanup_graph(gm):
 
 def apply_sharding_to_model(gm, sharding_placement, params_spec, buffers_spec):
     args = shard_nodes_given_placements(gm, sharding_placement)
+    local_args = [arg.to_local() for arg in args]
 
     decomp_table = select_decomp_table()
     # run with DTensor to apply the collectives given the graph
     interp = ApplyShardingInterpreter(gm, sharding_placement, decomp_table)
 
-    args = [x.to_local() for x in args]
-
     # TODO: make_fx here is suspicious in case of dynamic shapes
     with fx_traceback.preserve_node_meta():
-        parallel_gm0 = make_fx(interp.run)(*args)
+        parallel_gm0 = make_fx(interp.run)(*local_args)
 
     _cleanup_graph(parallel_gm0)
     interp2 = ApplyDecompInterpreter(parallel_gm0, decomp_table)
     with fx_traceback.preserve_node_meta():
-        parallel_gm = make_fx(interp2.run)(*args)
+        parallel_gm = make_fx(interp2.run)(*local_args)
     _cleanup_graph(parallel_gm)
 
     # Copy descriptors over to new graph

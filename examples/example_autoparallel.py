@@ -93,6 +93,7 @@ dim2 = dim1 * 4
 
 
 def input_fn():
+    print(f"global input shape: {(bs, seq_len, dim1)}")
     return torch.rand(bs, seq_len, dim1, device="cuda")
 
 
@@ -104,10 +105,9 @@ mp_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.
 # mp_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16)
 # mp_policy = None
 
-with AutoParallel(model, input_fn, mesh, mp_policy) as autop:
+with AutoParallel(model, input_fn, mesh, mp_policy, compile=True) as autop:
     assert any(n.meta.get("nn_module_stack") for n in autop.gm.graph.nodes)
     assert any(n.meta.get("fwd_nn_module_stack") for n in autop.gm.graph.nodes)
-
     autop.add_parameter_memory_constraint(low=None, high=None)
 
     x_sharding = (Shard(0),) + (Replicate(),) * (mesh.ndim - 1)
@@ -122,8 +122,6 @@ with AutoParallel(model, input_fn, mesh, mp_policy) as autop:
 
 parallel_mod.to_empty(device="cuda")
 parallel_mod.init_weights()
-
-parallel_mod.compile(fullgraph=True)
 
 # now let's run it
 x = (torch.rand(bs // mesh.shape[0], seq_len, dim1, device="cuda"),)

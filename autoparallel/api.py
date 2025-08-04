@@ -7,13 +7,16 @@ import copy
 import itertools
 from contextlib import ExitStack
 from types import MethodType
-from typing import Optional
+from typing import Optional, Union
 
 import torch
 from torch._functorch.aot_autograd import (
+    JointWithDescriptors,
     aot_compile_joint_with_descriptors,
     aot_export_joint_with_descriptors,
+    boxed_nop_preserve_node_meta,
 )
+from torch._inductor.compile_fx import compile_fx_inner
 from torch._inductor.decomposition import select_decomp_table
 from torch._inductor.fx_passes.joint_graph import joint_graph_passes
 from torch._inductor.fx_passes.post_grad import remove_assert_ops
@@ -23,12 +26,48 @@ from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor import DeviceMesh
 from torch.export._unlift import _assign_attr
 from torch.export.unflatten import _AttrKind
+from torch.fx import GraphModule
+from torch.fx.experimental._backward_state import BackwardState
 
 from .apply_sharding import apply_sharding_to_model
 from .cast_parametrization import apply_dtype_cast, canonicalize_mp, set_dtype_cast
 from .init_weights import hook_params_setters
 from .optimize_sharding import ShardingOptimizer
 from .utils import _get_device_from_mesh
+
+
+def update_joint_with_descriptors(
+    joint_with_descriptors: JointWithDescriptors,
+    updated_gm: GraphModule,
+) -> None:
+    """
+    Assuming we have transformed updated_gm since the time it was captured,
+    (e.g. by parallelizing it),
+    this util updates the joint_with_descriptors struct to reference the new gm, and
+    updates any copies of tensor meta/shape stored in joint_with_descriptors relating to input arguments,
+    which may have changed shape since the initial trace.
+    """
+    # TODO: should we upstream a util like this?
+    placeholders = [n for n in updated_gm.graph.nodes if n.op == "placeholder"]
+    new_local_args = [n.meta["val"] for n in placeholders]
+    joint_with_descriptors.graph_module = updated_gm
+    joint_with_descriptors._aot_graph_capture.graph_module = updated_gm
+
+    new_flat_args: list[Union[torch.Tensor, int, torch.SymInt, BackwardState]] = []
+    for orig, new in zip(joint_with_descriptors._aot_state.flat_args, new_local_args):
+        if isinstance(orig, torch.nn.Parameter):
+            new_flat_args.append(torch.nn.Parameter(new))
+        else:
+            new_flat_args.append(new)
+
+    tangent_idx = len(joint_with_descriptors._aot_state.flat_args)
+    new_local_tangents = new_local_args[tangent_idx:]
+    joint_with_descriptors._aot_graph_capture.updated_flat_args = (
+        new_flat_args,
+        new_local_tangents,
+    )
+    joint_with_descriptors._aot_state.flat_args = new_flat_args
+    joint_with_descriptors._aot_state.fw_metadata.traced_tangents = new_local_tangents
 
 
 def _add_alias(gm):
@@ -163,6 +202,7 @@ class AutoParallel:
         input_fn,
         mesh: DeviceMesh,
         mp_policy: Optional[MixedPrecisionPolicy] = None,
+        compile: bool = False,
     ):
         self.stack = ExitStack()
         self.fake_mode = (
@@ -187,6 +227,7 @@ class AutoParallel:
         self.model = move_to_fake(model, self.fake_mode, device)
         self.input_fn = input_fn
         self.mesh = mesh
+        self.compiler_fn = compile_fx_inner if compile else boxed_nop_preserve_node_meta
 
         # NB: rest of the construction happens in __enter__
 
@@ -196,6 +237,10 @@ class AutoParallel:
         assert self.active is False
 
         self.build_model_graph()
+        self.old_inductor_comprehensive_padding = (
+            torch._inductor.config.comprehensive_padding
+        )
+        torch._inductor.config.comprehensive_padding = False
 
         rescale_grad_comm_cost_for_mp = 1.0
         if self.mp_policy is not None:
@@ -224,6 +269,9 @@ class AutoParallel:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        torch._inductor.config.comprehensive_padding = (
+            self.old_inductor_comprehensive_padding
+        )
         self.active = None
         return self.stack.__exit__(exc_type, exc_val, exc_tb)
 
@@ -252,7 +300,12 @@ class AutoParallel:
         with set_dtype_cast(True):
             ep = torch.export.export(self.model, inputs)
             self.joint_with_descriptors = aot_export_joint_with_descriptors(
-                self.stack, ep.module(), inputs, decompositions=decomp_table
+                self.stack,
+                ep.module(),
+                inputs,
+                decompositions=decomp_table,
+                fw_compiler=self.compiler_fn,
+                bw_compiler=self.compiler_fn,
             )
         gm = self.joint_with_descriptors.graph_module
 
@@ -392,8 +445,7 @@ class AutoParallel:
         #    parallel_gm, self.params_len, self.buffer_len, self.metadata
         # )
         self.parallel_gm = parallel_gm
-        self.joint_with_descriptors.graph_module = parallel_gm
-
+        update_joint_with_descriptors(self.joint_with_descriptors, parallel_gm)
         # NB: so this function takes in the parameters at the beginning
 
         # let's remove those otherwise we can't clean the backward graph properly
