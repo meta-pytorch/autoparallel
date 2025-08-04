@@ -96,9 +96,8 @@ def apply_dtype_cast(model, mp_policy: MixedPrecisionPolicy):
                 # Different instances of the same class can resolve their parameter access to instance-specific getters
                 # (which contains unique objects used in that instance-specific parameter's unshard operation).
                 namespace[p_name] = create_dtype_cast_managed_attr(p_name)
-            new_cls = type(
-                f"DTypeCast{cls.__name__}", (DTypeCastModule, cls), namespace
-            )
+            cls_t = (DTypeCastModule, cls) if mod is model else (cls,)
+            new_cls = type(f"DTypeCast{cls.__name__}", cls_t, namespace)
             cls_key_to_dtype_cast_cls[(cls, param_properties_key)] = new_cls
         mod.__class__ = new_cls
         mod._name_to_dtype_cast_managed_attr_getter = param_properties
