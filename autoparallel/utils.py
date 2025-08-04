@@ -73,9 +73,6 @@ def propagate_tensor_meta(op, user_args, user_kwargs, out_strat):
                         else:
                             assert tm is None
         if strat.input_specs is None:
-            if op in TENSOR_FACTORY_OPS:
-                # there isn't an input spec bc the op has no input!
-                continue
 
             supported_ops = {
                 torch.ops.prims.convert_element_type.default,
@@ -88,9 +85,18 @@ def propagate_tensor_meta(op, user_args, user_kwargs, out_strat):
             )
             strat.input_specs = (strat.output_specs,)
             assert strat.redistribute_cost is None
-        assert len(tensor_metas) == len(
-            strat.input_specs
-        ), f"{op}, {len(tensor_metas)}, {len(strat.input_specs)}"
+        # NOTE: this invariant wrt factory ops is something I believe
+        # I'll keep for the solver, so we need to have some consistency here
+        # i.e., even though factory ops don't have inputs, we do put an
+        # input spec for it which is equal to the output spec
+        if op in TENSOR_FACTORY_OPS:
+            assert len(tensor_metas) == 0, f"{op}, {len(tensor_metas)}"
+            assert len(strat.input_specs) == 1, f"{op}, {len(strat.input_specs)}"
+        else:
+            assert len(tensor_metas) == len(
+                strat.input_specs
+            ), f"{op}, {len(tensor_metas)}, {len(strat.input_specs)}"
+
         for tm, ispec in zip(tensor_metas, strat.input_specs):
             if ispec.tensor_meta is None:
                 ispec.tensor_meta = tm

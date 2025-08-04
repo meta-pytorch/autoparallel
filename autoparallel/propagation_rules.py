@@ -379,7 +379,7 @@ def factory_rule(mesh, op_schema: OpSchema) -> OpStrategy:
     This util applies to any factory function that takes 'size' as the first argument,
     and supports Replication and Shard placements all at zero cost.
     """
-    assert isinstance(op_schema.args_schema[0], torch.Size)
+    assert isinstance(op_schema.args_schema[0], (torch.Size, list))
     shape = op_schema.args_schema[0]
     x = torch.empty(shape, device="meta")
     stride = x.stride()
@@ -408,7 +408,7 @@ def factory_rule(mesh, op_schema: OpSchema) -> OpStrategy:
     for strategy_comb in strategy_combs:
         spec_list = [DTensorSpec(mesh, specs) for specs in zip(*strategy_comb)]
         output_specs = spec_list[0]
-        output_specs.tensor_meta = TensorMeta(shape, stride, dtype)
+        output_specs.tensor_meta = TensorMeta(shape, stride, dtype)  # type: ignore[arg-type]
 
         if not is_tensor_shardable(shape, output_specs):
             continue
@@ -421,8 +421,13 @@ def factory_rule(mesh, op_schema: OpSchema) -> OpStrategy:
             * len(strategy_combs)
         ]
 
+        # NOTE: why do we have input_specs for constructor nodes, given that they have no inputs?
+        # This is because the optimizer code expects to see input_specs for all nodes, and it
+        # uses the input_specs to determine the sharding of the output.  So we have to give it
+        # something, even though it is in principle not needed.
         strategy = OpSpec(
             output_specs=output_specs,
+            input_specs=[output_specs],
             redistribute_cost=redistribute_cost,
         )
         all_strategies.append(strategy)
