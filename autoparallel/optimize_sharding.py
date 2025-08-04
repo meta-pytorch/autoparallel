@@ -751,8 +751,6 @@ class ShardingOptimizer:
             num_input_nodes = len(all_input_nodes)
             if len(strat0.redistribute_cost) != num_input_nodes:
                 # only constructor functions allowed here
-                if num_input_nodes > 0:
-                    breakpoint()
                 assert num_input_nodes == 0, f"{num_input_nodes}"
                 assert (
                     len(strat0.redistribute_cost) == 1

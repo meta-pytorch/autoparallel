@@ -193,7 +193,7 @@ def get_local_map_placement_option(
     # activations are always replicated
     replicated = tuple(Replicate() for _ in range(mesh.ndim))
     for activation in user_args[:num_activation_inputs]:
-        # only in bwd do we have activation inputs
+        # we have activation inputs for the bwd hop
         in_specs.append(
             DTensorSpec(
                 mesh=mesh,
@@ -228,7 +228,7 @@ def get_local_map_placement_option(
     outs = output_val if isinstance(output_val, (list, tuple)) else [output_val]
     for example, placement in zip(outs, out_placements):
         if example is None:
-            # if the HOP returns None, just ignore it
+            # the joint can return None, just ignore it
             out_specs.append(None)
             continue
 
@@ -252,7 +252,7 @@ def get_local_map_placement_option(
         )
 
     for example in outs[len(out_placements) :]:
-        # only in fwd hop do we have activation outputs
+        # we have activation outputs for the fwd hop
         out_specs.append(
             DTensorSpec(
                 mesh=mesh,
@@ -264,10 +264,6 @@ def get_local_map_placement_option(
                 ),
             )
         )
-
-    # does local_map allow returning tuple of len 1?
-    # if len(out_specs) == 1:
-    #     out_specs = out_specs[0]
 
     redistribute_costs = []
     for user_strategy, input_spec in zip(specs, in_specs):
