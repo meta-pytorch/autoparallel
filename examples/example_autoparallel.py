@@ -105,6 +105,9 @@ mp_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.
 # mp_policy = None
 
 with AutoParallel(model, input_fn, mesh, mp_policy) as autop:
+    assert any(n.meta.get('nn_module_stack') for n in autop.gm.graph.nodes)
+    assert any(n.meta.get('fwd_nn_module_stack') for n in autop.gm.graph.nodes)
+
     autop.add_parameter_memory_constraint(low=None, high=None)
 
     x_sharding = (Shard(0),) + (Replicate(),) * (mesh.ndim - 1)

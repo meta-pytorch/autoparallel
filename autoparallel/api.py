@@ -244,8 +244,9 @@ class AutoParallel:
                 inputs = (inputs,)
 
         with set_dtype_cast(True):
+            ep = torch.export.export(self.model, inputs)
             self.joint_with_descriptors = aot_export_joint_with_descriptors(
-                self.stack, self.model, inputs, decompositions=decomp_table
+                self.stack, ep.module(), inputs, decompositions=decomp_table
             )
         gm = self.joint_with_descriptors.graph_module
 
