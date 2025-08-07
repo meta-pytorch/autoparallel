@@ -20,6 +20,7 @@ from torch.distributed.tensor._dtensor_spec import DTensorSpec
 from torch.distributed.tensor._redistribute import redistribute_local_tensor
 from torch.distributed.tensor.placement_types import Partial, Replicate, Shard  # noqa
 from torch.fx.experimental.proxy_tensor import make_fx
+from torch.fx.passes.shape_prop import _extract_tensor_metadata
 from torch.utils._pytree import tree_flatten, tree_map_only
 
 from .propagation_rules import TENSOR_FACTORY_OPS
@@ -221,11 +222,22 @@ def apply_sharding_to_model(gm, sharding_placement, params_spec, buffers_spec):
     # run with DTensor to apply the collectives given the graph
     interp = ApplyShardingInterpreter(gm, sharding_placement)
 
-    args = [x.to_local() for x in args]
+    local_args = []
+    for placeholder, arg in zip(gm.graph.nodes, args):
+        assert placeholder.meta["val"].shape == arg.shape
+        local_arg = arg.to_local()
+        placeholder.meta["val"] = local_arg
+        # requires_grad is missing from val and local_arg, take it
+        # from original tensor_meta
+        requires_grad = placeholder.meta["tensor_meta"].requires_grad
+        placeholder.meta["tensor_meta"] = _extract_tensor_metadata(
+            local_arg.clone().requires_grad_(requires_grad)
+        )
+        local_args.append(local_arg)
 
     # TODO: make_fx here is suspicious in case of dynamic shapes
     with fx_traceback.preserve_node_meta():
-        parallel_gm = make_fx(interp.run)(*args)
+        parallel_gm = make_fx(interp.run)(*local_args)
 
     # Copy descriptors over to new graph
     for n1, n2 in zip(
@@ -262,4 +274,4 @@ def apply_sharding_to_model(gm, sharding_placement, params_spec, buffers_spec):
             n, sharding_placement, meta=True
         )
 
-    return parallel_gm, sharded_param_dict, sharded_buffer_dict
+    return parallel_gm, sharded_param_dict, sharded_buffer_dict, local_args

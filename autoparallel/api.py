@@ -7,10 +7,11 @@ import copy
 import itertools
 from contextlib import ExitStack
 from types import MethodType
-from typing import Optional
+from typing import Optional, Union
 
 import torch
 from torch._functorch.aot_autograd import (
+    JointWithDescriptors,
     aot_compile_joint_with_descriptors,
     aot_export_joint_with_descriptors,
 )
@@ -23,12 +24,43 @@ from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor import DeviceMesh
 from torch.export._unlift import _assign_attr
 from torch.export.unflatten import _AttrKind
+from torch.fx import GraphModule
+from torch.fx.experimental._backward_state import BackwardState
 
 from .apply_sharding import apply_sharding_to_model
 from .cast_parametrization import apply_dtype_cast, canonicalize_mp, set_dtype_cast
 from .init_weights import hook_params_setters
 from .optimize_sharding import ShardingOptimizer
 from .utils import _get_device_from_mesh
+
+
+def update_joint_with_descriptors(
+    joint_with_descriptors: JointWithDescriptors,
+    parallel_gm: GraphModule,
+    new_local_args: list[torch.Tensor],
+) -> None:
+    # TODO: should we upstream a util like this?
+    # Should we pass 'new_local_args' in here?
+    # or should we just rely on the parallel_gm to have its placehodler metas updated and
+    # extract the new_local_args from there?
+    joint_with_descriptors.graph_module = parallel_gm
+    joint_with_descriptors._aot_graph_capture.graph_module = parallel_gm
+
+    new_flat_args: list[Union[torch.Tensor, int, torch.SymInt, BackwardState]] = []
+    for orig, new in zip(joint_with_descriptors._aot_state.flat_args, new_local_args):
+        if isinstance(orig, torch.nn.Parameter):
+            new_flat_args.append(torch.nn.Parameter(new))
+        else:
+            new_flat_args.append(new)
+
+    tangent_idx = len(joint_with_descriptors._aot_state.flat_args)
+    new_local_tangents = new_local_args[tangent_idx:]
+    joint_with_descriptors._aot_graph_capture.updated_flat_args = (
+        new_flat_args,
+        new_local_tangents,
+    )
+    joint_with_descriptors._aot_state.flat_args = new_flat_args
+    joint_with_descriptors._aot_state.fw_metadata.traced_tangents = new_local_tangents
 
 
 def _add_alias(gm):
@@ -369,6 +401,7 @@ class AutoParallel:
                 parallel_gm,
                 sharded_param_dict,
                 sharded_buffer_dict,
+                new_local_args,
             ) = apply_sharding_to_model(
                 self.gm,
                 sharding_placement,
@@ -392,8 +425,9 @@ class AutoParallel:
         #    parallel_gm, self.params_len, self.buffer_len, self.metadata
         # )
         self.parallel_gm = parallel_gm
-        self.joint_with_descriptors.graph_module = parallel_gm
-
+        update_joint_with_descriptors(
+            self.joint_with_descriptors, parallel_gm, new_local_args
+        )
         # NB: so this function takes in the parameters at the beginning
 
         # let's remove those otherwise we can't clean the backward graph properly
