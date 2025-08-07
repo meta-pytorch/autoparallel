@@ -4,13 +4,25 @@
 # LICENSE file in the root directory of this source tree.
 
 
+import functools
+
 import torch
 from torch import nn
 from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor.placement_types import Replicate, Shard
 from torch.testing._internal.distributed.fake_pg import FakeStore
+from torch.utils.checkpoint import create_selective_checkpoint_contexts
 
 from autoparallel.api import AutoParallel
+
+
+def policy_fn(ctx, op, *args, **kwargs):
+    if op == torch.ops.aten._scaled_dot_product_flash_attention.default:
+        return torch.utils.checkpoint.CheckpointPolicy.PREFER_SAVE
+    return torch.utils.checkpoint.CheckpointPolicy.PREFER_RECOMPUTE
+
+
+context_fn = functools.partial(create_selective_checkpoint_contexts, policy_fn)
 
 
 class Block(nn.Module):
@@ -48,7 +60,7 @@ class Block(nn.Module):
 
     def forward(self, x):
         o = torch.utils.checkpoint.checkpoint(
-            self._compute_attention, x, use_reentrant=False
+            self._compute_attention, x, use_reentrant=False, context_fn=context_fn
         )
 
         o0 = o + x

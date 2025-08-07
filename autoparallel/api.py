@@ -250,9 +250,20 @@ class AutoParallel:
                 inputs = (inputs,)
 
         with set_dtype_cast(True):
+            # TODO: what is going on, why do I need to trace twice and
+            # under the preserve_node_meta mode?
+            # if I trace only once under preserve_node_meta, I get
+            # that the nn_module_stack is not set
+            with torch.fx.traceback.preserve_node_meta():
+                ep_with_ac = torch.export.export(self.model, inputs)
             ep = torch.export.export(self.model, inputs)
+            for n, n0 in zip(ep.graph.nodes, ep_with_ac.graph.nodes):
+                if "nn_module_stack" in n.meta:
+                    n0.meta["nn_module_stack"] = n.meta["nn_module_stack"]
+                if "fwd_nn_module_stack" in n.meta:
+                    n0.meta["fwd_nn_module_stack"] = n.meta["fwd_nn_module_stack"]
             self.joint_with_descriptors = aot_export_joint_with_descriptors(
-                self.stack, ep.module(), inputs, decompositions=decomp_table
+                self.stack, ep_with_ac.module(), inputs, decompositions=decomp_table
             )
         gm = self.joint_with_descriptors.graph_module
 
