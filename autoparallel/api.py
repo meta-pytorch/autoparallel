@@ -29,6 +29,7 @@ from torch.export.unflatten import _AttrKind
 from torch.fx import GraphModule
 from torch.fx.experimental._backward_state import BackwardState
 
+from .activation_checkpointing import ac_joint_pass
 from .apply_sharding import apply_sharding_to_model
 from .cast_parametrization import apply_dtype_cast, canonicalize_mp, set_dtype_cast
 from .init_weights import hook_params_setters
@@ -203,6 +204,9 @@ class AutoParallel:
         mesh: DeviceMesh,
         mp_policy: Optional[MixedPrecisionPolicy] = None,
         compile: bool = False,
+        enable_ac: bool = True,
+        # None means 'auto'
+        ac_stage_size_in_GiB: Optional[float] = None,
     ):
         self.stack = ExitStack()
         self.fake_mode = (
@@ -228,9 +232,10 @@ class AutoParallel:
         self.input_fn = input_fn
         self.mesh = mesh
         self.compiler_fn = compile_fx_inner if compile else boxed_nop_preserve_node_meta
+        self.enable_ac = enable_ac
+        self.ac_stage_size_in_GiB = ac_stage_size_in_GiB
 
         # NB: rest of the construction happens in __enter__
-
         self.active = False
 
     def __enter__(self):
@@ -439,6 +444,9 @@ class AutoParallel:
             },
             payload_fn=lambda: str(parallel_gm.graph),
         )
+
+        if self.enable_ac:
+            ac_joint_pass(parallel_gm.graph, self.ac_stage_size_in_GiB)
         # now rename input/param/tangent/output/grad_param/grad_input nodes following
         # our convention
         # apply_node_renaming(
