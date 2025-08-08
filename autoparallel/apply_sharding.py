@@ -28,6 +28,8 @@ from .ordered_sharding import (
 )
 from .propagation_rules import TENSOR_FACTORY_OPS
 
+_ENABLE_ORDERED_SHARDING_OPTIMIZATION = False
+
 
 class ApplyShardingInterpreter(torch.fx.Interpreter):
     def __init__(self, module, sharding_placement, decomp_table=None):
@@ -36,9 +38,12 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
         if decomp_table is None:
             decomp_table = {}
         self.decomp_table = decomp_table
-        self.param_placement_order = compute_optimal_placement_order_for_parameters(
-            module, sharding_placement
-        )
+        param_placement_order = {}
+        if _ENABLE_ORDERED_SHARDING_OPTIMIZATION:
+            param_placement_order = compute_optimal_placement_order_for_parameters(
+                module, sharding_placement
+            )
+        self.param_placement_order = param_placement_order
 
     def run_node(self, n):
         self._curr_node = n
