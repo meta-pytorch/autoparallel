@@ -21,7 +21,10 @@ from torch.distributed.tensor.placement_types import Partial, Replicate, Shard  
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.utils._pytree import tree_flatten, tree_map_only
 
-from .ordered_sharding import compute_node_directions, my_redistribute_local_tensor
+from .ordered_sharding import (
+    compute_optimal_placement_order_for_parameters,
+    ordered_redistribute_local_tensor,
+)
 from .propagation_rules import TENSOR_FACTORY_OPS
 
 
@@ -29,7 +32,9 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
     def __init__(self, module, sharding_placement):
         super().__init__(module, garbage_collect_values=True, graph=None)
         self.sharding_placement = sharding_placement
-        self.node_directions = compute_node_directions(module, sharding_placement)
+        self.param_placement_order = compute_optimal_placement_order_for_parameters(
+            module, sharding_placement
+        )
 
     def run_node(self, n):
         self._curr_node = n
@@ -44,10 +49,15 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
             tgt_spec_c = DTensorSpec(
                 tgt_spec.mesh, tgt_placements, tensor_meta=tgt_spec.tensor_meta
             )
-            perm = None
-            if src_tgt_nodes is not None and src_tgt_nodes in self.node_directions:
-                perm = self.node_directions[src_tgt_nodes]
-            x = my_redistribute_local_tensor(arg, curr_spec, tgt_spec_c, perm)
+            placement_order = None
+            if (
+                src_tgt_nodes is not None
+                and src_tgt_nodes in self.param_placement_order
+            ):
+                placement_order = self.param_placement_order[src_tgt_nodes]
+            x = ordered_redistribute_local_tensor(
+                arg, curr_spec, tgt_spec_c, placement_order
+            )
         return x
 
     def redistribute_getitem_arg(self, arg, idx):

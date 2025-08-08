@@ -12,13 +12,21 @@ from torch.distributed.tensor.placement_types import Partial, Replicate, Shard  
 from torch.utils._pytree import tree_flatten
 
 
-def my_redistribute_local_tensor(arg, curr_spec, tgt_spec, perm=None):
+def ordered_redistribute_local_tensor(arg, curr_spec, tgt_spec, placement_order=None):
+    """
+    This is a simplified version of redistribute_local_tensor that optimizes
+    a couple of specific cases by introducing an ordering information to the
+    placements.
+
+    The optimizations that we support for now are hard-coded, and we should
+    generalize this in the future.
+    """
     canonical = tuple(reversed(range(len(curr_spec.placements))))
-    if perm is None:
-        perm = canonical
-    if perm == canonical:
+    if placement_order is None:
+        placement_order = canonical
+    if placement_order == canonical:
         return redistribute_local_tensor(arg, curr_spec, tgt_spec)
-    assert perm == (0, 1), f"{perm}"
+    assert placement_order == (0, 1), f"{placement_order}"
     if curr_spec.placements == (Shard(0), Shard(0)) and tgt_spec.placements == (
         Replicate(),
         Shard(0),
@@ -46,7 +54,11 @@ def my_redistribute_local_tensor(arg, curr_spec, tgt_spec, perm=None):
     return x
 
 
-def get_src_tgt_placements(node, sharding_placement):
+def get_redistributed_input_placements(node, sharding_placement):
+    """
+    This function returns a map of input nodes to their current and target
+    placements, for the inputs that need to be redistributed.
+    """
     # use this instead of node.all_input_nodes as it handles repeated nodes
     all_input_nodes = [
         x for x in tree_flatten(node.args)[0] if isinstance(x, torch.fx.Node)
@@ -69,7 +81,17 @@ def get_src_tgt_placements(node, sharding_placement):
     return res
 
 
-def compute_node_directions(module, sharding_placement):
+def compute_optimal_placement_order_for_parameters(module, sharding_placement):
+    """
+    This function computes the optimal placement order for parameters and
+    gradients, based on the sharding placement. The optimal placement order is
+    defined as the order in which the parameters and gradients should be
+    placed, such that the number of communication steps is minimized.
+
+    For now this function only optimizes the case where the parameters are
+    distributed as S(0)S(0) -> RS(0) and the gradients are distributed
+    as PS(0) -> S(0)S(0). We should generalize this in the future.
+    """
     param_and_grad_nodes = list(get_param_and_grad_nodes(module.graph).values())
     param_and_single_user = {}
     grad_and_single_inputs = {}
@@ -96,8 +118,7 @@ def compute_node_directions(module, sharding_placement):
     redist_map = {}
     mesh_dim = None
     for node, tgt_node in combined.items():
-
-        d = get_src_tgt_placements(node, sharding_placement)
+        d = get_redistributed_input_placements(node, sharding_placement)
         if d:
             redist_map[tgt_node] = (node, d)
             if mesh_dim is None:
