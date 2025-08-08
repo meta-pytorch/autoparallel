@@ -206,7 +206,7 @@ class AutoParallel:
         compile: bool = False,
         enable_ac: bool = True,
         # None means 'auto'
-        ac_stage_size_in_GiB: Optional[float] = None,
+        ac_stage_size_in_GiB: Optional[Union[float, str]] = "auto",
     ):
         self.stack = ExitStack()
         self.fake_mode = (

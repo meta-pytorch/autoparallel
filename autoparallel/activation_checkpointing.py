@@ -5,7 +5,7 @@
 import logging
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Union
 
 import torch
 from torch._functorch.partitioners import _has_tag_is_backward, _size_of
@@ -104,9 +104,87 @@ def force_recompute_fsdp_all_gather(graph: torch.fx.Graph) -> None:
                 force_recompute_node(ag_node.all_input_nodes[0])
 
 
+INT_INF = int(1e9)
+
+
+# NOTE: this is taken from PyTorch partitioner
+def get_required_fwd_nodes(
+    joint_graph: torch.fx.Graph,
+) -> OrderedSet[torch.fx.Node]:
+    """
+    Return the set of nodes that are required in the forward graph.
+    NOTE: this is doing similar things as classify_nodes() in _functorch/partitioenrs.py
+            where nodes are classified into three types -- fwd, bwd, and unclaimed
+            both bwd and unclaimed nodes have partitioner_tag equal to "is_backward"
+    """
+    required_fwd_nodes: OrderedSet[torch.fx.Node] = OrderedSet()
+    for node in joint_graph.nodes:
+        if node.op == "placeholder" and "tangents" in node.target:
+            continue
+        if node.op == "output":
+            continue
+        if _has_tag_is_backward(node):
+            continue
+        required_fwd_nodes.add(node)
+    return required_fwd_nodes
+
+
+# NOTE: this is taken from PyTorch partitioner
+def get_node_distance_to_bwd(
+    joint_graph: torch.fx.Graph,
+    get_required_fwd_nodes: OrderedSet[torch.fx.Node],
+) -> dict[torch.fx.Node, int]:
+    """
+    Compute and return the distance of all nodes to the closest backward node.
+    If a node is not an ancestor of a backward node, then its distance is INT_INF.
+    NOTE: this is adapted from
+    https://github.com/pytorch/pytorch/blob/3196a3aca0f16792820158cfd451cb977f99ac7e/torch/_functorch/partitioners.py#L2089-L2097
+    """
+    dist_from_bw = {}
+    for node in reversed(joint_graph.nodes):
+        if node.op == "output":
+            dist_from_bw[node] = INT_INF
+        elif node not in get_required_fwd_nodes:
+            dist_from_bw[node] = 0
+        else:
+            dist_from_bw[node] = INT_INF
+            for user in node.users:
+                dist_from_bw[node] = min(dist_from_bw[node], dist_from_bw[user] + 1)
+    return dist_from_bw
+
+
+# NOTE: this is taken from PyTorch partitioner
+def get_all_recomputable_forward_nodes(
+    joint_graph: torch.fx.Graph,
+) -> OrderedSet[torch.fx.Node]:
+    """
+    Return the set of all forward nodes that are recomputable
+    """
+    required_fwd_nodes = get_required_fwd_nodes(joint_graph)
+    dist_from_bw = get_node_distance_to_bwd(joint_graph, required_fwd_nodes)
+    fwd_recomputable_nodes: OrderedSet[torch.fx.Node] = OrderedSet()
+    for node in joint_graph.nodes:
+        if (
+            node in required_fwd_nodes
+            and dist_from_bw[node] < INT_INF
+            and node.op != "placeholder"
+        ):
+            fwd_recomputable_nodes.add(node)
+    return fwd_recomputable_nodes
+
+
+def _mark_nodes_as_must_save(must_save_nodes: list[torch.fx.Node]) -> None:
+    """
+    Given a list of nodes, mark them as must save.
+    """
+    print(f"mark_nodes_as_must_save: {must_save_nodes}")
+    for node in must_save_nodes:
+        node.meta["recompute"] = CheckpointPolicy.MUST_SAVE
+
+
 def mark_nodes_as_must_save_to_stage_recomputation(
     joint_graph: torch.fx.Graph,
-    stage_size_in_GiB: Optional[float] = None,
+    stage_size_in_GiB: Optional[Union[float, str]] = "auto",
 ) -> None:
     """
     Marks specific nodes as "must save" to optimize memory usage during recomputation.
@@ -116,77 +194,11 @@ def mark_nodes_as_must_save_to_stage_recomputation(
     based by periodically saving itermediate nodes, keeping peak memory usage below.
     Args:
         joint_graph: The joint graph containing both forward and backward nodes
-        stage_size_in_GiB: Target memory size per stage in GiB (-1 to disable staging)
+        stage_size_in_GiB: Target memory size per stage in GiB. None means no stage
+            recomputation, "auto" means we use sqrt(total_used_memory) as stage size.
     """
-    INT_INF = int(1e9)
-
-    def get_required_fwd_nodes(
-        joint_graph: torch.fx.Graph,
-    ) -> OrderedSet[torch.fx.Node]:
-        """
-        Return the set of nodes that are required in the forward graph.
-        NOTE: this is doing similar things as classify_nodes() in _functorch/partitioenrs.py
-              where nodes are classified into three types -- fwd, bwd, and unclaimed
-              both bwd and unclaimed nodes have partitioner_tag equal to "is_backward"
-        """
-        required_fwd_nodes: OrderedSet[torch.fx.Node] = OrderedSet()
-        for node in joint_graph.nodes:
-            if node.op == "placeholder" and "tangents" in node.target:
-                continue
-            if node.op == "output":
-                continue
-            if _has_tag_is_backward(node):
-                continue
-            required_fwd_nodes.add(node)
-        return required_fwd_nodes
-
-    def get_node_distance_to_bwd(
-        joint_graph: torch.fx.Graph,
-        get_required_fwd_nodes: OrderedSet[torch.fx.Node],
-    ) -> dict[torch.fx.Node, int]:
-        """
-        Compute and return the distance of all nodes to the closest backward node.
-        If a node is not an ancestor of a backward node, then its distance is INT_INF.
-        NOTE: this is adapted from
-        https://github.com/pytorch/pytorch/blob/3196a3aca0f16792820158cfd451cb977f99ac7e/torch/_functorch/partitioners.py#L2089-L2097
-        """
-        dist_from_bw = {}
-        for node in reversed(joint_graph.nodes):
-            if node.op == "output":
-                dist_from_bw[node] = INT_INF
-            elif node not in get_required_fwd_nodes:
-                dist_from_bw[node] = 0
-            else:
-                dist_from_bw[node] = INT_INF
-                for user in node.users:
-                    dist_from_bw[node] = min(dist_from_bw[node], dist_from_bw[user] + 1)
-        return dist_from_bw
-
-    def get_all_recomputable_forward_nodes(
-        joint_graph: torch.fx.Graph,
-    ) -> OrderedSet[torch.fx.Node]:
-        """
-        Return the set of all forward nodes that are recomputable
-        """
-        required_fwd_nodes = get_required_fwd_nodes(joint_graph)
-        dist_from_bw = get_node_distance_to_bwd(joint_graph, required_fwd_nodes)
-        fwd_recomputable_nodes: OrderedSet[torch.fx.Node] = OrderedSet()
-        for node in joint_graph.nodes:
-            if (
-                node in required_fwd_nodes
-                and dist_from_bw[node] < INT_INF
-                and node.op != "placeholder"
-            ):
-                fwd_recomputable_nodes.add(node)
-        return fwd_recomputable_nodes
-
-    def mark_nodes_as_must_save(must_save_nodes: list[torch.fx.Node]) -> None:
-        """
-        Given a list of nodes, mark them as must save.
-        """
-        print(f"mark_nodes_as_must_save: {must_save_nodes}")
-        for node in must_save_nodes:
-            node.meta["recompute"] = CheckpointPolicy.MUST_SAVE
+    if stage_size_in_GiB is None:
+        return
 
     fwd_recomputable_nodes = get_all_recomputable_forward_nodes(joint_graph)
 
@@ -256,7 +268,7 @@ def mark_nodes_as_must_save_to_stage_recomputation(
     cum_mem_so_far = 0
     curr_stage_idx = 0
 
-    if stage_size_in_GiB is None:
+    if stage_size_in_GiB == "auto":
         total_used_memory = sum(
             _size_of(node)
             for node in fwd_recomputable_nodes
@@ -265,6 +277,7 @@ def mark_nodes_as_must_save_to_stage_recomputation(
         total_used_memory_in_GiB = total_used_memory / 2**30
         stage_size_in_GiB = total_used_memory_in_GiB**0.5
         print(f"Computed stage_size {stage_size_in_GiB=}")
+
     target_mem = stage_size_in_GiB * 2**30
     for node in fwd_recomputable_nodes:
         stages[curr_stage_idx].add(node)
@@ -280,13 +293,16 @@ def mark_nodes_as_must_save_to_stage_recomputation(
     for stage in stages.values():
         best_node = min(stage, key=lambda x: node2score[x].tot_mem)
         nodes_to_save.update(node2score[best_node].alive_node_names)
-    mark_nodes_as_must_save([name_to_node_mapping[n] for n in nodes_to_save])
+    _mark_nodes_as_must_save([name_to_node_mapping[n] for n in nodes_to_save])
 
-    save_list = {
-        torch.ops.aten.mm.default,
-        # torch.ops.aten._scaled_dot_product_efficient_attention.default,
-        # torch.ops.aten._scaled_dot_product_flash_attention.default,
-    }
+
+def _apply_ac_policy(joint_graph: torch.fx.Graph, save_list: set[torch.ops.OpOverload]):
+    """
+    This is not very generic, and just applies an AC policy similar to what
+    TorchTitan is doing. I think we should just replace this altogether with
+    torch._functorch.config.activation_memory_budget
+    """
+    fwd_recomputable_nodes = get_all_recomputable_forward_nodes(joint_graph)
     must_save_nodes = []
     counter = 0
     for node in fwd_recomputable_nodes:
@@ -298,7 +314,7 @@ def mark_nodes_as_must_save_to_stage_recomputation(
                     counter += 1
                     continue
             must_save_nodes.append(node)
-    mark_nodes_as_must_save(must_save_nodes)
+    _mark_nodes_as_must_save(must_save_nodes)
 
 
 def ac_joint_pass(graph: torch.fx.Graph, ac_stage_size_in_GiB: float = 2.0):
@@ -306,3 +322,12 @@ def ac_joint_pass(graph: torch.fx.Graph, ac_stage_size_in_GiB: float = 2.0):
     mark_nodes_as_must_save_to_stage_recomputation(
         graph, stage_size_in_GiB=ac_stage_size_in_GiB
     )
+
+    # TODO: we need to also enable sdpa perfectly mimic the TorchTitan
+    # policy, but this is not working yet
+    save_list = {
+        torch.ops.aten.mm.default,
+        # torch.ops.aten._scaled_dot_product_efficient_attention.default,
+        # torch.ops.aten._scaled_dot_product_flash_attention.default,
+    }
+    _apply_ac_policy(graph, save_list=save_list)
