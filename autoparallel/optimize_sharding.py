@@ -202,7 +202,10 @@ class ShardingOptimizer:
                 for n0, ni in zip(cluster0, cluster_i):
                     s0 = self.node_map[n0]
                     s1 = self.node_map[ni]
+                    # if s1 < s0:
+                    #     s0, s1 = s1, s0
                     for argi, oi, ii in self.walk_over_options(n0):
+                        assert s0 < s1, f"{n0}, {ni}, {s0}, {s1}"
                         self.cluster_links[(s1, argi, oi, ii)] = (s0, argi, oi, ii)
 
     def build_ds(self):
@@ -249,8 +252,14 @@ class ShardingOptimizer:
                         if node in grad_param_nodes:
                             comm_cost = comm_cost / self.rescale_grad_comm_cost_for_mp
                         key = (s_i, argi, ss, ii)
-                        if key in self.cluster_links:
-                            va = ds[self.cluster_links[key]]["va"]
+                        if (
+                            key in self.cluster_links
+                        ):  # and self.cluster_links[key] in ds:
+                            try:
+                                va = ds[self.cluster_links[key]]["va"]
+                            except:
+                                # from IPython import embed; embed(); sys.sdf
+                                raise
                         else:
                             va = pulp.LpVariable(
                                 f"n={node},s={s_i},arg={argi},output_p={ss},input_p={ii}",

@@ -32,6 +32,7 @@ from torch.fx.experimental._backward_state import BackwardState
 from .activation_checkpointing import ac_joint_pass
 from .apply_sharding import apply_sharding_to_model
 from .cast_parametrization import apply_dtype_cast, canonicalize_mp, set_dtype_cast
+from .graph_clustering import get_identical_regions
 from .init_weights import hook_params_setters
 from .optimize_sharding import ShardingOptimizer
 from .utils import _get_device_from_mesh
@@ -86,7 +87,6 @@ def _add_alias(gm):
             # node is not used, don't add alias for it
             continue
         first_user = nodes[min(node_map[n] for n in node.users)]
-        first_user = inputs[-1].next
         with graph.inserting_before(first_user):
             alias_node = graph.call_function(torch.ops.aten.alias.default, args=(node,))
             alias_node.meta.update(node.meta)
@@ -155,90 +155,6 @@ def _get_decomp_table():
     # decomp_table = None
 
     return decomp_table
-
-
-def get_graph_clusters(gm):
-    """
-    Super hacky, only works for the case where we have a single sdpa per block
-    Don't handle backward, just a POC to see if the solver will have speedups
-    with those constraints added
-    """
-    the_ops = [
-        torch.ops.aten._scaled_dot_product_efficient_attention.default,
-        torch.ops.aten._scaled_dot_product_efficient_attention_backward.default,
-    ]
-    clusters = []
-    for op in the_ops:
-        clusters += get_graph_clusters_one_op(gm, op)
-    return clusters
-
-
-def get_graph_clusters_one_op(gm, the_op):
-    from collections import defaultdict
-
-    picked_group = [
-        n for n in gm.graph.nodes if n.op == "call_function" and n.target == the_op
-    ]
-
-    node_map = {n: i for i, n in enumerate(gm.graph.nodes)}
-    node_locs = [node_map[n] for n in picked_group]
-    diff = node_locs[1] - node_locs[0]
-    assert all(
-        diff == (node_locs[i + 1] - node_locs[i]) for i in range(len(picked_group) - 1)
-    ), "Very basic graph clustering for now, this model isn't handled by it"
-
-    g = [[p] for p in picked_group]
-
-    def _get_node_hash(node):
-        if "val" not in node.meta:
-            return (node.op,)
-        if isinstance(node.meta["val"], torch.Tensor):
-            shape = node.meta["val"].shape
-        else:
-            shape = tuple(
-                x.shape for x in node.meta["val"] if isinstance(x, torch.Tensor)
-            )
-        return (str(node.target), shape)
-
-    def get_sequence_hash(seq):
-        return hash(tuple(_get_node_hash(x) for x in seq))
-
-    next_elm = True
-    for i in range(diff):
-        if next_elm:
-            new_seq = [p + [p[-1].next] if p[-1].op != "output" else p for p in g]
-        else:
-            new_seq = [[p[0].prev] + p if p[0].op != "placeholder" else p for p in g]
-
-        def get_elm(s):
-            if next_elm:
-                return s[-1]
-            return s[0]
-
-        hashes = defaultdict(list)
-        for i, s in enumerate(new_seq):
-            hashes[get_sequence_hash(s)].append((i, get_elm(s)))
-
-        if len(hashes) != 1:
-            next_elm = False
-            continue
-
-        for cls in hashes.values():
-            for cl_id, cl in cls:
-                if next_elm:
-                    g[cl_id].append(cl)
-                else:
-                    g[cl_id].insert(0, cl)
-
-    clusters = defaultdict(list)
-    for cl in g:
-        clusters[get_sequence_hash(cl)].append(cl)
-
-    clusters = [v for v in clusters.values() if len(v) > 1]
-    assert (
-        len(clusters) == 1
-    ), "Very basic graph clustering, this model isn't handled by it"
-    return clusters
 
 
 def move_to_fake(model: torch.nn.Module, mode: FakeTensorMode, device: torch.device):
@@ -344,8 +260,9 @@ class AutoParallel:
                 # dtype
                 rescale_grad_comm_cost_for_mp *= 1.1
         clusters = None
+        # from IPython import embed; embed(); sys.sdf
         if self.kwargs.get("repeated_subgraphs", False):
-            clusters = get_graph_clusters(self.gm)
+            clusters = get_identical_regions(self.gm.graph)
         sharding_optimizer = ShardingOptimizer(
             self.gm, self.mesh, rescale_grad_comm_cost_for_mp, clusters
         )
