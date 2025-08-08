@@ -154,7 +154,6 @@ def compute_optimal_placement_order_for_parameters(module, sharding_placement):
         (node_plc, node_tgt_plc),
         (grad_plc, grad_tgt_plc),
     ) in aligned_pg:
-        # assert node_plc == grad_tgt_plc, f"{node}, {grad_node}, {node_plc} {grad_tgt_plc}"
         if node_plc != grad_tgt_plc:
             # TODO: handle this
             print("Skipping", param_node, grad_node, node_plc, grad_tgt_plc)
