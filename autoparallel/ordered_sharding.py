@@ -117,38 +117,39 @@ def compute_optimal_placement_order_for_parameters(module, sharding_placement):
         for p in reversed(g_chain):
             param_and_grad_users[p] = grad
 
-    redist_map = {}
-    mesh_dim = None
-    for param_or_grad_node, user_node in param_and_grad_users.items():
-        d = get_redistributed_input_placements(param_or_grad_node, sharding_placement)
+    redistribution_map = {}
+    mesh_ndim = None
+    for user_node, param_or_grad_node in param_and_grad_users.items():
+        d = get_redistributed_input_placements(user_node, sharding_placement)
         if d:
-            redist_map[user_node] = (param_or_grad_node, d)
-            if mesh_dim is None:
+            redistribution_map[param_or_grad_node] = (user_node, d)
+            if mesh_ndim is None:
                 user_src_placement = list(d.values())[0][0]
-                mesh_dim = len(user_src_placement)
+                mesh_ndim = len(user_src_placement)
 
-    param_map = {p: g for p, g in param_and_grad_nodes}
+    param_grad_map = {p: g for p, g in param_and_grad_nodes}
     aligned_pg = []
-    for node in redist_map.keys():
+    for param_or_grad_node in redistribution_map.keys():
         # just allow for arbitrary execution order if both param and grad
         # are in the map
-        if node in param_map:
-            grad_node = param_map[node]
-            if grad_node in redist_map:
+        if param_or_grad_node in param_grad_map:
+            param_node = param_or_grad_node
+            grad_node = param_grad_map[param_node]
+            if grad_node in redistribution_map:
                 aligned_pg.append(
                     (
-                        node,
+                        param_node,
                         grad_node,
-                        list(redist_map[node][1].values())[0],
-                        list(redist_map[grad_node][1].values())[0],
+                        list(redistribution_map[param_node][1].values())[0],
+                        list(redistribution_map[grad_node][1].values())[0],
                     )
                 )
 
-    possible_permutations = list(itertools.permutations(range(mesh_dim)))
-    default_direction = tuple(reversed(range(mesh_dim)))
+    possible_orderings = list(itertools.permutations(range(mesh_ndim)))
+    default_order = tuple(reversed(range(mesh_ndim)))
     param_placement_order = {}
     for (
-        node,
+        param_node,
         grad_node,
         (node_plc, node_tgt_plc),
         (grad_plc, grad_tgt_plc),
@@ -156,18 +157,18 @@ def compute_optimal_placement_order_for_parameters(module, sharding_placement):
         # assert node_plc == grad_tgt_plc, f"{node}, {grad_node}, {node_plc} {grad_tgt_plc}"
         if node_plc != grad_tgt_plc:
             # TODO: handle this
-            print("Skipping", node, grad_node, node_plc, grad_tgt_plc)
+            print("Skipping", param_node, grad_node, node_plc, grad_tgt_plc)
             continue
         src_tgt_input = (
-            redist_map[node][0],
-            list(redist_map[node][1].keys())[0],
+            redistribution_map[param_node][0],
+            list(redistribution_map[param_node][1].keys())[0],
         )
         src_tgt_grad = (
-            redist_map[grad_node][0],
-            list(redist_map[grad_node][1].keys())[0],
+            redistribution_map[grad_node][0],
+            list(redistribution_map[grad_node][1].keys())[0],
         )
-        param_placement_order[src_tgt_input] = default_direction
-        param_placement_order[src_tgt_grad] = default_direction
+        param_placement_order[src_tgt_input] = default_order
+        param_placement_order[src_tgt_grad] = default_order
         # Only support S(0)S(0) -> RS(0) and PS(0) -> S(0)S optimizations
         # for now, giving them (0, 1) ordering (instead of canonical (1, 0))
         if node_plc == (Shard(0), Shard(0)) and node_tgt_plc == (
@@ -178,6 +179,6 @@ def compute_optimal_placement_order_for_parameters(module, sharding_placement):
                 Shard(0),
                 Shard(0),
             ):
-                param_placement_order[src_tgt_input] = possible_permutations[0]
-                param_placement_order[src_tgt_grad] = possible_permutations[0]
+                param_placement_order[src_tgt_input] = possible_orderings[0]
+                param_placement_order[src_tgt_grad] = possible_orderings[0]
     return param_placement_order
