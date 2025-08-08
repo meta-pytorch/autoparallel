@@ -5,8 +5,16 @@
 
 import contextlib
 import operator
+from typing import Any
 
 import torch
+import torch.fx.traceback as fx_traceback
+import torch.nn as nn
+from torch._functorch._aot_autograd.fx_utils import (
+    get_named_buffer_nodes,
+    get_named_param_nodes,
+)
+from torch._inductor.decomposition import select_decomp_table
 from torch._subclasses.fake_tensor import FakeTensor, unset_fake_temporarily
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor._dtensor_spec import DTensorSpec
@@ -14,6 +22,8 @@ from torch.distributed.tensor._redistribute import redistribute_local_tensor
 from torch.distributed.tensor.placement_types import Partial, Replicate, Shard  # noqa
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.utils._pytree import tree_flatten, tree_map_only
+
+from .propagation_rules import TENSOR_FACTORY_OPS
 
 
 def my_redistribute_local_tensor(arg, curr_spec, tgt_spec):
@@ -40,9 +50,12 @@ def my_redistribute_local_tensor(arg, curr_spec, tgt_spec):
 
 
 class ApplyShardingInterpreter(torch.fx.Interpreter):
-    def __init__(self, module, sharding_placement):
+    def __init__(self, module, sharding_placement, decomp_table=None):
         super().__init__(module, garbage_collect_values=True, graph=None)
         self.sharding_placement = sharding_placement
+        if decomp_table is None:
+            decomp_table = {}
+        self.decomp_table = decomp_table
 
     def run_node(self, n):
         self._curr_node = n
@@ -129,7 +142,7 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
             new_args = self.redistribute_args(args)
 
         # apply sharding to constructor functions as well
-        if target == torch.ops.aten.full.default:
+        if target in TENSOR_FACTORY_OPS:
             val = list(new_args[0])
             spec = self.sharding_placement[node].output_specs
             for mesh_size, placement in zip(spec.mesh.shape, spec.placements):
@@ -152,64 +165,155 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
             # TODO: see if we can remove this contiguous properly
             new_args[0] = new_args[0].contiguous()
 
+        if target in self.decomp_table:
+            new_target = self.decomp_table[target]
+            out = super().call_function(new_target, tuple(new_args), kwargs)
+            # NOTE: is there a canonical way of handling this?
+            if out is not NotImplemented:
+                out = tree_map_only(DTensor, lambda x: x.to_local(), out)
+                return out
         out = super().call_function(target, tuple(new_args), kwargs)
         out = tree_map_only(DTensor, lambda x: x.to_local(), out)
         return out
 
 
-def shard_nodes_given_placements(gm, sharding_placement, node_prefix, *, meta=False):
-    # NOTE: this relies my customized export_module
-    nodes = [
-        x for x in gm.graph.find_nodes(op="placeholder") if node_prefix in x.target
-    ]
+class ApplyDecompInterpreter(torch.fx.Interpreter):
+    def __init__(self, module, decomp_table=None):
+        super().__init__(module, garbage_collect_values=True, graph=None)
+        if decomp_table is None:
+            decomp_table = {}
+        self.decomp_table = decomp_table
+
+    def call_function(self, target, args, kwargs):
+        if target in self.decomp_table:
+            new_target = self.decomp_table[target]
+            out = super().call_function(new_target, args, kwargs)
+            # NOTE: is there a canonical way of handling this?
+            if out is not NotImplemented:
+                return out
+        out = super().call_function(target, args, kwargs)
+        return out
+
+
+def shard_node_given_placements(node, sharding_placement, *, meta: bool):
+    # TODO: not sure if we actually guarantee sharding_placement has ever
+    # input node lol
+    tgt_spec = sharding_placement[node].input_specs[0]
+    mesh = tgt_spec.mesh
+    # all tensors start as replicated
+    curr_placement = (Replicate(),) * mesh.ndim
+    tensor = node.meta["val"]
+
+    ctx: Any
+    if meta:
+        assert isinstance(
+            tensor, FakeTensor
+        ), f"only FakeTensor params supported for now, got {type(tensor)}"
+        ctx = unset_fake_temporarily
+        with ctx():
+            tensor = torch.randn(tensor.shape, dtype=tensor.dtype, device="meta")
+    else:
+        ctx = contextlib.nullcontext
+
+    with ctx():
+        sharded_tensor = DTensor.from_local(tensor, mesh, curr_placement).redistribute(
+            mesh, tgt_spec.placements
+        )
+
+    return sharded_tensor
+
+
+def shard_nodes_given_placements(gm, sharding_placement):
+    nodes = [x for x in gm.graph.find_nodes(op="placeholder")]
     sharded_tensors = []
     for node in nodes:
-        tgt_spec = sharding_placement[node].input_specs[0]
-        mesh = tgt_spec.mesh
-        # all tensors start as replicated
-        curr_placement = (Replicate(),) * mesh.ndim
-        tensor = node.meta["val"]
-
-        if meta:
-            assert isinstance(
-                tensor, FakeTensor
-            ), f"only FakeTensor params supported for now, got {type(tensor)}"
-            ctx = unset_fake_temporarily
-            with ctx():
-                tensor = torch.randn(tensor.shape, dtype=tensor.dtype, device="meta")
-        else:
-            ctx = contextlib.nullcontext
-
-        with ctx():
-            sharded_tensor = DTensor.from_local(
-                tensor, mesh, curr_placement
-            ).redistribute(mesh, tgt_spec.placements)
-        sharded_tensors.append(sharded_tensor)
+        sharded_tensors.append(
+            shard_node_given_placements(node, sharding_placement, meta=False)
+        )
     return sharded_tensors
 
 
-def apply_sharding_to_model(gm, sharding_placement):
-    # NOTE: this relies my customized export_module
-    # TODO: maybe make a copy?
-    sharded_inputs = shard_nodes_given_placements(gm, sharding_placement, "input")
-    sharded_tangents = shard_nodes_given_placements(gm, sharding_placement, "tangents")
-    sharded_params = shard_nodes_given_placements(gm, sharding_placement, "param")
-    sharded_buffers = shard_nodes_given_placements(gm, sharding_placement, "buffer")
+def rename_placeholder_node(
+    fx_g: torch.fx.GraphModule, node: torch.fx.Node, new_name: str
+):
+    assert node.op == "placeholder", f"only placeholder node supported, got {node.op}"
+    with fx_g.graph.inserting_before(node):
+        new_node = fx_g.graph.placeholder(new_name)
+        new_node.meta.update(node.meta)
+        node.replace_all_uses_with(new_node)
+        fx_g.graph.erase_node(node)
 
+
+def _cleanup_graph(gm):
+    gm.graph.eliminate_dead_code()
+    gm.recompile()
+    prev = torch._inductor.config.pattern_matcher
+    torch._inductor.config.pattern_matcher = False
+    prev_pass = torch._inductor.config.joint_custom_post_pass
+    torch._inductor.config.joint_custom_post_pass = None
+    from torch._inductor.fx_passes.joint_graph import joint_graph_passes
+
+    try:
+        # TODO: Double check if this is what we want to do
+        gm = joint_graph_passes(gm)
+    finally:
+        torch._inductor.config.pattern_matcher = prev
+        torch._inductor.config.joint_custom_post_pass = prev_pass
+    gm.graph.eliminate_dead_code()
+    gm.recompile()
+
+
+def apply_sharding_to_model(gm, sharding_placement, params_spec, buffers_spec):
+    args = shard_nodes_given_placements(gm, sharding_placement)
+    local_args = [arg.to_local() for arg in args]
+
+    decomp_table = select_decomp_table()
     # run with DTensor to apply the collectives given the graph
-    interp = ApplyShardingInterpreter(gm, sharding_placement)
+    interp = ApplyShardingInterpreter(gm, sharding_placement, decomp_table)
 
-    args = sharded_params + sharded_buffers + sharded_inputs + sharded_tangents
-    args = [x.to_local() for x in args]
-    parallel_gm = make_fx(interp.run)(*args)
+    # TODO: make_fx here is suspicious in case of dynamic shapes
+    with fx_traceback.preserve_node_meta():
+        parallel_gm0 = make_fx(interp.run)(*local_args)
 
-    # We put DTensor(meta_tensor) tensors in the state dict, as the user expects to be
-    # able to call parallel_mod.to_empty(device='cuda'). This does not work with FakeTensors.
-    sharded_meta_params = shard_nodes_given_placements(
-        gm, sharding_placement, "param", meta=True
-    )
-    sharded_meta_buffers = shard_nodes_given_placements(
-        gm, sharding_placement, "buffer", meta=True
-    )
+    _cleanup_graph(parallel_gm0)
+    interp2 = ApplyDecompInterpreter(parallel_gm0, decomp_table)
+    with fx_traceback.preserve_node_meta():
+        parallel_gm = make_fx(interp2.run)(*local_args)
+    _cleanup_graph(parallel_gm)
 
-    return parallel_gm, sharded_meta_params, sharded_meta_buffers
+    # Copy descriptors over to new graph
+    for n1, n2 in zip(
+        (n for n in gm.graph.nodes if n.op in ("placeholder", "output")),
+        (n for n in parallel_gm.graph.nodes if n.op in ("placeholder", "output")),
+    ):
+        n2.meta["desc"] = n1.meta["desc"]
+        if n2.op == "placeholder":
+            n2.target = n1.target
+            # node renaming is needed for partitioner as it searchs for tangents
+            # nodes. See https://fburl.com/kc4jtc3t for one case where it's used
+            rename_placeholder_node(parallel_gm, n2, n1.name)
+    # need to recompile after renaming nodes
+    parallel_gm.recompile()
+
+    sharded_param_dict = {}
+    sharded_buffer_dict = {}
+
+    # NB: ok to NOT use the parallel_gm here because we will just reapply the
+    # correct sharding placement via sharding_placement
+    fqn_to_param = get_named_param_nodes(gm.graph)
+    fqn_to_buffer = get_named_buffer_nodes(gm.graph)
+
+    for fqn in params_spec:
+        n = fqn_to_param[fqn]
+        with unset_fake_temporarily():
+            sharded_param_dict[fqn] = nn.Parameter(
+                shard_node_given_placements(n, sharding_placement, meta=True)
+            )
+
+    for fqn in buffers_spec:
+        n = fqn_to_buffer[fqn]
+        sharded_buffer_dict[fqn] = shard_node_given_placements(
+            n, sharding_placement, meta=True
+        )
+
+    return parallel_gm, sharded_param_dict, sharded_buffer_dict

@@ -10,6 +10,7 @@ from typing import ClassVar
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor.placement_types import Replicate, Shard
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.testing._internal.distributed.fake_pg import FakeStore
@@ -586,7 +587,7 @@ device = torch.device("cuda")
 
 def model_fn():
     model_args = TransformerModelArgs(
-        n_layers=8, vocab_size=vocab_size, max_seq_len=seqlen
+        n_layers=2, vocab_size=vocab_size, max_seq_len=seqlen
     )
     m = Transformer(model_args)
     return m
@@ -601,31 +602,33 @@ def input_fn():
 with torch.device("meta"):
     model = model_fn()
 
+mp_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
+
 # parallelize the model
-autop = AutoParallel(model, input_fn, mesh)
-autop.add_parameter_memory_constraint(low=None, high=None)
+with AutoParallel(model, input_fn, mesh, mp_policy, compile=True) as autop:
+    autop.add_parameter_memory_constraint(low=None, high=None)
 
-x_sharding = (Shard(0),) + (Replicate(),) * (mesh.ndim - 1)
+    x_sharding = (Shard(0),) + (Replicate(),) * (mesh.ndim - 1)
 
-autop.add_input_constraints([x_sharding])
-autop.add_output_constraints([x_sharding])
+    autop.add_input_constraints([x_sharding])
+    autop.add_output_constraints([x_sharding])
 
-# example of how to add manual constraints
-if use_1d_mesh:
-    # add constraint on the output sharding of embedding bag
-    # otherwise it might decide that it's ok to replicate both inputs. This is indeed fine
-    # for 1d but the current cost model doesn't take output memory into account, so it thinks
-    # it is not expensive. I should add an activation memory constraint as well to avoid
-    # those cases
-    embedding_nodes = autop.gm.graph.find_nodes(
-        op="call_function", target=torch.ops.aten.embedding.default
-    )
-    autop.sharding_optimizer.add_node_constraint(embedding_nodes[0], x_sharding)
+    # example of how to add manual constraints
+    if use_1d_mesh:
+        # add constraint on the output sharding of embedding bag
+        # otherwise it might decide that it's ok to replicate both inputs. This is indeed fine
+        # for 1d but the current cost model doesn't take output memory into account, so it thinks
+        # it is not expensive. I should add an activation memory constraint as well to avoid
+        # those cases
+        embedding_nodes = autop.gm.graph.find_nodes(
+            op="call_function", target=torch.ops.aten.embedding.default
+        )
+        autop.sharding_optimizer.add_node_constraint(embedding_nodes[0], x_sharding)
 
-t = time.time()
-sharding_placement = autop.optimize_placement()
-print(f"Took {time.time() - t:.2f} s")
-parallel_mod = autop.apply_placement(sharding_placement)
+    t = time.time()
+    sharding_placement = autop.optimize_placement()
+    print(f"Took {time.time() - t:.2f} s")
+    parallel_mod = autop.apply_placement(sharding_placement)
 
 # run weight init on our sharded DTensor params
 parallel_mod.to_empty(device="cuda")
