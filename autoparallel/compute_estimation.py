@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Dict, Tuple
 
 import torch
-from torch.utils._pytree import tree_map_only
+from torch.utils._pytree import tree_flatten, tree_map_only
 from torch.utils.flop_counter import FlopCounterMode
 
 
@@ -122,14 +122,7 @@ DEVICE_LIMITS: Tuple[DeviceLimit, ...] = (
 )
 
 
-def _get_device_tflops(dtype):
-    # for some reason the function from PyTorch is giving
-    # wildly different TFlops compared to the specs. I'm
-    # using hard-coded values for now that I pulled from xFormers
-    # https://github.com/fairinternal/xformers/blob/main/xformers/profiler/device_limits.py
-    # TODO: fix PyTorch's implementation
-    # from torch._inductor.utils import get_device_tflops
-
+def _get_device_limit():
     device = None
     device_name = torch.cuda.get_device_name(device)
 
@@ -146,13 +139,29 @@ def _get_device_tflops(dtype):
         raise ValueError(
             f"Unsupported device: {device_name}. Supported devices: {[limit.name for limit in DEVICE_LIMITS]}"
         )
+    return device_limit
 
+
+def _get_device_tflops(dtype):
+    # for some reason the function from PyTorch is giving
+    # wildly different TFlops compared to the specs. I'm
+    # using hard-coded values for now that I pulled from xFormers
+    # https://github.com/fairinternal/xformers/blob/main/xformers/profiler/device_limits.py
+    # TODO: fix PyTorch's implementation
+    # from torch._inductor.utils import get_device_tflops
+
+    device_limit = _get_device_limit()
     if dtype not in device_limit.gemm_tflops:
         raise ValueError(
             f"Dtype {dtype} not supported on {device_limit.name}. Supported dtypes: {list(device_limit.gemm_tflops.keys())}"
         )
 
     return device_limit.gemm_tflops[dtype]
+
+
+def _get_device_gmem_bandwidth():
+    device_limit = _get_device_limit()
+    return device_limit.gmem_bandwidth
 
 
 def _get_sharded_shape_stride(spec):
@@ -174,6 +183,19 @@ def _get_sharded_shape_stride(spec):
                     new_tensor_stride[dim - 1] + mesh_size - 1
                 ) // mesh_size
     return new_tensor_shape, new_tensor_stride
+
+
+def compute_memory_cost(op, args, outs):
+    def tensor_bytes(data):
+        return [
+            x.numel() * x.element_size()
+            for x in tree_flatten(data)[0]
+            if isinstance(x, torch.Tensor)
+        ]
+
+    read_bytes = sum(tensor_bytes(args))
+    write_bytes = sum(tensor_bytes(outs))
+    return read_bytes + write_bytes
 
 
 def estimate_strategy_runtime_cost(node, strategy):
@@ -214,16 +236,20 @@ def estimate_strategy_runtime_cost(node, strategy):
     # TODO: maybe cache the flop_counter to avoid recreating it
     # all the time
     with FlopCounterMode(display=False) as flop_counter:
-        node.target(*args, **kwargs)
+        out = node.target(*args, **kwargs)
 
     flops = flop_counter.get_total_flops()
+
+    read_write_bytes = compute_memory_cost(node.target, args, out)
+    gpu_memory_bandwidth = _get_device_gmem_bandwidth()
+    read_write_time = read_write_bytes / gpu_memory_bandwidth * 1e6  # us
 
     # TODO: fix this
     dtype = strategy.input_specs[0].tensor_meta.dtype
 
     # TODO: better handle this case
     if dtype.is_complex:
-        return 0
+        return read_write_time
     # TODO: use PyTorch's version once it's giving correct results
     gpu_flops = _get_device_tflops(dtype) * 10**12
 
@@ -231,4 +257,4 @@ def estimate_strategy_runtime_cost(node, strategy):
     factor = 1 / 0.5
     compute_time = factor * flops / gpu_flops * 1e6  # us
 
-    return compute_time
+    return max(compute_time, read_write_time)
