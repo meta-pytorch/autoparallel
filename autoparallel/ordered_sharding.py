@@ -93,37 +93,39 @@ def compute_optimal_placement_order_for_parameters(module, sharding_placement):
     as PS(0) -> S(0)S(0). We should generalize this in the future.
     """
     param_and_grad_nodes = list(get_param_and_grad_nodes(module.graph).values())
-    param_and_single_user = {}
-    grad_and_single_inputs = {}
+    # this is actually parameter users and gradient inputs
+    # but well, naming is hard
+    param_and_grad_users = {}
     for param, grad in param_and_grad_nodes:
         last_p = list(param.users)[0]
         p_chain = [param]
+        # get all linear chain of users of the parameter
         while len(last_p.all_input_nodes) == 1:
             p_chain.append(last_p)
             # TODO: we need to handle the case where there are multiple users
             # maybe?
             last_p = list(last_p.users.keys())[0]
         for p in p_chain:
-            param_and_single_user[p] = param
+            param_and_grad_users[p] = grad
 
         last_g = grad
         g_chain = []
+        # get all linear chain of inputs that lead to the gradient
         while len(last_g.all_input_nodes) == 1:
             g_chain.append(last_g)
             last_g = last_g.all_input_nodes[0]
         for p in reversed(g_chain):
-            grad_and_single_inputs[p] = grad
+            param_and_grad_users[p] = grad
 
-    combined = {**param_and_single_user, **grad_and_single_inputs}
     redist_map = {}
     mesh_dim = None
-    for node, tgt_node in combined.items():
-        d = get_redistributed_input_placements(node, sharding_placement)
+    for param_or_grad_node, user_node in param_and_grad_users.items():
+        d = get_redistributed_input_placements(param_or_grad_node, sharding_placement)
         if d:
-            redist_map[tgt_node] = (node, d)
+            redist_map[user_node] = (param_or_grad_node, d)
             if mesh_dim is None:
-                plc = list(d.values())[0][0]
-                mesh_dim = len(plc)
+                user_src_placement = list(d.values())[0][0]
+                mesh_dim = len(user_src_placement)
 
     param_map = {p: g for p, g in param_and_grad_nodes}
     aligned_pg = []
@@ -144,7 +146,7 @@ def compute_optimal_placement_order_for_parameters(module, sharding_placement):
 
     possible_permutations = list(itertools.permutations(range(mesh_dim)))
     default_direction = tuple(reversed(range(mesh_dim)))
-    node_directions = {}
+    param_placement_order = {}
     for (
         node,
         grad_node,
@@ -164,8 +166,10 @@ def compute_optimal_placement_order_for_parameters(module, sharding_placement):
             redist_map[grad_node][0],
             list(redist_map[grad_node][1].keys())[0],
         )
-        node_directions[src_tgt_input] = default_direction
-        node_directions[src_tgt_grad] = default_direction
+        param_placement_order[src_tgt_input] = default_direction
+        param_placement_order[src_tgt_grad] = default_direction
+        # Only support S(0)S(0) -> RS(0) and PS(0) -> S(0)S optimizations
+        # for now, giving them (0, 1) ordering (instead of canonical (1, 0))
         if node_plc == (Shard(0), Shard(0)) and node_tgt_plc == (
             Replicate(),
             Shard(0),
@@ -174,6 +178,6 @@ def compute_optimal_placement_order_for_parameters(module, sharding_placement):
                 Shard(0),
                 Shard(0),
             ):
-                node_directions[src_tgt_input] = possible_permutations[0]
-                node_directions[src_tgt_grad] = possible_permutations[0]
-    return node_directions
+                param_placement_order[src_tgt_input] = possible_permutations[0]
+                param_placement_order[src_tgt_grad] = possible_permutations[0]
+    return param_placement_order
