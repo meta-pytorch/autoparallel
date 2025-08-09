@@ -28,7 +28,7 @@ from .ordered_sharding import (
 )
 from .propagation_rules import TENSOR_FACTORY_OPS
 
-_ENABLE_ORDERED_SHARDING_OPTIMIZATION = False
+_ENABLE_ORDERED_SHARDING_OPTIMIZATION = True
 
 
 class ApplyShardingInterpreter(torch.fx.Interpreter):

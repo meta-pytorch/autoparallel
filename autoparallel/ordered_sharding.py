@@ -106,7 +106,7 @@ def compute_optimal_placement_order_for_parameters(module, sharding_placement):
             # maybe?
             last_p = list(last_p.users.keys())[0]
         for p in p_chain:
-            param_and_grad_users[p] = grad
+            param_and_grad_users[p] = param
 
         last_g = grad
         g_chain = []
