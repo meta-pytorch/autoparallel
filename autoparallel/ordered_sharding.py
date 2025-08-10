@@ -19,6 +19,8 @@ from torch.distributed.tensor.placement_types import (  # noqa
 )
 from torch.utils._pytree import tree_flatten
 
+from .redistribute_tensor import redistribute_local_tensor
+
 
 def _optimize_same_nd_sharding_as_1d(
     arg: torch.Tensor, curr_spec: DTensorSpec, tgt_spec: DTensorSpec
@@ -73,39 +75,18 @@ def ordered_redistribute_local_tensor(
     The optimizations that we support for now are hard-coded, and we should
     generalize this in the future.
     """
-    canonical = tuple(reversed(range(len(curr_spec.placements))))
+    # canonical = tuple(reversed(range(len(curr_spec.placements))))
+    canonical = tuple(range(len(curr_spec.placements)))
     if placement_order is None:
         placement_order = canonical
-    if placement_order == canonical:
-        return _optimize_same_nd_sharding_as_1d(arg, curr_spec, tgt_spec)
-    assert placement_order == (0, 1), f"{placement_order}"
-    if curr_spec.placements == (Shard(0), Shard(0)) and tgt_spec.placements == (
-        Replicate(),
-        Shard(0),
-    ):
-        assert isinstance(curr_spec.placements[0], Shard)
-        # TODO: double-check in which cases this is valid
-        x = curr_spec.placements[0]._to_replicate_tensor(
-            arg, curr_spec.mesh, 0, curr_spec.shape  # type: ignore[arg-type]
-        )
-    elif curr_spec.placements == (Partial(), Shard(0)) and tgt_spec.placements == (
-        Shard(0),
-        Shard(0),
-    ):
-        assert isinstance(curr_spec.placements[0], Partial)
-        x = curr_spec.placements[0]._reduce_shard_value(
-            arg, curr_spec.mesh, 0, tgt_spec.placements[0]
-        )
-    elif curr_spec.placements == (Partial(), Shard(1)) and tgt_spec.placements == (
-        Replicate(),
-        Shard(1),
-    ):
-        # from IPython import embed; embed(); sys.sdf
-        raise NotImplementedError("Not implemented yet in here")
-    else:
-        raise ValueError("Shouldn't be here")
-        x = redistribute_local_tensor(arg, curr_spec, tgt_spec)
-    return x
+
+    return redistribute_local_tensor(
+        arg,
+        curr_spec,
+        tgt_spec,
+        src_device_order=placement_order,
+        dst_device_order=canonical,
+    )
 
 
 def get_redistributed_input_placements(
@@ -204,7 +185,8 @@ def compute_optimal_placement_order_for_parameters(module, sharding_placement):
                 )
 
     possible_orderings = list(itertools.permutations(range(mesh_ndim)))
-    default_order = tuple(reversed(range(mesh_ndim)))
+    # default_order = tuple(reversed(range(mesh_ndim)))
+    default_order = tuple(range(mesh_ndim))
     param_placement_order = {}
     for (
         param_node,
@@ -236,6 +218,6 @@ def compute_optimal_placement_order_for_parameters(module, sharding_placement):
                 Shard(0),
                 Shard(0),
             ):
-                param_placement_order[src_tgt_input] = possible_orderings[0]
-                param_placement_order[src_tgt_grad] = possible_orderings[0]
+                param_placement_order[src_tgt_input] = possible_orderings[1]
+                param_placement_order[src_tgt_grad] = possible_orderings[1]
     return param_placement_order
