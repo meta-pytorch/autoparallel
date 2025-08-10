@@ -292,10 +292,6 @@ class AutoParallel:
 
     def build_model_graph(self):
         decomp_table = _get_decomp_table()
-        # needed because of https://github.com/pytorch/pytorch/issues/148977
-        # TODO: Don't do a global setting for this, this will unpredictably
-        # affect user code
-        torch.__future__.set_swap_module_params_on_conversion(True)
 
         with self.fake_mode:
             inputs = self.input_fn()
