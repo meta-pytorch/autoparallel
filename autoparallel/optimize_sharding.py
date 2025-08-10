@@ -78,6 +78,7 @@ runtime cost while satisfying all constraints.
 """
 
 import math
+import time
 from collections import defaultdict
 from typing import Optional
 
@@ -98,6 +99,7 @@ from .compute_estimation import (
     _get_sharded_shape_stride,
     estimate_strategy_runtime_cost,
 )
+from .graph_clustering import get_identical_regions
 from .propagation_rules import _create_all_options
 from .utils import get_local_map_placement_option, get_placement_options
 
@@ -123,7 +125,9 @@ def _get_next_name(name):
 
 
 class ShardingOptimizer:
-    def __init__(self, gm, mesh, rescale_grad_comm_cost_for_mp=1.0, clusters=None):
+    def __init__(
+        self, gm, mesh, rescale_grad_comm_cost_for_mp=1.0, repeated_subgraphs=False
+    ):
         self.gm = gm
         self.graph = gm.graph
         self.mesh = mesh
@@ -132,7 +136,10 @@ class ShardingOptimizer:
         self.strats = self.build_sharding_metadata()
 
         self.cluster_links = {}
-        if clusters is not None:
+        if repeated_subgraphs:
+            t = time.time()
+            clusters = get_identical_regions(self.gm.graph, self.strats)
+            print(f"Found {len(clusters)} clusters in {time.time() - t:.2f}s")
             self.create_cluster_links(clusters)
 
         # ds: Decision variables dictionary mapping (s_i, argi, ss, ii) -> ILP variable data
@@ -202,10 +209,7 @@ class ShardingOptimizer:
                 for n0, ni in zip(cluster0, cluster_i):
                     s0 = self.node_map[n0]
                     s1 = self.node_map[ni]
-                    # if s1 < s0:
-                    #     s0, s1 = s1, s0
                     for argi, oi, ii in self.walk_over_options(n0):
-                        assert s0 < s1, f"{n0}, {ni}, {s0}, {s1}"
                         self.cluster_links[(s1, argi, oi, ii)] = (s0, argi, oi, ii)
 
     def build_ds(self):
@@ -236,6 +240,7 @@ class ShardingOptimizer:
         grad_param_nodes = set(
             x[1] for x in get_param_and_grad_nodes(self.graph).values()
         )
+        nodes = list(self.graph.nodes)
         for s_i, (node, s) in enumerate(strats.items()):
             if node.op == "output":
                 continue
@@ -252,14 +257,23 @@ class ShardingOptimizer:
                         if node in grad_param_nodes:
                             comm_cost = comm_cost / self.rescale_grad_comm_cost_for_mp
                         key = (s_i, argi, ss, ii)
-                        if (
+                        if key in self.cluster_links and self.cluster_links[key] in ds:
+                            va = ds[self.cluster_links[key]]["va"]
+                        elif (
                             key in self.cluster_links
-                        ):  # and self.cluster_links[key] in ds:
-                            try:
-                                va = ds[self.cluster_links[key]]["va"]
-                            except:
-                                # from IPython import embed; embed(); sys.sdf
-                                raise
+                            and self.cluster_links[key] not in ds
+                        ):
+                            new_key = self.cluster_links[key]
+                            new_node = nodes[new_key[0]]
+                            new_s_i = new_key[0]
+                            va = pulp.LpVariable(
+                                f"n={new_node},s={new_s_i},arg={argi},output_p={ss},input_p={ii}",
+                                cat=pulp.LpBinary,
+                            )
+                            ds[new_key] = {"va": va}
+                        elif key in ds:
+                            va = ds[key]["va"]
+                            assert "cost" not in ds[key]
                         else:
                             va = pulp.LpVariable(
                                 f"n={node},s={s_i},arg={argi},output_p={ss},input_p={ii}",
@@ -601,6 +615,17 @@ class ShardingOptimizer:
         nodes = list(self.graph.nodes)
         for x in self.res:
             opt.setdefault(nodes[x[0]], []).append(self.ds[x])
+
+        # validate that a single solution is chosen
+        # per node
+        seen = set()
+        for r in self.res:
+            key = (r[0], r[1])
+            if key in seen:
+                raise RuntimeError(
+                    f"Multiple solutions for {nodes[key[0]]}, key={key}, solutions: {[str(x['full_strat']) for x in opt[nodes[key[0]]]]}"
+                )
+            seen.add(key)
 
         # Let's simplify the output representation
         # and just return a single OpSpec

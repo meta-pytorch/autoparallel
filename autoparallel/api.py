@@ -32,7 +32,6 @@ from torch.fx.experimental._backward_state import BackwardState
 from .activation_checkpointing import ac_joint_pass
 from .apply_sharding import apply_sharding_to_model
 from .cast_parametrization import apply_dtype_cast, canonicalize_mp, set_dtype_cast
-from .graph_clustering import get_identical_regions
 from .init_weights import hook_params_setters
 from .optimize_sharding import ShardingOptimizer
 from .utils import _get_device_from_mesh
@@ -259,12 +258,11 @@ class AutoParallel:
                 # Tiebreak, favoring performing the comms in the largest
                 # dtype
                 rescale_grad_comm_cost_for_mp *= 1.1
-        clusters = None
-        # from IPython import embed; embed(); sys.sdf
-        if self.kwargs.get("repeated_subgraphs", False):
-            clusters = get_identical_regions(self.gm.graph)
         sharding_optimizer = ShardingOptimizer(
-            self.gm, self.mesh, rescale_grad_comm_cost_for_mp, clusters
+            self.gm,
+            self.mesh,
+            rescale_grad_comm_cost_for_mp,
+            repeated_subgraphs=self.kwargs.get("repeated_subgraphs", False),
         )
 
         # makes sharding of params and gradients the same
