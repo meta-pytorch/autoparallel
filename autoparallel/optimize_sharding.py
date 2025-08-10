@@ -436,11 +436,13 @@ class ShardingOptimizer:
         Mathematical form: ∀i,a,o,j: c_{i,a,o,j} = ∞ ⟹ x_{i,a,o,j} = 0
         """
         # force inf cost values to be 0, as the solver doesn't accept inf
-        for x in self.ds.values():
+        for key, x in self.ds.items():
             if not math.isfinite(x["cost"]):
-                self.prob += (x["va"] == 0, _get_next_name("inf_cases"))
                 # set the cost to an arbitrary number
                 x["cost"] = 10000.0
+                if key in self.cluster_links:
+                    continue
+                self.prob += (x["va"] == 0, _get_next_name("inf_cases"))
 
     def add_default_constraints(self):
         self.add_unique_decision_constraint()
