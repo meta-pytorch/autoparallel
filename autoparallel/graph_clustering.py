@@ -3,6 +3,9 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+# This file is adapted from
+# https://github.com/pytorch/pytorch/blob/af10f1f86cc4effc93142a447693d8be55966615/torch/_dynamo/graph_region_tracker.py#L278
+# with slight modifications
 
 import logging
 import math

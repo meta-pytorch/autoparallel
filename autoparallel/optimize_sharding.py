@@ -130,6 +130,7 @@ class ShardingOptimizer:
     ):
         self.gm = gm
         self.graph = gm.graph
+        self.nodes = list(self.graph.nodes)
         self.mesh = mesh
         self.rescale_grad_comm_cost_for_mp = rescale_grad_comm_cost_for_mp
         self.node_map = {node: i for i, node in enumerate(self.graph.nodes)}
@@ -203,6 +204,12 @@ class ShardingOptimizer:
         return strats
 
     def create_cluster_links(self, clusters):
+        """
+        This function creates a mapping between optimization nodes that are
+        identical. We use this to reduce the optimization space.
+        If cluster_links[key1] == key2, this means that everywhere in the
+        optimization problem we will be using key2 instead.
+        """
         for cluster_group in clusters:
             cluster0 = cluster_group[0]
             for cluster_i in cluster_group[1:]:
@@ -211,6 +218,43 @@ class ShardingOptimizer:
                     s1 = self.node_map[ni]
                     for argi, oi, ii in self.walk_over_options(n0):
                         self.cluster_links[(s1, argi, oi, ii)] = (s0, argi, oi, ii)
+
+    def _build_pulp_variable(self, key, ds):
+        """
+        This function creates the PuLP optimization variable, taking into
+        consideration that if there are identical nodes (defined by cluster_links)
+        then we will reuse the optimization variable.
+        """
+        s_i, argi, ss, ii = key
+        node = self.nodes[s_i]
+        if key in self.cluster_links and self.cluster_links[key] in ds:
+            # if we already have a root variable created for a similar node, use it
+            va = ds[self.cluster_links[key]]["va"]
+        elif key in self.cluster_links and self.cluster_links[key] not in ds:
+            # if we have a similar node for which the root variable has not been created yet,
+            # create the new variable early and populate the ds with "va" field
+            # the remaining fields will be populated when the root variable is created
+            new_key = self.cluster_links[key]
+            new_s_i = new_key[0]
+            new_node = self.nodes[new_s_i]
+            va = pulp.LpVariable(
+                f"n={new_node},s={new_s_i},arg={argi},output_p={ss},input_p={ii}",
+                cat=pulp.LpBinary,
+            )
+            ds[new_key] = {"va": va}
+        elif key in ds:
+            # if we are the root variable, make sure that we haven't yet
+            # been initialized. This happens if we have been created before by
+            # a similar node which isn't a root
+            va = ds[key]["va"]
+            assert "cost" not in ds[key]
+        else:
+            # we are a root variable which came first in the iteration order
+            va = pulp.LpVariable(
+                f"n={node},s={s_i},arg={argi},output_p={ss},input_p={ii}",
+                cat=pulp.LpBinary,
+            )
+        return va
 
     def build_ds(self):
         """
@@ -240,7 +284,6 @@ class ShardingOptimizer:
         grad_param_nodes = set(
             x[1] for x in get_param_and_grad_nodes(self.graph).values()
         )
-        nodes = list(self.graph.nodes)
         for s_i, (node, s) in enumerate(strats.items()):
             if node.op == "output":
                 continue
@@ -257,28 +300,9 @@ class ShardingOptimizer:
                         if node in grad_param_nodes:
                             comm_cost = comm_cost / self.rescale_grad_comm_cost_for_mp
                         key = (s_i, argi, ss, ii)
-                        if key in self.cluster_links and self.cluster_links[key] in ds:
-                            va = ds[self.cluster_links[key]]["va"]
-                        elif (
-                            key in self.cluster_links
-                            and self.cluster_links[key] not in ds
-                        ):
-                            new_key = self.cluster_links[key]
-                            new_node = nodes[new_key[0]]
-                            new_s_i = new_key[0]
-                            va = pulp.LpVariable(
-                                f"n={new_node},s={new_s_i},arg={argi},output_p={ss},input_p={ii}",
-                                cat=pulp.LpBinary,
-                            )
-                            ds[new_key] = {"va": va}
-                        elif key in ds:
-                            va = ds[key]["va"]
-                            assert "cost" not in ds[key]
-                        else:
-                            va = pulp.LpVariable(
-                                f"n={node},s={s_i},arg={argi},output_p={ss},input_p={ii}",
-                                cat=pulp.LpBinary,
-                            )
+                        # NOTE: this modifies ds in-place sometimes
+                        # we might want to refactor this in the future
+                        va = self._build_pulp_variable(key, ds)
                         ds[key] = {
                             "va": va,
                             "cost": comm_cost + compute_cost / num_args[s_i],
@@ -625,7 +649,8 @@ class ShardingOptimizer:
             key = (r[0], r[1])
             if key in seen:
                 raise RuntimeError(
-                    f"Multiple solutions for {nodes[key[0]]}, key={key}, solutions: {[str(x['full_strat']) for x in opt[nodes[key[0]]]]}"
+                    f"Multiple solutions for {nodes[key[0]]}, key={key}, "
+                    f"solutions: {[str(x['full_strat']) for x in opt[nodes[key[0]]]]}"
                 )
             seen.add(key)
 
