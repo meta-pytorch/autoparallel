@@ -22,6 +22,7 @@ from torch.distributed.tensor.placement_types import Partial, Replicate, Shard  
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.utils._pytree import tree_flatten, tree_map_only
 
+from .graph_utils import cleanup_graph
 from .ordered_sharding import (
     compute_optimal_placement_order_for_parameters,
     ordered_redistribute_local_tensor,
@@ -242,25 +243,6 @@ def rename_placeholder_node(
         fx_g.graph.erase_node(node)
 
 
-def _cleanup_graph(gm):
-    gm.graph.eliminate_dead_code()
-    gm.recompile()
-    prev = torch._inductor.config.pattern_matcher
-    torch._inductor.config.pattern_matcher = False
-    prev_pass = torch._inductor.config.joint_custom_post_pass
-    torch._inductor.config.joint_custom_post_pass = None
-    from torch._inductor.fx_passes.joint_graph import joint_graph_passes
-
-    try:
-        # TODO: Double check if this is what we want to do
-        gm = joint_graph_passes(gm)
-    finally:
-        torch._inductor.config.pattern_matcher = prev
-        torch._inductor.config.joint_custom_post_pass = prev_pass
-    gm.graph.eliminate_dead_code()
-    gm.recompile()
-
-
 def apply_sharding_to_model(gm, sharding_placement, params_spec, buffers_spec):
     args = shard_nodes_given_placements(gm, sharding_placement)
     local_args = [arg.to_local() for arg in args]
@@ -273,11 +255,11 @@ def apply_sharding_to_model(gm, sharding_placement, params_spec, buffers_spec):
     with fx_traceback.preserve_node_meta():
         parallel_gm0 = make_fx(interp.run)(*local_args)
 
-    _cleanup_graph(parallel_gm0)
+    cleanup_graph(parallel_gm0)
     interp2 = ApplyDecompInterpreter(parallel_gm0, decomp_table)
     with fx_traceback.preserve_node_meta():
         parallel_gm = make_fx(interp2.run)(*local_args)
-    _cleanup_graph(parallel_gm)
+    cleanup_graph(parallel_gm)
 
     # Copy descriptors over to new graph
     for n1, n2 in zip(
