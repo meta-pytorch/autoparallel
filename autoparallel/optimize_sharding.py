@@ -78,6 +78,7 @@ runtime cost while satisfying all constraints.
 """
 
 import math
+import operator
 from typing import Optional
 
 import pulp
@@ -217,6 +218,7 @@ class ShardingOptimizer:
         grad_param_nodes = set(
             x[1] for x in get_param_and_grad_nodes(self.graph).values()
         )
+        sharding_transition_scale = 1
         for s_i, (node, s) in enumerate(strats.items()):
             if node.op == "output":
                 continue
@@ -229,6 +231,8 @@ class ShardingOptimizer:
             for ss, ssi in enumerate(s.strategies):
                 compute_cost = estimate_strategy_runtime_cost(node, ssi)
                 for argi, xxi in enumerate(ssi.redistribute_cost):
+                    if node.op != "placeholder":
+                        argi_strat = self.strats[self._all_input_nodes(node)[argi]]
                     for ii, comm_cost in enumerate(xxi):
                         if node in grad_param_nodes:
                             comm_cost = comm_cost / self.rescale_grad_comm_cost_for_mp
@@ -236,9 +240,37 @@ class ShardingOptimizer:
                             f"n={node},s={s_i},arg={argi},output_p={ss},input_p={ii}",
                             cat=pulp.LpBinary,
                         )
+                        # Imagine we start node_i from S(0)S(0) and we want to reach node_{i+2} at
+                        # RR, and that node_{i+1} is an op with zero cost (like alias).
+                        # In this case, all of the following chains yield the same cost:
+                        # - S(0)S(0) -> S(0)R -> RR
+                        # - S(0)S(0) -> RS(0) -> RR
+                        # - S(0)S(0) -> RR -> RR
+                        # - S(0)S(0) -> S(0)S(0) -> RR
+                        # all of those cases are in principle equivalent. But if we want to
+                        # optimize S(0)S(0) -> RR to dispatch into a single collective instead of two
+                        # then we need to vafor the last two cases where redistribution happens
+                        # in a single go. To do this, we add a tie-break cost that is 1 if a redistribution
+                        # happens prior to getting to this configuration, and 0 otherwise. This way,
+                        # we will favor having fewer redistributions happening in the graph.
+                        if node.op != "placeholder" and node.target != operator.getitem:
+                            original_placement = argi_strat.strategies[
+                                ii
+                            ].output_specs.placements
+                            current_placement = ssi.input_specs[argi].placements
+                            redistribution_happened = (
+                                current_placement != original_placement
+                            )
+                            sharding_transition_cost = (
+                                int(redistribution_happened) * sharding_transition_scale
+                            )
+                        else:
+                            sharding_transition_cost = 0
                         ds[(s_i, argi, ss, ii)] = {
                             "va": va,
-                            "cost": comm_cost + compute_cost / num_args[s_i],
+                            "cost": comm_cost
+                            + compute_cost / num_args[s_i]
+                            + sharding_transition_cost,
                             "full_strat": ssi,
                             "out_strat": ssi.output_specs,
                             "inp_strat": ssi.input_specs[argi],
