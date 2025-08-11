@@ -309,6 +309,12 @@ class AutoParallel:
         #    - contains another instance of subclass info in self
         #    - quite a lot of use of runtime_metadata
         #
+        from torch._subclasses.fake_tensor import unset_fake_temporarily
+
+        with unset_fake_temporarily():
+            # creates a new mesh and caches it internally
+            # we don't need to keep a reference to it
+            self.mesh._flatten()
         with self.fake_mode:
             (
                 parallel_gm,

@@ -7,12 +7,51 @@ import itertools
 
 import torch
 from torch._functorch._aot_autograd.fx_utils import get_param_and_grad_nodes
+from torch.distributed._tensor.placement_types import DTensorSpec
 from torch.distributed.tensor._redistribute import redistribute_local_tensor
 from torch.distributed.tensor.placement_types import Partial, Replicate, Shard  # noqa
 from torch.utils._pytree import tree_flatten
 
 
-def ordered_redistribute_local_tensor(arg, curr_spec, tgt_spec, placement_order=None):
+def _optimize_same_nd_sharding_as_1d(
+    arg: torch.Tensor, curr_spec: DTensorSpec, tgt_spec: DTensorSpec
+):
+    """
+    This function optimizes the case where the current and target placements
+    have the same placements for all mesh dimensions. For example, if the
+    current placement is S(0)S(0) and the target placement is RR, this
+    function will perform a single collective, instead of two collectives.
+    """
+    curr_spec_first = curr_spec.placements[0]
+    if not all(curr_spec_first == p for p in curr_spec.placements):
+        return redistribute_local_tensor(arg, curr_spec, tgt_spec)
+    tgt_spec_first = tgt_spec.placements[0]
+    if not all(tgt_spec_first == p for p in tgt_spec.placements):
+        return redistribute_local_tensor(arg, curr_spec, tgt_spec)
+
+    # TODO: make this more general, I'm playing safe for now
+    if not (curr_spec_first == Shard(0) and tgt_spec_first == Replicate()):
+        print(f"NOT doing optimization for {str(curr_spec)} -> {str(tgt_spec)}")
+        return redistribute_local_tensor(arg, curr_spec, tgt_spec)
+
+    print(f"Doing optimization for {str(curr_spec)} -> {str(tgt_spec)}")
+    mesh = curr_spec.device_mesh
+    flat_mesh = mesh._flatten()
+    flat_curr_spec = DTensorSpec(
+        flat_mesh, (curr_spec_first,), tensor_meta=curr_spec.tensor_meta
+    )
+    flat_tgt_spec = DTensorSpec(
+        flat_mesh, (tgt_spec_first,), tensor_meta=tgt_spec.tensor_meta
+    )
+    return redistribute_local_tensor(arg, flat_curr_spec, flat_tgt_spec)
+
+
+def ordered_redistribute_local_tensor(
+    arg: torch.Tensor,
+    curr_spec: DTensorSpec,
+    tgt_spec: DTensorSpec,
+    placement_order=None,
+):
     """
     This is a simplified version of redistribute_local_tensor that optimizes
     a couple of specific cases by introducing an ordering information to the
@@ -25,20 +64,22 @@ def ordered_redistribute_local_tensor(arg, curr_spec, tgt_spec, placement_order=
     if placement_order is None:
         placement_order = canonical
     if placement_order == canonical:
-        return redistribute_local_tensor(arg, curr_spec, tgt_spec)
+        return _optimize_same_nd_sharding_as_1d(arg, curr_spec, tgt_spec)
     assert placement_order == (0, 1), f"{placement_order}"
     if curr_spec.placements == (Shard(0), Shard(0)) and tgt_spec.placements == (
         Replicate(),
         Shard(0),
     ):
+        assert isinstance(curr_spec.placements[0], Shard)
         # TODO: double-check in which cases this is valid
         x = curr_spec.placements[0]._to_replicate_tensor(
-            arg, curr_spec.mesh, 0, curr_spec.shape
+            arg, curr_spec.mesh, 0, curr_spec.shape  # type: ignore[arg-type]
         )
     elif curr_spec.placements == (Partial(), Shard(0)) and tgt_spec.placements == (
         Shard(0),
         Shard(0),
     ):
+        assert isinstance(curr_spec.placements[0], Partial)
         x = curr_spec.placements[0]._reduce_shard_value(
             arg, curr_spec.mesh, 0, tgt_spec.placements[0]
         )
