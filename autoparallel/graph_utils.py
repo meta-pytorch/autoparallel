@@ -125,3 +125,26 @@ def _add_alias(gm):
 
     gm.recompile()
     return gm
+
+
+def is_collective(node: torch.fx.Node) -> bool:
+    return (
+        node.op == "call_function"
+        and isinstance(node.target, torch._ops.OpOverload)
+        and node.target.namespace == "_c10d_functional"
+    )
+
+
+def assert_has_no_collectives(gm: torch.fx.GraphModule):
+    for node in gm.graph.nodes:
+        if is_collective(node):
+            raise RuntimeError(
+                f"AutoParallel expects a single-GPU model "
+                f"implementation with not collectives in it, but found {node} "
+                f"operation in \n{node.meta['stack_trace']}.\n"
+                f"If you want to manually add collectives in the model "
+                f"(e.g., for optimization purposes), please wrap the region "
+                f"of the code which contains the collectives in an "
+                f"autoparallel.local_map_hop.apply_local_map, see "
+                "examples/example_local_map.py for more information."
+            )

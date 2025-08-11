@@ -27,7 +27,12 @@ from torch.export.unflatten import _AttrKind
 from .activation_checkpointing import ac_joint_pass
 from .apply_sharding import apply_sharding_to_model
 from .cast_parametrization import apply_dtype_cast, canonicalize_mp, set_dtype_cast
-from .graph_utils import _add_alias, cleanup_graph, update_joint_with_descriptors
+from .graph_utils import (
+    _add_alias,
+    assert_has_no_collectives,
+    cleanup_graph,
+    update_joint_with_descriptors,
+)
 from .init_weights import hook_params_setters
 from .optimize_sharding import ShardingOptimizer
 from .utils import _get_device_from_mesh
@@ -217,6 +222,7 @@ class AutoParallel:
                 bw_compiler=self.compiler_fn,
             )
         gm = self.joint_with_descriptors.graph_module
+        assert_has_no_collectives(gm)
 
         cleanup_graph(gm)
         # now add aliases nodes to the graph to
