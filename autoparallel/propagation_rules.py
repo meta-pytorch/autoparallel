@@ -742,64 +742,22 @@ def expand_rule(mesh, op_schema_):
 
 @register_opschema_rule(torch.ops.aten.matmul.default)
 def matmul_rule(mesh, op_schema):
-    # inspired from _mm_like_strategy but removing shards on inexisting dimensions
-    from torch.distributed.tensor._ops._einsum_strategy import gen_einsum_strategies
-    from torch.distributed.tensor._ops._matrix_ops import is_tensor_shardable
+    from torch.distributed.tensor._ops._matrix_ops import _mm_like_strategy
 
     self_strategy, mat2_strategy = op_schema.args_schema
-    assert isinstance(self_strategy, OpStrategy)
-    assert isinstance(mat2_strategy, OpStrategy)
 
     assert len(self_strategy.shape) == 3
     assert len(mat2_strategy.shape) == 2
 
     mm_equation = "bmk,kn->bmn"
-    # mm_equation = "bmk,bmn->kn"
-    # mm_equation = "bmn,bmk->nk"
-    # generate all possible strategies for mm
-    mm_strategy = gen_einsum_strategies(mm_equation, mesh)
-    # from IPython import embed; embed(); sys.sdf
-    # filter out invalid strategies and associate costs
-    strategies = mm_strategy.strategies
-    filtered_strategies = []
-    for strtg in strategies:
-        assert strtg.input_specs is not None
-        self_spec = strtg.input_specs[0]
-        mat2_spec = strtg.input_specs[1]
-        should_skip = False
-        for plc in self_spec.placements:
-            if plc.is_shard() and plc.dim >= len(self_strategy.shape):
-                should_skip = True
-                break
 
-        for plc in mat2_spec.placements:
-            if plc.is_shard() and plc.dim >= len(mat2_strategy.shape):
-                should_skip = True
-                break
-
-        if should_skip:
-            continue
-
-        if is_tensor_shardable(self_strategy.shape, self_spec) and is_tensor_shardable(
-            mat2_strategy.shape, mat2_spec
-        ):
-            redistribute_cost = [
-                generate_redistribute_costs(self_strategy, self_spec),
-                generate_redistribute_costs(mat2_strategy, mat2_spec),
-            ]
-            strtg.redistribute_cost = redistribute_cost
-            filtered_strategies.append(strtg)
-
-    mm_strategy.strategies = filtered_strategies
-    return mm_strategy
+    return _mm_like_strategy(mm_equation, mesh, op_schema)
 
 
 @register_opschema_rule(torch.ops.aten.einsum.default)
 def einsum_rule(mesh, op_schema):
-    # inspired from _mm_like_strategy but removing shards on inexisting dimensions
     from torch.distributed.tensor._op_schema import TupleStrategy
-    from torch.distributed.tensor._ops._einsum_strategy import gen_einsum_strategies
-    from torch.distributed.tensor._ops._matrix_ops import is_tensor_shardable
+    from torch.distributed.tensor._ops._matrix_ops import _mm_like_strategy
 
     mm_equation, mat_strategy = op_schema.args_schema
     assert isinstance(mm_equation, str)
@@ -809,38 +767,10 @@ def einsum_rule(mesh, op_schema):
 
     self_strategy, mat2_strategy = mat_strategy.children
 
-    # generate all possible strategies for mm
-    mm_strategy = gen_einsum_strategies(mm_equation, mesh)
-    # filter out invalid strategies and associate costs
-    strategies = mm_strategy.strategies
-    filtered_strategies = []
-    for strtg in strategies:
-        assert strtg.input_specs is not None
-        self_spec = strtg.input_specs[0]
-        mat2_spec = strtg.input_specs[1]
-        should_skip = False
-        for plc in self_spec.placements:
-            if plc.is_shard() and plc.dim >= len(self_strategy.shape):
-                should_skip = True
-                break
-
-        for plc in mat2_spec.placements:
-            if plc.is_shard() and plc.dim >= len(mat2_strategy.shape):
-                should_skip = True
-                break
-
-        if should_skip:
-            continue
-
-        if is_tensor_shardable(self_strategy.shape, self_spec) and is_tensor_shardable(
-            mat2_strategy.shape, mat2_spec
-        ):
-            redistribute_cost = [
-                generate_redistribute_costs(self_strategy, self_spec),
-                generate_redistribute_costs(mat2_strategy, mat2_spec),
-            ]
-            strtg.redistribute_cost = redistribute_cost
-            filtered_strategies.append(strtg)
-
-    mm_strategy.strategies = filtered_strategies
-    return mm_strategy
+    # dispatch to mm_like_strategy
+    new_op_schema = OpSchema(
+        torch.ops.aten.einsum.default,
+        args_schema=(self_strategy, mat2_strategy),
+        kwargs_schema={},
+    )
+    return _mm_like_strategy(mm_equation, mesh, new_op_schema)
