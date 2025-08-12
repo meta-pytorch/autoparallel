@@ -8,7 +8,34 @@ from typing import Dict, Tuple
 
 import torch
 from torch.utils._pytree import tree_flatten, tree_map_only
-from torch.utils.flop_counter import FlopCounterMode
+from torch.utils.flop_counter import FlopCounterMode, register_flop_formula
+
+
+@register_flop_formula(torch.ops.aten.einsum, get_raw=True)
+def einsum_flop(equation, tensors, out=None, **kwargs) -> int:
+    # from torch.distributed.tensor._ops._einsum_strategy import EinsumDims
+    assert len(tensors) == 2
+    a_shape, b_shape = [x.shape for x in tensors]
+
+    # parse einop equation and extract dims
+    # TODO: generalize
+    # input_dims, output_dim = EinsumDims.parse_equation(equation)
+    # edims = EinsumDims.parse_dims(input_dims, output_dim)
+
+    if len(a_shape) == 3 and len(b_shape) == 3:
+        b, m, k = a_shape
+        b1, n, k2 = b_shape
+        assert b == b1
+        assert m == n
+        flop = (b * m) * k * k2 * 2
+    elif len(a_shape) == 3 and len(b_shape) == 2:
+        b, m, k = a_shape
+        k2, n = b_shape
+        assert k == k2
+        flop = b * m * n * k * 2
+    else:
+        raise NotImplementedError(f"Unsupported einsum shapes: {a_shape} {b_shape}")
+    return flop
 
 
 @dataclass
@@ -213,8 +240,6 @@ def estimate_strategy_runtime_cost(node, strategy):
     args = tree_map_only(torch.fx.Node, lambda x: x.meta["val"], node.args)
     kwargs = tree_map_only(torch.fx.Node, lambda x: x.meta["val"], node.kwargs)
 
-    fake_mode = torch._guards.detect_fake_mode(args)
-
     if len(kwargs) > 0:
         for k, v in kwargs.items():
             assert not isinstance(v, torch.Tensor), f"{node} {v}"
@@ -222,16 +247,16 @@ def estimate_strategy_runtime_cost(node, strategy):
         _get_sharded_shape_stride(spec) for spec in strategy.input_specs
     )
 
+    flat_args, treespec = tree_flatten(args)
+    new_flat_args = []
     counter = 0
-    args = list(args)
-    for i, arg in enumerate(args):
-        if isinstance(arg, torch.Tensor):
-            with fake_mode:
-                sizes, strides = args_sizes_strides[counter]
-                args[i] = torch.empty_strided(
-                    sizes, strides, device=arg.device, dtype=arg.dtype
-                )
+    for x in flat_args:
+        if isinstance(x, torch.Tensor):
+            sizes, strides = args_sizes_strides[counter]
+            x = torch.empty_strided(sizes, strides, device=x.device, dtype=x.dtype)
             counter += 1
+        new_flat_args.append(x)
+    args = treespec.unflatten(new_flat_args)
 
     # TODO: maybe cache the flop_counter to avoid recreating it
     # all the time
