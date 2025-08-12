@@ -150,7 +150,7 @@ def assert_has_no_collectives(gm: torch.fx.GraphModule):
             )
 
 
-def _replace_view_mm_view_with_matmul(gm):
+def _replace_view_mm_view_with_einsum(gm):
     mm_nodes = gm.graph.find_nodes(op="call_function", target=torch.ops.aten.mm.default)
     for node in mm_nodes:
         first_input, second_input = node.all_input_nodes
@@ -161,11 +161,21 @@ def _replace_view_mm_view_with_matmul(gm):
                 len(users) == 1
                 and users[0].target == torch.ops.aten.view.default
                 and view_input.meta["val"].shape[:-1] == users[0].meta["val"].shape[:-1]
+                and second_input.meta["val"].ndim == 2
             ):
-                print(f"Found matmul node {node}")
+                print(
+                    f"Found matmul node {node}, {view_input.meta['val'].shape, second_input.meta['val'].shape}"
+                )
+                ndim = view_input.meta["val"].ndim
+                assert 1 < ndim <= 10, "Only support up to 10D for now"
+
+                # generate the leading dimensions as a, b, c, etc
+                dims = "".join([chr(97 + i) for i in range(ndim - 1)])
+                mm_equation = f"{dims}k,kn->{dims}n"
                 with gm.graph.inserting_before(node):
                     new_node = gm.graph.call_function(
-                        torch.ops.aten.matmul.default, args=(view_input, second_input)
+                        torch.ops.aten.einsum.default,
+                        args=(mm_equation, [view_input, second_input]),
                     )
                     new_node.meta.update(users[0].meta)
                     users[0].replace_all_uses_with(new_node)
@@ -183,12 +193,22 @@ def _replace_view_mm_view_with_matmul(gm):
                 and users[0].target == torch.ops.aten.permute.default
                 and orig_first.meta["val"].shape[:-1]
                 == orig_second.meta["val"].shape[:-1]
+                and node.meta["val"].ndim == 2
             ):
-                print(f"Found matmul node {node}")
+                print(
+                    f"Found matmul node {node} {orig_first.meta['val'].shape, orig_second.meta['val'].shape}"
+                )
+
+                ndim = orig_first.meta["val"].ndim
+                assert 1 < ndim <= 10, "Only support up to 10D for now"
+
+                # generate the leading dimensions as a, b, c, etc
+                dims = "".join([chr(97 + i) for i in range(ndim - 1)])
+                mm_equation = f"{dims}n,{dims}k->kn"
                 with gm.graph.inserting_before(node):
                     new_node = gm.graph.call_function(
                         torch.ops.aten.einsum.default,
-                        args=("bmn,bmk->kn", [orig_first, orig_second]),
+                        args=(mm_equation, [orig_first, orig_second]),
                     )
                     new_node.meta.update(users[0].meta)
                     users[0].replace_all_uses_with(new_node)

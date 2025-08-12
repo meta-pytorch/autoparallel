@@ -29,7 +29,7 @@ from .apply_sharding import apply_sharding_to_model
 from .cast_parametrization import apply_dtype_cast, canonicalize_mp, set_dtype_cast
 from .graph_utils import (
     _add_alias,
-    _replace_view_mm_view_with_matmul,
+    _replace_view_mm_view_with_einsum,
     assert_has_no_collectives,
     cleanup_graph,
     update_joint_with_descriptors,
@@ -226,7 +226,7 @@ class AutoParallel:
         assert_has_no_collectives(gm)
 
         cleanup_graph(gm)
-        _replace_view_mm_view_with_matmul(gm)
+        _replace_view_mm_view_with_einsum(gm)
         # now add aliases nodes to the graph to
         # give more room for optimizations
         _add_alias(gm)
