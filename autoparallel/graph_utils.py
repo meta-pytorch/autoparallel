@@ -186,10 +186,9 @@ def _replace_view_mm_view_with_matmul(gm):
             ):
                 print(f"Found matmul node {node}")
                 with gm.graph.inserting_before(node):
-                    # TODO: check einsum equation
                     new_node = gm.graph.call_function(
                         torch.ops.aten.einsum.default,
-                        args=("bmn,bmk->nk", [orig_first, orig_second]),
+                        args=("bmn,bmk->kn", [orig_first, orig_second]),
                     )
                     new_node.meta.update(users[0].meta)
                     users[0].replace_all_uses_with(new_node)
