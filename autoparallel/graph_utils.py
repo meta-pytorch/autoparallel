@@ -148,3 +148,25 @@ def assert_has_no_collectives(gm: torch.fx.GraphModule):
                 f"autoparallel.local_map_hop.apply_local_map, see "
                 "examples/example_local_map.py for more information."
             )
+
+
+def _replace_view_mm_view_with_matmul(gm):
+    mm_nodes = gm.graph.find_nodes(op="call_function", target=torch.ops.aten.mm.default)
+    for node in mm_nodes:
+        first_input, second_input = node.all_input_nodes
+        if first_input.target == torch.ops.aten.view.default:
+            view_input = first_input.all_input_nodes[0]
+            users = list(node.users)
+            if (
+                len(users) == 1
+                and users[0].target == torch.ops.aten.view.default
+                and view_input.meta["val"].shape == users[0].meta["val"].shape
+            ):
+                with gm.graph.inserting_before(node):
+                    new_node = gm.graph.call_function(
+                        torch.ops.aten.matmul.default, args=(view_input, second_input)
+                    )
+                    new_node.meta.update(users[0].meta)
+                    users[0].replace_all_uses_with(new_node)
+    gm.graph.eliminate_dead_code()
+    gm.recompile()

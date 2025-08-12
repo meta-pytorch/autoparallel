@@ -29,6 +29,7 @@ from .apply_sharding import apply_sharding_to_model
 from .cast_parametrization import apply_dtype_cast, canonicalize_mp, set_dtype_cast
 from .graph_utils import (
     _add_alias,
+    _replace_view_mm_view_with_matmul,
     assert_has_no_collectives,
     cleanup_graph,
     update_joint_with_descriptors,
@@ -36,28 +37,6 @@ from .graph_utils import (
 from .init_weights import hook_params_setters
 from .optimize_sharding import ShardingOptimizer
 from .utils import _get_device_from_mesh
-
-
-def _replace_view_mm_view_with_matmul(gm):
-    mm_nodes = gm.graph.find_nodes(op="call_function", target=torch.ops.aten.mm.default)
-    for node in mm_nodes:
-        first_input, second_input = node.all_input_nodes
-        if first_input.target == torch.ops.aten.view.default:
-            view_input = first_input.all_input_nodes[0]
-            users = list(node.users)
-            if (
-                len(users) == 1
-                and users[0].target == torch.ops.aten.view.default
-                and view_input.meta["val"].shape == users[0].meta["val"].shape
-            ):
-                with gm.graph.inserting_before(node):
-                    new_node = gm.graph.call_function(
-                        torch.ops.aten.matmul.default, args=(view_input, second_input)
-                    )
-                    new_node.meta.update(users[0].meta)
-                    users[0].replace_all_uses_with(new_node)
-    gm.graph.eliminate_dead_code()
-    gm.recompile()
 
 
 def try_convert_fake_to_real(tensors):
