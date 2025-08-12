@@ -283,8 +283,9 @@ class AutoParallel:
                 "name": "autoparallel_joint_graph",
                 "encoding": "string",
             },
-            # TODO: Use print_readable instead with useful options
-            payload_fn=lambda: str(gm.graph),
+            payload_fn=lambda: gm.print_readable(
+                print_output=False, include_stride=True, include_device=True
+            ),
         )
 
         self.gm = gm
@@ -384,7 +385,9 @@ class AutoParallel:
                 "name": "autoparallel_parallel_graph",
                 "encoding": "string",
             },
-            payload_fn=lambda: str(parallel_gm.graph),
+            payload_fn=lambda: parallel_gm.print_readable(
+                print_output=False, include_stride=True, include_device=True
+            ),
         )
         # now rename input/param/tangent/output/grad_param/grad_input nodes following
         # our convention
