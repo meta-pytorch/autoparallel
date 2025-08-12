@@ -746,11 +746,17 @@ def matmul_rule(mesh, op_schema):
 
     self_strategy, mat2_strategy = op_schema.args_schema
 
-    assert len(self_strategy.shape) == 3
+    assert len(self_strategy.shape) >= 2
     assert len(mat2_strategy.shape) == 2
 
-    mm_equation = "bmk,kn->bmn"
+    # I'm just being lazy here because otherwise I'd have to change
+    # the naming convention for k and n. I think this is fine for now
+    assert self_strategy.ndim <= 10, "Only support up to 10D matmul for now"
 
+    # generate the leading dimensions as a, b, c, etc
+    dims = "".join([chr(97 + i) for i in range(self_strategy.ndim - 1)])
+
+    mm_equation = f"{dims}k,kn->{dims}n"
     return _mm_like_strategy(mm_equation, mesh, op_schema)
 
 
