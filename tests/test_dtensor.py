@@ -3,10 +3,12 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+import functools
+
 import numpy as np
 import torch
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.tensor import DTensor, Shard, distribute_tensor
+from torch.distributed.tensor import DTensor, Replicate, Shard, distribute_tensor
 from torch.distributed.tensor._dtensor_spec import DTensorSpec, TensorMeta
 from torch.distributed.tensor._op_schema import (
     OpInfo,
@@ -15,6 +17,7 @@ from torch.distributed.tensor._op_schema import (
     OpStrategy,
     OutputSharding,
     OutputSpecType,
+    RuntimeSchemaInfo,
     TupleStrategy,
 )
 from torch.testing._internal.common_utils import run_tests
@@ -23,7 +26,12 @@ from torch.testing._internal.distributed._tensor.common_dtensor import (
     with_comms,
 )
 
-from autoparallel.dtensor_util import get_op_strategy, with_implicit_strategies
+from autoparallel.dtensor_util import (
+    batch_shard_strategy,
+    get_op_strategy,
+    op_strategy_context,
+    with_implicit_strategies,
+)
 
 propagator = DTensor._op_dispatcher.sharding_propagator
 
@@ -368,6 +376,106 @@ class ImplicitRegistrationTest(DTensorTestBase):
             f"Operator {test_op} does not have a sharding strategy registered",
         ):
             self._test_op_on_dtensor(test_op, input_x_dt, input_y_dt)
+
+
+class DimShardingTest(DTensorTestBase):
+    @with_comms
+    def test_simple_batch_sharding(self):
+        # both input tensors batch on dim 0
+        mesh = init_device_mesh(self.device_type, (2, self.world_size // 2))
+        test_op = torch.ops.mylib.numpy_sin.default
+
+        # 1. strategy that will try shard dim 0 into one devices axis.
+        shard_first_dim_strategy = functools.partial(
+            batch_shard_strategy, input_shard_dim=[0, 0], output_shard_dim=[0]
+        )
+        with op_strategy_context(test_op, shard_first_dim_strategy):
+            # dim 0 is the batch dim. Here we shard 16 over one device axis
+            input_x = torch.randn([16, 1, 4], device=self.device_type)
+            input_y = torch.randn([16, 1, 4], device=self.device_type)
+            # any sharding below should work
+            input_x_dt = distribute_tensor(input_x, mesh, [Shard(1), Replicate()])
+            input_y_dt = distribute_tensor(input_y, mesh, [Replicate(), Shard(0)])
+            self._test_op_on_dtensor(test_op, input_x_dt, input_y_dt)
+
+        # 2. strategy that will try shard dim 0 into multiple devices.
+        shard_first_dim_to_multiple_devices_strategy = functools.partial(
+            batch_shard_strategy,
+            input_shard_dim=[0, 0],
+            output_shard_dim=[0],
+            enable_shard_batch_dim_over_multiple_axis=True,
+        )
+        with op_strategy_context(test_op, shard_first_dim_to_multiple_devices_strategy):
+            # dim 0 is the batch dim. Here we potentially shard 16 over multiple device axes
+            input_x = torch.randn([16, 1, 4], device=self.device_type)
+            input_y = torch.randn([16, 1, 4], device=self.device_type)
+            # any sharding below should work
+            input_x_dt = distribute_tensor(input_x, mesh, [Shard(1), Replicate()])
+            input_y_dt = distribute_tensor(input_y, mesh, [Replicate(), Shard(0)])
+            self._test_op_on_dtensor(test_op, input_x_dt, input_y_dt)
+
+    @with_comms
+    def test_broadcast_batch_sharding(self):
+        # Not recommended, user need to make sure the op supports input with
+        # broadcast first. If not supported, try unsqueeze inputs first to match
+        # each other's dimensions and and use the example in the
+        # test_simple_batch_sharding test.
+        mesh = init_device_mesh(self.device_type, (2, self.world_size // 2))
+        test_op = torch.ops.mylib.numpy_sin.default
+        shard_on_first_dim_strategy = functools.partial(
+            batch_shard_strategy, input_shard_dim=[None, 0], output_shard_dim=[0]
+        )
+        with op_strategy_context(test_op, shard_on_first_dim_strategy):
+            input_x = torch.randn([1, 4], device=self.device_type)
+            # input_y's 16 locates on the batch dim
+            input_y = torch.randn([16, 1, 4], device=self.device_type)
+            # any sharding below should work as long as the tensor dim it is shardable
+            input_x_dt = distribute_tensor(input_x, mesh, [Shard(1), Replicate()])
+            input_y_dt = distribute_tensor(input_y, mesh, [Replicate(), Shard(0)])
+
+            output_dt = test_op(input_x_dt, input_y_dt)
+
+            # split the batch dim to test correctness
+            input_y_chucks = torch.chunk(input_y, 4, dim=0)
+            output = torch.cat(
+                [test_op(input_x, input_y_part) for input_y_part in input_y_chucks]
+            )
+            self.assertEqual(output_dt.full_tensor(), output)
+
+            # or we can test directly since the op support broadcast.
+            self._test_op_on_dtensor(test_op, input_x_dt, input_y_dt)
+
+    @with_comms
+    def test_simple_tuple_batch_sharding(self):
+        # both input tensors batch on dim 0
+        mesh = init_device_mesh(self.device_type, (2, self.world_size // 2))
+        test_op = torch.ops.mylib.numpy_tuple_sin.default
+
+        # 1. strategy that will try shard dim 0 into one devices axis.
+        shard_first_dim_to_multiple_devices_strategy = functools.partial(
+            batch_shard_strategy,
+            input_shard_dim=[0, 0, 0, 0, 0],  # flatten input_y
+            output_shard_dim=[0],
+            enable_shard_batch_dim_over_multiple_axis=True,
+        )
+        with op_strategy_context(
+            test_op,
+            shard_first_dim_to_multiple_devices_strategy,
+            schema_info=RuntimeSchemaInfo(needs_pytree=True),
+        ):
+            # dim 0 is the batch dim. Here we shard 16 over one device axis
+            input_x = torch.randn([16, 8, 4], device=self.device_type)
+            input_y = [
+                torch.randn([16, 8, 4], device=self.device_type) for _ in range(3)
+            ]
+            input_z = torch.randn([16, 8, 4], device=self.device_type)
+            # any sharding below should work as long as the tensor dim it is shardable
+            input_x_dt = distribute_tensor(input_x, mesh, [Shard(0), Shard(1)])
+            input_y_dt = [
+                distribute_tensor(i, mesh, [Shard(1), Shard(1)]) for i in input_y
+            ]
+            input_z_dt = distribute_tensor(input_z, mesh, [Shard(1), Shard(0)])
+            self._test_op_on_dtensor(test_op, input_x_dt, input_y_dt, input_z_dt)
 
 
 if __name__ == "__main__":

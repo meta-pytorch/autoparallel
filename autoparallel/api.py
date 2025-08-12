@@ -6,82 +6,36 @@
 import copy
 import itertools
 from contextlib import ExitStack
-from typing import Optional
+from types import MethodType
+from typing import Optional, Union
 
 import torch
 from torch._functorch.aot_autograd import (
     aot_compile_joint_with_descriptors,
     aot_export_joint_with_descriptors,
+    boxed_nop_preserve_node_meta,
 )
+from torch._inductor.compile_fx import compile_fx_inner
 from torch._inductor.decomposition import select_decomp_table
-from torch._inductor.fx_passes.joint_graph import joint_graph_passes
-from torch._inductor.fx_passes.post_grad import remove_assert_ops
 from torch._logging import trace_structured
 from torch._subclasses import FakeTensorMode
 from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor import DeviceMesh
 from torch.export._unlift import _assign_attr
 from torch.export.unflatten import _AttrKind
-from torch.nn.utils import stateless
 
+from .activation_checkpointing import ac_joint_pass
 from .apply_sharding import apply_sharding_to_model
 from .cast_parametrization import apply_dtype_cast, canonicalize_mp, set_dtype_cast
+from .graph_utils import (
+    _add_alias,
+    assert_has_no_collectives,
+    cleanup_graph,
+    update_joint_with_descriptors,
+)
+from .init_weights import hook_params_setters
 from .optimize_sharding import ShardingOptimizer
 from .utils import _get_device_from_mesh
-
-
-def _add_alias(gm):
-    """
-    Helper function to add alias nodes to every node in the graph
-    this gives more configuration opportunities
-    """
-    graph = gm.graph
-
-    nodes = [n for n in graph.nodes if n.op == "call_function"]
-    node_map = {node: idx for idx, node in enumerate(nodes)}
-    inputs = graph.find_nodes(op="placeholder")
-    for node in inputs:
-        if len(node.users) == 0:
-            # node is not used, don't add alias for it
-            continue
-        first_user = nodes[min(node_map[n] for n in node.users)]
-        with graph.inserting_before(first_user):
-            alias_node = graph.call_function(torch.ops.aten.alias.default, args=(node,))
-            alias_node.meta.update(node.meta)
-
-            def delete_user_cb(n):
-                return n != alias_node
-
-            node.replace_all_uses_with(alias_node, delete_user_cb=delete_user_cb)
-
-    """
-    for node in nodes:
-        # skip ops which return tuple
-        if not isinstance(node.meta["val"], torch.Tensor):
-            continue
-        with graph.inserting_after(node):
-            alias_node = graph.call_function(torch.ops.aten.alias.default, args=(node,))
-            alias_node.meta.update(node.meta)
-
-            def delete_user_cb(n):
-                return n != alias_node
-
-            node.replace_all_uses_with(alias_node, delete_user_cb=delete_user_cb)
-
-    """
-
-    for node in graph.find_nodes(op="output")[0].all_input_nodes:
-        with graph.inserting_after(node):
-            alias_node = graph.call_function(torch.ops.aten.alias.default, args=(node,))
-            alias_node.meta.update(node.meta)
-
-            def delete_user_cb(n):
-                return n != alias_node
-
-            node.replace_all_uses_with(alias_node, delete_user_cb=delete_user_cb)
-
-    gm.recompile()
-    return gm
 
 
 def _replace_view_mm_view_with_matmul(gm):
@@ -184,6 +138,10 @@ class AutoParallel:
         input_fn,
         mesh: DeviceMesh,
         mp_policy: Optional[MixedPrecisionPolicy] = None,
+        compile: bool = False,
+        enable_ac: bool = True,
+        # None means 'auto'
+        ac_stage_size_in_GiB: Optional[Union[float, str]] = "auto",
     ):
         self.stack = ExitStack()
         self.fake_mode = (
@@ -197,37 +155,45 @@ class AutoParallel:
         # in dtype casting and move_to_fake
         model = copy.deepcopy(model)
 
+        # keep a separate copy of the fake orig model to customize for supporting init_weights
+        self.init_weights_model = move_to_fake(
+            copy.deepcopy(model), self.fake_mode, device
+        )
+
         if self.mp_policy is not None:
             apply_dtype_cast(model, self.mp_policy)
 
         self.model = move_to_fake(model, self.fake_mode, device)
         self.input_fn = input_fn
         self.mesh = mesh
+        self.compiler_fn = compile_fx_inner if compile else boxed_nop_preserve_node_meta
+        self.enable_ac = enable_ac
+        self.ac_stage_size_in_GiB = ac_stage_size_in_GiB
 
         # NB: rest of the construction happens in __enter__
-
         self.active = False
 
     def __enter__(self):
         assert self.active is False
 
         self.build_model_graph()
+        self.old_inductor_comprehensive_padding = (
+            torch._inductor.config.comprehensive_padding
+        )
+        torch._inductor.config.comprehensive_padding = False
 
-        from torch._subclasses.fake_tensor import unset_fake_temporarily
-
-        with unset_fake_temporarily():
-            rescale_grad_comm_cost_for_mp = 1.0
-            if self.mp_policy is not None:
-                param_size = self.mp_policy.param_dtype.itemsize
-                reduce_size = self.mp_policy.reduce_dtype.itemsize
-                if param_size != reduce_size:
-                    rescale_grad_comm_cost_for_mp = reduce_size / param_size
-                    # Tiebreak, favoring performing the comms in the largest
-                    # dtype
-                    rescale_grad_comm_cost_for_mp *= 1.1
-            sharding_optimizer = ShardingOptimizer(
-                self.gm, self.mesh, rescale_grad_comm_cost_for_mp
-            )
+        rescale_grad_comm_cost_for_mp = 1.0
+        if self.mp_policy is not None:
+            param_size = self.mp_policy.param_dtype.itemsize
+            reduce_size = self.mp_policy.reduce_dtype.itemsize
+            if param_size != reduce_size:
+                rescale_grad_comm_cost_for_mp = reduce_size / param_size
+                # Tiebreak, favoring performing the comms in the largest
+                # dtype
+                rescale_grad_comm_cost_for_mp *= 1.1
+        sharding_optimizer = ShardingOptimizer(
+            self.gm, self.mesh, rescale_grad_comm_cost_for_mp
+        )
 
         # makes sharding of params and gradients the same
         sharding_optimizer.add_grad_param_constraints()
@@ -243,6 +209,9 @@ class AutoParallel:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        torch._inductor.config.comprehensive_padding = (
+            self.old_inductor_comprehensive_padding
+        )
         self.active = None
         return self.stack.__exit__(exc_type, exc_val, exc_tb)
 
@@ -258,10 +227,6 @@ class AutoParallel:
 
     def build_model_graph(self):
         decomp_table = _get_decomp_table()
-        # needed because of https://github.com/pytorch/pytorch/issues/148977
-        # TODO: Don't do a global setting for this, this will unpredictably
-        # affect user code
-        torch.__future__.set_swap_module_params_on_conversion(True)
 
         with self.fake_mode:
             inputs = self.input_fn()
@@ -269,30 +234,20 @@ class AutoParallel:
                 inputs = (inputs,)
 
         with set_dtype_cast(True):
+            ep = torch.export.export(self.model, inputs)
             self.joint_with_descriptors = aot_export_joint_with_descriptors(
-                self.stack, self.model, inputs, decompositions=decomp_table
+                self.stack,
+                ep.module(),
+                inputs,
+                decompositions=decomp_table,
+                fw_compiler=self.compiler_fn,
+                bw_compiler=self.compiler_fn,
             )
         gm = self.joint_with_descriptors.graph_module
+        assert_has_no_collectives(gm)
 
-        # cleanup graph
-        # TODO: Make the DCE match exactly the AOTAutograd logic, I don't
-        # think I trust the default FX DCE logic
-        gm.graph.eliminate_dead_code()
-        gm.recompile()
+        cleanup_graph(gm)
         _replace_view_mm_view_with_matmul(gm)
-        # disable pattern_matcher as it gets on our way
-        # we basically want to remove noops in here
-        prev = torch._inductor.config.pattern_matcher
-        torch._inductor.config.pattern_matcher = False
-        try:
-            # TODO: Double check if this is what we want to do
-            gm = joint_graph_passes(gm)
-        finally:
-            torch._inductor.config.pattern_matcher = prev
-        # TODO: We shouldn't actually remove these
-        remove_assert_ops(gm.graph)
-        gm.graph.eliminate_dead_code()
-        gm.recompile()
         # now add aliases nodes to the graph to
         # give more room for optimizations
         _add_alias(gm)
@@ -302,8 +257,9 @@ class AutoParallel:
                 "name": "autoparallel_joint_graph",
                 "encoding": "string",
             },
-            # TODO: Use print_readable instead with useful options
-            payload_fn=lambda: str(gm.graph),
+            payload_fn=lambda: gm.print_readable(
+                print_output=False, include_stride=True, include_device=True
+            ),
         )
 
         self.gm = gm
@@ -383,6 +339,12 @@ class AutoParallel:
         #    - contains another instance of subclass info in self
         #    - quite a lot of use of runtime_metadata
         #
+        from torch._subclasses.fake_tensor import unset_fake_temporarily
+
+        with unset_fake_temporarily():
+            # creates a new mesh and caches it internally
+            # we don't need to keep a reference to it
+            self.mesh._flatten()
         with self.fake_mode:
             (
                 parallel_gm,
@@ -396,23 +358,28 @@ class AutoParallel:
             )
         # clean it up by removing the added aliases from previous pass
         # as well as redundant views
-        parallel_gm = joint_graph_passes(parallel_gm)
+        cleanup_graph(parallel_gm, aggressive=True)
+
         trace_structured(
             "artifact",
             metadata_fn=lambda: {
                 "name": "autoparallel_parallel_graph",
                 "encoding": "string",
             },
-            payload_fn=lambda: str(parallel_gm.graph),
+            payload_fn=lambda: parallel_gm.print_readable(
+                print_output=False, include_stride=True, include_device=True
+            ),
         )
+
+        if self.enable_ac:
+            ac_joint_pass(parallel_gm.graph, self.ac_stage_size_in_GiB)
         # now rename input/param/tangent/output/grad_param/grad_input nodes following
         # our convention
         # apply_node_renaming(
         #    parallel_gm, self.params_len, self.buffer_len, self.metadata
         # )
         self.parallel_gm = parallel_gm
-        self.joint_with_descriptors.graph_module = parallel_gm
-
+        update_joint_with_descriptors(self.joint_with_descriptors, parallel_gm)
         # NB: so this function takes in the parameters at the beginning
 
         # let's remove those otherwise we can't clean the backward graph properly
@@ -454,6 +421,9 @@ class AutoParallel:
 
         self.parallel_model = AutoParallelModule()
 
+        # We construct an unflattened structure on parallel_mod,
+        # e.g. _assign_attr(v, parallel_model, k="layers.0.weight") will literally
+        # create empty nn.Modules recursively and then stash 'v' so it shows up in the right spot
         for k, v in sharded_param_dict.items():
             _assign_attr(v, self.parallel_model, k, attr_kind=_AttrKind.PARAMETER)
 
@@ -462,20 +432,18 @@ class AutoParallel:
 
         # Right now we require a convention that the user model provides an init_weights method,
         # although we could snoop for other methods too.
+        hook_params_setters(self.init_weights_model, self.parallel_model)
         if hasattr(self.model, "init_weights"):
 
-            def init_weights(*args, **kwargs):
-                with stateless._reparametrize_module(
-                    self.model, {**sharded_param_dict, **sharded_buffer_dict}
-                ):
-                    self.model.init_weights(*args, **kwargs)
+            def init_weights(_self, *args, **kwargs):
+                # this is now a deep-fake-copy of orig mod, so we don't have to use reparametrize
+                return self.init_weights_model.init_weights(*args, **kwargs)
 
-        else:
-            init_weights = None
-
-        # assign an init_weights method onto the output mod.
-        # all it does is sneakily run the original user mod's init_weights method,
-        # but with our new DTensor sharded params attached to the user module.
-        self.parallel_model.init_weights = init_weights
+            # assign an init_weights method onto the output mod.
+            # all it does is sneakily run the original user mod's init_weights method,
+            # but with our new DTensor sharded params attached to the user module.
+            self.parallel_model.init_weights = MethodType(
+                init_weights, self.parallel_model
+            )
 
         return self.parallel_model
