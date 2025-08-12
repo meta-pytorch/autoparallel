@@ -150,6 +150,7 @@ def assert_has_no_collectives(gm: torch.fx.GraphModule):
             )
 
 
+# TODO: use graph_patterns to simplify writing this
 def _replace_view_mm_view_with_einsum(gm):
     mm_nodes = gm.graph.find_nodes(op="call_function", target=torch.ops.aten.mm.default)
     for node in mm_nodes:
