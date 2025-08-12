@@ -138,31 +138,6 @@ with AutoParallel(model, input_fn, mesh, mp_policy, compile=True) as autop:
     # AutoParallel produces a module with meta-DTensor parameters that need to be initialized
     parallel_mod = autop.apply_placement(sharding_placement)
 
-# Validate graph and node meta
-seqs = set()
-for n in autop.gm.graph.nodes:
-    if "checkpoint" in n.meta.get(
-        "stack_trace", ""
-    ):  # placeholders don't have stack trace
-        is_bwd = n.meta.get("partitioner_tag", "") == "is_backward"
-        if not is_bwd:
-            # go over fwd nodes
-
-            if "getitem" in str(n.target):
-                # getitem nodes are tagged same as their parent
-                expected = policy_fn(None, n.args[0].target, (), ())
-            else:
-                expected = policy_fn(None, n.target, (), ())
-            actual = n.meta.get("recompute")
-            if actual != expected:
-                print(f"For {n}, Expected {expected}, got {actual}")
-                breakpoint()
-            assert actual == expected
-            seqs.add(n.meta["seq_nr"])
-        else:
-            # fwd counterpart should have already populated seqs
-            assert n.meta["seq_nr"] in seqs
-
 parallel_mod.to_empty(device="cuda")
 parallel_mod.init_weights()
 
@@ -170,5 +145,35 @@ parallel_mod.init_weights()
 x = (torch.rand(bs // mesh.shape[0], seq_len, dim1, device="cuda"),)
 out = parallel_mod(*x)
 out.backward(torch.randn_like(out))
+
+# Validate
+seqs = set()
+for n in autop.gm.graph.nodes:
+    if "checkpoint" in n.meta.get(
+        "stack_trace", ""
+    ):  # placeholders don't have stack trace
+        is_bwd = n.meta.get("partitioner_tag", "") == "is_backward"
+        if not is_bwd:
+            if "getitem" in str(n.target):
+                # getitem nodes are tagged same as their parent
+                expected = policy_fn(None, n.args[0].target, (), ())
+            else:
+                expected = policy_fn(None, n.target, (), ())
+            actual = n.meta.get("recompute")
+            # NOTE: this assert only supports policy_fns on op alone
+            assert actual == expected
+            seqs.add(n.meta["seq_nr"])
+        else:
+            # fwd counterpart should have already populated seqs
+            assert n.meta["seq_nr"] in seqs
+
+mm_nodes = autop.gm.graph.find_nodes(
+    op="call_function", target=torch.ops.aten.mm.default
+)
+
+assert (
+    mm_nodes[0].meta.get("recompute")
+    == torch.utils.checkpoint.CheckpointPolicy.PREFER_RECOMPUTE
+)
 
 print("All good!")
