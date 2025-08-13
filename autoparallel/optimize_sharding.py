@@ -78,6 +78,7 @@ runtime cost while satisfying all constraints.
 """
 
 import math
+import operator
 from typing import Optional
 
 import pulp
@@ -89,12 +90,12 @@ from torch._functorch._aot_autograd.fx_utils import (
     get_plain_input_and_grad_nodes,
     get_plain_output_and_tangent_nodes,
 )
-from torch.distributed.tensor._dtensor_spec import DTensorSpec
 from torch.distributed.tensor.placement_types import Placement, Replicate, Shard
 from torch.utils._pytree import tree_flatten, tree_map_only
 
 from .compute_estimation import (
     _get_sharded_shape_stride,
+    estimate_strategy_comms_cost,
     estimate_strategy_runtime_cost,
 )
 from .propagation_rules import _create_all_options
@@ -229,7 +230,15 @@ class ShardingOptimizer:
             for ss, ssi in enumerate(s.strategies):
                 compute_cost = estimate_strategy_runtime_cost(node, ssi)
                 for argi, xxi in enumerate(ssi.redistribute_cost):
+                    if node.op != "placeholder":
+                        argi_strat = self.strats[self._all_input_nodes(node)[argi]]
                     for ii, comm_cost in enumerate(xxi):
+                        # TODO: handle operator.getitem as well
+                        if node.op != "placeholder" and node.target != operator.getitem:
+                            src_spec = argi_strat.strategies[ii].output_specs
+                            tgt_spec = ssi.input_specs[argi]
+                            comm_cost = estimate_strategy_comms_cost(src_spec, tgt_spec)
+
                         if node in grad_param_nodes:
                             comm_cost = comm_cost / self.rescale_grad_comm_cost_for_mp
                         va = pulp.LpVariable(
@@ -371,61 +380,6 @@ class ShardingOptimizer:
         self.add_same_output_across_args_constraint()
         self.add_output_input_consistent_constraint()
         self.add_inf_cost_constraint()
-
-        self.penalize_inefficient_collectives()
-
-    def penalize_inefficient_collectives(self):
-        """
-        EFFICIENCY CONSTRAINTS (Category 5): Penalize inefficient collective operations like
-        non-batch dimension shard-to-replicate conversions and forbid invalid transitions.
-
-        - Shard(dim≠0) → Replicate: multiply cost by 4
-        - Replicate → Partial: x_{i,a,o,j} = 0 (forbidden)
-        - Partial → Shard(dim≠0): multiply cost by 4
-
-        When performing shard_{n} -> replicate (for n != 0), there is additional
-        computation cost associated. Let's penalize it here while we don't add
-        the computation cost together in the comm cost
-        """
-        # return
-        for s_i, node in enumerate(self.graph.nodes):
-            if node.op != "call_function":
-                continue
-            tgt_op_strat = self.strats[node]
-            for counter, parent in enumerate(node.all_input_nodes):
-                curr_op_strat = self.strats[parent]
-
-                for oi, tgt_strat in enumerate(tgt_op_strat.strategies):
-                    spec = tgt_strat.input_specs[counter]
-                    if not isinstance(spec, DTensorSpec):
-                        # TODO: check if this is correct
-                        continue
-
-                    for ii, curr_strat in enumerate(curr_op_strat.strategies):
-                        curr_spec = curr_strat.output_specs
-                        if not isinstance(curr_spec, DTensorSpec):
-                            continue
-                        for tgt_plc, curr_plc in zip(
-                            spec.placements, curr_spec.placements
-                        ):
-                            if (
-                                tgt_plc.is_replicate()
-                                and curr_plc.is_shard()
-                                and curr_plc.dim != 0
-                            ):
-                                # penalize case S(1) -> R as there are additional compute cost
-                                # TODO: add proper compute cost in the optimization objective
-                                self.ds[(s_i, counter, oi, ii)]["cost"] *= 4
-                            elif tgt_plc.is_partial() and curr_plc.is_replicate():
-                                # forbit  R -> P case as this doesn't make sense for us
-                                self.prob += self.ds[(s_i, counter, oi, ii)]["va"] == 0
-                            elif (
-                                tgt_plc.is_shard()
-                                and tgt_plc.dim != 0
-                                and curr_plc.is_partial()
-                            ):
-                                # penalize case P -> S(1) as there are additional compute cost
-                                self.ds[(s_i, counter, oi, ii)]["cost"] *= 4
 
     def get_violated_constraints_log(self):
         violated_constraints = [
