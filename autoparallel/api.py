@@ -120,6 +120,7 @@ class AutoParallel:
         enable_ac: bool = True,
         # None means 'auto'
         ac_stage_size_in_GiB: Optional[Union[float, str]] = "auto",
+        **kwargs,
     ):
         self.stack = ExitStack()
         self.fake_mode = (
@@ -129,6 +130,7 @@ class AutoParallel:
         if mp_policy is not None:
             mp_policy = canonicalize_mp(mp_policy)
         self.mp_policy = mp_policy
+        self.kwargs = kwargs
         # copy user model to avoid modifying it in-place
         # in dtype casting and move_to_fake
         model = copy.deepcopy(model)
@@ -170,7 +172,10 @@ class AutoParallel:
                 # dtype
                 rescale_grad_comm_cost_for_mp *= 1.1
         sharding_optimizer = ShardingOptimizer(
-            self.gm, self.mesh, rescale_grad_comm_cost_for_mp
+            self.gm,
+            self.mesh,
+            rescale_grad_comm_cost_for_mp,
+            repeated_subgraphs=self.kwargs.get("repeated_subgraphs", False),
         )
 
         # makes sharding of params and gradients the same
