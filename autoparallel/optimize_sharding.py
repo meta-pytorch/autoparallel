@@ -92,6 +92,7 @@ from torch._functorch._aot_autograd.fx_utils import (
     get_plain_input_and_grad_nodes,
     get_plain_output_and_tangent_nodes,
 )
+from torch.distributed._tensor.placement_types import DTensorSpec
 from torch.distributed.tensor.placement_types import Placement, Replicate, Shard
 from torch.utils._pytree import tree_flatten, tree_map_only
 
@@ -300,10 +301,15 @@ class ShardingOptimizer:
                     if node.op != "placeholder":
                         argi_strat = self.strats[self._all_input_nodes(node)[argi]]
                     for ii, comm_cost in enumerate(xxi):
-                        # TODO: handle operator.getitem as well
-                        if node.op != "placeholder" and node.target != operator.getitem:
+                        if node.op != "placeholder":
                             src_spec = argi_strat.strategies[ii].output_specs
+                            # TODO: operator.getitem being special is something
+                            # we might want to change in the future
+                            if node.target == operator.getitem:
+                                src_spec = src_spec[node.args[1]]
                             tgt_spec = ssi.input_specs[argi]
+                            assert isinstance(src_spec, DTensorSpec)
+                            assert isinstance(tgt_spec, DTensorSpec)
                             comm_cost = estimate_strategy_comms_cost(src_spec, tgt_spec)
 
                         if node in grad_param_nodes:
