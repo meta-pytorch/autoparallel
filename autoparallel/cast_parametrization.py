@@ -17,6 +17,38 @@ def _unimplemented_deepcopy(*args: Any, **kwargs: Any):
     )
 
 
+@torch.library.custom_op("autoparallel::dtype_cast", mutates_args=())
+def dtype_cast(x: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """
+    This is a custom op that is used to cast the input tensor to the specified dtype.
+    We use it to be able to specify a special compute cost for the cast operation,
+    so that we always favor performing all-gather of small tensors in the smallest
+    dtype.
+    """
+    return x.to(dtype)
+
+
+def setup_context(ctx, inputs, output) -> None:
+    x, _ = inputs
+    ctx.orig_dtype = x.dtype
+
+
+def backward(ctx, grad):
+    dtype = ctx.orig_dtype
+    return torch.ops.autoparallel.dtype_cast(grad, dtype), None
+
+
+torch.library.register_autograd(
+    "autoparallel::dtype_cast", backward, setup_context=setup_context
+)
+
+
+@dtype_cast.register_fake
+def _(x: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    out = torch.empty_like(x, dtype=dtype)
+    return out
+
+
 def create_dtype_cast_managed_attr(p_name):
     def getter(self):
         # TODO: if this function throws exception, how does it behave? add a unit test for it.
@@ -82,7 +114,7 @@ def apply_dtype_cast(model, mp_policy: MixedPrecisionPolicy):
                 _param = self_mod._parameters[_param_name]
                 if not active_param():
                     return _param
-                return _param.to(_dtype)
+                return torch.ops.autoparallel.dtype_cast(_param, _dtype)
 
             param_properties[p_name] = getter
 
