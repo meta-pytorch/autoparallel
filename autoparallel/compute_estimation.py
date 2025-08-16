@@ -210,9 +210,6 @@ def estimate_strategy_runtime_cost(node, strategy):
     if node.target.is_view:
         return 0
 
-    if node.target == torch.ops.autoparallel.dtype_cast.default:
-        return 0
-
     args = tree_map_only(torch.fx.Node, lambda x: x.meta["val"], node.args)
     kwargs = tree_map_only(torch.fx.Node, lambda x: x.meta["val"], node.kwargs)
 
