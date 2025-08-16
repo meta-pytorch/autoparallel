@@ -87,6 +87,11 @@ def _add_alias(gm):
         if len(node.users) == 0:
             # node is not used, don't add alias for it
             continue
+        if (
+            len(node.users) == 1
+            and list(node.users)[0].target == torch.ops.autoparallel.dtype_cast.default
+        ):
+            node = list(node.users)[0]
         first_user = nodes[min(node_map[n] for n in node.users)]
         with graph.inserting_before(first_user):
             alias_node = graph.call_function(torch.ops.aten.alias.default, args=(node,))
