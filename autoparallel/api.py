@@ -326,7 +326,11 @@ class AutoParallel:
         with unset_fake_temporarily():
             # creates a new mesh and caches it internally
             # we don't need to keep a reference to it
-            self.mesh._flatten()
+            # TODO: remove ndim == 1 special case once
+            # DeviceMesh._flatten is fixed
+            mesh = self.mesh
+            if mesh.ndim != 1:
+                mesh._flatten()
         with self.fake_mode:
             (
                 parallel_gm,
