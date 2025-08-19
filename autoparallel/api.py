@@ -228,16 +228,17 @@ class AutoParallel:
 
             from torch.export import _trace
 
-            ep = _trace._export_to_torch_ir(
-                self.model,
-                inputs,
-                {},  # kwargs
-                None,  # dynamic_shapes
-                preserve_module_call_signature=(),
-                restore_fqn=False,  # don't need to restore because we will do it later
-                allow_complex_guards_as_runtime_asserts=False,
-                _log_export_usage=False,
-            )
+            with torch._dynamo.config.patch(install_free_tensors=True):
+                ep = _trace._export_to_torch_ir(
+                    self.model,
+                    inputs,
+                    {},  # kwargs
+                    None,  # dynamic_shapes
+                    preserve_module_call_signature=(),
+                    restore_fqn=False,  # don't need to restore because we will do it later
+                    allow_complex_guards_as_runtime_asserts=False,
+                    _log_export_usage=False,
+                )
             self.joint_with_descriptors = aot_export_joint_with_descriptors(
                 self.stack,
                 ep,
