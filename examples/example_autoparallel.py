@@ -9,7 +9,7 @@ import functools
 import torch
 from torch import nn
 
-# from torch.distributed.fsdp import MixedPrecisionPolicy
+from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor.placement_types import Replicate, Shard
 from torch.testing._internal.distributed.fake_pg import FakeStore
 from torch.utils.checkpoint import create_selective_checkpoint_contexts
@@ -120,8 +120,8 @@ with torch.device("meta"):
 
 # MP policy causing some deepcopy issues
 # mp_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
-# mp_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16)
-mp_policy = None
+mp_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16)
+# mp_policy = None
 
 with AutoParallel(model, input_fn, mesh, mp_policy, compile=True) as autop:
     assert any(n.meta.get("nn_module_stack") for n in autop.gm.graph.nodes)
