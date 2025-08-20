@@ -4,21 +4,28 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import os
+import sys
 from dataclasses import dataclass
 from typing import Callable, Literal
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
-from torch import nn
 
-from torch.distributed.tensor import (
-    DeviceMesh,
-    distribute_module,
-    distribute_tensor,
-    DTensor,
-    Replicate,
-    Shard,
-)
+from moe_ops import batched_grouped_mm, batched_histc, token_combine, token_dispatch
+from torch import nn
+from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.tensor import DTensor
+from torch.fx import symbolic_trace
+
+# Import auto_parallel from the correct location
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+try:
+    from autoparallel.api import auto_parallel
+except ImportError:
+    print("Warning: auto_parallel not available, will run without parallelization")
+    auto_parallel = None
 
 
 def expert_parallel(func: Callable) -> Callable:
@@ -137,29 +144,6 @@ class FeedForward(nn.Module):
             nn.init.trunc_normal_(linear.weight, mean=0.0, std=init_std)
 
 
-@expert_parallel
-def _run_experts_grouped_mm(
-    w1: torch.Tensor,
-    w2: torch.Tensor,
-    w3: torch.Tensor,
-    x: torch.Tensor,
-    num_tokens_per_expert: torch.Tensor,
-) -> torch.Tensor:
-    offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
-    # grouped mm between a 2D tensor and a 3D tensor
-    assert x.dim() == 2
-
-    h = F.silu(
-        torch._grouped_mm(x.bfloat16(), w1.bfloat16().transpose(-2, -1), offs=offsets)
-    )
-    h = h * torch._grouped_mm(
-        x.bfloat16(), w3.bfloat16().transpose(-2, -1), offs=offsets
-    )
-    out = torch._grouped_mm(h, w2.bfloat16().transpose(-2, -1), offs=offsets).type_as(x)
-
-    return out
-
-
 class GroupedExperts(nn.Module):
     def __init__(
         self,
@@ -178,9 +162,22 @@ class GroupedExperts(nn.Module):
         x: torch.Tensor,
         num_tokens_per_expert: torch.Tensor,
     ) -> torch.Tensor:
-        return _run_experts_grouped_mm(
-            self.w1, self.w2, self.w3, x, num_tokens_per_expert
+        assert x.dim() == 3
+        assert num_tokens_per_expert.dim() == 2
+        offsets = torch.cumsum(num_tokens_per_expert, dim=1, dtype=torch.int32)
+        # grouped mm between a 3D tensor and a 3D tensor and 2D offsets
+        h = F.silu(
+            batched_grouped_mm(
+                x.bfloat16(), self.w1.bfloat16().transpose(-2, -1), offs=offsets
+            )
         )
+        h = h * batched_grouped_mm(
+            x.bfloat16(), self.w3.bfloat16().transpose(-2, -1), offs=offsets
+        )
+        out = batched_grouped_mm(
+            h, self.w2.bfloat16().transpose(-2, -1), offs=offsets
+        ).type_as(x)
+        return out
 
     def init_weights(self, init_std: float):
         nn.init.trunc_normal_(self.w1, mean=0.0, std=0.02)
@@ -223,41 +220,45 @@ class TokenChoiceTopKRouter(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
-            x (torch.Tensor): Input tensor with shape ``(bs*slen, dim)``.
+            x (torch.Tensor): Input tensor with shape ``(ob, ib*slen, dim)``.
             expert_bias (torch.Tensor | None, optional): Optional bias tensor for experts with shape ``(num_experts,)``.
                 Used for load balancing. Defaults to None.
 
         Returns:
             tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
                 - top_scores (torch.Tensor):
-                    Routing scores for selected experts with shape ``(bs*slen, top_k)``.
+                    Routing scores for selected experts with shape ``(ob, ib*slen, top_k)``.
                 - selected_experts_indices (torch.Tensor):
-                    Expert indices selected for each token with shape ``(bs*slen, top_k)``.
+                    Expert indices selected for each token with shape ``(ob, ib*slen, top_k)``.
                 - num_tokens_per_expert (torch.Tensor):
-                    Number of tokens assigned to each expert with shape ``(num_experts,)``.
+                    Number of tokens assigned to each expert with shape ``(ob, num_experts,)``.
         """
-        # scores shape (bs*slen, num_experts)
+        assert x.dim() == 3
+        if expert_bias is not None:
+            assert expert_bias.dim() == 1
+        # scores shape (ob, ib*slen, num_experts)
         scores = self.gate(x)
 
         # By default, sigmoid or softmax is performed in float32 to avoid loss explosion
         if self.score_func == "sigmoid":
             scores = torch.sigmoid(scores.to(torch.float32))
         elif self.score_func == "softmax":
-            scores = F.softmax(scores.to(torch.float32), dim=1)
+            scores = F.softmax(scores.to(torch.float32), dim=2)
         else:
             raise NotImplementedError(f"Unknown score function {self.score_function}")
 
-        # top scores shape (bs*slen, top_k)
+        # top scores shape (ob, ib*slen, top_k)
+        # selected_experts_indices shape (ob, ib*slen, top_k)
         # NOTE: The expert_bias is only used for routing. The gating value
         #       top_scores is still derived from the original scores.
         if expert_bias is not None:
             _, selected_experts_indices = torch.topk(
-                scores + expert_bias, k=self.top_k, dim=1
+                scores + expert_bias, k=self.top_k, dim=2
             )
-            top_scores = scores.gather(dim=1, index=selected_experts_indices)
+            top_scores = scores.gather(dim=2, index=selected_experts_indices)
         else:
             top_scores, selected_experts_indices = torch.topk(
-                scores, k=self.top_k, dim=1
+                scores, k=self.top_k, dim=2
             )
 
         if self.score_func == "sigmoid" and self.route_norm:
@@ -266,8 +267,9 @@ class TokenChoiceTopKRouter(nn.Module):
         top_scores = top_scores * self.route_scale
 
         # group tokens together by expert indices from 0 to num_experts and pass that to experts forward
-        num_tokens_per_expert = torch.histc(
-            selected_experts_indices.view(-1),
+        # num_tokens_per_expert has shape (ob, num_experts,)
+        num_tokens_per_expert = batched_histc(
+            selected_experts_indices.reshape(selected_experts_indices.shape[0], -1),
             bins=self.num_experts,
             min=0,
             max=self.num_experts,
@@ -277,67 +279,6 @@ class TokenChoiceTopKRouter(nn.Module):
 
     def init_weights(self, init_std: float):
         nn.init.trunc_normal_(self.gate.weight, mean=0.0, std=init_std)
-
-
-# NOTE: the reason we make this a stateless module is to support
-#       expert_tensor_parallel_degree=1 with consistent TP/EP APIs.
-class TokenReorderer(nn.Module):
-    """
-    This module reorders token indices to match the order of experts, enabling
-    efficient parallel processing of tokens by experts.
-
-    Args:
-        num_experts (int): Number of experts in the MoE layer.
-        top_k (int): Number of experts each token will be routed to.
-    """
-
-    def __init__(self, num_experts: int, top_k: int):
-        super().__init__()
-        self.num_experts = num_experts
-        self.top_k = top_k
-
-    def forward(
-        self,
-        top_scores: torch.Tensor,
-        selected_experts_indices: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Reorders token indices to match the order of experts for MoE routing.
-
-        Args:
-            top_scores (torch.Tensor): Routing scores for selected experts,
-                shape (batch_size*seq_len, top_k)
-            selected_experts_indices (torch.Tensor): Expert indices selected for each token,
-                shape (batch_size*seq_len, top_k)
-
-        Returns:
-            tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-                - top_scores_experts_sorted: Scores reordered to match expert ordering
-                - token_indices_experts_sorted: Token indices reordered to match expert ordering
-                - num_tokens_per_expert: Number of tokens assigned to each expert
-        """
-        # group tokens together by expert indices from 0 to num_experts and pass that to experts forward
-        num_tokens_per_expert = torch.histc(
-            selected_experts_indices.view(-1),
-            bins=self.num_experts,
-            min=0,
-            max=self.num_experts,
-        )
-
-        # Reorder the token indices to match the order of the experts
-        # token_indices_experts_sorted shape (bs*slen*top_k,)
-        token_indices_experts_sorted = torch.argsort(
-            selected_experts_indices.view(-1), stable=True
-        )
-
-        top_scores_experts_sorted = top_scores.view(-1)[token_indices_experts_sorted]
-        token_indices_experts_sorted = token_indices_experts_sorted // self.top_k
-
-        return (
-            top_scores_experts_sorted,
-            token_indices_experts_sorted,
-            num_tokens_per_expert,
-        )
 
 
 class MoE(nn.Module):
@@ -350,6 +291,7 @@ class MoE(nn.Module):
             hidden_dim=hidden_dim,
             num_experts=num_experts,
         )
+        self.top_k = moe_args.top_k
         self.router = TokenChoiceTopKRouter(
             dim=dim,
             num_experts=num_experts,
@@ -358,7 +300,6 @@ class MoE(nn.Module):
             route_norm=moe_args.route_norm,
             route_scale=moe_args.route_scale,
         )
-        self.reorderer = TokenReorderer(num_experts=num_experts, top_k=moe_args.top_k)
         self.shared_experts = (
             FeedForward(dim=dim, hidden_dim=hidden_dim * moe_args.num_shared_experts)
             if moe_args.num_shared_experts > 0
@@ -389,16 +330,18 @@ class MoE(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x (torch.Tensor): Input tensor with shape ``(bs, slen, dim)``.
+            x (torch.Tensor): Input tensor with shape ``(ob, ib, slen, dim)``.
 
         Returns:
-            out (torch.Tensor): Output tensor with shape ``(bs, slen, dim)``.
+            out (torch.Tensor): Output tensor with shape ``(ob, ib, slen, dim)``.
         """
-        bs, slen, dim = x.shape
-        x = x.view(-1, dim)
+        ob, ib, slen, dim = x.shape
+        # x shape (ob, ib*slen, dim)
+        x = x.view(ob, ib * slen, dim)
 
-        # top_scores and selected_experts_indices shape (bs*slen*top_k,)
-        # num_tokens_per_expert shape (num_experts,)
+        # top_scores shape (ob, ib*slen, top_k,)
+        # selected_experts_indices shape (ob, ib*slen, top_k,)
+        # num_tokens_per_expert shape (ob, num_experts,)
         (
             top_scores,
             selected_experts_indices,
@@ -411,35 +354,24 @@ class MoE(nn.Module):
         #       effect on the expert bias update thanks to the torch.sign() operator.
         if self.load_balance_coeff is not None:
             with torch.no_grad():
-                self.tokens_per_expert.add_(num_tokens_per_expert)
-
-        # top_scores and token_indices_experts_sorted shape (bs*slen*top_k,)
-        # num_tokens_per_expert shape (num_experts,)
-        # NOTE: the reason we need to compute num_tokens_per_expert again is:
-        #       1st computation in router is to update self.tokens_per_expert
-        #       which would be the same across all TP ranks.
-        #       2nd computation in reorderer is for the actual routing and experts computation
-        #       which would be sharded over TP ranks if expert_tensor_parallel_degree==1.
-        #       If tensor_paralllel_degree == expert_tensor_parallel_degree, they agree.
-        (
-            top_scores_experts_sorted,
-            token_indices_experts_sorted,
-            num_tokens_per_expert,
-        ) = self.reorderer(top_scores, selected_experts_indices)
-
-        # shape (bs*slen*top_k, dim)
-        token_indices_experts_sorted = token_indices_experts_sorted.reshape(
-            -1, 1
-        ).expand(-1, dim)
-
-        # shape (bs*slen*top_k, dim)
-        routed_input = torch.gather(x, dim=0, index=token_indices_experts_sorted)
-
-        if self.score_before_experts:
-            routed_input = (
-                routed_input.to(torch.float32)
-                * top_scores_experts_sorted.reshape(-1, 1)
-            ).to(x.dtype)
+                self.tokens_per_expert.add_(
+                    torch.sum(num_tokens_per_expert.sum(dim=0), dim=0)
+                )
+        # routed_input shape (ob, ib*slen*top_k, dim)
+        # top_scores_experts_sorted shape (ob, ib*slen*top_k,)
+        # token_indices_experts_sorted shape (ob, ib*slen*top_k,)
+        (routed_input, top_scores_experts_sorted, token_indices_experts_sorted) = (
+            token_dispatch(
+                x,
+                top_scores,
+                selected_experts_indices,
+                num_tokens_per_expert,
+                num_experts=self.router.num_experts,
+                top_k=self.top_k,
+                score_before_experts=self.score_before_experts,
+                ep_mesh=None,
+            )
+        )
 
         # shape (bs*slen*top_k, dim)
         routed_output = self.experts(routed_input, num_tokens_per_expert)
@@ -447,7 +379,7 @@ class MoE(nn.Module):
         if not self.score_before_experts:
             routed_output = (
                 routed_output.to(torch.float32)
-                * top_scores_experts_sorted.reshape(-1, 1)
+                * top_scores_experts_sorted.unsqueeze(-1)
             ).to(x.dtype)
 
         # shared expert
@@ -456,10 +388,18 @@ class MoE(nn.Module):
         else:
             out = torch.zeros_like(x)
 
-        out = out.scatter_add(
-            dim=0, index=token_indices_experts_sorted, src=routed_output
+        out = token_combine(
+            out,
+            routed_output,
+            top_scores_experts_sorted,
+            token_indices_experts_sorted,
+            num_tokens_per_expert,
+            num_experts=self.router.num_experts,
+            top_k=self.top_k,
+            score_before_experts=self.score_before_experts,
+            ep_mesh=None,
         )
-        out = out.reshape(bs, slen, dim)
+        out = out.reshape(ob, ib, slen, dim)
         return out
 
     def init_weights(
@@ -480,3 +420,94 @@ class MoE(nn.Module):
                 self.tokens_per_expert = torch.zeros(
                     self.experts.num_experts, dtype=torch.float32
                 )
+
+
+if __name__ == "__main__":
+
+    from autoparallel.api import AutoParallel
+    from torch.distributed.fsdp import MixedPrecisionPolicy
+    from torch.distributed.tensor.placement_types import Replicate, Shard
+    from torch.testing._internal.distributed.fake_pg import FakeStore
+
+    # Model configuration
+    world_size = 256
+    fake_store = FakeStore()
+    torch.distributed.init_process_group(
+        "fake", store=fake_store, rank=0, world_size=world_size
+    )
+    ep_degree = 32
+    dp_degree = world_size // ep_degree
+    mesh = torch.distributed.device_mesh.init_device_mesh(
+        "cuda",
+        (dp_degree, ep_degree),
+        mesh_dim_names=(
+            "dp",
+            "ep",
+        ),
+    )
+
+    bs = 8 * world_size
+    ob = dp_degree
+    ib = bs // ob
+    seq_len = 256
+    dim = 512
+    hidden_dim = 2048
+    num_experts = 128
+    top_k = 1
+
+    def input_fn():
+        print(f"global input shape: {(ob, ib, seq_len, dim)}")
+        return torch.rand(ob, ib, seq_len, dim, device="cuda")
+
+    # parallelize the model
+    with torch.device("meta"):
+        moe_args = MoEArgs(
+            num_experts=num_experts,
+            num_shared_experts=1,
+            score_func="softmax",
+            route_norm=False,
+            route_scale=1.0,
+            score_before_experts=True,
+            top_k=top_k,
+            use_grouped_mm=True,
+            load_balance_coeff=1e-3,
+        )
+        model = MoE(
+            moe_args=moe_args,
+            dim=dim,
+            hidden_dim=hidden_dim,
+        )
+
+    mp_policy = MixedPrecisionPolicy(
+        param_dtype=torch.bfloat16, reduce_dtype=torch.float32
+    )
+
+    with AutoParallel(model, input_fn, mesh, mp_policy, compile=True) as autop:
+        assert any(n.meta.get("nn_module_stack") for n in autop.gm.graph.nodes)
+        assert any(n.meta.get("fwd_nn_module_stack") for n in autop.gm.graph.nodes)
+        autop.add_parameter_memory_constraint(low=None, high=None)
+
+        x_sharding = (
+            Shard(0),
+            Shard(1),
+        ) + (
+            Replicate(),
+        ) * (mesh.ndim - 2)
+
+        autop.add_input_constraints([x_sharding])
+        autop.add_output_constraints([x_sharding])
+
+        sharding_placement = autop.optimize_placement()
+
+        # AutoParallel produces a module with meta-DTensor parameters that need to be initialized
+        parallel_mod = autop.apply_placement(sharding_placement)
+
+    parallel_mod.to_empty(device="cuda")
+    parallel_mod.init_weights(init_std=0.02, buffer_device="cuda")
+
+    # now let's run it
+    x = (torch.rand(bs // mesh.shape[0], 1, seq_len, dim, device="cuda"),)
+    out = parallel_mod(*x)
+    out.backward(torch.randn_like(out))
+
+    print("All good!")

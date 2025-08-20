@@ -1,60 +1,38 @@
-from typing import List, Optional, Union
+from typing import List, Optional, Sequence, Union
 
 import torch
 import torch.distributed._functional_collectives as funcol
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor._collective_utils import fill_empty_tensor_to_shards
-from torch.distributed.tensor.placement_types import Shard
 
 
-class DynamicShard(Shard):
-    def __init__(self, dim: int, chunk_sizes: List[Union[int, torch.SymInt]]):
+class DynamicShard:
+    """
+    DynamicShard allows variable-length chunks along the specified tensor dimension.
+
+    Unlike the standard Shard placement which assumes equal-sized chunks,
+    DynamicShard handles variable chunk sizes across a mesh dimension.
+    """
+
+    def __init__(self, dim: int):
         """
         DynamicShard allows variable-length chunks along the specified tensor dimension.
 
         Args:
             dim (int): The tensor dimension to shard.
-            chunk_sizes (List[Union[int, torch.SymInt]]):
-                List of chunk sizes for each device in the mesh dimension.
-                The length of chunk_sizes must equal the mesh dimension size.
-                A chunk size of 0 creates an empty tensor placeholder for that rank.
-                Chunk sizes can be int or torch.SymInt to support symbolic shapes.
         """
-        super().__init__(dim)
-        if not isinstance(chunk_sizes, (list, tuple)):
-            raise TypeError(
-                "chunk_sizes must be a list or tuple of ints or torch.SymInt"
-            )
-        if len(chunk_sizes) == 0:
-            raise ValueError("chunk_sizes must not be empty")
+        self.dim = dim
 
-        # Validate chunk size types
-        for i, size in enumerate(chunk_sizes):
-            if not (isinstance(size, int) or isinstance(size, torch.SymInt)):
-                raise TypeError(
-                    f"Chunk size at index {i} must be an int or torch.SymInt, got {type(size)}"
-                )
-
-        # Validate non-negative chunk sizes (for concrete values)
-        for i, size in enumerate(chunk_sizes):
-            if isinstance(size, int) and size < 0:
-                raise ValueError(
-                    f"Chunk size at index {i} must be non-negative, got {size}"
-                )
-
-        self.chunk_sizes = list(chunk_sizes)
-
-    def _compute_offsets(self) -> List[Union[int, torch.SymInt]]:
+    def _compute_offsets(
+        self, chunk_sizes: List[Union[int, torch.SymInt]]
+    ) -> List[Union[int, torch.SymInt]]:
         """
         Compute offsets from chunk sizes using cumulative sum.
         Returns offsets including the final endpoint.
         """
-        if not self.chunk_sizes:
-            return [0]
-
         offsets: List[Union[int, torch.SymInt]] = [0]
         current_offset = 0
-        for size in self.chunk_sizes:
+        for size in chunk_sizes:
             current_offset += size
             offsets.append(current_offset)
         return offsets
@@ -64,20 +42,16 @@ class DynamicShard(Shard):
         tensor: torch.Tensor,
         chunk_sizes: List[Union[int, torch.SymInt]],
         *,
-        with_padding: bool = True,
+        with_padding: bool = False,
         contiguous: bool = True,
     ) -> tuple[list[torch.Tensor], list[int]]:
         """
         Split tensor into variable-sized chunks based on provided chunk_sizes.
-        Updates the placement's chunk_sizes to the new values.
-
-        Note: with_padding is ignored as padding defeats the purpose of DynamicShard.
-              All chunks maintain their original variable sizes.
 
         Args:
             tensor: Tensor to split
-            chunk_sizes: New list of chunk sizes for splitting the tensor
-            with_padding: Ignored - DynamicShard never pads
+            chunk_sizes: List of chunk sizes for splitting the tensor
+            with_padding: Ignored - DynamicShard never pads to maintain variable sizes
             contiguous: Whether to make tensors contiguous
 
         Returns:
@@ -125,9 +99,6 @@ class DynamicShard(Shard):
                 f"on dim {self.dim}. chunk_sizes: {chunk_sizes}",
             )
 
-        # Update the placement's chunk_sizes to the new values
-        self.chunk_sizes = list(chunk_sizes)
-
         # Create chunks based on chunk sizes - unified logic for int and SymInt
         tensor_list: List[torch.Tensor] = []
         current_offset = 0
@@ -148,7 +119,7 @@ class DynamicShard(Shard):
             tensor_list.append(chunk)
             current_offset += chunk_size
 
-        # Fill empty tensors if needed (compatibility with base class)
+        # Fill empty tensors if needed (compatibility)
         tensor_list = fill_empty_tensor_to_shards(
             tensor_list, self.dim, len(chunk_sizes) - len(tensor_list)
         )
@@ -157,13 +128,16 @@ class DynamicShard(Shard):
         pad_sizes = [0] * len(tensor_list)
         return tensor_list, pad_sizes
 
-    def chunk_slices(self, tensor_shape):
+    def _chunk_slices(
+        self, tensor_shape: Sequence[int], chunk_sizes: List[Union[int, torch.SymInt]]
+    ):
         """
         Returns a list of slice objects for each chunk along the sharded dimension,
         based on the chunk sizes.
 
         Args:
             tensor_shape (Sequence[int]): The shape of the tensor to be sharded.
+            chunk_sizes (List[Union[int, torch.SymInt]]): The list of chunk sizes.
 
         Returns:
             List[tuple]: List of slice tuples for each chunk.
@@ -174,10 +148,10 @@ class DynamicShard(Shard):
             )
 
         # Compute offsets from chunk sizes
-        offsets = self._compute_offsets()
+        offsets = self._compute_offsets(chunk_sizes)
 
         slices = []
-        for i in range(len(self.chunk_sizes)):
+        for i in range(len(chunk_sizes)):
             start = offsets[i]
             end = offsets[i + 1]
 
@@ -193,34 +167,10 @@ class DynamicShard(Shard):
             slices.append(tuple(slc))
         return slices
 
-    def __eq__(self, other: object) -> bool:
-        if not isinstance(other, DynamicShard):
-            # For compatibility, check if it's a regular Shard with same dim
-            if isinstance(other, Shard):
-                return self.dim == other.dim
-            return False
-        return self.dim == other.dim and self.chunk_sizes == other.chunk_sizes
-
-    def __hash__(self) -> int:
-        # Use tuple of chunk_sizes for hashing, but handle SymInt carefully
-        try:
-            chunk_sizes_tuple = tuple(self.chunk_sizes)
-            return hash((self.dim, chunk_sizes_tuple))
-        except TypeError:
-            # If chunk_sizes contain unhashable SymInt, fall back to dim only
-            return hash(self.dim)
-
-    def __repr__(self) -> str:
-        """Machine readable representation of the DynamicShard placement"""
-        return f"DynamicShard(dim={self.dim}, chunk_sizes={self.chunk_sizes})"
-
-    def __str__(self) -> str:
-        """Human readable representation of the DynamicShard placement"""
-        return f"DS({self.dim}, {len(self.chunk_sizes)})"
-
     def _shard_tensor(
         self,
         tensor: torch.Tensor,
+        chunk_sizes: List[Union[int, torch.SymInt]],
         mesh: DeviceMesh,
         mesh_dim: int,
         src_data_rank: Optional[int] = 0,
@@ -228,6 +178,16 @@ class DynamicShard(Shard):
         """
         Shard and scatter a tensor on a mesh dimension with variable chunk sizes.
         Uses torch.distributed.scatter which can handle variable-sized tensors.
+
+        Args:
+            tensor: Tensor to shard and scatter
+            chunk_sizes: List of chunk sizes for each rank in the mesh dimension
+            mesh: DeviceMesh for distribution
+            mesh_dim: Dimension of the mesh to scatter across
+            src_data_rank: Source rank for scattering (default: 0)
+
+        Returns:
+            Local chunk of the tensor for this rank
         """
         my_coordinate = mesh.get_coordinate()
 
@@ -240,7 +200,7 @@ class DynamicShard(Shard):
         if src_data_rank is None:
             # Skip communications, just split locally
             scatter_list, _ = self._split_tensor(
-                tensor, self.chunk_sizes, with_padding=False, contiguous=True
+                tensor, chunk_sizes, with_padding=False, contiguous=True
             )
             return scatter_list[mesh_dim_local_rank]
 
@@ -250,14 +210,14 @@ class DynamicShard(Shard):
         if mesh_dim_local_rank == src_data_rank:
             # Source rank: split tensor and create scatter_list
             scatter_list, _ = self._split_tensor(
-                tensor, self.chunk_sizes, with_padding=False, contiguous=True
+                tensor, chunk_sizes, with_padding=False, contiguous=True
             )
         else:
             # Non-source ranks: scatter_list should be None
             scatter_list = None
 
         # Create output tensor for this rank's chunk
-        chunk_size = self.chunk_sizes[mesh_dim_local_rank]
+        chunk_size = chunk_sizes[mesh_dim_local_rank]
         if chunk_size == 0:
             output_shape = list(tensor.shape)
             output_shape[self.dim] = 0
@@ -276,6 +236,7 @@ class DynamicShard(Shard):
     def _reduce_shard_tensor(
         self,
         tensor: torch.Tensor,
+        chunk_sizes: List[Union[int, torch.SymInt]],
         mesh: DeviceMesh,
         reduce_op: str,
         mesh_dim: int,
@@ -283,6 +244,16 @@ class DynamicShard(Shard):
         """
         Reduce and scatter with variable chunk sizes.
         Cannot use reduce_scatter_tensor since chunks are not equal-sized.
+
+        Args:
+            tensor: Tensor to reduce and scatter
+            chunk_sizes: List of chunk sizes for each rank in the mesh dimension
+            mesh: DeviceMesh for distribution
+            reduce_op: Reduction operation ('sum', 'avg', etc.)
+            mesh_dim: Dimension of the mesh to reduce across
+
+        Returns:
+            Local reduced chunk for this rank
         """
         my_coordinate = mesh.get_coordinate()
 
@@ -303,7 +274,7 @@ class DynamicShard(Shard):
 
         # Step 2: Each rank extracts their own chunk
         mesh_dim_local_rank = my_coordinate[mesh_dim]
-        chunk_size = self.chunk_sizes[mesh_dim_local_rank]
+        chunk_size = chunk_sizes[mesh_dim_local_rank]
 
         if chunk_size == 0:
             # Return empty tensor
@@ -312,7 +283,7 @@ class DynamicShard(Shard):
             return tensor.new_empty(chunk_shape, requires_grad=tensor.requires_grad)
 
         # Compute offset for this rank
-        offset = sum(self.chunk_sizes[:mesh_dim_local_rank])
+        offset = sum(chunk_sizes[:mesh_dim_local_rank])
         result = reduced_tensor.narrow(self.dim, offset, chunk_size)
 
         return result.contiguous()
@@ -320,19 +291,30 @@ class DynamicShard(Shard):
     def _to_replicate_tensor(
         self,
         local_tensor: torch.Tensor,
+        chunk_sizes: List[Union[int, torch.SymInt]],
         mesh: DeviceMesh,
         mesh_dim: int,
-        current_logical_shape: List[int],
     ) -> torch.Tensor:
         """
         All-gather variable-sized shards to reconstruct the full replicated tensor.
         Uses torch.distributed.all_gather which supports uneven sized tensors.
+
+        Args:
+            local_tensor: Local tensor shard
+            chunk_sizes: List of chunk sizes for all ranks in the mesh dimension
+            mesh: DeviceMesh for distribution
+            mesh_dim: Dimension of the mesh to gather across
+
+        Returns:
+            Full reconstructed tensor
         """
         my_coordinate = mesh.get_coordinate()
 
         if my_coordinate is None:
             # Create empty tensor with the logical shape
-            result_shape = list(current_logical_shape)
+            total_size = sum(chunk_sizes)
+            result_shape = list(local_tensor.shape)
+            result_shape[self.dim] = total_size
             return local_tensor.new_empty(
                 result_shape, requires_grad=local_tensor.requires_grad
             )
@@ -347,7 +329,6 @@ class DynamicShard(Shard):
         # Prepare tensor list for all_gather - we don't pre-allocate since
         # all_gather with uneven tensors will handle the allocation
         gathered_tensors = []
-        # TODO: Need to define a functional version of all_gather to use here
         torch.distributed.all_gather(gathered_tensors, local_tensor, group=group)
 
         # Filter out empty chunks and concatenate
@@ -355,7 +336,9 @@ class DynamicShard(Shard):
 
         if not valid_chunks:
             # All chunks are empty
-            result_shape = list(current_logical_shape)
+            total_size = sum(chunk_sizes)
+            result_shape = list(local_tensor.shape)
+            result_shape[self.dim] = total_size
             return local_tensor.new_empty(
                 result_shape, requires_grad=local_tensor.requires_grad
             )
@@ -366,50 +349,44 @@ class DynamicShard(Shard):
     def _replicate_to_shard(
         self,
         local_tensor: torch.Tensor,
+        chunk_sizes: List[Union[int, torch.SymInt]],
         mesh: DeviceMesh,
         mesh_dim: int,
         shard_index: int,
     ) -> torch.Tensor:
         """
         Transform from replicated tensor to a sharded tensor by taking the appropriate chunk.
+
+        Args:
+            local_tensor: Full replicated tensor
+            chunk_sizes: List of chunk sizes for all ranks
+            mesh: DeviceMesh for distribution
+            mesh_dim: Dimension of the mesh
+            shard_index: Index of the shard to extract
+
+        Returns:
+            Local shard for the specified index
         """
         shards, _ = self._split_tensor(
             local_tensor,
-            self.chunk_sizes,
+            chunk_sizes,
             with_padding=False,
             contiguous=False,
         )
         return shards[shard_index].clone()
 
-    @staticmethod
-    def _local_shard_size_and_offset(
-        curr_local_size: int,
-        num_chunks: int,
-        rank: int,
-    ) -> tuple[int, int]:
-        """
-        Not supported for DynamicShard as it uses variable chunk sizes.
-        Use chunk_sizes directly instead of computing from equal-sized assumptions.
-        """
-        raise NotImplementedError(
-            "DynamicShard does not support _local_shard_size_and_offset as it uses "
-            "variable chunk sizes. Use the chunk_sizes attribute directly instead."
-        )
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, DynamicShard):
+            return False
+        return self.dim == other.dim
 
-    def _to_new_shard_dim(
-        self,
-        local_tensor: torch.Tensor,
-        mesh: DeviceMesh,
-        mesh_dim: int,
-        current_logical_shape: List[int],
-        new_shard_dim: int,
-    ) -> torch.Tensor:
-        """
-        Not supported for DynamicShard as resharding with variable chunk sizes
-        requires custom logic that depends on the specific use case.
-        """
-        raise NotImplementedError(
-            "DynamicShard does not support _to_new_shard_dim as resharding with "
-            "variable chunk sizes requires domain-specific logic. Consider "
-            "redistributing to Replicate first, then applying new DynamicShard."
-        )
+    def __hash__(self) -> int:
+        return hash(self.dim)
+
+    def __repr__(self) -> str:
+        """Machine readable representation of the DynamicShard placement"""
+        return f"DynamicShard(dim={self.dim})"
+
+    def __str__(self) -> str:
+        """Human readable representation of the DynamicShard placement"""
+        return f"DS({self.dim})"
