@@ -231,3 +231,125 @@ def generate_permute_indices(
         )
 
     return permuted_indices, m_sizes, m_offsets.to(torch.int32)
+
+
+def batched_generate_permute_indices(
+    batched_tokens_per_expert_group: torch.Tensor,
+    experts_per_rank: int,
+    num_ranks: int,
+    batched_max_len: list[int],
+    alignment: int,
+    use_cpu: bool = False,
+):
+    """
+    Prepare permutation indices and the number of tokens for each expert.
+
+    Args:
+        batched_tokens_per_expert_group: number of tokens for each expert from all ranks.
+        experts_per_rank: number of experts per rank.
+        num_ranks: number of ranks.
+        batched_max_len: maximum length of the output index vector.
+        alignment: alignment for each returned element in `m_sizes` and padding min for zero token experts.
+        use_cpu: whether to use CPU implementation.
+    Returns:
+        batched_permuted_indices: Tensor of indices that map original token order to the expert-grouped order.
+        batched_m_sizes: aligned number of tokens for each expert (padded to alignment boundary).
+        batched_m_offsets: Cumulative sum of m_sizes. The exclusive ending position for each expert's tokens.
+    """
+    batched_permuted_indices = []
+    batched_m_sizes = []
+    batched_m_offsets = []
+    for tokens_per_expert_group, max_len in zip(
+        batched_tokens_per_expert_group, batched_max_len
+    ):
+        permuted_indices, m_sizes, m_offsets = generate_permute_indices(
+            tokens_per_expert_group,
+            experts_per_rank,
+            num_ranks,
+            max_len,
+            alignment,
+            use_cpu,
+        )
+        batched_permuted_indices.append(permuted_indices)
+        batched_m_sizes.append(m_sizes)
+        batched_m_offsets.append(m_offsets)
+    batched_permuted_indices = torch.stack(batched_permuted_indices)
+    batched_m_sizes = torch.stack(batched_m_sizes)
+    batched_m_offsets = torch.stack(batched_m_offsets)
+    return batched_permuted_indices, batched_m_sizes, batched_m_offsets
+
+
+def batched_permute_and_pad(
+    batched_routed_input: torch.Tensor, batched_permute_indices: torch.Tensor
+):
+    """
+    Permute and pad the routed input.
+
+    Args:
+        batched_routed_input: routed input tensor.
+        batched_permute_indices: permutation indices.
+
+    Returns:
+        batched_padded_permuted_routed_input: permuted and padded routed input tensor.
+        batched_routed_input_shapes_before_permute: shapes of the routed input before permutation.
+    """
+    batched_routed_input_shapes_before_permute = []
+    batched_padded_permuted_routed_input = []
+    for routed_input, permute_indices in zip(
+        batched_routed_input, batched_permute_indices
+    ):
+        padded_routed_input = torch.vstack(
+            (routed_input, routed_input.new_zeros(routed_input.shape[-1]))
+        )
+        batched_routed_input_shapes_before_permute.append(padded_routed_input.shape)
+        padded_permuted_routed_input = padded_routed_input[permute_indices, :]
+        batched_padded_permuted_routed_input.append(padded_permuted_routed_input)
+    batched_padded_permuted_routed_input = torch.stack(
+        batched_padded_permuted_routed_input, dim=0
+    )
+
+    return (
+        batched_padded_permuted_routed_input,
+        batched_routed_input_shapes_before_permute,
+    )
+
+
+def batched_unpermute_and_unpad(
+    batched_padded_permuted_routed_output: torch.Tensor,
+    batched_permute_indices: torch.Tensor,
+    batched_routed_input_shapes_before_permute: list[torch.Size],
+):
+    """
+    Unpermute and unpad the routed output.
+
+    Args:
+        batched_padded_permuted_routed_output: permuted and padded routed input tensor.
+        batched_permute_indices: permutation indices.
+        batched_routed_input_shapes_before_permute: shapes of the routed input before permutation.
+
+    Returns:
+        batched_routed_output: unpermuted and unpadded routed output tensor.
+    """
+
+    batched_routed_output_unpermuted_unpadded = []
+    for (
+        padded_permuted_routed_output,
+        permute_indices,
+        routed_input_shape_before_permute,
+    ) in zip(
+        batched_padded_permuted_routed_output,
+        batched_permute_indices,
+        batched_routed_input_shapes_before_permute,
+    ):
+        routed_output_unpermuted = padded_permuted_routed_output.new_empty(
+            routed_input_shape_before_permute
+        )
+        routed_output_unpermuted[permute_indices, :] = padded_permuted_routed_output
+        routed_output_unpermuted_unpadded = routed_output_unpermuted[:-1]
+        batched_routed_output_unpermuted_unpadded.append(
+            routed_output_unpermuted_unpadded
+        )
+    batched_routed_output = torch.stack(
+        batched_routed_output_unpermuted_unpadded, dim=0
+    )
+    return batched_routed_output

@@ -3,7 +3,12 @@ from typing import cast
 import torch
 from autoparallel.propagation_rules import register_opschema_rule
 from dynamic_shard import DynamicShard
-from moe_utils import generate_permute_indices, TOKEN_GROUP_ALIGN_SIZE_M
+from moe_utils import (
+    batched_generate_permute_indices,
+    batched_permute_and_pad,
+    batched_unpermute_and_unpad,
+    TOKEN_GROUP_ALIGN_SIZE_M,
+)
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor._op_schema import OpSchema, OpStrategy
 from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
@@ -299,57 +304,46 @@ def token_dispatch_op(
         ).to(
             x.dtype
         )  # (ob, ib_slen * top_k, dim)
+
     exps_per_rank = num_tokens_per_expert.shape[1]
     num_ep_ranks = num_experts // exps_per_rank
-    padded_permuted_routed_input = []
-    routed_input_shape_before_permute: list[torch.Size] = []
-    batch_permuted_indices = []
-    for b in range(ob):
-        (
-            permuted_indices,
-            num_tokens_per_expert,
-            _,
-        ) = generate_permute_indices(
-            tokens_per_expert_group=num_tokens_per_expert[b],
-            experts_per_rank=exps_per_rank,
-            num_ranks=num_ep_ranks,
-            max_len=(ib_slen * top_k) + (num_experts * TOKEN_GROUP_ALIGN_SIZE_M),
-            alignment=TOKEN_GROUP_ALIGN_SIZE_M,
-            use_cpu=False,
-        )
 
-        pp_routed_input = torch.vstack(
-            (routed_input[b], routed_input[b].new_zeros(dim))
-        )  # (ib_slen * top_k + 1, dim)
-        shape_before_pp = pp_routed_input.shape  # (ib_slen * top_k + 1, dim)
-        routed_input_shape_before_permute.append(shape_before_pp)
-        # Max Size (ib_slen * top_k +  (num_experts * TOKEN_GROUP_ALIGN_SIZE_M), dim)
-        pp_routed_input = pp_routed_input[permuted_indices, :]
-        padded_permuted_routed_input.append(pp_routed_input)
-        batch_permuted_indices.append(permuted_indices)
-
-    # Max Size (ob, ib_slen * top_k + (num_experts * TOKEN_GROUP_ALIGN_SIZE_M), dim)
-    padded_permuted_routed_input = torch.stack(padded_permuted_routed_input, 0)
-    # Max Size (ob, ib_slen * top_k + (num_experts * TOKEN_GROUP_ALIGN_SIZE_M))
-    batch_permuted_indices = torch.stack(batch_permuted_indices, 0)
-
+    # Pad and permute routed input
+    permuted_indices, m_sizes, m_offsets = batched_generate_permute_indices(
+        batched_tokens_per_expert_group=num_tokens_per_expert,
+        experts_per_rank=exps_per_rank,
+        num_ranks=num_ep_ranks,
+        batched_max_len=[
+            routed_input[b].shape[0] + exps_per_rank * TOKEN_GROUP_ALIGN_SIZE_M
+            for b in range(ob)
+        ],
+        alignment=TOKEN_GROUP_ALIGN_SIZE_M,
+        use_cpu=False,
+    )
+    (
+        padded_permuted_routed_input,
+        routed_input_shapes_before_permute,
+    ) = batched_permute_and_pad(
+        batched_routed_input=routed_input,
+        batched_permute_indices=permuted_indices,
+    )
     return (
         padded_permuted_routed_input,
         scores_sorted,
         token_indices,
-        batch_permuted_indices,
-        routed_input_shape_before_permute,
+        permuted_indices,
+        routed_input_shapes_before_permute,
     )
 
 
 @torch.library.custom_op("autoparallel::token_combine", mutates_args=())
 def token_combine_op(
     base_output: torch.Tensor,
-    paddded_permuted_routed_output: torch.Tensor,
+    padded_permuted_routed_output: torch.Tensor,
     top_scores_sorted: torch.Tensor,
     token_indices_sorted: torch.Tensor,
     batch_permuted_indices: torch.Tensor,
-    routed_input_shape_before_permute: list[torch.Size],
+    routed_input_shapes_before_permute: list[torch.Size],
     num_tokens_per_expert: torch.Tensor,
     num_experts: int,
     top_k: int,
@@ -382,23 +376,11 @@ def token_combine_op(
     ob, ib_slen, dim = base_output.shape
 
     # Unpad and permute routed output
-    routed_output = []
-    for b in range(ob):
-        pp_routed_output = paddded_permuted_routed_output[
-            b
-        ]  # (ib_slen * top_k + (num_experts * TOKEN_GROUP_ALIGN_SIZE_M), dim)
-        shape_before_pp = routed_input_shape_before_permute[
-            b
-        ]  # (ib_slen * top_k + 1, dim)
-        routed_output_unpermuted = pp_routed_output.new_empty(
-            shape_before_pp
-        )  # (ib_slen * top_k + 1, dim)
-        routed_output_unpermuted[batch_permuted_indices[b], :] = (
-            pp_routed_output  # (ib_slen * top_k + (num_experts * TOKEN_GROUP_ALIGN_SIZE_M), dim)
-        )
-        pp_routed_output = routed_output_unpermuted[:-1]  # (ib_slen * top_k, dim)
-        routed_output.append(pp_routed_output)
-    routed_output = torch.stack(routed_output, 0)  # (ob, ib_slen * top_k, dim)
+    routed_output = batched_unpermute_and_unpad(
+        batched_padded_permuted_routed_output=padded_permuted_routed_output,
+        batched_permute_indices=batch_permuted_indices,
+        batched_routed_input_shapes_before_permute=routed_input_shapes_before_permute,
+    )
     # Apply scores if not applied before experts
     if not score_before_experts:
         routed_output = (
@@ -477,8 +459,7 @@ def token_dispatch_backward(
     """
     Backward pass for token_dispatch.
 
-    Since token_dispatch and token_combine are conjugates, the backward of
-    token_dispatch IS token_combine: scatter gradients back to original positions.
+    Scatter gradients back to original token positions.
     """
     if ctx.score_before_experts:
         (
@@ -502,45 +483,53 @@ def token_dispatch_backward(
     if grad_padded_permuted_routed_input is None:
         return None, None, None, None, None, None, None
 
-    # Create zero base tensor (no residual in backward pass)
-    grad_base = torch.zeros(
-        (ob, ib_slen, dim),
-        dtype=grad_padded_permuted_routed_input.dtype,
-        device=grad_padded_permuted_routed_input.device,
-    )
-
-    # Handle score gradients if scores were applied before experts
-    grad_routed_for_combine = grad_padded_permuted_routed_input
+    # Step 1: Handle score gradients if scores were applied before experts
+    grad_routed_input_for_scatter = grad_padded_permuted_routed_input
     grad_top_scores = None
 
     if ctx.score_before_experts:
-        # CORRECT chain rule for element-wise multiplication: y = scores * unscaled_input
-        # ∂L/∂scores = grad_output * unscaled_input
-        # Only compute gradients for the non-padded portion
-        ib_slen_topk = ib_slen * ctx.top_k
+        assert unscaled_routed_input is not None
+
+        # Unpad and unpermute both gradients and unscaled input for score gradient computation
+        grad_routed_input_unpermuted = batched_unpermute_and_unpad(
+            batched_padded_permuted_routed_output=grad_padded_permuted_routed_input,
+            batched_permute_indices=batch_permuted_indices,
+            batched_routed_input_shapes_before_permute=ctx.routed_input_shape_before_permute,
+        )
+
+        unscaled_routed_input_unpermuted = batched_unpermute_and_unpad(
+            batched_padded_permuted_routed_output=unscaled_routed_input,
+            batched_permute_indices=batch_permuted_indices,
+            batched_routed_input_shapes_before_permute=ctx.routed_input_shape_before_permute,
+        )
+
+        # Chain rule: ∂L/∂scores = grad_routed_input * unscaled_routed_input
         grad_top_scores_flat = (
-            grad_padded_permuted_routed_input[:, :ib_slen_topk, :]
-            * unscaled_routed_input[:, :ib_slen_topk, :]
+            grad_routed_input_unpermuted * unscaled_routed_input_unpermuted
         ).sum(dim=-1)
         grad_top_scores = grad_top_scores_flat.reshape(ob, ib_slen, ctx.top_k)
 
-        # Remove score scaling for token_combine call
-        grad_routed_for_combine = grad_padded_permuted_routed_input / (
+        # Remove score scaling from gradients for scatter operation
+        grad_routed_input_for_scatter = grad_padded_permuted_routed_input / (
             top_scores_sorted.unsqueeze(-1) + 1e-8
         )
 
-    # Call token_combine forward function to do the scatter_add
-    grad_x = token_combine_op(
-        grad_base,  # base_output: zero tensor
-        grad_routed_for_combine,  # paddded_permuted_routed_output: gradients to scatter
-        top_scores_sorted,  # top_scores_sorted: (not used since score_before_experts=True)
-        token_indices_sorted,  # token_indices_sorted: where to scatter
-        batch_permuted_indices,  # batch_permuted_indices: for unpermutation/unpadding
-        ctx.routed_input_shape_before_permute,  # routed_input_shape_before_permute: for unpadding
-        num_tokens_per_expert,  # num_tokens_per_expert: (not used in forward)
-        ctx.num_experts,  # num_experts: (not used in forward)
-        ctx.top_k,  # top_k: (not used in forward)
-        score_before_experts=True,  # Prevent double score application
+    # Step 2: Unpad and unpermute gradients
+    grad_routed_input = batched_unpermute_and_unpad(
+        batched_padded_permuted_routed_output=grad_routed_input_for_scatter,
+        batched_permute_indices=batch_permuted_indices,
+        batched_routed_input_shapes_before_permute=ctx.routed_input_shape_before_permute,
+    )
+
+    # Step 3: Scatter gradients back to original token positions (inverse of gather)
+    grad_x = torch.zeros(
+        (ob, ib_slen, dim),
+        dtype=grad_routed_input.dtype,
+        device=grad_routed_input.device,
+    )
+    token_indices_expanded = token_indices_sorted.unsqueeze(-1).expand(-1, -1, dim)
+    grad_x = grad_x.scatter_add(
+        dim=1, index=token_indices_expanded, src=grad_routed_input
     )
 
     return grad_x, grad_top_scores, None, None, None, None, None
@@ -550,11 +539,11 @@ def setup_token_combine_context(ctx, inputs, output):
     """Setup context for token_combine backward pass."""
     (
         base_output,
-        paddded_permuted_routed_output,
+        padded_permuted_routed_output,
         top_scores_sorted,
         token_indices_sorted,
         batch_permuted_indices,
-        routed_input_shape_before_permute,
+        routed_input_shapes_before_permute,
         num_tokens_per_expert,
         num_experts,
         top_k,
@@ -562,17 +551,18 @@ def setup_token_combine_context(ctx, inputs, output):
     ) = inputs
 
     # Save tensors needed for backward
-    # For exact score gradients when scores are applied in forward, we need unscaled routed_output
     if not score_before_experts:
-        # Save unscaled routed_output (before score multiplication in forward)
-        unscaled_routed_output = paddded_permuted_routed_output / (
-            top_scores_sorted.unsqueeze(-1) + 1e-8
+        # Save routed output before score multiplication for gradient computation
+        unpadded_unscaled_routed_output = batched_unpermute_and_unpad(
+            batched_padded_permuted_routed_output=padded_permuted_routed_output,
+            batched_permute_indices=batch_permuted_indices,
+            batched_routed_input_shapes_before_permute=routed_input_shapes_before_permute,
         )
         ctx.save_for_backward(
             top_scores_sorted,
             token_indices_sorted,
             num_tokens_per_expert,
-            unscaled_routed_output,
+            unpadded_unscaled_routed_output,
             batch_permuted_indices,
         )
     else:
@@ -587,17 +577,16 @@ def setup_token_combine_context(ctx, inputs, output):
     ctx.top_k = top_k
     ctx.score_before_experts = score_before_experts
     ctx.base_shape = base_output.shape
-    ctx.routed_shape = paddded_permuted_routed_output.shape
-    ctx.routed_input_shape_before_permute = routed_input_shape_before_permute
+    ctx.routed_shape = padded_permuted_routed_output.shape
+    ctx.routed_input_shapes_before_permute = routed_input_shapes_before_permute
 
 
 def token_combine_backward(ctx, grad_combined_output):
     """
     Backward pass for token_combine.
 
-    Since token_dispatch and token_combine are conjugates, the backward of
-    token_combine uses the conjugate operation: gather gradients from original
-    positions to expert-grouped order. Then we need to apply permutation and padding.
+    token_combine forward: unpad_unpermute → scatter_add
+    token_combine backward: gather → pad_permute
     """
     if not ctx.score_before_experts:
         (
@@ -614,54 +603,39 @@ def token_combine_backward(ctx, grad_combined_output):
             num_tokens_per_expert,
             batch_permuted_indices,
         ) = ctx.saved_tensors
+        unscaled_routed_output = None
 
     ob, ib_slen, dim = ctx.base_shape
 
     if grad_combined_output is None:
         return None, None, None, None, None, None, None, None, None, None
 
-    # Base output gets the full gradient (like residual connection)
+    # Step 1: Base output gets the full gradient (residual connection)
     grad_base_output = grad_combined_output.clone()
 
-    # Use conjugate operation: gather gradients from original positions to expert-grouped order
+    # Step 2: Gather gradients from original positions (inverse of scatter_add)
     token_indices_expanded = token_indices_sorted.unsqueeze(-1).expand(-1, -1, dim)
     grad_routed_output = torch.gather(
         grad_combined_output, dim=1, index=token_indices_expanded
     )
 
-    # Apply permutation and padding to match forward pass
-    grad_padded_permuted_routed_output = []
-    for b in range(ob):
-        # Add zero row for padding (same as forward pass)
-        grad_pp_routed_output = torch.vstack(
-            (grad_routed_output[b], grad_routed_output[b].new_zeros(dim))
-        )  # (ib_slen * top_k + 1, dim) - zero row is at index -1
-
-        # Permute using batch_permuted_indices
-        # Note: -1 indices in batch_permuted_indices will access the zero row
-        permuted_indices = batch_permuted_indices[b]
-        # Handle -1 indices by converting them to the last index (zero row)
-        safe_indices = torch.where(
-            permuted_indices == -1, grad_pp_routed_output.shape[0] - 1, permuted_indices
-        )
-        grad_pp_routed_output = grad_pp_routed_output[safe_indices, :]
-        grad_padded_permuted_routed_output.append(grad_pp_routed_output)
-
-    grad_padded_permuted_routed_output = torch.stack(
-        grad_padded_permuted_routed_output, 0
-    )
-
-    # Handle score gradients if scores were applied in forward pass
+    # Step 3: Handle score gradients if scores were applied in forward pass
     grad_top_scores_sorted = None
-    if not ctx.score_before_experts:
-        # CORRECT chain rule for element-wise multiplication: combined = base + scores * unscaled_routed
-        # ∂L/∂scores = grad_combined * unscaled_routed (gathered)
-        unscaled_routed_gathered = torch.gather(
-            grad_combined_output, dim=1, index=token_indices_expanded
-        )
-        grad_top_scores_sorted = (grad_routed_output * unscaled_routed_gathered).sum(
+    if not ctx.score_before_experts and unscaled_routed_output is not None:
+        # Chain rule: In forward we had: final_output = unscaled_routed_output * scores
+        # So: ∂L/∂scores = grad_final_output * unscaled_routed_output
+        grad_top_scores_sorted = (grad_routed_output * unscaled_routed_output).sum(
             dim=-1
         )
+
+    # Step 4: Apply permutation and padding (inverse of unpad_unpermute)
+    (
+        grad_padded_permuted_routed_output,
+        _,  # Don't need the shapes
+    ) = batched_permute_and_pad(
+        batched_routed_input=grad_routed_output,
+        batched_permute_indices=batch_permuted_indices,
+    )
 
     return (
         grad_base_output,  # grad_base_output
@@ -669,7 +643,7 @@ def token_combine_backward(ctx, grad_combined_output):
         grad_top_scores_sorted,  # grad_top_scores_sorted
         None,  # grad_token_indices_sorted
         None,  # grad_batch_permuted_indices
-        None,  # grad_routed_input_shape_before_permute
+        None,  # grad_routed_input_shapes_before_permute
         None,  # grad_num_tokens_per_expert
         None,  # grad_num_experts
         None,  # grad_top_k
