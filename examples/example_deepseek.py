@@ -4,95 +4,19 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-import os
-import sys
 from dataclasses import dataclass
-from typing import Callable, Literal
+from typing import Literal
 
 import torch
-import torch.distributed as dist
 import torch.nn.functional as F
 
-from moe_ops import batched_grouped_mm, batched_histc, token_combine, token_dispatch
+from moe_ops import (
+    batched_grouped_mm,
+    batched_histc,
+    token_combine_op,
+    token_dispatch_op,
+)
 from torch import nn
-from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.tensor import DTensor
-from torch.fx import symbolic_trace
-
-# Import auto_parallel from the correct location
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-try:
-    from autoparallel.api import auto_parallel
-except ImportError:
-    print("Warning: auto_parallel not available, will run without parallelization")
-    auto_parallel = None
-
-
-def expert_parallel(func: Callable) -> Callable:
-    """
-    This is a wrapper applied to the GroupedExperts computation, serving
-    the following three purposes:
-    1. Convert parameters from DTensors to plain Tensors, to work with
-    dynamic-shape inputs which cannot be easily expressed as DTensors.
-    2. In Expert Parallel, apply the generate_permute_indices kernel to
-    permute the inputs to be ordered by local experts (see the _token_dispatch
-    function in ExpertParallel) and permute the outputs back.
-    3. In order to use torch._grouped_mm, we need to make sure the number of
-    tokens each expert gets is a multiple of ALIGN_SIZE_M. The generate_permute_indices
-    kernel also helps achieve this via padding, without incurring synchronization
-    between device and host. Note that this will create side effects when wrapping
-    the for-loop implementation of GroupedExperts, as it does not need padding.
-
-    Among the above:
-    1 and 2 are needed only when expert_parallel_degree > 1.
-    3 is needed even for single-device computation.
-    2 can be moved to ExpertParallel _token_dispatch if not coupled with 3.
-    """
-
-    def wrapper(
-        w1: torch.Tensor,
-        w2: torch.Tensor,
-        w3: torch.Tensor,
-        x: torch.Tensor,
-        num_tokens_per_expert: torch.Tensor,
-    ) -> torch.Tensor:
-        global TOKEN_GROUP_ALIGN_SIZE_M
-        if isinstance(w1, DTensor):
-            w1 = w1.to_local()
-            w2 = w2.to_local()
-            w3 = w3.to_local()
-
-        from moe_utils import generate_permute_indices, TOKEN_GROUP_ALIGN_SIZE_M
-
-        experts_per_ep_rank = w1.shape[0]
-        num_ep_ranks = num_tokens_per_expert.shape[0] // experts_per_ep_rank
-
-        with torch.no_grad():
-            (
-                permuted_indices,
-                num_tokens_per_expert,
-                _,  # offsets,
-            ) = generate_permute_indices(
-                num_tokens_per_expert,
-                experts_per_ep_rank,
-                num_ep_ranks,
-                x.shape[0] + experts_per_ep_rank * TOKEN_GROUP_ALIGN_SIZE_M,
-                TOKEN_GROUP_ALIGN_SIZE_M,
-            )
-
-        x = torch.vstack((x, x.new_zeros((x.shape[-1]))))
-        input_shape = x.shape
-        x = x[permuted_indices, :]
-
-        out = func(w1, w2, w3, x, num_tokens_per_expert)
-
-        out_unpermuted = out.new_empty(input_shape)
-        out_unpermuted[permuted_indices, :] = out
-        out = out_unpermuted[:-1]
-
-        return out
-
-    return wrapper
 
 
 @dataclass
@@ -357,28 +281,36 @@ class MoE(nn.Module):
                 self.tokens_per_expert.add_(
                     torch.sum(num_tokens_per_expert.sum(dim=0), dim=0)
                 )
-        # routed_input shape (ob, ib*slen*top_k, dim)
+        # routed_input shape (ob, padded_length, dim) - padded and permuted
         # top_scores_experts_sorted shape (ob, ib*slen*top_k,)
         # token_indices_experts_sorted shape (ob, ib*slen*top_k,)
-        (routed_input, top_scores_experts_sorted, token_indices_experts_sorted) = (
-            token_dispatch(
-                x,
-                top_scores,
-                selected_experts_indices,
-                num_tokens_per_expert,
-                num_experts=self.router.num_experts,
-                top_k=self.top_k,
-                score_before_experts=self.score_before_experts,
-                ep_mesh=None,
-            )
+        # batch_permuted_indices shape (ob, padded_length) - permutation indices
+        # routed_input_shape_before_permute list[torch.Size] - original shapes before permutation
+        (
+            padded_permuted_routed_input,
+            top_scores_experts_sorted,
+            token_indices_experts_sorted,
+            batch_permuted_indices,
+            routed_input_shape_before_permute,
+        ) = token_dispatch_op(
+            x,
+            top_scores,
+            selected_experts_indices,
+            num_tokens_per_expert,
+            self.router.num_experts,
+            self.top_k,
+            self.score_before_experts,
+            None,  # mesh
         )
 
-        # shape (bs*slen*top_k, dim)
-        routed_output = self.experts(routed_input, num_tokens_per_expert)
+        # shape (ob, padded_length, dim) - experts process padded/permuted input
+        padded_permuted_routed_output = self.experts(
+            padded_permuted_routed_input, num_tokens_per_expert
+        )
 
         if not self.score_before_experts:
-            routed_output = (
-                routed_output.to(torch.float32)
+            padded_permuted_routed_output = (
+                padded_permuted_routed_output.to(torch.float32)
                 * top_scores_experts_sorted.unsqueeze(-1)
             ).to(x.dtype)
 
@@ -388,16 +320,18 @@ class MoE(nn.Module):
         else:
             out = torch.zeros_like(x)
 
-        out = token_combine(
+        out = token_combine_op(
             out,
-            routed_output,
+            padded_permuted_routed_output,
             top_scores_experts_sorted,
             token_indices_experts_sorted,
+            batch_permuted_indices,
+            routed_input_shape_before_permute,
             num_tokens_per_expert,
-            num_experts=self.router.num_experts,
-            top_k=self.top_k,
-            score_before_experts=self.score_before_experts,
-            ep_mesh=None,
+            self.router.num_experts,
+            self.top_k,
+            self.score_before_experts,
+            None,  # mesh
         )
         out = out.reshape(ob, ib, slen, dim)
         return out
