@@ -7,15 +7,10 @@
 from dataclasses import dataclass
 from typing import Literal
 
+import moe_ops
+
 import torch
 import torch.nn.functional as F
-
-from moe_ops import (
-    batched_grouped_mm,
-    batched_histc,
-    token_combine_op,
-    token_dispatch_op,
-)
 from torch import nn
 
 
@@ -91,14 +86,14 @@ class GroupedExperts(nn.Module):
         offsets = torch.cumsum(num_tokens_per_expert, dim=1, dtype=torch.int32)
         # grouped mm between a 3D tensor and a 3D tensor and 2D offsets
         h = F.silu(
-            batched_grouped_mm(
+            torch.ops.autoparallel.batched_grouped_mm(
                 x.bfloat16(), self.w1.bfloat16().transpose(-2, -1), offs=offsets
             )
         )
-        h = h * batched_grouped_mm(
+        h = h * torch.ops.autoparallel.batched_grouped_mm(
             x.bfloat16(), self.w3.bfloat16().transpose(-2, -1), offs=offsets
         )
-        out = batched_grouped_mm(
+        out = torch.ops.autoparallel.batched_grouped_mm(
             h, self.w2.bfloat16().transpose(-2, -1), offs=offsets
         ).type_as(x)
         return out
@@ -192,7 +187,7 @@ class TokenChoiceTopKRouter(nn.Module):
 
         # group tokens together by expert indices from 0 to num_experts and pass that to experts forward
         # num_tokens_per_expert has shape (ob, num_experts,)
-        num_tokens_per_expert = batched_histc(
+        num_tokens_per_expert = torch.ops.autoparallel.batched_histc(
             selected_experts_indices.reshape(selected_experts_indices.shape[0], -1),
             bins=self.num_experts,
             min=0,
@@ -278,9 +273,7 @@ class MoE(nn.Module):
         #       effect on the expert bias update thanks to the torch.sign() operator.
         if self.load_balance_coeff is not None:
             with torch.no_grad():
-                self.tokens_per_expert.add_(
-                    torch.sum(num_tokens_per_expert.sum(dim=0), dim=0)
-                )
+                self.tokens_per_expert.add_(torch.sum(num_tokens_per_expert, dim=0))
         # routed_input shape (ob, padded_length, dim) - padded and permuted
         # top_scores_experts_sorted shape (ob, ib*slen*top_k,)
         # token_indices_experts_sorted shape (ob, ib*slen*top_k,)
@@ -292,7 +285,7 @@ class MoE(nn.Module):
             token_indices_experts_sorted,
             batch_permuted_indices,
             routed_input_shape_before_permute,
-        ) = token_dispatch_op(
+        ) = torch.ops.autoparallel.token_dispatch(
             x,
             top_scores,
             selected_experts_indices,
@@ -308,19 +301,13 @@ class MoE(nn.Module):
             padded_permuted_routed_input, num_tokens_per_expert
         )
 
-        if not self.score_before_experts:
-            padded_permuted_routed_output = (
-                padded_permuted_routed_output.to(torch.float32)
-                * top_scores_experts_sorted.unsqueeze(-1)
-            ).to(x.dtype)
-
         # shared expert
         if self.shared_experts is not None:
             out = self.shared_experts(x)
         else:
             out = torch.zeros_like(x)
 
-        out = token_combine_op(
+        out = torch.ops.autoparallel.token_combine(
             out,
             padded_permuted_routed_output,
             top_scores_experts_sorted,
