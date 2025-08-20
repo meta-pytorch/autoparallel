@@ -4,6 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import contextlib
+import copy
 import operator
 from typing import Any
 
@@ -243,11 +244,20 @@ def rename_placeholder_node(
         fx_g.graph.erase_node(node)
 
 
+def _get_inductor_decomp_table():
+    decomp_table = copy.copy(select_decomp_table())
+    # desugar our custom operator now that we've computed the sharding decision
+    decomp_table[torch.ops.autoparallel.dtype_cast.default] = lambda x, dtype: x.to(
+        dtype
+    )
+    return decomp_table
+
+
 def apply_sharding_to_model(gm, sharding_placement, params_spec, buffers_spec):
     args = shard_nodes_given_placements(gm, sharding_placement)
     local_args = [arg.to_local() for arg in args]
 
-    decomp_table = select_decomp_table()
+    decomp_table = _get_inductor_decomp_table()
     # run with DTensor to apply the collectives given the graph
     interp = ApplyShardingInterpreter(gm, sharding_placement, decomp_table)
 
