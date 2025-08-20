@@ -238,6 +238,9 @@ def estimate_strategy_comms_cost(src_spec, tgt_spec):
     factor = 1 / 0.8
     compute_cost *= factor
 
+    # suppose 70% efficiency for comms
+    comms_cost *= 1 / 0.7
+
     return comms_cost + compute_cost
 
 
