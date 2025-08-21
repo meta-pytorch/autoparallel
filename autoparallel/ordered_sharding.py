@@ -36,7 +36,12 @@ def _optimize_same_nd_sharding_as_1d(
 
     print(f"Doing optimization for {str(curr_spec)} -> {str(tgt_spec)}")
     mesh = curr_spec.device_mesh
-    flat_mesh = mesh._flatten()
+    # TODO: remove ndim == 1 special case once
+    # DeviceMesh._flatten is fixed
+    if mesh.ndim != 1:
+        flat_mesh = mesh._flatten()
+    else:
+        flat_mesh = mesh
     flat_curr_spec = DTensorSpec(
         flat_mesh, (curr_spec_first,), tensor_meta=curr_spec.tensor_meta
     )

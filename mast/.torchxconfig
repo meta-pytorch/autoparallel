@@ -1,0 +1,24 @@
+[mast_conda]
+conda_path_in_fbpkg = conda
+activate_conda = False
+fbpkg_ids = fb-py-spy:prod
+hpcIdentity = pytorch_distributed
+rmAttribution = pytorch4all_clients_approved
+workspace_fbpkg_name = torchtitan_workspace
+conda_pack_ignore_missing_files = True
+git = False
+hpcJobOncall = meta_conda
+modelTypeName = gen_ai_conda
+hpcClusterUuid = MastProdCluster
+forceSingleRegion = False
+use_caf = False
+
+[component:mast.py:train]
+name = torchtitan
+; other hardware options can be found at
+; https://www.internalfb.com/code/fbsource/fbcode/torchx/specs/fb/named_resources.py
+h=grandteton
+run_as_root = True
+
+[cli:run]
+scheduler = mast_conda

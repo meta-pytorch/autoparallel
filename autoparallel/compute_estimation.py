@@ -213,8 +213,6 @@ def estimate_strategy_runtime_cost(node, strategy):
     args = tree_map_only(torch.fx.Node, lambda x: x.meta["val"], node.args)
     kwargs = tree_map_only(torch.fx.Node, lambda x: x.meta["val"], node.kwargs)
 
-    fake_mode = torch._guards.detect_fake_mode(args)
-
     if len(kwargs) > 0:
         for k, v in kwargs.items():
             assert not isinstance(v, torch.Tensor), f"{node} {v}"
@@ -222,16 +220,16 @@ def estimate_strategy_runtime_cost(node, strategy):
         _get_sharded_shape_stride(spec) for spec in strategy.input_specs
     )
 
+    flat_args, treespec = tree_flatten(args)
+    new_flat_args = []
     counter = 0
-    args = list(args)
-    for i, arg in enumerate(args):
-        if isinstance(arg, torch.Tensor):
-            with fake_mode:
-                sizes, strides = args_sizes_strides[counter]
-                args[i] = torch.empty_strided(
-                    sizes, strides, device=arg.device, dtype=arg.dtype
-                )
+    for x in flat_args:
+        if isinstance(x, torch.Tensor):
+            sizes, strides = args_sizes_strides[counter]
+            x = torch.empty_strided(sizes, strides, device=x.device, dtype=x.dtype)
             counter += 1
+        new_flat_args.append(x)
+    args = treespec.unflatten(new_flat_args)
 
     # TODO: maybe cache the flop_counter to avoid recreating it
     # all the time
