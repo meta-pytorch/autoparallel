@@ -694,6 +694,22 @@ def _(mesh, op_schema):
     return sdpa_rule(op, mesh, op_schema)
 
 
+@register_opschema_rule(
+    torch.ops.aten._scaled_dot_product_flash_attention_backward.default
+)
+def _(mesh, op_schema):
+    op = torch.ops.aten._scaled_dot_product_flash_attention_backward.default
+    return sdpa_rule(op, mesh, op_schema)
+
+
+@register_opschema_rule(
+    torch.ops.aten._scaled_dot_product_efficient_attention_backward.default
+)
+def _(mesh, op_schema):
+    op = torch.ops.aten._scaled_dot_product_efficient_attention_backward.default
+    return sdpa_rule(op, mesh, op_schema)
+
+
 @register_opschema_rule(torch.ops.aten.reshape.default)
 def reshape_rule(mesh, op_schema):
     op = torch.ops.aten.reshape.default
