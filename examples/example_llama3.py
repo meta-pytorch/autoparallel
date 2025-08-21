@@ -582,6 +582,7 @@ else:
 batch_size = 4 * mesh.shape[0]
 seqlen = 2048 * 4
 vocab_size = 128256
+use_vocab_parallel = not use_1d_mesh
 device = torch.device("cuda")
 
 
@@ -616,9 +617,14 @@ with AutoParallel(
     autop.add_parameter_memory_constraint(low=None, high=None)
 
     x_sharding = (Shard(0),) + (Replicate(),) * (mesh.ndim - 1)
+    out_sharding = x_sharding
+    if use_vocab_parallel:
+        # add vocab parallel constraint
+        assert mesh.ndim == 2, "Only 2d mesh supported here"
+        out_sharding = (Shard(0), Shard(2))
 
     autop.add_input_constraints([x_sharding])
-    autop.add_output_constraints([x_sharding])
+    autop.add_output_constraints([out_sharding])
 
     # example of how to add manual constraints
     if use_1d_mesh:
