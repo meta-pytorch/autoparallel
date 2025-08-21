@@ -1,8 +1,3 @@
-# Copyright (c) Facebook, Inc. and its affiliates. All rights reserved.
-# #
-# # This source code is licensed under the BSD license found in the
-# # LICENSE file in the root directory of this source tree.
-
 #!/bin/bash
 export PS4=' + [$(date +"%Y-%m-%d %H:%M:%S,%3N")] '
 set -eExu -o pipefail
