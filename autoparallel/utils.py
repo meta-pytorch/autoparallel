@@ -11,6 +11,7 @@ from torch.distributed.tensor._op_schema import (
     OpSchema,
     OpSpec,
     OpStrategy,
+    RuntimeSchemaInfo,
     TupleStrategy,
 )
 from torch.distributed.tensor._ops.utils import generate_redistribute_costs
@@ -151,6 +152,7 @@ def get_placement_options(mesh, op, specs, user_args, user_kwargs):
         return out_strat
 
     strat = []
+    needs_pytree = False
     for spec in specs:
         if isinstance(spec, OpStrategy):
             strat.append(spec)
@@ -160,11 +162,12 @@ def get_placement_options(mesh, op, specs, user_args, user_kwargs):
             and any(isinstance(x, OpStrategy) for x in spec)
         ):
             strat.append(TupleStrategy(spec))
+            needs_pytree = True
         else:
             strat.append(spec)
     strat = tuple(strat)
 
-    op_schema = OpSchema(op, strat, {})
+    op_schema = OpSchema(op, strat, {}, RuntimeSchemaInfo(needs_pytree=needs_pytree))
 
     if op in _op_partial_rules:
         out_strat = _op_partial_rules[op](mesh, op_schema)
