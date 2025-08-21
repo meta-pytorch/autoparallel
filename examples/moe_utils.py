@@ -256,26 +256,27 @@ def batched_generate_permute_indices(
         batched_m_sizes: aligned number of tokens for each expert (padded to alignment boundary).
         batched_m_offsets: Cumulative sum of m_sizes. The exclusive ending position for each expert's tokens.
     """
-    batched_permuted_indices = []
-    batched_m_sizes = []
-    batched_m_offsets = []
-    for tokens_per_expert_group, max_len in zip(
-        batched_tokens_per_expert_group, batched_max_len
-    ):
-        permuted_indices, m_sizes, m_offsets = generate_permute_indices(
-            tokens_per_expert_group,
-            experts_per_rank,
-            num_ranks,
-            max_len,
-            alignment,
-            use_cpu,
-        )
-        batched_permuted_indices.append(permuted_indices)
-        batched_m_sizes.append(m_sizes)
-        batched_m_offsets.append(m_offsets)
-    batched_permuted_indices = torch.stack(batched_permuted_indices)
-    batched_m_sizes = torch.stack(batched_m_sizes)
-    batched_m_offsets = torch.stack(batched_m_offsets)
+    with torch.no_grad():
+        batched_permuted_indices = []
+        batched_m_sizes = []
+        batched_m_offsets = []
+        for tokens_per_expert_group, max_len in zip(
+            batched_tokens_per_expert_group, batched_max_len
+        ):
+            permuted_indices, m_sizes, m_offsets = generate_permute_indices(
+                tokens_per_expert_group,
+                experts_per_rank,
+                num_ranks,
+                max_len,
+                alignment,
+                use_cpu,
+            )
+            batched_permuted_indices.append(permuted_indices)
+            batched_m_sizes.append(m_sizes)
+            batched_m_offsets.append(m_offsets)
+        batched_permuted_indices = torch.stack(batched_permuted_indices)
+        batched_m_sizes = torch.stack(batched_m_sizes)
+        batched_m_offsets = torch.stack(batched_m_offsets)
     return batched_permuted_indices, batched_m_sizes, batched_m_offsets
 
 

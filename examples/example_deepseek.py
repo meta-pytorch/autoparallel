@@ -281,10 +281,13 @@ class MoE(nn.Module):
         # routed_input_shape_before_permute list[torch.Size] - original shapes before permutation
         (
             padded_permuted_routed_input,
+            tokens_per_expert,
             top_scores_experts_sorted,
             token_indices_experts_sorted,
-            batch_permuted_indices,
+            permuted_indices,
             routed_input_shape_before_permute,
+            input_splits,
+            output_splits,
         ) = torch.ops.autoparallel.token_dispatch(
             x,
             top_scores,
@@ -298,7 +301,7 @@ class MoE(nn.Module):
 
         # shape (ob, padded_length, dim) - experts process padded/permuted input
         padded_permuted_routed_output = self.experts(
-            padded_permuted_routed_input, num_tokens_per_expert
+            padded_permuted_routed_input, tokens_per_expert
         )
 
         # shared expert
@@ -312,12 +315,11 @@ class MoE(nn.Module):
             padded_permuted_routed_output,
             top_scores_experts_sorted,
             token_indices_experts_sorted,
-            batch_permuted_indices,
+            permuted_indices,
             routed_input_shape_before_permute,
-            num_tokens_per_expert,
-            self.router.num_experts,
-            self.top_k,
             self.score_before_experts,
+            input_splits,
+            output_splits,
             None,  # mesh
         )
         out = out.reshape(ob, ib, slen, dim)
