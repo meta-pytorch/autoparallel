@@ -217,7 +217,11 @@ class AutoParallel:
                 inputs = (inputs,)
 
         with set_dtype_cast(True):
-            ep = torch.export.export(self.model, inputs)
+            with torch._dynamo.config.patch(install_free_tensors=True):
+                # pre-dispatch graph
+                ep = torch.export.export(self.model, inputs, strict=True)
+
+            # post-dispatch graph
             self.joint_with_descriptors = aot_export_joint_with_descriptors(
                 self.stack,
                 ep.module(),

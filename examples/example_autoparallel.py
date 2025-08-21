@@ -134,10 +134,8 @@ mm_nodes = autop.gm.graph.find_nodes(
     op="call_function", target=torch.ops.aten.mm.default
 )
 
-# assert (
-#     mm_nodes[0].meta.get("recompute")
-#     == torch.utils.checkpoint.CheckpointPolicy.PREFER_RECOMPUTE
-# )
-
-# TODO: change this assert once we fix AC
-assert mm_nodes[0].meta.get("recompute") is None
+# Tags are on the graph, but won't recompute until we land the pre-dispatch AC HOP
+assert (
+    mm_nodes[0].meta.get("recompute")
+    == torch.utils.checkpoint.CheckpointPolicy.PREFER_RECOMPUTE
+)
