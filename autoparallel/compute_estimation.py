@@ -230,7 +230,7 @@ def compute_memory_cost(op, args, outs):
 def estimate_strategy_comms_cost(src_spec, tgt_spec):
     # TODO: need to use optimal redistribution cost instead
     comms_cost = redistribute_cost(src_spec, tgt_spec)
-    compute_cost = 0
+    total_read_write_bytes = 0
 
     src_sizes, _ = _get_sharded_shape_stride(src_spec)
     tgt_sizes, _ = _get_sharded_shape_stride(tgt_spec)
@@ -239,22 +239,34 @@ def estimate_strategy_comms_cost(src_spec, tgt_spec):
 
     for src_plc, tgt_plc in zip(src_spec.placements, tgt_spec.placements):
         if src_plc.is_partial() and tgt_plc.is_shard() and tgt_plc.dim != 0:
-            # add cost of additional cat on full size
-            # *2 because we need to count input and output reads
+            # penalize cases like P -> S(1) as there are additional compute cost
+            # which corresponds to reshuffling the whole input tensor
+            # we multiply the cost by 2 because we need to count input and output
+            # reads for the reshuffle
             read_write_bytes = (
                 math.prod(src_sizes) * 2 * src_spec.tensor_meta.dtype.itemsize
             )
-            compute_cost += read_write_bytes / gpu_memory_bandwidth * 1e6  # us
+            total_read_write_bytes += read_write_bytes
         elif src_plc.is_shard() and src_plc.dim != 0 and tgt_plc.is_replicate():
-            # add cost of additional cat on full size
-            # *2 because we need to count input and output reads
+            # penalize cases like  S(1) -> R as there are additional compute cost
+            # which corresponds to reshuffling the whole output tensor
+            # we multiply the cost by 2 because we need to count input and output
+            # reads for the reshuffle
             read_write_bytes = (
                 math.prod(tgt_sizes) * 2 * tgt_spec.tensor_meta.dtype.itemsize
             )
-            compute_cost += read_write_bytes / gpu_memory_bandwidth * 1e6  # us
+            total_read_write_bytes += read_write_bytes
         elif src_plc.is_replicate() and tgt_plc.is_partial():
             # forbit  R -> P case as this doesn't make sense for us
-            compute_cost += math.inf
+            total_read_write_bytes += math.inf
+
+    compute_cost = total_read_write_bytes / gpu_memory_bandwidth * 1e6  # us
+    # suppose 80% efficiency for memory-bound ops
+    factor = 1 / 0.8
+    compute_cost *= factor
+
+    # suppose 70% efficiency for comms
+    comms_cost *= 1 / 0.7
 
     return comms_cost + compute_cost
 

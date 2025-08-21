@@ -121,6 +121,7 @@ class AutoParallel:
         enable_ac: bool = True,
         # None means 'auto'
         ac_stage_size_in_GiB: Optional[Union[float, str]] = "auto",
+        **kwargs,
     ):
         self.stack = ExitStack()
         self.fake_mode = (
@@ -130,6 +131,7 @@ class AutoParallel:
         if mp_policy is not None:
             mp_policy = canonicalize_mp(mp_policy)
         self.mp_policy = mp_policy
+        self.kwargs = kwargs
         # copy user model to avoid modifying it in-place
         # in dtype casting and move_to_fake
         model = copy.deepcopy(model)
@@ -171,7 +173,10 @@ class AutoParallel:
                 # dtype
                 rescale_grad_comm_cost_for_mp *= 1.1
         sharding_optimizer = ShardingOptimizer(
-            self.gm, self.mesh, rescale_grad_comm_cost_for_mp
+            self.gm,
+            self.mesh,
+            rescale_grad_comm_cost_for_mp,
+            repeated_subgraphs=self.kwargs.get("repeated_subgraphs", False),
         )
 
         # makes sharding of params and gradients the same
@@ -323,7 +328,11 @@ class AutoParallel:
         with unset_fake_temporarily():
             # creates a new mesh and caches it internally
             # we don't need to keep a reference to it
-            self.mesh._flatten()
+            # TODO: remove ndim == 1 special case once
+            # DeviceMesh._flatten is fixed
+            mesh = self.mesh
+            if mesh.ndim != 1:
+                mesh._flatten()
         with self.fake_mode:
             (
                 parallel_gm,
