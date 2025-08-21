@@ -228,7 +228,7 @@ def estimate_strategy_runtime_cost(node, strategy):
             sizes, strides = args_sizes_strides[counter]
             x = torch.empty_strided(sizes, strides, device=x.device, dtype=x.dtype)
             counter += 1
-            new_flat_args.append(x)
+        new_flat_args.append(x)
     args = treespec.unflatten(new_flat_args)
 
     # TODO: maybe cache the flop_counter to avoid recreating it
