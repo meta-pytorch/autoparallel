@@ -338,6 +338,9 @@ class ShardingOptimizer:
                             "cost": comm_cost
                             + compute_cost / num_args[s_i]
                             + sharding_transition_cost,
+                            "compute_cost": compute_cost / num_args[s_i],
+                            "comm_cost": comm_cost,
+                            "sharding_transition_cost": sharding_transition_cost,
                             "full_strat": ssi,
                             "out_strat": ssi.output_specs,
                             "inp_strat": ssi.input_specs[argi],
@@ -615,7 +618,10 @@ class ShardingOptimizer:
                 continue
             d = opt[node]
             strat = str(d[0]["full_strat"])
-            costs = [x["cost"] for x in d]
+            costs = [
+                (x["comm_cost"], x["compute_cost"], x["sharding_transition_cost"])
+                for x in d
+            ]
             line = f"  {plc_txt}{attr_color(strat)}{cost_txt}{attr_color(str(costs))}"
             if node.op == "placeholder":
                 line = f"    # {node.name}: {line}"
