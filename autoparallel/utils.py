@@ -243,8 +243,8 @@ def get_local_map_placement_option(
     return OpStrategy(
         [
             OpSpec(
-                output_specs=out_specs,
-                input_specs=in_specs,
+                output_specs=tuple(out_specs),
+                input_specs=tuple(in_specs),
                 redistribute_cost=redistribute_costs,
             )
         ]
