@@ -19,7 +19,7 @@ from torch.distributed.tensor.placement_types import (  # noqa
 )
 from torch.utils._pytree import tree_flatten
 
-from .redistribute_tensor import redistribute_local_tensor
+from .dtensor_util.redistribute_tensor import redistribute_local_tensor
 
 
 def _optimize_same_nd_sharding_as_1d(
@@ -75,17 +75,19 @@ def ordered_redistribute_local_tensor(
     The optimizations that we support for now are hard-coded, and we should
     generalize this in the future.
     """
-    # canonical = tuple(reversed(range(len(curr_spec.placements))))
-    canonical = tuple(range(len(curr_spec.placements)))
+    # canonical = tuple(reversed(range(curr_spec.mesh.ndim)))
+    canonical = tuple(range(curr_spec.mesh.ndim))
     if placement_order is None:
         placement_order = canonical
-
+    curr_spec.device_order = placement_order
+    tgt_spec.device_order = canonical
+    if placement_order != canonical:
+        print('============')
+        print(f"Doing optimization for {str(curr_spec)}{placement_order} -> {str(tgt_spec)}{canonical}")
     return redistribute_local_tensor(
         arg,
         curr_spec,
         tgt_spec,
-        src_device_order=placement_order,
-        dst_device_order=canonical,
     )
 
 
