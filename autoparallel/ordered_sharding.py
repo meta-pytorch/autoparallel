@@ -4,18 +4,25 @@
 # LICENSE file in the root directory of this source tree.
 
 import itertools
+from typing import Optional, Union
 
 import torch
 from torch._functorch._aot_autograd.fx_utils import get_param_and_grad_nodes
 from torch.distributed._tensor.placement_types import DTensorSpec
+from torch.distributed.tensor._op_schema import OpSpec
 from torch.distributed.tensor._redistribute import redistribute_local_tensor
-from torch.distributed.tensor.placement_types import Partial, Replicate, Shard  # noqa
+from torch.distributed.tensor.placement_types import (  # noqa
+    Partial,
+    Placement,
+    Replicate,
+    Shard,
+)
 from torch.utils._pytree import tree_flatten
 
 
 def _optimize_same_nd_sharding_as_1d(
     arg: torch.Tensor, curr_spec: DTensorSpec, tgt_spec: DTensorSpec
-):
+) -> torch.Tensor:
     """
     This function optimizes the case where the current and target placements
     have the same placements for all mesh dimensions. For example, if the
@@ -56,7 +63,7 @@ def ordered_redistribute_local_tensor(
     curr_spec: DTensorSpec,
     tgt_spec: DTensorSpec,
     placement_order=None,
-):
+) -> torch.Tensor:
     """
     This is a simplified version of redistribute_local_tensor that optimizes
     a couple of specific cases by introducing an ordering information to the
@@ -100,7 +107,9 @@ def ordered_redistribute_local_tensor(
     return x
 
 
-def get_redistributed_input_placements(node, sharding_placement):
+def get_redistributed_input_placements(
+    node: torch.fx.Node, sharding_placement: dict[torch.fx.Node, OpSpec]
+) -> dict[torch.fx.Node, tuple[tuple[Placement, ...], tuple[Placement, ...]]]:
     """
     This function returns a map of input nodes to their current and target
     placements, for the inputs that need to be redistributed.
@@ -110,11 +119,11 @@ def get_redistributed_input_placements(node, sharding_placement):
         x for x in tree_flatten(node.args)[0] if isinstance(x, torch.fx.Node)
     ]
     num_input_nodes = len(all_input_nodes)
-    curr_specs = [
+    curr_specs: list[Union[DTensorSpec, tuple[Optional[DTensorSpec], ...]]] = [
         sharding_placement[n].output_specs for n in all_input_nodes
     ]  # FIXME ?
-    tgt_specs = [
-        sharding_placement[node].input_specs[c] for c in range(num_input_nodes)
+    tgt_specs: list[DTensorSpec] = [
+        sharding_placement[node].input_specs[c] for c in range(num_input_nodes)  # type: ignore[index]
     ]
 
     res = {}
@@ -122,6 +131,8 @@ def get_redistributed_input_placements(node, sharding_placement):
         tgt_placements = tuple(
             p if not p.is_partial() else Replicate() for p in tgt_spec.placements
         )
+        if not isinstance(curr_spec, DTensorSpec):
+            raise NotImplementedError("No support for ops with multiple outputs yet")
         if curr_spec.placements != tgt_spec.placements:
             res[all_input_nodes[i]] = (curr_spec.placements, tgt_placements)
     return res

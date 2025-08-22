@@ -9,3 +9,5 @@ flake8 == 6.1.0
 flake8-copyright
 isort == 5.7.0
 mypy == 1.10.0
+tabulate
+types-tabulate
