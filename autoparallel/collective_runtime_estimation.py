@@ -14,6 +14,16 @@ from torch.distributed.tensor._collective_utils import (
 from torch.distributed.tensor.placement_types import Partial, Shard
 
 
+def all_to_all_cost(bytes_gb: float, mesh_topo: MeshTopoInfo, mesh_dim: int) -> float:
+    num_devices_on_mesh_dim = mesh_topo.mesh_dim_devices[mesh_dim]
+    mesh_dim_bandwidth = mesh_topo.mesh_dim_bandwidth[mesh_dim]
+    num_hops = num_devices_on_mesh_dim**2
+    # base latency + comm latency
+    latency = 6.6 + num_hops * mesh_topo.mesh_dim_latency[mesh_dim]  # us
+    bw = (bytes_gb * num_hops / num_devices_on_mesh_dim) / mesh_dim_bandwidth  # s
+    return latency + bw * 1e6  # rescale to us
+
+
 # this is a copy-paste from https://github.com/pytorch/pytorch/blob/main/torch/distributed/tensor/_collective_utils.py
 # with iteration order introduced
 # TODO: this should be improved, as we just really use the non-canonical order for
@@ -64,7 +74,7 @@ def redistribute_cost(
         elif current.is_shard() and target.is_shard():
             # should be alltoall comm, since we haven't implement it yet, add penalty
             # to favor allgather instead
-            cost += allgather_cost(comm_bytes_gb, mesh_topo, i) + 1.0
+            cost += all_to_all_cost(comm_bytes_gb, mesh_topo, i)
         elif current.is_partial() and target.is_replicate():
             # add up allreduce comm cost
             cost += allreduce_cost(comm_bytes_gb, mesh_topo, i)
