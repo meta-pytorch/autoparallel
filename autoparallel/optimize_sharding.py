@@ -96,6 +96,7 @@ from torch.distributed.tensor._dtensor_spec import DTensorSpec
 from torch.distributed.tensor.placement_types import Placement, Replicate, Shard
 from torch.utils._pytree import tree_flatten, tree_map_only
 
+from .collective_runtime_estimation import estimate_strategy_comms_cost
 from .compute_estimation import (
     _get_sharded_shape_stride,
     estimate_strategy_runtime_cost,
@@ -301,6 +302,19 @@ class ShardingOptimizer:
                     if node.op != "placeholder":
                         argi_strat = self.strats[self._all_input_nodes(node)[argi]]
                     for ii, comm_cost in enumerate(xxi):
+                        if node.op != "placeholder":
+                            src_spec = argi_strat.strategies[ii].output_specs
+                            # TODO: operator.getitem being special is something
+                            # we might want to change in the future
+                            if node.target == operator.getitem:
+                                src_spec = src_spec[node.args[1]]
+                            tgt_spec = ssi.input_specs[argi]
+                            assert isinstance(src_spec, DTensorSpec)
+                            assert isinstance(tgt_spec, DTensorSpec)
+                            # we use our custom comm_cost function to estimate the cost
+                            # of the collective operation
+                            comm_cost = estimate_strategy_comms_cost(src_spec, tgt_spec)
+
                         if node in grad_param_nodes:
                             comm_cost = comm_cost / self.rescale_grad_comm_cost_for_mp
                         # Imagine we start node_i from S(0)S(0) and we want to reach node_{i+2} at
