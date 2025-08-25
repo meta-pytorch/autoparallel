@@ -83,6 +83,7 @@ def _add_alias(gm):
     nodes = [n for n in graph.nodes if n.op == "call_function"]
     node_map = {node: idx for idx, node in enumerate(nodes)}
     inputs = graph.find_nodes(op="placeholder")
+    """
     for node in inputs:
         if len(node.users) == 0:
             # node is not used, don't add alias for it
@@ -92,6 +93,23 @@ def _add_alias(gm):
             and list(node.users)[0].target == torch.ops.autoparallel.dtype_cast.default
         ):
             node = list(node.users)[0]
+        first_user = nodes[min(node_map[n] for n in node.users)]
+        with graph.inserting_before(first_user):
+            alias_node = graph.call_function(torch.ops.aten.alias.default, args=(node,))
+            alias_node.meta.update(node.meta)
+
+            def delete_user_cb(n):
+                return n != alias_node
+
+            node.replace_all_uses_with(alias_node, delete_user_cb=delete_user_cb)
+    """
+
+    for node in inputs + nodes:
+        if len(node.users) < 2:
+            continue
+        # skip ops which return tuple
+        if not isinstance(node.meta["val"], torch.Tensor):
+            continue
         first_user = nodes[min(node_map[n] for n in node.users)]
         with graph.inserting_before(first_user):
             alias_node = graph.call_function(torch.ops.aten.alias.default, args=(node,))
