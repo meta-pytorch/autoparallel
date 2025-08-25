@@ -635,7 +635,15 @@ class ShardingOptimizer:
             l_id += 1
         code = "\n".join(code)
         total_cost = sum(self.ds[x]["cost"] for x in self.res)
+        total_comm_cost = sum(self.ds[x]["comm_cost"] for x in self.res)
+        total_compute_cost = sum(self.ds[x]["compute_cost"] for x in self.res)
+        total_transition_cost = sum(
+            self.ds[x]["sharding_transition_cost"] for x in self.res
+        )
         code += f"\ntotal_cost: {total_cost:.2f}"
+        code += f"\n  comm_cost: {total_comm_cost:.2f}"
+        code += f"\n  compute_cost: {total_compute_cost:.2f}"
+        code += f"\n  transition_cost: {total_transition_cost:.2f}"
         code += "\n" + self.get_violated_constraints_log()
         return code
 
