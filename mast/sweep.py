@@ -88,21 +88,29 @@ def maybe_find_pulp(maybe_path: Optional[str] = None) -> Optional[str]:
     return None
 
 
+llama3_1d_common_opts = [
+    "--training.local_batch_size=1",
+    "--parallelism.tensor_parallel_degree=1",
+]
+llama3_2d_common_opts = [
+    "--training.local_batch_size=2",
+    "--parallelism.tensor_parallel_degree=8",
+]
 llama3_1d = {
-    "llama3_FSDP_compile": [
+    "llama3_FSDP_compile": llama3_1d_common_opts
+    + [
         "--model.name=llama3",
         "--training.compile",
-        "--parallelism.tensor_parallel_degree=1",
     ],
-    "llama3_autop_1d_compile": [
+    "llama3_autop_1d_compile": llama3_1d_common_opts
+    + [
         "--model.name=llama3_auto_parallel",
         "--training.compile",
-        "--parallelism.tensor_parallel_degree=1",
     ],
-    "llama3_autop_1d_compile_bucket_reorder": [
+    "llama3_autop_1d_compile_bucket_reorder": llama3_1d_common_opts
+    + [
         "--model.name=llama3_auto_parallel",
         "--training.compile",
-        "--parallelism.tensor_parallel_degree=1",
         "--experimental.bucket_all_gathers_fx=fsdp",
         "--experimental.bucket_reduce_scatters_fx=fsdp",
         "--experimental.reorder_for_compute_comm_overlap",
@@ -110,20 +118,20 @@ llama3_1d = {
 }
 
 llama3_2d = {
-    "llama3_FSDP_tp_compile": [
+    "llama3_FSDP_tp_compile": llama3_2d_common_opts
+    + [
         "--model.name=llama3",
         "--training.compile",
-        "--parallelism.tensor_parallel_degree=8",
     ],
-    "llama3_autop_2d_compile": [
+    "llama3_autop_2d_compile": llama3_2d_common_opts
+    + [
         "--model.name=llama3_auto_parallel",
         "--training.compile",
-        "--parallelism.tensor_parallel_degree=8",
     ],
-    "llama3_autop_2d_compile_bucket_reorder": [
+    "llama3_autop_2d_compile_bucket_reorder": llama3_2d_common_opts
+    + [
         "--model.name=llama3_auto_parallel",
         "--training.compile",
-        "--parallelism.tensor_parallel_degree=8",
         "--experimental.bucket_all_gathers_fx=fsdp",
         "--experimental.bucket_reduce_scatters_fx=fsdp",
         "--experimental.reorder_for_compute_comm_overlap",
@@ -131,35 +139,52 @@ llama3_2d = {
 }
 
 test_run = {
-    "FSDP_tp_compile": [
+    "FSDP_tp_compile": llama3_2d_common_opts
+    + [
         "--model.name=llama3",
         "--training.compile",
-        "--parallelism.tensor_parallel_degree=8",
     ],
 }
 
-sweeps = {
-    "llama3_1d": llama3_1d,
-    "llama3_2d": llama3_2d,
-}
+
 all_runs = (
     llama3_1d
     | llama3_2d
     | {
-        "llama3_autop_1d_compile_ruisi_bucket_reorder": [
+        "llama3_autop_1d_compile_ruisi_bucket_reorder": llama3_1d_common_opts
+        + [
             "--model.name=llama3_auto_parallel",
             "--training.compile",
-            "--parallelism.tensor_parallel_degree=1",
             "--experimental.enable_simplefsdp_passes",
         ],
-        "llama3_autop_2d_compile_ruisi_bucket_reorder": [
+        "llama3_autop_2d_compile_ruisi_bucket_reorder": llama3_2d_common_opts
+        + [
             "--model.name=llama3_auto_parallel",
             "--training.compile",
-            "--parallelism.tensor_parallel_degree=8",
             "--experimental.enable_simplefsdp_passes",
         ],
     }
 )
+
+
+def build_sweep(names):
+    return {name: all_runs[name] for name in names}
+
+
+sweeps = {
+    "llama3_1d": llama3_1d,
+    "llama3_2d": llama3_2d,
+    "update3": build_sweep(
+        [
+            "llama3_FSDP_compile",
+            "llama3_autop_1d_compile",
+            "llama3_autop_1d_compile_ruisi_bucket_reorder",
+            "llama3_FSDP_tp_compile",
+            "llama3_autop_2d_compile",
+            "llama3_autop_2d_compile_ruisi_bucket_reorder",
+        ]
+    ),
+}
 
 
 def run(args: argparse.Namespace) -> None:
