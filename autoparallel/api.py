@@ -217,31 +217,11 @@ class AutoParallel:
                 inputs = (inputs,)
 
         with set_dtype_cast(True):
-            """
-            1. Why can't we use torch.export(strict=True)?
-              - defaults to pre-dispatch trace, doesn't work with SAC's TorchDispatchMode impl
-            2. Why can't we use torch.export._trace._export(pre_dispatch=False)?
-              - it first does a make_fx in no_grad, doesn't work with SAC's grad_mode based tagging
-
-            Directly calling _export_to_torch_ir allows us to still strict_mode trace
-            """
-
-            from torch.export import _trace
-
             with torch._dynamo.config.patch(install_free_tensors=True):
-                ep = _trace._export_to_torch_ir(
-                    self.model,
-                    inputs,
-                    {},  # kwargs
-                    None,  # dynamic_shapes
-                    preserve_module_call_signature=(),
-                    restore_fqn=False,  # don't need to restore because we will do it later
-                    allow_complex_guards_as_runtime_asserts=False,
-                    _log_export_usage=False,
-                )
+                ep = torch.export.export(self.model, inputs, strict=True)
             self.joint_with_descriptors = aot_export_joint_with_descriptors(
                 self.stack,
-                ep,
+                ep.module(),
                 inputs,
                 decompositions=decomp_table,
                 fw_compiler=self.compiler_fn,
