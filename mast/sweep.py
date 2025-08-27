@@ -260,15 +260,19 @@ def run(args: argparse.Namespace) -> None:
     for name, sub_cmd in runs.items():
         if extra_torchtitan_name:
             name += "_" + extra_torchtitan_name
-        logger.info(f"Launching {name}")
-        cmd = base_cmd + addl_libs + llama3_base + sub_cmd + extra_torchtitan_args
-        if args.dry_run:
-            # TODO configure log levels..
-            logger.warning(f"Dry-run: command for {name} is\n" + " ".join(cmd))
-            job_id = "dry-run"
-        else:
-            job_id = launch_job(cmd)
-        results[name] = job_id
+        for repeat in range(args.repeat):
+            full_name = name
+            if args.repeat > 1:
+                full_name += f"_repeat{repeat}"
+            logger.info(f"Launching {full_name}")
+            cmd = base_cmd + addl_libs + llama3_base + sub_cmd + extra_torchtitan_args
+            if args.dry_run:
+                # TODO configure log levels..
+                logger.warning(f"Dry-run: command for {full_name} is\n" + " ".join(cmd))
+                job_id = "dry-run"
+            else:
+                job_id = launch_job(cmd)
+            results[full_name] = job_id
 
     print("")
     print(
@@ -343,6 +347,11 @@ if __name__ == "__main__":
         type=int,
         default=8,
         help="How many nodes to use for the job, defaults to 8.",
+    )
+    parser.add_argument(
+        "--repeat",
+        type=int,
+        default=1,
     )
 
     args = parser.parse_args()
