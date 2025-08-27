@@ -8,7 +8,34 @@ from typing import Dict, Tuple
 
 import torch
 from torch.utils._pytree import tree_flatten, tree_map_only
-from torch.utils.flop_counter import FlopCounterMode
+from torch.utils.flop_counter import FlopCounterMode, register_flop_formula
+
+
+@register_flop_formula(torch.ops.aten.einsum, get_raw=True)
+def einsum_flop(equation, tensors, out=None, **kwargs) -> int:
+    # from torch.distributed.tensor._ops._einsum_strategy import EinsumDims
+    assert len(tensors) == 2
+    a_shape, b_shape = [x.shape for x in tensors]
+
+    # parse einop equation and extract dims
+    # TODO: generalize
+    # input_dims, output_dim = EinsumDims.parse_equation(equation)
+    # edims = EinsumDims.parse_dims(input_dims, output_dim)
+
+    if len(a_shape) == 3 and len(b_shape) == 3:
+        b, m, k = a_shape
+        b1, n, k2 = b_shape
+        assert b == b1
+        assert m == n
+        flop = (b * m) * k * k2 * 2
+    elif len(a_shape) == 3 and len(b_shape) == 2:
+        b, m, k = a_shape
+        k2, n = b_shape
+        assert k == k2
+        flop = b * m * n * k * 2
+    else:
+        raise NotImplementedError(f"Unsupported einsum shapes: {a_shape} {b_shape}")
+    return flop
 
 
 @dataclass

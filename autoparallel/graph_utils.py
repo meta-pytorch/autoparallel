@@ -153,3 +153,81 @@ def assert_has_no_collectives(gm: torch.fx.GraphModule):
                 f"autoparallel.local_map_hop.apply_local_map, see "
                 "examples/example_local_map.py for more information."
             )
+
+
+# NOTE: [nn.Linear decomposition]
+# PyTorch currently decomposes any 3d-input nn.Linear (and matmul) into a
+# sequence of view -> mm -> view operations.
+# This has as a consequence of breaking any type of sharding on both the
+# batch and the sequence dimension, because the flattening that happens doesn't
+# allow to preserve this sharding.
+# While we wait for PyTorch to avoid decomposing nn.Linear, we instead take
+# the route of pattern-matching the nn.Linear specific occurences, and we replace
+# them with an einsum operator.
+# We perform this pattern-matching replacement for both the forward as well as
+# the backward pass.
+# TODO: use graph_patterns to simplify writing this
+def _replace_view_mm_view_with_einsum(gm):
+    mm_nodes = gm.graph.find_nodes(op="call_function", target=torch.ops.aten.mm.default)
+    for node in mm_nodes:
+        first_input, second_input = node.all_input_nodes
+        if first_input.target == torch.ops.aten.view.default:
+            view_input = first_input.all_input_nodes[0]
+            users = list(node.users)
+            if (
+                len(users) == 1
+                and users[0].target == torch.ops.aten.view.default
+                and view_input.meta["val"].shape[:-1] == users[0].meta["val"].shape[:-1]
+                and second_input.meta["val"].ndim == 2
+            ):
+                print(
+                    f"Found matmul node {node}, {view_input.meta['val'].shape, second_input.meta['val'].shape}"
+                )
+                ndim = view_input.meta["val"].ndim
+                assert 1 < ndim <= 10, "Only support up to 10D for now"
+
+                # generate the leading dimensions as a, b, c, etc
+                dims = "".join([chr(97 + i) for i in range(ndim - 1)])
+                mm_equation = f"{dims}k,kn->{dims}n"
+                with gm.graph.inserting_before(node):
+                    new_node = gm.graph.call_function(
+                        torch.ops.aten.einsum.default,
+                        args=(mm_equation, [view_input, second_input]),
+                    )
+                    new_node.meta.update(users[0].meta)
+                    users[0].replace_all_uses_with(new_node)
+
+        elif second_input.target == torch.ops.aten.view.default:
+            if first_input.target != torch.ops.aten.permute.default:
+                continue
+            if first_input.all_input_nodes[0].target != torch.ops.aten.view.default:
+                continue
+            orig_first = first_input.all_input_nodes[0].all_input_nodes[0]
+            orig_second = second_input.all_input_nodes[0]
+            users = list(node.users)
+            if (
+                len(users) == 1
+                and users[0].target == torch.ops.aten.permute.default
+                and orig_first.meta["val"].shape[:-1]
+                == orig_second.meta["val"].shape[:-1]
+                and node.meta["val"].ndim == 2
+            ):
+                print(
+                    f"Found matmul node {node} {orig_first.meta['val'].shape, orig_second.meta['val'].shape}"
+                )
+
+                ndim = orig_first.meta["val"].ndim
+                assert 1 < ndim <= 10, "Only support up to 10D for now"
+
+                # generate the leading dimensions as a, b, c, etc
+                dims = "".join([chr(97 + i) for i in range(ndim - 1)])
+                mm_equation = f"{dims}n,{dims}k->kn"
+                with gm.graph.inserting_before(node):
+                    new_node = gm.graph.call_function(
+                        torch.ops.aten.einsum.default,
+                        args=(mm_equation, [orig_first, orig_second]),
+                    )
+                    new_node.meta.update(users[0].meta)
+                    users[0].replace_all_uses_with(new_node)
+    gm.graph.eliminate_dead_code()
+    gm.recompile()

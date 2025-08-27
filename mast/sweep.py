@@ -167,7 +167,9 @@ def run(args: argparse.Namespace) -> None:
     if args.runs:
         runs = {name: all_runs[name] for name in args.runs}
     else:
-        runs = sweeps[args.sweep]
+        runs = {}
+        for sweep in args.sweep:
+            runs.update(sweeps[sweep])
 
     # overrides values in .torchxconfig
     scheduler_args = ",".join([f"conda_fbpkg_id={args.fbpkg}"])
@@ -177,6 +179,8 @@ def run(args: argparse.Namespace) -> None:
         "run",
         f"--scheduler_args={scheduler_args}",
         "mast.py:train",
+        "--nodes",
+        f"{args.nodes}",
         "--additional_folders",
         args.torchtitan_dir,
         "--twtask_bootstrap_script",
@@ -295,6 +299,7 @@ if __name__ == "__main__":
         "--sweep",
         choices=sweeps.keys(),
         default="llama3_1d",
+        nargs="+",
         help="Sweep to run, if not specified will run only specified runs",
     )
     parser.add_argument(
@@ -308,5 +313,12 @@ if __name__ == "__main__":
         nargs="+",
         help="arguments to pass to torchtitan, e.g. 'training.batch_size=2'",
     )
+    parser.add_argument(
+        "--nodes",
+        type=int,
+        default=8,
+        help="How many nodes to use for the job, defaults to 8.",
+    )
+
     args = parser.parse_args()
     run(args)

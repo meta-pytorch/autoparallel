@@ -29,6 +29,7 @@ from .apply_sharding import apply_sharding_to_model
 from .cast_parametrization import apply_dtype_cast, canonicalize_mp, set_dtype_cast
 from .graph_utils import (
     _add_alias,
+    _replace_view_mm_view_with_einsum,
     assert_has_no_collectives,
     cleanup_graph,
     update_joint_with_descriptors,
@@ -36,6 +37,8 @@ from .graph_utils import (
 from .init_weights import hook_params_setters
 from .optimize_sharding import ShardingOptimizer
 from .utils import _get_device_from_mesh
+
+_APPLY_VIEW_MM_VIEW_PATTERN = False
 
 
 def try_convert_fake_to_real(tensors):
@@ -230,6 +233,8 @@ class AutoParallel:
         assert_has_no_collectives(gm)
 
         cleanup_graph(gm)
+        if _APPLY_VIEW_MM_VIEW_PATTERN:
+            _replace_view_mm_view_with_einsum(gm)
         # now add aliases nodes to the graph to
         # give more room for optimizations
         _add_alias(gm)
