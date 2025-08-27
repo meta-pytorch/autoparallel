@@ -575,9 +575,11 @@ def _gen_transform_infos_non_cached(
     if not hasattr(dst_spec, "device_order"):
         dst_spec.device_order = tuple(range(dst_spec.mesh.ndim))
 
-    if src_spec.device_order == tuple(
+    if src_spec.device_order == tuple(  # type: ignore[attr-defined]
         range(src_spec.mesh.ndim)
-    ) and dst_spec.device_order == tuple(range(dst_spec.mesh.ndim)):
+    ) and dst_spec.device_order == tuple(  # type: ignore[attr-defined]
+        range(dst_spec.mesh.ndim)
+    ):
         use_greedy_transform = True
     else:
         use_greedy_transform = False
@@ -757,8 +759,8 @@ class Redistribute(torch.autograd.Function):
                     stride=input.stride(),
                     dtype=forward_dtype,
                 ),
-                device_order=device_order,
             )
+            current_spec.device_order = device_order  # type: ignore[attr-defined]
         else:
             local_tensor = input._local_tensor
             current_spec = input._spec
@@ -770,8 +772,8 @@ class Redistribute(torch.autograd.Function):
                 device_mesh,
                 placements,
                 tensor_meta=current_spec.tensor_meta,
-                device_order=device_order,
             )
+            target_spec.device_order = device_order  # type: ignore[attr-defined]
 
             output = redistribute_local_tensor(
                 local_tensor,
