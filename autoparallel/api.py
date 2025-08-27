@@ -110,8 +110,13 @@ def monkey_patch_export_verifier():
 
     prior = Verifier._check_graph_module
 
+    # Export validates the output module to ensure metadata isn't missing, that it is serializable, etc.
+    # We don't need them for the most part, please allowlist them here:
     def expected_error(e: Exception):
-        okay = ["Operator 'autoparallel.dtype_cast' is not an allowed operator type"]
+        okay = [
+            "Operator 'autoparallel.dtype_cast' is not an allowed operator type",
+            "call_local_map"
+        ]
         e_str = str(e)
         for msg in okay:
             if msg in e_str:
@@ -133,6 +138,21 @@ def monkey_patch_export_verifier():
     finally:
         Verifier._check_graph_module = prior
 
+@contextmanager
+def enable_local_map_wrapping():
+    from torch._higher_order_ops import local_map as local_map_module
+    from torch._dynamo.variables.higher_order_ops import LocalMapWrappedHigherOrderVariable as vt_cls
+
+    prior = local_map_module._DEFER_INLINING
+    prior2 = vt_cls._enabled
+
+    try:
+        local_map_module._DEFER_INLINING = True
+        vt_cls._enabled = True
+        yield
+    finally:
+        local_map_module._DEFER_INLINING = prior
+        vt_cls._enabled = prior2
 
 class AutoParallel:
     """
@@ -247,7 +267,7 @@ class AutoParallel:
             if not isinstance(inputs, tuple):
                 inputs = (inputs,)
 
-        with set_dtype_cast(True):
+        with set_dtype_cast(True), enable_local_map_wrapping():
             with torch._dynamo.config.patch(
                 install_free_tensors=True
             ), monkey_patch_export_verifier():

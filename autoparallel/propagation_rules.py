@@ -180,20 +180,33 @@ def getitem_rule(mesh, specs):
     op_spec = specs[0]
     index = specs[1]
     strats = []
+
+    # Really annoying
+    def get_output_specs(strat, index=None):
+        if index is None:
+            if isinstance(strat.output_specs, DTensorSpec):
+                return (strat.output_specs,)
+            return strat.output_specs
+        else:
+            if isinstance(strat.output_specs, DTensorSpec):
+                return strat.output_specs
+            return strat.output_specs[index]
+
+
     new_inp = OpStrategy(
         [
-            OpSpec(strat.output_specs[index], input_specs=strat.output_specs)
+            OpSpec(get_output_specs(strat, index), input_specs=get_output_specs(strat))
             for strat in op_spec.strategies
         ]
     )
     for strat in op_spec.strategies:
-        input_specs = strat.output_specs
+        input_specs = get_output_specs(strat)
         output_specs = input_specs[index]
         redistribute_costs = [generate_redistribute_costs(new_inp, output_specs)]
         # TODO: fix this to take input_specs as argument
         # this will require fixing apply_sharding as well, see other TODO
         # s = OpSpec(output_specs, input_specs=input_specs)
-        s = OpSpec(output_specs, input_specs=(output_specs,))
+        s = OpSpec(output_specs, input_specs=(output_specs,))  # bruh why is input_specs like this
         # s.redistribute_cost = [[0.0]] * len(input_specs)
         # s.redistribute_cost[index] = redistribute_costs
         s.redistribute_cost = redistribute_costs

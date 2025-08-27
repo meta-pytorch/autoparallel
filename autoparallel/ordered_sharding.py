@@ -132,7 +132,8 @@ def get_redistributed_input_placements(
             p if not p.is_partial() else Replicate() for p in tgt_spec.placements
         )
         if not isinstance(curr_spec, DTensorSpec):
-            raise NotImplementedError("No support for ops with multiple outputs yet")
+            breakpoint()
+            raise NotImplementedError(f"No support for ops with multiple outputs yet: {node.name}")
         if curr_spec.placements != tgt_spec.placements:
             res[all_input_nodes[i]] = (curr_spec.placements, tgt_placements)
     return res
