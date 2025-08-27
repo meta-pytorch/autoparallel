@@ -505,15 +505,18 @@ class ShardingOptimizer:
         self.add_same_output_across_args_constraint()
         self.add_output_input_consistent_constraint()
         self.add_inf_cost_constraint()
+
         self.penalize_inefficient_collectives()
 
     def penalize_inefficient_collectives(self):
         """
         EFFICIENCY CONSTRAINTS (Category 5): Penalize inefficient collective operations like
         non-batch dimension shard-to-replicate conversions and forbid invalid transitions.
+
         - Shard(dim≠0) → Replicate: multiply cost by 4
         - Replicate → Partial: x_{i,a,o,j} = 0 (forbidden)
         - Partial → Shard(dim≠0): multiply cost by 4
+
         When performing shard_{n} -> replicate (for n != 0), there is additional
         computation cost associated. Let's penalize it here while we don't add
         the computation cost together in the comm cost
