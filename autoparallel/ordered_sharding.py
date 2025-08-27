@@ -37,8 +37,7 @@ def _optimize_same_nd_sharding_as_1d(
         return redistribute_local_tensor(arg, curr_spec, tgt_spec)
 
     # TODO: make this more general, I'm playing safe for now
-    allowed_placements = [(Shard(0), Replicate()), (Partial(), Shard(0))]
-    if (curr_spec_first, tgt_spec_first) not in allowed_placements:
+    if not (curr_spec_first == Shard(0) and tgt_spec_first == Replicate()):
         print(f"NOT doing optimization for {str(curr_spec)} -> {str(tgt_spec)}")
         return redistribute_local_tensor(arg, curr_spec, tgt_spec)
 
