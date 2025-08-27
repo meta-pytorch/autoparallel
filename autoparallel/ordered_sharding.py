@@ -244,6 +244,6 @@ def compute_optimal_placement_order_for_parameters(module, sharding_placement):
                     else:
                         # below is supposed not to be triggered
                         redistribute_node_order[p] = ((1, 0), False)
-    for node, (order, _) in redistribute_node_order:
+    for node, (order, _) in redistribute_node_order.items():
         node.meta["device_order"] = order
     return redistribute_node_order
