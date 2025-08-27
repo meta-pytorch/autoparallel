@@ -60,14 +60,20 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
             tgt_spec_c = DTensorSpec(
                 tgt_spec.mesh, tgt_placements, tensor_meta=tgt_spec.tensor_meta
             )
+            reversed_placement_order = None
             placement_order = None
             if (
                 src_tgt_nodes is not None
                 and src_tgt_nodes in self.param_placement_order
             ):
                 placement_order = self.param_placement_order[src_tgt_nodes]
+                reversed_placement_order = placement_order[::-1]
             x = ordered_redistribute_local_tensor(
-                arg, curr_spec, tgt_spec_c, placement_order
+                arg,
+                curr_spec,
+                tgt_spec_c,
+                src_placement_order=reversed_placement_order,
+                tgt_placement_order=placement_order,
             )
         return x
 

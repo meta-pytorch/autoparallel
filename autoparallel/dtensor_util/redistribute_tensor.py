@@ -1,14 +1,17 @@
-# mypy: allow-untyped-defs
-# Copyright (c) Meta Platforms, Inc. and affiliates
+# Copyright (c) Facebook, Inc. and its affiliates. All rights reserved.
+#
+# This source code is licensed under the BSD license found in the
+# LICENSE file in the root directory of this source tree.
+
 import dataclasses
-import itertools
 import logging
 from functools import cache
-from typing import cast, NamedTuple, Optional
+from typing import NamedTuple, Optional, cast
 
 import torch
 import torch.distributed._functional_collectives as funcol
 import torch.distributed.tensor._api as dtensor
+
 # from torch.distributed.tensor._dtensor_spec import DTensorSpec, TensorMeta
 from torch.distributed.tensor._dtensor_spec import DTensorSpec, TensorMeta
 from torch.distributed.tensor.device_mesh import DeviceMesh
@@ -19,9 +22,7 @@ from torch.distributed.tensor.placement_types import (
     Shard,
 )
 
-
 logger = logging.getLogger(__name__)
-
 
 
 class _TransformInfo(NamedTuple):
@@ -92,10 +93,7 @@ class DTensorRedistributePlanner:
                 return False
             if self._hash != other._hash:
                 return False
-            return (
-                self.placements,
-                self.tensor_dim_to_mesh_dim,
-            ) == (
+            return (self.placements, self.tensor_dim_to_mesh_dim,) == (
                 other.placements,
                 other.tensor_dim_to_mesh_dim,
             )
@@ -411,13 +409,14 @@ class DTensorRedistributePlanner:
 
         transform_infos: list[_TransformInfo] = []
         state_path = self.find_min_cost_path(src_state, dst_state)
-        # print(
-        #     "Path from %s to %s: \n%s" % (
-        #         src_state,
-        #         dst_state,
-        #         " -> ".join(str(s) for s in state_path),
-        #     )
-        # )
+        print(
+            "Path from %s to %s: \n%s"
+            % (
+                src_state,
+                dst_state,
+                " -> ".join(str(s) for s in state_path),
+            )
+        )
         for cur_state, nxt_state in zip(state_path[:-1], state_path[1:]):
             # find the mesh_dim that is different between cur_state and nxt_state
             if cur_state.placements != nxt_state.placements:
@@ -573,6 +572,11 @@ def _gen_transform_infos_non_cached(
     transform_infos: list[_TransformInfo] = []
     device_mesh = src_spec.device_mesh
 
+    if not hasattr(src_spec, "device_order"):
+        src_spec.device_order = tuple(range(src_spec.mesh.ndim))
+    if not hasattr(dst_spec, "device_order"):
+        dst_spec.device_order = tuple(range(dst_spec.mesh.ndim))
+
     if src_spec.device_order == tuple(
         range(src_spec.mesh.ndim)
     ) and dst_spec.device_order == tuple(range(dst_spec.mesh.ndim)):
@@ -675,9 +679,9 @@ def redistribute_local_tensor(
                     local_tensor, device_mesh, i, my_coordinate[i]
                 )
             else:
-                assert current.is_shard(), (
-                    f"Current placement should be shard but found {current}"
-                )
+                assert (
+                    current.is_shard()
+                ), f"Current placement should be shard but found {current}"
                 shard_spec = cast(Shard, current)
                 if shard_spec.dim != target_placement.dim:
                     new_local_tensor = shard_spec._to_new_shard_dim(
@@ -744,7 +748,9 @@ class Redistribute(torch.autograd.Function):
         if forward_dtype is not None and forward_dtype != input._local_tensor.dtype:
             local_tensor = input._local_tensor.to(dtype=forward_dtype)
             # Safely get device_order, defaulting to standard order if not available
-            device_order = getattr(input._spec, 'device_order', tuple(range(device_mesh.ndim)))
+            device_order = getattr(
+                input._spec, "device_order", tuple(range(device_mesh.ndim))
+            )
             current_spec = DTensorSpec(
                 mesh=device_mesh,
                 placements=input._spec.placements,
@@ -775,7 +781,6 @@ class Redistribute(torch.autograd.Function):
                 target_spec,
                 async_op=async_op,
             )
-            output.device_order
         else:
             # use the same local tensor if placements are the same.
             output = local_tensor

@@ -10,7 +10,6 @@ import torch
 from torch._functorch._aot_autograd.fx_utils import get_param_and_grad_nodes
 from torch.distributed._tensor.placement_types import DTensorSpec
 from torch.distributed.tensor._op_schema import OpSpec
-from torch.distributed.tensor._redistribute import redistribute_local_tensor
 from torch.distributed.tensor.placement_types import (  # noqa
     Partial,
     Placement,
@@ -65,7 +64,8 @@ def ordered_redistribute_local_tensor(
     arg: torch.Tensor,
     curr_spec: DTensorSpec,
     tgt_spec: DTensorSpec,
-    placement_order=None,
+    src_placement_order=None,
+    tgt_placement_order=None,
 ) -> torch.Tensor:
     """
     This is a simplified version of redistribute_local_tensor that optimizes
@@ -75,15 +75,10 @@ def ordered_redistribute_local_tensor(
     The optimizations that we support for now are hard-coded, and we should
     generalize this in the future.
     """
-    # canonical = tuple(reversed(range(curr_spec.mesh.ndim)))
-    canonical = tuple(range(curr_spec.mesh.ndim))
-    if placement_order is None:
-        placement_order = canonical
-    curr_spec.device_order = placement_order
-    tgt_spec.device_order = canonical
-    if placement_order != canonical:
-        print('============')
-        print(f"Doing optimization for {str(curr_spec)}{placement_order} -> {str(tgt_spec)}{canonical}")
+    if src_placement_order:
+        curr_spec.device_order = src_placement_order
+    if tgt_placement_order:
+        tgt_spec.device_order = tgt_placement_order
     return redistribute_local_tensor(
         arg,
         curr_spec,
@@ -188,7 +183,7 @@ def compute_optimal_placement_order_for_parameters(module, sharding_placement):
 
     possible_orderings = list(itertools.permutations(range(mesh_ndim)))
     # default_order = tuple(reversed(range(mesh_ndim)))
-    default_order = tuple(range(mesh_ndim))
+    # default_order = tuple(range(mesh_ndim))
     param_placement_order = {}
     for (
         param_node,
@@ -208,8 +203,8 @@ def compute_optimal_placement_order_for_parameters(module, sharding_placement):
             redistribution_map[grad_node][0],
             list(redistribution_map[grad_node][1].keys())[0],
         )
-        param_placement_order[src_tgt_input] = default_order
-        param_placement_order[src_tgt_grad] = default_order
+        # param_placement_order[src_tgt_input] = default_order
+        # param_placement_order[src_tgt_grad] = default_order
         # Only support S(0)S(0) -> RS(0) and PS(0) -> S(0)S optimizations
         # for now, giving them (0, 1) ordering (instead of canonical (1, 0))
         if node_plc == (Shard(0), Shard(0)) and node_tgt_plc == (
@@ -220,6 +215,11 @@ def compute_optimal_placement_order_for_parameters(module, sharding_placement):
                 Shard(0),
                 Shard(0),
             ):
-                param_placement_order[src_tgt_input] = possible_orderings[1]
+                # last node with single input after param use order [0, 1]
+                param_placement_order[src_tgt_input] = possible_orderings[0]
+                # grad node use order [1, 0]
                 param_placement_order[src_tgt_grad] = possible_orderings[1]
+                src_tgt_input[0].meta["device_order"] = possible_orderings[0]
+                src_tgt_grad[0].meta["device_order"] = possible_orderings[1]
+    print(param_placement_order)
     return param_placement_order
