@@ -155,6 +155,17 @@ def assert_has_no_collectives(gm: torch.fx.GraphModule):
             )
 
 
+# NOTE: [nn.Linear decomposition]
+# PyTorch currently decomposes any 3d-input nn.Linear (and matmul) into a
+# sequence of view -> mm -> view operations.
+# This has as a consequence of breaking any type of sharding on both the
+# batch and the sequence dimension, because the flattening that happens doesn't
+# allow to preserve this sharding.
+# While we wait for PyTorch to avoid decomposing nn.Linear, we instead take
+# the route of pattern-matching the nn.Linear specific occurences, and we replace
+# them with an einsum operator.
+# We perform this pattern-matching replacement for both the forward as well as
+# the backward pass.
 # TODO: use graph_patterns to simplify writing this
 def _replace_view_mm_view_with_einsum(gm):
     mm_nodes = gm.graph.find_nodes(op="call_function", target=torch.ops.aten.mm.default)
