@@ -74,8 +74,8 @@ def redistribute_cost(
         elif current.is_shard() and target.is_shard():
             # should be alltoall comm, since we haven't implement it yet, add penalty
             # to favor allgather instead
-            # cost += all_to_all_cost(comm_bytes_gb, mesh_topo, i)
-            cost += allgather_cost(comm_bytes_gb, mesh_topo, i) * 4.0
+            cost += all_to_all_cost(comm_bytes_gb, mesh_topo, i)
+            # cost += allgather_cost(comm_bytes_gb, mesh_topo, i) * 4.0
         elif current.is_partial() and target.is_replicate():
             # add up allreduce comm cost
             cost += allreduce_cost(comm_bytes_gb, mesh_topo, i)
