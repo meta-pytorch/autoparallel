@@ -51,29 +51,28 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
         self._curr_node = n
         return super().run_node(n)
 
-    def redistribute_tensor(self, arg, curr_spec, tgt_spec, src_tgt_nodes=None):
+    def redistribute_tensor(self, arg, curr_spec, tgt_spec, node=None):
         tgt_placements = tuple(
             p if not p.is_partial() else Replicate() for p in tgt_spec.placements
         )
         x = arg
+        if node in self.param_placement_order and self.param_placement_order[node][1]:
+            assert curr_spec.placements != tgt_spec.placements
         if curr_spec.placements != tgt_spec.placements:
             tgt_spec_c = DTensorSpec(
                 tgt_spec.mesh, tgt_placements, tensor_meta=tgt_spec.tensor_meta
             )
-            reversed_placement_order = None
-            placement_order = None
-            if (
-                src_tgt_nodes is not None
-                and src_tgt_nodes in self.param_placement_order
-            ):
-                placement_order = self.param_placement_order[src_tgt_nodes]
-                reversed_placement_order = placement_order[::-1]
+            origin_order = None
+            tgt_order = None
+            if node in self.param_placement_order:
+                tgt_order, do_redistribute = self.param_placement_order[node]
+                origin_order = tgt_order[::-1] if do_redistribute else tgt_order
             x = ordered_redistribute_local_tensor(
                 arg,
                 curr_spec,
                 tgt_spec_c,
-                src_placement_order=reversed_placement_order,
-                tgt_placement_order=placement_order,
+                src_placement_order=origin_order,
+                tgt_placement_order=tgt_order,
             )
         return x
 
@@ -115,7 +114,7 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
         for n, arg, curr_spec, tgt_spec in zip(
             all_input_nodes, flat_args_t, curr_specs, tgt_specs
         ):
-            x = self.redistribute_tensor(arg, curr_spec, tgt_spec, (node, n))
+            x = self.redistribute_tensor(arg, curr_spec, tgt_spec, node)
             new_flat_args_t.append(x)
             self.tgt_spec = tgt_spec
         new_flat_args = []

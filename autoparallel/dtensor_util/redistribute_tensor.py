@@ -394,10 +394,8 @@ class DTensorRedistributePlanner:
     ) -> list[_TransformInfo]:
         src_device_order = tuple(range(self.device_mesh.ndim))
         dst_device_order = tuple(range(self.device_mesh.ndim))
-        if src_spec.device_order is not None:
-            src_device_order = src_spec.device_order
-        if dst_spec.device_order is not None:
-            dst_device_order = dst_spec.device_order
+        src_device_order = getattr(src_spec, "device_order", src_device_order)
+        dst_device_order = getattr(dst_spec, "device_order", dst_device_order)
         src_map = self.map_tensor_dim_to_mesh_dim(src_spec.placements, src_device_order)
         dst_map = self.map_tensor_dim_to_mesh_dim(dst_spec.placements, dst_device_order)
         src_state = self.DistState(

@@ -3,7 +3,6 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
-import itertools
 from typing import Optional, Union
 
 import torch
@@ -79,6 +78,8 @@ def ordered_redistribute_local_tensor(
         curr_spec.device_order = src_placement_order
     if tgt_placement_order:
         tgt_spec.device_order = tgt_placement_order
+    if src_placement_order == tgt_placement_order:
+        return _optimize_same_nd_sharding_as_1d(arg, curr_spec, tgt_spec)
     return redistribute_local_tensor(
         arg,
         curr_spec,
@@ -132,6 +133,7 @@ def compute_optimal_placement_order_for_parameters(module, sharding_placement):
     # this is actually parameter users and gradient inputs
     # but well, naming is hard
     param_and_grad_users = {}
+    param_grad_chain = {}
     for param, grad in param_and_grad_nodes:
         last_p = list(param.users)[0]
         p_chain = [param]
@@ -143,6 +145,8 @@ def compute_optimal_placement_order_for_parameters(module, sharding_placement):
             last_p = list(last_p.users.keys())[0]
         for p in p_chain:
             param_and_grad_users[p] = param
+        # order from source to dest
+        param_grad_chain[param] = p_chain
 
         last_g = grad
         g_chain = []
@@ -150,8 +154,10 @@ def compute_optimal_placement_order_for_parameters(module, sharding_placement):
         while len(last_g.all_input_nodes) == 1:
             g_chain.append(last_g)
             last_g = last_g.all_input_nodes[0]
-        for p in reversed(g_chain):
+        for p in g_chain:
             param_and_grad_users[p] = grad
+        # order from dest to source
+        param_grad_chain[grad] = g_chain
 
     redistribution_map = {}
     mesh_ndim = None
@@ -181,10 +187,8 @@ def compute_optimal_placement_order_for_parameters(module, sharding_placement):
                     )
                 )
 
-    possible_orderings = list(itertools.permutations(range(mesh_ndim)))
-    # default_order = tuple(reversed(range(mesh_ndim)))
-    # default_order = tuple(range(mesh_ndim))
-    param_placement_order = {}
+    # map node from to (target order, need redistribute?)
+    redistribute_node_order = {}
     for (
         param_node,
         grad_node,
@@ -203,10 +207,7 @@ def compute_optimal_placement_order_for_parameters(module, sharding_placement):
             redistribution_map[grad_node][0],
             list(redistribution_map[grad_node][1].keys())[0],
         )
-        # param_placement_order[src_tgt_input] = default_order
-        # param_placement_order[src_tgt_grad] = default_order
-        # Only support S(0)S(0) -> RS(0) and PS(0) -> S(0)S optimizations
-        # for now, giving them (0, 1) ordering (instead of canonical (1, 0))
+        # Only support S(0)S(0) -> RS(0) and PS(0) -> S(0)S optimizations.
         if node_plc == (Shard(0), Shard(0)) and node_tgt_plc == (
             Replicate(),
             Shard(0),
@@ -215,11 +216,34 @@ def compute_optimal_placement_order_for_parameters(module, sharding_placement):
                 Shard(0),
                 Shard(0),
             ):
-                # last node with single input after param use order [0, 1]
-                param_placement_order[src_tgt_input] = possible_orderings[0]
-                # grad node use order [1, 0]
-                param_placement_order[src_tgt_grad] = possible_orderings[1]
-                src_tgt_input[0].meta["device_order"] = possible_orderings[0]
-                src_tgt_grad[0].meta["device_order"] = possible_orderings[1]
-    print(param_placement_order)
-    return param_placement_order
+                # last node with single input after param use order [0, 1].
+                # note: we need to make all front nodes ordered as [1,0]
+                # handle forward pass param related nodes
+                param_node = param_and_grad_users[src_tgt_input[0]]
+                param_chain = param_grad_chain[param_node]
+                # node that need to be reverse the order from (1,0) to (0,1)
+                node_to_reorder = src_tgt_input[0]
+                # node between [param_and_grad_users[src_tgt_input[0]], src_tgt_input[0]) are under order [1,0],
+                for p in param_chain:
+                    if p == node_to_reorder:
+                        redistribute_node_order[p] = ((0, 1), True)
+                        break
+                    else:
+                        redistribute_node_order[p] = ((1, 0), False)
+
+                # handle backward pass grad related nodes
+                grad_node = param_and_grad_users[src_tgt_grad[0]]
+                grad_chain = param_grad_chain[grad_node]
+                # node that need to be reverse the order from (0,1) to (1,0)
+                node_to_reorder = src_tgt_grad[0]
+                # node between [param_and_grad_users[src_tgt_grad[0]], src_tgt_grad[0]) are under order [1,0],
+                for p in grad_chain:
+                    if p == node_to_reorder:
+                        redistribute_node_order[p] = ((1, 0), True)
+                        break
+                    else:
+                        # below is supposed not to be triggered
+                        redistribute_node_order[p] = ((1, 0), False)
+    for node, (order, _) in redistribute_node_order:
+        node.meta["device_order"] = order
+    return redistribute_node_order
