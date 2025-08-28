@@ -107,6 +107,12 @@ def move_to_fake(model: torch.nn.Module, mode: FakeTensorMode, device: torch.dev
     return model
 
 
+# Export runs some asserts on the exported program to ensure that it is serializable,
+# and some safety checks e.g. whether the graph metadata is consistent with what's been traced.
+#
+# In autoparallel, we don't care about the serializability of this initial
+# trace, but we do want those same safety checks. In the short term, we
+# can patch the verification logic.
 @contextmanager
 def monkey_patch_export_verifier():
     from torch._export.verifier import SpecViolationError, Verifier, final
