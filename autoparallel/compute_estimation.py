@@ -334,11 +334,9 @@ def benchmark_strategy_runtime_cost(node, strategy):
 
 
 def benchmark_fn(fn, *args, **kwargs):
-    torch.cuda.synchronize()
     n_warmup = 3
     for _ in range(n_warmup):
         fn(*args, **kwargs)
-    torch.cuda.synchronize()
 
     num_iters = 10
     start_event = torch.cuda.Event(enable_timing=True)
