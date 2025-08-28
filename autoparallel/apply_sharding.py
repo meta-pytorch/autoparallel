@@ -65,8 +65,8 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
             origin_order = None
             tgt_order = None
             if node in self.param_placement_order:
-                tgt_order, do_redistribute = self.param_placement_order[node]
-                origin_order = tgt_order[::-1] if do_redistribute else tgt_order
+                tgt_order, do_reorder = self.param_placement_order[node]
+                origin_order = tgt_order[::-1] if do_reorder else tgt_order
             x = ordered_redistribute_local_tensor(
                 arg,
                 curr_spec,

@@ -187,7 +187,7 @@ def compute_optimal_placement_order_for_parameters(module, sharding_placement):
                     )
                 )
 
-    # map node from to (target order, need redistribute?)
+    # map node from to (target order, need reorder?)
     redistribute_node_order = {}
     for (
         param_node,
@@ -199,14 +199,8 @@ def compute_optimal_placement_order_for_parameters(module, sharding_placement):
             # TODO: handle this
             print("Skipping", param_node, grad_node, node_plc, grad_tgt_plc)
             continue
-        src_tgt_input = (
-            redistribution_map[param_node][0],
-            list(redistribution_map[param_node][1].keys())[0],
-        )
-        src_tgt_grad = (
-            redistribution_map[grad_node][0],
-            list(redistribution_map[grad_node][1].keys())[0],
-        )
+        src_input = redistribution_map[param_node][0]
+        src_grad = redistribution_map[grad_node][0]
         # Only support S(0)S(0) -> RS(0) and PS(0) -> S(0)S optimizations.
         if node_plc == (Shard(0), Shard(0)) and node_tgt_plc == (
             Replicate(),
@@ -219,11 +213,11 @@ def compute_optimal_placement_order_for_parameters(module, sharding_placement):
                 # last node with single input after param use order [0, 1].
                 # note: we need to make all front nodes ordered as [1,0]
                 # handle forward pass param related nodes
-                param_node = param_and_grad_users[src_tgt_input[0]]
+                param_node = param_and_grad_users[src_input]
                 param_chain = param_grad_chain[param_node]
                 # node that need to be reverse the order from (1,0) to (0,1)
-                node_to_reorder = src_tgt_input[0]
-                # node between [param_and_grad_users[src_tgt_input[0]], src_tgt_input[0]) are under order [1,0],
+                node_to_reorder = src_input
+                # node between [param_and_grad_users[src_input], src_input) are under order [1,0],
                 for p in param_chain:
                     if p == node_to_reorder:
                         redistribute_node_order[p] = ((0, 1), True)
@@ -232,11 +226,11 @@ def compute_optimal_placement_order_for_parameters(module, sharding_placement):
                         redistribute_node_order[p] = ((1, 0), False)
 
                 # handle backward pass grad related nodes
-                grad_node = param_and_grad_users[src_tgt_grad[0]]
+                grad_node = param_and_grad_users[src_grad]
                 grad_chain = param_grad_chain[grad_node]
                 # node that need to be reverse the order from (0,1) to (1,0)
-                node_to_reorder = src_tgt_grad[0]
-                # node between [param_and_grad_users[src_tgt_grad[0]], src_tgt_grad[0]) are under order [1,0],
+                node_to_reorder = src_grad
+                # node between [param_and_grad_users[src_grad], src_grad) are under order [1,0],
                 for p in grad_chain:
                     if p == node_to_reorder:
                         redistribute_node_order[p] = ((1, 0), True)
