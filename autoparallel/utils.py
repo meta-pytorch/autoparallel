@@ -143,7 +143,7 @@ def keep_unique_configs(op_strat: OpStrategy) -> OpStrategy:
 
 
 def get_placement_options(mesh, op, specs, user_args, user_kwargs):
-    # print(op)
+    assert len(specs) == len(user_args)
 
     if op in _op_rules:
         out_strat = _op_rules[op](mesh, specs)
@@ -192,7 +192,24 @@ def get_local_map_placement_option(
     out_placements,
 ):
     in_specs = []
-    for example, placement in zip(user_args, in_placements):
+    num_activation_inputs = len(user_args) - len(in_placements)
+    # activations are always replicated
+    replicated = tuple(Replicate() for _ in range(mesh.ndim))
+    for activation in user_args[:num_activation_inputs]:
+        # we have activation inputs for the bwd hop
+        in_specs.append(
+            DTensorSpec(
+                mesh=mesh,
+                placements=replicated,
+                tensor_meta=TensorMeta(
+                    shape=activation.shape,
+                    stride=activation.stride(),
+                    dtype=activation.dtype,
+                ),
+            )
+        )
+
+    for example, placement in zip(user_args[num_activation_inputs:], in_placements):
         if placement is None:
             # not a dtensor
             assert False, "Not sure how to create DTensorSpec for this input"
@@ -213,6 +230,11 @@ def get_local_map_placement_option(
     assert isinstance(output_val, (torch.Tensor, list, tuple))
     outs = output_val if isinstance(output_val, (list, tuple)) else [output_val]
     for example, placement in zip(outs, out_placements):
+        if example is None:
+            # Due to how HOP backward is partitioned, it can return None
+            out_specs.append(None)
+            continue
+
         if placement is None:
             # not a dtensor
             assert False, "Not sure how to create DTensorSpec for this output"
@@ -232,8 +254,23 @@ def get_local_map_placement_option(
             )
         )
 
-    if len(out_specs) == 1:
-        out_specs = out_specs[0]
+    for example in outs[len(out_placements) :]:
+        if example is None:
+            # Due to how HOP backward is partitioned, it can return None
+            out_specs.append(None)
+            continue
+        # we have activation outputs for the fwd hop
+        out_specs.append(
+            DTensorSpec(
+                mesh=mesh,
+                placements=replicated,
+                tensor_meta=TensorMeta(
+                    shape=example.shape,
+                    stride=example.stride(),
+                    dtype=example.dtype,
+                ),
+            )
+        )
 
     redistribute_costs = []
     for user_strategy, input_spec in zip(specs, in_specs):

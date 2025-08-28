@@ -7,7 +7,9 @@ from unittest.mock import patch
 
 import pytest
 import torch
+import torch.nn.functional as F
 from torch import nn
+from torch.distributed._tensor.experimental import local_map
 from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
 from torch.testing._internal.distributed.fake_pg import FakeStore
 
@@ -44,6 +46,17 @@ def device_mesh_2d():
             "dp",
             "tp",
         ),
+    )
+    return mesh
+
+
+@pytest.fixture(scope="module")
+def device_mesh_local_map():
+    world_size = torch.distributed.get_world_size()
+    mesh = torch.distributed.device_mesh.init_device_mesh(
+        "cuda",
+        (world_size // 32, 8, 4),  # dp=8, tp=8, cp=4
+        mesh_dim_names=("dp", "tp", "cp"),
     )
     return mesh
 
@@ -355,4 +368,128 @@ def test_in_graph_tensor_ctor(device_mesh_1d):
     )
     assert torch.equal(
         parallel_mod.get_buffer("buf").full_tensor(), torch.arange(dim, device="cuda")
+    )
+
+
+class LocalMapTransformerBlock(nn.Module):
+    def __init__(self, nheads, dim1, dim2):
+        super().__init__()
+        self.nheads = nheads
+        bias = False
+        self.wq = nn.Linear(dim1, dim1, bias=bias)
+        self.wk = nn.Linear(dim1, dim1, bias=bias)
+        self.wv = nn.Linear(dim1, dim1, bias=bias)
+        self.wo = nn.Linear(dim1, dim1, bias=bias)
+        self.w1 = nn.Linear(dim1, dim2, bias=bias)
+        self.w2 = nn.Linear(dim2, dim1, bias=bias)
+
+    def forward(self, x):
+        @local_map(
+            out_placements=((Shard(0), Shard(1), Shard(2)),),
+            in_placements=(
+                (Shard(0), Shard(1), Shard(2)),  # query
+                (Shard(0), Shard(1), Replicate()),  # key
+                (Shard(0), Shard(1), Replicate()),  # value
+            ),
+            redistribute_inputs=True,
+            in_grad_placements=None,
+            device_mesh=None,
+        )
+        def _context_parallel_attention(query, key, value):
+            out = F.scaled_dot_product_attention(
+                query=query, key=key, value=value, is_causal=False
+            )
+            return (out,)
+
+        q = self.wq(x)
+        k = self.wk(x)
+        v = self.wv(x)
+
+        q = q.unflatten(-1, (self.nheads, -1)).permute(0, 2, 1, 3)
+        k = k.unflatten(-1, (self.nheads, -1)).permute(0, 2, 1, 3)
+        v = v.unflatten(-1, (self.nheads, -1)).permute(0, 2, 1, 3)
+
+        o = _context_parallel_attention(q, k, v)[0]
+        o = o.permute(0, 2, 1, 3).flatten(-2)
+
+        o = self.wo(o)
+
+        o0 = o + x
+
+        o = self.w1(o0)
+        o = torch.nn.functional.relu(o)
+        o = self.w2(o)
+
+        o = o0 + o
+        return o
+
+
+@patch("torch.cuda.device_count", lambda: 8)
+@patch("torch.cuda.get_device_name", lambda device: "H100")
+def test_local_map_placement_respected(device_mesh_local_map, device="cuda"):
+    # Setup per example_local_map.py
+    bs = 8 * device_mesh_local_map.shape[0]
+    dim1 = 6144
+    dim2 = dim1 * 4
+    nheads = 48
+    seq_len = 256
+
+    def model_fn():
+        return LocalMapTransformerBlock(nheads, dim1, dim2)
+
+    def input_fn():
+        return torch.randn(bs, seq_len, dim1, device=device, requires_grad=True)
+
+    with torch.device("meta"):
+        model = model_fn()
+
+    with AutoParallel(model, input_fn, device_mesh_local_map) as autop:
+        autop.add_parameter_memory_constraint(low=None, high=None)
+
+        x_sharding = (Shard(0), Replicate(), Shard(1))
+        autop.add_input_constraints([x_sharding])
+        autop.add_output_constraints([x_sharding])
+
+        sharding_placement = autop.optimize_placement()
+
+    local_map_nodes = []
+    for node in autop.gm.graph.nodes:
+        if "local_map_kwargs" in node.meta:
+            local_map_nodes.append(node)
+
+    assert len(local_map_nodes) == 2, "Expected a fw and bw node"
+    fw_node = local_map_nodes[0]
+    bw_node = local_map_nodes[1]
+
+    fw_spec = sharding_placement[fw_node]
+    bw_spec = sharding_placement[bw_node]
+
+    # Check fw inputs
+    assert len(fw_spec.input_specs) == 3  # query, key, value
+    q_spec, k_spec, v_spec = fw_spec.input_specs
+    assert q_spec.placements == (Shard(dim=0), Shard(dim=1), Shard(dim=2))
+    assert k_spec.placements == v_spec.placements == (Shard(0), Shard(1), Replicate())
+
+    # Check fw outputs incl saved activations
+    assert len(fw_spec.output_specs) == 8
+    fw_out_spec, *act_specs = fw_spec.output_specs
+    assert fw_out_spec.placements == (Shard(0), Shard(1), Shard(2))
+    for act_spec in act_specs:
+        assert act_spec.placements == (Replicate(), Replicate(), Replicate())
+
+    # Check bw inputs incl saved activations
+    assert len(bw_spec.input_specs) == 8
+    *act_specs, bw_in_spec = bw_spec.input_specs
+    assert bw_in_spec.placements == (Shard(0), Shard(1), Shard(2))
+    for act_spec in act_specs:
+        assert act_spec.placements == (Replicate(), Replicate(), Replicate())
+
+    # Check bw outputs
+    assert len(bw_spec.output_specs) == 3  # query, key, value
+    grad_q_spec, grad_k_spec, grad_v_spec = bw_spec.output_specs
+    assert grad_q_spec.placements == (Shard(dim=0), Shard(dim=1), Shard(dim=2))
+    assert (
+        grad_k_spec.placements
+        == grad_v_spec.placements
+        == (Shard(0), Shard(1), Replicate())
     )
