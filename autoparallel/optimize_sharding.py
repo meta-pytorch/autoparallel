@@ -299,10 +299,12 @@ class ShardingOptimizer:
             for ss, ssi in enumerate(s.strategies):
                 compute_cost = estimate_strategy_runtime_cost(node, ssi)
                 for argi, xxi in enumerate(ssi.redistribute_cost):
-                    if node.op != "placeholder":
-                        argi_strat = self.strats[self._all_input_nodes(node)[argi]]
+                    all_input_nodes = self._all_input_nodes(node)
+                    argi_strat = (
+                        self.strats[all_input_nodes[argi]] if all_input_nodes else None
+                    )
                     for ii, comm_cost in enumerate(xxi):
-                        if node.op != "placeholder":
+                        if argi_strat is not None:
                             src_spec = argi_strat.strategies[ii].output_specs
                             # TODO: operator.getitem being special is something
                             # we might want to change in the future
@@ -330,7 +332,7 @@ class ShardingOptimizer:
                         # in a single go. To do this, we add a tie-break cost that is 1 if a redistribution
                         # happens prior to getting to this configuration, and 0 otherwise. This way,
                         # we will favor having fewer redistributions happening in the graph.
-                        if node.op != "placeholder" and node.target != operator.getitem:
+                        if argi_strat is not None and node.target != operator.getitem:
                             original_placement = argi_strat.strategies[
                                 ii
                             ].output_specs.placements
