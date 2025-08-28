@@ -171,11 +171,23 @@ class ShardingOptimizer:
                 user_kwargs = tree_map_only(
                     torch.fx.Node, lambda x: x.meta["val"], node.kwargs
                 )
-                if local_map_kwargs := node.meta.get("custom", {}).get(
-                    "dtensor_local_map_kwargs"
-                ):
-                    assert "call_local_map" in str(node.target)
+                if local_map_kwargs := node.meta.get("local_map_kwargs", {}):
+                    assert local_map_kwargs["in_placements"] is not None
+                    assert local_map_kwargs["out_placements"] is not None
+                    assert (
+                        local_map_kwargs.get("in_grad_placements", None) is None
+                    ), "Not yet implemented"
+                    assert (
+                        local_map_kwargs.get("device_mesh", None) is None
+                    ), "Must be provided by Autoparallel"
+                    assert local_map_kwargs.get(
+                        "redistribute_inputs", None
+                    ), "Autoparallel must always be allowed to redistribute inputs"
                     assert not user_kwargs
+                    # TODO: get rid of this when HOP can install as a subgraph
+                    assert "call_local_map" in str(
+                        node.target
+                    ) or "call_local_map_backward" in str(node.target)
                     strat = get_local_map_placement_option(
                         self.mesh,
                         user_strats,
@@ -184,18 +196,31 @@ class ShardingOptimizer:
                         local_map_kwargs["in_placements"],
                         local_map_kwargs["out_placements"],
                     )
+                    # call_local_map output_specs=DTensorSpec
+                    # call_local_map_1 output_specs=(DTensorSpec, DTensorSpec)
 
-                    assert not node.kwargs
-                    node.kwargs = {
-                        "_inline": True
-                    }  # notify the HOP to desugar in the next trace
+                    # breakpoint()
+                    # expected_out_specs = len(node.users)
+                    # if isinstance(strat.strategies[0].output_specs, DTensorSpec):
+                    #     actual_out_specs = 1
+                    # else:
+                    #     actual_out_specs = len(strat.strategies[0].output_specs)
 
-                    strats[node] = strat
+                    # # Note: when the graph dce'd some nodes, it's possible for unused outputs to still have specs
+                    # assert expected_out_specs <= actual_out_specs, f"{expected_out_specs} > {actual_out_specs} for {node}"
                 else:
                     strat = get_placement_options(
                         self.mesh, node.target, user_strats, user_args, user_kwargs
                     )
-                    strats[node] = strat
+                    # import operator
+                    # if node.target == operator.getitem:
+                    #     assert isinstance(strat, DTensorSpec)
+                    #     breakpoint()
+                    # if node.name == "getitem_14":
+                    #     breakpoint()
+                strats[node] = strat
+                # if node.name == "getitem_14":
+                #     breakpoint()
             elif node.op == "output":
                 user_strats = tree_map_only(
                     torch.fx.Node, lambda x: strats[x], node.args
@@ -308,7 +333,10 @@ class ShardingOptimizer:
                             src_spec = argi_strat.strategies[ii].output_specs
                             # TODO: operator.getitem being special is something
                             # we might want to change in the future
-                            if node.target == operator.getitem:
+                            # we sometimes flatten tuples
+                            if node.target == operator.getitem and not isinstance(
+                                src_spec, DTensorSpec
+                            ):
                                 src_spec = src_spec[node.args[1]]
                             tgt_spec = ssi.input_specs[argi]
                             assert isinstance(src_spec, DTensorSpec)

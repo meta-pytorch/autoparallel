@@ -3,6 +3,7 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+import operator
 from typing import Optional, Union
 
 import torch
@@ -102,6 +103,23 @@ def get_redistributed_input_placements(
     curr_specs: list[Union[DTensorSpec, tuple[Optional[DTensorSpec], ...]]] = [
         sharding_placement[n].output_specs for n in all_input_nodes
     ]  # FIXME ?
+    if node.target == operator.getitem:
+        # edge case example:
+        #   out = getitem(tuple_inp, index)
+        # tuple_inp will be a collection, so curr_specs should be a tuple of specs
+        # index will be an int, may or may not be hardcoded
+        assert (
+            len(all_input_nodes) == 1
+        ), "getitem with dynamic index not yet supported."
+        assert isinstance(node.args[1], int)
+        assert (
+            len(curr_specs) == 1
+        ), "when index is hardcoded, it should not have a corresponding fx.Node"
+        # flatten it to match against tgt_spec
+        curr_specs = curr_specs[0]  # type: ignore[assignment]
+        assert isinstance(node.args[1], int)
+        assert node.args[1] < len(curr_specs)
+
     tgt_specs: list[DTensorSpec] = [
         sharding_placement[node].input_specs[c] for c in range(num_input_nodes)  # type: ignore[index]
     ]
@@ -112,9 +130,14 @@ def get_redistributed_input_placements(
             p if not p.is_partial() else Replicate() for p in tgt_spec.placements
         )
         if not isinstance(curr_spec, DTensorSpec):
-            raise NotImplementedError("No support for ops with multiple outputs yet")
+            raise NotImplementedError(
+                f"No support for ops with multiple outputs yet: {node.name}"
+            )
         if curr_spec.placements != tgt_spec.placements:
             res[all_input_nodes[i]] = (curr_spec.placements, tgt_placements)
+
+    # if node.name == "alias_default_12":
+    #     breakpoint()
     return res
 
 
@@ -165,6 +188,7 @@ def compute_optimal_placement_order_for_parameters(module, sharding_placement):
         d = get_redistributed_input_placements(user_node, sharding_placement)
         if d:
             redistribution_map[param_or_grad_node] = (user_node, d)
+            # redistribution_map[param_or_grad_node] = (user_node, {user_user_node: (current, redistributed)})
             if mesh_ndim is None:
                 user_src_placement = list(d.values())[0][0]
                 mesh_ndim = len(user_src_placement)
@@ -182,7 +206,9 @@ def compute_optimal_placement_order_for_parameters(module, sharding_placement):
                     (
                         param_node,
                         grad_node,
-                        list(redistribution_map[param_node][1].values())[0],
+                        list(redistribution_map[param_node][1].values())[
+                            0
+                        ],  # placements
                         list(redistribution_map[grad_node][1].values())[0],
                     )
                 )
@@ -198,6 +224,7 @@ def compute_optimal_placement_order_for_parameters(module, sharding_placement):
         if node_plc != grad_tgt_plc:
             # TODO: handle this
             print("Skipping", param_node, grad_node, node_plc, grad_tgt_plc)
+            # breakpoint()
             continue
         src_input = redistribution_map[param_node][0]
         src_grad = redistribution_map[grad_node][0]
