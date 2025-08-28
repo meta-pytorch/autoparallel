@@ -96,6 +96,7 @@ from torch.distributed.tensor._dtensor_spec import DTensorSpec
 from torch.distributed.tensor.placement_types import Placement, Replicate, Shard
 from torch.utils._pytree import tree_flatten, tree_map_only
 
+from .collective_runtime_estimation import estimate_strategy_comms_cost
 from .compute_estimation import (
     _get_sharded_shape_stride,
     estimate_strategy_runtime_cost,
@@ -298,9 +299,24 @@ class ShardingOptimizer:
             for ss, ssi in enumerate(s.strategies):
                 compute_cost = estimate_strategy_runtime_cost(node, ssi)
                 for argi, xxi in enumerate(ssi.redistribute_cost):
-                    if node.op != "placeholder":
-                        argi_strat = self.strats[self._all_input_nodes(node)[argi]]
+                    all_input_nodes = self._all_input_nodes(node)
+                    argi_strat = (
+                        self.strats[all_input_nodes[argi]] if all_input_nodes else None
+                    )
                     for ii, comm_cost in enumerate(xxi):
+                        if argi_strat is not None:
+                            src_spec = argi_strat.strategies[ii].output_specs
+                            # TODO: operator.getitem being special is something
+                            # we might want to change in the future
+                            if node.target == operator.getitem:
+                                src_spec = src_spec[node.args[1]]
+                            tgt_spec = ssi.input_specs[argi]
+                            assert isinstance(src_spec, DTensorSpec)
+                            assert isinstance(tgt_spec, DTensorSpec)
+                            # we use our custom comm_cost function to estimate the cost
+                            # of the collective operation
+                            comm_cost = estimate_strategy_comms_cost(src_spec, tgt_spec)
+
                         if node in grad_param_nodes:
                             comm_cost = comm_cost / self.rescale_grad_comm_cost_for_mp
                         # Imagine we start node_i from S(0)S(0) and we want to reach node_{i+2} at
@@ -316,7 +332,7 @@ class ShardingOptimizer:
                         # in a single go. To do this, we add a tie-break cost that is 1 if a redistribution
                         # happens prior to getting to this configuration, and 0 otherwise. This way,
                         # we will favor having fewer redistributions happening in the graph.
-                        if node.op != "placeholder" and node.target != operator.getitem:
+                        if argi_strat is not None and node.target != operator.getitem:
                             original_placement = argi_strat.strategies[
                                 ii
                             ].output_specs.placements

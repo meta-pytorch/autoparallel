@@ -761,3 +761,25 @@ def expand_rule(mesh, op_schema_):
         for remov in to_remove:
             ss.redistribute_cost[0].insert(remov, math.inf)
     return out_strat
+
+
+@register_opschema_rule(torch.ops.aten.einsum.default)
+def einsum_rule(mesh, op_schema):
+    from torch.distributed.tensor._op_schema import TupleStrategy
+    from torch.distributed.tensor._ops._matrix_ops import _mm_like_strategy
+
+    mm_equation, mat_strategy = op_schema.args_schema
+    assert isinstance(mm_equation, str)
+    assert isinstance(mat_strategy, TupleStrategy)
+
+    assert len(mat_strategy.children) == 2, "Only two args to einsum supported for now"
+
+    self_strategy, mat2_strategy = mat_strategy.children
+
+    # dispatch to mm_like_strategy
+    new_op_schema = OpSchema(
+        torch.ops.aten.einsum.default,
+        args_schema=(self_strategy, mat2_strategy),
+        kwargs_schema={},
+    )
+    return _mm_like_strategy(mm_equation, mesh, new_op_schema)
