@@ -117,10 +117,8 @@ def input_fn():
 with torch.device("meta"):
     model = Block(nheads, dim1, dim2)
 
-# MP policy causing some deepcopy issues
-# mp_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
-mp_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16)
-# mp_policy = None
+mp_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
+# mp_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16)
 
 with AutoParallel(model, input_fn, mesh, mp_policy, compile=True) as autop:
     assert any(n.meta.get("nn_module_stack") for n in autop.gm.graph.nodes)
