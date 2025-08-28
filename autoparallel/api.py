@@ -376,12 +376,20 @@ class AutoParallel:
         # let's remove those otherwise we can't clean the backward graph properly
         # NB: This is VERY important for good memory use!
         # TODO: This is VERY VERY NAUGHTY, need to do this in a scoped way
-        torch.fx.node._side_effectful_functions.remove(
+        if (
             torch.ops._c10d_functional.wait_tensor
-        )
-        torch.fx.node._side_effectful_functions.remove(
+            in torch.fx.node._side_effectful_functions
+        ):
+            torch.fx.node._side_effectful_functions.remove(
+                torch.ops._c10d_functional.wait_tensor
+            )
+        if (
             torch.ops._c10d_functional.wait_tensor.default
-        )
+            in torch.fx.node._side_effectful_functions
+        ):
+            torch.fx.node._side_effectful_functions.remove(
+                torch.ops._c10d_functional.wait_tensor.default
+            )
 
         self.parallel_model_fn = parallel_model_fn = aot_compile_joint_with_descriptors(
             self.joint_with_descriptors
