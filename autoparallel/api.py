@@ -237,7 +237,7 @@ class AutoParallel:
             _replace_view_mm_view_with_einsum(gm)
         # now add aliases nodes to the graph to
         # give more room for optimizations
-        _add_alias(gm)
+        _add_alias(gm, version="v1")
         trace_structured(
             "artifact",
             metadata_fn=lambda: {

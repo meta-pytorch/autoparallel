@@ -73,7 +73,7 @@ def update_joint_with_descriptors(
     joint_with_descriptors._aot_state.fw_metadata.traced_tangents = new_local_tangents
 
 
-def _add_alias(gm):
+def _add_alias(gm, version="v1"):
     """
     Helper function to add alias nodes to every node in the graph
     this gives more configuration opportunities
@@ -82,43 +82,43 @@ def _add_alias(gm):
 
     nodes = [n for n in graph.nodes if n.op == "call_function"]
     node_map = {node: idx for idx, node in enumerate(nodes)}
+
+    def _insert_alias(node):
+        first_user = nodes[min(node_map[n] for n in node.users)]
+        with graph.inserting_before(first_user):
+            alias_node = graph.call_function(torch.ops.aten.alias.default, args=(node,))
+            alias_node.meta.update(node.meta)
+
+            def delete_user_cb(n):
+                return n != alias_node
+
+            node.replace_all_uses_with(alias_node, delete_user_cb=delete_user_cb)
+
     inputs = graph.find_nodes(op="placeholder")
-    """
-    for node in inputs:
-        if len(node.users) == 0:
-            # node is not used, don't add alias for it
-            continue
-        if (
-            len(node.users) == 1
-            and list(node.users)[0].target == torch.ops.autoparallel.dtype_cast.default
-        ):
-            node = list(node.users)[0]
-        first_user = nodes[min(node_map[n] for n in node.users)]
-        with graph.inserting_before(first_user):
-            alias_node = graph.call_function(torch.ops.aten.alias.default, args=(node,))
-            alias_node.meta.update(node.meta)
-
-            def delete_user_cb(n):
-                return n != alias_node
-
-            node.replace_all_uses_with(alias_node, delete_user_cb=delete_user_cb)
-    """
-
-    for node in inputs + nodes:
-        if len(node.users) < 2:
-            continue
-        # skip ops which return tuple
-        if not isinstance(node.meta["val"], torch.Tensor):
-            continue
-        first_user = nodes[min(node_map[n] for n in node.users)]
-        with graph.inserting_before(first_user):
-            alias_node = graph.call_function(torch.ops.aten.alias.default, args=(node,))
-            alias_node.meta.update(node.meta)
-
-            def delete_user_cb(n):
-                return n != alias_node
-
-            node.replace_all_uses_with(alias_node, delete_user_cb=delete_user_cb)
+    if version == "v1":
+        # only on inputs
+        for node in inputs:
+            if len(node.users) == 0:
+                # node is not used, don't add alias for it
+                continue
+            if (
+                len(node.users) == 1
+                and list(node.users)[0].target
+                == torch.ops.autoparallel.dtype_cast.default
+            ):
+                node = list(node.users)[0]
+            _insert_alias(node)
+    elif version == "v2":
+        # for every node that has more than one user
+        for node in inputs + nodes:
+            if len(node.users) < 2:
+                continue
+            # don't add alias for ops which return tuple for now
+            if not isinstance(node.meta["val"], torch.Tensor):
+                continue
+            _insert_alias(node)
+    else:
+        raise ValueError(f"Unknown version {version}")
 
     """
     for node in nodes:
