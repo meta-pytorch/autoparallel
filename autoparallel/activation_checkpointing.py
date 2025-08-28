@@ -335,7 +335,6 @@ def _apply_ac_policy(joint_graph: torch.fx.Graph, save_list: set[torch.ops.OpOve
                     counter += 1
                     continue
             must_save_nodes.append(node)
-            must_save_nodes.append(node)
     _mark_nodes_as_must_save(must_save_nodes)
 
 
