@@ -1,5 +1,3 @@
-from itertools import batched
-from math import exp
 from typing import cast, Optional
 
 import torch
@@ -17,6 +15,115 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor._op_schema import OpSchema, OpStrategy
 from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
 from torch.utils.flop_counter import register_flop_formula
+
+
+@torch.library.custom_op("autoparallel::batched_mm", mutates_args=())
+def batched_mm(
+    mat1: torch.Tensor,
+    mat2: torch.Tensor,
+) -> torch.Tensor:
+    assert mat1.ndim == 3
+    assert mat2.ndim == 2
+    assert mat1.shape[2] == mat2.shape[0]
+    out = []
+    for a in mat1:
+        out.append(torch.mm(a, mat2))
+    return torch.stack(out, 0)
+
+
+def setup_context_batched_mm(ctx, inputs, output):
+    mat1, mat2 = inputs
+    ctx.save_for_backward(mat1, mat2)
+
+
+def backward_batched_mm(ctx, grad):
+    mat1, mat2 = ctx.saved_tensors
+    grad1 = batched_mm(grad, mat2.transpose(-2, -1))
+    # compute mat1[b].T @ grad[b] for each batch and sum them up
+    grad2 = torch.bmm(mat1.transpose(-2, -1), grad).sum(dim=0)
+    return grad1, grad2
+
+
+torch.library.register_autograd(
+    "autoparallel::batched_mm",
+    backward_batched_mm,
+    setup_context=setup_context_batched_mm,
+)
+
+
+@batched_mm.register_fake
+def batched_mm_meta(
+    mat1: torch.Tensor,
+    mat2: torch.Tensor,
+) -> torch.Tensor:
+    assert mat1.ndim == 3
+    assert mat2.ndim == 2
+    assert mat1.shape[2] == mat2.shape[0]
+    out = torch.empty(
+        mat1.shape[0],
+        mat1.shape[1],
+        mat2.shape[1],
+        dtype=mat1.dtype,
+        device=mat1.device,
+    )
+    return out
+
+
+@register_flop_formula(torch.ops.autoparallel.batched_mm)
+def batched_mm_flop_count(mat1_shape, mat2_shape, *args, out_shape=None, **kwargs):
+    """
+    Count floating-point operations for batched matrix multiplication.
+
+    This operation performs matrix multiplication between mat1 and mat2, where mat1 is
+    a batched tensor and mat2 is a regular matrix. The output is also a batched tensor.
+
+    Args:
+        mat1_shape: Shape of first input matrix
+        mat2_shape: Shape of second input matrix
+    Returns:
+        Total number of floating-point operations
+    """
+    assert len(mat1_shape) == 3
+    assert len(mat2_shape) == 2
+    # Parse mat1 dimensions
+    b, m, n = mat1_shape
+    # Parse mat2 dimensions
+    n2, k = mat2_shape
+    assert n == n2, f"Dimension mismatch: {n} vs {n2}"
+    # Calculate FLOPs for matrix multiplication: C = A @ B
+    return b * m * n * k * 2
+
+
+@register_opschema_rule(torch.ops.autoparallel.batched_mm.default)
+def batched_mm_strategy(mesh: DeviceMesh, op_schema: OpSchema):
+    from torch.distributed.tensor._op_schema import PlacementList
+    from torch.distributed.tensor._ops.utils import expand_to_full_mesh_op_strategy
+
+    mat1_strategy = cast(OpStrategy, op_schema.args_schema[0])
+    mat2_strategy = cast(OpStrategy, op_schema.args_schema[1])
+
+    assert len(mat1_strategy.shape) == 3
+    assert len(mat2_strategy.shape) == 2
+    assert mat1_strategy.shape[2] == mat2_strategy.shape[0]
+
+    single_mesh_dim_strategies = []
+
+    # placement list stores placements of [output, mat1, mat2]
+    # first we always have replicate all for inputs and output
+    all_replicate: PlacementList = [Replicate()] * 3
+    single_mesh_dim_strategies.append(all_replicate)
+    # mat1 sharded on outer batch, mat2 is replicated -> output is sharded on outer batch
+    single_mesh_dim_strategies.append([Shard(0), Shard(0), Replicate()])
+    # mat1 is replicated, mat2 is sharded on column dim -> output is sharded on column dim
+    single_mesh_dim_strategies.append([Shard(2), Replicate(), Shard(2)])
+    # mat1 is sharded on column dim, mat2 is sharded on row dim -> output is partial
+    single_mesh_dim_strategies.append([Partial(), Shard(2), Shard(1)])
+    # mat1 is sharded on row dim, mat2 is replicated -> output is sharded on row dim
+    single_mesh_dim_strategies.append([Shard(1), Shard(1), Replicate()])
+
+    return expand_to_full_mesh_op_strategy(
+        mesh, op_schema, single_mesh_dim_strategies, input_index=1
+    )
 
 
 @torch.library.custom_op("autoparallel::batched_grouped_mm", mutates_args=())
@@ -46,7 +153,16 @@ def setup_context_batched_grouped_mm(ctx, inputs, output):
 def backward_batched_grouped_mm(ctx, grad):
     mat1, mat2, offs = ctx.saved_tensors
     grad1 = batched_grouped_mm(grad, mat2.transpose(-2, -1), offs)
-    grad2 = batched_grouped_mm(mat1.transpose(-2, -1), grad, offs)
+    grad2 = torch.zeros_like(mat2)
+    for g, a, off in zip(grad, mat1, offs):
+        start_idx = 0
+        for i, end_idx in enumerate(off):  # offs are cumulative indices
+            if end_idx > start_idx:  # Only compute if there are tokens for this expert
+                grad2[i, :, :] += torch.mm(
+                    a[start_idx:end_idx, :].transpose(-2, -1),
+                    g[start_idx:end_idx, :],
+                )
+            start_idx = end_idx
     return grad1, grad2, None
 
 
@@ -177,7 +293,7 @@ def batched_grouped_mm_flop_count(
 
 
 @register_opschema_rule(torch.ops.autoparallel.batched_grouped_mm.default)
-def _(mesh: DeviceMesh, op_schema: OpSchema):
+def batched_grouped_mm_strategy(mesh: DeviceMesh, op_schema: OpSchema):
     from torch.distributed.tensor._op_schema import PlacementList
     from torch.distributed.tensor._ops.utils import expand_to_full_mesh_op_strategy
 
@@ -230,11 +346,36 @@ def batched_histc(
 
 
 @batched_histc.register_fake
-def batched_hist_meta(
+def batched_histc_meta(
     x: torch.Tensor, bins: int = 100, min_val: int = 0, max_val: int = 1
 ) -> torch.Tensor:
     out = torch.empty((x.shape[0], bins), dtype=x.dtype, device=x.device)
     return out
+
+
+@register_opschema_rule(torch.ops.autoparallel.batched_histc.default)
+def batched_histc_strategy(mesh: DeviceMesh, op_schema: OpSchema):
+    from torch.distributed.tensor._op_schema import PlacementList
+    from torch.distributed.tensor._ops.utils import expand_to_full_mesh_op_strategy
+
+    x_strategy = cast(OpStrategy, op_schema.args_schema[0])
+
+    assert len(x_strategy.shape) == 2
+
+    single_mesh_dim_strategies = []
+
+    # placement list stores placements of [output, x]
+    # first we always have replicate all for inputs and output
+    all_replicate: PlacementList = [Replicate()] * 2
+    single_mesh_dim_strategies.append(all_replicate)
+    # x sharded on outer batch -> output is sharded on outer batch
+    single_mesh_dim_strategies.append([Shard(0), Shard(0)])
+    # x is sharded in inner batch -> output is partial
+    single_mesh_dim_strategies.append([Partial(), Shard(1)])
+
+    return expand_to_full_mesh_op_strategy(
+        mesh, op_schema, single_mesh_dim_strategies, input_index=1
+    )
 
 
 # from torch.distributed._functional_collectives import all_to_all_single_autograd
@@ -242,6 +383,9 @@ def batched_hist_meta(
 # This is a temporary fix by @rakkit https://github.com/pytorch/torchtitan/issues/1467
 # NOTE: This is for future use, we are currently writing custom backward for
 #  token dispatch and token combine, so we call all to all single directly
+# if we decide to trace the backward of token dispatch and token combine, we can
+#  use this function to replace all to all single autograd
+#
 @torch.library.custom_op("autoparallel::all_to_all_single_autograd", mutates_args=())
 def all_to_all_single_autograd(
     x: torch.Tensor,
@@ -295,6 +439,7 @@ def batched_all_to_all_single(
         for input_t, in_splits, out_splits in zip(
             batched_input, batched_in_splits, batched_out_splits
         ):
+            # TODO: We should coalesce all to alls to reduce overhead
             out_t = all_to_all_single(
                 input_t.contiguous(), out_splits, in_splits, group=group
             )
@@ -955,3 +1100,87 @@ def token_combine_meta(
     ep_mesh: DeviceMesh | None = None,
 ) -> torch.Tensor:
     return torch.empty_like(base_output)
+
+
+@register_opschema_rule(torch.ops.autoparallel.token_dispatch.default)
+def _token_dispatch_strategy(mesh: DeviceMesh, op_schema: OpSchema):
+    from torch.distributed.tensor._op_schema import PlacementList
+    from torch.distributed.tensor._ops.utils import expand_to_full_mesh_op_strategy
+
+    mat1_strategy = cast(OpStrategy, op_schema.args_schema[0])
+    mat2_strategy = cast(OpStrategy, op_schema.args_schema[1])
+    offs_strategy = cast(OpStrategy, op_schema.args_schema[2])
+
+    assert len(mat1_strategy.shape) == 3
+    assert len(mat2_strategy.shape) == 3
+    assert len(offs_strategy.shape) == 2
+    assert mat1_strategy.shape[0] == offs_strategy.shape[0]
+    assert mat2_strategy.shape[0] == offs_strategy.shape[1]
+    assert mat1_strategy.shape[2] == mat2_strategy.shape[1]
+
+    single_mesh_dim_strategies = []
+
+    # placement list stores placements of [output, mat1, mat2, offs]
+    # first we always have replicate all for inputs and output
+    all_replicate: PlacementList = [Replicate()] * 4
+    single_mesh_dim_strategies.append(all_replicate)
+    # mat1 sharded on outer batch, mat2 is replicated, offs is sharded on outer batch
+    #  -> output is sharded on outer batch
+    single_mesh_dim_strategies.append([Shard(0), Shard(0), Replicate(), Shard(0)])
+    # mat1 is replicated, mat2 is sharded on column dim, offs is replicated
+    #  -> output is sharded on column dim
+    single_mesh_dim_strategies.append([Shard(2), Replicate(), Shard(2), Replicate()])
+    # mat1 is sharded on column dim, mat2 is sharded on row dim, offs is replicated
+    #  -> output is partial
+    single_mesh_dim_strategies.append([Partial(), Shard(2), Shard(1), Replicate()])
+    # mat1 is dynamically sharded on row dim, mat2 is sharded on experts dim,
+    # offs is sharded on experts dim -> output is dynamically sharded on row dim
+    single_mesh_dim_strategies.append(
+        [DynamicShard(1), DynamicShard(1), Shard(0), Shard(1)]
+    )
+
+    return expand_to_full_mesh_op_strategy(
+        mesh, op_schema, single_mesh_dim_strategies, input_index=1
+    )
+
+
+@register_opschema_rule(torch.ops.autoparallel.token_combine.default)
+def _token_combine_strategy(mesh: DeviceMesh, op_schema: OpSchema):
+    from torch.distributed.tensor._op_schema import PlacementList
+    from torch.distributed.tensor._ops.utils import expand_to_full_mesh_op_strategy
+
+    mat1_strategy = cast(OpStrategy, op_schema.args_schema[0])
+    mat2_strategy = cast(OpStrategy, op_schema.args_schema[1])
+    offs_strategy = cast(OpStrategy, op_schema.args_schema[2])
+
+    assert len(mat1_strategy.shape) == 3
+    assert len(mat2_strategy.shape) == 3
+    assert len(offs_strategy.shape) == 2
+    assert mat1_strategy.shape[0] == offs_strategy.shape[0]
+    assert mat2_strategy.shape[0] == offs_strategy.shape[1]
+    assert mat1_strategy.shape[2] == mat2_strategy.shape[1]
+
+    single_mesh_dim_strategies = []
+
+    # placement list stores placements of [output, mat1, mat2, offs]
+    # first we always have replicate all for inputs and output
+    all_replicate: PlacementList = [Replicate()] * 4
+    single_mesh_dim_strategies.append(all_replicate)
+    # mat1 sharded on outer batch, mat2 is replicated, offs is sharded on outer batch
+    #  -> output is sharded on outer batch
+    single_mesh_dim_strategies.append([Shard(0), Shard(0), Replicate(), Shard(0)])
+    # mat1 is replicated, mat2 is sharded on column dim, offs is replicated
+    #  -> output is sharded on column dim
+    single_mesh_dim_strategies.append([Shard(2), Replicate(), Shard(2), Replicate()])
+    # mat1 is sharded on column dim, mat2 is sharded on row dim, offs is replicated
+    #  -> output is partial
+    single_mesh_dim_strategies.append([Partial(), Shard(2), Shard(1), Replicate()])
+    # mat1 is dynamically sharded on row dim, mat2 is sharded on experts dim,
+    # offs is sharded on experts dim -> output is dynamically sharded on row dim
+    single_mesh_dim_strategies.append(
+        [DynamicShard(1), DynamicShard(1), Shard(0), Shard(1)]
+    )
+
+    return expand_to_full_mesh_op_strategy(
+        mesh, op_schema, single_mesh_dim_strategies, input_index=1
+    )
