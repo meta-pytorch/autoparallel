@@ -651,11 +651,7 @@ class ShardingOptimizer:
                     )
             # this is an annoying special case
             if node.target == operator.getitem:
-                idx = node.args[1]
-                src_strat = d_inputs[0][0]["out_strat"][idx]
-                dst_strat = d[0]["inp_strat"]
                 redistributions = []
-                # redistributions.append((0, node.args[0], src_strat, dst_strat))
             preline = ""
             if redistributions:
                 preline += f"\n    # Redistributing for node {str(node)}:"
@@ -665,15 +661,12 @@ class ShardingOptimizer:
                     comment = f"# shape={str(tuple(src.shape))}, comm_cost={d[i]['comm_cost']}"
                     preline += f"\n    # {str(n)} = redistribute({str(n)}, src={src_s}, dst={dst_s})  {comment}"
             strat = str(d[0]["full_strat"])
-            costs = [x["compute_cost"] for x in d]
-            costs = sum(costs)
+            costs = sum(x["compute_cost"] for x in d)
             device_order = getattr(node.meta, "device_order", None)
+            device_order_str = ""
             if device_order:
-                line = f"  {plc_txt}{attr_color(strat)} device_order: {device_order} {cost_txt}{attr_color(str(costs))}"
-            else:
-                line = (
-                    f"  {plc_txt}{attr_color(strat)} {cost_txt}{attr_color(str(costs))}"
-                )
+                device_order_str = f" device_order={device_order} "
+            line = f"  {plc_txt}{attr_color(strat)}{device_order_str} {cost_txt}{attr_color(str(costs))}"
             if node.op == "placeholder":
                 line = f"    # {node.name}: {line}"
                 code.insert(l_id, line)
