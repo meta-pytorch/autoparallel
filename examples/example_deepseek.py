@@ -37,11 +37,6 @@ class FeedForward(nn.Module):
     Args:
         dim (int): Input dimension.
         hidden_dim (int): Hidden dimension of the feedforward layer.
-
-    Attributes:
-        w1 (Linear): Linear transformation for the first layer.
-        w2 (Linear): Linear transformation for the second layer.
-        w3 (Linear): Linear transformation for the third layer.
     """
 
     def __init__(
@@ -50,17 +45,22 @@ class FeedForward(nn.Module):
         hidden_dim: int,
     ):
         super().__init__()
-        self.w1 = nn.Linear(dim, hidden_dim, bias=False)
-        self.w2 = nn.Linear(hidden_dim, dim, bias=False)
-        self.w3 = nn.Linear(dim, hidden_dim, bias=False)
+        self.w1 = nn.Parameter(torch.empty(hidden_dim, dim))
+        self.w2 = nn.Parameter(torch.empty(dim, hidden_dim))
+        self.w3 = nn.Parameter(torch.empty(hidden_dim, dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+        assert x.dim() == 3
+        # shape (ob, ib*slen, dim)
+        h = F.silu(torch.ops.autoparallel.batched_mm(x, self.w1.transpose(-2, -1)))
+        h = h * torch.ops.autoparallel.batched_mm(x, self.w3.transpose(-2, -1))
+        out = torch.ops.autoparallel.batched_mm(h, self.w2.transpose(-2, -1))
+        return out
 
     def init_weights(self, init_std: float = 0.02):
-        nn.init.trunc_normal_(self.w1.weight, mean=0.0, std=0.02)
-        for linear in (self.w2, self.w3):
-            nn.init.trunc_normal_(linear.weight, mean=0.0, std=init_std)
+        nn.init.trunc_normal_(self.w1, mean=0.0, std=0.02)
+        nn.init.trunc_normal_(self.w2, mean=0.0, std=init_std)
+        nn.init.trunc_normal_(self.w3, mean=0.0, std=init_std)
 
 
 class GroupedExperts(nn.Module):
@@ -127,7 +127,7 @@ class TokenChoiceTopKRouter(nn.Module):
         route_scale: float,
     ):
         super().__init__()
-        self.gate = nn.Linear(dim, num_experts, bias=False)
+        self.gate = nn.Parameter(torch.empty(dim, num_experts))
         self.num_experts = num_experts
         self.top_k = top_k
         self.score_func = score_func
@@ -156,7 +156,7 @@ class TokenChoiceTopKRouter(nn.Module):
         if expert_bias is not None:
             assert expert_bias.dim() == 1
         # scores shape (ob, ib*slen, num_experts)
-        scores = self.gate(x)
+        scores = torch.ops.autoparallel.batched_mm(x, self.gate.transpose(-2, -1))
 
         # By default, sigmoid or softmax is performed in float32 to avoid loss explosion
         if self.score_func == "sigmoid":
@@ -197,7 +197,7 @@ class TokenChoiceTopKRouter(nn.Module):
         return top_scores, selected_experts_indices, num_tokens_per_expert
 
     def init_weights(self, init_std: float):
-        nn.init.trunc_normal_(self.gate.weight, mean=0.0, std=init_std)
+        nn.init.trunc_normal_(self.gate, mean=0.0, std=init_std)
 
 
 class MoE(nn.Module):
@@ -256,7 +256,7 @@ class MoE(nn.Module):
         """
         ob, ib, slen, dim = x.shape
         # x shape (ob, ib*slen, dim)
-        x = x.view(ob, ib * slen, dim)
+        x = x.reshape(ob, ib * slen, dim)
 
         # top_scores shape (ob, ib*slen, top_k,)
         # selected_experts_indices shape (ob, ib*slen, top_k,)

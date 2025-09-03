@@ -10,7 +10,7 @@ from moe_utils import (
     batched_unpermute_and_unpad,
     TOKEN_GROUP_ALIGN_SIZE_M,
 )
-from torch.distributed._functional_collectives import all_to_all_single
+from torch.distributed._functional_collectives import all_to_all_single, RANK_TYPES
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor._op_schema import OpSchema, OpStrategy
 from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
@@ -25,10 +25,8 @@ def batched_mm(
     assert mat1.ndim == 3
     assert mat2.ndim == 2
     assert mat1.shape[2] == mat2.shape[0]
-    out = []
-    for a in mat1:
-        out.append(torch.mm(a, mat2))
-    return torch.stack(out, 0)
+    out = torch.bmm(mat1, mat2.expand(mat1.shape[0], -1, -1))
+    return out
 
 
 def setup_context_batched_mm(ctx, inputs, output):
@@ -37,8 +35,9 @@ def setup_context_batched_mm(ctx, inputs, output):
 
 
 def backward_batched_mm(ctx, grad):
+    assert grad.ndim == 3
     mat1, mat2 = ctx.saved_tensors
-    grad1 = batched_mm(grad, mat2.transpose(-2, -1))
+    grad1 = torch.bmm(grad, mat2.transpose(-2, -1).expand(grad.shape[0], -1, -1))
     # compute mat1[b].T @ grad[b] for each batch and sum them up
     grad2 = torch.bmm(mat1.transpose(-2, -1), grad).sum(dim=0)
     return grad1, grad2
@@ -130,18 +129,20 @@ def batched_mm_strategy(mesh: DeviceMesh, op_schema: OpSchema):
 def batched_grouped_mm(
     mat1: torch.Tensor, mat2: torch.Tensor, offs: torch.Tensor
 ) -> torch.Tensor:
-    assert offs.ndim == 2  # [ob, num_experts]
-    assert mat1.ndim == 3  # [ob, ib, dim]
-    assert mat2.ndim == 3, f"{mat2.shape}"  # [num_experts, dim, hidden_dim]
+    # TODO (@sanketpurandare): When mat1 is the experts tensor and mat2 is the batched output
+    # that will support grouped_mm(mat1, experts, off) = grouped_mm(experts.T, mat1.T, off).T
+    assert offs.ndim == 2
+    assert mat1.ndim == 3
+    assert mat2.ndim == 3, f"{mat2.shape}"
     ob1, num_experts1 = offs.shape
-    ob2, _, dim = mat1.shape
-    num_experts2, dim, _ = mat2.shape
+    ob2, _, dim1 = mat1.shape
+    num_experts2, dim2, _ = mat2.shape
     assert ob1 == ob2, f"{mat1.shape} vs {offs.shape}"
+    assert dim1 == dim2, f"{mat1.shape} vs {mat2.shape}"
     assert num_experts1 == num_experts2, f"{mat2.shape} vs {offs.shape}"
-    assert dim == dim, f"{mat1.shape} vs {mat2.shape}"
     res = []
-    for a, off in zip(mat1, offs):
-        res.append(torch._grouped_mm(a, mat2, off))
+    for m1, off in zip(mat1, offs):
+        res.append(torch._grouped_mm(m1, mat2, off))
     return torch.stack(res, 0)
 
 
@@ -150,20 +151,44 @@ def setup_context_batched_grouped_mm(ctx, inputs, output):
     ctx.save_for_backward(mat1, mat2, offs)
 
 
-def backward_batched_grouped_mm(ctx, grad):
+def _backward_grouped_mm_mat1(
+    mat1: torch.Tensor, mat2: torch.Tensor, grad: torch.Tensor, offs: torch.Tensor
+) -> torch.Tensor:
+    if mat1.stride(-2) == 1 and mat1.stride(-1) == mat1.size(-2):
+        # if input was column-major, return grad as column-order for efficiency
+        res = []
+        for g, off in zip(grad.transpose(-2, -1), offs):
+            res.append(torch._grouped_mm(mat2, g, off))
+        grad_mat1 = torch.stack(res, 0).transpose(-2, -1)
+    else:
+        grad_mat1 = batched_grouped_mm(grad, mat2.transpose(-2, -1), offs)
+    return grad_mat1
+
+
+def _backward_grouped_mm_mat2(
+    mat1: torch.Tensor, mat2: torch.Tensor, grad: torch.Tensor, offs: torch.Tensor
+) -> torch.Tensor:
+    partial_grad_mat2 = []
+    if mat2.stride(-2) == 1 and mat2.stride(-1) == mat2.size(-2):
+        # if input was column-major, return grad as column-order for efficiency
+        for g, m1, off in zip(grad, mat1, offs):
+            partial_grad_mat2.append(
+                torch._grouped_mm(g.transpose(-2, -1), m1, off).transpose(-2, -1)
+            )
+    else:
+        for g, m1, off in zip(grad, mat1, offs):
+            partial_grad_mat2.append(torch._grouped_mm(m1.transpose(-2, -1), g, off))
+    grad_mat2 = torch.stack(partial_grad_mat2, 0).sum(0)
+    return grad_mat2
+
+
+def backward_batched_grouped_mm(
+    ctx, grad: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, None]:
     mat1, mat2, offs = ctx.saved_tensors
-    grad1 = batched_grouped_mm(grad, mat2.transpose(-2, -1), offs)
-    grad2 = torch.zeros_like(mat2)
-    for g, a, off in zip(grad, mat1, offs):
-        start_idx = 0
-        for i, end_idx in enumerate(off):  # offs are cumulative indices
-            if end_idx > start_idx:  # Only compute if there are tokens for this expert
-                grad2[i, :, :] += torch.mm(
-                    a[start_idx:end_idx, :].transpose(-2, -1),
-                    g[start_idx:end_idx, :],
-                )
-            start_idx = end_idx
-    return grad1, grad2, None
+    grad_mat1 = _backward_grouped_mm_mat1(mat1, mat2, grad, offs)
+    grad_mat2 = _backward_grouped_mm_mat2(mat1, mat2, grad, offs)
+    return grad_mat1, grad_mat2, None
 
 
 torch.library.register_autograd(
@@ -177,20 +202,19 @@ torch.library.register_autograd(
 def batched_grouped_mm_meta(
     mat1: torch.Tensor, mat2: torch.Tensor, offs: torch.Tensor
 ) -> torch.Tensor:
-    assert offs.ndim == 2  # [ob, num_experts]
-    assert mat1.ndim == 3  # [ob, ib, dim]
-    assert mat2.ndim == 3, f"{mat2.shape}"  # [num_experts, dim, hidden_dim]
+    assert offs.ndim == 2
+    assert mat1.ndim == 3
+    assert mat2.ndim == 3
     ob1, num_experts1 = offs.shape
-    ob2, _, dim = mat1.shape
-    num_experts2, dim, _ = mat2.shape
+    ob2, ib, dim1 = mat1.shape
+    num_experts2, dim2, hidden_dim = mat2.shape
     assert ob1 == ob2, f"{mat1.shape} vs {offs.shape}"
+    assert dim1 == dim2, f"{mat1.shape} vs {mat2.shape}"
     assert num_experts1 == num_experts2, f"{mat2.shape} vs {offs.shape}"
-    assert dim == dim, f"{mat1.shape} vs {mat2.shape}"
-
     out = torch.empty(
-        mat1.shape[0],
-        mat1.shape[1],
-        mat2.shape[2],
+        ob1,
+        ib,
+        hidden_dim,
         dtype=mat1.dtype,
         device=mat1.device,
     )
@@ -376,51 +400,6 @@ def batched_histc_strategy(mesh: DeviceMesh, op_schema: OpSchema):
     return expand_to_full_mesh_op_strategy(
         mesh, op_schema, single_mesh_dim_strategies, input_index=1
     )
-
-
-# from torch.distributed._functional_collectives import all_to_all_single_autograd
-# TODO: there is memory leak issue with AC + all_to_all_single_autograd
-# This is a temporary fix by @rakkit https://github.com/pytorch/torchtitan/issues/1467
-# NOTE: This is for future use, we are currently writing custom backward for
-#  token dispatch and token combine, so we call all to all single directly
-# if we decide to trace the backward of token dispatch and token combine, we can
-#  use this function to replace all to all single autograd
-#
-@torch.library.custom_op("autoparallel::all_to_all_single_autograd", mutates_args=())
-def all_to_all_single_autograd(
-    x: torch.Tensor,
-    out_splits: list[int],
-    in_splits: list[int],
-    group: dist.ProcessGroup,
-) -> torch.Tensor:
-    y = all_to_all_single(x.contiguous(), out_splits, in_splits, group=group)
-    return y
-
-
-def setup_context_all_to_all_single_autograd(ctx, inputs, output):
-    (
-        x,
-        out_splits,
-        in_splits,
-        group,
-    ) = inputs
-    ctx.in_splits = in_splits
-    ctx.out_splits = out_splits
-    ctx.group = group
-
-
-def backward_all_to_all_single_autograd(ctx, grad_y):
-    grad_x = all_to_all_single(
-        grad_y.contiguous(), ctx.in_splits, ctx.out_splits, group=ctx.group
-    )
-    return grad_x, None, None, None
-
-
-torch.library.register_autograd(
-    "autoparallel::all_to_all_single_autograd",
-    backward_all_to_all_single_autograd,
-    setup_context=setup_context_all_to_all_single_autograd,
-)
 
 
 def batched_all_to_all_single(
