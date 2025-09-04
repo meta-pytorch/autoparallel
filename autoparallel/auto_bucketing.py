@@ -19,6 +19,7 @@ class simplefsdp_autobucketing_config:
     - load_cache: set to True to load cache from save_estimation_path
     - enable_bucket_ir: set to True to bucket all_gather/reduce_scatter
     - enable_reorder_ir: set to True to reorder all_gather/reduce_satter
+    - calibrate_number: number of samples to calibrate during comm estimation
     """
 
     relax_ratio = 0
@@ -27,6 +28,7 @@ class simplefsdp_autobucketing_config:
     save_estimation_path = "/mnt/mffuse/cache_ruisi/estimation_mast.pkl"
     enable_bucket_ir = True
     enable_reorder_ir = True
+    calibrate_number = 40
 
 
 def simple_fsdp_autobucketing_reordering_pass(
