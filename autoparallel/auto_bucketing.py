@@ -5,7 +5,7 @@
 
 import torch
 
-from .autobucketing_util import bucket_plan, bucket_utils
+from .autobucketing_util import bucket_func, bucket_plan, bucket_utils
 
 
 class simplefsdp_autobucketing_config:
@@ -53,4 +53,22 @@ def simple_fsdp_autobucketing_reordering_pass(
             bucketable_nodes,
             configs,
         )
+
+        snodes = bucket_func.bucket_fsdp_all_gather_with_plan(
+            scheduler,
+            snodes,
+            scheduler.name_to_buf,
+            scheduler.name_to_fused_node,
+            all_gather_plan,
+            bucketable_nodes,
+        )
+        if len(reduce_scatter_plan) > 0:
+            snodes = bucket_func.bucket_fsdp_reduce_scatter_with_plan(
+                scheduler,
+                snodes,
+                scheduler.name_to_buf,
+                scheduler.name_to_fused_node,
+                reduce_scatter_plan,
+                bucketable_nodes,
+            )
     return snodes

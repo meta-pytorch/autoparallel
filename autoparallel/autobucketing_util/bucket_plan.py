@@ -12,10 +12,10 @@ from typing import Any, Dict
 import torch
 from torch._C._distributed_c10d import ReduceOp
 from torch._inductor import scheduler
-from torch._inductor.comm import _schedule_fallback_operation
 from torch._inductor.utils import is_collective
 
 from .bucket_utils import (
+    _schedule_fallback_operation,
     check_ir_node_bucketable,
     estimate_bucketed_snode_runtime,
     get_data_size,
