@@ -39,7 +39,7 @@ from .init_weights import hook_params_setters
 from .optimize_sharding import ShardingOptimizer
 from .utils import _get_device_from_mesh
 
-_APPLY_VIEW_MM_VIEW_PATTERN = False
+_APPLY_VIEW_MM_VIEW_PATTERN = True
 
 
 def try_convert_fake_to_real(tensors):
@@ -279,7 +279,7 @@ class AutoParallel:
             _replace_view_mm_view_with_einsum(gm)
         # now add aliases nodes to the graph to
         # give more room for optimizations
-        _add_alias(gm, version="v1")
+        _add_alias(gm, version="v2")
         trace_structured(
             "artifact",
             metadata_fn=lambda: {
