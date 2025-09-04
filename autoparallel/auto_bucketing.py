@@ -5,7 +5,7 @@
 
 import torch
 
-from .autobucketing_util import bucket_func, bucket_plan, bucket_utils
+from .autobucketing_util import bucket_func, bucket_plan, bucket_utils, reorder
 
 
 class simplefsdp_autobucketing_config:
@@ -71,4 +71,21 @@ def simple_fsdp_autobucketing_reordering_pass(
                 reduce_scatter_plan,
                 bucketable_nodes,
             )
+
+    if configs.enable_reorder_ir:
+        print("Reorder scheduler nodes with autobucketing algroithm")
+        node_length = len(snodes)
+        snodes = reorder.reorder_all_gather(
+            snodes,
+            bucketable_nodes,
+            all_gather_before_last_wait=True
+        )
+        assert node_length == len(snodes), (
+            f"Missed nodes in reordering all gather: expected {node_length}, but got {len(snodes)}"
+        )
+        snodes = reorder.reorder_reduce_scatter(snodes, bucketable_nodes)
+        assert node_length == len(snodes), (
+            f"Missed nodes in reordering reduce scatter: expected {node_length}, but got {len(snodes)}"
+        )
+
     return snodes
