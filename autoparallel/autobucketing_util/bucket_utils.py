@@ -9,6 +9,7 @@ from typing import Any, Callable, Dict, Union
 
 import torch
 from torch._inductor import ir, scheduler
+from torch._inductor.comm import bucket_all_gathers, bucket_reduce_scatters
 from torch._inductor.dependencies import WeakDep
 from torch._inductor.ir import NoneLayout
 from torch._inductor.utils import buf_name_to_fused_snode, is_collective, is_wait
@@ -241,3 +242,101 @@ def get_snode_tensor_info(
     if return_data_size:
         result += (input_size, output_size)
     return result
+
+
+def _estimate_bucketed_node_list(
+    current_node_list: list["scheduler.BaseSchedulerNode"],
+    schedule_fallback_operation: Callable[[Any]],
+    group_size: int,
+    group_name: str,
+    name_to_buf: Dict[str, "scheduler.SchedulerBuffer"],
+    comm_func: Callable[[Any], Any],
+    comm_cache: Dict[Any, Any],
+    reduce_op: Any = None,
+):
+    input_ir_nodes = [n.node.inputs[0] for n in current_node_list]
+    if len(input_ir_nodes) == 1:
+        # standalone node, no need to bucket
+        comm_node = current_node_list[0].node
+        comm_size_inp, comm_size_out = (
+            comm_node.inputs[0].layout.size,
+            comm_node.layout.size,
+        )
+        estimated_comm = comm_cache.get_comm_time(
+            comm_size_inp,
+            comm_size_out,
+            comm_func,
+            calibrated=True,
+        )
+        return estimated_comm, comm_size_inp, comm_size_out
+
+    if comm_func == torch.ops._c10d_functional.all_gather_into_tensor.default:
+        bucked_node = bucket_all_gathers(
+            schedule_fallback_operation,
+            group_size,
+            group_name,
+            input_ir_nodes,
+            current_node_list,
+            name_to_buf,
+            return_ag_only=True,
+        )
+        comm_size_inp = bucked_node[0].layout.size
+        comm_size_out = bucked_node[1].layout.size
+    elif comm_func == torch.ops._c10d_functional.reduce_scatter_tensor.default:
+        bucked_node = bucket_reduce_scatters(
+            schedule_fallback_operation,
+            group_size,
+            group_name,
+            reduce_op,
+            input_ir_nodes,
+            current_node_list,
+            name_to_buf,
+            return_rs_only=True,
+        )
+        comm_size_inp = bucked_node[0].layout.size
+        comm_size_out = bucked_node[1].layout.size
+    else:
+        raise ValueError(f"Unsupported comm_func {comm_func} for bucketing")
+
+    estimated_comm = comm_cache.get_comm_time(
+        bucked_node[0].layout.size,
+        bucked_node[1].layout.size,
+        comm_func,
+        calibrated=True,
+    )
+    return estimated_comm, comm_size_inp, comm_size_out
+
+
+def estimate_bucketed_snode_runtime(
+    node_bucket_dict: Dict[tuple[Any, ...], list["scheduler.BaseSchedulerNode"]],
+    schedule_fallback_operation: Callable[[Any]],
+    name_to_buf: Dict[str, "scheduler.SchedulerBuffer"],
+    comm_func: Callable[[Any], Any],
+    comm_cache: Dict[Any, Any],
+    reduce_op: Any = None,
+) -> tuple[float, int, int]:
+    """
+    We can have AG/RS nodes from different process groups & different dtypes in a bucket
+    This function estimates the accumulated time & comm size of a bucketed AG/RS node
+    """
+    estimated_comm, comm_size_inp, comm_size_out = 0, 0, 0
+    for node_info, node_list in node_bucket_dict.items():
+        group_size, group_name = node_info[-2], node_info[-1]
+        (
+            local_comm,
+            local_comm_size_inp,
+            local_comm_size_out,
+        ) = _estimate_bucketed_node_list(
+            node_list,
+            schedule_fallback_operation,
+            group_size,
+            group_name,
+            name_to_buf,
+            comm_func,
+            comm_cache,
+            reduce_op,
+        )
+        estimated_comm += local_comm
+        comm_size_inp += get_data_size(local_comm_size_inp)
+        comm_size_out += get_data_size(local_comm_size_out)
+    return estimated_comm, comm_size_inp, comm_size_out

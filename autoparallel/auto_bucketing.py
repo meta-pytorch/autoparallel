@@ -5,7 +5,7 @@
 
 import torch
 
-from .autobucketing_util import bucket_utils
+from .autobucketing_util import bucket_plan, bucket_utils
 
 
 class simplefsdp_autobucketing_config:
@@ -36,7 +36,21 @@ def simple_fsdp_autobucketing_reordering_pass(
     configs: "simplefsdp_autobucketing_config",
 ) -> list["torch._inductor.scheduler.BaseSchedulerNode"]:
     scheduler = snodes[0].scheduler
-    bucket_utils.get_bucketable_ir_nodes(
+    bucketable_nodes = bucket_utils.get_bucketable_ir_nodes(
         snodes, scheduler.name_to_fused_node, scheduler.name_to_buf
     )
+
+    assert (
+        not torch._inductor.config.allow_buffer_reuse
+    ), "bucketing algorithm requires torch._inductor.config.allow_buffer_reuse to be False"
+
+    if configs.enable_bucket_ir:
+        all_gather_plan, reduce_scatter_plan = bucket_plan.get_simplefsdp_auto_plan(
+            scheduler,
+            snodes,
+            scheduler.name_to_buf,
+            scheduler.name_to_fused_node,
+            bucketable_nodes,
+            configs,
+        )
     return snodes
