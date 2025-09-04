@@ -328,25 +328,33 @@ def benchmark_strategy_runtime_cost(node, strategy):
 
     with unset_fake_temporarily(), no_dispatch():
         args, kwargs = _shard_args_for_node(node, strategy, rand_init=True)
-        mean_op_time_us = benchmark_fn(node.target, *args, **kwargs)
+        mean_op_time_us = benchmark_fn(node.target, False, *args, **kwargs)
 
     return mean_op_time_us
 
 
-def benchmark_fn(fn, *args, **kwargs):
+def benchmark_fn(fn, barrier, *args, **kwargs):
+    cb = torch.distributed.barrier if barrier else lambda: None
+    wait = torch.ops._c10d_functional.wait_tensor.default if barrier else lambda x: None
     n_warmup = 3
     for _ in range(n_warmup):
-        fn(*args, **kwargs)
+        cb()
+        out = fn(*args, **kwargs)
+        wait(out)
 
     num_iters = 10
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
-    start_event.record(torch.cuda.current_stream())
+    total_op_time = 0
     for _ in range(num_iters):
-        fn(*args, **kwargs)
-    end_event.record(torch.cuda.current_stream())
-    torch.cuda.synchronize()
-    total_op_time = start_event.elapsed_time(end_event)
+        cb()
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record(torch.cuda.current_stream())
+        out = fn(*args, **kwargs)
+        wait(out)
+        end_event.record(torch.cuda.current_stream())
+        torch.cuda.synchronize()
+        current_op_time = start_event.elapsed_time(end_event)
+        total_op_time += current_op_time
     mean_op_time_ms = total_op_time / num_iters
     mean_op_time_us = mean_op_time_ms * 1e3
     return mean_op_time_us
@@ -377,3 +385,49 @@ def compare_estimated_with_benchmarked_throughput(
         est_t = estimate_strategy_runtime_cost(node, strategy)
         data[node] = (real_t_us, est_t, throughput, gpu_tflops, efficiency)
     return data
+
+
+from .graph_utils import is_collective
+
+
+class BenchmarkInterpreter(torch.fx.Interpreter):
+    def __init__(self, module):
+        super().__init__(module, garbage_collect_values=True, graph=None)
+        self.times = {}
+
+    def run_node(self, n):
+        self._curr_node = n
+        return super().run_node(n)
+
+    def call_function(self, target, args, kwargs):
+        node = self._curr_node
+        # print(f"benchmarking {node}")
+        mean_op_time_us = 0
+        if is_collective(node):
+            if node.target != torch.ops._c10d_functional.wait_tensor.default:
+                mean_op_time_us = benchmark_fn(target, True, *args, **kwargs)
+        else:
+            mean_op_time_us = benchmark_fn(target, False, *args, **kwargs)
+        self.times[node] = mean_op_time_us
+        # print(f"{node}: {mean_op_time_us:.3f} us")
+
+        out = super().call_function(target, args, kwargs)
+        return out
+
+    def benchmark(self):
+        input_nodes = self.graph.find_nodes(op="placeholder")
+        with unset_fake_temporarily():
+            inputs = []
+            for node in input_nodes:
+                v = node.meta["val"]
+                if v.dtype.is_floating_point or v.dtype.is_complex:
+                    tensor = torch.randn(v.shape, device=v.device, dtype=v.dtype)
+                else:
+                    tensor = torch.randint(
+                        0, 255, v.shape, device=v.device, dtype=v.dtype
+                    )
+                inputs.append(tensor)
+
+            with torch.no_grad():
+                self.run(*inputs)
+        return self.times

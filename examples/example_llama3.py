@@ -643,6 +643,16 @@ with AutoParallel(
     print(f"Took {time.time() - t:.2f} s")
     parallel_mod = autop.apply_placement(sharding_placement)
 
+    do_benchmark = False
+    if do_benchmark:
+        from autoparallel.compute_estimation import BenchmarkInterpreter
+
+        bi = BenchmarkInterpreter(autop.parallel_gm)
+        times = bi.benchmark()
+        if torch.distributed.get_rank() == 0:
+            for n, t in times.items():
+                print(f"{n}: {t} us")
+
 # run weight init on our sharded DTensor params
 parallel_mod.to_empty(device="cuda")
 parallel_mod.init_weights()
