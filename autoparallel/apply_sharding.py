@@ -182,24 +182,6 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
         return out
 
 
-class ApplyDecompInterpreter(torch.fx.Interpreter):
-    def __init__(self, module, decomp_table=None):
-        super().__init__(module, garbage_collect_values=True, graph=None)
-        if decomp_table is None:
-            decomp_table = {}
-        self.decomp_table = decomp_table
-
-    def call_function(self, target, args, kwargs):
-        if target in self.decomp_table:
-            new_target = self.decomp_table[target]
-            out = super().call_function(new_target, args, kwargs)
-            # NOTE: is there a canonical way of handling this?
-            if out is not NotImplemented:
-                return out
-        out = super().call_function(target, args, kwargs)
-        return out
-
-
 def shard_node_given_placements(node, sharding_placement, *, meta: bool):
     # TODO: not sure if we actually guarantee sharding_placement has ever
     # input node lol
@@ -271,9 +253,11 @@ def apply_sharding_to_model(gm, sharding_placement, params_spec, buffers_spec):
         parallel_gm0 = make_fx(interp.run)(*local_args)
 
     cleanup_graph(parallel_gm0)
-    interp2 = ApplyDecompInterpreter(parallel_gm0, decomp_table)
+    interp2 = torch.fx.Interpreter(parallel_gm0)
     with fx_traceback.preserve_node_meta():
-        parallel_gm = make_fx(interp2.run)(*local_args)
+        parallel_gm = make_fx(interp2.run, decomposition_table=decomp_table)(
+            *local_args
+        )
     cleanup_graph(parallel_gm)
 
     # Copy descriptors over to new graph
