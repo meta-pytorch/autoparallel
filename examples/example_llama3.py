@@ -11,7 +11,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.distributed.fsdp import MixedPrecisionPolicy
-from torch.distributed.tensor.placement_types import Replicate, Shard, Partial
+from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.testing._internal.distributed.fake_pg import FakeStore
 
@@ -628,11 +628,12 @@ with AutoParallel(
     autop.add_input_constraints([x_sharding])
     autop.add_output_constraints([out_sharding])
 
-    mm_nodes = autop.gm.graph.find_nodes(op="call_function", target=torch.ops.aten.mm.default)
-    einsum_nodes = autop.gm.graph.find_nodes(op="call_function", target=torch.ops.aten.einsum.default)
-    view_nodes = autop.gm.graph.find_nodes(op="call_function", target=torch.ops.aten.view.default)
-    cet_nodes = autop.gm.graph.find_nodes(op="call_function", target=torch.ops.prims.convert_element_type.default)
-    sig_nodes = autop.gm.graph.find_nodes(op="call_function", target=torch.ops.aten.sigmoid.default)
+    mm_nodes = autop.gm.graph.find_nodes(
+        op="call_function", target=torch.ops.aten.mm.default
+    )
+    einsum_nodes = autop.gm.graph.find_nodes(
+        op="call_function", target=torch.ops.aten.einsum.default
+    )
 
     enable_constraint = True
     # out = x @ w   - S(0)R, RS(1) -> S(0)S(1)
@@ -647,7 +648,10 @@ with AutoParallel(
         for fwd_node in fwd_nodes:
             o = []
             for bwd_node in bwd_nodes:
-                if fwd_node.meta["nn_module_stack"] == bwd_node.meta["fwd_nn_module_stack"]:
+                if (
+                    fwd_node.meta["nn_module_stack"]
+                    == bwd_node.meta["fwd_nn_module_stack"]
+                ):
                     o.append(bwd_node)
             assert len(o) == 2
             res[fwd_node] = o
@@ -657,10 +661,10 @@ with AutoParallel(
         add_node_constraint = autop.sharding_optimizer.add_node_constraint
         fwd_bwd_groups = group_mm_nodes_with_its_gradients(mm_nodes)
         fwd_nodes = list(fwd_bwd_groups.keys())
-        last_proj = fwd_nodes[-1]
         # assume there are 7 mm nodes per transformer block
+        # skipt last mm as it's the final projection layer
         for block in range(0, len(fwd_nodes) - 1, 7):
-            fwd_nodes_block = fwd_nodes[block:block+7]
+            fwd_nodes_block = fwd_nodes[block : block + 7]
             # force the first 3 mm nodes to be TP
             the_nodes = fwd_nodes_block[:3] + fwd_nodes_block[4:6]
             for n in the_nodes:
@@ -686,73 +690,19 @@ with AutoParallel(
                     add_node_constraint(bwd_nodes[0], (Partial(), Shard(0)))
                     add_node_constraint(bwd_nodes[1], (Shard(0), Shard(feat_dim)))
 
-
     if mm_nodes and enable_constraint:
-
         force_tp_constraints(autop, mm_nodes, feat_dim=1)
-
-        autop.sharding_optimizer.add_node_constraint(view_nodes[20], (Shard(0), Shard(2)))
-        autop.sharding_optimizer.add_node_constraint(cet_nodes[8], (Shard(0), Shard(2)))  # 18
-        autop.sharding_optimizer.add_node_constraint(sig_nodes[0], (Shard(0), Shard(2)))
-        autop.sharding_optimizer.add_node_constraint(cet_nodes[9], (Shard(0), Shard(2)))  # 19
-
-        autop.sharding_optimizer.add_node_constraint(mm_nodes[10], (Partial(), Shard(0)))
-        autop.sharding_optimizer.add_node_constraint(mm_nodes[11], (Shard(0), Shard(1)))
-
-        autop.sharding_optimizer.add_node_constraint(mm_nodes[12], (Partial(), Shard(0)))
-        autop.sharding_optimizer.add_node_constraint(mm_nodes[13], (Shard(0), Partial()))
-        autop.sharding_optimizer.add_node_constraint(mm_nodes[14], (Partial(), Shard(0)))
-        autop.sharding_optimizer.add_node_constraint(mm_nodes[15], (Shard(0), Partial()))
-
-        autop.sharding_optimizer.add_node_constraint(mm_nodes[16], (Partial(), Shard(0)))
-        autop.sharding_optimizer.add_node_constraint(mm_nodes[17], (Shard(0), Shard(1)))
-
-        autop.sharding_optimizer.add_node_constraint(mm_nodes[18], (Partial(), Shard(0)))
-        autop.sharding_optimizer.add_node_constraint(mm_nodes[19], (Shard(0), Partial()))
-        autop.sharding_optimizer.add_node_constraint(mm_nodes[20], (Partial(), Shard(0)))
-        autop.sharding_optimizer.add_node_constraint(mm_nodes[21], (Shard(0), Partial()))
-        autop.sharding_optimizer.add_node_constraint(mm_nodes[22], (Partial(), Shard(0)))
-        autop.sharding_optimizer.add_node_constraint(mm_nodes[23], (Shard(0), Partial()))
     elif einsum_nodes and enable_constraint:
         mm_nodes = einsum_nodes
 
         force_tp_constraints(autop, mm_nodes, feat_dim=2)
-        # from IPython import embed; embed(); exit()
 
-        autop.sharding_optimizer.add_node_constraint(list(mm_nodes[3].users)[0], (Shard(0), Shard(1)))
-        autop.sharding_optimizer.add_node_constraint(list(list(mm_nodes[3].users)[0].users)[0], (Shard(0), Shard(1)))
-
-        for n in mm_nodes[18:23:2]:
-            autop.sharding_optimizer.add_node_constraint(n, (Partial(), Shard(0)))
-            # autop.sharding_optimizer.add_node_constraint(n.all_input_nodes[0], (Shard(0), Shard(2)))
-            # autop.sharding_optimizer.add_node_constraint(n.all_input_nodes[1], (Replicate(), Shard(0)))
-
-        for n in mm_nodes[19:24:2]:
-            autop.sharding_optimizer.add_node_constraint(n, (Shard(0), Partial()))
-
-        # autop.sharding_optimizer.add_node_constraint(view_nodes[20], (Shard(0), Shard(2)))
-        # autop.sharding_optimizer.add_node_constraint(cet_nodes[8], (Shard(0), Shard(2)))  # 18
-        # autop.sharding_optimizer.add_node_constraint(sig_nodes[0], (Shard(0), Shard(2)))
-        # autop.sharding_optimizer.add_node_constraint(cet_nodes[9], (Shard(0), Shard(2)))  # 19
-
-        # autop.sharding_optimizer.add_node_constraint(mm_nodes[10], (Partial(), Shard(0)))
-        # autop.sharding_optimizer.add_node_constraint(mm_nodes[11], (Shard(0), Shard(1)))
-
-        # autop.sharding_optimizer.add_node_constraint(mm_nodes[12], (Partial(), Shard(0)))
-        # autop.sharding_optimizer.add_node_constraint(mm_nodes[13], (Shard(0), Partial()))
-        # autop.sharding_optimizer.add_node_constraint(mm_nodes[14], (Partial(), Shard(0)))
-        # autop.sharding_optimizer.add_node_constraint(mm_nodes[15], (Shard(0), Partial()))
-
-        # autop.sharding_optimizer.add_node_constraint(mm_nodes[16], (Partial(), Shard(0)))
-        # autop.sharding_optimizer.add_node_constraint(mm_nodes[17], (Shard(0), Shard(1)))
-
-        # autop.sharding_optimizer.add_node_constraint(mm_nodes[18], (Partial(), Shard(0)))
-        # autop.sharding_optimizer.add_node_constraint(mm_nodes[19], (Shard(0), Partial()))
-        # autop.sharding_optimizer.add_node_constraint(mm_nodes[20], (Partial(), Shard(0)))
-        # autop.sharding_optimizer.add_node_constraint(mm_nodes[21], (Shard(0), Partial()))
-        # autop.sharding_optimizer.add_node_constraint(mm_nodes[22], (Partial(), Shard(0)))
-        # autop.sharding_optimizer.add_node_constraint(mm_nodes[23], (Shard(0), Partial()))
-
+        autop.sharding_optimizer.add_node_constraint(
+            list(mm_nodes[3].users)[0], (Shard(0), Shard(1))
+        )
+        autop.sharding_optimizer.add_node_constraint(
+            list(list(mm_nodes[3].users)[0].users)[0], (Shard(0), Shard(1))
+        )
 
     t = time.time()
     sharding_placement = autop.optimize_placement()
