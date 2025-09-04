@@ -5,172 +5,41 @@
 
 import copy
 import itertools
-from contextlib import ExitStack
+import warnings
+from contextlib import ExitStack, contextmanager
 from types import MethodType
 from typing import Optional, Union
 
 import torch
 from torch._functorch.aot_autograd import (
-    JointWithDescriptors,
     aot_compile_joint_with_descriptors,
     aot_export_joint_with_descriptors,
     boxed_nop_preserve_node_meta,
 )
 from torch._inductor.compile_fx import compile_fx_inner
 from torch._inductor.decomposition import select_decomp_table
-from torch._inductor.fx_passes.joint_graph import joint_graph_passes
-from torch._inductor.fx_passes.post_grad import remove_assert_ops
 from torch._logging import trace_structured
 from torch._subclasses import FakeTensorMode
 from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor import DeviceMesh
 from torch.export._unlift import _assign_attr
 from torch.export.unflatten import _AttrKind
-from torch.fx import GraphModule
-from torch.fx.experimental._backward_state import BackwardState
 
 from .activation_checkpointing import ac_joint_pass
 from .apply_sharding import apply_sharding_to_model
 from .cast_parametrization import apply_dtype_cast, canonicalize_mp, set_dtype_cast
+from .graph_utils import (
+    _add_alias,
+    _replace_view_mm_view_with_einsum,
+    assert_has_no_collectives,
+    cleanup_graph,
+    update_joint_with_descriptors,
+)
 from .init_weights import hook_params_setters
 from .optimize_sharding import ShardingOptimizer
 from .utils import _get_device_from_mesh
 
-
-def update_joint_with_descriptors(
-    joint_with_descriptors: JointWithDescriptors,
-    updated_gm: GraphModule,
-) -> None:
-    """
-    Assuming we have transformed updated_gm since the time it was captured,
-    (e.g. by parallelizing it),
-    this util updates the joint_with_descriptors struct to reference the new gm, and
-    updates any copies of tensor meta/shape stored in joint_with_descriptors relating to input arguments,
-    which may have changed shape since the initial trace.
-    """
-    # TODO: should we upstream a util like this?
-    placeholders = [n for n in updated_gm.graph.nodes if n.op == "placeholder"]
-    new_local_args = [n.meta["val"] for n in placeholders]
-    joint_with_descriptors.graph_module = updated_gm
-    joint_with_descriptors._aot_graph_capture.graph_module = updated_gm
-
-    new_flat_args: list[Union[torch.Tensor, int, torch.SymInt, BackwardState]] = []
-    for orig, new in zip(joint_with_descriptors._aot_state.flat_args, new_local_args):
-        if isinstance(orig, torch.nn.Parameter):
-            new_flat_args.append(torch.nn.Parameter(new))
-        else:
-            new_flat_args.append(new)
-
-    tangent_idx = len(joint_with_descriptors._aot_state.flat_args)
-    new_local_tangents = new_local_args[tangent_idx:]
-    joint_with_descriptors._aot_graph_capture.updated_flat_args = (
-        new_flat_args,
-        new_local_tangents,
-    )
-    joint_with_descriptors._aot_state.flat_args = new_flat_args
-    joint_with_descriptors._aot_state.fw_metadata.traced_tangents = new_local_tangents
-
-
-def _add_alias(gm):
-    """
-    Helper function to add alias nodes to every node in the graph
-    this gives more configuration opportunities
-    """
-    graph = gm.graph
-
-    nodes = [n for n in graph.nodes if n.op == "call_function"]
-    node_map = {node: idx for idx, node in enumerate(nodes)}
-    inputs = graph.find_nodes(op="placeholder")
-    for node in inputs:
-        if len(node.users) == 0:
-            # node is not used, don't add alias for it
-            continue
-        first_user = nodes[min(node_map[n] for n in node.users)]
-        with graph.inserting_before(first_user):
-            alias_node = graph.call_function(torch.ops.aten.alias.default, args=(node,))
-            alias_node.meta.update(node.meta)
-
-            def delete_user_cb(n):
-                return n != alias_node
-
-            node.replace_all_uses_with(alias_node, delete_user_cb=delete_user_cb)
-
-    """
-    for node in nodes:
-        # skip ops which return tuple
-        if not isinstance(node.meta["val"], torch.Tensor):
-            continue
-        if node.target != torch.ops.aten.view.default:
-            continue
-        with graph.inserting_after(node):
-            alias_node = graph.call_function(torch.ops.aten.alias.default, args=(node,))
-            alias_node.meta.update(node.meta)
-
-            def delete_user_cb(n):
-                return n != alias_node
-
-            node.replace_all_uses_with(alias_node, delete_user_cb=delete_user_cb)
-    """
-
-    for node in graph.find_nodes(op="output")[0].all_input_nodes:
-        with graph.inserting_after(node):
-            alias_node = graph.call_function(torch.ops.aten.alias.default, args=(node,))
-            alias_node.meta.update(node.meta)
-
-            def delete_user_cb(n):
-                return n != alias_node
-
-            node.replace_all_uses_with(alias_node, delete_user_cb=delete_user_cb)
-
-    gm.recompile()
-    return gm
-
-
-def _replace_view_mm_view_with_matmul(gm):
-    mm_nodes = gm.graph.find_nodes(op="call_function", target=torch.ops.aten.mm.default)
-    for node in mm_nodes:
-        first_input, second_input = node.all_input_nodes
-        if first_input.target == torch.ops.aten.view.default:
-            view_input = first_input.all_input_nodes[0]
-            users = list(node.users)
-            if (
-                len(users) == 1
-                and users[0].target == torch.ops.aten.view.default
-                and view_input.meta["val"].shape[:-1] == users[0].meta["val"].shape[:-1]
-            ):
-                print(f"Found matmul node {node}")
-                with gm.graph.inserting_before(node):
-                    new_node = gm.graph.call_function(
-                        torch.ops.aten.matmul.default, args=(view_input, second_input)
-                    )
-                    new_node.meta.update(users[0].meta)
-                    users[0].replace_all_uses_with(new_node)
-
-        elif second_input.target == torch.ops.aten.view.default:
-            if first_input.target != torch.ops.aten.permute.default:
-                continue
-            if first_input.all_input_nodes[0].target != torch.ops.aten.view.default:
-                continue
-            orig_first = first_input.all_input_nodes[0].all_input_nodes[0]
-            orig_second = second_input.all_input_nodes[0]
-            users = list(node.users)
-            if (
-                len(users) == 1
-                and users[0].target == torch.ops.aten.permute.default
-                and orig_first.meta["val"].shape[:-1]
-                == orig_second.meta["val"].shape[:-1]
-            ):
-                print(f"Found matmul node {node}")
-                with gm.graph.inserting_before(node):
-                    # TODO: check einsum equation
-                    new_node = gm.graph.call_function(
-                        torch.ops.aten.einsum.default,
-                        args=("bmn,bmk->nk", [orig_first, orig_second]),
-                    )
-                    new_node.meta.update(users[0].meta)
-                    users[0].replace_all_uses_with(new_node)
-    gm.graph.eliminate_dead_code()
-    gm.recompile()
+_APPLY_VIEW_MM_VIEW_PATTERN = False
 
 
 def try_convert_fake_to_real(tensors):
@@ -240,6 +109,42 @@ def move_to_fake(model: torch.nn.Module, mode: FakeTensorMode, device: torch.dev
     return model
 
 
+# Export runs some asserts on the exported program to ensure that it is serializable,
+# and some safety checks e.g. whether the graph metadata is consistent with what's been traced.
+#
+# In autoparallel, we don't care about the serializability of this initial
+# trace, but we do want those same safety checks. In the short term, we
+# can patch the verification logic.
+@contextmanager
+def monkey_patch_export_verifier():
+    from torch._export.verifier import SpecViolationError, Verifier, final
+
+    prior = Verifier._check_graph_module
+
+    def expected_error(e: Exception):
+        okay = ["Operator 'autoparallel.dtype_cast' is not an allowed operator type"]
+        e_str = str(e)
+        for msg in okay:
+            if msg in e_str:
+                return True
+        return False
+
+    @final
+    def _try_check_graph_module(self: Verifier, gm: torch.fx.GraphModule) -> None:
+        try:
+            return prior(self, gm)
+        except SpecViolationError as e:
+            if not expected_error(e):
+                raise
+            warnings.warn(f"Ignoring strict-mode export verifier error: {e}")
+
+    try:
+        Verifier._check_graph_module = _try_check_graph_module
+        yield
+    finally:
+        Verifier._check_graph_module = prior
+
+
 class AutoParallel:
     """
     Args:
@@ -257,6 +162,7 @@ class AutoParallel:
         enable_ac: bool = True,
         # None means 'auto'
         ac_stage_size_in_GiB: Optional[Union[float, str]] = "auto",
+        **kwargs,
     ):
         self.stack = ExitStack()
         self.fake_mode = (
@@ -266,6 +172,7 @@ class AutoParallel:
         if mp_policy is not None:
             mp_policy = canonicalize_mp(mp_policy)
         self.mp_policy = mp_policy
+        self.kwargs = kwargs
         # copy user model to avoid modifying it in-place
         # in dtype casting and move_to_fake
         model = copy.deepcopy(model)
@@ -307,7 +214,10 @@ class AutoParallel:
                 # dtype
                 rescale_grad_comm_cost_for_mp *= 1.1
         sharding_optimizer = ShardingOptimizer(
-            self.gm, self.mesh, rescale_grad_comm_cost_for_mp
+            self.gm,
+            self.mesh,
+            rescale_grad_comm_cost_for_mp,
+            repeated_subgraphs=self.kwargs.get("repeated_subgraphs", False),
         )
 
         # makes sharding of params and gradients the same
@@ -342,10 +252,6 @@ class AutoParallel:
 
     def build_model_graph(self):
         decomp_table = _get_decomp_table()
-        # needed because of https://github.com/pytorch/pytorch/issues/148977
-        # TODO: Don't do a global setting for this, this will unpredictably
-        # affect user code
-        torch.__future__.set_swap_module_params_on_conversion(True)
 
         with self.fake_mode:
             inputs = self.input_fn()
@@ -353,7 +259,10 @@ class AutoParallel:
                 inputs = (inputs,)
 
         with set_dtype_cast(True):
-            ep = torch.export.export(self.model, inputs)
+            with torch._dynamo.config.patch(
+                install_free_tensors=True
+            ), monkey_patch_export_verifier():
+                ep = torch.export.export(self.model, inputs, strict=True)
             self.joint_with_descriptors = aot_export_joint_with_descriptors(
                 self.stack,
                 ep.module(),
@@ -363,37 +272,23 @@ class AutoParallel:
                 bw_compiler=self.compiler_fn,
             )
         gm = self.joint_with_descriptors.graph_module
+        assert_has_no_collectives(gm)
 
-        # cleanup graph
-        # TODO: Make the DCE match exactly the AOTAutograd logic, I don't
-        # think I trust the default FX DCE logic
-        gm.graph.eliminate_dead_code()
-        gm.recompile()
-        _replace_view_mm_view_with_matmul(gm)
-        # disable pattern_matcher as it gets on our way
-        # we basically want to remove noops in here
-        prev = torch._inductor.config.pattern_matcher
-        torch._inductor.config.pattern_matcher = False
-        try:
-            # TODO: Double check if this is what we want to do
-            gm = joint_graph_passes(gm)
-        finally:
-            torch._inductor.config.pattern_matcher = prev
-        # TODO: We shouldn't actually remove these
-        remove_assert_ops(gm.graph)
-        gm.graph.eliminate_dead_code()
-        gm.recompile()
+        cleanup_graph(gm)
+        if _APPLY_VIEW_MM_VIEW_PATTERN:
+            _replace_view_mm_view_with_einsum(gm)
         # now add aliases nodes to the graph to
         # give more room for optimizations
-        _add_alias(gm)
+        _add_alias(gm, version="v1")
         trace_structured(
             "artifact",
             metadata_fn=lambda: {
                 "name": "autoparallel_joint_graph",
                 "encoding": "string",
             },
-            # TODO: Use print_readable instead with useful options
-            payload_fn=lambda: str(gm.graph),
+            payload_fn=lambda: gm.print_readable(
+                print_output=False, include_stride=True, include_device=True
+            ),
         )
 
         self.gm = gm
@@ -473,6 +368,16 @@ class AutoParallel:
         #    - contains another instance of subclass info in self
         #    - quite a lot of use of runtime_metadata
         #
+        from torch._subclasses.fake_tensor import unset_fake_temporarily
+
+        with unset_fake_temporarily():
+            # creates a new mesh and caches it internally
+            # we don't need to keep a reference to it
+            # TODO: remove ndim == 1 special case once
+            # DeviceMesh._flatten is fixed
+            mesh = self.mesh
+            if mesh.ndim != 1:
+                mesh._flatten()
         with self.fake_mode:
             (
                 parallel_gm,
@@ -486,14 +391,17 @@ class AutoParallel:
             )
         # clean it up by removing the added aliases from previous pass
         # as well as redundant views
-        parallel_gm = joint_graph_passes(parallel_gm)
+        cleanup_graph(parallel_gm, aggressive=True)
+
         trace_structured(
             "artifact",
             metadata_fn=lambda: {
                 "name": "autoparallel_parallel_graph",
                 "encoding": "string",
             },
-            payload_fn=lambda: str(parallel_gm.graph),
+            payload_fn=lambda: parallel_gm.print_readable(
+                print_output=False, include_stride=True, include_device=True
+            ),
         )
 
         if self.enable_ac:
@@ -510,12 +418,20 @@ class AutoParallel:
         # let's remove those otherwise we can't clean the backward graph properly
         # NB: This is VERY important for good memory use!
         # TODO: This is VERY VERY NAUGHTY, need to do this in a scoped way
-        torch.fx.node._side_effectful_functions.remove(
+        if (
             torch.ops._c10d_functional.wait_tensor
-        )
-        torch.fx.node._side_effectful_functions.remove(
+            in torch.fx.node._side_effectful_functions
+        ):
+            torch.fx.node._side_effectful_functions.remove(
+                torch.ops._c10d_functional.wait_tensor
+            )
+        if (
             torch.ops._c10d_functional.wait_tensor.default
-        )
+            in torch.fx.node._side_effectful_functions
+        ):
+            torch.fx.node._side_effectful_functions.remove(
+                torch.ops._c10d_functional.wait_tensor.default
+            )
 
         self.parallel_model_fn = parallel_model_fn = aot_compile_joint_with_descriptors(
             self.joint_with_descriptors

@@ -579,15 +579,21 @@ else:
         ),
     )
 
-batch_size = 1 * mesh.shape[0]
+batch_size = 4 * mesh.shape[0]
 seqlen = 2048 * 4
-vocab_size = 64000
+vocab_size = 128256
+use_vocab_parallel = not use_1d_mesh
 device = torch.device("cuda")
 
 
 def model_fn():
     model_args = TransformerModelArgs(
-        n_layers=2, vocab_size=vocab_size, max_seq_len=seqlen
+        n_layers=32,
+        vocab_size=vocab_size,
+        max_seq_len=seqlen,
+        multiple_of=1024,
+        ffn_dim_multiplier=1.3,
+        n_kv_heads=8,
     )
     m = Transformer(model_args)
     return m
@@ -605,13 +611,20 @@ with torch.device("meta"):
 mp_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
 
 # parallelize the model
-with AutoParallel(model, input_fn, mesh, mp_policy, compile=True) as autop:
+with AutoParallel(
+    model, input_fn, mesh, mp_policy, compile=True, repeated_subgraphs=True
+) as autop:
     autop.add_parameter_memory_constraint(low=None, high=None)
 
     x_sharding = (Shard(0),) + (Replicate(),) * (mesh.ndim - 1)
+    out_sharding = x_sharding
+    if use_vocab_parallel:
+        # add vocab parallel constraint
+        assert mesh.ndim == 2, "Only 2d mesh supported here"
+        out_sharding = (Shard(0), Shard(2))
 
     autop.add_input_constraints([x_sharding])
-    autop.add_output_constraints([x_sharding])
+    autop.add_output_constraints([out_sharding])
 
     # example of how to add manual constraints
     if use_1d_mesh:

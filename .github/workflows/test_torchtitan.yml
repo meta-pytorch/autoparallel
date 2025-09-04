@@ -47,4 +47,4 @@ jobs:
           --model.name llama3_auto_parallel \
           --parallelism.tensor_parallel_degree 4 \
           --training.dataset c4 \
-          --training.compile
+          --compile.enable

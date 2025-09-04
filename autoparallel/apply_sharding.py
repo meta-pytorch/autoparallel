@@ -4,6 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import contextlib
+import copy
 import operator
 from typing import Any
 
@@ -22,13 +23,14 @@ from torch.distributed.tensor.placement_types import Partial, Replicate, Shard  
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.utils._pytree import tree_flatten, tree_map_only
 
+from .graph_utils import cleanup_graph
 from .ordered_sharding import (
     compute_optimal_placement_order_for_parameters,
     ordered_redistribute_local_tensor,
 )
 from .propagation_rules import TENSOR_FACTORY_OPS
 
-_ENABLE_ORDERED_SHARDING_OPTIMIZATION = False
+_ENABLE_ORDERED_SHARDING_OPTIMIZATION = True
 
 
 class ApplyShardingInterpreter(torch.fx.Interpreter):
@@ -49,23 +51,28 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
         self._curr_node = n
         return super().run_node(n)
 
-    def redistribute_tensor(self, arg, curr_spec, tgt_spec, src_tgt_nodes=None):
+    def redistribute_tensor(self, arg, curr_spec, tgt_spec, node=None):
         tgt_placements = tuple(
             p if not p.is_partial() else Replicate() for p in tgt_spec.placements
         )
         x = arg
+        if node in self.param_placement_order and self.param_placement_order[node][1]:
+            assert curr_spec.placements != tgt_spec.placements
         if curr_spec.placements != tgt_spec.placements:
             tgt_spec_c = DTensorSpec(
                 tgt_spec.mesh, tgt_placements, tensor_meta=tgt_spec.tensor_meta
             )
-            placement_order = None
-            if (
-                src_tgt_nodes is not None
-                and src_tgt_nodes in self.param_placement_order
-            ):
-                placement_order = self.param_placement_order[src_tgt_nodes]
+            origin_order = None
+            tgt_order = None
+            if node in self.param_placement_order:
+                tgt_order, do_reorder = self.param_placement_order[node]
+                origin_order = tgt_order[::-1] if do_reorder else tgt_order
             x = ordered_redistribute_local_tensor(
-                arg, curr_spec, tgt_spec_c, placement_order
+                arg,
+                curr_spec,
+                tgt_spec_c,
+                src_placement_order=origin_order,
+                tgt_placement_order=tgt_order,
             )
         return x
 
@@ -107,7 +114,7 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
         for n, arg, curr_spec, tgt_spec in zip(
             all_input_nodes, flat_args_t, curr_specs, tgt_specs
         ):
-            x = self.redistribute_tensor(arg, curr_spec, tgt_spec, (node, n))
+            x = self.redistribute_tensor(arg, curr_spec, tgt_spec, node)
             new_flat_args_t.append(x)
             self.tgt_spec = tgt_spec
         new_flat_args = []
@@ -242,30 +249,20 @@ def rename_placeholder_node(
         fx_g.graph.erase_node(node)
 
 
-def _cleanup_graph(gm):
-    gm.graph.eliminate_dead_code()
-    gm.recompile()
-    prev = torch._inductor.config.pattern_matcher
-    torch._inductor.config.pattern_matcher = False
-    prev_pass = torch._inductor.config.joint_custom_post_pass
-    torch._inductor.config.joint_custom_post_pass = None
-    from torch._inductor.fx_passes.joint_graph import joint_graph_passes
-
-    try:
-        # TODO: Double check if this is what we want to do
-        gm = joint_graph_passes(gm)
-    finally:
-        torch._inductor.config.pattern_matcher = prev
-        torch._inductor.config.joint_custom_post_pass = prev_pass
-    gm.graph.eliminate_dead_code()
-    gm.recompile()
+def _get_inductor_decomp_table():
+    decomp_table = copy.copy(select_decomp_table())
+    # desugar our custom operator now that we've computed the sharding decision
+    decomp_table[torch.ops.autoparallel.dtype_cast.default] = lambda x, dtype: x.to(
+        dtype
+    )
+    return decomp_table
 
 
 def apply_sharding_to_model(gm, sharding_placement, params_spec, buffers_spec):
     args = shard_nodes_given_placements(gm, sharding_placement)
     local_args = [arg.to_local() for arg in args]
 
-    decomp_table = select_decomp_table()
+    decomp_table = _get_inductor_decomp_table()
     # run with DTensor to apply the collectives given the graph
     interp = ApplyShardingInterpreter(gm, sharding_placement, decomp_table)
 
@@ -273,11 +270,11 @@ def apply_sharding_to_model(gm, sharding_placement, params_spec, buffers_spec):
     with fx_traceback.preserve_node_meta():
         parallel_gm0 = make_fx(interp.run)(*local_args)
 
-    _cleanup_graph(parallel_gm0)
+    cleanup_graph(parallel_gm0)
     interp2 = ApplyDecompInterpreter(parallel_gm0, decomp_table)
     with fx_traceback.preserve_node_meta():
         parallel_gm = make_fx(interp2.run)(*local_args)
-    _cleanup_graph(parallel_gm)
+    cleanup_graph(parallel_gm)
 
     # Copy descriptors over to new graph
     for n1, n2 in zip(

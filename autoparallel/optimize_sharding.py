@@ -78,6 +78,9 @@ runtime cost while satisfying all constraints.
 """
 
 import math
+import operator
+import time
+from collections import defaultdict
 from typing import Optional
 
 import pulp
@@ -93,10 +96,12 @@ from torch.distributed.tensor._dtensor_spec import DTensorSpec
 from torch.distributed.tensor.placement_types import Placement, Replicate, Shard
 from torch.utils._pytree import tree_flatten, tree_map_only
 
+from .collective_runtime_estimation import estimate_strategy_comms_cost
 from .compute_estimation import (
     _get_sharded_shape_stride,
     estimate_strategy_runtime_cost,
 )
+from .graph_clustering import get_identical_regions
 from .propagation_rules import _create_all_options
 from .utils import get_local_map_placement_option, get_placement_options
 
@@ -122,13 +127,24 @@ def _get_next_name(name):
 
 
 class ShardingOptimizer:
-    def __init__(self, gm, mesh, rescale_grad_comm_cost_for_mp=1.0):
+    def __init__(
+        self, gm, mesh, rescale_grad_comm_cost_for_mp=1.0, repeated_subgraphs=False
+    ):
         self.gm = gm
         self.graph = gm.graph
+        self.nodes = list(self.graph.nodes)
         self.mesh = mesh
         self.rescale_grad_comm_cost_for_mp = rescale_grad_comm_cost_for_mp
         self.node_map = {node: i for i, node in enumerate(self.graph.nodes)}
         self.strats = self.build_sharding_metadata()
+
+        self.cluster_links = {}
+        if repeated_subgraphs:
+            t = time.time()
+            clusters = get_identical_regions(self.gm.graph, self.strats)
+            print(f"Found {len(clusters)} clusters in {time.time() - t:.2f}s")
+            self.create_cluster_links(clusters)
+
         # ds: Decision variables dictionary mapping (s_i, argi, ss, ii) -> ILP variable data
         # Each key represents a choice of input placement ii and output placement ss
         # for operation s_i and argument argi (corresponds to x_{i,a,o,j} in math notation)
@@ -189,6 +205,59 @@ class ShardingOptimizer:
                 raise ValueError(f"Oups {node.op}")
         return strats
 
+    def create_cluster_links(self, clusters):
+        """
+        This function creates a mapping between optimization nodes that are
+        identical. We use this to reduce the optimization space.
+        If cluster_links[key1] == key2, this means that everywhere in the
+        optimization problem we will be using key2 instead.
+        """
+        for cluster_group in clusters:
+            cluster0 = cluster_group[0]
+            for cluster_i in cluster_group[1:]:
+                for n0, ni in zip(cluster0, cluster_i):
+                    s0 = self.node_map[n0]
+                    s1 = self.node_map[ni]
+                    for argi, oi, ii in self.walk_over_options(n0):
+                        self.cluster_links[(s1, argi, oi, ii)] = (s0, argi, oi, ii)
+
+    def _build_pulp_variable(self, key, ds):
+        """
+        This function creates the PuLP optimization variable, taking into
+        consideration that if there are identical nodes (defined by cluster_links)
+        then we will reuse the optimization variable.
+        """
+        s_i, argi, ss, ii = key
+        node = self.nodes[s_i]
+        if key in self.cluster_links and self.cluster_links[key] in ds:
+            # if we already have a root variable created for a similar node, use it
+            va = ds[self.cluster_links[key]]["va"]
+        elif key in self.cluster_links and self.cluster_links[key] not in ds:
+            # if we have a similar node for which the root variable has not been created yet,
+            # create the new variable early and populate the ds with "va" field
+            # the remaining fields will be populated when the root variable is created
+            new_key = self.cluster_links[key]
+            new_s_i = new_key[0]
+            new_node = self.nodes[new_s_i]
+            va = pulp.LpVariable(
+                f"n={new_node},s={new_s_i},arg={argi},output_p={ss},input_p={ii}",
+                cat=pulp.LpBinary,
+            )
+            ds[new_key] = {"va": va}
+        elif key in ds:
+            # if we are the root variable, make sure that we haven't yet
+            # been initialized. This happens if we have been created before by
+            # a similar node which isn't a root
+            va = ds[key]["va"]
+            assert "cost" not in ds[key]
+        else:
+            # we are a root variable which came first in the iteration order
+            va = pulp.LpVariable(
+                f"n={node},s={s_i},arg={argi},output_p={ss},input_p={ii}",
+                cat=pulp.LpBinary,
+            )
+        return va
+
     def build_ds(self):
         """
         Build decision variables (ds) for the ILP optimization.
@@ -217,6 +286,7 @@ class ShardingOptimizer:
         grad_param_nodes = set(
             x[1] for x in get_param_and_grad_nodes(self.graph).values()
         )
+        sharding_transition_scale = 1
         for s_i, (node, s) in enumerate(strats.items()):
             if node.op == "output":
                 continue
@@ -229,16 +299,64 @@ class ShardingOptimizer:
             for ss, ssi in enumerate(s.strategies):
                 compute_cost = estimate_strategy_runtime_cost(node, ssi)
                 for argi, xxi in enumerate(ssi.redistribute_cost):
+                    all_input_nodes = self._all_input_nodes(node)
+                    argi_strat = (
+                        self.strats[all_input_nodes[argi]] if all_input_nodes else None
+                    )
                     for ii, comm_cost in enumerate(xxi):
+                        if argi_strat is not None:
+                            src_spec = argi_strat.strategies[ii].output_specs
+                            # TODO: operator.getitem being special is something
+                            # we might want to change in the future
+                            if node.target == operator.getitem:
+                                src_spec = src_spec[node.args[1]]
+                            tgt_spec = ssi.input_specs[argi]
+                            assert isinstance(src_spec, DTensorSpec)
+                            assert isinstance(tgt_spec, DTensorSpec)
+                            # we use our custom comm_cost function to estimate the cost
+                            # of the collective operation
+                            comm_cost = estimate_strategy_comms_cost(src_spec, tgt_spec)
+
                         if node in grad_param_nodes:
                             comm_cost = comm_cost / self.rescale_grad_comm_cost_for_mp
-                        va = pulp.LpVariable(
-                            f"n={node},s={s_i},arg={argi},output_p={ss},input_p={ii}",
-                            cat=pulp.LpBinary,
-                        )
-                        ds[(s_i, argi, ss, ii)] = {
+                        # Imagine we start node_i from S(0)S(0) and we want to reach node_{i+2} at
+                        # RR, and that node_{i+1} is an op with zero cost (like alias).
+                        # In this case, all of the following chains yield the same cost:
+                        # - S(0)S(0) -> S(0)R -> RR
+                        # - S(0)S(0) -> RS(0) -> RR
+                        # - S(0)S(0) -> RR -> RR
+                        # - S(0)S(0) -> S(0)S(0) -> RR
+                        # all of those cases are in principle equivalent. But if we want to
+                        # optimize S(0)S(0) -> RR to dispatch into a single collective instead of two
+                        # then we need to vafor the last two cases where redistribution happens
+                        # in a single go. To do this, we add a tie-break cost that is 1 if a redistribution
+                        # happens prior to getting to this configuration, and 0 otherwise. This way,
+                        # we will favor having fewer redistributions happening in the graph.
+                        if argi_strat is not None and node.target != operator.getitem:
+                            original_placement = argi_strat.strategies[
+                                ii
+                            ].output_specs.placements
+                            current_placement = ssi.input_specs[argi].placements
+                            redistribution_happened = (
+                                current_placement != original_placement
+                            )
+                            sharding_transition_cost = (
+                                int(redistribution_happened) * sharding_transition_scale
+                            )
+                        else:
+                            sharding_transition_cost = 0
+                        key = (s_i, argi, ss, ii)
+                        # NOTE: this modifies ds in-place sometimes
+                        # we might want to refactor this in the future
+                        va = self._build_pulp_variable(key, ds)
+                        ds[key] = {
                             "va": va,
-                            "cost": comm_cost + compute_cost / num_args[s_i],
+                            "cost": comm_cost
+                            + compute_cost / num_args[s_i]
+                            + sharding_transition_cost,
+                            "compute_cost": compute_cost / num_args[s_i],
+                            "comm_cost": comm_cost,
+                            "sharding_transition_cost": sharding_transition_cost,
                             "full_strat": ssi,
                             "out_strat": ssi.output_specs,
                             "inp_strat": ssi.input_specs[argi],
@@ -278,7 +396,10 @@ class ShardingOptimizer:
                 continue
             arg_vars = {}
             for arg, oi, ii in self.walk_over_options(node):
-                va = self.ds[(s_i, arg, oi, ii)]["va"]
+                key = (s_i, arg, oi, ii)
+                if key in self.cluster_links:
+                    continue
+                va = self.ds[key]["va"]
                 arg_vars.setdefault(arg, []).append(va)
             for eqs in arg_vars.values():
                 self.prob += (pulp.lpSum(eqs) == 1, _get_next_name("unique_decision"))
@@ -299,7 +420,10 @@ class ShardingOptimizer:
                 continue
             vars_per_output = {}
             for arg, oi, ii in self.walk_over_options(node):
-                va = self.ds[(s_i, arg, oi, ii)]["va"]
+                key = (s_i, arg, oi, ii)
+                if key in self.cluster_links:
+                    continue
+                va = self.ds[key]["va"]
                 vars_per_output.setdefault((arg, oi), []).append(va)
             eqs_per_arg = [[] for _ in self._all_input_nodes(node)]
             for (arg, oi), value in vars_per_output.items():
@@ -337,15 +461,42 @@ class ShardingOptimizer:
 
                 vars_s_i = {}
                 for _, s_i_oi, s_i_ii in self.walk_over_options(node, argi):
-                    va = self.ds[(s_i, argi, s_i_oi, s_i_ii)]["va"]
+                    key = (s_i, argi, s_i_oi, s_i_ii)
+                    if key in self.cluster_links:
+                        continue
+                    va = self.ds[key]["va"]
                     vars_s_i.setdefault(s_i_oi, []).append(va)
 
                 vars_s_j = {}
                 for _, s_j_oi, s_j_ii in self.walk_over_options(user, argj):
-                    va = self.ds[(s_j, argj, s_j_oi, s_j_ii)]["va"]
+                    key = (s_j, argj, s_j_oi, s_j_ii)
+                    if key in self.cluster_links:
+                        continue
+                    va = self.ds[key]["va"]
                     vars_s_j.setdefault(s_j_ii, []).append(va)
 
-                assert vars_s_i.keys() == vars_s_j.keys()
+                if vars_s_i.keys() != vars_s_j.keys():
+                    vars_s_j = {}
+                    for _, s_j_oi, s_j_ii in self.walk_over_options(user, argj):
+                        key = (s_j, argj, s_j_oi, s_j_ii)
+                        if key in self.cluster_links:
+                            va = self.ds[self.cluster_links[key]]["va"]
+                        else:
+                            va = self.ds[key]["va"]
+                        vars_s_j.setdefault(s_j_ii, []).append(va)
+
+                if vars_s_i.keys() != vars_s_j.keys():
+                    vars_s_i = {}
+                    for _, s_i_oi, s_i_ii in self.walk_over_options(node, argi):
+                        key = (s_i, argi, s_i_oi, s_i_ii)
+                        if key in self.cluster_links:
+                            va = self.ds[self.cluster_links[key]]["va"]
+                        else:
+                            va = self.ds[key]["va"]
+                        vars_s_i.setdefault(s_i_oi, []).append(va)
+
+                assert vars_s_i.keys() == vars_s_j.keys(), f"{vars_s_i}, {vars_s_j}"
+
                 for k in vars_s_i:
                     self.prob += (
                         pulp.lpSum(vars_s_i[k]) == pulp.lpSum(vars_s_j[k]),
@@ -360,11 +511,13 @@ class ShardingOptimizer:
         Mathematical form: ∀i,a,o,j: c_{i,a,o,j} = ∞ ⟹ x_{i,a,o,j} = 0
         """
         # force inf cost values to be 0, as the solver doesn't accept inf
-        for x in self.ds.values():
+        for key, x in self.ds.items():
             if not math.isfinite(x["cost"]):
-                self.prob += (x["va"] == 0, _get_next_name("inf_cases"))
                 # set the cost to an arbitrary number
                 x["cost"] = 10000.0
+                if key in self.cluster_links:
+                    continue
+                self.prob += (x["va"] == 0, _get_next_name("inf_cases"))
 
     def add_default_constraints(self):
         self.add_unique_decision_constraint()
@@ -481,8 +634,17 @@ class ShardingOptimizer:
                 continue
             d = opt[node]
             strat = str(d[0]["full_strat"])
-            costs = [x["cost"] for x in d]
-            line = f"  {plc_txt}{attr_color(strat)}{cost_txt}{attr_color(str(costs))}"
+            costs = [
+                (x["comm_cost"], x["compute_cost"], x["sharding_transition_cost"])
+                for x in d
+            ]
+            device_order = getattr(node.meta, "device_order", None)
+            if device_order:
+                line = f"  {plc_txt}{attr_color(strat)} device_order: {device_order} {cost_txt}{attr_color(str(costs))}"
+            else:
+                line = (
+                    f"  {plc_txt}{attr_color(strat)} {cost_txt}{attr_color(str(costs))}"
+                )
             if node.op == "placeholder":
                 line = f"    # {node.name}: {line}"
                 code.insert(l_id, line)
@@ -495,7 +657,15 @@ class ShardingOptimizer:
             l_id += 1
         code = "\n".join(code)
         total_cost = sum(self.ds[x]["cost"] for x in self.res)
+        total_comm_cost = sum(self.ds[x]["comm_cost"] for x in self.res)
+        total_compute_cost = sum(self.ds[x]["compute_cost"] for x in self.res)
+        total_transition_cost = sum(
+            self.ds[x]["sharding_transition_cost"] for x in self.res
+        )
         code += f"\ntotal_cost: {total_cost:.2f}"
+        code += f"\n  comm_cost: {total_comm_cost:.2f}"
+        code += f"\n  compute_cost: {total_compute_cost:.2f}"
+        code += f"\n  transition_cost: {total_transition_cost:.2f}"
         code += "\n" + self.get_violated_constraints_log()
         return code
 
@@ -516,7 +686,12 @@ class ShardingOptimizer:
 
     def get_solution(self, verbose=False):
         # add cost
-        self.prob += pulp.lpSum([x["va"] * x["cost"] for x in self.ds.values()])
+        opt_target = defaultdict(int)
+        # let's remove potentially duplicate variables in the program and just
+        # add their costs
+        for x in self.ds.values():
+            opt_target[x["va"]] += x["cost"]
+        self.prob += pulp.lpSum([va * cost for va, cost in opt_target.items()])
 
         # solver = pulp.HiGHS(msg=verbose)
         solver = pulp.PULP_CBC_CMD(msg=verbose)
@@ -534,6 +709,18 @@ class ShardingOptimizer:
         nodes = list(self.graph.nodes)
         for x in self.res:
             opt.setdefault(nodes[x[0]], []).append(self.ds[x])
+
+        # validate that a single solution is chosen
+        # per node
+        seen = set()
+        for r in self.res:
+            key = (r[0], r[1])
+            if key in seen:
+                raise RuntimeError(
+                    f"Multiple solutions for {nodes[key[0]]}, key={key}, "
+                    f"solutions: {[str(x['full_strat']) for x in opt[nodes[key[0]]]]}"
+                )
+            seen.add(key)
 
         # Let's simplify the output representation
         # and just return a single OpSpec

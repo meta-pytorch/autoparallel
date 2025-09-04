@@ -4,13 +4,29 @@
 # LICENSE file in the root directory of this source tree.
 
 
+import functools
+
 import torch
 from torch import nn
 from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor.placement_types import Replicate, Shard
 from torch.testing._internal.distributed.fake_pg import FakeStore
+from torch.utils.checkpoint import create_selective_checkpoint_contexts
 
 from autoparallel.api import AutoParallel
+
+
+def policy_fn(ctx, op, *args, **kwargs):
+    if (
+        op == torch.ops.aten._scaled_dot_product_flash_attention.default
+        or op == torch.ops.aten._scaled_dot_product_efficient_attention.default
+    ):
+        # NOTE: we can't save nondeterministic_seeded ops, the run with rng wrapper is not traceable yet
+        return torch.utils.checkpoint.CheckpointPolicy.PREFER_SAVE
+    return torch.utils.checkpoint.CheckpointPolicy.PREFER_RECOMPUTE
+
+
+context_fn = functools.partial(create_selective_checkpoint_contexts, policy_fn)
 
 
 class Block(nn.Module):
@@ -48,7 +64,7 @@ class Block(nn.Module):
 
     def forward(self, x):
         o = torch.utils.checkpoint.checkpoint(
-            self._compute_attention, x, use_reentrant=False
+            self._compute_attention, x, use_reentrant=False, context_fn=context_fn
         )
 
         o0 = o + x
@@ -103,7 +119,6 @@ with torch.device("meta"):
 
 mp_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
 # mp_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16)
-# mp_policy = None
 
 with AutoParallel(model, input_fn, mesh, mp_policy, compile=True) as autop:
     assert any(n.meta.get("nn_module_stack") for n in autop.gm.graph.nodes)
@@ -128,16 +143,34 @@ x = (torch.rand(bs // mesh.shape[0], seq_len, dim1, device="cuda"),)
 out = parallel_mod(*x)
 out.backward(torch.randn_like(out))
 
-print("All good!")
+# Validate
+seqs = set()
+for n in autop.gm.graph.nodes:
+    if "checkpoint" in n.meta.get(
+        "stack_trace", ""
+    ):  # placeholders don't have stack trace
+        is_bwd = n.meta.get("partitioner_tag", "") == "is_backward"
+        if not is_bwd:
+            if "getitem" in str(n.target):
+                # getitem nodes are tagged same as their parent
+                expected = policy_fn(None, n.args[0].target, (), ())
+            else:
+                expected = policy_fn(None, n.target, (), ())
+            actual = n.meta.get("recompute")
+            # NOTE: this assert only supports policy_fns on op alone
+            assert actual == expected
+            seqs.add(n.meta["seq_nr"])
+        else:
+            # fwd counterpart should have already populated seqs
+            assert n.meta["seq_nr"] in seqs
 
 mm_nodes = autop.gm.graph.find_nodes(
     op="call_function", target=torch.ops.aten.mm.default
 )
 
-# assert (
-#     mm_nodes[0].meta.get("recompute")
-#     == torch.utils.checkpoint.CheckpointPolicy.PREFER_RECOMPUTE
-# )
+assert (
+    mm_nodes[0].meta.get("recompute")
+    == torch.utils.checkpoint.CheckpointPolicy.PREFER_RECOMPUTE
+)
 
-# TODO: change this assert once we fix AC
-assert mm_nodes[0].meta.get("recompute") is None
+print("All good!")
