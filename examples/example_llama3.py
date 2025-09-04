@@ -612,6 +612,88 @@ with torch.device("meta"):
 
 mp_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
 
+
+def group_mm_nodes_with_its_gradients(nodes):
+    fwd_nodes = [n for n in nodes if "nn_module_stack" in n.meta]
+    bwd_nodes = [n for n in nodes if "fwd_nn_module_stack" in n.meta]
+    assert len(fwd_nodes) * 2 == len(bwd_nodes)
+    res = {}
+    for fwd_node in fwd_nodes:
+        o = []
+        for bwd_node in bwd_nodes:
+            if fwd_node.meta["nn_module_stack"] == bwd_node.meta["fwd_nn_module_stack"]:
+                o.append(bwd_node)
+        assert len(o) == 2
+        res[fwd_node] = o
+    return res
+
+
+def force_tp_constraints(autop, mm_nodes, feat_dim=1, bwd_constraint=False):
+    # out = x @ w   - S(0)R, RS(1) -> S(0)S(1)
+    # g_w = g.T @ x - S(1)S(0), S(0)R -> PS(0)
+    # g_x = g @ w.T - S(0)S(1), RS(0) -> S(0)P
+
+    add_node_constraint = autop.sharding_optimizer.add_node_constraint
+    fwd_bwd_groups = group_mm_nodes_with_its_gradients(mm_nodes)
+    fwd_nodes = list(fwd_bwd_groups.keys())
+    # assume there are 7 mm nodes per transformer block
+    # skip last mm as it's the final projection layer
+    assert (
+        len(fwd_nodes) - 1
+    ) % 7 == 0, f"expected 7 mm nodes per transformer block, {len(fwd_nodes) - 1}"
+    for block in range(0, len(fwd_nodes) - 1, 7):
+        fwd_nodes_block = fwd_nodes[block : block + 7]
+        # force the first 3 mm nodes to be S(0)S(1)
+        the_nodes = fwd_nodes_block[:3] + fwd_nodes_block[4:6]
+        for n in the_nodes:
+            add_node_constraint(n, (Shard(0), Shard(feat_dim)))
+            add_node_constraint(n.all_input_nodes[0], (Shard(0), Replicate()))
+            add_node_constraint(n.all_input_nodes[1], (Replicate(), Shard(1)))
+
+            if bwd_constraint:
+                bwd_nodes = fwd_bwd_groups[n]
+                # first is g_w, second is g_x
+                add_node_constraint(bwd_nodes[0], (Partial(), Shard(0)))
+                add_node_constraint(bwd_nodes[1], (Shard(0), Partial()))
+
+        # add reduction to finish TP, yielding S(0)P
+        the_nodes = fwd_nodes_block[3:4] + fwd_nodes_block[6:7]
+        for n in the_nodes:
+            add_node_constraint(n, (Shard(0), Partial()))
+            add_node_constraint(n.all_input_nodes[0], (Shard(0), Shard(feat_dim)))
+            add_node_constraint(n.all_input_nodes[1], (Replicate(), Shard(0)))
+
+            if bwd_constraint:
+                bwd_nodes = fwd_bwd_groups[n]
+                # first is g_w, second is g_x
+                add_node_constraint(bwd_nodes[0], (Partial(), Shard(0)))
+                add_node_constraint(bwd_nodes[1], (Shard(0), Shard(feat_dim)))
+
+
+def add_tp_constraints(autop):
+    mm_nodes = autop.gm.graph.find_nodes(
+        op="call_function", target=torch.ops.aten.mm.default
+    )
+    einsum_nodes = autop.gm.graph.find_nodes(
+        op="call_function", target=torch.ops.aten.einsum.default
+    )
+    assert (len(mm_nodes) > 0) ^ (
+        len(einsum_nodes) > 0
+    ), f"only one should be non-empty, got {len(mm_nodes)} and {len(einsum_nodes)}"
+    feat_dim = 1 if len(mm_nodes) > 0 else 2
+    tgt_nodes = mm_nodes + einsum_nodes
+    force_tp_constraints(autop, tgt_nodes, feat_dim=feat_dim, bwd_constraint=True)
+
+    if einsum_nodes:
+        # add sequence parallelism if we have einsum nodes
+        autop.sharding_optimizer.add_node_constraint(
+            list(tgt_nodes[3].users)[0], (Shard(0), Shard(1))
+        )
+        autop.sharding_optimizer.add_node_constraint(
+            list(list(tgt_nodes[3].users)[0].users)[0], (Shard(0), Shard(1))
+        )
+
+
 # parallelize the model
 with AutoParallel(
     model, input_fn, mesh, mp_policy, compile=True, repeated_subgraphs=True
@@ -628,81 +710,9 @@ with AutoParallel(
     autop.add_input_constraints([x_sharding])
     autop.add_output_constraints([out_sharding])
 
-    mm_nodes = autop.gm.graph.find_nodes(
-        op="call_function", target=torch.ops.aten.mm.default
-    )
-    einsum_nodes = autop.gm.graph.find_nodes(
-        op="call_function", target=torch.ops.aten.einsum.default
-    )
-
-    enable_constraint = True
-    # out = x @ w   - S(0)R, RS(1) -> S(0)S(1)
-    # g_w = g.T @ x - S(1)S(0), S(0)R -> PS(0)
-    # g_x = g @ w.T - S(0)S(1), RS(0) -> S(0)P
-
-    def group_mm_nodes_with_its_gradients(nodes):
-        fwd_nodes = [n for n in nodes if "nn_module_stack" in n.meta]
-        bwd_nodes = [n for n in nodes if "fwd_nn_module_stack" in n.meta]
-        assert len(fwd_nodes) * 2 == len(bwd_nodes)
-        res = {}
-        for fwd_node in fwd_nodes:
-            o = []
-            for bwd_node in bwd_nodes:
-                if (
-                    fwd_node.meta["nn_module_stack"]
-                    == bwd_node.meta["fwd_nn_module_stack"]
-                ):
-                    o.append(bwd_node)
-            assert len(o) == 2
-            res[fwd_node] = o
-        return res
-
-    def force_tp_constraints(autop, mm_nodes, feat_dim=1, bwd_constraint=False):
-        add_node_constraint = autop.sharding_optimizer.add_node_constraint
-        fwd_bwd_groups = group_mm_nodes_with_its_gradients(mm_nodes)
-        fwd_nodes = list(fwd_bwd_groups.keys())
-        # assume there are 7 mm nodes per transformer block
-        # skipt last mm as it's the final projection layer
-        for block in range(0, len(fwd_nodes) - 1, 7):
-            fwd_nodes_block = fwd_nodes[block : block + 7]
-            # force the first 3 mm nodes to be TP
-            the_nodes = fwd_nodes_block[:3] + fwd_nodes_block[4:6]
-            for n in the_nodes:
-                add_node_constraint(n, (Shard(0), Shard(feat_dim)))
-                add_node_constraint(n.all_input_nodes[0], (Shard(0), Replicate()))
-                add_node_constraint(n.all_input_nodes[1], (Replicate(), Shard(1)))
-
-                if bwd_constraint:
-                    bwd_nodes = fwd_bwd_groups[n]
-                    # first is g_w, second is g_x
-                    add_node_constraint(bwd_nodes[0], (Partial(), Shard(0)))
-                    add_node_constraint(bwd_nodes[1], (Shard(0), Partial()))
-
-            the_nodes = fwd_nodes_block[3:4] + fwd_nodes_block[6:7]
-            for n in the_nodes:
-                add_node_constraint(n, (Shard(0), Partial()))
-                add_node_constraint(n.all_input_nodes[0], (Shard(0), Shard(feat_dim)))
-                add_node_constraint(n.all_input_nodes[1], (Replicate(), Shard(0)))
-
-                if bwd_constraint:
-                    bwd_nodes = fwd_bwd_groups[n]
-                    # first is g_w, second is g_x
-                    add_node_constraint(bwd_nodes[0], (Partial(), Shard(0)))
-                    add_node_constraint(bwd_nodes[1], (Shard(0), Shard(feat_dim)))
-
-    if mm_nodes and enable_constraint:
-        force_tp_constraints(autop, mm_nodes, feat_dim=1)
-    elif einsum_nodes and enable_constraint:
-        mm_nodes = einsum_nodes
-
-        force_tp_constraints(autop, mm_nodes, feat_dim=2)
-
-        autop.sharding_optimizer.add_node_constraint(
-            list(mm_nodes[3].users)[0], (Shard(0), Shard(1))
-        )
-        autop.sharding_optimizer.add_node_constraint(
-            list(list(mm_nodes[3].users)[0].users)[0], (Shard(0), Shard(1))
-        )
+    enable_manual_constraint = True
+    if enable_manual_constraint and not use_1d_mesh:
+        add_tp_constraints(autop)
 
     t = time.time()
     sharding_placement = autop.optimize_placement()
