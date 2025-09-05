@@ -9,8 +9,8 @@ from typing import Any, Dict
 
 import torch
 from torch._inductor import ir, scheduler
-from torch._inductor.comms import bucket_all_gathers, bucket_reduce_scatters, get_op_idx
 from torch._inductor.dependencies import StarDep, WeakDep
+from torch._inductor.comms import get_op_idx
 from torch._inductor.utils import is_collective, is_wait
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
@@ -23,6 +23,8 @@ from .bucket_utils import (
     _replace_scheduler_buffer,
     _schedule_fallback_operation,
     _schedule_snode,
+    bucket_all_gathers,
+    bucket_reduce_scatters,
     check_ir_node_bucketable,
 )
 
