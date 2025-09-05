@@ -5,6 +5,7 @@
 
 import time
 from dataclasses import dataclass
+from functools import partial
 from typing import ClassVar
 
 import torch
@@ -16,6 +17,10 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.testing._internal.distributed.fake_pg import FakeStore
 
 from autoparallel.api import AutoParallel
+from autoparallel.auto_bucketing import (
+    simple_fsdp_autobucketing_reordering_pass,
+    simplefsdp_autobucketing_config,
+)
 
 
 def has_cuda_capability(major: int, minor: int) -> bool:
@@ -558,14 +563,18 @@ class Transformer(nn.Module):
 
 world_size = 256
 
-backend = "fake"
-kwargs = {"rank": 0, "world_size": world_size}
-if True:
-    backend = "nccl"
-    fake_store = None
-    kwargs = {}
-    world_size = 8
-torch.distributed.init_process_group(backend, store=fake_store, **kwargs)
+fake_store = FakeStore()
+torch.distributed.init_process_group(
+    "fake", store=fake_store, rank=0, world_size=world_size
+)
+# backend = "fake"
+# kwargs = {"rank": 0, "world_size": world_size}
+# if True:
+#     backend = "nccl"
+#     fake_store = None
+#     kwargs = {}
+#     world_size = 8
+# torch.distributed.init_process_group(backend, store=fake_store, **kwargs)
 
 use_1d_mesh = False
 
@@ -608,19 +617,11 @@ def input_fn():
     return x
 
 
-from functools import partial
-
-from autoparallel.auto_bucketing import (
-    simple_fsdp_autobucketing_reordering_pass,
-    simplefsdp_autobucketing_config,
-)
-
 torch._inductor.config.allow_buffer_reuse = False
 torch._inductor.config.reorder_for_peak_memory = False
 torch._inductor.config.reorder_for_compute_comm_overlap = True
-simplefsdp_autobucketing_config.save_estimation_path = (
-    "/storage/home/fmassa/work/projects/autoparallel/estimation_mast.pkl"
-)
+simplefsdp_autobucketing_config.calibrate_number = 5
+simplefsdp_autobucketing_config.save_estimation_path = "./estimation_mast.pkl"
 simple_fsdp_autobucketing_reordering_pass = partial(
     simple_fsdp_autobucketing_reordering_pass,
     configs=simplefsdp_autobucketing_config,
