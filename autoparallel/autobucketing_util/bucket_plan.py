@@ -108,7 +108,9 @@ def get_simplefsdp_auto_plan(
         comp_time_dict,
         memory_dict,
         peak_memory_per_step_dict,
-    ) = benchmark_and_sync_runtime(sched, snodes, bucketable_nodes)
+    ) = benchmark_and_sync_runtime(
+        sched, snodes, name_to_buf, name_to_fused_node, bucketable_nodes, configs
+    )
     future_comp_time = sum(comp_time_dict.values())
     peak_memory = max(peak_memory_per_step_dict.values()) + configs.peak_memory_offset
 
@@ -139,7 +141,7 @@ def get_simplefsdp_auto_plan(
                 current_ag_bucket,
                 schedule_fallback_operation,
                 name_to_buf,
-                torch.ops._c10d_functional.all_gather_into_tensor.default,
+                "torch.ops._c10d_functional.all_gather_into_tensor.default",
                 comm_cache,
             )
 
@@ -243,7 +245,7 @@ def get_simplefsdp_auto_plan(
                         current_rs_bucket,
                         schedule_fallback_operation,
                         name_to_buf,
-                        torch.ops._c10d_functional.reduce_scatter_tensor.default,
+                        "torch.ops._c10d_functional.reduce_scatter_tensor.default",
                         comm_cache,
                         ReduceOp.AVG,
                     )
@@ -290,7 +292,7 @@ def get_simplefsdp_auto_plan(
                 current_rs_bucket,
                 schedule_fallback_operation,
                 name_to_buf,
-                torch.ops._c10d_functional.reduce_scatter_tensor.default,
+                "torch.ops._c10d_functional.reduce_scatter_tensor.default",
                 comm_cache,
                 ReduceOp.AVG,
             )
@@ -333,10 +335,10 @@ def get_simplefsdp_auto_plan(
                     ]
                     seen_new_bucketable_ag = False
 
-    if len(current_ag_bucket) > 0 or len(all_gather_plan) == 0:
+    if len(current_ag_bucket) > 0:
         all_gather_plan.append(current_ag_bucket)
 
-    if len(current_rs_bucket) > 0 or len(reduce_scatter_plan) == 0:
+    if len(current_rs_bucket) > 0:
         reduce_scatter_plan.append(current_rs_bucket)
 
     return all_gather_plan, reduce_scatter_plan

@@ -161,7 +161,7 @@ def check_ir_node_bucketable(
 
 def _get_fx_node(
     snode_or_ir_node: Union["scheduler.BaseSchedulerNode", "ir.IRNode"],
-    expected_op: Callable[[Any]],
+    expected_op: Any,
 ) -> torch.fx.Node:
     origins = None
     if isinstance(snode_or_ir_node, scheduler.BaseSchedulerNode):
@@ -188,7 +188,7 @@ def _get_fx_node(
 
 def get_snode_process_group_info(
     snode: "scheduler.BaseSchedulerNode",
-    expected_op: Callable[[Any]],
+    expected_op: Any,
     resolve_pg: bool = False,
 ) -> tuple[int, Union[str, ProcessGroup]]:
     fx_node = _get_fx_node(snode, expected_op=expected_op)
@@ -246,7 +246,7 @@ def get_snode_tensor_info(
 
 def _estimate_bucketed_node_list(
     current_node_list: list["scheduler.BaseSchedulerNode"],
-    schedule_fallback_operation: Callable[[Any]],
+    schedule_fallback_operation: Callable[[Any], Any],
     group_size: int,
     group_name: str,
     name_to_buf: Dict[str, "scheduler.SchedulerBuffer"],
@@ -270,7 +270,7 @@ def _estimate_bucketed_node_list(
         )
         return estimated_comm, comm_size_inp, comm_size_out
 
-    if comm_func == torch.ops._c10d_functional.all_gather_into_tensor.default:
+    if comm_func == "torch.ops._c10d_functional.all_gather_into_tensor.default":
         bucked_node = bucket_all_gathers(
             schedule_fallback_operation,
             group_size,
@@ -282,7 +282,7 @@ def _estimate_bucketed_node_list(
         )
         comm_size_inp = bucked_node[0].layout.size
         comm_size_out = bucked_node[1].layout.size
-    elif comm_func == torch.ops._c10d_functional.reduce_scatter_tensor.default:
+    elif comm_func == "torch.ops._c10d_functional.reduce_scatter_tensor.default":
         bucked_node = bucket_reduce_scatters(
             schedule_fallback_operation,
             group_size,
@@ -309,7 +309,7 @@ def _estimate_bucketed_node_list(
 
 def estimate_bucketed_snode_runtime(
     node_bucket_dict: Dict[tuple[Any, ...], list["scheduler.BaseSchedulerNode"]],
-    schedule_fallback_operation: Callable[[Any]],
+    schedule_fallback_operation: Callable[[Any], Any],
     name_to_buf: Dict[str, "scheduler.SchedulerBuffer"],
     comm_func: Callable[[Any], Any],
     comm_cache: Dict[Any, Any],
