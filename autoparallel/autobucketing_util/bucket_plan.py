@@ -187,11 +187,13 @@ def get_simplefsdp_auto_plan(
             )
 
             # (3) Communication size criteria
-            break_comm_size_criteria = (
-                comm_cache.ag_max_inp_size <= comm_size_inp
-                or comm_cache.rs_max_out_size
-                <= heuristic_info["this_step_rs_comm_out_size"]
-            )
+            break_comm_size_criteria = comm_cache.ag_max_inp_size < comm_size_inp
+            if comm_cache.rs_max_out_size > 0:
+                break_comm_size_criteria = (
+                    break_comm_size_criteria
+                    or comm_cache.rs_max_out_size
+                    < heuristic_info["this_step_rs_comm_out_size"]
+                )
 
             if (
                 break_overlap_criteria
