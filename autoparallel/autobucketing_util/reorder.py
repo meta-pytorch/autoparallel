@@ -9,9 +9,9 @@ from enum import IntEnum
 from typing import Dict, List, Optional, Tuple
 
 import torch
-from torch.utils._ordered_set import OrderedSet
 from torch._inductor import ir, scheduler
-from torch._inductor.utils import is_collective
+from torch._inductor.utils import contains_collective, contains_wait, is_collective
+from torch.utils._ordered_set import OrderedSet
 
 from .bucket_utils import check_ir_node_bucketable
 
@@ -143,7 +143,9 @@ def get_node_type(node: "scheduler.BaseSchedulerNode", bucketable_ir_nodes) -> N
 
     if isinstance(node, scheduler.GroupedSchedulerNode):
         # [Only for bucketing]: newly created AG and RS are grouped as GroupedSchedulerNode
-        child_nodes_type = [_get_ir_node_type(n.node, bucketable_ir_nodes) for n in node.snodes]
+        child_nodes_type = [
+            _get_ir_node_type(n.node, bucketable_ir_nodes) for n in node.snodes
+        ]
         if NodeType.AG_WAIT in child_nodes_type:
             return NodeType.AG_WAIT
         elif NodeType.RS_WAIT in child_nodes_type:
@@ -187,7 +189,11 @@ def reorder_all_gather(
             all_gather_list.append(node)
             inverse_user = list(inverse_users[node])
             inverse_user = [
-                n for n in inverse_user if node_to_type[n] == NodeType.COMPUTE
+                n
+                for n in inverse_user
+                if node_to_type[n] == NodeType.COMPUTE
+                and not contains_collective(n)
+                and not contains_wait(n)
             ]
             if len(inverse_user) > 0:
                 all_gather_list.extend(inverse_user)
@@ -244,7 +250,7 @@ def reorder_reduce_scatter(
             wait_list.append(node)
             node_user = node_users[node]
             node_user = [n for n in node_user if node_to_type[n] == NodeType.COMPUTE]
-            #wait_list.extend(node_user)
+            # wait_list.extend(node_user)
         elif node_type == NodeType.REDUCE_SCATTER:
             if len(wait_list) > 0:
                 # move the i-th wait node before (i+1)-th reduce scatter node

@@ -76,16 +76,14 @@ def simple_fsdp_autobucketing_reordering_pass(
         print("Reorder scheduler nodes with autobucketing algroithm")
         node_length = len(snodes)
         snodes = reorder.reorder_all_gather(
-            snodes,
-            bucketable_nodes,
-            all_gather_before_last_wait=True
+            snodes, bucketable_nodes, all_gather_before_last_wait=False
         )
-        assert node_length == len(snodes), (
-            f"Missed nodes in reordering all gather: expected {node_length}, but got {len(snodes)}"
-        )
+        assert node_length == len(
+            snodes
+        ), f"Missed nodes in reordering all gather: expected {node_length}, but got {len(snodes)}"
         snodes = reorder.reorder_reduce_scatter(snodes, bucketable_nodes)
-        assert node_length == len(snodes), (
-            f"Missed nodes in reordering reduce scatter: expected {node_length}, but got {len(snodes)}"
-        )
+        assert node_length == len(
+            snodes
+        ), f"Missed nodes in reordering reduce scatter: expected {node_length}, but got {len(snodes)}"
 
     return snodes
