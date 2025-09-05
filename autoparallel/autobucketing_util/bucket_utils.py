@@ -160,7 +160,7 @@ def check_ir_node_bucketable(
 
 def _get_fx_node(
     snode_or_ir_node: Union["scheduler.BaseSchedulerNode", "ir.IRNode"],
-    expected_op: Callable[[Any]],
+    expected_op: Any,
 ) -> torch.fx.Node:
     origins = None
     if isinstance(snode_or_ir_node, scheduler.BaseSchedulerNode):
@@ -187,7 +187,7 @@ def _get_fx_node(
 
 def get_snode_process_group_info(
     snode: "scheduler.BaseSchedulerNode",
-    expected_op: Callable[[Any]],
+    expected_op: Any,
     resolve_pg: bool = False,
 ) -> tuple[int, Union[str, ProcessGroup]]:
     fx_node = _get_fx_node(snode, expected_op=expected_op)
