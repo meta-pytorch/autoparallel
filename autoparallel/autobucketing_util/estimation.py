@@ -7,6 +7,7 @@
 import os
 import pickle
 from collections import defaultdict
+from typing import Any
 
 import torch
 import torch.distributed as c10d
@@ -15,7 +16,6 @@ from torch._inductor.utils import is_collective
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 
-from ..auto_bucketing import simplefsdp_autobucketing_config
 from .bucket_utils import (
     check_ir_node_bucketable,
     get_snode_process_group_info,
@@ -44,7 +44,7 @@ def benchmark_and_sync_runtime(
     name_to_buf: dict[str, "scheduler.SchedulerBuffer"],
     name_to_fused_node: dict[str, "scheduler.BaseSchedulerNode"],
     bucketable_nodes: set[str],
-    configs: "simplefsdp_autobucketing_config",
+    configs: Any,
 ):
     world_size = c10d.distributed_c10d.get_world_size()
 
@@ -220,6 +220,6 @@ def benchmark_and_sync_runtime(
     median_runtimes = sync_dict_across_ranks(comm_cache.cache, world_size)
     comm_cache.cache = median_runtimes
     comm_cache._update_max_size()
-    with open(configs.simplefsdp.save_estimation_path, "wb") as file:
+    with open(configs.save_estimation_path, "wb") as file:
         pickle.dump(comm_cache.cache, file)
     return comm_cache, comp_time_dict, memory_dict, peak_memory_per_step_dict
