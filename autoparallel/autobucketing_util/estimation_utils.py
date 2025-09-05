@@ -200,6 +200,7 @@ class CommPerfCache:
     def get_comm_time(
         self, tensor_input_size, tensor_output_size, comm_func, calibrated=False
     ):
+        comm_func = str(comm_func)
         key = (tuple(tensor_input_size), tuple(tensor_output_size), comm_func)
         if key in self.cache:
             return self.cache[key]
@@ -368,7 +369,7 @@ def benchmark_extern_node(
                 return out
 
             def delete_tensor_in_list(tensor_list: list[Any]) -> None:
-                for i in range(len(tensor_list)):
+                for i in range(len(tensor_list) - 1, -1, -1):
                     if isinstance(tensor_list[i], torch.Tensor):
                         tensor_list[i].cpu()
                         del tensor_list[i]
