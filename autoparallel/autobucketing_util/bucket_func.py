@@ -9,8 +9,8 @@ from typing import Any, Dict
 
 import torch
 from torch._inductor import ir, scheduler
-from torch._inductor.dependencies import StarDep, WeakDep
 from torch._inductor.comms import get_op_idx
+from torch._inductor.dependencies import StarDep, WeakDep
 from torch._inductor.utils import is_collective, is_wait
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
