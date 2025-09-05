@@ -34,12 +34,9 @@ _ENABLE_ORDERED_SHARDING_OPTIMIZATION = True
 
 
 class ApplyShardingInterpreter(torch.fx.Interpreter):
-    def __init__(self, module, sharding_placement, decomp_table=None):
+    def __init__(self, module, sharding_placement):
         super().__init__(module, garbage_collect_values=True, graph=None)
         self.sharding_placement = sharding_placement
-        if decomp_table is None:
-            decomp_table = {}
-        self.decomp_table = decomp_table
         param_placement_order = {}
         if _ENABLE_ORDERED_SHARDING_OPTIMIZATION:
             param_placement_order = compute_optimal_placement_order_for_parameters(
@@ -170,13 +167,6 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
             # TODO: see if we can remove this contiguous properly
             new_args[0] = new_args[0].contiguous()
 
-        if target in self.decomp_table:
-            new_target = self.decomp_table[target]
-            out = super().call_function(new_target, tuple(new_args), kwargs)
-            # NOTE: is there a canonical way of handling this?
-            if out is not NotImplemented:
-                out = tree_map_only(DTensor, lambda x: x.to_local(), out)
-                return out
         out = super().call_function(target, tuple(new_args), kwargs)
         out = tree_map_only(DTensor, lambda x: x.to_local(), out)
         return out
@@ -246,7 +236,7 @@ def apply_sharding_to_model(gm, sharding_placement, params_spec, buffers_spec):
 
     decomp_table = _get_inductor_decomp_table()
     # run with DTensor to apply the collectives given the graph
-    interp = ApplyShardingInterpreter(gm, sharding_placement, decomp_table)
+    interp = ApplyShardingInterpreter(gm, sharding_placement)
 
     # TODO: make_fx here is suspicious in case of dynamic shapes
     with fx_traceback.preserve_node_meta():
