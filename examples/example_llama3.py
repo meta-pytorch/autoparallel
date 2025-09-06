@@ -653,7 +653,7 @@ def force_tp_constraints(autop, mm_nodes, feat_dim=1, bwd_constraint=False):
             if bwd_constraint:
                 bwd_nodes = fwd_bwd_groups[n]
                 # first is g_w, second is g_x
-                add_node_constraint(bwd_nodes[0], (Partial(), Shard(0)))
+                add_node_constraint(bwd_nodes[0], (Partial(), Shard(1)))
                 add_node_constraint(bwd_nodes[1], (Shard(0), Partial()))
 
         # add reduction to finish TP, yielding S(0)P
@@ -710,7 +710,7 @@ with AutoParallel(
     autop.add_input_constraints([x_sharding])
     autop.add_output_constraints([out_sharding])
 
-    enable_manual_constraint = True
+    enable_manual_constraint = False
     if enable_manual_constraint and not use_1d_mesh:
         add_tp_constraints(autop)
 
