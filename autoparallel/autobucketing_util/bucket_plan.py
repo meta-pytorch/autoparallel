@@ -177,7 +177,6 @@ def get_simplefsdp_auto_plan(
             bucketed_comm_memory = (
                 2 * comm_size_inp
                 + 2 * comm_size_out
-                + heuristic_info["accumulated_gradient_size"]
                 + heuristic_info["this_step_rs_comm_inp_size"] * 2
                 + heuristic_info["last_step_rs_comm_size"]
             )
