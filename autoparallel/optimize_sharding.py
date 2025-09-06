@@ -218,7 +218,13 @@ class ShardingOptimizer:
                 for n0, ni in zip(cluster0, cluster_i):
                     s0 = self.node_map[n0]
                     s1 = self.node_map[ni]
-                    for argi, oi, ii in self.walk_over_options(n0):
+                    options_n0 = list(self.walk_over_options(n0))
+                    options_ni = list(self.walk_over_options(ni))
+                    assert options_n0 == options_ni, (
+                        f"Problem with graph clustering: {n0} and {ni} don't have the same number "
+                        "of input/output placements. Please report a bug"
+                    )
+                    for argi, oi, ii in options_n0:
                         self.cluster_links[(s1, argi, oi, ii)] = (s0, argi, oi, ii)
 
     def _build_pulp_variable(self, key, ds):
@@ -475,7 +481,7 @@ class ShardingOptimizer:
                     va = self.ds[key]["va"]
                     vars_s_j.setdefault(s_j_ii, []).append(va)
 
-                if vars_s_i.keys() != vars_s_j.keys():
+                if len(vars_s_j) == 0:
                     vars_s_j = {}
                     for _, s_j_oi, s_j_ii in self.walk_over_options(user, argj):
                         key = (s_j, argj, s_j_oi, s_j_ii)
@@ -485,7 +491,7 @@ class ShardingOptimizer:
                             va = self.ds[key]["va"]
                         vars_s_j.setdefault(s_j_ii, []).append(va)
 
-                if vars_s_i.keys() != vars_s_j.keys():
+                if len(vars_s_i) == 0:
                     vars_s_i = {}
                     for _, s_i_oi, s_i_ii in self.walk_over_options(node, argi):
                         key = (s_i, argi, s_i_oi, s_i_ii)
