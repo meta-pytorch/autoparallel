@@ -75,6 +75,10 @@ def benchmark_and_sync_runtime(
     _, memories_at_nodes = memory.estimate_peak_memory(
         snodes, name_to_freeable_input_buf, graph_outputs
     )
+    # ensure memory offset is always positive
+    if min(memories_at_nodes) < 0:
+        shift_value = abs(min(memories_at_nodes))
+        memories_at_nodes = [x + shift_value for x in memories_at_nodes]
 
     for idx, snode in enumerate(snodes):
         if is_collective(
