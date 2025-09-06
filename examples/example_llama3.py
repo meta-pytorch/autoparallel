@@ -5,6 +5,7 @@
 
 import time
 from dataclasses import dataclass
+from functools import partial
 from typing import ClassVar
 
 import torch
@@ -16,6 +17,10 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.testing._internal.distributed.fake_pg import FakeStore
 
 from autoparallel.api import AutoParallel
+from autoparallel.auto_bucketing import (
+    simple_fsdp_autobucketing_reordering_pass,
+    simplefsdp_autobucketing_config,
+)
 
 
 def has_cuda_capability(major: int, minor: int) -> bool:
@@ -562,6 +567,14 @@ fake_store = FakeStore()
 torch.distributed.init_process_group(
     "fake", store=fake_store, rank=0, world_size=world_size
 )
+# backend = "fake"
+# kwargs = {"rank": 0, "world_size": world_size}
+# if True:
+#     backend = "nccl"
+#     fake_store = None
+#     kwargs = {}
+#     world_size = 8
+# torch.distributed.init_process_group(backend, store=fake_store, **kwargs)
 
 use_1d_mesh = False
 
@@ -588,7 +601,7 @@ device = torch.device("cuda")
 
 def model_fn():
     model_args = TransformerModelArgs(
-        n_layers=32,
+        n_layers=2,
         vocab_size=vocab_size,
         max_seq_len=seqlen,
         multiple_of=1024,
@@ -602,6 +615,20 @@ def model_fn():
 def input_fn():
     x = torch.randint(0, vocab_size, (batch_size, seqlen), device=device)
     return x
+
+
+torch._inductor.config.allow_buffer_reuse = False
+torch._inductor.config.reorder_for_peak_memory = False
+torch._inductor.config.reorder_for_compute_comm_overlap = True
+simplefsdp_autobucketing_config.calibrate_number = 5
+simplefsdp_autobucketing_config.save_estimation_path = "./estimation_mast.pkl"
+simple_fsdp_autobucketing_reordering_pass = partial(
+    simple_fsdp_autobucketing_reordering_pass,
+    configs=simplefsdp_autobucketing_config,
+)
+torch._inductor.config.reorder_for_compute_comm_overlap_passes = [
+    simple_fsdp_autobucketing_reordering_pass
+]
 
 
 # parallelize the model
@@ -659,3 +686,35 @@ x = (
 out = parallel_mod(*x)
 out.backward(torch.randn_like(out))
 print("All good!")
+
+
+def _dump_trace(prof):
+    prof.export_chrome_trace(
+        f"/home/fmassa/work/projects/autoparallel/traces/rank{torch.distributed.get_rank()}.json"
+    )
+
+
+prof = torch.profiler.profile(
+    activities=[
+        torch.profiler.ProfilerActivity.CUDA,
+        torch.profiler.ProfilerActivity.CPU,
+    ],
+    schedule=torch.profiler.schedule(
+        warmup=2,
+        active=2,
+        wait=1,
+        repeat=1,
+        skip_first=0,
+    ),
+    record_shapes=False,
+    profile_memory=False,
+    with_stack=True,
+    with_flops=False,
+    on_trace_ready=_dump_trace,
+)
+
+with prof:
+    for i in range(10):
+        out = parallel_mod(*x)
+        out.backward(torch.randn_like(out))
+        prof.step()
