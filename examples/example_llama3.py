@@ -636,6 +636,8 @@ def force_tp_constraints(autop, mm_nodes, feat_dim=1, bwd_constraint=False):
     add_node_constraint = autop.sharding_optimizer.add_node_constraint
     fwd_bwd_groups = group_mm_nodes_with_its_gradients(mm_nodes)
     fwd_nodes = list(fwd_bwd_groups.keys())
+    dim1 = 0 if feat_dim == 1 else 1
+    dim2 = 1 if feat_dim == 1 else 0
     # assume there are 7 mm nodes per transformer block
     # skip last mm as it's the final projection layer
     assert (
@@ -653,7 +655,7 @@ def force_tp_constraints(autop, mm_nodes, feat_dim=1, bwd_constraint=False):
             if bwd_constraint:
                 bwd_nodes = fwd_bwd_groups[n]
                 # first is g_w, second is g_x
-                add_node_constraint(bwd_nodes[0], (Partial(), Shard(1)))
+                add_node_constraint(bwd_nodes[0], (Partial(), Shard(dim1)))
                 add_node_constraint(bwd_nodes[1], (Shard(0), Partial()))
 
         # add reduction to finish TP, yielding S(0)P
@@ -666,7 +668,7 @@ def force_tp_constraints(autop, mm_nodes, feat_dim=1, bwd_constraint=False):
             if bwd_constraint:
                 bwd_nodes = fwd_bwd_groups[n]
                 # first is g_w, second is g_x
-                add_node_constraint(bwd_nodes[0], (Partial(), Shard(0)))
+                add_node_constraint(bwd_nodes[0], (Partial(), Shard(dim2)))
                 add_node_constraint(bwd_nodes[1], (Shard(0), Shard(feat_dim)))
 
 
