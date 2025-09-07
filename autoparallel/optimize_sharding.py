@@ -218,7 +218,13 @@ class ShardingOptimizer:
                 for n0, ni in zip(cluster0, cluster_i):
                     s0 = self.node_map[n0]
                     s1 = self.node_map[ni]
-                    for argi, oi, ii in self.walk_over_options(n0):
+                    options_n0 = list(self.walk_over_options(n0))
+                    options_ni = list(self.walk_over_options(ni))
+                    assert options_n0 == options_ni, (
+                        f"Problem with graph clustering: {n0} and {ni} don't have the same number "
+                        "of input/output placements. Please report a bug"
+                    )
+                    for argi, oi, ii in options_n0:
                         self.cluster_links[(s1, argi, oi, ii)] = (s0, argi, oi, ii)
 
     def _build_pulp_variable(self, key, ds):
@@ -304,21 +310,6 @@ class ShardingOptimizer:
                         self.strats[all_input_nodes[argi]] if all_input_nodes else None
                     )
                     for ii, comm_cost in enumerate(xxi):
-                        if argi_strat is not None:
-                            src_spec = argi_strat.strategies[ii].output_specs
-                            # TODO: operator.getitem being special is something
-                            # we might want to change in the future
-                            if node.target == operator.getitem:
-                                src_spec = src_spec[node.args[1]]
-                            tgt_spec = ssi.input_specs[argi]
-                            assert isinstance(src_spec, DTensorSpec)
-                            assert isinstance(tgt_spec, DTensorSpec)
-                            # we use our custom comm_cost function to estimate the cost
-                            # of the collective operation
-                            comm_cost = estimate_strategy_comms_cost(src_spec, tgt_spec)
-
-                        if node in grad_param_nodes:
-                            comm_cost = comm_cost / self.rescale_grad_comm_cost_for_mp
                         # Imagine we start node_i from S(0)S(0) and we want to reach node_{i+2} at
                         # RR, and that node_{i+1} is an op with zero cost (like alias).
                         # In this case, all of the following chains yield the same cost:
@@ -332,19 +323,34 @@ class ShardingOptimizer:
                         # in a single go. To do this, we add a tie-break cost that is 1 if a redistribution
                         # happens prior to getting to this configuration, and 0 otherwise. This way,
                         # we will favor having fewer redistributions happening in the graph.
-                        if argi_strat is not None and node.target != operator.getitem:
-                            original_placement = argi_strat.strategies[
-                                ii
-                            ].output_specs.placements
-                            current_placement = ssi.input_specs[argi].placements
+                        if argi_strat is not None:
+                            src_spec = argi_strat.strategies[ii].output_specs
+                            # TODO: operator.getitem being special is something
+                            # we might want to change in the future
+                            if node.target == operator.getitem:
+                                src_spec = src_spec[node.args[1]]
+                            tgt_spec = ssi.input_specs[argi]
+                            assert isinstance(src_spec, DTensorSpec)
+                            assert isinstance(tgt_spec, DTensorSpec)
+                            # we use our custom comm_cost function to estimate the cost
+                            # of the collective operation
+                            comm_cost = estimate_strategy_comms_cost(src_spec, tgt_spec)
+
                             redistribution_happened = (
-                                current_placement != original_placement
+                                src_spec.placements != tgt_spec.placements
                             )
                             sharding_transition_cost = (
                                 int(redistribution_happened) * sharding_transition_scale
                             )
                         else:
                             sharding_transition_cost = 0
+
+                        if node in grad_param_nodes:
+                            comm_cost = comm_cost / self.rescale_grad_comm_cost_for_mp
+
+                        # update OpSpec redistribution cost with our newly-computed cost
+                        # this is useful for print_costs_for_node to print the updated cost
+                        xxi[ii] = comm_cost
                         key = (s_i, argi, ss, ii)
                         # NOTE: this modifies ds in-place sometimes
                         # we might want to refactor this in the future
@@ -475,7 +481,7 @@ class ShardingOptimizer:
                     va = self.ds[key]["va"]
                     vars_s_j.setdefault(s_j_ii, []).append(va)
 
-                if vars_s_i.keys() != vars_s_j.keys():
+                if len(vars_s_j) == 0:
                     vars_s_j = {}
                     for _, s_j_oi, s_j_ii in self.walk_over_options(user, argj):
                         key = (s_j, argj, s_j_oi, s_j_ii)
@@ -485,7 +491,7 @@ class ShardingOptimizer:
                             va = self.ds[key]["va"]
                         vars_s_j.setdefault(s_j_ii, []).append(va)
 
-                if vars_s_i.keys() != vars_s_j.keys():
+                if len(vars_s_i) == 0:
                     vars_s_i = {}
                     for _, s_i_oi, s_i_ii in self.walk_over_options(node, argi):
                         key = (s_i, argi, s_i_oi, s_i_ii)
@@ -684,14 +690,16 @@ class ShardingOptimizer:
         # TODO: assert all nodes have a placement?
         return opt
 
-    def _add_node_constraint(self, node, oi, constraint_name=None):
+    def _add_node_constraint(
+        self, node, output_constraint_indices, constraint_name=None
+    ):
         if constraint_name is None:
             constraint_name = "user_constraint"
         s_i = self.node_map[node]
         vars_per_arg = {}
-        for argi, oi_, ii in self.walk_over_options(node):
-            if oi_ == oi:
-                va = self.ds[(s_i, argi, oi, ii)]["va"]
+        for argi, output_constraint_index, input_index in self.walk_over_options(node):
+            if output_constraint_index in output_constraint_indices:
+                va = self.ds[(s_i, argi, output_constraint_index, input_index)]["va"]
                 vars_per_arg.setdefault(argi, []).append(va)
         for eqs in vars_per_arg.values():
             self.prob += (pulp.lpSum(eqs) == 1, _get_next_name(constraint_name))
@@ -773,15 +781,20 @@ class ShardingOptimizer:
         if placement is None:
             # default is Shard(0) to parallelize on the batch
             placement = (Shard(0),) + (Replicate(),) * (self.mesh.ndim - 1)
-        for oi, s in enumerate(strat.strategies):
+        output_constraint_indices = []
+        for output_constraint_index, s in enumerate(strat.strategies):
             spec = s.output_specs
             if spec.placements == placement:
-                break
-        else:
+                output_constraint_indices.append(output_constraint_index)
+        if len(output_constraint_indices) == 0:
             raise RuntimeError(
                 f"Couldn't find appropriate constraint {node} {constraint_name} {placement}"
             )
-        self._add_node_constraint(node, oi=oi, constraint_name=constraint_name)
+        self._add_node_constraint(
+            node,
+            output_constraint_indices=output_constraint_indices,
+            constraint_name=constraint_name,
+        )
 
     def add_sharded_input_constraint(
         self, input_placements: Optional[list[Optional[tuple[Placement, ...]]]] = None
