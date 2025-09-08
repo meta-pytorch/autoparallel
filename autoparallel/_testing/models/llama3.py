@@ -4,7 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 
 from dataclasses import dataclass
-from typing import ClassVar
+from typing import ClassVar, Optional
 
 import torch
 import torch.nn.functional as F
@@ -54,7 +54,7 @@ class ScaledDotProductAttention(torch.nn.Module):
 
 
 def build_attention(
-    use_flex_attn: bool, attn_mask_type: str, fixed_block_size: int | None = None
+    use_flex_attn: bool, attn_mask_type: str, fixed_block_size: Optional[int] = None
 ):
     if use_flex_attn:
         raise NotImplementedError()
@@ -76,10 +76,10 @@ class TransformerModelArgs:
     dim: int = 4096
     n_layers: int = 32
     n_heads: int = 32
-    n_kv_heads: int | None = None
+    n_kv_heads: Optional[int] = None
     vocab_size: int = 64000  # -1  # defined later by tokenizer
     multiple_of: int = 256  # make SwiGLU hidden layer size multiple of large power of 2
-    ffn_dim_multiplier: float | None = None
+    ffn_dim_multiplier: Optional[float] = None
     norm_eps: float = 1e-5
     rope_theta: float = 10000
 
@@ -338,7 +338,7 @@ class FeedForward(nn.Module):
         dim: int,
         hidden_dim: int,
         multiple_of: int,
-        ffn_dim_multiplier: float | None,
+        ffn_dim_multiplier: Optional[float],
     ):
         super().__init__()
         hidden_dim = int(2 * hidden_dim / 3)
@@ -473,7 +473,7 @@ class Transformer(nn.Module):
 
     def init_weights(
         self,
-        buffer_device: torch.device | None = None,
+        buffer_device: Optional[torch.device] = None,
     ):
         """
         [Note: On ``init_weights`` vs. ``reset_parameters``]
@@ -517,7 +517,7 @@ class Transformer(nn.Module):
             self.model_args.rope_theta,
         )
 
-    def forward(self, tokens: torch.Tensor, input_batch: torch.Tensor | None = None):
+    def forward(self, tokens: torch.Tensor, input_batch: Optional[torch.Tensor] = None):
         """
         Perform a forward pass through the Transformer model.
 
