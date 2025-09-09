@@ -1,0 +1,748 @@
+# Copyright (c) Facebook, Inc. and its affiliates. All rights reserved.
+#
+# This source code is licensed under the BSD license found in the
+# LICENSE file in the root directory of this source tree.
+
+# mypy: ignore-errors
+import math
+from functools import reduce
+from typing import Any, Callable, Dict, Union, cast
+
+import torch
+import torch.utils._pytree as pytree
+from torch._inductor import ir, scheduler
+from torch._inductor.dependencies import StarDep, WeakDep
+from torch._inductor.ir import NoneLayout
+from torch._inductor.utils import buf_name_to_fused_snode, is_collective, is_wait
+from torch._inductor.virtualized import V
+from torch.distributed import ProcessGroup
+from torch.distributed.distributed_c10d import _resolve_process_group
+from torch.utils._ordered_set import OrderedSet
+
+
+def get_data_size(size):
+    return reduce(lambda x, y: x * y, size)
+
+
+def _find_recursive_deps_of_snode(
+    snode: "scheduler.BaseSchedulerNode",
+    collected_node_set: OrderedSet["scheduler.BaseSchedulerNode"],
+    name_to_buf: Dict[str, "scheduler.SchedulerBuffer"],
+    name_to_fused_node: Dict[str, "scheduler.BaseSchedulerNode"],
+    criteria_cb: Callable[[Any], bool] = lambda snode: False,
+    allow_weak_dep: bool = True,
+):
+    if criteria_cb(snode):
+        return
+    collected_node_set.add(snode)
+    for dep in snode.unmet_dependencies:
+        if isinstance(dep, WeakDep) and not allow_weak_dep:
+            continue
+        defining_op_for_dep = buf_name_to_fused_snode(
+            dep.name, name_to_buf, name_to_fused_node
+        )
+        if defining_op_for_dep in collected_node_set:
+            continue
+        _find_recursive_deps_of_snode(
+            defining_op_for_dep,
+            collected_node_set,
+            name_to_buf,
+            name_to_fused_node,
+            criteria_cb=criteria_cb,
+        )
+
+
+def _find_recursive_users_of_snode(
+    snode: "scheduler.BaseSchedulerNode",
+    collected_node_set: OrderedSet["scheduler.BaseSchedulerNode"],
+    name_to_buf: Dict[str, "scheduler.SchedulerBuffer"],
+    name_to_fused_node: Dict[str, "scheduler.BaseSchedulerNode"],
+    criteria_cb: Callable[[Any], bool] = lambda snode: False,
+):
+    if criteria_cb(snode):
+        return
+    collected_node_set.add(snode)
+    for o in snode.get_outputs():
+        for user in o.users:
+            assert user.node is not None
+            if user.node.get_name() == "OUTPUT":
+                continue
+            if user.node.get_name() not in name_to_fused_node:
+                continue
+            user_op = name_to_fused_node[user.node.get_name()]
+            if user_op in collected_node_set:
+                continue
+            _find_recursive_users_of_snode(
+                user_op,
+                collected_node_set,
+                name_to_buf,
+                name_to_fused_node,
+                criteria_cb=criteria_cb,
+            )
+
+
+def get_bucketable_ir_nodes(
+    snodes: list["torch._inductor.scheduler.BaseSchedulerNode"],
+    name_to_fused_node: Dict[str, "scheduler.BaseSchedulerNode"],
+    name_to_buf: Dict[str, "scheduler.SchedulerBuffer"],
+) -> set[str]:
+    """
+    This function selects the ir nodes' names that are bucketable
+    From first principle, only all-gathers that gather parameters and reduce-scatters
+    that update model gradients could be bucketed together.
+    Thus, bucketable all-gathers's deps are (1) computed buffer for dtype conversion (optional)
+        (2) all-gather itself
+    bucketable reduce-scatter wait's users are (1) reduce-scatter wait itself
+    """
+    bucketable_ir_nodes = set()
+    for snode in snodes:
+        if is_collective(
+            snode.node, op=torch.ops._c10d_functional.all_gather_into_tensor.default
+        ):
+            ag_related_snode_set: OrderedSet[
+                "torch._inductor.scheduler.BaseSchedulerNode"
+            ] = OrderedSet()
+            _find_recursive_deps_of_snode(
+                snode,
+                ag_related_snode_set,
+                name_to_buf,
+                name_to_fused_node,
+                allow_weak_dep=False,
+            )
+            if len(ag_related_snode_set) <= 2:
+                bucketable_ir_nodes.add(snode.node.get_name())
+        elif is_collective(
+            snode.node, op=torch.ops._c10d_functional.reduce_scatter_tensor.default
+        ):
+            wait_snode = snode.get_outputs()[0].users[0].node
+            wait_snode_recursive_users: OrderedSet[
+                "torch._inductor.scheduler.BaseSchedulerNode"
+            ] = OrderedSet()
+            _find_recursive_users_of_snode(
+                wait_snode,
+                wait_snode_recursive_users,
+                name_to_buf,
+                name_to_fused_node,
+            )
+            if len(wait_snode_recursive_users) <= 1:
+                bucketable_ir_nodes.add(snode.node.get_name())
+
+    return bucketable_ir_nodes
+
+
+def check_ir_node_bucketable(
+    ir_node: "ir.IRNode", bucketable_ir_nodes: set[str]
+) -> bool:
+    """
+    Determine if the AG/RS & AG/RS wait node is from bucketable nodes or not
+    """
+    ir_node_origins = list(getattr(ir_node, "origins", None))
+    if len(ir_node_origins) == 0:
+        # bucketed AG and RS doesn't have origins
+        return True
+
+    if is_wait(ir_node):
+        ir_node = ir_node.inputs[0]
+
+    if is_collective(
+        ir_node, op=torch.ops._c10d_functional.all_gather_into_tensor.default
+    ):
+        ir_node_name = ir_node.get_name()
+    elif is_collective(
+        ir_node, op=torch.ops._c10d_functional.reduce_scatter_tensor.default
+    ):
+        ir_node_name = ir_node.get_name()
+    else:
+        return False
+
+    if ir_node_name in bucketable_ir_nodes:
+        return True
+
+    return False
+
+
+def _get_fx_node(
+    snode_or_ir_node: Union["scheduler.BaseSchedulerNode", "ir.IRNode"],
+    expected_op: Any,
+) -> torch.fx.Node:
+    origins = None
+    if isinstance(snode_or_ir_node, scheduler.BaseSchedulerNode):
+        origins = snode_or_ir_node.node.get_origins()
+    elif isinstance(snode_or_ir_node, ir.IRNode):
+        origins = snode_or_ir_node.origins
+    else:
+        raise ValueError(
+            f"Expected BaseSchedulerNode or IRNode, got {type(snode_or_ir_node)}. Offending value: {snode_or_ir_node}"
+        )
+    origins_with_expected_op = [o for o in origins if o.target == expected_op]
+    if len(origins_with_expected_op) != 1:
+        print(
+            "[Get FX exception] origins_with_expected_op",
+            origins_with_expected_op,
+            "expected_op",
+            expected_op,
+            "snode_or_ir_node",
+            snode_or_ir_node,
+        )
+        return None
+    return origins_with_expected_op[0]
+
+
+def get_snode_process_group_info(
+    snode: "scheduler.BaseSchedulerNode",
+    expected_op: Any,
+    resolve_pg: bool = False,
+) -> tuple[int, Union[str, ProcessGroup]]:
+    fx_node = _get_fx_node(snode, expected_op=expected_op)
+    # return None if the snode doesn't have a valid fx_node
+    if fx_node is None:
+        return None
+
+    if expected_op == torch.ops._c10d_functional.all_gather_into_tensor.default:
+        group_size, group_name = (
+            snode.node.constant_args[0],
+            snode.node.constant_args[1],
+        )
+    elif expected_op == torch.ops._c10d_functional.reduce_scatter_tensor.default:
+        group_size, group_name = (
+            snode.node.constant_args[1],
+            snode.node.constant_args[2],
+        )
+    elif expected_op == torch.ops._c10d_functional.all_reduce_.default:
+        group_size, group_name = fx_node.args[1], fx_node.args[2]
+    elif expected_op == torch.ops._c10d_functional.all_to_all_single.default:
+        group_size, group_name = 0, fx_node.args[3]
+    else:
+        raise ValueError(f"Unsupported op {expected_op}")
+
+    if resolve_pg:
+        group_name = _resolve_process_group(group_name)
+    return group_size, group_name
+
+
+def get_snode_tensor_info(
+    snode: "scheduler.BaseSchedulerNode", return_data_size: bool = False
+) -> tuple[Any, ...]:
+    input_dtype, input_device = (
+        snode.node.inputs[0].layout.dtype,
+        snode.node.inputs[0].layout.device,
+    )
+    input_size = get_data_size(snode.node.inputs[0].layout.size)
+
+    if not isinstance(snode.node.layout, NoneLayout):
+        output_dtype, output_device = (
+            snode.node.layout.dtype,
+            snode.node.layout.device,
+        )
+        output_size = get_data_size(snode.node.layout.size)
+    else:
+        # In all_reduce, layout is NoneLayout
+        # We set output info to be the same as input info as a special treatment
+        output_dtype, output_device, output_size = input_dtype, input_device, input_size
+
+    result = (input_dtype, input_device, output_dtype, output_device)
+    if return_data_size:
+        result += (input_size, output_size)
+    return result
+
+
+def _estimate_bucketed_node_list(
+    current_node_list: list["scheduler.BaseSchedulerNode"],
+    schedule_fallback_operation: Callable[[Any], Any],
+    group_size: int,
+    group_name: str,
+    name_to_buf: Dict[str, "scheduler.SchedulerBuffer"],
+    comm_func: Callable[[Any], Any],
+    comm_cache: Dict[Any, Any],
+    reduce_op: Any = None,
+):
+    input_ir_nodes = [n.node.inputs[0] for n in current_node_list]
+    if len(input_ir_nodes) == 1:
+        # standalone node, no need to bucket
+        comm_node = current_node_list[0].node
+        comm_size_inp, comm_size_out = (
+            comm_node.inputs[0].layout.size,
+            comm_node.layout.size,
+        )
+        estimated_comm = comm_cache.get_comm_time(
+            comm_size_inp,
+            comm_size_out,
+            comm_func,
+            calibrated=True,
+        )
+        return estimated_comm, comm_size_inp, comm_size_out
+
+    if comm_func == "torch.ops._c10d_functional.all_gather_into_tensor.default":
+        bucked_node = bucket_all_gathers(
+            schedule_fallback_operation,
+            group_size,
+            group_name,
+            input_ir_nodes,
+            current_node_list,
+            name_to_buf,
+            return_ag_only=True,
+        )
+        comm_size_inp = bucked_node[0].layout.size
+        comm_size_out = bucked_node[1].layout.size
+    elif comm_func == "torch.ops._c10d_functional.reduce_scatter_tensor.default":
+        bucked_node = bucket_reduce_scatters(
+            schedule_fallback_operation,
+            group_size,
+            group_name,
+            reduce_op,
+            input_ir_nodes,
+            current_node_list,
+            name_to_buf,
+            return_rs_only=True,
+        )
+        comm_size_inp = bucked_node[0].layout.size
+        comm_size_out = bucked_node[1].layout.size
+    else:
+        raise ValueError(f"Unsupported comm_func {comm_func} for bucketing")
+
+    estimated_comm = comm_cache.get_comm_time(
+        bucked_node[0].layout.size,
+        bucked_node[1].layout.size,
+        comm_func,
+        calibrated=True,
+    )
+    return estimated_comm, comm_size_inp, comm_size_out
+
+
+def estimate_bucketed_snode_runtime(
+    node_bucket_dict: Dict[tuple[Any, ...], list["scheduler.BaseSchedulerNode"]],
+    schedule_fallback_operation: Callable[[Any], Any],
+    name_to_buf: Dict[str, "scheduler.SchedulerBuffer"],
+    comm_func: Callable[[Any], Any],
+    comm_cache: Dict[Any, Any],
+    reduce_op: Any = None,
+) -> tuple[float, int, int]:
+    """
+    We can have AG/RS nodes from different process groups & different dtypes in a bucket
+    This function estimates the accumulated time & comm size of a bucketed AG/RS node
+    """
+    estimated_comm, comm_size_inp, comm_size_out = 0, 0, 0
+    for node_info, node_list in node_bucket_dict.items():
+        group_size, group_name = node_info[-2], node_info[-1]
+        (
+            local_comm,
+            local_comm_size_inp,
+            local_comm_size_out,
+        ) = _estimate_bucketed_node_list(
+            node_list,
+            schedule_fallback_operation,
+            group_size,
+            group_name,
+            name_to_buf,
+            comm_func,
+            comm_cache,
+            reduce_op,
+        )
+        estimated_comm += local_comm
+        comm_size_inp += get_data_size(local_comm_size_inp)
+        comm_size_out += get_data_size(local_comm_size_out)
+    return estimated_comm, comm_size_inp, comm_size_out
+
+
+def _schedule_snode(
+    snode: "scheduler.BaseSchedulerNode",
+    new_order: list["scheduler.BaseSchedulerNode"],
+    scheduled: list["scheduler.BaseSchedulerNode"],
+):
+    if snode in scheduled:
+        return
+
+    new_order.append(snode)
+    scheduled.add(snode)
+
+
+def _remove_operation(
+    operation: ir.Operation,
+    name_to_fused_node: Dict[str, "scheduler.BaseSchedulerNode"],
+):
+    assert isinstance(
+        operation, ir.Operation
+    ), f"Expected ir.Operation, but got {type(ir.Operation)}. Offending value: {ir.Operation}"
+    idx = V.graph.operations.index(operation)
+    del V.graph.operations[idx]
+    del V.graph.name_to_op[operation.get_operation_name()]
+    del name_to_fused_node[operation.get_operation_name()]
+
+
+def _replace_scheduler_buffer(
+    orig_sched_buf: "scheduler.SchedulerBuffer",
+    new_sched_buf: "scheduler.SchedulerBuffer",
+    name_to_buf: Dict[str, "scheduler.SchedulerBuffer"],
+):
+    new_buf = new_sched_buf.node
+    new_buf_name = new_buf.get_name()
+    orig_buf = orig_sched_buf.node
+    orig_buf_name = orig_buf.get_name()
+    V.graph.buffers[V.graph.buffers.index(orig_buf)] = new_buf
+    V.graph.name_to_buffer[orig_buf_name] = new_buf
+    name_to_buf[orig_buf_name] = new_sched_buf
+    new_buf.name = orig_buf_name
+    new_sched_buf.defining_op.set_read_writes(
+        new_sched_buf.defining_op.read_writes.rename({new_buf_name: orig_buf_name})
+    )
+    new_sched_buf.users = orig_sched_buf.users
+
+
+def _schedule_fallback_operation(
+    target: Any,
+    args: list[Any],
+    kwargs: dict[str, Any],
+    scheduler: "scheduler.Scheduler",
+    name_to_buf: Dict[str, "scheduler.SchedulerBuffer"],
+    name_to_fused_node: Dict[str, "scheduler.BaseSchedulerNode"],
+    schedule_snode_fn: Union[Callable[..., Any], Any] = None,
+    new_operation_name_to_snode: Dict[str, "scheduler.BaseSchedulerNode"] = {},
+    dep_operations: Union[ir.Operation, list[ir.Operation], None] = None,
+) -> Union[ir.Operation, list[ir.Operation]]:
+    # NOTE: `dep_operations` enforces strong ordering between ops, helpful if the dependency chain is not clear
+    #       from direct input-output relationship
+    # (i.e. if OP1 mutates a view of buffer X and then OP2 reads from X, and OP1 is expected to run before OP2 -> OP2
+    # must have `dep_operations` pointing to OP1 to ensure reordering pass would not mess up the order).
+
+    def wrap_tensors(x):
+        if isinstance(x, ir.MutationOutput):
+            mutated_buf_names = x.get_mutation_names()
+            assert (
+                isinstance(mutated_buf_names, list) and len(mutated_buf_names) == 1
+            ), "Expect only one mutated buffer in MutationOutput"
+            return wrap_tensors(name_to_buf[mutated_buf_names[0]].node)
+        elif isinstance(x, ir.IRNode):
+            if isinstance(x, ir.StorageBox):
+                return x
+            else:
+                return ir.TensorBox.create(x)
+        else:
+            return x
+
+    operations_prev_watermark = len(V.graph.operations)
+    # this will append newly created operations to V.graph.operations
+    ir.FallbackKernel.create(
+        target,
+        *pytree.tree_map(wrap_tensors, args),
+        **pytree.tree_map(wrap_tensors, kwargs),
+    )
+    new_operations = V.graph.operations[operations_prev_watermark:]
+    new_snodes = []
+    if isinstance(dep_operations, ir.Operation):
+        dep_operations = [dep_operations]
+    for new_operation in new_operations:
+        new_snode = scheduler.create_scheduler_node(new_operation)
+        if dep_operations is not None:
+            # make the new snode depend on all output buffers of all the dep operations,
+            # to ensure that the new snode will always be executed after all the dep operations.
+            for dep_operation in dep_operations:
+                dep_snode = name_to_fused_node[dep_operation.get_operation_name()]
+                for buf_name in dep_snode.get_buffer_names():
+                    new_snode.set_read_writes(
+                        new_snode.read_writes.with_read(
+                            StarDep(name=buf_name, mode=None)
+                        )
+                    )
+        if schedule_snode_fn is not None:
+            schedule_snode_fn(new_snode)
+        new_snodes.append(new_snode)
+        new_operation_name_to_snode[new_operation.get_operation_name()] = new_snode
+        for o in new_snode.get_outputs():
+            name_to_buf[o.get_name()] = o
+        name_to_fused_node[new_snode.get_name()] = new_snode
+    multi_output_operations = []
+    # identify the trailing MultiOutput operations, if any
+    for operation in reversed(new_operations):
+        if isinstance(operation, ir.MultiOutput):
+            multi_output_operations.insert(0, operation)
+        else:
+            break
+    if len(multi_output_operations) == 0:
+        # if no MultiOutput operations, it means this fallback kernel has no output -
+        # in this case, just return the FallbackKernel operation.
+        assert len(new_operations) == 1
+        return new_operations[0]
+    elif len(multi_output_operations) == 1:
+        return multi_output_operations[0]
+    else:
+        return multi_output_operations
+
+
+def bucket_all_gathers(
+    schedule_fallback_operation: Callable,
+    group_size: int,
+    group_name: str,
+    ag_input_ir_nodes: list["ir.IRNode"],
+    orig_ag_snodes: list["scheduler.BaseSchedulerNode"],
+    name_to_buf: Dict[str, "scheduler.SchedulerBuffer"],
+    orig_wait_snodes: list["scheduler.BaseSchedulerNode"] = None,
+    schedule_snode_fn: Union[Callable[..., Any], Any] = None,
+    return_ag_only: bool = False,
+):
+    """
+    bucket multiple all_gather nodes into one all_gather node
+    return_ag_only set to True: only return the bucketed all_gather node
+    return_ag_only set to False: return the bucketed all_gather node and the bucketed wait node (in GroupedSchedulerNode)
+    """
+    orig_ag_fx_nodes = [
+        _get_fx_node(
+            sn, expected_op=torch.ops._c10d_functional.all_gather_into_tensor.default
+        )
+        for sn in orig_ag_snodes
+    ]
+    ag_input_fx_nodes = [n.args[0] for n in orig_ag_fx_nodes]
+    assert all(
+        n.meta["val"].dtype == orig_ag_fx_nodes[0].meta["val"].dtype
+        for n in orig_ag_fx_nodes
+    ), "All all_gather inputs in the same bucket must have the same dtype"
+
+    # must schedule all the all_gather input nodes first, before the bucketed all_gather node
+    param_all_gather_inputs_orig: list[Union[ir.IRNode, scheduler.SchedulerBuffer]] = []
+    for ag_input_ir_node in ag_input_ir_nodes:
+        if ag_input_ir_node.is_input_buffer() or isinstance(
+            ag_input_ir_node, ir.ReinterpretView
+        ):
+            param_all_gather_inputs_orig.append(ag_input_ir_node)
+        elif ag_input_sched_buf := name_to_buf.get(ag_input_ir_node.get_name()):
+            if not return_ag_only:
+                schedule_snode_fn(ag_input_sched_buf.defining_op)
+            param_all_gather_inputs_orig.append(ag_input_sched_buf.node)
+        else:
+            raise ValueError("Unexpected node type")
+            # assert ag_input_ir_node.is_input_buffer()
+            # param_all_gather_inputs_orig.append(ag_input_ir_node)
+
+    # schedule the bucketed all_gather node
+    param_all_gather_inputs_flattened = [
+        schedule_fallback_operation(torch.ops.aten.reshape.default, (n, [-1]), {})
+        for n in param_all_gather_inputs_orig
+    ]
+
+    inp_split_sizes = [n.meta["val"].numel() for n in ag_input_fx_nodes]
+    param_all_gather_outputs = [
+        schedule_fallback_operation(
+            torch.ops.aten.empty.memory_format,
+            ([n.meta["val"].numel() * group_size],),
+            {
+                "dtype": n.meta["val"].dtype,
+                "device": n.meta["val"].device,
+                "pin_memory": False,
+            },
+        )
+        for n in ag_input_fx_nodes
+    ]
+    # TODO(yf225): This assumes dim-0 sharding.
+    # If we need to support sharding on another dim, we should look at how FSDP2 does it (e.g. search for `shard_dim` in FSDP2 codebase)
+    param_all_gather_outputs_shape_orig = [
+        (n.meta["val"].shape[0] * group_size,) + n.meta["val"].shape[1:]
+        for n in ag_input_fx_nodes
+    ]
+    all_gather_input_numel = sum(inp_split_sizes)
+    param_all_gather_outputs_flattened = schedule_fallback_operation(
+        torch.ops.aten.empty.memory_format,
+        ([all_gather_input_numel * group_size],),
+        {
+            "dtype": ag_input_fx_nodes[0].meta["val"].dtype,
+            "device": ag_input_fx_nodes[0].meta["val"].device,
+            "pin_memory": False,
+        },
+    )
+
+    example_ag_input_tensor = ag_input_fx_nodes[0].meta["val"]
+    all_gather_input, all_gather_output = schedule_fallback_operation(
+        torch.ops.fsdp.all_gather_copy_in.default,
+        (
+            param_all_gather_inputs_flattened,
+            param_all_gather_outputs_flattened,
+            inp_split_sizes,
+            all_gather_input_numel,
+            example_ag_input_tensor.device.index % group_size,
+        ),
+        {},
+    )
+    all_gather_into_tensor_out = schedule_fallback_operation(
+        torch.ops._c10d_functional.all_gather_into_tensor_out.default,
+        (all_gather_input, group_size, group_name),
+        {"out": all_gather_output},
+    )
+    if return_ag_only:
+        assert len(all_gather_into_tensor_out.inputs) == 1
+        return all_gather_input, all_gather_output, all_gather_into_tensor_out
+
+    wait_tensor = schedule_fallback_operation(
+        torch.ops._c10d_functional.wait_tensor.default,
+        (all_gather_into_tensor_out,),
+        {},
+    )
+    all_gather_output_reshaped = schedule_fallback_operation(
+        torch.ops.aten.reshape.default,
+        (wait_tensor, [group_size, -1]),
+        {},
+    )
+    outs_flattened = [
+        schedule_fallback_operation(
+            torch.ops.aten.reshape.default,
+            (n, [group_size, -1]),
+            {},
+        )
+        for n in param_all_gather_outputs
+    ]
+    split_with_sizes_copy = schedule_fallback_operation(
+        torch.ops.fsdp.split_with_sizes_copy.default,
+        (all_gather_output_reshaped, inp_split_sizes),
+        {"dim": 1, "out": outs_flattened},
+    )
+    outs = [
+        schedule_fallback_operation(
+            torch.ops.aten.reshape.default,
+            (n, orig_shape),
+            {},
+            dep_operations=split_with_sizes_copy,
+        )
+        for n, orig_shape in zip(outs_flattened, param_all_gather_outputs_shape_orig)
+    ]
+    # Make sure downstream users of original wait nodes are now dependent on the new `outs` nodes
+    assert len(outs) == len(orig_wait_snodes)
+    assert len(outs) == len(orig_ag_snodes)
+    return outs
+
+
+def bucket_reduce_scatters(
+    schedule_fallback_operation: Callable,
+    group_size: int,
+    group_name: str,
+    reduce_op: Any,
+    rs_input_ir_nodes: list["ir.IRNode"],
+    orig_rs_snodes: list["scheduler.BaseSchedulerNode"],
+    name_to_buf: Dict[str, "scheduler.SchedulerBuffer"],
+    orig_wait_snodes: list["scheduler.BaseSchedulerNode"] = None,
+    return_rs_only: bool = False,
+):
+    orig_rs_fx_nodes = [
+        _get_fx_node(
+            sn, expected_op=torch.ops._c10d_functional.reduce_scatter_tensor.default
+        )
+        for sn in orig_rs_snodes
+    ]
+    # must schedule all the reduce_scatter input nodes first, before the bucketed reduce_scatter node
+    unsharded_grads = []
+    unsharded_grads_fx_nodes = [n.args[0] for n in orig_rs_fx_nodes]
+    for rs_input_ir_node in rs_input_ir_nodes:
+        if rs_input_ir_node.is_input_buffer() or isinstance(
+            rs_input_ir_node, ir.ReinterpretView
+        ):
+            unsharded_grads.append(rs_input_ir_node)
+        elif rs_input_sched_buf := name_to_buf.get(rs_input_ir_node.get_name()):
+            unsharded_grads.append(rs_input_sched_buf.node)
+        else:
+            raise ValueError("Unexpected node type")
+    reduce_dtype = unsharded_grads_fx_nodes[0].meta["val"].dtype
+    # Only float32 and bfloat16 are supported for now.
+    # To support fp16, please see FSDP2 `_get_gradient_divide_factors`.
+    assert reduce_dtype in (
+        torch.float32,
+        torch.bfloat16,
+    ), f"reduce_dtype {reduce_dtype} is not supported"
+    assert all(n.meta["val"].dtype == reduce_dtype for n in unsharded_grads_fx_nodes)
+    device = unsharded_grads_fx_nodes[0].meta["val"].device
+    rank = device.index % group_size
+    # TODO(yf225): need more work if we want to support non-dim-0 sharding (e.g. search for `shard_dim` in FSDP2 codebase)
+    shard_dim = 0
+
+    def _get_dim0_padded_size(tensor_size: torch.Size, dim0_factor: int) -> torch.Size:
+        padded_dim0 = math.ceil(tensor_size[0] / dim0_factor) * dim0_factor
+        return cast(torch.Size, torch.Size([padded_dim0]) + tensor_size[1:])
+
+    padded_unsharded_sizes = tuple(
+        _get_dim0_padded_size(n.meta["val"].size(), group_size)
+        for n in unsharded_grads_fx_nodes
+    )
+
+    reduce_scatter_input_numel = sum(s.numel() for s in padded_unsharded_sizes)
+    reduce_scatter_input = schedule_fallback_operation(
+        torch.ops.aten.empty.memory_format,
+        ([reduce_scatter_input_numel],),
+        {
+            "dtype": reduce_dtype,
+            "device": device,
+            "pin_memory": False,
+        },
+    )
+    reduce_scatter_input_reshaped = schedule_fallback_operation(
+        torch.ops.aten.reshape.default,
+        (reduce_scatter_input, [group_size, -1]),
+        {},
+    )
+    # NOTE(yf225): have to turn off Inductor config shape_padding and comprehensive_padding,
+    # otherwise we get "torch.Size([4096, 80096]) and strides (80128, 1) cannot be viewed as shape (2, 164036608)" error.
+    chunk_cat = schedule_fallback_operation(
+        torch.ops.fsdp.chunk_cat.default,
+        (unsharded_grads,),
+        {
+            "dim": 0,
+            "num_chunks": group_size,
+            "out": reduce_scatter_input_reshaped,
+        },
+    )
+
+    reduce_scatter_tensor = schedule_fallback_operation(
+        torch.ops._c10d_functional.reduce_scatter_tensor.default,
+        (reduce_scatter_input, str(reduce_op), group_size, group_name),
+        {},
+        dep_operations=chunk_cat,
+    )
+
+    if return_rs_only:
+        assert len(reduce_scatter_tensor.inputs) == 1
+        return reduce_scatter_tensor.inputs[0].inputs[0], reduce_scatter_tensor
+
+    wait_tensor = schedule_fallback_operation(
+        torch.ops._c10d_functional.wait_tensor.default,
+        (reduce_scatter_tensor,),
+        {},
+    )
+
+    def _chunk_with_empty(
+        tensor: torch.Tensor, num_chunks: int, dim: int
+    ) -> list[torch.Tensor]:
+        chunks = list(torch.chunk(tensor, num_chunks, dim=dim))
+        while len(chunks) < num_chunks:
+            chunks.append(chunks[0].new_empty(0))
+        return chunks
+
+    reduce_output = wait_tensor
+    # View out and accumulate sharded gradients
+    new_sharded_grads = []
+
+    flat_grad_offset = 0  # [0, reduce_scatter_output_numel - 1]
+    for padded_unsharded_size, unsharded_grad_fx_node in zip(
+        padded_unsharded_sizes, unsharded_grads_fx_nodes
+    ):
+        # NOTE: we only care about the shape of tensors in `chunks`, so using meta tensor here
+        chunks = _chunk_with_empty(
+            torch.empty_like(unsharded_grad_fx_node.meta["val"], device="meta"),
+            group_size,
+            dim=shard_dim,
+        )
+        sharded_param = chunks[rank]
+        sharded_size = sharded_param.size()
+        contiguous_sharded_stride = torch._prims_common.make_contiguous_strides_for(
+            sharded_size
+        )
+        # Assume even sharding for Shard(i), i > 0; otherwise would require
+        # copy-out for contiguous strides
+        new_sharded_grad = schedule_fallback_operation(
+            torch.ops.aten.as_strided.default,
+            (reduce_output,),
+            {
+                "size": sharded_size,
+                "stride": contiguous_sharded_stride,
+                "storage_offset": flat_grad_offset,
+            },
+        )
+        new_sharded_grads.append(new_sharded_grad)
+        padded_sharded_numel = padded_unsharded_size.numel() // group_size
+        flat_grad_offset += padded_sharded_numel
+    assert len(orig_wait_snodes) == len(new_sharded_grads)
+    assert len(orig_wait_snodes) == len(orig_rs_snodes)
+    return new_sharded_grads

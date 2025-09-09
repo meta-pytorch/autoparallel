@@ -26,6 +26,7 @@ from torch._dynamo.graph_region_tracker import (
     tree_flatten,
 )
 from torch._inductor.codecache import sha256_hash
+from torch.distributed.tensor._dtensor_spec import DTensorSpec
 from torch.distributed.tensor._op_schema import OpStrategy
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -52,7 +53,24 @@ def _normalize_args(
     return (sorted_keys, tuple(_extract_args(arg) for arg in all_args))
 
 
-def _prepare_op_strategy(op_strategy):
+def _print_output_specs(op_strategy):
+    output = []
+    for s in op_strategy.strategies:
+        output_placements = []
+        output_specs = s.output_specs
+        if isinstance(output_specs, DTensorSpec):
+            output_specs = [output_specs]
+        for output_spec in output_specs:
+            if output_spec is None:
+                output_placements.append("(None)")
+                continue
+            plc_str = ",".join([str(p) for p in output_spec.placements])
+            output_placements.append(f"({plc_str})")
+        output.append(f"({','.join(output_placements)})")
+    return ", ".join(output)
+
+
+def _prepare_op_strategy(op_strategy, output_only=False):
     # hasing op_strategy is expensive, so we hash the string representation
     # instead, which is much cheaper and is a reasonable proxy for the
     # clustering
@@ -62,14 +80,20 @@ def _prepare_op_strategy(op_strategy):
     # view ops, which propagate the input shardings to the output.
     # So we also add the strategy for a node as a hash key to avoid
     # clustering nodes that look the same but have different strategies
+    if output_only:
+        return _print_output_specs(op_strategy)
     return str(op_strategy)
 
 
-def _hash_node(node, op_strategy, input_pickler):
+def _hash_node(node, strategies, input_pickler):
     key = (
         node.meta.get("stack_trace"),
         _normalize_args(node),
-        _prepare_op_strategy(op_strategy),
+        _prepare_op_strategy(strategies[node]),
+        tuple(
+            _prepare_op_strategy(strategies[s], output_only=True)
+            for s in node.all_input_nodes
+        ),
     )
     return sha256_hash(input_pickler.dumps(key))
 
@@ -104,9 +128,7 @@ def get_identical_regions(
         if node.op == "placeholder":
             continue
 
-        duplicates = hash_to_duplicates[
-            _hash_node(node, strategies[node], input_pickler)
-        ]
+        duplicates = hash_to_duplicates[_hash_node(node, strategies, input_pickler)]
         duplicates.append(node)
         node_to_duplicates[node] = duplicates
     logger.info(f"Hashed nodes in {time.time() - t} s")
