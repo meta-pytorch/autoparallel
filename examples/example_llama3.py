@@ -204,7 +204,8 @@ with AutoParallel(
         times = bi.benchmark()
         if torch.distributed.get_rank() == 0:
             for n, t in times.items():
-                print(f"{n}: {t} us")
+                print(f"{str(n):>30}: {t:.2f} us")
+            print(f"Total time: {sum(times.values()):.2f} us")
 
 # run weight init on our sharded DTensor params
 parallel_mod.to_empty(device="cuda")
