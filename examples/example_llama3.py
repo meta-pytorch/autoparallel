@@ -43,13 +43,14 @@ use_vocab_parallel = not use_1d_mesh
 device = torch.device("cuda")
 
 model_type = "8b"
+enable_asynctp = False
 
 
 def model_fn():
     if model_type == "8b":
         model_args = TransformerModelArgs(
             dim=4096,
-            n_layers=32,
+            n_layers=1,
             n_heads=32,
             n_kv_heads=8,
             ffn_dim_multiplier=1.3,
@@ -173,7 +174,13 @@ def add_tp_constraints(autop):
 
 # parallelize the model
 with AutoParallel(
-    model, input_fn, mesh, mp_policy, compile=True, repeated_subgraphs=True
+    model,
+    input_fn,
+    mesh,
+    mp_policy,
+    compile=True,
+    repeated_subgraphs=True,
+    enable_asynctp=enable_asynctp,
 ) as autop:
     autop.add_parameter_memory_constraint(low=None, high=None)
 
@@ -190,6 +197,25 @@ with AutoParallel(
     enable_manual_constraint = False
     if enable_manual_constraint and not use_1d_mesh:
         add_tp_constraints(autop)
+
+    if enable_asynctp:
+        from torch.distributed._symmetric_memory import enable_symm_mem_for_group
+
+        enable_symm_mem_for_group(mesh["dp"].get_group().group_name)
+        enable_symm_mem_for_group(mesh["tp"].get_group().group_name)
+        torch._inductor.config._micro_pipeline_tp = False
+        from autoparallel.asynctp import micro_pipeline_tp_pass
+
+        existing_post_grad_custom_post_pass = (
+            torch._inductor.config.post_grad_custom_post_pass
+        )
+
+        def _pass(graph):
+            if existing_post_grad_custom_post_pass is not None:
+                existing_post_grad_custom_post_pass(graph)
+            micro_pipeline_tp_pass(graph)
+
+        torch._inductor.config.post_grad_custom_post_pass = _pass
 
     t = time.time()
     sharding_placement = autop.optimize_placement()
