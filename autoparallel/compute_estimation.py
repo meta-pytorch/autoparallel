@@ -300,18 +300,27 @@ def estimate_strategy_runtime_cost(node, strategy):
     gpu_memory_bandwidth = _get_device_gmem_bandwidth()
     read_write_time = read_write_bytes / gpu_memory_bandwidth * 1e6  # us
 
+    # suppose 70% efficiency for the operator
+    read_write_efficiency = 0.70
+
+    kernel_launch_overhead = 7  # us
+
+    read_write_time = max(
+        read_write_time / read_write_efficiency, kernel_launch_overhead
+    )
+
+    if flops == 0:
+        return read_write_time
     # TODO: fix this
     dtype = strategy.input_specs[0].tensor_meta.dtype
 
-    # TODO: better handle this case
-    if dtype.is_complex:
-        return read_write_time
     # TODO: use PyTorch's version once it's giving correct results
     gpu_flops = _get_device_tflops(dtype) * 10**12
 
-    # suppose 50% efficiency for the operator
-    factor = 1 / 0.5
-    compute_time = factor * flops / gpu_flops * 1e6  # us
+    # suppose 70% efficiency for the operator
+    compute_efficiency = 0.70
+    compute_time = flops / gpu_flops * 1e6  # us
+    compute_time = max(compute_time / compute_efficiency, kernel_launch_overhead)
 
     return max(compute_time, read_write_time)
 
