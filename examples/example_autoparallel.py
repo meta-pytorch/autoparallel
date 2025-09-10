@@ -154,11 +154,14 @@ for n in autop.gm.graph.nodes:
             if "getitem" in str(n.target):
                 # getitem nodes are tagged same as their parent
                 expected = policy_fn(None, n.args[0].target, (), ())
+            elif "alias" in str(n.target) and "getitem" in str(n.args[0].target):
+                # alias nodes that depend on getitem are tagged same as their parent
+                expected = policy_fn(None, n.args[0].args[0].target, (), ())
             else:
                 expected = policy_fn(None, n.target, (), ())
             actual = n.meta.get("recompute")
             # NOTE: this assert only supports policy_fns on op alone
-            assert actual == expected
+            assert actual == expected, f"{n} {actual} {expected}"
             seqs.add(n.meta["seq_nr"])
         else:
             # fwd counterpart should have already populated seqs
