@@ -24,8 +24,11 @@ def all_to_all_cost(bytes_gb: float, mesh_topo: MeshTopoInfo, mesh_dim: int) -> 
     num_hops = num_devices_on_mesh_dim - 1
     # base latency + comm latency
     latency = 6.6 + num_hops * mesh_topo.mesh_dim_latency[mesh_dim]  # us
-    bw = (bytes_gb * num_hops / num_devices_on_mesh_dim**2) / mesh_dim_bandwidth  # s
-    return latency + bw * 1e6  # rescale to us
+    bw = (bytes_gb * num_hops / num_devices_on_mesh_dim) / mesh_dim_bandwidth  # s
+    total_time = latency + bw * 1e6  # rescale to us
+    # FIXME: this is a hack, we need to spend some more effort on the cost model
+    total_time *= 5
+    return total_time
 
 
 # this is a copy-paste from https://github.com/pytorch/pytorch/blob/main/torch/distributed/tensor/_collective_utils.py
