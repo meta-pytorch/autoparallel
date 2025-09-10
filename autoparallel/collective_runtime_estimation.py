@@ -68,6 +68,10 @@ def redistribute_cost(
     # 3. allreduce 4. reduce_scatter
     curr_placements = [current_spec.placements[i] for i in order]
     tgt_placements = [target_spec.placements[i] for i in order]
+
+    # suppose 70% efficiency for the non-collective operators
+    read_write_efficiency = 0.70
+    kernel_launch_overhead = 7  # us
     for i, current, target in zip(order, curr_placements, tgt_placements):
         if current == target:
             continue
@@ -77,14 +81,17 @@ def redistribute_cost(
             # allgather gives larger comm bytes
             comm_bytes_gb *= num_devices_on_mesh_dim
             # add up allgather comm cost
-            c = allgather_cost(comm_bytes_gb, mesh_topo, i)
+            cost += allgather_cost(comm_bytes_gb, mesh_topo, i)
             if current.dim != 0:
                 # penalize cases like  S(1) -> R as there are additional compute cost
                 # which corresponds to reshuffling the whole output tensor
                 # we multiply the cost by 2 because we need to count input and output
                 # reads for the reshuffle
-                c += comm_bytes_gb * 2 / gpu_memory_bandwidth * 1e6  # us
-            cost += c
+                compute_cost = comm_bytes_gb * 2 / gpu_memory_bandwidth * 1e6  # us
+                compute_cost = max(
+                    compute_cost / read_write_efficiency, kernel_launch_overhead
+                )
+                cost += compute_cost
         elif current.is_shard() and target.is_shard():
             # should be alltoall comm, since we haven't implement it yet, add penalty
             # to favor allgather instead
@@ -95,14 +102,17 @@ def redistribute_cost(
         elif current.is_partial() and target.is_shard():
             target = cast(Shard, target)
             # add up reduce_scatter comm cost
-            c = reduce_scatter_cost(comm_bytes_gb, mesh_topo, i)
+            cost += reduce_scatter_cost(comm_bytes_gb, mesh_topo, i)
             if target.dim != 0:
                 # penalize cases like  P -> S(1) as there are additional compute cost
                 # which corresponds to reshuffling the whole input tensor
                 # we multiply the cost by 2 because we need to count input and output
                 # reads for the reshuffle
-                c += comm_bytes_gb * 2 / gpu_memory_bandwidth * 1e6  # us
-            cost += c
+                compute_cost = comm_bytes_gb * 2 / gpu_memory_bandwidth * 1e6  # us
+                compute_cost = max(
+                    compute_cost / read_write_efficiency, kernel_launch_overhead
+                )
+                cost += compute_cost
             # after reduce_scatter the comm bytes for further collectives halved.
             comm_bytes_gb /= num_devices_on_mesh_dim
         elif current.is_shard() and target.is_partial():
