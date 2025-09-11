@@ -38,8 +38,8 @@ def rank_print(*args, **kwargs):
 mp_policy = MixedPrecisionPolicy(param_dtype=torch.float32, reduce_dtype=torch.float32)
 
 seq_len = 256
-nheads = 4  # 48
-dim1 = 192  # 6144
+nheads = 48
+dim1 = 6144
 dim2 = dim1 * 4
 
 
