@@ -143,38 +143,38 @@ def run_example_test():
     out = parallel_mod(*x)
     out.backward(torch.randn_like(out))
 
-# Validate
-seqs = set()
-for n in autop.gm.graph.nodes:
-    if "checkpoint" in n.meta.get(
-        "stack_trace", ""
-    ):  # placeholders don't have stack trace
-        is_bwd = n.meta.get("partitioner_tag", "") == "is_backward"
-        if not is_bwd:
-            if "getitem" in str(n.target):
-                # getitem nodes are tagged same as their parent
-                expected = policy_fn(None, n.args[0].target, (), ())
-            elif "alias" in str(n.target) and "getitem" in str(n.args[0].target):
-                # alias nodes that depend on getitem are tagged same as their parent
-                expected = policy_fn(None, n.args[0].args[0].target, (), ())
+    # Validate
+    seqs = set()
+    for n in autop.gm.graph.nodes:
+        if "checkpoint" in n.meta.get(
+            "stack_trace", ""
+        ):  # placeholders don't have stack trace
+            is_bwd = n.meta.get("partitioner_tag", "") == "is_backward"
+            if not is_bwd:
+                if "getitem" in str(n.target):
+                    # getitem nodes are tagged same as their parent
+                    expected = policy_fn(None, n.args[0].target, (), ())
+                elif "alias" in str(n.target) and "getitem" in str(n.args[0].target):
+                    # alias nodes that depend on getitem are tagged same as their parent
+                    expected = policy_fn(None, n.args[0].args[0].target, (), ())
+                else:
+                    expected = policy_fn(None, n.target, (), ())
+                actual = n.meta.get("recompute")
+                # NOTE: this assert only supports policy_fns on op alone
+                assert actual == expected, f"{n} {actual} {expected}"
+                seqs.add(n.meta["seq_nr"])
             else:
-                expected = policy_fn(None, n.target, (), ())
-            actual = n.meta.get("recompute")
-            # NOTE: this assert only supports policy_fns on op alone
-            assert actual == expected, f"{n} {actual} {expected}"
-            seqs.add(n.meta["seq_nr"])
-        else:
-            # fwd counterpart should have already populated seqs
-            assert n.meta["seq_nr"] in seqs
+                # fwd counterpart should have already populated seqs
+                assert n.meta["seq_nr"] in seqs
 
-    mm_nodes = autop.gm.graph.find_nodes(
-        op="call_function", target=torch.ops.aten.mm.default
-    )
+        mm_nodes = autop.gm.graph.find_nodes(
+            op="call_function", target=torch.ops.aten.mm.default
+        )
 
-    assert (
-        mm_nodes[0].meta.get("recompute")
-        == torch.utils.checkpoint.CheckpointPolicy.PREFER_RECOMPUTE
-    )
+        assert (
+            mm_nodes[0].meta.get("recompute")
+            == torch.utils.checkpoint.CheckpointPolicy.PREFER_RECOMPUTE
+        )
 
     print("All good!")
 
