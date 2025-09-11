@@ -65,13 +65,13 @@ def redistribute_cost(
     comm_bytes_gb = (
         spec_to_bytes(current_spec) / current_spec.num_shards / 1024 / 1024 / 1024
     )
-    gpu_memory_bandwidth = _get_device_gmem_bandwidth() / 1024**3  # GB/s
     # Transformation that considered for redistribute cost:
     # 1. allgather 2. alltoall
     # 3. allreduce 4. reduce_scatter
     curr_placements = [current_spec.placements[i] for i in order]
     tgt_placements = [target_spec.placements[i] for i in order]
 
+    gpu_memory_bandwidth = _get_device_gmem_bandwidth() / 1024**3  # GB/s
     # suppose 70% efficiency for the non-collective operators
     read_write_efficiency = 0.70
     kernel_launch_overhead = 7  # us
@@ -96,9 +96,24 @@ def redistribute_cost(
                 )
                 cost += compute_cost
         elif current.is_shard() and target.is_shard():
+            current = cast(Shard, current)
+            target = cast(Shard, target)
             # should be alltoall comm, since we haven't implement it yet, add penalty
             # to favor allgather instead
             cost += all_to_all_cost(comm_bytes_gb, mesh_topo, i)  # us
+            if current.dim != 0:
+                compute_cost = comm_bytes_gb * 2 / gpu_memory_bandwidth * 1e6  # us
+                compute_cost = max(
+                    compute_cost / read_write_efficiency, kernel_launch_overhead
+                )
+                cost += compute_cost
+
+            if target.dim != 0:
+                compute_cost = comm_bytes_gb * 2 / gpu_memory_bandwidth * 1e6  # us
+                compute_cost = max(
+                    compute_cost / read_write_efficiency, kernel_launch_overhead
+                )
+                cost += compute_cost
         elif current.is_partial() and target.is_replicate():
             # add up allreduce comm cost
             cost += allreduce_cost(comm_bytes_gb, mesh_topo, i)
