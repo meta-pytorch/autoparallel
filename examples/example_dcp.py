@@ -10,6 +10,7 @@ import tempfile
 import torch
 import torch.distributed.checkpoint
 import torch.multiprocessing as mp
+from torch import nn
 from torch.distributed.checkpoint.state_dict import (
     get_model_state_dict,
     get_optimizer_state_dict,
@@ -23,7 +24,6 @@ from torch.distributed.tensor.placement_types import Replicate, Shard
 from torch.testing._internal.distributed.fake_pg import FakeStore
 
 from autoparallel.api import AutoParallel
-from examples.example_autoparallel import Block
 
 
 def master_print(*args, **kwargs):
@@ -41,6 +41,53 @@ seq_len = 256
 nheads = 4  # 48
 dim1 = 192  # 6144
 dim2 = dim1 * 4
+
+
+# copy the module from example/example_autoparallel.py
+class Block(nn.Module):
+    def __init__(self, nheads, dim1, dim2):
+        super().__init__()
+        self.nheads = nheads
+        bias = False
+        self.wq = nn.Linear(dim1, dim1, bias=bias)
+        self.wk = nn.Linear(dim1, dim1, bias=bias)
+        self.wv = nn.Linear(dim1, dim1, bias=bias)
+        self.wo = nn.Linear(dim1, dim1, bias=bias)
+        self.w1 = nn.Linear(dim1, dim2, bias=bias)
+        self.w2 = nn.Linear(dim2, dim1, bias=bias)
+
+    def init_weights(self):
+        for lin in [self.wq, self.wk, self.wv, self.wo, self.w1, self.w2]:
+            torch.nn.init.normal_(lin.weight)
+            if lin.bias is not None:
+                torch.nn.init.normal_(lin.bias)
+
+    def _compute_attention(self, x):
+        q = self.wq(x)
+        k = self.wk(x)
+        v = self.wv(x)
+
+        q = q.unflatten(-1, (self.nheads, -1)).permute(0, 2, 1, 3)
+        k = k.unflatten(-1, (self.nheads, -1)).permute(0, 2, 1, 3)
+        v = v.unflatten(-1, (self.nheads, -1)).permute(0, 2, 1, 3)
+
+        o = nn.functional.scaled_dot_product_attention(q, k, v)
+        o = o.permute(0, 2, 1, 3).flatten(-2)
+
+        o = self.wo(o)
+        return o
+
+    def forward(self, x):
+        o = self._compute_attention(x)
+        o0 = o + x
+
+        o = self.w1(o0)
+        o = torch.nn.functional.relu(o)
+        o = self.w2(o)
+
+        o = o0 + o
+
+        return o
 
 
 def setup_fake_process_group_if_needed(fake_world_size):
