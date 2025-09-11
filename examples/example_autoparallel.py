@@ -78,70 +78,70 @@ class Block(nn.Module):
         return o
 
 
-world_size = 256
+def run_example_test():
+    world_size = 256
 
-fake_store = FakeStore()
-torch.distributed.init_process_group(
-    "fake", store=fake_store, rank=0, world_size=world_size
-)
-
-use_1d_mesh = False
-
-if use_1d_mesh:
-    mesh = torch.distributed.device_mesh.init_device_mesh(
-        "cuda", (world_size,), mesh_dim_names=("dp",)
-    )
-else:
-    mesh = torch.distributed.device_mesh.init_device_mesh(
-        "cuda",
-        (world_size // 8, 8),
-        mesh_dim_names=(
-            "dp",
-            "tp",
-        ),
+    fake_store = FakeStore()
+    torch.distributed.init_process_group(
+        "fake", store=fake_store, rank=0, world_size=world_size
     )
 
-bs = 8 * mesh.shape[0]
-seq_len = 256
-nheads = 48
-dim1 = 6144
-dim2 = dim1 * 4
+    use_1d_mesh = False
 
+    if use_1d_mesh:
+        mesh = torch.distributed.device_mesh.init_device_mesh(
+            "cuda", (world_size,), mesh_dim_names=("dp",)
+        )
+    else:
+        mesh = torch.distributed.device_mesh.init_device_mesh(
+            "cuda",
+            (world_size // 8, 8),
+            mesh_dim_names=(
+                "dp",
+                "tp",
+            ),
+        )
 
-def input_fn():
-    print(f"global input shape: {(bs, seq_len, dim1)}")
-    return torch.rand(bs, seq_len, dim1, device="cuda")
+    bs = 8 * mesh.shape[0]
+    seq_len = 256
+    nheads = 48
+    dim1 = 6144
+    dim2 = dim1 * 4
 
+    def input_fn():
+        print(f"global input shape: {(bs, seq_len, dim1)}")
+        return torch.rand(bs, seq_len, dim1, device="cuda")
 
-# parallelize the model
-with torch.device("meta"):
-    model = Block(nheads, dim1, dim2)
+    # parallelize the model
+    with torch.device("meta"):
+        model = Block(nheads, dim1, dim2)
 
-mp_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
-# mp_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16)
+    mp_policy = MixedPrecisionPolicy(
+        param_dtype=torch.bfloat16, reduce_dtype=torch.float32
+    )
 
-with AutoParallel(model, input_fn, mesh, mp_policy, compile=True) as autop:
-    assert any(n.meta.get("nn_module_stack") for n in autop.gm.graph.nodes)
-    assert any(n.meta.get("fwd_nn_module_stack") for n in autop.gm.graph.nodes)
-    autop.add_parameter_memory_constraint(low=None, high=None)
+    with AutoParallel(model, input_fn, mesh, mp_policy, compile=True) as autop:
+        assert any(n.meta.get("nn_module_stack") for n in autop.gm.graph.nodes)
+        assert any(n.meta.get("fwd_nn_module_stack") for n in autop.gm.graph.nodes)
+        autop.add_parameter_memory_constraint(low=None, high=None)
 
-    x_sharding = (Shard(0),) + (Replicate(),) * (mesh.ndim - 1)
+        x_sharding = (Shard(0),) + (Replicate(),) * (mesh.ndim - 1)
 
-    autop.add_input_constraints([x_sharding])
-    autop.add_output_constraints([x_sharding])
+        autop.add_input_constraints([x_sharding])
+        autop.add_output_constraints([x_sharding])
 
-    sharding_placement = autop.optimize_placement()
+        sharding_placement = autop.optimize_placement()
 
-    # AutoParallel produces a module with meta-DTensor parameters that need to be initialized
-    parallel_mod = autop.apply_placement(sharding_placement)
+        # AutoParallel produces a module with meta-DTensor parameters that need to be initialized
+        parallel_mod = autop.apply_placement(sharding_placement)
 
-parallel_mod.to_empty(device="cuda")
-parallel_mod.init_weights()
+    parallel_mod.to_empty(device="cuda")
+    parallel_mod.init_weights()
 
-# now let's run it
-x = (torch.rand(bs // mesh.shape[0], seq_len, dim1, device="cuda"),)
-out = parallel_mod(*x)
-out.backward(torch.randn_like(out))
+    # now let's run it
+    x = (torch.rand(bs // mesh.shape[0], seq_len, dim1, device="cuda"),)
+    out = parallel_mod(*x)
+    out.backward(torch.randn_like(out))
 
 # Validate
 seqs = set()
@@ -167,13 +167,17 @@ for n in autop.gm.graph.nodes:
             # fwd counterpart should have already populated seqs
             assert n.meta["seq_nr"] in seqs
 
-mm_nodes = autop.gm.graph.find_nodes(
-    op="call_function", target=torch.ops.aten.mm.default
-)
+    mm_nodes = autop.gm.graph.find_nodes(
+        op="call_function", target=torch.ops.aten.mm.default
+    )
 
-assert (
-    mm_nodes[0].meta.get("recompute")
-    == torch.utils.checkpoint.CheckpointPolicy.PREFER_RECOMPUTE
-)
+    assert (
+        mm_nodes[0].meta.get("recompute")
+        == torch.utils.checkpoint.CheckpointPolicy.PREFER_RECOMPUTE
+    )
 
-print("All good!")
+    print("All good!")
+
+
+if __name__ == "__main__":
+    run_example_test()

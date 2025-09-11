@@ -9,12 +9,8 @@ import torch
 from torch._functorch._aot_autograd.fx_utils import get_param_and_grad_nodes
 from torch.distributed._tensor.placement_types import DTensorSpec
 from torch.distributed.tensor._op_schema import OpSpec
-from torch.distributed.tensor.placement_types import (  # noqa
-    Partial,
-    Placement,
-    Replicate,
-    Shard,
-)
+from torch.distributed.tensor.placement_types import Partial  # noqa
+from torch.distributed.tensor.placement_types import Placement, Replicate, Shard
 from torch.utils._pytree import tree_flatten
 
 from .dtensor_util.redistribute_tensor import redistribute_local_tensor

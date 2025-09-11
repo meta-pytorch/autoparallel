@@ -19,7 +19,8 @@ from torch._inductor.decomposition import select_decomp_table
 from torch._subclasses.fake_tensor import FakeTensor, unset_fake_temporarily
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor._dtensor_spec import DTensorSpec
-from torch.distributed.tensor.placement_types import Partial, Replicate, Shard  # noqa
+from torch.distributed.tensor.placement_types import Partial  # noqa
+from torch.distributed.tensor.placement_types import Replicate, Shard
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.utils._pytree import tree_flatten, tree_map_only
 
@@ -48,6 +49,14 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
         self._curr_node = n
         return super().run_node(n)
 
+    def _get_origin_and_target_device_order(self, node):
+        orig_order = None
+        tgt_order = None
+        if node in self.param_placement_order:
+            tgt_order, do_reorder = self.param_placement_order[node]
+            orig_order = tgt_order[::-1] if do_reorder else tgt_order
+        return orig_order, tgt_order
+
     def redistribute_tensor(self, arg, curr_spec, tgt_spec, node=None):
         tgt_placements = tuple(
             p if not p.is_partial() else Replicate() for p in tgt_spec.placements
@@ -55,11 +64,7 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
         x = arg
         if node in self.param_placement_order and self.param_placement_order[node][1]:
             assert curr_spec.placements != tgt_spec.placements
-        orig_order = None
-        tgt_order = None
-        if node in self.param_placement_order:
-            tgt_order, do_reorder = self.param_placement_order[node]
-            orig_order = tgt_order[::-1] if do_reorder else tgt_order
+        orig_order, tgt_order = self._get_origin_and_target_device_order(node)
         if curr_spec.placements != tgt_spec.placements:
             tgt_spec_c = DTensorSpec(
                 tgt_spec.mesh, tgt_placements, tensor_meta=tgt_spec.tensor_meta
@@ -71,7 +76,7 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
                 src_placement_order=orig_order,
                 tgt_placement_order=tgt_order,
             )
-        return x, orig_order, tgt_order
+        return x
 
     def redistribute_getitem_arg(self, arg, idx):
         node = self._curr_node
@@ -86,7 +91,7 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
         curr_spec = self.sharding_placement[all_input_nodes[0]].output_specs[idx]
         tgt_spec = self.sharding_placement[node].input_specs[0]
 
-        x, _, _ = self.redistribute_tensor(arg, curr_spec, tgt_spec)
+        x = self.redistribute_tensor(arg, curr_spec, tgt_spec)
         self.tgt_spec = tgt_spec
         return x
 
@@ -108,27 +113,17 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
         flat_args_t = [x for x in flat_args if isinstance(x, torch.Tensor)]
         assert len(flat_args_t) == len(curr_specs) == len(tgt_specs)
         new_flat_args_t = []
-        specs_to_modify_with_device_order = [[] for _ in range(num_input_nodes)]
-        for idx, (n, arg, curr_spec, tgt_spec) in enumerate(
-            zip(all_input_nodes, flat_args_t, curr_specs, tgt_specs)
+        for n, arg, curr_spec, tgt_spec in zip(
+            all_input_nodes, flat_args_t, curr_specs, tgt_specs
         ):
-            x, orig_order, tgt_order = self.redistribute_tensor(
-                arg, curr_spec, tgt_spec, node
-            )
+            x = self.redistribute_tensor(arg, curr_spec, tgt_spec, node)
+            orig_order, tgt_order = self._get_origin_and_target_device_order(node)
             new_flat_args_t.append(x)
-            self.tgt_spec = tgt_spec
             if tgt_order:
-                setattr(self.tgt_spec, "device_order", tgt_order)
-            specs_to_modify_with_device_order[idx] = [orig_order, tgt_order]
-
-        # update the sharding_placement to record the device order information
-        for idx, (orig_order, tgt_order) in enumerate(
-            specs_to_modify_with_device_order
-        ):
+                setattr(tgt_spec, "device_order", tgt_order)
             if orig_order:
-                setattr(curr_specs[idx], "device_order", orig_order)
-            if tgt_order:
-                setattr(tgt_specs[idx], "device_order", tgt_order)
+                setattr(curr_spec, "device_order", orig_order)
+            self.tgt_spec = tgt_spec
 
         new_flat_args = []
         counter = 0
