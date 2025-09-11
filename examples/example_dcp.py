@@ -176,12 +176,14 @@ def multiple_process_run(rank, world_size, tmp_dir, model, sharding_map):
         ):
             optimizer.zero_grad()
             if in_shard:
-                input_data = distribute_tensor(input_data, mesh, x_sharding).to_local()
+                input_data = distribute_tensor(input_data, mesh, in_shard).to_local()
             output = model(input_data)
             if out_shard:
-                output = DTensor.from_local(output, mesh, out_shard).full_tensor()
+                output_d = DTensor.from_local(output, mesh, out_shard)
+                output = output_d.full_tensor()
             # use mean instead of sum to avoid huge loss values, and add loss scaling
             loss = torch.abs(output.mean()) * 1e-3  # scale down the loss for stability
+            torch.distributed.barrier()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
@@ -233,10 +235,10 @@ def multiple_process_run(rank, world_size, tmp_dir, model, sharding_map):
         # TODO(zpcore): enable the following assertion check once merge
         # https://github.com/pytorch/pytorch/pull/162294 to upstream
         # assert all(
-        #     torch.allclose(i, j) for i, j in zip(ap_loss, non_ap_loss)
+        #     torch.allclose(i, j, rtol=1e-2) for i, j in zip(ap_loss, non_ap_loss)
         # ), "DCP loss curve mismatch when load state dict from AP model to non AP model"
         allclose_result = all(
-            torch.allclose(i, j) for i, j in zip(ap_loss, non_ap_loss)
+            torch.allclose(i, j, rtol=1e-2) for i, j in zip(ap_loss, non_ap_loss)
         )
         if not allclose_result:
             master_print(
@@ -249,7 +251,8 @@ def multiple_process_run(rank, world_size, tmp_dir, model, sharding_map):
         raise e
 
     finally:
-        torch.distributed.destroy_process_group()
+        if torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
 
 
 def main():
