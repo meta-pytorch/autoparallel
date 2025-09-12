@@ -19,7 +19,7 @@ jobs:
       fail-fast: true
       matrix:
         include:
-          - name: 4xlargegpu
+          - name: 12xlargegpu
             runs-on: linux.g5.12xlarge.nvidia.gpu
             torch-spec: '--pre torch --index-url https://download.pytorch.org/whl/nightly/cu126'
             gpu-arch-type: "cuda"
