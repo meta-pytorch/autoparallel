@@ -93,18 +93,21 @@ def redistribute_cost(
             # should be alltoall comm, since we haven't implement it yet, add penalty
             # to favor allgather instead
             cost += all_to_all_cost(comm_bytes_gb, mesh_topo, i)  # us
+
+            num_copies = 0
             is_contiguous = False
             if not is_contiguous:
-                compute_cost = compute_read_write_time(comm_bytes_gb * 2 * 1024**3)
-                cost += compute_cost
+                num_copies += 1
 
             if current.dim != 0:
-                compute_cost = compute_read_write_time(comm_bytes_gb * 2 * 1024**3)
-                cost += compute_cost
+                num_copies += 1
 
             if target.dim != 0:
-                compute_cost = compute_read_write_time(comm_bytes_gb * 2 * 1024**3)
-                cost += compute_cost
+                num_copies += 1
+
+            compute_cost = compute_read_write_time(comm_bytes_gb * 2 * 1024**3)
+            cost += num_copies * compute_cost
+
         elif current.is_partial() and target.is_replicate():
             # add up allreduce comm cost
             cost += allreduce_cost(comm_bytes_gb, mesh_topo, i)
