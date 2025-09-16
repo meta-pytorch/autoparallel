@@ -101,6 +101,14 @@ def redistribute_cost(
             # should be alltoall comm, since we haven't implement it yet, add penalty
             # to favor allgather instead
             cost += all_to_all_cost(comm_bytes_gb, mesh_topo, i)  # us
+            is_contiguous = False
+            if not is_contiguous:
+                compute_cost = comm_bytes_gb * 2 / gpu_memory_bandwidth * 1e6  # us
+                compute_cost = max(
+                    compute_cost / read_write_efficiency, kernel_launch_overhead
+                )
+                cost += compute_cost
+
             if current.dim != 0:
                 compute_cost = comm_bytes_gb * 2 / gpu_memory_bandwidth * 1e6  # us
                 compute_cost = max(
