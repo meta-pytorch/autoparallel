@@ -3,16 +3,19 @@ from typing import cast, Optional
 import torch
 import torch.distributed as dist
 from autoparallel.propagation_rules import register_opschema_rule
-from dynamic_shard import DynamicShard
+from moe_placements import DynamicShard
 from moe_utils import (
     batched_generate_permute_indices,
     batched_permute_and_pad,
     batched_unpermute_and_unpad,
     TOKEN_GROUP_ALIGN_SIZE_M,
 )
+
 from torch.distributed._functional_collectives import all_to_all_single, RANK_TYPES
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor._op_schema import OpSchema, OpStrategy
+from torch.distributed.tensor._ops._matrix_ops import _mm_like_strategy
+from torch.distributed.tensor._ops.utils import register_op_strategy
 from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
 from torch.utils.flop_counter import register_flop_formula
 
@@ -23,9 +26,15 @@ def batched_mm(
     mat2: torch.Tensor,
 ) -> torch.Tensor:
     assert mat1.ndim == 3
-    assert mat2.ndim == 2
-    assert mat1.shape[2] == mat2.shape[0]
-    out = torch.bmm(mat1, mat2.expand(mat1.shape[0], -1, -1))
+    assert mat2.ndim == 2 or mat2.ndim == 3
+    if mat2.ndim == 2:
+        assert mat1.shape[2] == mat2.shape[0]
+        mat2_expanded = mat2.expand(mat1.shape[0], -1, -1)
+    else:
+        assert mat1.shape[0] == mat2.shape[0]
+        assert mat1.shape[2] == mat2.shape[1]
+        mat2_expanded = mat2
+    out = torch.bmm(mat1, mat2_expanded)
     return out
 
 
@@ -37,9 +46,10 @@ def setup_context_batched_mm(ctx, inputs, output):
 def backward_batched_mm(ctx, grad):
     assert grad.ndim == 3
     mat1, mat2 = ctx.saved_tensors
-    grad1 = torch.bmm(grad, mat2.transpose(-2, -1).expand(grad.shape[0], -1, -1))
-    # compute mat1[b].T @ grad[b] for each batch and sum them up
-    grad2 = torch.bmm(mat1.transpose(-2, -1), grad).sum(dim=0)
+    grad1 = batched_mm(grad, mat2.transpose(-2, -1))
+    grad2 = batched_mm(mat1.transpose(-2, -1), grad)
+    if mat2.ndim == 2:
+        grad2 = torch.sum(grad2, dim=0)
     return grad1, grad2
 
 
@@ -56,12 +66,16 @@ def batched_mm_meta(
     mat2: torch.Tensor,
 ) -> torch.Tensor:
     assert mat1.ndim == 3
-    assert mat2.ndim == 2
-    assert mat1.shape[2] == mat2.shape[0]
+    assert mat2.ndim == 3 or mat2.ndim == 2
+
+    if mat2.ndim == 2:
+        assert mat1.shape[2] == mat2.shape[0]
+    else:
+        assert mat1.shape[2] == mat2.shape[1]
     out = torch.empty(
         mat1.shape[0],
         mat1.shape[1],
-        mat2.shape[1],
+        mat2.shape[-1],
         dtype=mat1.dtype,
         device=mat1.device,
     )
@@ -83,112 +97,227 @@ def batched_mm_flop_count(mat1_shape, mat2_shape, *args, out_shape=None, **kwarg
         Total number of floating-point operations
     """
     assert len(mat1_shape) == 3
-    assert len(mat2_shape) == 2
+    assert len(mat2_shape) == 2 or len(mat2_shape) == 3
     # Parse mat1 dimensions
     b, m, n = mat1_shape
     # Parse mat2 dimensions
-    n2, k = mat2_shape
+    n2, k = mat2_shape[-2], mat2_shape[-1]
     assert n == n2, f"Dimension mismatch: {n} vs {n2}"
     # Calculate FLOPs for matrix multiplication: C = A @ B
     return b * m * n * k * 2
 
 
-@register_opschema_rule(torch.ops.autoparallel.batched_mm.default)
-def batched_mm_strategy(mesh: DeviceMesh, op_schema: OpSchema):
-    from torch.distributed.tensor._op_schema import PlacementList
-    from torch.distributed.tensor._ops.utils import expand_to_full_mesh_op_strategy
-
-    mat1_strategy = cast(OpStrategy, op_schema.args_schema[0])
+@register_op_strategy(torch.ops.autoparallel.batched_mm.default)
+def batched_matmul_rule(op_schema: OpSchema):
+    mesh = op_schema.get_mesh_from_args()
     mat2_strategy = cast(OpStrategy, op_schema.args_schema[1])
+    if len(mat2_strategy.shape) == 2:
+        mm_equation = "bmk,kn->bmn"
+    else:
+        assert len(mat2_strategy.shape) == 3, "mat2 must be 2D or 3D"
+        mm_equation = "bmk,bkn->bmn"
+    # dispatch to mm_like_strategy
+    return _mm_like_strategy(mm_equation, mesh, op_schema)
 
-    assert len(mat1_strategy.shape) == 3
-    assert len(mat2_strategy.shape) == 2
-    assert mat1_strategy.shape[2] == mat2_strategy.shape[0]
 
-    single_mesh_dim_strategies = []
+def _validate_batched_args(b_args: list[int]) -> None:
+    assert b_args in [
+        [
+            0,
+        ],
+        [
+            1,
+        ],
+        [0, 1],
+    ], f"Invalid batched_args: {b_args}"
 
-    # placement list stores placements of [output, mat1, mat2]
-    # first we always have replicate all for inputs and output
-    all_replicate: PlacementList = [Replicate()] * 3
-    single_mesh_dim_strategies.append(all_replicate)
-    # mat1 sharded on outer batch, mat2 is replicated -> output is sharded on outer batch
-    single_mesh_dim_strategies.append([Shard(0), Shard(0), Replicate()])
-    # mat1 is replicated, mat2 is sharded on column dim -> output is sharded on column dim
-    single_mesh_dim_strategies.append([Shard(2), Replicate(), Shard(2)])
-    # mat1 is sharded on column dim, mat2 is sharded on row dim -> output is partial
-    single_mesh_dim_strategies.append([Partial(), Shard(2), Shard(1)])
-    # mat1 is sharded on row dim, mat2 is replicated -> output is sharded on row dim
-    single_mesh_dim_strategies.append([Shard(1), Shard(1), Replicate()])
 
-    return expand_to_full_mesh_op_strategy(
-        mesh, op_schema, single_mesh_dim_strategies, input_index=1
+def _transform_grouped_mm_args(
+    mat1: torch.Tensor,
+    mat2: torch.Tensor,
+    batched_args: list[int],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if batched_args == [
+        0,
+    ]:
+        mat1_exp = mat1
+        mat2_exp = mat2.expand(mat1.shape[0], -1, -1, -1)
+    elif batched_args == [
+        1,
+    ]:
+        mat1_exp = mat1.expand(mat2.shape[0], -1, -1, -1)
+        mat2_exp = mat2
+    else:
+        mat1_exp = mat1
+        mat2_exp = mat2
+    return mat1_exp, mat2_exp
+
+
+def _validate_batched_grouped_mm_shapes(
+    mat1_shape: torch.Size,
+    mat2_shape: torch.Size,
+    offs_shape: torch.Size,
+) -> None:
+    # Case 1: mat1 and mat2 are both 3D batched tensors
+    # grouped_mm 2Dx2D case
+    # Case 2: mat1 is 3D batched tensor and mat2 is 4D batched tensor
+    # grouped_mm 2Dx3D case
+    # Case 3: mat1 is 4D batched tensor and mat2 is 3D batched tensor
+    # grouped_mm 3Dx2D case
+    valid_shapes = (
+        (len(mat1_shape) == 3 and len(mat2_shape) == 3)
+        or (len(mat1_shape) == 4 and len(mat2_shape) == 3)
+        or (len(mat1_shape) == 3 and len(mat2_shape) == 4)
     )
+    assert valid_shapes, (
+        f"Invalid tensor dimensions: expected mat1 and mat2 to be either both 3D, "
+        f"or mat1 4D and mat2 3D, or mat1 3D and mat2 4D. "
+        f"Got mat1={mat1_shape} and mat2={mat2_shape}."
+    )
+    assert len(offs_shape) == 2, f"offs needs to be 2D, got {offs_shape}"
+    # OB = batch size
+    # IB = sum(num_tokens_per_expert)
+    # D = embedding dim
+    # H = hidden dim
+    # E = number of experts
+    if len(mat1_shape) == 3 and len(mat2_shape) == 3:
+        OB1, _, IB1 = mat1_shape
+        OB2, IB2, _ = mat2_shape
+        assert OB1 == OB2, f"Batch size mismatch: {OB1} vs {OB2}"
+        assert IB1 == IB2, f"Total tokens mismatch: {IB1} vs {IB2}"
+    elif len(mat1_shape) == 4 and len(mat2_shape) == 3:
+        OB1, E1, _, H1 = mat1_shape
+        OB2, H2, _ = mat2_shape
+        OB3, E2 = offs_shape
+        assert (
+            OB1 == OB2 and OB2 == OB3
+        ), f"Batch size mismatch: {OB1} vs {OB2} vs {OB3}"
+        assert H1 == H2, f"Contracting dimension mismatch: {H1} vs {H2}"
+        assert E1 == E2, f"Number of experts mismatch: {E1} vs {E2}"
+    else:
+        OB1, IB1, D1 = mat1_shape
+        OB2, E1, D2, _ = mat2_shape
+        OB3, E2 = offs_shape
+        assert (
+            OB1 == OB2 and OB2 == OB3
+        ), f"Batch size mismatch: {OB1} vs {OB2} vs {OB3}"
+        assert D1 == D2, f"Contracting dimension mismatch: {D1} vs {D2}"
+        assert E1 == E2, f"Number of experts mismatch: {E1} vs {E2}"
 
 
 @torch.library.custom_op("autoparallel::batched_grouped_mm", mutates_args=())
 def batched_grouped_mm(
-    mat1: torch.Tensor, mat2: torch.Tensor, offs: torch.Tensor
+    mat1: torch.Tensor,
+    mat2: torch.Tensor,
+    offs: torch.Tensor,
+    batched_args: list[int],
 ) -> torch.Tensor:
-    # TODO (@sanketpurandare): When mat1 is the experts tensor and mat2 is the batched output
-    # that will support grouped_mm(mat1, experts, off) = grouped_mm(experts.T, mat1.T, off).T
-    assert offs.ndim == 2
-    assert mat1.ndim == 3
-    assert mat2.ndim == 3, f"{mat2.shape}"
-    ob1, num_experts1 = offs.shape
-    ob2, _, dim1 = mat1.shape
-    num_experts2, dim2, _ = mat2.shape
-    assert ob1 == ob2, f"{mat1.shape} vs {offs.shape}"
-    assert dim1 == dim2, f"{mat1.shape} vs {mat2.shape}"
-    assert num_experts1 == num_experts2, f"{mat2.shape} vs {offs.shape}"
+    _validate_batched_args(batched_args)
+    mat1_exp, mat2_exp = _transform_grouped_mm_args(mat1, mat2, batched_args)
+    _validate_batched_grouped_mm_shapes(mat1_exp.shape, mat2_exp.shape, offs.shape)
     res = []
-    for m1, off in zip(mat1, offs):
-        res.append(torch._grouped_mm(m1, mat2, off))
+    for m1, m2, off in zip(mat1_exp, mat2_exp, offs):
+        res.append(torch._grouped_mm(m1, m2, off))
     return torch.stack(res, 0)
 
 
 def setup_context_batched_grouped_mm(ctx, inputs, output):
-    mat1, mat2, offs = inputs
+    mat1, mat2, offs, batched_args = inputs
     ctx.save_for_backward(mat1, mat2, offs)
+    ctx.batched_args = batched_args
 
 
-def _backward_grouped_mm_mat1(
-    mat1: torch.Tensor, mat2: torch.Tensor, grad: torch.Tensor, offs: torch.Tensor
+def _backward_batched_grouped_mm_mat1(
+    mat1: torch.Tensor,
+    mat2: torch.Tensor,
+    grad: torch.Tensor,
+    offs: torch.Tensor,
+    batched_args: list[int],
 ) -> torch.Tensor:
     if mat1.stride(-2) == 1 and mat1.stride(-1) == mat1.size(-2):
-        # if input was column-major, return grad as column-order for efficiency
-        res = []
-        for g, off in zip(grad.transpose(-2, -1), offs):
-            res.append(torch._grouped_mm(mat2, g, off))
-        grad_mat1 = torch.stack(res, 0).transpose(-2, -1)
+        if batched_args == [
+            0,
+        ]:
+            b_args = [
+                1,
+            ]
+        else:
+            b_args = [0, 1]
+        # if input was column-major, return grad_input as column-order for efficiency
+        grad_mat1 = batched_grouped_mm(
+            mat2, grad.transpose(-2, -1), offs, b_args
+        ).transpose(-2, -1)
     else:
-        grad_mat1 = batched_grouped_mm(grad, mat2.transpose(-2, -1), offs)
+        if batched_args == [
+            0,
+        ]:
+            b_args = [
+                0,
+            ]
+        else:
+            b_args = [0, 1]
+        grad_mat1 = batched_grouped_mm(grad, mat2.transpose(-2, -1), offs, b_args)
     return grad_mat1
 
 
-def _backward_grouped_mm_mat2(
-    mat1: torch.Tensor, mat2: torch.Tensor, grad: torch.Tensor, offs: torch.Tensor
+def _backward_batched_grouped_mm_mat2(
+    mat1: torch.Tensor,
+    mat2: torch.Tensor,
+    grad: torch.Tensor,
+    offs: torch.Tensor,
+    batched_args: list[int],
 ) -> torch.Tensor:
-    partial_grad_mat2 = []
     if mat2.stride(-2) == 1 and mat2.stride(-1) == mat2.size(-2):
-        # if input was column-major, return grad as column-order for efficiency
-        for g, m1, off in zip(grad, mat1, offs):
-            partial_grad_mat2.append(
-                torch._grouped_mm(g.transpose(-2, -1), m1, off).transpose(-2, -1)
-            )
+        if batched_args == [
+            1,
+        ]:
+            b_args = [
+                0,
+            ]
+        else:
+            b_args = [0, 1]
+        # if experts were column-major, return experts_grad as column-order for efficiency
+        grad_mat2 = batched_grouped_mm(
+            grad.transpose(-2, -1),
+            mat1,
+            offs,
+            b_args,
+        ).transpose(-2, -1)
     else:
-        for g, m1, off in zip(grad, mat1, offs):
-            partial_grad_mat2.append(torch._grouped_mm(m1.transpose(-2, -1), g, off))
-    grad_mat2 = torch.stack(partial_grad_mat2, 0).sum(0)
+        if batched_args == [
+            1,
+        ]:
+            b_args = [
+                1,
+            ]
+        else:
+            b_args = [0, 1]
+        grad_mat2 = batched_grouped_mm(
+            mat1.transpose(-2, -1),
+            grad,
+            offs,
+            b_args,
+        )
     return grad_mat2
 
 
 def backward_batched_grouped_mm(
     ctx, grad: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor, None]:
+) -> tuple[torch.Tensor, torch.Tensor, None, None]:
     mat1, mat2, offs = ctx.saved_tensors
-    grad_mat1 = _backward_grouped_mm_mat1(mat1, mat2, grad, offs)
-    grad_mat2 = _backward_grouped_mm_mat2(mat1, mat2, grad, offs)
-    return grad_mat1, grad_mat2, None
+    batched_args = ctx.batched_args
+    grad_mat1 = _backward_batched_grouped_mm_mat1(mat1, mat2, grad, offs, batched_args)
+    grad_mat2 = _backward_batched_grouped_mm_mat2(mat1, mat2, grad, offs, batched_args)
+    if batched_args == [
+        0,
+    ]:
+        grad_mat2 = torch.sum(grad_mat2, dim=0)
+    elif batched_args == [
+        1,
+    ]:
+        grad_mat1 = torch.sum(grad_mat1, dim=0)
+
+    return grad_mat1, grad_mat2, None, None
 
 
 torch.library.register_autograd(
@@ -200,32 +329,51 @@ torch.library.register_autograd(
 
 @batched_grouped_mm.register_fake
 def batched_grouped_mm_meta(
-    mat1: torch.Tensor, mat2: torch.Tensor, offs: torch.Tensor
+    mat1: torch.Tensor,
+    mat2: torch.Tensor,
+    offs: torch.Tensor,
+    batched_args: list[int],
 ) -> torch.Tensor:
-    assert offs.ndim == 2
-    assert mat1.ndim == 3
-    assert mat2.ndim == 3
-    ob1, num_experts1 = offs.shape
-    ob2, ib, dim1 = mat1.shape
-    num_experts2, dim2, hidden_dim = mat2.shape
-    assert ob1 == ob2, f"{mat1.shape} vs {offs.shape}"
-    assert dim1 == dim2, f"{mat1.shape} vs {mat2.shape}"
-    assert num_experts1 == num_experts2, f"{mat2.shape} vs {offs.shape}"
-    out = torch.empty(
-        ob1,
-        ib,
-        hidden_dim,
-        dtype=mat1.dtype,
-        device=mat1.device,
-    )
+    _validate_batched_args(batched_args)
+    mat1, mat2 = _transform_grouped_mm_args(mat1, mat2, batched_args)
+    _validate_batched_grouped_mm_shapes(mat1.shape, mat2.shape, offs.shape)
+    if mat1.ndim == 3 and mat2.ndim == 3:
+        # out_shape = (OB, E, H, D)
+        out = torch.empty(
+            mat1.shape[0],
+            offs.shape[1],
+            mat1.shape[1],
+            mat2.shape[2],
+            dtype=mat1.dtype,
+            device=mat1.device,
+        )
+    elif mat1.ndim == 4 and mat2.ndim == 3:
+        # out_shape = (OB, D, IB)
+        out = torch.empty(
+            mat1.shape[0],
+            mat1.shape[2],
+            mat2.shape[2],
+            dtype=mat1.dtype,
+            device=mat1.device,
+        )
+    else:
+        # out_shape = (OB, IB, H)
+        out = torch.empty(
+            mat1.shape[0],
+            mat1.shape[1],
+            mat2.shape[3],
+            dtype=mat1.dtype,
+            device=mat1.device,
+        )
     return out
 
 
 @register_flop_formula(torch.ops.autoparallel.batched_grouped_mm)
 def batched_grouped_mm_flop_count(
-    mat1_shape,
-    mat2_shape,
-    offsets_shape=None,
+    mat1_shape: torch.Size,
+    mat2_shape: torch.Size,
+    offsets_shape: torch.Size,
+    batched_args: list[int],
     bias_shape=None,
     out_shape=None,
     **kwargs,
@@ -240,79 +388,37 @@ def batched_grouped_mm_flop_count(
     Args:
         mat1_shape: Shape of first input matrix
         mat2_shape: Shape of second input matrix
-        offsets_shape: Shape of offsets tensor defining token grouping
+        offsets_shape: Shape of offsets tensor
 
     Returns:
         Total number of floating-point operations
+
     """
+    _validate_batched_args(batched_args)
+    if batched_args == [
+        0,
+    ]:
+        mat2_shape = torch.Size([mat1_shape[0], *mat2_shape])
+    elif batched_args == [
+        1,
+    ]:
+        mat1_shape = torch.Size([mat2_shape[0], *mat1_shape])
+    _validate_batched_grouped_mm_shapes(mat1_shape, mat2_shape, offsets_shape)
 
-    # Parse mat1 dimensions based on whether it's already batched or flat
-    if len(mat1_shape) == 2:
-        # Case: Flat tokens that need to be grouped by experts
-        # mat1_shape: (total_tokens, input_dim)
-        assert offsets_shape is not None, "Offsets required for flat token tensor"
-        total_tokens, input_dim = mat1_shape
-        num_expert_groups = offsets_shape[0]  # Number of expert groups
-        # Assume roughly balanced distribution of tokens across experts
-        avg_tokens_per_group = total_tokens // num_expert_groups
-
-    elif len(mat1_shape) == 3:
-        # Case: Pre-batched tokens already grouped by experts
-        # mat1_shape: (batch_size, total_tokens, input_dim)
-        assert offsets_shape is not None, "Offsets required to determine grouping"
-        batch_size, total_tokens, input_dim = mat1_shape
-        offset_batch_size, num_expert_groups = offsets_shape
-
-        # Validate consistency
-        assert (
-            batch_size == offset_batch_size
-        ), f"Batch size mismatch: {batch_size} vs {offset_batch_size}"
-
-        # Average tokens per expert group (assuming balanced distribution)
-        avg_tokens_per_group = total_tokens // num_expert_groups
-
+    if len(mat1_shape) == 3 and len(mat2_shape) == 3:
+        OB, D, IB = mat1_shape
+        _, _, H = mat2_shape
+    elif len(mat1_shape) == 4 and len(mat2_shape) == 3:
+        OB, _, D, H = mat1_shape
+        _, _, IB = mat2_shape
     else:
-        raise ValueError(f"Unsupported mat1 shape: {mat1_shape}")
-
-    # Parse mat2 dimensions
-    if len(mat2_shape) == 2:
-        # Case: Flat weight matrix that will be grouped
-        # mat2_shape: (input_dim, total_output_dim)
-        input_dim_2, total_output_dim = mat2_shape
-        assert offsets_shape is not None, "Offsets required for flat weight matrix"
-        # Assume output dimension is distributed across expert groups
-        avg_output_dim_per_group = total_output_dim // num_expert_groups
-
-    elif len(mat2_shape) == 3:
-        # Case: Pre-grouped expert weight matrices
-        # mat2_shape: (num_experts, input_dim, output_dim_per_expert)
-        num_experts, input_dim_2, output_dim_per_expert = mat2_shape
-
-        # Validate dimensions match
-        assert (
-            num_experts == num_expert_groups
-        ), f"Expert count mismatch: {num_experts} vs {num_expert_groups}"
-        avg_output_dim_per_group = output_dim_per_expert
-
-    else:
-        raise ValueError(f"Unsupported mat2 shape: {mat2_shape}")
-
-    # Validate input dimensions match
-    assert (
-        input_dim == input_dim_2
-    ), f"Input dimension mismatch: {input_dim} vs {input_dim_2}"
-
-    # Calculate FLOPs for matrix multiplication: C = A @ B
-    # For each output element C[i,j], we compute: sum_k(A[i,k] * B[k,j])
-    # This requires k multiplications and (k-1) additions ≈ 2k operations
-    total_flops = (
-        num_expert_groups  # Number of expert groups to process
-        * avg_tokens_per_group  # Average tokens per expert group
-        * avg_output_dim_per_group  # Output features per expert
-        * 2
-        * input_dim  # 2 ops per inner product (multiply + add)
-    )
-
+        OB, IB, D = mat1_shape
+        _, _, _, H = mat2_shape
+    # OB = batch size
+    # IB = sum(num_tokens_per_expert)
+    # D = embedding dim
+    # H = hidden dim
+    total_flops = OB * IB * D * H * 2
     return total_flops
 
 
@@ -324,34 +430,168 @@ def batched_grouped_mm_strategy(mesh: DeviceMesh, op_schema: OpSchema):
     mat1_strategy = cast(OpStrategy, op_schema.args_schema[0])
     mat2_strategy = cast(OpStrategy, op_schema.args_schema[1])
     offs_strategy = cast(OpStrategy, op_schema.args_schema[2])
-
-    assert len(mat1_strategy.shape) == 3
-    assert len(mat2_strategy.shape) == 3
-    assert len(offs_strategy.shape) == 2
-    assert mat1_strategy.shape[0] == offs_strategy.shape[0]
-    assert mat2_strategy.shape[0] == offs_strategy.shape[1]
-    assert mat1_strategy.shape[2] == mat2_strategy.shape[1]
+    batched_args = cast(list[int], op_schema.args_schema[3])
+    _validate_batched_args(batched_args)
+    assert offs_strategy.ndim == 2
 
     single_mesh_dim_strategies = []
 
     # placement list stores placements of [output, mat1, mat2, offs]
     # first we always have replicate all for inputs and output
     all_replicate: PlacementList = [Replicate()] * 4
+    # TODO (@sanketpurandare): add sharding rules when one of the inputs will be partial (maybe not needed)
     single_mesh_dim_strategies.append(all_replicate)
-    # mat1 sharded on outer batch, mat2 is replicated, offs is sharded on outer batch
-    #  -> output is sharded on outer batch
-    single_mesh_dim_strategies.append([Shard(0), Shard(0), Replicate(), Shard(0)])
-    # mat1 is replicated, mat2 is sharded on column dim, offs is replicated
-    #  -> output is sharded on column dim
-    single_mesh_dim_strategies.append([Shard(2), Replicate(), Shard(2), Replicate()])
-    # mat1 is sharded on column dim, mat2 is sharded on row dim, offs is replicated
-    #  -> output is partial
-    single_mesh_dim_strategies.append([Partial(), Shard(2), Shard(1), Replicate()])
-    # mat1 is dynamically sharded on row dim, mat2 is sharded on experts dim,
-    # offs is sharded on experts dim -> output is dynamically sharded on row dim
-    single_mesh_dim_strategies.append(
-        [DynamicShard(1), DynamicShard(1), Shard(0), Shard(1)]
-    )
+    if batched_args == [
+        0,
+    ]:
+        # Case: 2Dx3D
+        # mat1 is [OB, IB, D]
+        # mat2 is [E, D, H]
+        # offs is [OB, E]
+        # output is [OB, IB, H]
+        assert mat1_strategy.ndim == 3 and mat2_strategy.ndim == 3
+        strategies_2x3 = []
+        # dp mesh
+        # mat1 is sharded on outer batch, mat2 is replicated, offs is sharded on outer batch
+        #  -> output is sharded on outer batch
+        strategies_2x3.append([Shard(0), Shard(0), Replicate(), Shard(0)])
+        # ep mesh
+        # mat1 is sharded on inner batch, mat2 is replicated, offs is partial
+        #  -> output is sharded on inner batch
+        strategies_2x3.append([Shard(1), Shard(1), Replicate(), Partial()])
+        # mat1 is dynamically sharded on row dim, mat2 is sharded on experts dim, offs is sharded on experts dim
+        #  -> output is dynamically sharded on row dim
+        strategies_2x3.append([DynamicShard(1), DynamicShard(1), Shard(0), Shard(1)])
+        # tp mesh
+        # mat2 is sharded on column dim, mat1 is replicated, offs is replicated
+        #  -> output is sharded on column dim
+        strategies_2x3.append([Shard(2), Replicate(), Shard(2), Replicate()])
+        # mat1 is sharded on column dim, mat2 is sharded on row dim, offs is replicated
+        #  -> output is partial
+        strategies_2x3.append([Partial(), Shard(2), Shard(1), Replicate()])
+        single_mesh_dim_strategies.extend(strategies_2x3)
+    elif batched_args == [
+        1,
+    ]:
+        # Case: 3Dx2D
+        # mat1 is [E, H, D]
+        # mat2 is [OB, D, IB]
+        # offs is [OB, E]
+        # output is [OB, H, IB]
+        assert mat1_strategy.ndim == 3 and mat2_strategy.ndim == 3
+        strategies_3x2 = []
+        # dp mesh
+        # mat1 is replicated, mat2 is sharded on outer batch, offs is sharded on outer batch
+        # -> output is sharded on outer batch
+        strategies_3x2.append([Shard(0), Replicate(), Shard(0), Shard(0)])
+        # ep mesh
+        # mat1 is replicated, mat2 is sharded on inner batch, offs is partial
+        # -> output is sharded on inner batch
+        strategies_3x2.append([Shard(2), Replicate(), Shard(2), Partial()])
+        # mat1 is sharded on experts dim, mat2 is dynamically sharded on column dim, offs is sharded on experts dim
+        # -> output is dynamically sharded on column dim
+        strategies_3x2.append([DynamicShard(2), Shard(0), DynamicShard(2), Shard(1)])
+        # tp mesh
+        # mat1 is sharded on column dim, mat2 is sharded on row dim, offs is replicated
+        # -> output is partial
+        strategies_3x2.append([Partial(), Shard(2), Shard(2), Replicate()])
+        # mat1 is sharded on row dim, mat2 is replicated, offs is replicated
+        # output is sharded on row dim
+        strategies_3x2.append([Shard(1), Shard(1), Replicate(), Replicate()])
+        single_mesh_dim_strategies.extend(strategies_3x2)
+    else:
+        assert batched_args == [0, 1]
+        if mat1_strategy.ndim == 3 and mat2_strategy.ndim == 3:
+            # Case: 2Dx2D
+            # mat1 is [OB, D, IB]
+            # mat2 is [OB, IB, H]
+            # offs is [OB, E]
+            # output is [OB, E, D, H]
+            strategies_2x2 = []
+            # dp mesh
+            # mat1 is sharded on outer batch, mat2 is sharded on outer batch, offs is sharded on outer batch
+            # -> output is sharded on outer batch
+            strategies_2x2.append([Shard(0), Shard(0), Shard(0), Shard(0)])
+            # ep mesh
+            # mat1 is sharded on inner batch, mat2 is sharded on inner batch, offs is partial
+            # -> output is partial
+            strategies_2x2.append([Partial(), Shard(2), Shard(1), Partial()])
+            # mat1 is dynamically sharded on column dim, mat2 is dynamically sharded on row dim, offs is sharded on experts dim
+            # -> output is sharded on experts dim
+            strategies_2x2.append(
+                [Shard(1), DynamicShard(2), DynamicShard(1), Shard(0)]
+            )
+            # tp mesh
+            # mat1 is replicated, mat2 is sharded on column dim, offs is replicated
+            # -> output is sharded on column dim
+            strategies_2x2.append([Shard(3), Replicate(), Shard(2), Replicate()])
+            # mat1 is sharded on row dim, mat2 is replicated, offs is replicated
+            # -> output is sharded on row dim
+            strategies_2x2.append([Shard(2), Shard(1), Replicate(), Replicate()])
+            single_mesh_dim_strategies.extend(strategies_2x2)
+        elif mat1_strategy.ndim == 4 and mat2_strategy.ndim == 3:
+            # Case: 3Dx2D
+            # mat1 is [OB, E, D, H]
+            # mat2 is [OB, H, IB]
+            # offs is [OB, E]
+            # output is [OB, D, IB]
+            strategies_batched_3x2 = []
+            # dp mesh
+            # mat1 is sharded on outer batch, mat2 is sharded on outer batch, offs is sharded on outer batch
+            # -> output is sharded on outer batch
+            strategies_batched_3x2.append([Shard(0), Shard(0), Shard(0), Shard(0)])
+            # ep mesh
+            # mat1 is replicated, mat2 is sharded on inner batch, offs is partial
+            # -> output is sharded on inner batch
+            strategies_batched_3x2.append([Shard(2), Replicate(), Shard(2), Partial()])
+            # mat1 is sharded on experts dim, mat2 is dynamically sharded on column dim, offs is sharded on experts dim
+            # -> output is dynamically sharded on column dim
+            strategies_batched_3x2.append(
+                [DynamicShard(2), Shard(1), DynamicShard(2), Shard(1)]
+            )
+            # tp mesh
+            # mat1 is sharded on column dim, mat2 is sharded on row dim, offs is replicated
+            # -> output is partial
+            strategies_batched_3x2.append([Partial(), Shard(3), Shard(1), Replicate()])
+            # mat1 is sharded on row dim, mat2 is replicated, offs is replicated
+            # output is sharded on row dim
+            strategies_batched_3x2.append(
+                [Shard(1), Shard(2), Replicate(), Replicate()]
+            )
+            single_mesh_dim_strategies.extend(strategies_batched_3x2)
+
+        elif mat1_strategy.ndim == 3 and mat2_strategy.ndim == 4:
+            # Case: 2Dx3D
+            # mat1 is [OB, IB, D]
+            # mat2 is [OB, E, D, H]
+            # offs is [OB, E]
+            # output is [OB, IB, H]
+            strategies_batched_2x3 = []
+            # dp mesh
+            # mat1 is sharded on outer batch, mat2 is sharded on outer batch, offs is sharded on outer batch
+            #  -> output is sharded on outer batch
+            strategies_batched_2x3.append([Shard(0), Shard(0), Shard(0), Shard(0)])
+            # ep mesh
+            # mat1 is sharded on inner batch, mat2 is replicated, offs is partial
+            #  -> output is sharded on inner batch
+            strategies_batched_2x3.append([Shard(1), Shard(1), Replicate(), Partial()])
+            # mat1 is dynamically sharded on row dim, mat2 is sharded on experts dim, offs is sharded on experts dim
+            #  -> output is dynamically sharded on row dim
+            strategies_batched_2x3.append(
+                [DynamicShard(1), DynamicShard(1), Shard(1), Shard(1)]
+            )
+            # tp mesh
+            # mat1 is replicated, mat2 is sharded on column dim , offs is replicated
+            #  -> output is sharded on column dim
+            strategies_batched_2x3.append(
+                [Shard(2), Replicate(), Shard(3), Replicate()]
+            )
+            # mat1 is sharded on column dim, mat2 is sharded on row dim, offs is replicated
+            #  -> output is partial
+            strategies_batched_2x3.append([Partial(), Shard(2), Shard(2), Replicate()])
+            single_mesh_dim_strategies.extend(strategies_batched_2x3)
+        else:
+            raise RuntimeError("Invalid batched grouped mm strategy")
 
     return expand_to_full_mesh_op_strategy(
         mesh, op_schema, single_mesh_dim_strategies, input_index=1
