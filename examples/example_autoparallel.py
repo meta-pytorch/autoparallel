@@ -21,9 +21,8 @@ def policy_fn(ctx, op, *args, **kwargs):
         op == torch.ops.aten._scaled_dot_product_flash_attention.default
         or op == torch.ops.aten._scaled_dot_product_efficient_attention.default
     ):
-        # NOTE: we can't save nondeterministic_seeded ops, the run with rng wrapper is not traceable yet
-        return torch.utils.checkpoint.CheckpointPolicy.PREFER_SAVE
-    return torch.utils.checkpoint.CheckpointPolicy.PREFER_RECOMPUTE
+        return torch.utils.checkpoint.CheckpointPolicy.MUST_RECOMPUTE
+    return torch.utils.checkpoint.CheckpointPolicy.MUST_SAVE
 
 
 context_fn = functools.partial(create_selective_checkpoint_contexts, policy_fn)
@@ -173,7 +172,7 @@ mm_nodes = autop.gm.graph.find_nodes(
 
 assert (
     mm_nodes[0].meta.get("recompute")
-    == torch.utils.checkpoint.CheckpointPolicy.PREFER_RECOMPUTE
+    == torch.utils.checkpoint.CheckpointPolicy.MUST_SAVE
 )
 
 print("All good!")

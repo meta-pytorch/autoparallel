@@ -17,6 +17,11 @@ logger: logging.Logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 
+# add an arbitrarily large graph id. I'm assuming 100000 here, which should be fine
+# and is the same we add for the all-gather nodes
+AP_AC_GRAPH_ID = 100000
+
+
 # reimplement torch._functorch.partitioners.must_recompute
 # to only check for MUST_RECOMPUTE tag, and not PREFER_RECOMPUTE
 # For now there isn't any distinction in the partitioner between both
@@ -71,16 +76,15 @@ def force_recompute_fsdp_all_gather(graph: torch.fx.Graph) -> None:
 
     def force_recompute_node(node):
         node.meta["recompute"] = CheckpointPolicy.MUST_RECOMPUTE
-        if "ac_graph_id" not in node.meta:
-            # ac_graph_id is used in the partitioner to decide
-            # if two nodes which have AC applied come from a different
-            # AC regions. This is needed because  nodes in the boundary
-            # of two AC regions are marked as MUST_SAVE. In our case
-            # we just add a large value of ac_graph_id so that
-            # all nodes we tag for recomputation do indeed get recomputed
-            # and are not influenced by other nodes in the graph with
-            # nearby ac_graph_id values
-            node.meta["ac_graph_id"] = 100000
+        # ac_graph_id is used in the partitioner to decide
+        # if two nodes which have AC applied come from a different
+        # AC regions. This is needed because  nodes in the boundary
+        # of two AC regions are marked as MUST_SAVE. In our case
+        # we just add a large value of ac_graph_id so that
+        # all nodes we tag for recomputation do indeed get recomputed
+        # and are not influenced by other nodes in the graph with
+        # nearby ac_graph_id values
+        node.meta["ac_graph_id"] = AP_AC_GRAPH_ID
 
     # Make all-gather nodes (and related nodes) recomputable, to circumvent
     # https://github.com/pytorch/pytorch/issues/136433
@@ -178,9 +182,18 @@ def _mark_nodes_as_must_save(must_save_nodes: list[torch.fx.Node]) -> None:
     """
     Given a list of nodes, mark them as must save.
     """
-    print(f"mark_nodes_as_must_save: {must_save_nodes}")
+    skipped_nodes = {}
     for node in must_save_nodes:
+        if (
+            node.meta.get("recompute", None) is not None
+            and node.meta["ac_graph_id"] != AP_AC_GRAPH_ID
+        ):
+            # Let user annotations take precedence
+            skipped_nodes[node] = node.meta["recompute"]
+            continue
         node.meta["recompute"] = CheckpointPolicy.MUST_SAVE
+    print(f"mark_nodes_as_must_save, attempting to mark nodes: {must_save_nodes}")
+    print(f"mark_nodes_as_must_save, skipping already marked nodes: {skipped_nodes}")
 
 
 def mark_nodes_as_must_save_to_stage_recomputation(
@@ -229,9 +242,7 @@ def mark_nodes_as_must_save_to_stage_recomputation(
             #   is implicitly determined by the recompute behavior of the multi-output op preceding it.
             continue
         node.meta["recompute"] = CheckpointPolicy.PREFER_RECOMPUTE
-        # add an arbitrarily large graph id. I'm assuming 100000 here, which should be fine
-        # and is the same we add for the all-gather nodes
-        node.meta["ac_graph_id"] = 100000
+        node.meta["ac_graph_id"] = AP_AC_GRAPH_ID
 
     # get the mapping between node name and node
     name_to_node_mapping = {}
