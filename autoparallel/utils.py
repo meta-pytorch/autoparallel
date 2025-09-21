@@ -212,7 +212,8 @@ def get_local_map_placement_option(
     for example, placement in zip(user_args[num_activation_inputs:], in_placements):
         if placement is None:
             # not a dtensor
-            assert False, "Not sure how to create DTensorSpec for this input"
+            in_specs.append(None)
+            continue
 
         in_specs.append(
             DTensorSpec(
@@ -237,7 +238,9 @@ def get_local_map_placement_option(
 
         if placement is None:
             # not a dtensor
-            assert False, "Not sure how to create DTensorSpec for this output"
+            out_specs.append(None)
+            continue
+
         elif isinstance(placement, Placement):
             placement = [placement]
 
