@@ -272,7 +272,9 @@ class AutoParallel:
             if not isinstance(inputs, tuple):
                 inputs = (inputs,)
 
-        with set_dtype_cast(True), enable_local_map_wrapping():
+        with set_dtype_cast(
+            True
+        ), enable_local_map_wrapping(), torch._dynamo.utils._disable_saved_tensors_hooks_during_tracing():
             with torch._dynamo.config.patch(
                 install_free_tensors=True
             ), monkey_patch_export_verifier():

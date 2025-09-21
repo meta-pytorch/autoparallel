@@ -180,7 +180,7 @@ def _mark_nodes_as_must_save(must_save_nodes: list[torch.fx.Node]) -> None:
     """
     skipped_nodes = []
     for node in must_save_nodes:
-        if node.meta["recompute"] is not None:
+        if node.meta.get("recompute", None) is not None:
             # Let user annotations take precedence
             skipped_nodes.append(node)
             continue

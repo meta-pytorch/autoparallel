@@ -3,31 +3,30 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+import functools
+
 import torch
 from torch import nn
 from torch.distributed._tensor.experimental import local_map
 from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor.placement_types import Replicate, Shard
 from torch.testing._internal.distributed.fake_pg import FakeStore
+from torch.utils.checkpoint import create_selective_checkpoint_contexts
 
 from autoparallel.api import AutoParallel
 
-# import functools
-# from torch.utils.checkpoint import create_selective_checkpoint_contexts
 
-# SAC's dispatch mode does not support HOPs: https://github.com/pytorch/pytorch/issues/162246
-
-# def policy_fn(ctx, op, *args, **kwargs):
-#     if (
-#         op == torch.ops.aten._scaled_dot_product_flash_attention.default
-#         or op == torch.ops.aten._scaled_dot_product_efficient_attention.default
-#     ):
-#         # NOTE: we can't save nondeterministic_seeded ops, the run with rng wrapper is not traceable yet
-#         return torch.utils.checkpoint.CheckpointPolicy.PREFER_SAVE
-#     return torch.utils.checkpoint.CheckpointPolicy.PREFER_RECOMPUTE
+def policy_fn(ctx, op, *args, **kwargs):
+    if (
+        op == torch.ops.aten._scaled_dot_product_flash_attention.default
+        or op == torch.ops.aten._scaled_dot_product_efficient_attention.default
+    ):
+        # NOTE: we can't save nondeterministic_seeded ops, the run with rng wrapper is not traceable yet
+        return torch.utils.checkpoint.CheckpointPolicy.PREFER_SAVE
+    return torch.utils.checkpoint.CheckpointPolicy.PREFER_RECOMPUTE
 
 
-# context_fn = functools.partial(create_selective_checkpoint_contexts, policy_fn)
+context_fn = functools.partial(create_selective_checkpoint_contexts, policy_fn)
 
 
 @local_map(
@@ -100,7 +99,6 @@ class Block(nn.Module):
     def _compute_attention(self, x):
         boosted_weight, scalar = sharded_pointwise(self.wq.weight, 10)
         q = replicate_linear(boosted_weight, x)
-        # q = self.wq(x)
         k = self.wk(x)
         v = self.wv(x)
 
@@ -109,17 +107,15 @@ class Block(nn.Module):
         v = v.unflatten(-1, (self.nheads, -1)).permute(0, 2, 1, 3)
 
         o = context_parallel_attention(q, k, v)
-        # o = nn.functional.scaled_dot_product_attention(q, k, v)
         o = o.permute(0, 2, 1, 3).flatten(-2)
 
         o = self.wo(o)
         return o
 
     def forward(self, x):
-        # o = torch.utils.checkpoint.checkpoint(
-        #     self._compute_attention, x, use_reentrant=False, context_fn=context_fn
-        # )
-        o = self._compute_attention(x)
+        o = torch.utils.checkpoint.checkpoint(
+            self._compute_attention, x, use_reentrant=False, context_fn=context_fn
+        )
 
         o0 = o + x
 
@@ -193,28 +189,28 @@ out = parallel_mod(*x)
 out.backward(torch.randn_like(out))
 
 # Validate
-# seqs = set()
-# for n in autop.gm.graph.nodes:
-#     if "checkpoint" in n.meta.get(
-#         "stack_trace", ""
-#     ):  # placeholders don't have stack trace
-#         is_bwd = n.meta.get("partitioner_tag", "") == "is_backward"
-#         if not is_bwd:
-#             if "getitem" in str(n.target):
-#                 # getitem nodes are tagged same as their parent
-#                 expected = policy_fn(None, n.args[0].target, (), ())
-#             else:
-#                 expected = policy_fn(None, n.target, (), ())
-#             actual = n.meta.get("recompute")
-#             # NOTE: this assert only supports policy_fns on op alone
-#             assert actual == expected
-#             seqs.add(n.meta["seq_nr"])
-#         else:
-#             # fwd counterpart should have already populated seqs
-#             assert n.meta["seq_nr"] in seqs
+seqs = set()
+for n in autop.gm.graph.nodes:
+    if "checkpoint" in n.meta.get(
+        "stack_trace", ""
+    ):  # placeholders don't have stack trace
+        is_bwd = n.meta.get("partitioner_tag", "") == "is_backward"
+        if not is_bwd:
+            if "getitem" in str(n.target):
+                # getitem nodes are tagged same as their parent
+                expected = policy_fn(None, n.args[0].target, (), ())
+            else:
+                expected = policy_fn(None, n.target, (), ())
+            actual = n.meta.get("recompute")
+            # NOTE: this assert only supports policy_fns on op alone
+            assert actual == expected
+            seqs.add(n.meta["seq_nr"])
+        else:
+            # fwd counterpart should have already populated seqs
+            assert n.meta["seq_nr"] in seqs
 
-# mm_nodes = autop.gm.graph.find_nodes(
-#     op="call_function", target=torch.ops.aten.mm.default
-# )
+mm_nodes = autop.gm.graph.find_nodes(
+    op="call_function", target=torch.ops.aten.mm.default
+)
 
 print("All good!")
