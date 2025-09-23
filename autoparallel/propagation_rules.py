@@ -180,6 +180,11 @@ def getitem_rule(mesh, specs):
     op_spec = specs[0]
     index = specs[1]
     strats = []
+    for strat in op_spec.strategies:
+        if index >= len(strat.output_specs):
+            # oob
+            torch.distributed.breakpoint()
+
     new_inp = OpStrategy(
         [
             OpSpec(strat.output_specs[index], input_specs=strat.output_specs)

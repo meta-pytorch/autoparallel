@@ -29,6 +29,23 @@ def policy_fn(ctx, op, *args, **kwargs):
 context_fn = functools.partial(create_selective_checkpoint_contexts, policy_fn)
 
 
+world_size = 256
+
+fake_store = FakeStore()
+torch.distributed.init_process_group(
+    "fake", store=fake_store, rank=0, world_size=world_size
+)
+mesh = torch.distributed.device_mesh.init_device_mesh(
+    "cuda",
+    (world_size // 32, 8, 4),
+    mesh_dim_names=(
+        "dp",
+        "tp",
+        "cp",
+    ),
+)
+
+
 @local_map(
     out_placements=((Replicate(), Replicate(), Replicate()),),
     in_placements=(
@@ -37,7 +54,7 @@ context_fn = functools.partial(create_selective_checkpoint_contexts, policy_fn)
     ),
     redistribute_inputs=True,
     in_grad_placements=None,
-    device_mesh=None,
+    device_mesh=mesh,
 )
 def replicate_linear(w, x):
     return torch.matmul(x, w.t())
@@ -54,7 +71,7 @@ def replicate_linear(w, x):
     ),
     redistribute_inputs=True,
     in_grad_placements=None,
-    device_mesh=None,
+    device_mesh=mesh,
 )
 def sharded_pointwise(x, scalar):
     return x + scalar, scalar
@@ -64,12 +81,12 @@ def sharded_pointwise(x, scalar):
     out_placements=((Shard(0), Shard(1), Shard(2)),),
     in_placements=(
         (Shard(0), Shard(1), Shard(2)),
-        (Shard(0), Shard(1), Shard(2)),
-        (Shard(0), Shard(1), Shard(2)),
+        (Shard(0), Shard(1), Replicate()),
+        (Shard(0), Shard(1), Replicate()),
     ),
     redistribute_inputs=True,
     in_grad_placements=None,
-    device_mesh=None,
+    device_mesh=mesh,
 )
 def context_parallel_attention(query, key, value):
     out = nn.functional.scaled_dot_product_attention(
@@ -128,22 +145,6 @@ class Block(nn.Module):
         return o
 
 
-world_size = 256
-
-fake_store = FakeStore()
-torch.distributed.init_process_group(
-    "fake", store=fake_store, rank=0, world_size=world_size
-)
-mesh = torch.distributed.device_mesh.init_device_mesh(
-    "cuda",
-    (world_size // 32, 8, 4),
-    mesh_dim_names=(
-        "dp",
-        "tp",
-        "cp",
-    ),
-)
-
 bs = 8 * mesh.shape[0]
 seq_len = 256
 nheads = 48
@@ -170,7 +171,7 @@ with AutoParallel(model, input_fn, mesh, mp_policy, compile=True) as autop:
     assert any(n.meta.get("fwd_nn_module_stack") for n in autop.gm.graph.nodes)
     autop.add_parameter_memory_constraint(low=None, high=None)
 
-    x_sharding = (Shard(0),) + (Replicate(),) * (mesh.ndim - 1)
+    x_sharding = (Shard(0), Replicate(), Shard(1))
 
     autop.add_input_constraints([x_sharding])
     autop.add_output_constraints([x_sharding])
@@ -184,7 +185,7 @@ parallel_mod.to_empty(device="cuda")
 parallel_mod.init_weights()
 
 # now let's run it
-x = (torch.rand(bs // mesh.shape[0], seq_len, dim1, device="cuda"),)
+x = (torch.rand(bs // mesh.shape[0], seq_len // mesh.shape[2], dim1, device="cuda"),)
 out = parallel_mod(*x)
 out.backward(torch.randn_like(out))
 
