@@ -32,11 +32,14 @@ class Container:
         self.name = name
         self.klass = klass
         self.data = []
+        self.unique_nodes = set()
         # self.children = defaultdict(Container)
         self.children = {}
 
-    def append(self, data):
-        self.data.append(data)
+    def add(self, data):
+        if data not in self.unique_nodes:
+            self.data.append(data)
+            self.unique_nodes.add(data)
 
     def get_child(self, module_stack, klass=None):
         if module_stack not in self.children:
@@ -125,6 +128,10 @@ def _make_subgraph(nodes):
     return new_graph
 
 
+def _is_root(stack):
+    return stack == ""
+
+
 def make_graph_view(graph):
     """
     Make a graph view from the fx.Graph. This is a tree structure that
@@ -186,7 +193,10 @@ def make_graph_view(graph):
                 if nodes_by_module_stack is None:
                     nodes_by_module_stack = Container(name, module_class)
                     nodes_by_module_stack_root = nodes_by_module_stack
-                new_stack = nodes_by_module_stack.get_child(name, module_class)
-                nodes_by_module_stack.data.append(node)
+                if _is_root(module_stack):
+                    new_stack = nodes_by_module_stack
+                else:
+                    new_stack = nodes_by_module_stack.get_child(name, module_class)
                 nodes_by_module_stack = new_stack
+                nodes_by_module_stack.add(node)
     return nodes_by_module_stack_root
