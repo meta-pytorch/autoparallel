@@ -48,6 +48,14 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
         self._curr_node = n
         return super().run_node(n)
 
+    def _get_origin_and_target_device_order(self, node):
+        orig_order = None
+        tgt_order = None
+        if node in self.param_placement_order:
+            tgt_order, do_reorder = self.param_placement_order[node]
+            orig_order = tgt_order[::-1] if do_reorder else tgt_order
+        return orig_order, tgt_order
+
     def redistribute_tensor(self, arg, curr_spec, tgt_spec, node=None):
         tgt_placements = tuple(
             p if not p.is_partial() else Replicate() for p in tgt_spec.placements
@@ -55,20 +63,16 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
         x = arg
         if node in self.param_placement_order and self.param_placement_order[node][1]:
             assert curr_spec.placements != tgt_spec.placements
+        orig_order, tgt_order = self._get_origin_and_target_device_order(node)
         if curr_spec.placements != tgt_spec.placements:
             tgt_spec_c = DTensorSpec(
                 tgt_spec.mesh, tgt_placements, tensor_meta=tgt_spec.tensor_meta
             )
-            origin_order = None
-            tgt_order = None
-            if node in self.param_placement_order:
-                tgt_order, do_reorder = self.param_placement_order[node]
-                origin_order = tgt_order[::-1] if do_reorder else tgt_order
             x = ordered_redistribute_local_tensor(
                 arg,
                 curr_spec,
                 tgt_spec_c,
-                src_placement_order=origin_order,
+                src_placement_order=orig_order,
                 tgt_placement_order=tgt_order,
             )
         return x
@@ -112,8 +116,14 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
             all_input_nodes, flat_args_t, curr_specs, tgt_specs
         ):
             x = self.redistribute_tensor(arg, curr_spec, tgt_spec, node)
+            orig_order, tgt_order = self._get_origin_and_target_device_order(node)
             new_flat_args_t.append(x)
+            if tgt_order:
+                setattr(tgt_spec, "device_order", tgt_order)
+            if orig_order:
+                setattr(curr_spec, "device_order", orig_order)
             self.tgt_spec = tgt_spec
+
         new_flat_args = []
         counter = 0
         for x in flat_args:
@@ -164,6 +174,10 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
             new_args[0] = DTensor.from_local(
                 new_args[0], self.tgt_spec.mesh, self.tgt_spec.placements
             )
+            # TODO: once `from_local` accept device order arg, we can remove the following
+            if hasattr(self.tgt_spec, "device_order"):
+                setattr(new_args[0]._spec, "device_order", self.tgt_spec.device_order)
+
             # TODO: see if we can remove this contiguous properly
             new_args[0] = new_args[0].contiguous()
 
@@ -239,6 +253,7 @@ def apply_sharding_to_model(gm, sharding_placement, params_spec, buffers_spec):
     interp = ApplyShardingInterpreter(gm, sharding_placement)
 
     # TODO: make_fx here is suspicious in case of dynamic shapes
+    # here we update sharding_placement if device order get muted
     with fx_traceback.preserve_node_meta():
         parallel_gm0 = make_fx(interp.run)(*local_args)
 
@@ -278,6 +293,12 @@ def apply_sharding_to_model(gm, sharding_placement, params_spec, buffers_spec):
             sharded_param_dict[fqn] = nn.Parameter(
                 shard_node_given_placements(n, sharding_placement, meta=True)
             )
+            # assign device order info to fqn model parameter
+            tgt_spec = sharding_placement[n].input_specs[0]
+            if hasattr(tgt_spec, "device_order"):
+                setattr(
+                    sharded_param_dict[fqn]._spec, "device_order", tgt_spec.device_order
+                )
 
     for fqn in buffers_spec:
         n = fqn_to_buffer[fqn]

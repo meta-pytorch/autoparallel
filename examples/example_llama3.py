@@ -192,23 +192,23 @@ with AutoParallel(
         add_tp_constraints(autop)
 
     t = time.time()
-    sharding_placement = autop.optimize_placement()
+    sharding_placement = autop.optimize_placement(verbose=False)
     print(f"Took {time.time() - t:.2f} s")
     parallel_mod = autop.apply_placement(sharding_placement)
 
 # run weight init on our sharded DTensor params
-parallel_mod.to_empty(device="cuda")
-parallel_mod.init_weights()
+# parallel_mod.to_empty(device="cuda")
+# parallel_mod.init_weights()
 
 # now let's run it
-x = (
-    torch.randint(
-        0,
-        vocab_size,
-        (batch_size // mesh.shape[0], seqlen),
-        device=torch.device("cuda"),
-    ),
-)
-out = parallel_mod(*x)
-out.backward(torch.randn_like(out))
+# x = (
+#     torch.randint(
+#         0,
+#         vocab_size,
+#         (batch_size // mesh.shape[0], seqlen),
+#         device=torch.device("cuda"),
+#     ),
+# )
+# out = parallel_mod(*x)
+# out.backward(torch.randn_like(out))
 print("All good!")

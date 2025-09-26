@@ -3,6 +3,7 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+import operator
 from typing import Optional, Union
 
 import torch
@@ -102,9 +103,26 @@ def get_redistributed_input_placements(
     curr_specs: list[Union[DTensorSpec, tuple[Optional[DTensorSpec], ...]]] = [
         sharding_placement[n].output_specs for n in all_input_nodes
     ]  # FIXME ?
+    if node.target == operator.getitem:
+        # if getitem index is static, then there's no associated fx.Node
+        assert (
+            len(all_input_nodes) == 1
+        ), "getitem with dynamic index not yet supported."
+        assert len(curr_specs) == 1 and isinstance(curr_specs[0], (tuple, list))
+        assert len(node.args) == 2
+        index = node.args[1]
+        assert isinstance(index, int)
+        assert index < len(curr_specs[0])
+
+        # This looks wrong, and it is wrong.
+        # Basically, we need a refactor to properly support getitem.
+        # It currently uses the wrong input_specs, see TODO in `getitem_rule`.
+        curr_specs = [curr_specs[0][index]]  # type: ignore[assignment, list-item]
+
     tgt_specs: list[DTensorSpec] = [
         sharding_placement[node].input_specs[c] for c in range(num_input_nodes)  # type: ignore[index]
     ]
+    assert len(curr_specs) == len(tgt_specs)
 
     res = {}
     for i, (curr_spec, tgt_spec) in enumerate(zip(curr_specs, tgt_specs)):
@@ -112,7 +130,9 @@ def get_redistributed_input_placements(
             p if not p.is_partial() else Replicate() for p in tgt_spec.placements
         )
         if not isinstance(curr_spec, DTensorSpec):
-            raise NotImplementedError("No support for ops with multiple outputs yet")
+            raise NotImplementedError(
+                f"No support for ops with multiple outputs yet: {node.name}"
+            )
         if curr_spec.placements != tgt_spec.placements:
             res[all_input_nodes[i]] = (curr_spec.placements, tgt_placements)
     return res
