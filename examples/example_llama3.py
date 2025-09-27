@@ -192,7 +192,7 @@ with AutoParallel(
         add_tp_constraints(autop)
 
     t = time.time()
-    sharding_placement = autop.optimize_placement(verbose=False)
+    sharding_placement = autop.optimize_placement(verbose=True)
     print(f"Took {time.time() - t:.2f} s")
     parallel_mod = autop.apply_placement(sharding_placement)
 
