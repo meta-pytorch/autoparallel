@@ -172,15 +172,18 @@ def model_fn():
 with torch.device("meta"):
     model = model_fn()
 
-autop = AutoParallel(model, input_fn, mesh)
-autop.add_parameter_memory_constraint(low=None, high=None)
+with AutoParallel(model, input_fn, mesh) as autop:
+    autop.add_parameter_memory_constraint(low=None, high=None)
 
-from torch.distributed.tensor.placement_types import Replicate, Shard
+    from torch.distributed.tensor.placement_types import Replicate, Shard
 
-x_sharding = (Shard(0), Shard(0))
+    x_sharding = (Shard(0), Shard(0))
 
-autop.add_input_constraints([x_sharding])
-autop.add_output_constraints([x_sharding])
+    autop.add_input_constraints([x_sharding])
+    autop.add_output_constraints([x_sharding])
 
+    import time
 
-sharding_placement = autop.optimize_placement()
+    t = time.time()
+    sharding_placement = autop.optimize_placement()
+    print(f"Took {time.time() - t:.2f} s")
