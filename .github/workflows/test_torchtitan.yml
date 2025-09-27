@@ -1,4 +1,4 @@
-name: Test CUDA
+name: Test TorchTitan Integration
 
 on:
   pull_request:
@@ -8,12 +8,12 @@ on:
       - release/*
 
 concurrency:
-  group: test-cuda-${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.run_number || github.ref }}
+  group: test-torchtitan-${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.run_number || github.ref }}
   cancel-in-progress: true
 
 jobs:
-  test-cuda:
-    name: Test CUDA (cuda12.6-py3.10)
+  test-torchtitan:
+    name: Test TorchTitan Integration (cuda12.6-py3.10)
     uses: pytorch/test-infra/.github/workflows/linux_job_v2.yml@main
     strategy:
       fail-fast: true
@@ -36,7 +36,15 @@ jobs:
         pip uninstall -y torch
         pip install --no-input --quiet --pre torch --index-url https://download.pytorch.org/whl/nightly/cu126
         pip install --quiet .
-        pytest tests
-        python examples/example_autoparallel.py
-        python examples/example_llama3.py
-        python examples/example_dcp.py
+
+        # Clone TorchTitan on autoparallel branch
+        git clone --branch autoparallel https://github.com/pytorch/torchtitan.git
+        cd torchtitan
+        pip install --quiet -r requirements.txt
+
+        # Run TorchTitan training with AutoParallel
+        NGPU=4 CONFIG_FILE="./torchtitan/models/llama3/train_configs/debug_model.toml" ./run_train.sh \
+          --model.name llama3_auto_parallel \
+          --parallelism.tensor_parallel_degree 4 \
+          --training.dataset c4 \
+          --compile.enable

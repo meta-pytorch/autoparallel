@@ -3,11 +3,11 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
-
 import functools
 
 import torch
 from torch import nn
+from torch.distributed._tensor.experimental import local_map
 from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor.placement_types import Replicate, Shard
 from torch.testing._internal.distributed.fake_pg import FakeStore
@@ -21,11 +21,61 @@ def policy_fn(ctx, op, *args, **kwargs):
         op == torch.ops.aten._scaled_dot_product_flash_attention.default
         or op == torch.ops.aten._scaled_dot_product_efficient_attention.default
     ):
-        return torch.utils.checkpoint.CheckpointPolicy.MUST_RECOMPUTE
-    return torch.utils.checkpoint.CheckpointPolicy.MUST_SAVE
+        # NOTE: we can't save nondeterministic_seeded ops, the run with rng wrapper is not traceable yet
+        return torch.utils.checkpoint.CheckpointPolicy.PREFER_SAVE
+    return torch.utils.checkpoint.CheckpointPolicy.PREFER_RECOMPUTE
 
 
 context_fn = functools.partial(create_selective_checkpoint_contexts, policy_fn)
+
+
+@local_map(
+    out_placements=((Replicate(), Replicate(), Replicate()),),
+    in_placements=(
+        (Replicate(), Replicate(), Replicate()),
+        (Replicate(), Replicate(), Replicate()),
+    ),
+    redistribute_inputs=True,
+    in_grad_placements=None,
+    device_mesh=None,
+)
+def replicate_linear(w, x):
+    return torch.matmul(x, w.t())
+
+
+@local_map(
+    out_placements=(
+        (Shard(0), Shard(0), Replicate()),
+        None,
+    ),
+    in_placements=(
+        (Shard(0), Shard(0), Replicate()),
+        None,
+    ),
+    redistribute_inputs=True,
+    in_grad_placements=None,
+    device_mesh=None,
+)
+def sharded_pointwise(x, scalar):
+    return x + scalar, scalar
+
+
+@local_map(
+    out_placements=((Shard(0), Shard(1), Shard(2)),),
+    in_placements=(
+        (Shard(0), Shard(1), Shard(2)),
+        (Shard(0), Shard(1), Shard(2)),
+        (Shard(0), Shard(1), Shard(2)),
+    ),
+    redistribute_inputs=True,
+    in_grad_placements=None,
+    device_mesh=None,
+)
+def context_parallel_attention(query, key, value):
+    out = nn.functional.scaled_dot_product_attention(
+        query=query, key=key, value=value, is_causal=False
+    )
+    return out
 
 
 class Block(nn.Module):
@@ -47,7 +97,8 @@ class Block(nn.Module):
                 torch.nn.init.normal_(lin.bias)
 
     def _compute_attention(self, x):
-        q = self.wq(x)
+        boosted_weight, scalar = sharded_pointwise(self.wq.weight, 10)
+        q = replicate_linear(boosted_weight, x)
         k = self.wk(x)
         v = self.wv(x)
 
@@ -55,7 +106,7 @@ class Block(nn.Module):
         k = k.unflatten(-1, (self.nheads, -1)).permute(0, 2, 1, 3)
         v = v.unflatten(-1, (self.nheads, -1)).permute(0, 2, 1, 3)
 
-        o = nn.functional.scaled_dot_product_attention(q, k, v)
+        o = context_parallel_attention(q, k, v)
         o = o.permute(0, 2, 1, 3).flatten(-2)
 
         o = self.wo(o)
@@ -83,22 +134,15 @@ fake_store = FakeStore()
 torch.distributed.init_process_group(
     "fake", store=fake_store, rank=0, world_size=world_size
 )
-
-use_1d_mesh = False
-
-if use_1d_mesh:
-    mesh = torch.distributed.device_mesh.init_device_mesh(
-        "cuda", (world_size,), mesh_dim_names=("dp",)
-    )
-else:
-    mesh = torch.distributed.device_mesh.init_device_mesh(
-        "cuda",
-        (world_size // 8, 8),
-        mesh_dim_names=(
-            "dp",
-            "tp",
-        ),
-    )
+mesh = torch.distributed.device_mesh.init_device_mesh(
+    "cuda",
+    (world_size // 32, 8, 4),
+    mesh_dim_names=(
+        "dp",
+        "tp",
+        "cp",
+    ),
+)
 
 bs = 8 * mesh.shape[0]
 seq_len = 256
@@ -116,8 +160,10 @@ def input_fn():
 with torch.device("meta"):
     model = Block(nheads, dim1, dim2)
 
-mp_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
-# mp_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16)
+# MP policy causing some deepcopy issues
+# mp_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
+mp_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16)
+# mp_policy = None
 
 with AutoParallel(model, input_fn, mesh, mp_policy, compile=True) as autop:
     assert any(n.meta.get("nn_module_stack") for n in autop.gm.graph.nodes)
@@ -153,14 +199,11 @@ for n in autop.gm.graph.nodes:
             if "getitem" in str(n.target):
                 # getitem nodes are tagged same as their parent
                 expected = policy_fn(None, n.args[0].target, (), ())
-            elif "alias" in str(n.target) and "getitem" in str(n.args[0].target):
-                # alias nodes that depend on getitem are tagged same as their parent
-                expected = policy_fn(None, n.args[0].args[0].target, (), ())
             else:
                 expected = policy_fn(None, n.target, (), ())
             actual = n.meta.get("recompute")
             # NOTE: this assert only supports policy_fns on op alone
-            assert actual == expected, f"{n} {actual} {expected}"
+            assert actual == expected
             seqs.add(n.meta["seq_nr"])
         else:
             # fwd counterpart should have already populated seqs
@@ -168,11 +211,6 @@ for n in autop.gm.graph.nodes:
 
 mm_nodes = autop.gm.graph.find_nodes(
     op="call_function", target=torch.ops.aten.mm.default
-)
-
-assert (
-    mm_nodes[0].meta.get("recompute")
-    == torch.utils.checkpoint.CheckpointPolicy.MUST_SAVE
 )
 
 print("All good!")

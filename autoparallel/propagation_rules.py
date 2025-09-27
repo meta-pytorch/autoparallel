@@ -39,6 +39,10 @@ from torch.distributed.tensor._ops.utils import (
 )
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
+# need to import this to have the dtype_cast registered
+from .cast_parametrization import dtype_cast  # noqa
+from .dtensor_util import get_op_strategy
+
 # TODO: move this to PyTorch
 dim_maps[torch.t] = lambda input: dim_transpose(input.ndim, -2, -1)
 
@@ -377,7 +381,7 @@ def factory_rule(mesh, op_schema: OpSchema) -> OpStrategy:
     This util applies to any factory function that takes 'size' as the first argument,
     and supports Replication and Shard placements all at zero cost.
     """
-    assert isinstance(op_schema.args_schema[0], torch.Size)
+    assert isinstance(op_schema.args_schema[0], (torch.Size, list))
     shape = op_schema.args_schema[0]
     x = torch.empty(shape, device="meta")
     stride = x.stride()
@@ -406,7 +410,7 @@ def factory_rule(mesh, op_schema: OpSchema) -> OpStrategy:
     for strategy_comb in strategy_combs:
         spec_list = [DTensorSpec(mesh, specs) for specs in zip(*strategy_comb)]
         output_specs = spec_list[0]
-        output_specs.tensor_meta = TensorMeta(shape, stride, dtype)
+        output_specs.tensor_meta = TensorMeta(shape, stride, dtype)  # type: ignore[arg-type]
 
         if not is_tensor_shardable(shape, output_specs):
             continue
@@ -419,8 +423,13 @@ def factory_rule(mesh, op_schema: OpSchema) -> OpStrategy:
             * len(strategy_combs)
         ]
 
+        # NOTE: why do we have input_specs for constructor nodes, given that they have no inputs?
+        # This is because the optimizer code expects to see input_specs for all nodes, and it
+        # uses the input_specs to determine the sharding of the output.  So we have to give it
+        # something, even though it is in principle not needed.
         strategy = OpSpec(
             output_specs=output_specs,
+            input_specs=[output_specs],
             redistribute_cost=redistribute_cost,
         )
         all_strategies.append(strategy)
@@ -572,7 +581,12 @@ def native_layer_norm_backward_rule(mesh, op_schema):
     return OpStrategy(kept)
 
 
-@register_opschema_rule(torch.ops.prims.convert_element_type.default)
+@register_opschema_rule(
+    [
+        torch.ops.prims.convert_element_type.default,
+        torch.ops.autoparallel.dtype_cast.default,
+    ]
+)
 def convert_element_type_rule(mesh, op_schema):
     from torch.distributed.tensor._ops._tensor_ops import (
         propagate_single_input_strategy,
@@ -653,14 +667,8 @@ def index_rule(mesh, op_schema):
     return out_strat
 
 
-@register_opschema_rule(torch.ops.aten._scaled_dot_product_efficient_attention.default)
-def sdpa_rule(mesh, op_schema):
-    op = torch.ops.aten._scaled_dot_product_efficient_attention.default
-    out_strat = torch.distributed.tensor.DTensor._op_dispatcher.sharding_propagator.op_strategy_funcs[
-        op
-    ](
-        op_schema
-    )
+def sdpa_rule(op, mesh, op_schema):
+    out_strat = get_op_strategy(op, op_schema)
     # remove wrong context-parallel strategy
     # https://github.com/pytorch/pytorch/pull/131351#discussion_r1716164659
     new_strats = []
@@ -669,29 +677,43 @@ def sdpa_rule(mesh, op_schema):
             torch.distributed.tensor.placement_types.Shard(2)
             not in ss.input_specs[0].placements
         ):
-            os = ss.output_specs
-            new_os = []
-            for s in os:
-                # replace None with Replicate() in the output_spec
-                # as this is done by default but somewhere further
-                # down the line in DTensor
-                if s is None:
-                    s = DTensorSpec(mesh=mesh, placements=(Replicate(),) * mesh.ndim)
-                new_os.append(s)
-            ss.output_specs = tuple(new_os)
             new_strats.append(ss)
     out_strat.strategies = new_strats
     return out_strat
 
 
+@register_opschema_rule(torch.ops.aten._scaled_dot_product_efficient_attention.default)
+def _(mesh, op_schema):
+    op = torch.ops.aten._scaled_dot_product_efficient_attention.default
+    return sdpa_rule(op, mesh, op_schema)
+
+
+@register_opschema_rule(torch.ops.aten._scaled_dot_product_flash_attention.default)
+def _(mesh, op_schema):
+    op = torch.ops.aten._scaled_dot_product_flash_attention.default
+    return sdpa_rule(op, mesh, op_schema)
+
+
+@register_opschema_rule(
+    torch.ops.aten._scaled_dot_product_flash_attention_backward.default
+)
+def _(mesh, op_schema):
+    op = torch.ops.aten._scaled_dot_product_flash_attention_backward.default
+    return sdpa_rule(op, mesh, op_schema)
+
+
+@register_opschema_rule(
+    torch.ops.aten._scaled_dot_product_efficient_attention_backward.default
+)
+def _(mesh, op_schema):
+    op = torch.ops.aten._scaled_dot_product_efficient_attention_backward.default
+    return sdpa_rule(op, mesh, op_schema)
+
+
 @register_opschema_rule(torch.ops.aten.reshape.default)
 def reshape_rule(mesh, op_schema):
     op = torch.ops.aten.reshape.default
-    out_strat = torch.distributed.tensor.DTensor._op_dispatcher.sharding_propagator.op_strategy_funcs[
-        op
-    ](
-        op_schema
-    )
+    out_strat = get_op_strategy(op, op_schema)
     if mesh.ndim == 1:
         # remove duplicate strategy
         # TODO: hack, fixme
@@ -706,7 +728,10 @@ def reshape_rule(mesh, op_schema):
 @register_opschema_rule(torch.ops.aten.expand.default)
 def expand_rule(mesh, op_schema_):
     op = torch.ops.aten.expand.default
-    op_schema = copy.deepcopy(op_schema_)
+    from torch._subclasses.fake_tensor import unset_fake_temporarily
+
+    with unset_fake_temporarily():
+        op_schema = copy.deepcopy(op_schema_)
     input_strat = op_schema.args_schema[0]
     orig_shape = input_strat.strategies[0].output_specs.tensor_meta.shape
     dest_shape = op_schema.args_schema[1]
@@ -717,11 +742,7 @@ def expand_rule(mesh, op_schema_):
     ]
     if len(expand_dim) != 1:
         assert len(expand_dim) == 0
-        return torch.distributed.tensor.DTensor._op_dispatcher.sharding_propagator.op_strategy_funcs[
-            op
-        ](
-            op_schema
-        )
+        return get_op_strategy(op, op_schema)
     assert len(expand_dim) == 1, f"{expand_dim}"
     expand_dim = expand_dim[0]
     to_remove = []
@@ -735,12 +756,30 @@ def expand_rule(mesh, op_schema_):
     removed = []
     for i in reversed(to_remove):
         removed.append(input_strat.strategies.pop(i))
-    out_strat = torch.distributed.tensor.DTensor._op_dispatcher.sharding_propagator.op_strategy_funcs[
-        op
-    ](
-        op_schema
-    )
+    out_strat = get_op_strategy(op, op_schema)
     for i, ss in enumerate(out_strat.strategies):
         for remov in to_remove:
             ss.redistribute_cost[0].insert(remov, math.inf)
     return out_strat
+
+
+@register_opschema_rule(torch.ops.aten.einsum.default)
+def einsum_rule(mesh, op_schema):
+    from torch.distributed.tensor._op_schema import TupleStrategy
+    from torch.distributed.tensor._ops._matrix_ops import _mm_like_strategy
+
+    mm_equation, mat_strategy = op_schema.args_schema
+    assert isinstance(mm_equation, str)
+    assert isinstance(mat_strategy, TupleStrategy)
+
+    assert len(mat_strategy.children) == 2, "Only two args to einsum supported for now"
+
+    self_strategy, mat2_strategy = mat_strategy.children
+
+    # dispatch to mm_like_strategy
+    new_op_schema = OpSchema(
+        torch.ops.aten.einsum.default,
+        args_schema=(self_strategy, mat2_strategy),
+        kwargs_schema={},
+    )
+    return _mm_like_strategy(mm_equation, mesh, new_op_schema)

@@ -4,12 +4,21 @@
 # LICENSE file in the root directory of this source tree.
 
 import torch
-from torch.distributed._tensor.placement_types import TensorMeta
+from torch.distributed._tensor.placement_types import Placement, TensorMeta
 from torch.distributed.device_mesh import _get_device_handle
-from torch.distributed.tensor._op_schema import OpSchema, OpStrategy, TupleStrategy
+from torch.distributed.tensor._dtensor_spec import DTensorSpec
+from torch.distributed.tensor._op_schema import (
+    OpSchema,
+    OpSpec,
+    OpStrategy,
+    RuntimeSchemaInfo,
+    TupleStrategy,
+)
 from torch.distributed.tensor._ops.utils import generate_redistribute_costs
+from torch.distributed.tensor.placement_types import Replicate
 from torch.utils._pytree import tree_flatten, tree_map_only
 
+from .dtensor_util import get_op_strategy, with_implicit_strategies
 from .propagation_rules import (
     TENSOR_FACTORY_OPS,
     _op_partial_rules,
@@ -38,6 +47,22 @@ def propagate_tensor_meta(op, user_args, user_kwargs, out_strat):
         if isinstance(new_tensor_meta, TensorMeta):
             strat.output_spec.tensor_meta = new_tensor_meta
         else:
+            # This is basically trying to workaround this behavior of DTensor
+            # https://github.com/pytorch/pytorch/pull/159205#issuecomment-3121562920
+            # would be good to have changed in main
+            new_output_specs = []
+            mesh = strat.mesh
+            for ospec, tm in zip(strat.output_specs, new_tensor_meta):
+                # replace None with Replicate() in the output_spec
+                # as this is done by default but somewhere further
+                # down the line in DTensor
+                if ospec is None and isinstance(tm, TensorMeta):
+                    ospec = DTensorSpec(
+                        mesh=mesh, placements=(Replicate(),) * mesh.ndim
+                    )
+                new_output_specs.append(ospec)
+            strat.output_specs = tuple(new_output_specs)
+
             for ospec, tm in zip(strat.output_specs, new_tensor_meta):
                 if ospec is not None:
                     if ospec.tensor_meta != tm:
@@ -49,9 +74,6 @@ def propagate_tensor_meta(op, user_args, user_kwargs, out_strat):
                         else:
                             assert tm is None
         if strat.input_specs is None:
-            if op in TENSOR_FACTORY_OPS:
-                # there isn't an input spec bc the op has no input!
-                continue
 
             supported_ops = {
                 torch.ops.prims.convert_element_type.default,
@@ -64,9 +86,18 @@ def propagate_tensor_meta(op, user_args, user_kwargs, out_strat):
             )
             strat.input_specs = (strat.output_specs,)
             assert strat.redistribute_cost is None
-        assert len(tensor_metas) == len(
-            strat.input_specs
-        ), f"{op}, {len(tensor_metas)}, {len(strat.input_specs)}"
+        # NOTE: this invariant wrt factory ops is something I believe
+        # I'll keep for the solver, so we need to have some consistency here
+        # i.e., even though factory ops don't have inputs, we do put an
+        # input spec for it which is equal to the output spec
+        if op in TENSOR_FACTORY_OPS:
+            assert len(tensor_metas) == 0, f"{op}, {len(tensor_metas)}"
+            assert len(strat.input_specs) == 1, f"{op}, {len(strat.input_specs)}"
+        else:
+            assert len(tensor_metas) == len(
+                strat.input_specs
+            ), f"{op}, {len(tensor_metas)}, {len(strat.input_specs)}"
+
         for tm, ispec in zip(tensor_metas, strat.input_specs):
             if ispec.tensor_meta is None:
                 ispec.tensor_meta = tm
@@ -92,15 +123,36 @@ def fill_missing_redistribute_cost(op, specs, out_strat):
             strat.redistribute_cost = redistribute_costs
 
 
+def keep_unique_configs(op_strat: OpStrategy) -> OpStrategy:
+    added = set()
+    filtered_strats = []
+    for strat in op_strat.strategies:
+        input_specs = strat.input_specs
+        output_specs = strat.output_specs
+        if isinstance(input_specs, list):
+            input_specs = tuple(input_specs)
+        if isinstance(output_specs, list):
+            output_specs = tuple(output_specs)
+        key = (input_specs, output_specs)
+        if key in added:
+            continue
+
+        added.add(key)
+        filtered_strats.append(strat)
+    return OpStrategy(filtered_strats)
+
+
 def get_placement_options(mesh, op, specs, user_args, user_kwargs):
-    # print(op)
+    assert len(specs) == len(user_args)
 
     if op in _op_rules:
         out_strat = _op_rules[op](mesh, specs)
         out_strat = remove_invalid_configs(out_strat, mesh)
+        out_strat = keep_unique_configs(out_strat)
         return out_strat
 
     strat = []
+    needs_pytree = False
     for spec in specs:
         if isinstance(spec, OpStrategy):
             strat.append(spec)
@@ -110,26 +162,133 @@ def get_placement_options(mesh, op, specs, user_args, user_kwargs):
             and any(isinstance(x, OpStrategy) for x in spec)
         ):
             strat.append(TupleStrategy(spec))
+            needs_pytree = True
         else:
             strat.append(spec)
     strat = tuple(strat)
 
-    op_schema = OpSchema(op, strat, {})
+    op_schema = OpSchema(op, strat, {}, RuntimeSchemaInfo(needs_pytree=needs_pytree))
 
     if op in _op_partial_rules:
         out_strat = _op_partial_rules[op](mesh, op_schema)
     else:
-        out_strat = torch.distributed.tensor.DTensor._op_dispatcher.sharding_propagator.op_strategy_funcs[
-            op
-        ](
-            op_schema
-        )
+        with with_implicit_strategies():
+            out_strat = get_op_strategy(op, op_schema)
 
     propagate_tensor_meta(op, user_args, user_kwargs, out_strat)
     fill_missing_redistribute_cost(op, specs, out_strat)
     out_strat = remove_invalid_configs(out_strat, mesh)
+    out_strat = keep_unique_configs(out_strat)
 
     return out_strat
+
+
+def get_local_map_placement_option(
+    mesh,
+    specs,
+    user_args,
+    output_val,
+    in_placements,
+    out_placements,
+):
+    in_specs = []
+    num_activation_inputs = len(user_args) - len(in_placements)
+    # activations are always replicated
+    replicated = tuple(Replicate() for _ in range(mesh.ndim))
+    for activation in user_args[:num_activation_inputs]:
+        # we have activation inputs for the bwd hop
+        in_specs.append(
+            DTensorSpec(
+                mesh=mesh,
+                placements=replicated,
+                tensor_meta=TensorMeta(
+                    shape=activation.shape,
+                    stride=activation.stride(),
+                    dtype=activation.dtype,
+                ),
+            )
+        )
+
+    for example, placement in zip(user_args[num_activation_inputs:], in_placements):
+        if placement is None:
+            # not a dtensor
+            in_specs.append(None)
+            continue
+
+        in_specs.append(
+            DTensorSpec(
+                mesh=mesh,
+                placements=placement,
+                tensor_meta=TensorMeta(
+                    shape=example.shape,
+                    stride=example.stride(),
+                    dtype=example.dtype,
+                ),
+            )
+        )
+
+    out_specs = []
+    assert isinstance(output_val, (torch.Tensor, list, tuple))
+    outs = output_val if isinstance(output_val, (list, tuple)) else [output_val]
+    for example, placement in zip(outs, out_placements):
+        if example is None:
+            # Due to how HOP backward is partitioned, it can return None
+            out_specs.append(None)
+            continue
+
+        if placement is None:
+            # not a dtensor
+            out_specs.append(None)
+            continue
+
+        elif isinstance(placement, Placement):
+            placement = [placement]
+
+        assert isinstance(placement, (list, tuple)), "Not implemented"
+        out_specs.append(
+            DTensorSpec(
+                mesh=mesh,
+                placements=placement,
+                tensor_meta=TensorMeta(
+                    shape=example.shape,
+                    stride=example.stride(),
+                    dtype=example.dtype,
+                ),
+            )
+        )
+
+    for example in outs[len(out_placements) :]:
+        if example is None:
+            # Due to how HOP backward is partitioned, it can return None
+            out_specs.append(None)
+            continue
+        # we have activation outputs for the fwd hop
+        out_specs.append(
+            DTensorSpec(
+                mesh=mesh,
+                placements=replicated,
+                tensor_meta=TensorMeta(
+                    shape=example.shape,
+                    stride=example.stride(),
+                    dtype=example.dtype,
+                ),
+            )
+        )
+
+    redistribute_costs = []
+    for user_strategy, input_spec in zip(specs, in_specs):
+        costs = generate_redistribute_costs(user_strategy, input_spec)
+        redistribute_costs.append(costs)
+
+    return OpStrategy(
+        [
+            OpSpec(
+                output_specs=tuple(out_specs),
+                input_specs=tuple(in_specs),
+                redistribute_cost=redistribute_costs,
+            )
+        ]
+    )
 
 
 def _get_device_from_mesh(mesh):
