@@ -39,7 +39,7 @@ def test_debug_mode_bitwise_equivalent(llama3_debug_model):
     print(debug_mode.debug_string())
     assert torch.equal(r1, r2)  # bitwise equal
 
-@pytest.mark.xfail('aot_eager bitwise equivalence WIP')
+@pytest.mark.xfail
 def test_aot_eager_bitwise_equivalent(llama3_debug_model):
     batch_size = 8
     seqlen = 2048
