@@ -655,7 +655,7 @@ class ShardingOptimizer:
         self.res = [k for k, v in sol.items() if v == 1]
 
         if self.prob.status == -1:
-            print(self.get_log())
+            print(self.get_violated_constraints_log())
             raise RuntimeError("Unsolvable problem")
 
         opt = {}
