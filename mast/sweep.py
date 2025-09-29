@@ -123,6 +123,12 @@ llama3_2d = {
         "--model.name=llama3",
         "--compile.enable",
     ],
+    "llama3_FSDP_tp_async_tp_compile": llama3_2d_common_opts
+    + [
+        "--model.name=llama3",
+        "--compile.enable",
+        "--parallelism.enable_async_tensor_parallel",
+    ],
     "llama3_autop_2d_compile": llama3_2d_common_opts
     + [
         "--model.name=llama3_auto_parallel",

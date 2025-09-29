@@ -160,6 +160,7 @@ class AutoParallel:
         enable_ac: bool = True,
         # None means 'auto'
         ac_stage_size_in_GiB: Optional[Union[float, str]] = "auto",
+        enable_asynctp: bool = False,
         **kwargs,
     ):
         self.stack = ExitStack()
@@ -190,6 +191,8 @@ class AutoParallel:
         self.enable_ac = enable_ac
         self.ac_stage_size_in_GiB = ac_stage_size_in_GiB
 
+        self.enable_asynctp = enable_asynctp
+
         # NB: rest of the construction happens in __enter__
         self.active = False
 
@@ -216,6 +219,7 @@ class AutoParallel:
             self.mesh,
             rescale_grad_comm_cost_for_mp,
             repeated_subgraphs=self.kwargs.get("repeated_subgraphs", False),
+            enable_asynctp=self.enable_asynctp,
         )
 
         # makes sharding of params and gradients the same
