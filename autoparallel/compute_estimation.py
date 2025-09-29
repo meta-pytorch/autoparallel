@@ -281,6 +281,21 @@ def _compute_flops(fn, *args, **kwargs):
     return flop_counter.get_total_flops(), out
 
 
+def compute_read_write_time(read_write_bytes):
+    gpu_memory_bandwidth = _get_device_gmem_bandwidth()
+    read_write_time = read_write_bytes / gpu_memory_bandwidth * 1e6  # us
+
+    # suppose 70% efficiency for the operator
+    read_write_efficiency = 0.70
+
+    kernel_launch_overhead = 7  # us
+
+    read_write_time = max(
+        read_write_time / read_write_efficiency, kernel_launch_overhead
+    )
+    return read_write_time
+
+
 def estimate_strategy_runtime_cost(node, strategy):
     """
     This function estimates the runtime cost of a given strategy
@@ -297,17 +312,7 @@ def estimate_strategy_runtime_cost(node, strategy):
     flops, out = _compute_flops(node.target, *args, **kwargs)
 
     read_write_bytes = compute_memory_cost(node.target, args, out)
-    gpu_memory_bandwidth = _get_device_gmem_bandwidth()
-    read_write_time = read_write_bytes / gpu_memory_bandwidth * 1e6  # us
-
-    # suppose 70% efficiency for the operator
-    read_write_efficiency = 0.70
-
-    kernel_launch_overhead = 7  # us
-
-    read_write_time = max(
-        read_write_time / read_write_efficiency, kernel_launch_overhead
-    )
+    read_write_time = compute_read_write_time(read_write_bytes)
 
     if flops == 0:
         return read_write_time
@@ -320,7 +325,7 @@ def estimate_strategy_runtime_cost(node, strategy):
     # suppose 70% efficiency for the operator
     compute_efficiency = 0.70
     compute_time = flops / gpu_flops * 1e6  # us
-    compute_time = max(compute_time / compute_efficiency, kernel_launch_overhead)
+    compute_time = compute_time / compute_efficiency
 
     return max(compute_time, read_write_time)
 

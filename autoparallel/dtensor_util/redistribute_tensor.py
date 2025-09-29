@@ -378,11 +378,13 @@ class DTensorRedistributePlanner:
             for mdim in mesh_dims:
                 if mdim == mesh_dim:
                     continue
-                new_size = Shard._local_shard_size_and_offset(
+                new_size = Shard.local_shard_size_and_offset(  # type: ignore[attr-defined]
                     new_logical_shape[tensor_dim],
                     self.device_mesh.size(mesh_dim=mdim),
                     self.coordinate[mdim],
-                )[0]
+                )[
+                    0
+                ]
                 new_logical_shape[tensor_dim] = new_size
         return new_logical_shape
 
