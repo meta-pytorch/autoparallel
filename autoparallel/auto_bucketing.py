@@ -4,6 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import torch
+from torch._inductor.fx_passes.overlap_scheduling import OverlapScheduler
 
 from .autobucketing_util import bucket_func, bucket_plan, bucket_utils, reorder
 
@@ -87,3 +88,27 @@ def simple_fsdp_autobucketing_reordering_pass(
         ), f"Missed nodes in reordering reduce scatter: expected {node_length}, but got {len(snodes)}"
 
     return snodes
+
+
+class aten_autobucketing_config:
+    """
+    Config for aten level autobucketing pass from stacked PR: https://github.com/pytorch/pytorch/pull/163960
+    - max_in_flight_gb: maximum GB of concurrent collective data
+    - compute_overlap_multipler: scale factor for compute time used to hide collectives
+    - max_coll_distance: maximum node distance for overlap consideration
+    """
+
+    max_in_flight_gb = 2.0
+    compute_overlap_multipler = 1.0
+    max_coll_distance = 100
+
+
+def aten_autobucketing_reordering_pass(
+    gm: torch.fx.Graph, configs: "aten_autobucketing_config"
+) -> torch.fx.GraphModule:
+    return OverlapScheduler(
+        gm.owning_module,
+        compute_overlap_multipler=configs.compute_overlap_multipler,
+        max_in_flight_gb=configs.max_in_flight_gb,
+        max_coll_distance=configs.max_coll_distance,
+    ).run()
