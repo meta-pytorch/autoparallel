@@ -174,7 +174,13 @@ def add_tp_constraints(autop):
 
 # parallelize the model
 with AutoParallel(
-    model, input_fn, mesh, mp_policy, compile=True, repeated_subgraphs=True
+    model,
+    input_fn,
+    mesh,
+    mp_policy,
+    compile=True,
+    repeated_subgraphs=True,
+    enable_asynctp=enable_asynctp,
 ) as autop:
     autop.add_parameter_memory_constraint(low=None, high=None)
 
