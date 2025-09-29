@@ -62,31 +62,46 @@ class MOEBatched(nn.Module):
     def __init__(self, in_channels, inter_channels, num_experts):
         super().__init__()
         self.num_experts = num_experts
+        # TODO: need to fix case with bias, as the parameter memory constraint is not satisfied
+        # because too many GPUs for the number of experts
+        self.router = nn.Linear(in_channels, num_experts, bias=False)
         self.experts = BatchFFN(in_channels, inter_channels, num_experts)
+        self.top_k = 4
 
     def init_weights(self):
         pass
 
     def forward(self, x):
         assert x.ndim == 3
-        shape = x.shape
-        x = x.flatten(0, 1)
-        assert x.shape[0] % self.num_experts == 0
-        # force balanced indices
-        indices = (
-            torch.randperm(x.shape[0], dtype=torch.int64, device=x.device)
-            % self.num_experts
-        )
-        # put all tokens corresponding to the same expert together
-        idxs = indices.argsort()
-        xs = x[idxs].unflatten(0, (self.num_experts, -1))
-        # now experts can be computed as bmm
+
+        # route tokens to experts
+        scores = self.router(x)
+
+        # select topk experts following some criteria
+        dim = -1
+        scores = F.softmax(scores, dim=dim)
+        # TODO: this is wrong, we need to do a sinkhorn here to ensure that the tokens are evenly distributed
+        top_scores, selected_experts_indices = torch.topk(scores, k=self.top_k, dim=dim)
+        idxs = selected_experts_indices.flatten(-2, -1).argsort(dim=-1, stable=True)
+        top_scores = top_scores.flatten(-2, -1).gather(-1, idxs)
+        idxs = idxs // self.top_k
+
+        # route tokens for each expert
+        xs = x.gather(-2, idxs[:, :, None].expand(-1, -1, x.shape[-1]))
+        xs = xs.unflatten(1, (self.num_experts, -1))
+        tokens_per_expert = xs.shape[2]
+        xs = xs.permute(1, 0, 2, 3).flatten(1, 2)
         out = self.experts(xs)
-        # put tokens back into its original order
-        out = out.flatten(0, 1)
-        new_idxs = idxs.argsort()
-        out = out[new_idxs]
-        return out.reshape(shape)
+
+        out = out.unflatten(1, (-1, tokens_per_expert))
+        out = out.permute(1, 0, 2, 3).flatten(1, 2)
+
+        out = out * top_scores[:, :, None]
+
+        # TODO: add shared expert
+        res = torch.zeros_like(x)
+        res = res.scatter_add(-2, idxs[:, :, None].expand(-1, -1, x.shape[-1]), out)
+        return res
 
 
 class MOEBatchedDebug(nn.Module):
@@ -165,8 +180,8 @@ def input_fn():
 
 
 def model_fn():
-    # return MOEBatched(in_channels, inter_channels, num_experts)
-    return MOEBatchedDebug(in_channels, inter_channels, num_experts)
+    return MOEBatched(in_channels, inter_channels, num_experts)
+    # return MOEBatchedDebug(in_channels, inter_channels, num_experts)
 
 
 with torch.device("meta"):
@@ -187,3 +202,19 @@ with AutoParallel(model, input_fn, mesh) as autop:
     t = time.time()
     sharding_placement = autop.optimize_placement()
     print(f"Took {time.time() - t:.2f} s")
+    parallel_mod = autop.apply_placement(sharding_placement)
+
+# run weight init on our sharded DTensor params
+parallel_mod.to_empty(device="cuda")
+parallel_mod.init_weights()
+
+# now let's run it
+x = (
+    torch.randn(
+        (bs // mesh.shape[0] // mesh.shape[1], seqlen, in_channels),
+        device=torch.device("cuda"),
+    ),
+)
+out = parallel_mod(*x)
+out.backward(torch.randn_like(out))
+print("All good!")
