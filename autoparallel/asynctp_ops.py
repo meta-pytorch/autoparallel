@@ -16,8 +16,8 @@ import torch
 import torch.distributed._functional_collectives as funcol
 import torch.distributed.distributed_c10d as c10d
 from torch._C._autograd import DeviceType
-from torch.distributed._distributed_c10d import Work as _Work
-from torch.distributed._distributed_c10d import _register_work, _SymmetricMemory
+from torch._C._distributed_c10d import Work as _Work
+from torch._C._distributed_c10d import _register_work, _SymmetricMemory
 from torch.distributed._symmetric_memory import get_symm_mem_workspace, rendezvous
 
 _is_test_mode: bool = False
