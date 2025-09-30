@@ -92,7 +92,9 @@ def move_to_fake(model: torch.nn.Module, mode: FakeTensorMode, device: torch.dev
 
         fake_tensor = mode.from_tensor(getattr(submod, k)).to(device)
         if parameter:
-            fake_tensor = torch.nn.Parameter(fake_tensor)
+            fake_tensor = torch.nn.Parameter(
+                fake_tensor, requires_grad=fake_tensor.requires_grad
+            )
 
         setattr(submod, k, fake_tensor)
 
