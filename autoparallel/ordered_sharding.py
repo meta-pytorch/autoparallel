@@ -168,6 +168,9 @@ def compute_optimal_placement_order_for_parameters(module, sharding_placement):
         # order from source to dest
         param_grad_chain[param] = p_chain
 
+        # TODO: optimize case where parameter doesn't require gradient
+        if grad is None:
+            continue
         last_g = grad
         g_chain = []
         # get all linear chain of inputs that lead to the gradient
