@@ -123,9 +123,9 @@ def test_compute_optimal_placement_order_with_non_trainable_params(device_mesh_2
             autop.gm, sharding_placement
         )
 
-        # The function should return successfully (not None or empty is fine)
-        assert placement_order is not None
+        # The function should return successfully
         assert isinstance(placement_order, dict)
+        assert len(placement_order) == 0
 
         # Verify we can examine the graph structure to understand param/grad relationships
         from torch._functorch._aot_autograd.fx_utils import get_param_and_grad_nodes
@@ -184,5 +184,5 @@ def test_compute_optimal_placement_order_with_all_non_trainable_params(device_me
         )
 
         # Should return successfully with empty or minimal result
-        assert placement_order is not None
         assert isinstance(placement_order, dict)
+        assert len(placement_order) == 0
