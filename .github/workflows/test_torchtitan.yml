@@ -30,8 +30,11 @@ jobs:
       gpu-arch-type: ${{ matrix.gpu-arch-type }}
       gpu-arch-version: ${{ matrix.gpu-arch-version }}
       submodules: recursive
-      python-version: "3.12"
       script: |
+        conda create --yes --quiet --name py312 python=3.12
+        source $(conda info --base)/etc/profile.d/conda.sh
+        conda activate py312
+
         pip install --quiet -r requirements-test.txt
         # For some reason the spec above isnt working
         pip uninstall -y torch
