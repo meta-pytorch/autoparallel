@@ -13,7 +13,7 @@ concurrency:
 
 jobs:
   test-torchtitan:
-    name: Test TorchTitan Integration (cuda12.6-py3.10)
+    name: Test TorchTitan Integration (cuda12.6-py3.12)
     uses: pytorch/test-infra/.github/workflows/linux_job_v2.yml@main
     strategy:
       fail-fast: true
@@ -30,6 +30,7 @@ jobs:
       gpu-arch-type: ${{ matrix.gpu-arch-type }}
       gpu-arch-version: ${{ matrix.gpu-arch-version }}
       submodules: recursive
+      python-version: "3.12"
       script: |
         pip install --quiet -r requirements-test.txt
         # For some reason the spec above isnt working
