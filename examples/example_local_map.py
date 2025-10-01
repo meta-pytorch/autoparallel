@@ -61,20 +61,14 @@ def replicate_linear(w, x):
 
 
 @local_map(
-    out_placements=(
-        (Shard(0), Shard(0), Replicate()),
-        None,
-    ),
-    in_placements=(
-        (Shard(0), Shard(0), Replicate()),
-        None,
-    ),
+    out_placements=((Shard(0), Shard(0), Replicate()),),
+    in_placements=((Shard(0), Shard(0), Replicate()),),
     redistribute_inputs=True,
     in_grad_placements=None,
     device_mesh=mesh,
 )
-def sharded_pointwise(x, scalar):
-    return x + scalar, scalar
+def sharded_pointwise(x):
+    return x + 10
 
 
 @local_map(
@@ -114,7 +108,7 @@ class Block(nn.Module):
                 torch.nn.init.normal_(lin.bias)
 
     def _compute_attention(self, x):
-        boosted_weight, scalar = sharded_pointwise(self.wq.weight, 10)
+        boosted_weight = sharded_pointwise(self.wq.weight)
         q = replicate_linear(boosted_weight, x)
         k = self.wk(x)
         v = self.wv(x)
