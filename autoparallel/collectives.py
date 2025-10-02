@@ -6,6 +6,45 @@
 
 import torch
 import torch.distributed.distributed_c10d as c10d
+from torch.distributed._tensor.experimental import local_map as _local_map
+
+_local_map_device_mesh = None
+
+
+def local_map(*args, **kwargs):
+    # TODO: ideally after we get out of the local map region we should
+    # just reset the global device mesh to None. For now we just keep it
+    # around.
+    global _local_map_device_mesh
+    _local_map_device_mesh = kwargs.get("device_mesh", None)
+    return _local_map(*args, **kwargs)
+
+
+def get_mesh_from_global():
+    global _local_map_device_mesh
+    if _local_map_device_mesh is None:
+        raise RuntimeError(
+            "No mesh found, make sure to call this collective in a local_map region"
+        )
+    return _local_map_device_mesh
+
+
+def _get_group_name_from_axis_name(mesh_name):
+    mesh = get_mesh_from_global()
+    group = mesh.get_group(mesh_name)
+    return group.group_name
+
+
+def axis_size(axis_name):
+    mesh = get_mesh_from_global()
+    assert axis_name in mesh.mesh_dim_names
+    axis_dim = mesh.mesh_dim_names.index(axis_name)
+    return mesh.size(axis_dim)
+
+
+def axis_index(axis_name):
+    mesh = get_mesh_from_global()
+    return mesh.get_local_rank(mesh_dim=axis_name)
 
 
 def _all_gather_tensor(
@@ -56,7 +95,8 @@ def _all_reduce(self: torch.Tensor, reduceOp: str, group_name: str):
 
 class _AllGather(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x: torch.Tensor, gather_dim: int, group_name: str):
+    def forward(ctx, x: torch.Tensor, gather_dim: int, axis_name: str):
+        group_name = _get_group_name_from_axis_name(axis_name)
         ctx.group_name = group_name
         ctx.gather_dim = gather_dim
         return _all_gather_tensor(x, gather_dim, group_name)
@@ -72,7 +112,8 @@ class _AllGather(torch.autograd.Function):
 
 class _ReduceScatter(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x: torch.Tensor, scatter_dim: int, group_name: str):
+    def forward(ctx, x: torch.Tensor, scatter_dim: int, axis_name: str):
+        group_name = _get_group_name_from_axis_name(axis_name)
         ctx.group_name = group_name
         ctx.scatter_dim = scatter_dim
         return _reduce_scatter_tensor(x, "sum", scatter_dim, group_name)
@@ -88,7 +129,8 @@ class _ReduceScatter(torch.autograd.Function):
 
 class _AllReduce(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x: torch.Tensor, group_name: str):
+    def forward(ctx, x: torch.Tensor, axis_name: str):
+        group_name = _get_group_name_from_axis_name(axis_name)
         ctx.group_name = group_name
         return _all_reduce(x, "sum", group_name)
 
