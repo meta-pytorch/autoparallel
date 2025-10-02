@@ -615,6 +615,7 @@ def _fused_all_gather_matmul_last_gather_dim_impl(
 ) -> tuple[torch.Tensor | None, list[torch.Tensor]]:
     assert gather_dim == A_shard.ndim - 1
     group = c10d._resolve_process_group(group_name)
+    group_size = group.size()
 
     B_shards = [B.chunk(group.size()) for B in Bs]
 
@@ -625,7 +626,6 @@ def _fused_all_gather_matmul_last_gather_dim_impl(
         return t.view(*leading_dims, -1)
 
     A_out_leading_dims = list(A_shard.shape[:-1])
-    A_out_leading_dims[0] *= group.size()
 
     def unflatten_A_out(t: torch.Tensor) -> torch.Tensor:
         return t.view(*A_out_leading_dims, -1)
@@ -667,9 +667,14 @@ def _fused_all_gather_matmul_last_gather_dim_impl(
         group_name,
         return_A,
     )
+    ret_A = None
+    if return_A:
+        # This path is inefficient and will be filtered out at passes stage
+        # Added only for completness.
+        A_split_cat_out_flat = torch.cat(A_flat_out.chunk(group_size), dim=-1)
+        ret_A = unflatten_A_out(A_split_cat_out_flat)
 
-    A = unflatten_A_out(A_flat_out) if return_A else None
-    return A, [unflatten(output) for output in outputs]
+    return ret_A, [unflatten(output) for output in outputs]
 
 
 @torch.library.impl(lib, "fused_all_gather_matmul", "Meta")
@@ -691,7 +696,7 @@ def _fused_all_gather_matmul_fallback(
         A_mm = torch.cat(A_splits, dim=-1)
         res = [torch.matmul(A_mm, B) for B in Bs]
         if return_A:
-            return A, res
+            return A_mm, res
         else:
             return None, res
 
