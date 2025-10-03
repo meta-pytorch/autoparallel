@@ -288,8 +288,6 @@ class AutoParallel:
                 ep.module(),
                 inputs,
                 decompositions=decomp_table,
-                fw_compiler=self.compiler_fn,
-                bw_compiler=self.compiler_fn,
             )
         gm = self.joint_with_descriptors.graph_module
         assert_has_no_collectives(gm)
@@ -454,7 +452,9 @@ class AutoParallel:
             )
 
         self.parallel_model_fn = parallel_model_fn = aot_compile_joint_with_descriptors(
-            self.joint_with_descriptors
+            self.joint_with_descriptors,
+            fw_compiler=self.compiler_fn,
+            bw_compiler=self.compiler_fn,
         )
 
         # TODO: this probably belongs in the AOTAutograd API
