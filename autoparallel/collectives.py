@@ -3,6 +3,7 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+from typing import Any
 
 import torch
 import torch.distributed.distributed_c10d as c10d
@@ -95,14 +96,14 @@ def _all_reduce(self: torch.Tensor, reduceOp: str, group_name: str):
 
 class _AllGather(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x: torch.Tensor, gather_dim: int, axis_name: str):
+    def forward(ctx: Any, x: torch.Tensor, gather_dim: int, axis_name: str):
         group_name = _get_group_name_from_axis_name(axis_name)
         ctx.group_name = group_name
         ctx.gather_dim = gather_dim
         return _all_gather_tensor(x, gather_dim, group_name)
 
     @staticmethod
-    def backward(ctx, grad_output: torch.Tensor):
+    def backward(ctx: Any, grad_output: torch.Tensor):  # type: ignore[override]
         return (
             _reduce_scatter_tensor(grad_output, "sum", ctx.gather_dim, ctx.group_name),
             None,
@@ -112,14 +113,14 @@ class _AllGather(torch.autograd.Function):
 
 class _ReduceScatter(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x: torch.Tensor, scatter_dim: int, axis_name: str):
+    def forward(ctx: Any, x: torch.Tensor, scatter_dim: int, axis_name: str):
         group_name = _get_group_name_from_axis_name(axis_name)
         ctx.group_name = group_name
         ctx.scatter_dim = scatter_dim
         return _reduce_scatter_tensor(x, "sum", scatter_dim, group_name)
 
     @staticmethod
-    def backward(ctx, grad_output: torch.Tensor):
+    def backward(ctx: Any, grad_output: torch.Tensor):  # type: ignore[override]
         return (
             _all_gather_tensor(grad_output, ctx.scatter_dim, ctx.group_name),
             None,
@@ -129,13 +130,13 @@ class _ReduceScatter(torch.autograd.Function):
 
 class _AllReduce(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x: torch.Tensor, axis_name: str):
+    def forward(ctx: Any, x: torch.Tensor, axis_name: str):
         group_name = _get_group_name_from_axis_name(axis_name)
         ctx.group_name = group_name
         return _all_reduce(x, "sum", group_name)
 
     @staticmethod
-    def backward(ctx, grad_output: torch.Tensor):
+    def backward(ctx: Any, grad_output: torch.Tensor):  # type: ignore[override]
         # TODO: split this into a function that does all-reduce and one which is the identity
         return _all_reduce(grad_output, "sum", ctx.group_name), None
 
