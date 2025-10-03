@@ -177,9 +177,6 @@ class ShardingOptimizer:
                     assert (
                         local_map_kwargs.get("in_grad_placements", None) is None
                     ), "Not yet implemented"
-                    assert (
-                        local_map_kwargs.get("device_mesh", None) is None
-                    ), "Must be provided by Autoparallel"
                     assert not user_kwargs
                     # TODO: get rid of this when HOP can install as a subgraph
                     assert "call_local_map" in str(
