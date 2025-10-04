@@ -177,6 +177,10 @@ class ShardingOptimizer:
                     assert (
                         local_map_kwargs.get("in_grad_placements", None) is None
                     ), "Not yet implemented"
+                    assert local_map_kwargs.get("device_mesh", None) in (
+                        self.mesh,
+                        None,
+                    ), "Not yet implemented"
                     assert not user_kwargs
                     # TODO: get rid of this when HOP can install as a subgraph
                     assert "call_local_map" in str(
@@ -186,7 +190,7 @@ class ShardingOptimizer:
                         self.mesh,
                         user_strats,
                         user_args,
-                        node.meta["val"],
+                        node,
                         local_map_kwargs["in_placements"],
                         local_map_kwargs["out_placements"],
                     )
