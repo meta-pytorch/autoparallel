@@ -3,7 +3,7 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import Any
+from typing import Any, Optional
 
 import torch
 import torch.distributed.distributed_c10d as c10d
@@ -94,6 +94,28 @@ def _all_reduce(self: torch.Tensor, reduceOp: str, group_name: str):
     return res
 
 
+def _all_to_all(
+    self: torch.Tensor,
+    output_split_sizes: Optional[list[int]],
+    input_split_sizes: Optional[list[int]],
+    group_name: str,
+):
+    group_size = c10d._get_group_size_by_name(group_name)
+    if output_split_sizes is None or input_split_sizes is None:
+        assert output_split_sizes is None and input_split_sizes is None, (
+            "output_split_sizes and input_split_sizes must either be "
+            "specified together or both set to None"
+        )
+        output_split_sizes = [self.shape[0] // group_size] * group_size
+        input_split_sizes = output_split_sizes
+
+    tensor = torch.ops._c10d_functional.all_to_all_single(
+        self, output_split_sizes, input_split_sizes, group_name
+    )
+    res = torch.ops._c10d_functional.wait_tensor(tensor)
+    return res
+
+
 class _AllGather(torch.autograd.Function):
     @staticmethod
     def forward(ctx: Any, x: torch.Tensor, gather_dim: int, axis_name: str):
@@ -141,6 +163,29 @@ class _AllReduce(torch.autograd.Function):
         return _all_reduce(grad_output, "sum", ctx.group_name), None
 
 
+class _AllToAll(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx: Any,
+        x: torch.Tensor,
+        output_split_sizes: Optional[list[int]],
+        input_split_sizes: Optional[list[int]],
+        axis_name: str,
+    ):
+        group_name = _get_group_name_from_axis_name(axis_name)
+        ctx.group_name = group_name
+        ctx.output_split_sizes = output_split_sizes
+        ctx.input_split_sizes = input_split_sizes
+        return _all_to_all(x, output_split_sizes, input_split_sizes, group_name)
+
+    @staticmethod
+    def backward(ctx: Any, grad_output: torch.Tensor):  # type: ignore[override]
+        return _all_to_all(
+            grad_output, ctx.input_split_sizes, ctx.output_split_sizes, ctx.group_name
+        )
+
+
 all_gather = _AllGather.apply
 all_reduce = _AllReduce.apply
 reduce_scatter = _ReduceScatter.apply
+all_to_all = _AllToAll.apply
