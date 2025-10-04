@@ -26,6 +26,7 @@ from torch.distributed.tensor import DeviceMesh
 from torch.export._trace import _restore_state_dict
 from torch.export._unlift import _assign_attr
 from torch.export.unflatten import _AttrKind
+from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
 from .activation_checkpointing import ac_joint_pass
 from .apply_sharding import apply_sharding_to_model
@@ -200,9 +201,10 @@ class AutoParallel:
         **kwargs,
     ):
         self.stack = ExitStack()
-        self.fake_mode = (
-            FakeTensorMode()
+        self.fake_mode = FakeTensorMode(
+            shape_env=ShapeEnv()
         )  # TODO: maybe need to reuse the model's fake mode
+        # self.fake_mode.allow_scalar_outputs = True
         device = _get_device_from_mesh(mesh)
         if mp_policy is not None:
             mp_policy = canonicalize_mp(mp_policy)

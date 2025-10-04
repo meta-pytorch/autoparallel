@@ -187,7 +187,7 @@ def get_local_map_placement_option(
     mesh,
     specs,
     user_args,
-    output_val,
+    node,
     in_placements,
     out_placements,
 ):
@@ -209,6 +209,8 @@ def get_local_map_placement_option(
             )
         )
 
+    assert len(user_args) == (num_activation_inputs + len(in_placements))
+
     for example, placement in zip(user_args[num_activation_inputs:], in_placements):
         if placement is None:
             # not a dtensor
@@ -228,6 +230,17 @@ def get_local_map_placement_option(
         )
 
     out_specs = []
+    if node.meta.get("partitioner_tag", None) == "is_backward":
+        # has correct meta val
+        output_val = node.meta["val"]
+    else:
+        # TODO: why is node.meta["val"] in global shapes for fwd?
+        num_activation_outputs = len(node.users) - len(out_placements)
+        output_val = [*node.meta["val"]]
+        dummy_activations = [
+            output_val[0]
+        ] * num_activation_outputs  # metadata doesn't matter
+        output_val += dummy_activations
     assert isinstance(output_val, (torch.Tensor, list, tuple))
     outs = output_val if isinstance(output_val, (list, tuple)) else [output_val]
     for example, placement in zip(outs, out_placements):
