@@ -12,9 +12,7 @@ import torch.nn.functional as F
 from torch import nn
 
 # from torchtitan.distributed.expert_parallel import expert_parallel
-from torch.distributed.tensor import (
-    DTensor,
-)
+from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import Replicate, Shard
 from torch.testing._internal.distributed.fake_pg import FakeStore
 
@@ -517,7 +515,7 @@ class TokenChoiceTopKRouter(nn.Module):
         x: torch.Tensor,
         gate_weight: torch.nn.Parameter,
         expert_bias: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             x (torch.Tensor): Input tensor with shape ``(bs*slen, dim)``.
@@ -563,22 +561,7 @@ class TokenChoiceTopKRouter(nn.Module):
             top_scores = top_scores / denominator
         top_scores = top_scores * self.route_scale
 
-        # group tokens together by expert indices from 0 to num_experts and pass that to experts forward
-        # num_tokens_per_expert = torch.histc(
-        #     selected_experts_indices.view(-1),
-        #     bins=self.num_experts,
-        #     min=0,
-        #     max=self.num_experts,
-        # )
-
-        num_tokens_per_expert = torch.ops.autoparallel.batched_histc(
-            selected_experts_indices.flatten(1),
-            bins=self.num_experts,
-            min=0,
-            max=self.num_experts,
-        )
-
-        return top_scores, selected_experts_indices, num_tokens_per_expert
+        return top_scores, selected_experts_indices
 
     def init_weights(self, init_std: float):
         nn.init.trunc_normal_(self.gate.weight, mean=0.0, std=init_std)
@@ -648,7 +631,7 @@ class TokenReorderer(nn.Module):
         )
 
 
-from autoparallel.collectives import all_to_all, axis_size, local_map
+from autoparallel.collectives import all_reduce, all_to_all, axis_size, local_map
 
 
 def _token_dispatch(routed_input, num_tokens_per_expert, axis_name):
@@ -663,11 +646,6 @@ def _token_dispatch(routed_input, num_tokens_per_expert, axis_name):
             None,
             None,
             axis_name,
-        )
-        # Need to wait explicitly because it is used by a triton kernel later
-        # which doesn't realize that AsyncCollectiveTensor needs unwrapping
-        num_tokens_per_expert_group = torch.ops._c10d_functional.wait_tensor(
-            num_tokens_per_expert_group
         )
         input_splits = (
             num_tokens_per_expert.view(ep_size, -1)
@@ -714,6 +692,183 @@ def _token_combine(routed_output, input_splits, output_splits, axis_name):
     return routed_output
 
 
+@torch.library.custom_op("autoparallel::local_mapped_region", mutates_args=())
+def local_mapped_region(
+    x: torch.Tensor,
+    selected_experts_indices: torch.Tensor,
+    top_scores: torch.Tensor,
+    out: torch.Tensor,
+    experts_w1: torch.Tensor,
+    experts_w2: torch.Tensor,
+    experts_w3: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    axis_name = "ep"
+
+    top_k = 6
+    num_experts = 64
+
+    dim = x.shape[-1]
+
+    # num_tokens_per_expert = torch.ops.autoparallel.batched_histc(
+    num_tokens_per_expert = torch.histc(
+        selected_experts_indices.flatten(),
+        bins=num_experts,
+        min=0,
+        max=num_experts,
+    )
+
+    total_tokens_per_expert = all_reduce(num_tokens_per_expert, axis_name)
+
+    token_indices_experts_sorted = torch.argsort(
+        selected_experts_indices.flatten(1), dim=-1, stable=True
+    )
+
+    # top_scores_experts_sorted = top_scores.view(-1)[token_indices_experts_sorted]
+    top_scores_experts_sorted = top_scores.view_as(token_indices_experts_sorted).gather(
+        1, token_indices_experts_sorted
+    )
+    token_indices_experts_sorted = token_indices_experts_sorted // top_k
+
+    # shape (bs*slen*top_k, dim)
+    token_indices_experts_sorted = token_indices_experts_sorted[..., None].expand(
+        -1, -1, dim
+    )
+
+    # shape (bs*slen*top_k, dim)
+    routed_input = torch.gather(
+        x.view(token_indices_experts_sorted.shape[0], -1, dim),
+        dim=1,
+        index=token_indices_experts_sorted,
+    )
+    routed_input = (
+        routed_input.to(torch.float32) * top_scores_experts_sorted[..., None]
+    ).to(x.dtype)
+
+    assert (
+        num_tokens_per_expert.shape[0] == 1
+    ), f"{num_tokens_per_expert.shape}, {routed_input.shape}"
+    shape = routed_input.shape
+    dim = shape[-1]
+    routed_input = routed_input.view(-1, dim)
+    num_tokens_per_expert = num_tokens_per_expert.view(-1)
+    (
+        routed_input,
+        num_tokens_per_expert_group,
+        input_splits,
+        output_splits,
+    ) = _token_dispatch(routed_input, num_tokens_per_expert, axis_name)
+
+    routed_output = _run_experts_grouped_mm(
+        # experts_w1, experts_w2, experts_w3, routed_input, num_tokens_per_expert
+        experts_w1,
+        experts_w2,
+        experts_w3,
+        routed_input,
+        num_tokens_per_expert_group,
+    )
+
+    routed_output = _token_combine(
+        routed_output, input_splits, output_splits, axis_name
+    )
+
+    routed_output = routed_output.view(shape)
+
+    out = out.scatter_add(dim=1, index=token_indices_experts_sorted, src=routed_output)
+    return out, total_tokens_per_expert[None, :]
+
+
+@torch.library.custom_op("autoparallel::local_mapped_region_grad", mutates_args=())
+def local_mapped_region_grad(
+    routed_input: torch.Tensor,
+    selected_experts_indices: torch.Tensor,
+    top_scores: torch.Tensor,
+    out: torch.Tensor,
+    experts_w1: torch.Tensor,
+    experts_w2: torch.Tensor,
+    experts_w3: torch.Tensor,
+) -> tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+]:
+    grad_i = torch.empty_like(routed_input)
+    grad_o = torch.empty_like(out)
+    grad_s = torch.empty_like(top_scores)
+    g1 = torch.empty_like(experts_w1)
+    g2 = torch.empty_like(experts_w2)
+    g3 = torch.empty_like(experts_w3)
+    return grad_i, grad_s, grad_o, g1, g2, g3
+
+
+@local_mapped_region_grad.register_fake
+def _(
+    routed_input: torch.Tensor,
+    selected_experts_indices: torch.Tensor,
+    top_scores: torch.Tensor,
+    out: torch.Tensor,
+    experts_w1: torch.Tensor,
+    experts_w2: torch.Tensor,
+    experts_w3: torch.Tensor,
+) -> tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+]:
+    grad_i = torch.empty_like(routed_input)
+    grad_o = torch.empty_like(out)
+    grad_s = torch.empty_like(top_scores)
+    g1 = torch.empty_like(experts_w1)
+    g2 = torch.empty_like(experts_w2)
+    g3 = torch.empty_like(experts_w3)
+    return grad_i, grad_s, grad_o, g1, g2, g3
+
+
+def setup_context_local_mapped_region(ctx, inputs, output):
+    # routed_input, num_tokens_per_expert, experts_w1, experts_w2, experts_w3 = inputs
+    ctx.save_for_backward(*inputs)
+
+
+def backward_local_mapped_region(ctx, grad, grad2):
+    (
+        routed_input,
+        selected_experts_indices,
+        top_scores,
+        out,
+        experts_w1,
+        experts_w2,
+        experts_w3,
+    ) = ctx.saved_tensors
+    grad_i, grad_s, grad_o, g1, g2, g3 = local_mapped_region_grad(
+        routed_input,
+        selected_experts_indices,
+        top_scores,
+        out,
+        experts_w1,
+        experts_w2,
+        experts_w3,
+    )
+    return grad_i, None, grad_s, grad_o, g1, g2, g3
+
+
+torch.library.register_autograd(
+    "autoparallel::local_mapped_region",
+    backward_local_mapped_region,
+    setup_context=setup_context_local_mapped_region,
+)
+
+
+@local_mapped_region.register_fake
+def _(
+    routed_input: torch.Tensor,
+    selected_expert_indices: torch.Tensor,
+    top_scores: torch.Tensor,
+    out: torch.Tensor,
+    experts_w1: torch.Tensor,
+    experts_w2: torch.Tensor,
+    experts_w3: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    num_experts = 64
+    return torch.empty_like(routed_input), torch.empty(
+        (1, num_experts), dtype=routed_input.dtype, device=routed_input.device
+    )
+
+
 # def forward(self,
 #     rms_norm_5: "f32[64, 2048, 256][524288, 256, 1]cuda:0",
 #     self____modules__layers____modules__1____modules__moe____modules__router____modules__gate____parameters__weight: "f32[8, 256][256, 1]cuda:0",
@@ -740,10 +895,10 @@ def _moe_forward(
     # x: 64, 2048, 256
     bs, slen, dim = x.shape
 
-    local_batch_size = 4
-    num_gpus_participating = 32 * 2
-    num_experts_per_groups = local_batch_size * num_gpus_participating
-    x = x.unflatten(0, (-1, num_experts_per_groups))
+    # local_batch_size = 4
+    # num_gpus_participating = 32 * 2
+    # num_experts_per_groups = local_batch_size * num_gpus_participating
+    # x = x.unflatten(0, (-1, num_experts_per_groups))
     # x = x.view(-1, dim)
 
     # top_scores and selected_experts_indices shape (bs*slen*top_k,)
@@ -751,7 +906,6 @@ def _moe_forward(
     (
         top_scores,
         selected_experts_indices,
-        num_tokens_per_expert,
     ) = router(x, router_gate_weight, expert_bias)
 
     # tokens_per_expert will be used to update the expert bias for load balancing.
@@ -771,75 +925,37 @@ def _moe_forward(
     #       2nd computation in reorderer is for the actual routing and experts computation
     #       which would be sharded over TP ranks if expert_tensor_parallel_degree==1.
     #       If tensor_paralllel_degree == expert_tensor_parallel_degree, they agree.
-    (
-        top_scores_experts_sorted,
-        token_indices_experts_sorted,
-        # _, #num_tokens_per_expert,
-    ) = reorderer(top_scores, selected_experts_indices)
-
-    # shape (bs*slen*top_k, dim)
-    token_indices_experts_sorted = token_indices_experts_sorted[..., None].expand(
-        -1, -1, dim
-    )
-
-    # shape (bs*slen*top_k, dim)
-    routed_input = torch.gather(
-        x.view(token_indices_experts_sorted.shape[0], -1, dim),
-        dim=1,
-        index=token_indices_experts_sorted,
-    )
-    routed_input = (
-        routed_input.to(torch.float32) * top_scores_experts_sorted[..., None]
-    ).to(x.dtype)
+    # (
+    #     top_scores_experts_sorted,
+    #     token_indices_experts_sorted,
+    #     # _, #num_tokens_per_expert,
+    # ) = reorderer(top_scores, selected_experts_indices)
 
     # shape (bs*slen*top_k, dim)
     # routed_output = experts(routed_input, num_tokens_per_expert)
 
+    out = functional_feed_forward(shared_w1, shared_w2, shared_w3, x)
+
     ######################################################
     # This is in the local_map region
     ######################################################
-    axis_name = "ep"
-
-    def fn(routed_input, num_tokens_per_expert, experts_w1, experts_w2, experts_w3):
-        assert (
-            num_tokens_per_expert.shape[0] == 1
-        ), f"{num_tokens_per_expert.shape}, {routed_input.shape}"
-        shape = routed_input.shape
-        routed_input = routed_input.view(-1, dim)
-        num_tokens_per_expert = num_tokens_per_expert.view(-1)
-        (
-            routed_input,
-            num_tokens_per_expert_group,
-            input_splits,
-            output_splits,
-        ) = _token_dispatch(routed_input, num_tokens_per_expert, axis_name)
-
-        routed_output = _run_experts_grouped_mm(
-            # experts_w1, experts_w2, experts_w3, routed_input, num_tokens_per_expert
-            experts_w1,
-            experts_w2,
-            experts_w3,
-            routed_input,
-            num_tokens_per_expert_group,
-        )
-
-        routed_output = _token_combine(
-            routed_output, input_splits, output_splits, axis_name
-        )
-
-        routed_output = routed_output.view(shape)
-        return routed_output
 
     expert_placements = ((Replicate(), Shard(0)),) * 3
-    in_placements = ((Shard(0), Shard(1)), (Shard(0), Replicate()))
-    routed_output = local_map(
-        fn,
-        out_placements=((Shard(0), Shard(1)),),
+    in_placements = (
+        (Shard(0), Shard(0)),
+        (Shard(0), Shard(0)),
+        (Shard(0), Shard(0)),
+        (Shard(0), Shard(0)),
+    )
+    out, num_tokens_per_expert = local_map(
+        local_mapped_region,
+        out_placements=((Shard(0), Shard(0)), (Shard(0), Replicate())),
         in_placements=in_placements + expert_placements,
         redistribute_inputs=True,
         in_grad_placements=None,
         device_mesh=mesh,
-    )(routed_input, num_tokens_per_expert, experts_w1, experts_w2, experts_w3)
+    )(x, selected_experts_indices, top_scores, out, experts_w1, experts_w2, experts_w3)
+
     ######################################################
     # end of the local_map region
     ######################################################
@@ -849,14 +965,8 @@ def _moe_forward(
     #     out = shared_experts(x)
     # else:
     #     out = torch.zeros_like(x)
-    out = (
-        functional_feed_forward(shared_w1, shared_w2, shared_w3, x.flatten(0, 1))
-        .unflatten(0, (-1, x.shape[1]))
-        .flatten(1, 2)
-    )
 
     # assert False, f"{out.shape}, {token_indices_experts_sorted.shape}, {routed_output.shape}"
-    out = out.scatter_add(dim=1, index=token_indices_experts_sorted, src=routed_output)
     out = out.reshape(bs, slen, dim)
     return out, num_tokens_per_expert.sum(0)
 
@@ -1550,8 +1660,8 @@ config = DeepSeekV3ModelArgs(
     dim=2048,
     inter_dim=10944,
     moe_inter_dim=1408,
-    n_layers=27,
-    n_dense_layers=1,
+    n_layers=1,  # 27,
+    n_dense_layers=0,  # 1,
     n_heads=16,
     moe_args=MoEArgs(
         num_experts=64,
@@ -1588,22 +1698,17 @@ def input_fn():
 with AutoParallel(model, input_fn, mesh) as autop:
     autop.add_parameter_memory_constraint(low=None, high=None)
 
-    from IPython import embed
-
-    embed()
-    exit()
     # x_sharding = (Shard(0), Replicate())
     x_sharding = (Shard(0), Shard(0))
-
-    mm_nodes = autop.gm.graph.find_nodes(
-        op="call_function", target=torch.ops.aten.matmul.default
-    )
-    autop.sharding_optimizer.add_node_constraint(mm_nodes[0], x_sharding)
 
     autop.add_input_constraints([x_sharding])
     autop.add_output_constraints([x_sharding])
 
     sharding_placement = autop.optimize_placement()
+    from IPython import embed
+
+    embed()
+    exit()
     parallel_mod = autop.apply_placement(sharding_placement)
 
 # run weight init on our sharded DTensor params
