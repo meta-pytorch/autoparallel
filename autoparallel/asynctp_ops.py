@@ -418,9 +418,6 @@ def _fused_all_gather_matmul_impl(
     group = c10d._resolve_process_group(group_name)
 
     if gather_dim == A_shard.ndim - 1:
-        # Implementation for gathering on last dimension of matmul (N)
-        # A_shard splitted column wise
-        # A_shard: [A0, A1, ... , Ags]
         return _fused_all_gather_matmul_last_gather_dim_impl(
             mm_out_op,
             A_shard,
@@ -625,11 +622,6 @@ def _fused_all_gather_matmul_last_gather_dim_impl(
     def unflatten(t: torch.Tensor) -> torch.Tensor:
         return t.view(*leading_dims, -1)
 
-    A_out_leading_dims = list(A_shard.shape[:-1])
-
-    def unflatten_A_out(t: torch.Tensor) -> torch.Tensor:
-        return t.view(*A_out_leading_dims, -1)
-
     A_flat_out = A_shard_flat.new_empty(
         A_shard_flat.shape[0] * group.size(),
         A_shard_flat.shape[1],
@@ -645,19 +637,17 @@ def _fused_all_gather_matmul_last_gather_dim_impl(
         for B, out_dtype in zip(Bs, out_dtypes)
     ]
 
-    # Additional allocation for partials output,
-    # That will be reduced into output.
-    output_partials = [torch.empty_like(out) for out in outputs]
-
     first = True
 
     def default_consumer(shard: torch.Tensor, rank: int) -> None:
         nonlocal first
         for idx, (B, kwargs) in enumerate(zip(Bs, kwargs_list)):
-            out = outputs[idx] if first else output_partials[idx]
-            mm_out_op(shard, B_shards[idx][rank], **kwargs, out=out)
-            if not first:
-                outputs[idx] += output_partials[idx]
+            out = outputs[idx]
+            if first:
+                torch.ops.aten.mm.out(shard, B_shards[idx][rank], **kwargs, out=out)
+            else:
+                out.addmm_(shard, B_shards[idx][rank])
+
         first = False
 
     _pipelined_all_gather_and_consume_last_dim(
@@ -672,7 +662,7 @@ def _fused_all_gather_matmul_last_gather_dim_impl(
         # This path is inefficient and will be filtered out at passes stage
         # Added only for completness.
         A_split_cat_out_flat = torch.cat(A_flat_out.chunk(group_size), dim=-1)
-        ret_A = unflatten_A_out(A_split_cat_out_flat)
+        ret_A = unflatten(A_split_cat_out_flat)
 
     return ret_A, [unflatten(output) for output in outputs]
 
@@ -1134,7 +1124,7 @@ def _fused_matmul_reduce_scatter_impl(
     out_shape = [*A.shape[:-1], B.shape[1]]
     out_shape[scatter_dim] //= group.size()
 
-    if scatter_dim == A.ndim - 1:
+    if scatter_dim == A.ndim - 1 or scatter_dim == -1:
         B_shards = B.chunk(group.size(), dim=B.ndim - 1)
         A_flat = A.flatten(0, -2)
 

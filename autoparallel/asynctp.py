@@ -33,13 +33,15 @@ log = logging.getLogger(__name__)
 aten = torch.ops.aten
 patterns = PatternMatcherPass()
 
-_micro_pipeline_tp_ag_transpose_mm_enabled = True
+# Configs:
+_ag_transpose_mm_enabled = False
+_ag_mm_last_dim_enabled = True
+_ag_mm_last_dim_no_splitcat_use = False
+_mm_rs_last_dim_enabled = True
 
-# Check performance if overhead of decomposition outweights pipeline wins
-_micro_pipeline_tp_ag_mm_last_dim_enabled = True
-_micro_pipeline_tp_ag_mm_last_dim_splitcatuse_enabled = True
 
-_micro_pipeline_tp_mm_rs_last_dim_enabled = True
+def _is_last_dim(t: torch.Tensor, dim: int) -> bool:
+    return dim == t.ndim - 1 or dim == -1
 
 
 def _is_backward(graph: torch.fx.Graph) -> bool:
@@ -617,7 +619,7 @@ def _find_consumer_matmuls(node: torch.fx.Node) -> list[_Matmul]:
             matmul = _ScaledMatmul.from_match([user])
             matmuls.append(matmul)
         elif (
-            _micro_pipeline_tp_ag_transpose_mm_enabled
+            _ag_transpose_mm_enabled
             and user.target == aten.permute.default
             and (user.args[1] == [1, 0] or user.args[1] == [0, 1])
         ):
@@ -762,11 +764,12 @@ def fuse_all_gather_matmul(all_gather: _AllGatherMatch, log_strs) -> None:
     if not is_symm_mem_enabled_for_group(group_name):
         return
 
-    if (
-        not _micro_pipeline_tp_ag_mm_last_dim_enabled
-        and gather_dim == _get_tensor(shard_node).ndim - 1
-    ):
-        return
+    if _is_last_dim(_get_tensor(shard_node), gather_dim):
+        if not _ag_mm_last_dim_enabled:
+            return
+
+        if _get_tensor(shard_node).shape[-1] < 1024:
+            return
 
     # Find consumer matmuls
     matmuls = _find_consumer_matmuls(ag_res_node)
@@ -784,13 +787,12 @@ def fuse_all_gather_matmul(all_gather: _AllGatherMatch, log_strs) -> None:
         return
 
     if (
-        _micro_pipeline_tp_ag_mm_last_dim_splitcatuse_enabled
-        and gather_dim == _get_tensor(shard_node).ndim - 1
+        _ag_mm_last_dim_no_splitcat_use
+        and _is_last_dim(_get_tensor(shard_node), gather_dim)
         and len(all_gather.res_node.users) > len(matmuls)
     ):
         # The result of ag-split-cat is used not only in matmuls.
         # Then it has to be materialized, which can have overhead.
-        # TODO: find out conditions of strideness when there is no overhead.
         log_strs.append(
             f"fuse_agmm lastdim ag-split-cat {len(all_gather.res_node.users)} used more than num matmuls"
         )
@@ -837,15 +839,16 @@ def fuse_all_gather_matmul(all_gather: _AllGatherMatch, log_strs) -> None:
                 matmul.replace_with(new_out_node)
                 matmul.erase()
         else:
-            if "val" in shard_node.meta:
-                restrided = restride_A_shard_for_fused_all_gather_matmul(
-                    _get_tensor(shard_node),
-                    gather_dim,
-                )
-                shard_node = graph.call_function(
-                    inductor_prims.force_stride_order,
-                    args=(shard_node, restrided.stride()),
-                )
+            if not _is_last_dim(_get_tensor(shard_node), gather_dim):
+                if "val" in shard_node.meta:
+                    restrided = restride_A_shard_for_fused_all_gather_matmul(
+                        _get_tensor(shard_node),
+                        gather_dim,
+                    )
+                    shard_node = graph.call_function(
+                        inductor_prims.force_stride_order,
+                        args=(shard_node, restrided.stride()),
+                    )
             fused_node = _insert_fused_all_gather_matmul(
                 graph, matmuls, shard_node, gather_dim, group_name
             )
@@ -1055,11 +1058,14 @@ def fuse_matmul_reduce_scatter(reduce_scatter: _ReduceScatterMatch, log_strs) ->
         log_strs.append("fuse_mmrs not symm mem group")
         return
 
-    if (
-        not _micro_pipeline_tp_mm_rs_last_dim_enabled
-        and orig_scatter_dim == _get_tensor(input_node).ndim - 1
-    ):
-        return
+    if _is_last_dim(_get_tensor(input_node), orig_scatter_dim):
+        if not _mm_rs_last_dim_enabled:
+            return
+
+        group = torch._C._distributed_c10d._resolve_process_group(group_name)
+        group_size = group.size()
+        if _get_tensor(input_node).shape[-1] // group_size < 1024:
+            return
 
     # Currently fused_matmul_reduce_scatter doesn't return the matmul result,
     # so we can't apply the fusion if the matmul result is used by multiple
@@ -1113,16 +1119,17 @@ def fuse_matmul_reduce_scatter(reduce_scatter: _ReduceScatterMatch, log_strs) ->
 
     graph = rs_wait_tensor_node.graph
     with graph.inserting_before(rs_wait_tensor_node):
-        # Restride A tensor before fused op, for optimal perf in fused matmul reduce scatter
-        if "val" in matmul.A_node.meta:
-            restrided = restride_A_for_fused_matmul_reduce_scatter(
-                _get_tensor(matmul.A_node),
-                scatter_dim_after_maybe_reshape,
-            )
-            matmul.A_node = graph.call_function(
-                inductor_prims.force_stride_order,
-                args=(matmul.A_node, restrided.stride()),
-            )
+        if not _is_last_dim(_get_tensor(input_node), orig_scatter_dim):
+            # Restride A tensor before fused op, for optimal perf in fused matmul reduce scatter
+            if "val" in matmul.A_node.meta:
+                restrided = restride_A_for_fused_matmul_reduce_scatter(
+                    _get_tensor(matmul.A_node),
+                    scatter_dim_after_maybe_reshape,
+                )
+                matmul.A_node = graph.call_function(
+                    inductor_prims.force_stride_order,
+                    args=(matmul.A_node, restrided.stride()),
+                )
 
         # Replace matched subgraph with fused matmul reduce scatter node
         fused_node = _insert_fused_matmul_reduce_scatter(
@@ -1295,11 +1302,12 @@ def micro_pipeline_tp_pass(
             "async TP found no matching all-gather/reduce-scatter patterns for fusion"
         )
 
+    for all_gather in all_gathers:
+        fuse_all_gather_matmul(all_gather, log_strs)
+
     for reduce_scatter in reduce_scatters:
         fuse_matmul_reduce_scatter(reduce_scatter, log_strs)
 
-    for all_gather in all_gathers:
-        fuse_all_gather_matmul(all_gather, log_strs)
     trace_structured(
         "artifact",
         metadata_fn=lambda: {
