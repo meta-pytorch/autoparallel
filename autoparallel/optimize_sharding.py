@@ -755,9 +755,15 @@ class ShardingOptimizer:
         # get all parameters
         param_nodes = get_param_nodes(self.graph)
         elms = []
+        num_params_to_consider = 0
+        world_size = math.prod(self.mesh.shape)
         for node in param_nodes:
             s_i = self.node_map[node]
             vv = self.num_inp_out[(s_i, 0)]
+            can_be_fully_sharded = node.meta["val"].numel() >= world_size
+            num_params_to_consider += int(can_be_fully_sharded)
+            if not can_be_fully_sharded:
+                continue
             for ii in range(vv["num_output_strat"]):
                 data = self.ds[(s_i, 0, ii, 0)]
                 spec = data["inp_strat"]
@@ -767,8 +773,8 @@ class ShardingOptimizer:
                 old_size = math.prod(tensor_shape)
                 elms.append(data["va"] * new_size / old_size)
 
-        memory_factor_low *= len(param_nodes)
-        memory_factor_high *= len(param_nodes)
+        memory_factor_low *= num_params_to_consider # len(param_nodes)
+        memory_factor_high *= num_params_to_consider # len(param_nodes)
         self.prob += (pulp.lpSum(elms) <= memory_factor_high, "memory_constraint_high")
         self.prob += (pulp.lpSum(elms) >= memory_factor_low, "memory_constraint_low")
 
