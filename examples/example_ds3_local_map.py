@@ -692,7 +692,7 @@ def _token_combine(routed_output, input_splits, output_splits, axis_name):
     return routed_output
 
 
-@torch.library.custom_op("autoparallel::local_mapped_region", mutates_args=())
+# @torch.library.custom_op("autoparallel::local_mapped_region", mutates_args=())
 def local_mapped_region(
     x: torch.Tensor,
     selected_experts_indices: torch.Tensor,
@@ -703,6 +703,7 @@ def local_mapped_region(
     experts_w3: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     axis_name = "ep"
+    # assert False, f"{x.shape}, {selected_experts_indices.shape}, {top_scores.shape}, {out.shape}"
 
     top_k = 6
     num_experts = 64
@@ -717,7 +718,8 @@ def local_mapped_region(
         max=num_experts,
     )
 
-    total_tokens_per_expert = all_reduce(num_tokens_per_expert, axis_name)
+    # total_tokens_per_expert = all_reduce(num_tokens_per_expert, axis_name)
+    total_tokens_per_expert = num_tokens_per_expert
 
     token_indices_experts_sorted = torch.argsort(
         selected_experts_indices.flatten(1), dim=-1, stable=True
@@ -744,9 +746,6 @@ def local_mapped_region(
         routed_input.to(torch.float32) * top_scores_experts_sorted[..., None]
     ).to(x.dtype)
 
-    assert (
-        num_tokens_per_expert.shape[0] == 1
-    ), f"{num_tokens_per_expert.shape}, {routed_input.shape}"
     shape = routed_input.shape
     dim = shape[-1]
     routed_input = routed_input.view(-1, dim)
@@ -771,89 +770,14 @@ def local_mapped_region(
         routed_output, input_splits, output_splits, axis_name
     )
 
+    torch._check(routed_output.shape[0] == shape[0] * shape[1])
+
     routed_output = routed_output.view(shape)
 
     out = out.scatter_add(dim=1, index=token_indices_experts_sorted, src=routed_output)
     return out, total_tokens_per_expert[None, :]
 
-
-@torch.library.custom_op("autoparallel::local_mapped_region_grad", mutates_args=())
-def local_mapped_region_grad(
-    routed_input: torch.Tensor,
-    selected_experts_indices: torch.Tensor,
-    top_scores: torch.Tensor,
-    out: torch.Tensor,
-    experts_w1: torch.Tensor,
-    experts_w2: torch.Tensor,
-    experts_w3: torch.Tensor,
-) -> tuple[
-    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
-]:
-    grad_i = torch.empty_like(routed_input)
-    grad_o = torch.empty_like(out)
-    grad_s = torch.empty_like(top_scores)
-    g1 = torch.empty_like(experts_w1)
-    g2 = torch.empty_like(experts_w2)
-    g3 = torch.empty_like(experts_w3)
-    return grad_i, grad_s, grad_o, g1, g2, g3
-
-
-@local_mapped_region_grad.register_fake
-def _(
-    routed_input: torch.Tensor,
-    selected_experts_indices: torch.Tensor,
-    top_scores: torch.Tensor,
-    out: torch.Tensor,
-    experts_w1: torch.Tensor,
-    experts_w2: torch.Tensor,
-    experts_w3: torch.Tensor,
-) -> tuple[
-    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
-]:
-    grad_i = torch.empty_like(routed_input)
-    grad_o = torch.empty_like(out)
-    grad_s = torch.empty_like(top_scores)
-    g1 = torch.empty_like(experts_w1)
-    g2 = torch.empty_like(experts_w2)
-    g3 = torch.empty_like(experts_w3)
-    return grad_i, grad_s, grad_o, g1, g2, g3
-
-
-def setup_context_local_mapped_region(ctx, inputs, output):
-    # routed_input, num_tokens_per_expert, experts_w1, experts_w2, experts_w3 = inputs
-    ctx.save_for_backward(*inputs)
-
-
-def backward_local_mapped_region(ctx, grad, grad2):
-    (
-        routed_input,
-        selected_experts_indices,
-        top_scores,
-        out,
-        experts_w1,
-        experts_w2,
-        experts_w3,
-    ) = ctx.saved_tensors
-    grad_i, grad_s, grad_o, g1, g2, g3 = local_mapped_region_grad(
-        routed_input,
-        selected_experts_indices,
-        top_scores,
-        out,
-        experts_w1,
-        experts_w2,
-        experts_w3,
-    )
-    return grad_i, None, grad_s, grad_o, g1, g2, g3
-
-
-torch.library.register_autograd(
-    "autoparallel::local_mapped_region",
-    backward_local_mapped_region,
-    setup_context=setup_context_local_mapped_region,
-)
-
-
-@local_mapped_region.register_fake
+# @local_mapped_region.register_fake
 def _(
     routed_input: torch.Tensor,
     selected_expert_indices: torch.Tensor,
@@ -867,6 +791,83 @@ def _(
     return torch.empty_like(routed_input), torch.empty(
         (1, num_experts), dtype=routed_input.dtype, device=routed_input.device
     )
+
+
+# @torch.library.custom_op("autoparallel::local_mapped_region_grad", mutates_args=())
+# def local_mapped_region_grad(
+#     routed_input: torch.Tensor,
+#     selected_experts_indices: torch.Tensor,
+#     top_scores: torch.Tensor,
+#     out: torch.Tensor,
+#     experts_w1: torch.Tensor,
+#     experts_w2: torch.Tensor,
+#     experts_w3: torch.Tensor,
+# ) -> tuple[
+#     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+# ]:
+#     grad_i = torch.empty_like(routed_input)
+#     grad_o = torch.empty_like(out)
+#     grad_s = torch.empty_like(top_scores)
+#     g1 = torch.empty_like(experts_w1)
+#     g2 = torch.empty_like(experts_w2)
+#     g3 = torch.empty_like(experts_w3)
+#     return grad_i, grad_s, grad_o, g1, g2, g3
+
+
+# @local_mapped_region_grad.register_fake
+# def _(
+#     routed_input: torch.Tensor,
+#     selected_experts_indices: torch.Tensor,
+#     top_scores: torch.Tensor,
+#     out: torch.Tensor,
+#     experts_w1: torch.Tensor,
+#     experts_w2: torch.Tensor,
+#     experts_w3: torch.Tensor,
+# ) -> tuple[
+#     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+# ]:
+#     grad_i = torch.empty_like(routed_input)
+#     grad_o = torch.empty_like(out)
+#     grad_s = torch.empty_like(top_scores)
+#     g1 = torch.empty_like(experts_w1)
+#     g2 = torch.empty_like(experts_w2)
+#     g3 = torch.empty_like(experts_w3)
+#     return grad_i, grad_s, grad_o, g1, g2, g3
+
+
+# def setup_context_local_mapped_region(ctx, inputs, output):
+#     # routed_input, num_tokens_per_expert, experts_w1, experts_w2, experts_w3 = inputs
+#     ctx.save_for_backward(*inputs)
+
+
+# def backward_local_mapped_region(ctx, grad, grad2):
+#     (
+#         routed_input,
+#         selected_experts_indices,
+#         top_scores,
+#         out,
+#         experts_w1,
+#         experts_w2,
+#         experts_w3,
+#     ) = ctx.saved_tensors
+#     grad_i, grad_s, grad_o, g1, g2, g3 = local_mapped_region_grad(
+#         routed_input,
+#         selected_experts_indices,
+#         top_scores,
+#         out,
+#         experts_w1,
+#         experts_w2,
+#         experts_w3,
+#     )
+#     return grad_i, None, grad_s, grad_o, g1, g2, g3
+
+
+# torch.library.register_autograd(
+#     "autoparallel::local_mapped_region",
+#     backward_local_mapped_region,
+#     setup_context=setup_context_local_mapped_region,
+# )
+
 
 
 # def forward(self,
@@ -947,14 +948,16 @@ def _moe_forward(
         (Shard(0), Shard(0)),
         (Shard(0), Shard(0)),
     )
+    # assert False, f"{x.shape}, {selected_experts_indices.shape}, {top_scores.shape}, {out.shape}"
     out, num_tokens_per_expert = local_map(
         local_mapped_region,
-        out_placements=((Shard(0), Shard(0)), (Shard(0), Replicate())),
+        out_placements=((Shard(0), Shard(0)), (Shard(0), Shard(0))),
         in_placements=in_placements + expert_placements,
         redistribute_inputs=True,
         in_grad_placements=None,
         device_mesh=mesh,
     )(x, selected_experts_indices, top_scores, out, experts_w1, experts_w2, experts_w3)
+    # assert False, f"there: {out.shape}, {num_tokens_per_expert.shape}"
 
     ######################################################
     # end of the local_map region
@@ -1705,10 +1708,7 @@ with AutoParallel(model, input_fn, mesh) as autop:
     autop.add_output_constraints([x_sharding])
 
     sharding_placement = autop.optimize_placement()
-    from IPython import embed
-
-    embed()
-    exit()
+    from IPython import embed; embed(); exit()
     parallel_mod = autop.apply_placement(sharding_placement)
 
 # run weight init on our sharded DTensor params
