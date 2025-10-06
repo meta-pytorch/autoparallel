@@ -694,13 +694,13 @@ def _token_combine(routed_output, input_splits, output_splits, axis_name):
 
 # @torch.library.custom_op("autoparallel::local_mapped_region", mutates_args=())
 def local_mapped_region(
-    x: torch.Tensor,
     selected_experts_indices: torch.Tensor,
     top_scores: torch.Tensor,
-    out: torch.Tensor,
+    x: torch.Tensor,
     experts_w1: torch.Tensor,
-    experts_w2: torch.Tensor,
     experts_w3: torch.Tensor,
+    experts_w2: torch.Tensor,
+    out: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     axis_name = "ep"
     # assert False, f"{x.shape}, {selected_experts_indices.shape}, {top_scores.shape}, {out.shape}"
@@ -941,22 +941,33 @@ def _moe_forward(
     # This is in the local_map region
     ######################################################
 
-    expert_placements = ((Replicate(), Shard(0)),) * 3
-    in_placements = (
+    # expert_placements = ((Replicate(), Shard(0)),) * 3
+    # in_placements = (
+    #     (Shard(0), Shard(0)),
+    #     (Shard(0), Shard(0)),
+    #     (Shard(0), Shard(0)),
+    #     (Shard(0), Shard(0)),
+    # )
+    reordered_placements = (
         (Shard(0), Shard(0)),
         (Shard(0), Shard(0)),
         (Shard(0), Shard(0)),
+        (Replicate(), Shard(0)),
+        (Replicate(), Shard(0)),
+        (Replicate(), Shard(0)),
         (Shard(0), Shard(0)),
     )
+
     # assert False, f"{x.shape}, {selected_experts_indices.shape}, {top_scores.shape}, {out.shape}"
+    # [selected_experts_indices, top_scores_1, rms_norm_2, v_2, v_4, v_3, out]
     out, num_tokens_per_expert = local_map(
         local_mapped_region,
         out_placements=((Shard(0), Shard(0)), (Shard(0), Shard(0))),
-        in_placements=in_placements + expert_placements,
+        in_placements=reordered_placements,
         redistribute_inputs=True,
         in_grad_placements=None,
         device_mesh=mesh,
-    )(x, selected_experts_indices, top_scores, out, experts_w1, experts_w2, experts_w3)
+    )(selected_experts_indices, top_scores, x, experts_w1, experts_w3, experts_w2, out)
     # assert False, f"there: {out.shape}, {num_tokens_per_expert.shape}"
 
     ######################################################
