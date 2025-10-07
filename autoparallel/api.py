@@ -21,7 +21,7 @@ from torch._inductor.decomposition import select_decomp_table
 from torch._logging import trace_structured
 from torch._subclasses import FakeTensorMode
 from torch.distributed.fsdp import MixedPrecisionPolicy
-from torch.distributed.tensor import DeviceMesh
+from torch.distributed.tensor import DeviceMesh, DTensor
 from torch.export._unlift import _assign_attr
 from torch.export.unflatten import _AttrKind
 
@@ -457,16 +457,51 @@ class AutoParallel:
             self.joint_with_descriptors
         )
 
+        param_mappings = {}
+
+        def fwd_hook(model, args):
+            nonlocal param_mappings
+            param_mappings.clear()
+            for module in model.modules():
+                for name, p in module.named_parameters(recurse=False):
+                    if not isinstance(p, DTensor):
+                        continue
+                    p_new = torch.nn.Parameter(p._local_tensor)
+                    param_mappings[p_new] = p
+                    module._parameters[name] = p_new
+
+        def bwd_hook(model, grad_input, grad_output):
+            nonlocal param_mappings
+            for module in model.modules():
+                for name, p in module.named_parameters(recurse=False):
+                    if p not in param_mappings:
+                        continue
+                    orig_p = param_mappings[p]
+                    grad = p.grad
+                    if grad is not None:
+                        grad = DTensor(
+                            grad.detach(),
+                            orig_p._spec,
+                            requires_grad=grad.requires_grad,
+                        )
+                    orig_p.grad = grad
+                    module._parameters[name] = orig_p
+
         # TODO: this probably belongs in the AOTAutograd API
         # TODO: pytree handling
         class AutoParallelModule(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.register_forward_pre_hook(fwd_hook, prepend=True)
+                self.register_full_backward_hook(bwd_hook)
+
             def forward(self, *args):
                 # NB: don't close over the parameters/buffers, as the user may
                 # reassign the module!
                 # TODO: It's this to just exactly match
                 # prepare_aot_module_simplified, this seems like an API gap
                 params = [
-                    v.to_local()
+                    v
                     for k, v in
                     # TODO: this is very slow
                     itertools.chain(
