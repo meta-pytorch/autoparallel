@@ -4,7 +4,6 @@
 # LICENSE file in the root directory of this source tree.
 
 import copy
-import itertools
 import warnings
 from contextlib import ExitStack, contextmanager
 from types import MethodType
@@ -500,16 +499,14 @@ class AutoParallel:
                 # reassign the module!
                 # TODO: It's this to just exactly match
                 # prepare_aot_module_simplified, this seems like an API gap
-                params = [
-                    v
-                    for k, v in
-                    # TODO: this is very slow
-                    itertools.chain(
-                        dict(self.named_parameters(remove_duplicate=False)).items(),
-                        dict(self.named_buffers(remove_duplicate=False)).items(),
-                    )
-                ]
-                boxed_args = [*params, *args]
+                params = tuple(
+                    v for k, v in self.named_parameters(remove_duplicate=False)
+                )
+                # buffers aren't impacted by the fwd hook
+                buffers = tuple(
+                    v.to_local() for k, v in self.named_buffers(remove_duplicate=False)
+                )
+                boxed_args = [*params, *buffers, *args]
                 del params
                 # NB: don't do self.parallel_model_fn work around Dynamo bug
                 out = parallel_model_fn(boxed_args)
