@@ -18,7 +18,11 @@ from torch.testing._internal.distributed.fake_pg import FakeStore
 
 from autoparallel.api import AutoParallel
 
-world_size = 2048
+# must symbolically evaluate to run on 32 dp ranks
+# world_size = 2048
+fake_evaluate = False
+
+world_size = 256
 
 fake_store = FakeStore()
 torch.distributed.init_process_group(
@@ -1719,25 +1723,42 @@ with AutoParallel(model, input_fn, mesh) as autop:
     autop.add_output_constraints([x_sharding])
 
     sharding_placement = autop.optimize_placement()
-    from IPython import embed; embed(); exit()
+    # from IPython import embed; embed(); exit()
     parallel_mod = autop.apply_placement(sharding_placement)
 
-# run weight init on our sharded DTensor params
 parallel_mod.to_empty(device="cuda")
-parallel_mod.init_weights(
-    init_std=0.02, buffer_device="cuda"
-)  # maybe not correct value
-
-# # now let's run it
+# run weight init on our sharded DTensor params
+# TODO: plumb init_std through
+# parallel_mod.init_weights(
+#     init_std=0.02, buffer_device="cuda"
+# )  # maybe not correct value
+parallel_mod.init_weights(buffer_device="cuda")
 x = (
-    torch.randn(
-        # 0,
-        # args.vocab_size,
-        (bs // mesh.shape[0] // mesh.shape[1], seqlen, dim),
+    torch.randint(
+        0,
+        config.vocab_size,
+        (bs // mesh.shape[0] // mesh.shape[1], seq_len),
         device=torch.device("cuda"),
-        dtype=torch.bfloat16,
     ),
 )
-out = parallel_mod(*x)
-out.backward(torch.randn_like(out))
+
+# Symbolically evaluate in case you want to test running a graph bigger than your gpu
+if fake_evaluate:
+    # all gather on the tokens takes 128 GiB (4GiB * 32 ranks)
+    from torch._subclasses.fake_tensor import FakeTensorMode, FakeTensor
+    from torch.fx.experimental.symbolic_shapes import DimDynamic, ShapeEnv
+    shape_env = ShapeEnv()
+    with FakeTensorMode(
+        allow_non_fake_inputs=True,
+        shape_env=shape_env,
+    ) as mode:
+        # # now let's run it
+        # why was this using bfloat16?
+        out = parallel_mod(*x)
+        out.backward(torch.randn_like(out))
+else:
+    out = parallel_mod(*x)
+    out.backward(torch.randn_like(out))
+
+
 print("All good!")
