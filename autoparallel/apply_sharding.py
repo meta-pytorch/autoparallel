@@ -143,6 +143,7 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
 
         flat_args, treespec = tree_flatten(args)
         flat_args_t = [x for x in flat_args if isinstance(x, torch.Tensor)]
+        # TODO: flat_args_t is only for tensors here, but we should support other types as well
         assert len(flat_args_t) == len(curr_specs) == len(tgt_specs)
         new_flat_args_t = []
         for n, arg, curr_spec, tgt_spec in zip(
