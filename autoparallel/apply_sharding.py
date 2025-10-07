@@ -111,6 +111,26 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
         flat_args, treespec = tree_flatten(args)
         flat_args_t = [x for x in flat_args if isinstance(x, torch.Tensor)]
         # TODO: flat_args_t is only for tensors here, but we should support other types as well
+        if len(flat_args_t) < len(flat_args) and "local_map" in node.name:
+            # The only reason this block is only for local_map is that
+            # other ops seem to have filtered out non-symint/tensors from their specs
+            curr_specs_t = []
+            tgt_specs_t = []
+            for i, arg in enumerate(flat_args):
+                if isinstance(arg, torch.Tensor):
+                    curr_specs_t.append(curr_specs[i])
+                    tgt_specs_t.append(tgt_specs[i])
+                    continue
+                elif node.name and isinstance(arg, torch.SymInt):
+                    assert curr_specs[i] is None
+                    assert tgt_specs[i] is None
+                else:
+                    raise ValueError("Unexpected local_map HOP argument")
+
+            assert len(flat_args_t) == len(curr_specs_t) == len(tgt_specs_t)
+            curr_specs = curr_specs_t
+            tgt_specs = tgt_specs_t
+
         assert len(flat_args_t) == len(curr_specs) == len(tgt_specs)
         new_flat_args_t = []
         for n, arg, curr_spec, tgt_spec in zip(
