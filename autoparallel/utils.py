@@ -18,6 +18,8 @@ from torch.distributed.tensor._ops.utils import generate_redistribute_costs
 from torch.distributed.tensor.placement_types import Replicate
 from torch.utils._pytree import tree_flatten, tree_map_only
 
+from autoparallel.propagation_rules import generate_dummy_redistribute_costs
+
 from .dtensor_util import get_op_strategy, with_implicit_strategies
 from .propagation_rules import (
     TENSOR_FACTORY_OPS,
@@ -133,11 +135,14 @@ def keep_unique_configs(op_strat: OpStrategy) -> OpStrategy:
             input_specs = tuple(input_specs)
         if isinstance(output_specs, list):
             output_specs = tuple(output_specs)
-        key = (input_specs, output_specs)
-        if key in added:
-            continue
+        try:
+            key = (input_specs, output_specs)
+            if key in added:
+                continue
 
-        added.add(key)
+            added.add(key)
+        except TypeError:
+            print("Failed to hash, skipping dedup")
         filtered_strats.append(strat)
     return OpStrategy(filtered_strats)
 
@@ -197,17 +202,20 @@ def get_local_map_placement_option(
     replicated = tuple(Replicate() for _ in range(mesh.ndim))
     for activation in user_args[:num_activation_inputs]:
         # we have activation inputs for the bwd hop
-        in_specs.append(
-            DTensorSpec(
-                mesh=mesh,
-                placements=replicated,
-                tensor_meta=TensorMeta(
-                    shape=activation.shape,
-                    stride=activation.stride(),
-                    dtype=activation.dtype,
-                ),
+        if isinstance(activation, torch.SymInt):
+            in_specs.append(None)
+        else:
+            in_specs.append(
+                DTensorSpec(
+                    mesh=mesh,
+                    placements=replicated,
+                    tensor_meta=TensorMeta(
+                        shape=activation.shape,
+                        stride=activation.stride(),
+                        dtype=activation.dtype,
+                    ),
+                )
             )
-        )
 
     assert len(user_args) == (num_activation_inputs + len(in_placements))
 
@@ -235,12 +243,12 @@ def get_local_map_placement_option(
         output_val = node.meta["val"]
     else:
         # TODO: why is node.meta["val"] in global shapes for fwd?
-        num_activation_outputs = len(node.users) - len(out_placements)
+        # num_activation_outputs = len(node.users) - len(out_placements)
         output_val = [*node.meta["val"]]
-        dummy_activations = [
-            output_val[0]
-        ] * num_activation_outputs  # metadata doesn't matter
-        output_val += dummy_activations
+        # dummy_activations = [
+        #     output_val[0]
+        # ] * num_activation_outputs  # metadata doesn't matter
+        # output_val += dummy_activations
     assert isinstance(output_val, (torch.Tensor, list, tuple))
     outs = output_val if isinstance(output_val, (list, tuple)) else [output_val]
     for example, placement in zip(outs, out_placements):
@@ -271,8 +279,8 @@ def get_local_map_placement_option(
         )
 
     for example in outs[len(out_placements) :]:
-        if example is None:
-            # Due to how HOP backward is partitioned, it can return None
+        if example is None or isinstance(example, torch.SymInt):
+            # Due to how HOP backward is partitioned, it can return None or SymInt
             out_specs.append(None)
             continue
         # we have activation outputs for the fwd hop
@@ -290,7 +298,10 @@ def get_local_map_placement_option(
 
     redistribute_costs = []
     for user_strategy, input_spec in zip(specs, in_specs):
-        costs = generate_redistribute_costs(user_strategy, input_spec)
+        if input_spec is None:
+            costs = generate_dummy_redistribute_costs(user_strategy)
+        else:
+            costs = generate_redistribute_costs(user_strategy, input_spec)
         redistribute_costs.append(costs)
 
     return OpStrategy(

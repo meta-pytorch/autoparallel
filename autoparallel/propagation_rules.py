@@ -109,7 +109,10 @@ def remove_invalid_configs(out_strat, mesh):
         if isinstance(output_specs, DTensorSpec):
             output_specs = [output_specs]
         if strategy.input_specs is not None:
-            specs = list(strategy.input_specs) + list(output_specs)
+            if output_specs is None:
+                specs = list(strategy.input_specs)
+            else:
+                specs = list(strategy.input_specs) + list(output_specs)
         else:
             # special case for ops like full, empty, which have no inputs. See further comments by `TENSOR_FACTORY_OPS`
             specs = list(output_specs)
@@ -175,6 +178,11 @@ def _create_all_options(mesh, shape, tensor_meta=None, tensor=None):
     return out_strats
 
 
+# For when dst_spec is None
+def generate_dummy_redistribute_costs(src_strategy: OpStrategy) -> list[float]:
+    return [0.0] * len(src_strategy.strategies)
+
+
 @register_rule(operator.getitem)
 def getitem_rule(mesh, specs):
     op_spec = specs[0]
@@ -189,7 +197,11 @@ def getitem_rule(mesh, specs):
     for strat in op_spec.strategies:
         input_specs = strat.output_specs
         output_specs = input_specs[index]
-        redistribute_costs = [generate_redistribute_costs(new_inp, output_specs)]
+        if output_specs is None:
+            # if getitem doesn't return a tensor, there are no costs
+            redistribute_costs = [generate_dummy_redistribute_costs(new_inp)]
+        else:
+            redistribute_costs = [generate_redistribute_costs(new_inp, output_specs)]
         # TODO: fix this to take input_specs as argument
         # this will require fixing apply_sharding as well, see other TODO
         # s = OpSpec(output_specs, input_specs=input_specs)
