@@ -3,13 +3,6 @@ from typing import cast, Optional
 import torch
 import torch.distributed as dist
 from autoparallel.propagation_rules import register_opschema_rule
-from moe_placements import DynamicShard
-from moe_utils import (
-    batched_generate_permute_indices,
-    batched_permute_and_pad,
-    batched_unpermute_and_unpad,
-    TOKEN_GROUP_ALIGN_SIZE_M,
-)
 
 from torch.distributed._functional_collectives import all_to_all_single, RANK_TYPES
 from torch.distributed.device_mesh import DeviceMesh
@@ -18,6 +11,14 @@ from torch.distributed.tensor._ops._matrix_ops import _mm_like_strategy
 from torch.distributed.tensor._ops.utils import register_op_strategy
 from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
 from torch.utils.flop_counter import register_flop_formula
+
+from .moe_placements import PartitionedShard
+from .moe_utils import (
+    batched_generate_permute_indices,
+    batched_permute_and_pad,
+    batched_unpermute_and_unpad,
+    TOKEN_GROUP_ALIGN_SIZE_M,
+)
 
 
 @torch.library.custom_op("autoparallel::batched_mm", mutates_args=())
@@ -461,7 +462,9 @@ def batched_grouped_mm_strategy(mesh: DeviceMesh, op_schema: OpSchema):
         strategies_2x3.append([Shard(1), Shard(1), Replicate(), Partial()])
         # mat1 is dynamically sharded on row dim, mat2 is sharded on experts dim, offs is sharded on experts dim
         #  -> output is dynamically sharded on row dim
-        strategies_2x3.append([DynamicShard(1), DynamicShard(1), Shard(0), Shard(1)])
+        strategies_2x3.append(
+            [PartitionedShard(1), PartitionedShard(1), Shard(0), Shard(1)]
+        )
         # tp mesh
         # mat2 is sharded on column dim, mat1 is replicated, offs is replicated
         #  -> output is sharded on column dim
@@ -490,7 +493,9 @@ def batched_grouped_mm_strategy(mesh: DeviceMesh, op_schema: OpSchema):
         strategies_3x2.append([Shard(2), Replicate(), Shard(2), Partial()])
         # mat1 is sharded on experts dim, mat2 is dynamically sharded on column dim, offs is sharded on experts dim
         # -> output is dynamically sharded on column dim
-        strategies_3x2.append([DynamicShard(2), Shard(0), DynamicShard(2), Shard(1)])
+        strategies_3x2.append(
+            [PartitionedShard(2), Shard(0), PartitionedShard(2), Shard(1)]
+        )
         # tp mesh
         # mat1 is sharded on column dim, mat2 is sharded on row dim, offs is replicated
         # -> output is partial
@@ -519,7 +524,7 @@ def batched_grouped_mm_strategy(mesh: DeviceMesh, op_schema: OpSchema):
             # mat1 is dynamically sharded on column dim, mat2 is dynamically sharded on row dim, offs is sharded on experts dim
             # -> output is sharded on experts dim
             strategies_2x2.append(
-                [Shard(1), DynamicShard(2), DynamicShard(1), Shard(0)]
+                [Shard(1), PartitionedShard(2), PartitionedShard(1), Shard(0)]
             )
             # tp mesh
             # mat1 is replicated, mat2 is sharded on column dim, offs is replicated
@@ -547,7 +552,7 @@ def batched_grouped_mm_strategy(mesh: DeviceMesh, op_schema: OpSchema):
             # mat1 is sharded on experts dim, mat2 is dynamically sharded on column dim, offs is sharded on experts dim
             # -> output is dynamically sharded on column dim
             strategies_batched_3x2.append(
-                [DynamicShard(2), Shard(1), DynamicShard(2), Shard(1)]
+                [PartitionedShard(2), Shard(1), PartitionedShard(2), Shard(1)]
             )
             # tp mesh
             # mat1 is sharded on column dim, mat2 is sharded on row dim, offs is replicated
@@ -578,7 +583,7 @@ def batched_grouped_mm_strategy(mesh: DeviceMesh, op_schema: OpSchema):
             # mat1 is dynamically sharded on row dim, mat2 is sharded on experts dim, offs is sharded on experts dim
             #  -> output is dynamically sharded on row dim
             strategies_batched_2x3.append(
-                [DynamicShard(1), DynamicShard(1), Shard(1), Shard(1)]
+                [PartitionedShard(1), PartitionedShard(1), Shard(1), Shard(1)]
             )
             # tp mesh
             # mat1 is replicated, mat2 is sharded on column dim , offs is replicated
@@ -1326,16 +1331,10 @@ def _token_dispatch_strategy(mesh: DeviceMesh, op_schema: OpSchema):
     from torch.distributed.tensor._op_schema import PlacementList
     from torch.distributed.tensor._ops.utils import expand_to_full_mesh_op_strategy
 
-    mat1_strategy = cast(OpStrategy, op_schema.args_schema[0])
-    mat2_strategy = cast(OpStrategy, op_schema.args_schema[1])
-    offs_strategy = cast(OpStrategy, op_schema.args_schema[2])
-
-    assert len(mat1_strategy.shape) == 3
-    assert len(mat2_strategy.shape) == 3
-    assert len(offs_strategy.shape) == 2
-    assert mat1_strategy.shape[0] == offs_strategy.shape[0]
-    assert mat2_strategy.shape[0] == offs_strategy.shape[1]
-    assert mat1_strategy.shape[2] == mat2_strategy.shape[1]
+    x_strategy = cast(OpStrategy, op_schema.args_schema[0])
+    top_scores_strategy = cast(OpStrategy, op_schema.args_schema[1])
+    selected_expert_indices_strategy = cast(OpStrategy, op_schema.args_schema[2])
+    num_tokens_per_expert = cast(list[int], op_schema.args_schema[3])
 
     single_mesh_dim_strategies = []
 
@@ -1345,7 +1344,6 @@ def _token_dispatch_strategy(mesh: DeviceMesh, op_schema: OpSchema):
     single_mesh_dim_strategies.append(all_replicate)
     # mat1 sharded on outer batch, mat2 is replicated, offs is sharded on outer batch
     #  -> output is sharded on outer batch
-    single_mesh_dim_strategies.append([Shard(0), Shard(0), Replicate(), Shard(0)])
     # mat1 is replicated, mat2 is sharded on column dim, offs is replicated
     #  -> output is sharded on column dim
     single_mesh_dim_strategies.append([Shard(2), Replicate(), Shard(2), Replicate()])
@@ -1355,7 +1353,7 @@ def _token_dispatch_strategy(mesh: DeviceMesh, op_schema: OpSchema):
     # mat1 is dynamically sharded on row dim, mat2 is sharded on experts dim,
     # offs is sharded on experts dim -> output is dynamically sharded on row dim
     single_mesh_dim_strategies.append(
-        [DynamicShard(1), DynamicShard(1), Shard(0), Shard(1)]
+        [PartitionedShard(1), PartitionedShard(1), Shard(0), Shard(1)]
     )
 
     return expand_to_full_mesh_op_strategy(
@@ -1397,7 +1395,7 @@ def _token_combine_strategy(mesh: DeviceMesh, op_schema: OpSchema):
     # mat1 is dynamically sharded on row dim, mat2 is sharded on experts dim,
     # offs is sharded on experts dim -> output is dynamically sharded on row dim
     single_mesh_dim_strategies.append(
-        [DynamicShard(1), DynamicShard(1), Shard(0), Shard(1)]
+        [PartitionedShard(1), PartitionedShard(1), Shard(0), Shard(1)]
     )
 
     return expand_to_full_mesh_op_strategy(
