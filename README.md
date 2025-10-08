@@ -1,6 +1,11 @@
 # AutoParallel
 
-WARNING: Highly under development!
+> ⚠️ **Early Development Warning** Autoparallel is currently in an experimental
+> stage. You should expect bugs, incomplete features, and APIs that may change
+> in future versions. The project welcomes bugfixes, but to make sure things are
+> well coordinated you should discuss any significant change before starting the
+> work. It's recommended that you signal your intention to contribute in the
+> issue tracker, either by filing a new issue or by claiming an existing one.
 
 This currently works on PyTorch 2.8.0.dev20250506.
 
