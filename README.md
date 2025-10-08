@@ -30,3 +30,7 @@ If you got ``An unexpected error has occurred: ... 'python3.11')``, try modify `
 ```
 python examples/example_autoparallel.py
 ```
+
+## License
+
+Autoparallel is BSD-3 licensed, as found in the [LICENSE](LICENSE) file.
