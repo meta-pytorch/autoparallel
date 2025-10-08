@@ -3,266 +3,57 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import cast, Optional
+from typing import Optional, cast
 
 import torch
 import torch.distributed as dist
-from autoparallel.propagation_rules import register_opschema_rule
-
-from torch.distributed._functional_collectives import all_to_all_single, RANK_TYPES
+from torch.distributed._functional_collectives import all_to_all_single
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor._op_schema import OpSchema, OpStrategy
-from torch.distributed.tensor._ops._matrix_ops import _mm_like_strategy
-from torch.distributed.tensor._ops.utils import register_op_strategy
 from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
 from torch.utils.flop_counter import register_flop_formula
 
+from autoparallel.propagation_rules import register_opschema_rule
+
 from .moe_placements import PartitionedShard
 from .moe_utils import (
+    TOKEN_GROUP_ALIGN_SIZE_M,
     batched_generate_permute_indices,
     batched_permute_and_pad,
     batched_unpermute_and_unpad,
-    TOKEN_GROUP_ALIGN_SIZE_M,
 )
 
 
-@torch.library.custom_op("autoparallel::batched_mm", mutates_args=())
-def batched_mm(
+@torch.library.custom_op("autoparallel::grouped_mm", mutates_args=())
+def grouped_mm(
     mat1: torch.Tensor,
     mat2: torch.Tensor,
+    offsets: torch.Tensor,
 ) -> torch.Tensor:
-    assert mat1.ndim == 3
-    assert mat2.ndim == 2 or mat2.ndim == 3
-    if mat2.ndim == 2:
-        assert mat1.shape[2] == mat2.shape[0]
-        mat2_expanded = mat2.expand(mat1.shape[0], -1, -1)
-    else:
-        assert mat1.shape[0] == mat2.shape[0]
-        assert mat1.shape[2] == mat2.shape[1]
-        mat2_expanded = mat2
-    out = torch.bmm(mat1, mat2_expanded)
-    return out
+    res = torch._grouped_mm(mat1, mat2, offsets)
+    return res
 
 
-def setup_context_batched_mm(ctx, inputs, output):
-    mat1, mat2 = inputs
-    ctx.save_for_backward(mat1, mat2)
-
-
-def backward_batched_mm(ctx, grad):
-    assert grad.ndim == 3
-    mat1, mat2 = ctx.saved_tensors
-    grad1 = batched_mm(grad, mat2.transpose(-2, -1))
-    grad2 = batched_mm(mat1.transpose(-2, -1), grad)
-    if mat2.ndim == 2:
-        grad2 = torch.sum(grad2, dim=0)
-    return grad1, grad2
-
-
-torch.library.register_autograd(
-    "autoparallel::batched_mm",
-    backward_batched_mm,
-    setup_context=setup_context_batched_mm,
-)
-
-
-@batched_mm.register_fake
-def batched_mm_meta(
-    mat1: torch.Tensor,
-    mat2: torch.Tensor,
-) -> torch.Tensor:
-    assert mat1.ndim == 3
-    assert mat2.ndim == 3 or mat2.ndim == 2
-
-    if mat2.ndim == 2:
-        assert mat1.shape[2] == mat2.shape[0]
-    else:
-        assert mat1.shape[2] == mat2.shape[1]
-    out = torch.empty(
-        mat1.shape[0],
-        mat1.shape[1],
-        mat2.shape[-1],
-        dtype=mat1.dtype,
-        device=mat1.device,
-    )
-    return out
-
-
-@register_flop_formula(torch.ops.autoparallel.batched_mm)
-def batched_mm_flop_count(mat1_shape, mat2_shape, *args, out_shape=None, **kwargs):
-    """
-    Count floating-point operations for batched matrix multiplication.
-
-    This operation performs matrix multiplication between mat1 and mat2, where mat1 is
-    a batched tensor and mat2 is a regular matrix. The output is also a batched tensor.
-
-    Args:
-        mat1_shape: Shape of first input matrix
-        mat2_shape: Shape of second input matrix
-    Returns:
-        Total number of floating-point operations
-    """
-    assert len(mat1_shape) == 3
-    assert len(mat2_shape) == 2 or len(mat2_shape) == 3
-    # Parse mat1 dimensions
-    b, m, n = mat1_shape
-    # Parse mat2 dimensions
-    n2, k = mat2_shape[-2], mat2_shape[-1]
-    assert n == n2, f"Dimension mismatch: {n} vs {n2}"
-    # Calculate FLOPs for matrix multiplication: C = A @ B
-    return b * m * n * k * 2
-
-
-@register_op_strategy(torch.ops.autoparallel.batched_mm.default)
-def batched_matmul_rule(op_schema: OpSchema):
-    mesh = op_schema.get_mesh_from_args()
-    mat2_strategy = cast(OpStrategy, op_schema.args_schema[1])
-    if len(mat2_strategy.shape) == 2:
-        mm_equation = "bmk,kn->bmn"
-    else:
-        assert len(mat2_strategy.shape) == 3, "mat2 must be 2D or 3D"
-        mm_equation = "bmk,bkn->bmn"
-    # dispatch to mm_like_strategy
-    return _mm_like_strategy(mm_equation, mesh, op_schema)
-
-
-def _validate_batched_args(b_args: list[int]) -> None:
-    assert b_args in [
-        [
-            0,
-        ],
-        [
-            1,
-        ],
-        [0, 1],
-    ], f"Invalid batched_args: {b_args}"
-
-
-def _transform_grouped_mm_args(
-    mat1: torch.Tensor,
-    mat2: torch.Tensor,
-    batched_args: list[int],
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if batched_args == [
-        0,
-    ]:
-        mat1_exp = mat1
-        mat2_exp = mat2.expand(mat1.shape[0], -1, -1, -1)
-    elif batched_args == [
-        1,
-    ]:
-        mat1_exp = mat1.expand(mat2.shape[0], -1, -1, -1)
-        mat2_exp = mat2
-    else:
-        mat1_exp = mat1
-        mat2_exp = mat2
-    return mat1_exp, mat2_exp
-
-
-def _validate_batched_grouped_mm_shapes(
-    mat1_shape: torch.Size,
-    mat2_shape: torch.Size,
-    offs_shape: torch.Size,
-) -> None:
-    # Case 1: mat1 and mat2 are both 3D batched tensors
-    # grouped_mm 2Dx2D case
-    # Case 2: mat1 is 3D batched tensor and mat2 is 4D batched tensor
-    # grouped_mm 2Dx3D case
-    # Case 3: mat1 is 4D batched tensor and mat2 is 3D batched tensor
-    # grouped_mm 3Dx2D case
-    valid_shapes = (
-        (len(mat1_shape) == 3 and len(mat2_shape) == 3)
-        or (len(mat1_shape) == 4 and len(mat2_shape) == 3)
-        or (len(mat1_shape) == 3 and len(mat2_shape) == 4)
-    )
-    assert valid_shapes, (
-        f"Invalid tensor dimensions: expected mat1 and mat2 to be either both 3D, "
-        f"or mat1 4D and mat2 3D, or mat1 3D and mat2 4D. "
-        f"Got mat1={mat1_shape} and mat2={mat2_shape}."
-    )
-    assert len(offs_shape) == 2, f"offs needs to be 2D, got {offs_shape}"
-    # OB = batch size
-    # IB = sum(num_tokens_per_expert)
-    # D = embedding dim
-    # H = hidden dim
-    # E = number of experts
-    if len(mat1_shape) == 3 and len(mat2_shape) == 3:
-        OB1, _, IB1 = mat1_shape
-        OB2, IB2, _ = mat2_shape
-        assert OB1 == OB2, f"Batch size mismatch: {OB1} vs {OB2}"
-        assert IB1 == IB2, f"Total tokens mismatch: {IB1} vs {IB2}"
-    elif len(mat1_shape) == 4 and len(mat2_shape) == 3:
-        OB1, E1, _, H1 = mat1_shape
-        OB2, H2, _ = mat2_shape
-        OB3, E2 = offs_shape
-        assert (
-            OB1 == OB2 and OB2 == OB3
-        ), f"Batch size mismatch: {OB1} vs {OB2} vs {OB3}"
-        assert H1 == H2, f"Contracting dimension mismatch: {H1} vs {H2}"
-        assert E1 == E2, f"Number of experts mismatch: {E1} vs {E2}"
-    else:
-        OB1, IB1, D1 = mat1_shape
-        OB2, E1, D2, _ = mat2_shape
-        OB3, E2 = offs_shape
-        assert (
-            OB1 == OB2 and OB2 == OB3
-        ), f"Batch size mismatch: {OB1} vs {OB2} vs {OB3}"
-        assert D1 == D2, f"Contracting dimension mismatch: {D1} vs {D2}"
-        assert E1 == E2, f"Number of experts mismatch: {E1} vs {E2}"
-
-
-@torch.library.custom_op("autoparallel::batched_grouped_mm", mutates_args=())
-def batched_grouped_mm(
-    mat1: torch.Tensor,
-    mat2: torch.Tensor,
-    offs: torch.Tensor,
-    batched_args: list[int],
-) -> torch.Tensor:
-    _validate_batched_args(batched_args)
-    mat1_exp, mat2_exp = _transform_grouped_mm_args(mat1, mat2, batched_args)
-    _validate_batched_grouped_mm_shapes(mat1_exp.shape, mat2_exp.shape, offs.shape)
-    res = []
-    for m1, m2, off in zip(mat1_exp, mat2_exp, offs):
-        res.append(torch._grouped_mm(m1, m2, off))
-    return torch.stack(res, 0)
-
-
-def setup_context_batched_grouped_mm(ctx, inputs, output):
-    mat1, mat2, offs, batched_args = inputs
-    ctx.save_for_backward(mat1, mat2, offs)
-    ctx.batched_args = batched_args
+def setup_context_grouped_mm(ctx, inputs, output):
+    mat1, mat2, offsets = inputs
+    ctx.save_for_backward(mat1, mat2, offsets)
 
 
 def _backward_batched_grouped_mm_mat1(
     mat1: torch.Tensor,
     mat2: torch.Tensor,
     grad: torch.Tensor,
-    offs: torch.Tensor,
-    batched_args: list[int],
+    offsets: torch.Tensor,
 ) -> torch.Tensor:
     if mat1.stride(-2) == 1 and mat1.stride(-1) == mat1.size(-2):
-        if batched_args == [
-            0,
-        ]:
-            b_args = [
-                1,
-            ]
-        else:
-            b_args = [0, 1]
         # if input was column-major, return grad_input as column-order for efficiency
-        grad_mat1 = batched_grouped_mm(
-            mat2, grad.transpose(-2, -1), offs, b_args
+        grad_mat1 = grouped_mm(
+            mat2,
+            grad.transpose(-2, -1),
+            offsets,
         ).transpose(-2, -1)
     else:
-        if batched_args == [
-            0,
-        ]:
-            b_args = [
-                0,
-            ]
-        else:
-            b_args = [0, 1]
-        grad_mat1 = batched_grouped_mm(grad, mat2.transpose(-2, -1), offs, b_args)
+        grad_mat1 = grouped_mm(grad, mat2.transpose(-2, -1), offsets)
     return grad_mat1
 
 
@@ -270,116 +61,102 @@ def _backward_batched_grouped_mm_mat2(
     mat1: torch.Tensor,
     mat2: torch.Tensor,
     grad: torch.Tensor,
-    offs: torch.Tensor,
-    batched_args: list[int],
+    offsets: torch.Tensor,
 ) -> torch.Tensor:
     if mat2.stride(-2) == 1 and mat2.stride(-1) == mat2.size(-2):
-        if batched_args == [
-            1,
-        ]:
-            b_args = [
-                0,
-            ]
-        else:
-            b_args = [0, 1]
         # if experts were column-major, return experts_grad as column-order for efficiency
-        grad_mat2 = batched_grouped_mm(
+        grad_mat2 = grouped_mm(
             grad.transpose(-2, -1),
             mat1,
-            offs,
-            b_args,
+            offsets,
         ).transpose(-2, -1)
     else:
-        if batched_args == [
-            1,
-        ]:
-            b_args = [
-                1,
-            ]
-        else:
-            b_args = [0, 1]
-        grad_mat2 = batched_grouped_mm(
+        grad_mat2 = grouped_mm(
             mat1.transpose(-2, -1),
             grad,
-            offs,
-            b_args,
+            offsets,
         )
     return grad_mat2
 
 
-def backward_batched_grouped_mm(
+def backward_grouped_mm(
     ctx, grad: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor, None, None]:
-    mat1, mat2, offs = ctx.saved_tensors
-    batched_args = ctx.batched_args
-    grad_mat1 = _backward_batched_grouped_mm_mat1(mat1, mat2, grad, offs, batched_args)
-    grad_mat2 = _backward_batched_grouped_mm_mat2(mat1, mat2, grad, offs, batched_args)
-    if batched_args == [
-        0,
-    ]:
-        grad_mat2 = torch.sum(grad_mat2, dim=0)
-    elif batched_args == [
-        1,
-    ]:
-        grad_mat1 = torch.sum(grad_mat1, dim=0)
-
-    return grad_mat1, grad_mat2, None, None
+) -> tuple[torch.Tensor, torch.Tensor, None]:
+    mat1, mat2, offsets = ctx.saved_tensors
+    grad_mat1 = _backward_batched_grouped_mm_mat1(mat1, mat2, grad, offsets)
+    grad_mat2 = _backward_batched_grouped_mm_mat2(mat1, mat2, grad, offsets)
+    return grad_mat1, grad_mat2, None
 
 
 torch.library.register_autograd(
-    "autoparallel::batched_grouped_mm",
-    backward_batched_grouped_mm,
-    setup_context=setup_context_batched_grouped_mm,
+    "autoparallel::grouped_mm",
+    backward_grouped_mm,
+    setup_context=setup_context_grouped_mm,
 )
 
 
-@batched_grouped_mm.register_fake
-def batched_grouped_mm_meta(
+@grouped_mm.register_fake
+def grouped_mm_meta(
     mat1: torch.Tensor,
     mat2: torch.Tensor,
-    offs: torch.Tensor,
-    batched_args: list[int],
+    offsets: torch.Tensor,
 ) -> torch.Tensor:
-    _validate_batched_args(batched_args)
-    mat1, mat2 = _transform_grouped_mm_args(mat1, mat2, batched_args)
-    _validate_batched_grouped_mm_shapes(mat1.shape, mat2.shape, offs.shape)
-    if mat1.ndim == 3 and mat2.ndim == 3:
-        # out_shape = (OB, E, H, D)
+    if mat1.ndim == 2 and mat2.ndim == 2:
+        # mat1 is [H, B]
+        # mat2 is [B, D]
+        # offsets is [E]
+        # out_shape = [E, H, D]
+        out = torch.empty(
+            offsets.shape[0],
+            mat1.shape[0],
+            mat2.shape[1],
+            dtype=mat1.dtype,
+            device=mat1.device,
+        )
+    elif mat1.ndim == 2 and mat2.ndim == 3:
+        # mat1 is [B, D]
+        # mat2 is [E, D, H]
+        # offsets is [E]
+        # out_shape = [B, H]
         out = torch.empty(
             mat1.shape[0],
-            offs.shape[1],
-            mat1.shape[1],
             mat2.shape[2],
             dtype=mat1.dtype,
             device=mat1.device,
         )
-    elif mat1.ndim == 4 and mat2.ndim == 3:
-        # out_shape = (OB, D, IB)
+    elif mat1.ndim == 3 and mat2.ndim == 2:
+        # mat1 is [E, D, H]
+        # mat2 is [H, B]
+        # offsets is [E]
+        # out_shape = [D, B]
+        out = torch.empty(
+            mat2.shape[1],
+            mat2.shape[1],
+            dtype=mat1.dtype,
+            device=mat1.device,
+        )
+    elif mat1.ndim == 3 and mat2.ndim == 3:
+        # mat1 is [B, D, K]
+        # mat2 is [B, K, H]
+        # offsets is None
+        # out_shape = [B, D, H]
         out = torch.empty(
             mat1.shape[0],
-            mat1.shape[2],
+            mat1.shape[1],
             mat2.shape[2],
             dtype=mat1.dtype,
             device=mat1.device,
         )
     else:
-        # out_shape = (OB, IB, H)
-        out = torch.empty(
-            mat1.shape[0],
-            mat1.shape[1],
-            mat2.shape[3],
-            dtype=mat1.dtype,
-            device=mat1.device,
-        )
+        raise RuntimeError("Unsupported input shapes for grouped_mm")
     return out
 
 
-@register_flop_formula(torch.ops.autoparallel.batched_grouped_mm)
-def batched_grouped_mm_flop_count(
+@register_flop_formula(torch.ops.autoparallel.grouped_mm)
+def grouped_mm_flop_count(
     mat1_shape: torch.Size,
     mat2_shape: torch.Size,
     offsets_shape: torch.Size,
-    batched_args: list[int],
     bias_shape=None,
     out_shape=None,
     **kwargs,
@@ -400,31 +177,26 @@ def batched_grouped_mm_flop_count(
         Total number of floating-point operations
 
     """
-    _validate_batched_args(batched_args)
-    if batched_args == [
-        0,
-    ]:
-        mat2_shape = torch.Size([mat1_shape[0], *mat2_shape])
-    elif batched_args == [
-        1,
-    ]:
-        mat1_shape = torch.Size([mat2_shape[0], *mat1_shape])
-    _validate_batched_grouped_mm_shapes(mat1_shape, mat2_shape, offsets_shape)
-
+    K = 1
     if len(mat1_shape) == 3 and len(mat2_shape) == 3:
-        OB, D, IB = mat1_shape
+        B, D, K = mat1_shape
         _, _, H = mat2_shape
-    elif len(mat1_shape) == 4 and len(mat2_shape) == 3:
-        OB, _, D, H = mat1_shape
-        _, _, IB = mat2_shape
+    elif len(mat1_shape) == 3 and len(mat2_shape) == 2:
+        _, D, H = mat1_shape
+        _, B = mat2_shape
+    elif len(mat1_shape) == 2 and len(mat2_shape) == 3:
+        B, D = mat1_shape
+        _, _, H = mat2_shape
+    elif len(mat1_shape) == 2 and len(mat2_shape) == 2:
+        D, B = mat1_shape
+        _, H = mat2_shape
     else:
-        OB, IB, D = mat1_shape
-        _, _, _, H = mat2_shape
-    # OB = batch size
-    # IB = sum(num_tokens_per_expert)
+        raise RuntimeError("Unsupported input shapes for grouped_mm")
+    # B = batch size = sum(num_tokens_per_expert)
     # D = embedding dim
     # H = hidden dim
-    total_flops = OB * IB * D * H * 2
+    # K = contraction dim
+    total_flops = B * K * D * H * 2
     return total_flops
 
 
@@ -437,7 +209,6 @@ def batched_grouped_mm_strategy(mesh: DeviceMesh, op_schema: OpSchema):
     mat2_strategy = cast(OpStrategy, op_schema.args_schema[1])
     offs_strategy = cast(OpStrategy, op_schema.args_schema[2])
     batched_args = cast(list[int], op_schema.args_schema[3])
-    _validate_batched_args(batched_args)
     assert offs_strategy.ndim == 2
 
     single_mesh_dim_strategies = []
@@ -1336,10 +1107,10 @@ def _token_dispatch_strategy(mesh: DeviceMesh, op_schema: OpSchema):
     from torch.distributed.tensor._op_schema import PlacementList
     from torch.distributed.tensor._ops.utils import expand_to_full_mesh_op_strategy
 
-    x_strategy = cast(OpStrategy, op_schema.args_schema[0])
-    top_scores_strategy = cast(OpStrategy, op_schema.args_schema[1])
-    selected_expert_indices_strategy = cast(OpStrategy, op_schema.args_schema[2])
-    num_tokens_per_expert = cast(list[int], op_schema.args_schema[3])
+    # x_strategy = cast(OpStrategy, op_schema.args_schema[0])
+    # top_scores_strategy = cast(OpStrategy, op_schema.args_schema[1])
+    # selected_expert_indices_strategy = cast(OpStrategy, op_schema.args_schema[2])
+    # num_tokens_per_expert = cast(list[int], op_schema.args_schema[3])
 
     single_mesh_dim_strategies = []
 

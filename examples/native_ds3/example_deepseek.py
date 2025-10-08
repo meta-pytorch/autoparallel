@@ -6,8 +6,7 @@
 from dataclasses import dataclass
 from typing import Literal
 
-import moe_ops
-
+import moe_ops  # noqa: F401
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -346,10 +345,11 @@ class MoE(nn.Module):
 
 if __name__ == "__main__":
 
-    from autoparallel.api import AutoParallel
     from torch.distributed.fsdp import MixedPrecisionPolicy
     from torch.distributed.tensor.placement_types import Replicate, Shard
     from torch.testing._internal.distributed.fake_pg import FakeStore
+
+    from autoparallel.api import AutoParallel
 
     # Model configuration
     world_size = 256
@@ -409,10 +409,7 @@ if __name__ == "__main__":
         assert any(n.meta.get("fwd_nn_module_stack") for n in autop.gm.graph.nodes)
         autop.add_parameter_memory_constraint(low=None, high=None)
 
-        x_sharding = (
-            Shard(0),
-            Shard(1),
-        ) + (
+        x_sharding = (Shard(0), Shard(1),) + (
             Replicate(),
         ) * (mesh.ndim - 2)
 

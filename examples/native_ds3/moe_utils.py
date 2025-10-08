@@ -9,7 +9,6 @@ import torch
 import triton
 import triton.language as tl
 
-
 TOKEN_GROUP_ALIGN_SIZE_M = 8
 ValidTokenGroupAlignmentSize = Literal[8, 16, 32]
 

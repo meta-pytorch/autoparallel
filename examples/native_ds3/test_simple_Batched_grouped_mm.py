@@ -10,7 +10,6 @@ from torch.utils._python_dispatch import TorchDispatchMode
 
 
 class TestMode(TorchDispatchMode):
-
     def __torch_dispatch__(self, func, types, args=..., kwargs=None):
         kwargs = kwargs if kwargs else {}
         out = func(*args, **kwargs)

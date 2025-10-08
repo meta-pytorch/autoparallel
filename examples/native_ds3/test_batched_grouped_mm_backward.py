@@ -324,10 +324,12 @@ def test_case2_4d_x_3d_col_row():
     ).type_as(mat2)
 
     print(
-        f"mat1 shape: {mat1_base_bf16.shape}, strides: {mat1_base_bf16.stride()} (row-major: {verify_tensor_layout(mat1_base_bf16, 'row_major')})"
+        f"mat1 shape: {mat1_base_bf16.shape}, strides: {mat1_base_bf16.stride()}"
+        f" (row-major: {verify_tensor_layout(mat1_base_bf16, 'row_major')})"
     )
     print(
-        f"mat2 shape: {mat2_bf16_T.shape}, strides: {mat2_bf16_T.stride()} (column-major: {verify_tensor_layout(mat2_bf16_T, 'column_major')})"
+        f"mat2 shape: {mat2_bf16_T.shape}, strides: {mat2_bf16_T.stride()}"
+        f" (column-major: {verify_tensor_layout(mat2_bf16_T, 'column_major')})"
     )
     print(f"result shape: {result.shape}")
 

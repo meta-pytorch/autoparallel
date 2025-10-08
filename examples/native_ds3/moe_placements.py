@@ -543,8 +543,6 @@ class PartitionedShard(Placement):
         for partition_idx in range(self.num_partitions_unaligned):
             # Find which shard this partition should go to in aligned layout
             target_rank = partition_idx // partitions_per_shard
-            # Find position within that shard
-            local_partition_idx = partition_idx % partitions_per_shard
 
             # If this is my target rank, collect the split
             if target_rank == my_rank:
@@ -557,9 +555,6 @@ class PartitionedShard(Placement):
         # Step 3: Compute boundaries for data exchange
         # in_boundaries: current chunk sizes (what we have)
         in_boundaries = current_splits
-
-        # out_boundaries: target chunk sizes (what we want to receive)
-        out_boundaries = target_splits
 
         # Step 4: Second all-to-all - exchange tensor data
         # Split local tensor according to current partitions
@@ -655,9 +650,6 @@ class PartitionedShard(Placement):
         torch.distributed.all_gather_object(
             all_splits, current_splits, group=mesh.get_group(mesh_dim)
         )
-
-        # Compute target unaligned splits for this rank
-        target_splits = self._compute_unaligned_splits(mesh_size, my_rank)
 
         # Step 3: Prepare data for all-to-all exchange
         # Split local tensor according to current aligned partitions
