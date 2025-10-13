@@ -6,6 +6,7 @@
 import functools
 
 import torch
+import torch.fx.traceback as fx_traceback
 from torch import nn
 from torch.distributed._tensor.experimental import local_map
 from torch.distributed.fsdp import MixedPrecisionPolicy
@@ -57,7 +58,8 @@ context_fn = functools.partial(create_selective_checkpoint_contexts, policy_fn)
     device_mesh=mesh,
 )
 def replicate_linear(w, x):
-    return torch.matmul(x, w.t())
+    with fx_traceback.annotate({"inside_local_map": 1}):
+        return torch.matmul(x, w.t())
 
 
 @local_map(
@@ -68,7 +70,8 @@ def replicate_linear(w, x):
     device_mesh=mesh,
 )
 def sharded_pointwise(x):
-    return x + 10
+    with fx_traceback.annotate({"inside_local_map": 0}):
+        return x + 10
 
 
 @local_map(
@@ -83,10 +86,11 @@ def sharded_pointwise(x):
     device_mesh=mesh,
 )
 def context_parallel_attention(query, key, value):
-    out = nn.functional.scaled_dot_product_attention(
-        query=query, key=key, value=value, is_causal=False
-    )
-    return out
+    with fx_traceback.annotate({"inside_local_map": 2}):
+        out = nn.functional.scaled_dot_product_attention(
+            query=query, key=key, value=value, is_causal=False
+        )
+        return out
 
 
 class Block(nn.Module):
@@ -108,35 +112,37 @@ class Block(nn.Module):
                 torch.nn.init.normal_(lin.bias)
 
     def _compute_attention(self, x):
-        boosted_weight = sharded_pointwise(self.wq.weight)
-        q = replicate_linear(boosted_weight, x)
-        k = self.wk(x)
-        v = self.wv(x)
+        with fx_traceback.annotate({"inside_checkpoint": 0}):
+            boosted_weight = sharded_pointwise(self.wq.weight)
+            q = replicate_linear(boosted_weight, x)
+            k = self.wk(x)
+            v = self.wv(x)
 
-        q = q.unflatten(-1, (self.nheads, -1)).permute(0, 2, 1, 3)
-        k = k.unflatten(-1, (self.nheads, -1)).permute(0, 2, 1, 3)
-        v = v.unflatten(-1, (self.nheads, -1)).permute(0, 2, 1, 3)
+            q = q.unflatten(-1, (self.nheads, -1)).permute(0, 2, 1, 3)
+            k = k.unflatten(-1, (self.nheads, -1)).permute(0, 2, 1, 3)
+            v = v.unflatten(-1, (self.nheads, -1)).permute(0, 2, 1, 3)
 
-        o = context_parallel_attention(q, k, v)
-        o = o.permute(0, 2, 1, 3).flatten(-2)
+            o = context_parallel_attention(q, k, v)
+            o = o.permute(0, 2, 1, 3).flatten(-2)
 
-        o = self.wo(o)
-        return o
+            o = self.wo(o)
+            return o
 
     def forward(self, x):
-        o = torch.utils.checkpoint.checkpoint(
-            self._compute_attention, x, use_reentrant=False, context_fn=context_fn
-        )
+        with fx_traceback.annotate({"outside_checkpoint": 0}):
+            o = torch.utils.checkpoint.checkpoint(
+                self._compute_attention, x, use_reentrant=False, context_fn=context_fn
+            )
 
-        o0 = o + x
+            o0 = o + x
 
-        o = self.w1(o0)
-        o = torch.nn.functional.relu(o)
-        o = self.w2(o)
+            o = self.w1(o0)
+            o = torch.nn.functional.relu(o)
+            o = self.w2(o)
 
-        o = o0 + o
+            o = o0 + o
 
-        return o
+            return o
 
 
 bs = 8 * mesh.shape[0]
@@ -160,7 +166,9 @@ with torch.device("meta"):
 mp_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16)
 # mp_policy = None
 
-with AutoParallel(model, input_fn, mesh, mp_policy, compile=True) as autop:
+with torch.fx.traceback.preserve_node_meta(), AutoParallel(
+    model, input_fn, mesh, mp_policy, compile=True
+) as autop:
     assert any(n.meta.get("nn_module_stack") for n in autop.gm.graph.nodes)
     assert any(n.meta.get("fwd_nn_module_stack") for n in autop.gm.graph.nodes)
     autop.add_parameter_memory_constraint(low=None, high=None)
@@ -207,5 +215,24 @@ for n in autop.gm.graph.nodes:
 mm_nodes = autop.gm.graph.find_nodes(
     op="call_function", target=torch.ops.aten.mm.default
 )
+
+metas = [n.meta.get("custom", None) for n in autop.parallel_gm.graph.nodes]
+fwd_sdpa, bwd_sdpa = [
+    n
+    for n in autop.parallel_gm.graph.nodes
+    if "_scaled_dot_product_flash_attention" in n.name
+]
+# TODO: Dynamo HOP body is not preserving the fx_traceback.annotate
+# We should expect to also see the "inside_local_map" annotation
+assert fwd_sdpa.meta["custom"] == {
+    "inside_checkpoint": 0,
+    "inside_local_map": 2,
+    "outside_checkpoint": 0,
+}
+assert bwd_sdpa.meta["custom"] == {
+    "inside_checkpoint": 0,
+    "inside_local_map": 2,
+    "outside_checkpoint": 0,
+}
 
 print("All good!")

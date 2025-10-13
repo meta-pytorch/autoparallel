@@ -184,7 +184,7 @@ def _mark_nodes_as_must_save(must_save_nodes: list[torch.fx.Node]) -> None:
     for node in must_save_nodes:
         if (
             node.meta.get("recompute", None) is not None
-            and node.meta["ac_graph_id"] != AP_AC_GRAPH_ID
+            and node.meta.get("ac_graph_id", -1) != AP_AC_GRAPH_ID
         ):
             # Let user annotations take precedence
             skipped_nodes[node] = node.meta["recompute"]
