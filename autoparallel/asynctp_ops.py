@@ -638,15 +638,17 @@ def _fused_all_gather_matmul_last_gather_dim_impl(
     ]
 
     first = True
+    events = [torch.cuda.Event() for _ in outputs]
 
     def default_consumer(shard: torch.Tensor, rank: int) -> None:
         nonlocal first
-        for idx, (B, kwargs) in enumerate(zip(Bs, kwargs_list)):
-            out = outputs[idx]
+        for out, event, B_shard, kwargs in zip(outputs, events, B_shards, kwargs_list):
+            event.wait()
             if first:
-                torch.ops.aten.mm.out(shard, B_shards[idx][rank], **kwargs, out=out)
+                torch.ops.aten.mm.out(shard, B_shard[rank], **kwargs, out=out)
             else:
-                out.addmm_(shard, B_shards[idx][rank])
+                out.addmm_(shard, B_shard[rank])
+            event.record()
 
         first = False
 
