@@ -517,11 +517,14 @@ class AutoParallel:
             sharding_placement
         )
 
-        self.parallel_model_fn = parallel_model_fn = aot_compile_joint_with_descriptors(
+        parallel_model_fn, fw_module, bw_module = aot_compile_joint_with_descriptors(
             self.joint_with_descriptors,
             fw_compiler=self.compiler_fn,
             bw_compiler=self.compiler_fn,
         )
+        self.parallel_model_fn = parallel_model_fn
+        self.fw_module = fw_module
+        self.bw_module = bw_module
 
         # TODO: this probably belongs in the AOTAutograd API
         # TODO: pytree handling
