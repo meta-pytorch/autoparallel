@@ -12,6 +12,7 @@ from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
 from torch.testing._internal.distributed.fake_pg import FakeStore
 
 from autoparallel._passes.graph_multiplex import multiplex_fw_bw_graph
+from autoparallel._passes.split_fsdp_collectives import split_fsdp_prefetch
 from autoparallel._testing.models.llama3 import Transformer, TransformerModelArgs
 from autoparallel.api import AutoParallel
 from autoparallel.auto_bucketing import (
@@ -257,9 +258,22 @@ with AutoParallel(
     if multiplex_graph:
         f_gm = autop.fw_module
         b_gm = autop.bw_module
-        multiplexed_gm = multiplex_fw_bw_graph(f_gm, b_gm)
+        print("Original Fwd Graph:")
         print(f_gm.graph)
+        print("Original Bwd Graph:")
         print(b_gm.graph)
+        prefetch_f_gm, main_f_gm = split_fsdp_prefetch(f_gm)
+        print("Main Fwd Graph:")
+        print(main_f_gm.graph)
+        print("Prefetch Fwd Graph:")
+        print(prefetch_f_gm.graph)
+        prefetch_b_gm, main_b_gm = split_fsdp_prefetch(b_gm)
+        print("Main Bwd Graph:")
+        print(main_b_gm.graph)
+        print("Prefetch Bwd Graph:")
+        print(prefetch_b_gm.graph)
+        multiplexed_gm = multiplex_fw_bw_graph(main_f_gm, main_b_gm)
+        print("Multiplexed Graph:")
         print(multiplexed_gm.graph)
 
 # run weight init on our sharded DTensor params
