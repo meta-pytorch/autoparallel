@@ -279,19 +279,12 @@ def multiple_process_run(rank, world_size, tmp_dir, model, sharding_map):
                 master_print(f"(after load from ckp) step: {i}, {loss=}")
             if i >= 11:
                 non_ap_loss.append(loss)
-        # TODO(zpcore): enable the following assertion check once merge
-        # https://github.com/pytorch/pytorch/pull/162294 to upstream
-        # assert all(
-        #     torch.allclose(i, j, rtol=1e-2) for i, j in zip(ap_loss, non_ap_loss)
-        # ), "DCP loss curve mismatch when load state dict from AP model to non AP model"
-        allclose_result = all(
+        assert all(
             torch.allclose(i, j, rtol=1e-2) for i, j in zip(ap_loss, non_ap_loss)
+        ), "DCP loss curve mismatch when load state dict from AP model to non AP model"
+        master_print(
+            "DCP test passed: DCP loss curve match when load state dict from AP model to non AP model"
         )
-        if not allclose_result:
-            master_print(
-                "DCP loss curve mismatch when load state dict from AP model to non AP model"
-            )
-
     except Exception as e:
         if torch.distributed.is_initialized():
             torch.distributed.destroy_process_group()

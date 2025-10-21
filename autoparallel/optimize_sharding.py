@@ -588,9 +588,9 @@ class ShardingOptimizer:
                 (x["comm_cost"], x["compute_cost"], x["sharding_transition_cost"])
                 for x in d
             ]
-            device_order = getattr(node.meta, "device_order", None)
-            if device_order:
-                line = f"  {plc_txt}{attr_color(strat)} device_order: {device_order} {cost_txt}{attr_color(str(costs))}"
+            shard_order = getattr(node.meta, "shard_order", None)
+            if shard_order:
+                line = f"  {plc_txt}{attr_color(strat)} {shard_order=} {cost_txt}{attr_color(str(costs))}"
             else:
                 line = (
                     f"  {plc_txt}{attr_color(strat)} {cost_txt}{attr_color(str(costs))}"

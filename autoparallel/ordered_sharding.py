@@ -4,12 +4,14 @@
 # LICENSE file in the root directory of this source tree.
 
 import operator
-from typing import Optional, Union
+from collections import namedtuple
+from typing import Any, Optional, Union
 
 import torch
 from torch._functorch._aot_autograd.fx_utils import get_param_and_grad_nodes
 from torch.distributed._tensor.placement_types import DTensorSpec
 from torch.distributed.tensor._op_schema import OpSpec
+from torch.distributed.tensor._redistribute import redistribute_local_tensor
 from torch.distributed.tensor.placement_types import (  # noqa
     Partial,
     Placement,
@@ -17,8 +19,6 @@ from torch.distributed.tensor.placement_types import (  # noqa
     Shard,
 )
 from torch.utils._pytree import tree_flatten
-
-from .dtensor_util.redistribute_tensor import redistribute_local_tensor
 
 
 def _optimize_same_nd_sharding_as_1d(
@@ -64,8 +64,6 @@ def ordered_redistribute_local_tensor(
     arg: torch.Tensor,
     curr_spec: DTensorSpec,
     tgt_spec: DTensorSpec,
-    src_placement_order=None,
-    tgt_placement_order=None,
 ) -> torch.Tensor:
     """
     This is a simplified version of redistribute_local_tensor that optimizes
@@ -75,11 +73,7 @@ def ordered_redistribute_local_tensor(
     The optimizations that we support for now are hard-coded, and we should
     generalize this in the future.
     """
-    if src_placement_order:
-        curr_spec.device_order = src_placement_order
-    if tgt_placement_order:
-        tgt_spec.device_order = tgt_placement_order
-    if src_placement_order == tgt_placement_order:
+    if curr_spec.shard_order == tgt_spec.shard_order:
         return _optimize_same_nd_sharding_as_1d(arg, curr_spec, tgt_spec)
     return redistribute_local_tensor(
         arg,
@@ -210,8 +204,10 @@ def compute_optimal_placement_order_for_parameters(module, sharding_placement):
                     )
                 )
 
-    # map node from to (target order, need reorder?)
-    redistribute_node_order = {}
+    # map node to (is reversed order originally?, need reorder?)
+    OrderInfo = namedtuple("OrderInfo", ["is_reversed_order", "need_reorder"])
+    redistribute_node_order: dict[Any, OrderInfo] = {}
+
     for (
         param_node,
         grad_node,
@@ -243,10 +239,14 @@ def compute_optimal_placement_order_for_parameters(module, sharding_placement):
                 # node between [param_and_grad_users[src_input], src_input) are under order [1,0],
                 for p in param_chain:
                     if p == node_to_reorder:
-                        redistribute_node_order[p] = ((0, 1), True)
+                        redistribute_node_order[p] = OrderInfo(
+                            is_reversed_order=False, need_reorder=True
+                        )
                         break
                     else:
-                        redistribute_node_order[p] = ((1, 0), False)
+                        redistribute_node_order[p] = OrderInfo(
+                            is_reversed_order=False, need_reorder=False
+                        )
 
                 # handle backward pass grad related nodes
                 grad_node = param_and_grad_users[src_grad]
@@ -256,11 +256,15 @@ def compute_optimal_placement_order_for_parameters(module, sharding_placement):
                 # node between [param_and_grad_users[src_grad], src_grad) are under order [1,0],
                 for p in grad_chain:
                     if p == node_to_reorder:
-                        redistribute_node_order[p] = ((1, 0), True)
+                        redistribute_node_order[p] = OrderInfo(
+                            is_reversed_order=True, need_reorder=True
+                        )
                         break
                     else:
                         # below is supposed not to be triggered
-                        redistribute_node_order[p] = ((1, 0), False)
+                        redistribute_node_order[p] = OrderInfo(
+                            is_reversed_order=True, need_reorder=False
+                        )
     for node, (order, _) in redistribute_node_order.items():
-        node.meta["device_order"] = order
+        node.meta["shard_order"] = order
     return redistribute_node_order
