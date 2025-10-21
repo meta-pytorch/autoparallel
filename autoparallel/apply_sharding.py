@@ -53,36 +53,36 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
         assert curr_spec.shard_order is not None
         assert tgt_spec.shard_order is not None
         if node in self.param_placement_order:
-            is_reversed_order, need_reorder = self.param_placement_order[node]
+            is_target_reversed_order, need_reorder = self.param_placement_order[node]
             curr_shard_order = []
             tgt_shard_order = []
             for tensor_dim, mesh_dims in curr_spec.shard_order:
                 default_order = sorted(mesh_dims)
-                if is_reversed_order:
+                if is_target_reversed_order and need_reorder:
                     curr_shard_order.append(
                         ShardOrderEntry(
-                            tensor_dim=tensor_dim, mesh_dims=tuple(default_order[::-1])
+                            tensor_dim=tensor_dim, mesh_dims=tuple(default_order)
                         )
                     )
                 else:
                     curr_shard_order.append(
                         ShardOrderEntry(
-                            tensor_dim=tensor_dim, mesh_dims=tuple(default_order)
+                            tensor_dim=tensor_dim, mesh_dims=tuple(default_order[::-1])
                         )
                     )
 
             for tensor_dim, mesh_dims in tgt_spec.shard_order:
                 default_order = sorted(mesh_dims)
-                if is_reversed_order == need_reorder:
+                if is_target_reversed_order:
                     tgt_shard_order.append(
                         ShardOrderEntry(
-                            tensor_dim=tensor_dim, mesh_dims=tuple(default_order)
+                            tensor_dim=tensor_dim, mesh_dims=tuple(default_order[::-1])
                         )
                     )
                 else:
                     tgt_shard_order.append(
                         ShardOrderEntry(
-                            tensor_dim=tensor_dim, mesh_dims=tuple(default_order[::-1])
+                            tensor_dim=tensor_dim, mesh_dims=tuple(default_order)
                         )
                     )
             curr_spec.shard_order = tuple(curr_shard_order)

@@ -205,7 +205,7 @@ def compute_optimal_placement_order_for_parameters(module, sharding_placement):
                 )
 
     # map node to (is reversed order originally?, need reorder?)
-    OrderInfo = namedtuple("OrderInfo", ["is_reversed_order", "need_reorder"])
+    OrderInfo = namedtuple("OrderInfo", ["is_target_reversed_order", "need_reorder"])
     redistribute_node_order: dict[Any, OrderInfo] = {}
 
     for (
@@ -240,12 +240,12 @@ def compute_optimal_placement_order_for_parameters(module, sharding_placement):
                 for p in param_chain:
                     if p == node_to_reorder:
                         redistribute_node_order[p] = OrderInfo(
-                            is_reversed_order=False, need_reorder=True
+                            is_target_reversed_order=False, need_reorder=True
                         )
                         break
                     else:
                         redistribute_node_order[p] = OrderInfo(
-                            is_reversed_order=False, need_reorder=False
+                            is_target_reversed_order=True, need_reorder=False
                         )
 
                 # handle backward pass grad related nodes
@@ -257,13 +257,13 @@ def compute_optimal_placement_order_for_parameters(module, sharding_placement):
                 for p in grad_chain:
                     if p == node_to_reorder:
                         redistribute_node_order[p] = OrderInfo(
-                            is_reversed_order=True, need_reorder=True
+                            is_target_reversed_order=True, need_reorder=True
                         )
                         break
                     else:
                         # below is supposed not to be triggered
                         redistribute_node_order[p] = OrderInfo(
-                            is_reversed_order=True, need_reorder=False
+                            is_target_reversed_order=True, need_reorder=False
                         )
     for node, (order, _) in redistribute_node_order.items():
         node.meta["shard_order"] = order
