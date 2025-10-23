@@ -77,6 +77,21 @@ DEVICE_LIMITS: Tuple[DeviceLimit, ...] = (
         },
     ),
     DeviceLimit(
+        "B200",
+        "https://nvdam.widen.net/s/wwnsxrhm2w/blackwell-datasheet-3384703",
+        sm=(10, 0),
+        gmem_bandwidth=7.7 * (1024**4),
+        gemm_tflops={
+            torch.float64: 37,
+            # NOTE: NVIDIA gives all numbers "with 2:4 sparsity"
+            # but we want the full GEMM numbers
+            torch.float32: 2200 // 2,
+            torch.float16: 4500 // 2,
+            torch.bfloat16: 4500 // 2,
+            torch.int8: 9000 // 2,
+        },
+    ),
+    DeviceLimit(
         "A100",
         "https://www.nvidia.com/content/dam/en-zz/Solutions/Data-Center/a100/pdf/nvidia-a100-datasheet-us-nvidia-1758950-r4-web.pdf",
         sm=(8, 0),
