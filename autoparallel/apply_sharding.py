@@ -96,7 +96,10 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
         if node in self.param_placement_order and self.param_placement_order[node][1]:
             assert curr_spec.placements != tgt_spec.placements
         self._set_origin_and_target_device_order(node, curr_spec, tgt_spec)
-        if curr_spec != tgt_spec:
+        if (
+            curr_spec.placements != tgt_spec.placements
+            or curr_spec.shard_order != tgt_spec.shard_order
+        ):
             tgt_spec_c = DTensorSpec(
                 tgt_spec.mesh,
                 tgt_placements,
