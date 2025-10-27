@@ -780,8 +780,8 @@ class ShardingOptimizer:
                 old_size = math.prod(tensor_shape)
                 elms.append(data["va"] * new_size / old_size)
 
-        memory_factor_low *= num_params_to_consider # len(param_nodes)
-        memory_factor_high *= num_params_to_consider # len(param_nodes)
+        memory_factor_low *= num_params_to_consider  # len(param_nodes)
+        memory_factor_high *= num_params_to_consider  # len(param_nodes)
         self.prob += (pulp.lpSum(elms) <= memory_factor_high, "memory_constraint_high")
         self.prob += (pulp.lpSum(elms) >= memory_factor_low, "memory_constraint_low")
 

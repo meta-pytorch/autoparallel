@@ -38,7 +38,7 @@ def _get_group_name_from_axis_name(mesh_name):
 
 def axis_size(axis_name):
     mesh = get_mesh_from_global()
-    # assert axis_name in mesh.mesh_dim_names
+    assert axis_name in mesh.mesh_dim_names
     axis_dim = mesh.mesh_dim_names.index(axis_name)
     return mesh.size(axis_dim)
 

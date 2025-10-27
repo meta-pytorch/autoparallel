@@ -201,7 +201,8 @@ class AutoParallel:
         **kwargs,
     ):
         self.stack = ExitStack()
-        self.fake_mode = FakeTensorMode(
+        self.fake_mode = (
+            FakeTensorMode()
         )  # TODO: maybe need to reuse the model's fake mode
         # self.fake_mode.allow_scalar_outputs = True
         device = _get_device_from_mesh(mesh)
