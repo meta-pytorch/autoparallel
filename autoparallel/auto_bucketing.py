@@ -4,7 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import torch
-from torch._inductor.fx_passes.overlap_scheduling import OverlapScheduler
+from torch._inductor.fx_passes.overlap_scheduling import schedule_overlap_bucketing
 
 from .autobucketing_util import bucket_func, bucket_plan, bucket_utils, reorder
 
@@ -106,9 +106,9 @@ class aten_autobucketing_config:
 def aten_autobucketing_reordering_pass(
     gm: torch.fx.Graph, configs: "aten_autobucketing_config"
 ) -> torch.fx.GraphModule:
-    return OverlapScheduler(
+    return schedule_overlap_bucketing(
         gm.owning_module,
         compute_overlap_multipler=configs.compute_overlap_multipler,
         max_in_flight_gb=configs.max_in_flight_gb,
         max_coll_distance=configs.max_coll_distance,
-    ).run()
+    )
