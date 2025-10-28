@@ -333,18 +333,25 @@ class ShardingOptimizer:
                             if node.target == operator.getitem:
                                 src_spec = src_spec[node.args[1]]
                             tgt_spec = ssi.input_specs[argi]
-                            assert isinstance(src_spec, DTensorSpec)
-                            assert isinstance(tgt_spec, DTensorSpec)
-                            # we use our custom comm_cost function to estimate the cost
-                            # of the collective operation
-                            comm_cost = estimate_strategy_comms_cost(src_spec, tgt_spec)
+                            if isinstance(src_spec, DTensorSpec) and isinstance(
+                                tgt_spec, DTensorSpec
+                            ):
+                                # we use our custom comm_cost function to estimate the cost
+                                # of the collective operation
+                                comm_cost = estimate_strategy_comms_cost(
+                                    src_spec, tgt_spec
+                                )
 
-                            redistribution_happened = (
-                                src_spec.placements != tgt_spec.placements
-                            )
-                            sharding_transition_cost = (
-                                int(redistribution_happened) * sharding_transition_scale
-                            )
+                                redistribution_happened = (
+                                    src_spec.placements != tgt_spec.placements
+                                )
+                                sharding_transition_cost = (
+                                    int(redistribution_happened)
+                                    * sharding_transition_scale
+                                )
+                            else:
+                                # e.g. getitem returning on scalars
+                                sharding_transition_cost = 0
                         else:
                             sharding_transition_cost = 0
 
@@ -773,8 +780,8 @@ class ShardingOptimizer:
                 old_size = math.prod(tensor_shape)
                 elms.append(data["va"] * new_size / old_size)
 
-        memory_factor_low *= num_params_to_consider # len(param_nodes)
-        memory_factor_high *= num_params_to_consider # len(param_nodes)
+        memory_factor_low *= num_params_to_consider  # len(param_nodes)
+        memory_factor_high *= num_params_to_consider  # len(param_nodes)
         self.prob += (pulp.lpSum(elms) <= memory_factor_high, "memory_constraint_high")
         self.prob += (pulp.lpSum(elms) >= memory_factor_low, "memory_constraint_low")
 
@@ -919,6 +926,9 @@ class ShardingOptimizer:
                         assert (
                             spec.tensor_meta is not None
                         ), f"{node} doesn't have a tensor_meta"
+            elif ospec is None:
+                # e.g. getitem on scalars
+                pass
             else:
                 assert (
                     ospec.tensor_meta is not None
@@ -930,6 +940,9 @@ class ShardingOptimizer:
                         assert (
                             spec.tensor_meta is not None
                         ), f"{node} input_spec doesn't have a tensor_meta"
+                elif ospec is None:
+                    # e.g. getitem on scalars
+                    pass
                 else:
                     assert (
                         ospec.tensor_meta is not None

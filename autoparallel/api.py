@@ -198,10 +198,12 @@ class AutoParallel:
         enable_ac: bool = True,
         # None means 'auto'
         ac_stage_size_in_GiB: Optional[Union[float, str]] = "auto",
+        dynamic: bool = False,
         **kwargs,
     ):
         self.stack = ExitStack()
-        self.fake_mode = FakeTensorMode(
+        self.fake_mode = (
+            FakeTensorMode()
         )  # TODO: maybe need to reuse the model's fake mode
         # self.fake_mode.allow_scalar_outputs = True
         device = _get_device_from_mesh(mesh)
@@ -228,8 +230,9 @@ class AutoParallel:
         self.enable_ac = enable_ac
         self.ac_stage_size_in_GiB = ac_stage_size_in_GiB
 
-        self.fake_mode.shape_env = ShapeEnv()
-        self.fake_mode.static_shapes = False
+        if dynamic:
+            self.fake_mode.shape_env = ShapeEnv()
+            self.fake_mode.static_shapes = False
 
         # NB: rest of the construction happens in __enter__
         self.active = False

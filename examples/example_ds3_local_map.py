@@ -1,24 +1,34 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
+# Copyright (c) Facebook, Inc. and its affiliates. All rights reserved.
 #
-# This source code is licensed under the BSD-style license found in the
+# This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
-from dataclasses import dataclass
-from typing import Callable, Literal
+import math
+from dataclasses import dataclass, field
+from typing import Callable, ClassVar, Literal, Tuple
 
 import torch
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 from torch import nn
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 # from torchtitan.distributed.expert_parallel import expert_parallel
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import Replicate, Shard
+from torch.fx.experimental.symbolic_shapes import ShapeEnv
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.testing._internal.distributed.fake_pg import FakeStore
 
 from autoparallel.api import AutoParallel
+from autoparallel.collectives import all_to_all, axis_size, local_map
 
-world_size = 2048
+# must symbolically evaluate to run on 32 dp ranks
+# world_size = 2048
+fake_evaluate = False
+
+world_size = 256
 
 fake_store = FakeStore()
 torch.distributed.init_process_group(
@@ -33,13 +43,6 @@ mesh = torch.distributed.device_mesh.init_device_mesh(
         "ep",
     ),
 )
-
-
-import torch
-import triton
-import triton.language as tl
-
-__all__ = ["generate_permute_indices"]
 
 
 # parallelized kernel
@@ -285,8 +288,6 @@ def expert_parallel(func: Callable) -> Callable:
             w1 = w1.to_local()
             w2 = w2.to_local()
             w3 = w3.to_local()
-
-        # from torchtitan.experiments.kernels.moe.indices import generate_permute_indices
 
         experts_per_ep_rank = w1.shape[0]
         num_ep_ranks = num_tokens_per_expert.shape[0] // experts_per_ep_rank
@@ -631,9 +632,6 @@ class TokenReorderer(nn.Module):
         )
 
 
-from autoparallel.collectives import all_reduce, all_to_all, axis_size, local_map
-
-
 def _token_dispatch(routed_input, num_tokens_per_expert, axis_name):
     # annotate module input placements/sharding with input_layouts
     # ep_size = device_mesh.shape[0]
@@ -694,13 +692,13 @@ def _token_combine(routed_output, input_splits, output_splits, axis_name):
 
 # @torch.library.custom_op("autoparallel::local_mapped_region", mutates_args=())
 def local_mapped_region(
-    x: torch.Tensor,
     selected_experts_indices: torch.Tensor,
     top_scores: torch.Tensor,
-    out: torch.Tensor,
+    x: torch.Tensor,
     experts_w1: torch.Tensor,
-    experts_w2: torch.Tensor,
     experts_w3: torch.Tensor,
+    experts_w2: torch.Tensor,
+    out: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     axis_name = "ep"
     # assert False, f"{x.shape}, {selected_experts_indices.shape}, {top_scores.shape}, {out.shape}"
@@ -776,6 +774,7 @@ def local_mapped_region(
 
     out = out.scatter_add(dim=1, index=token_indices_experts_sorted, src=routed_output)
     return out, total_tokens_per_expert[None, :]
+
 
 # @local_mapped_region.register_fake
 def _(
@@ -869,17 +868,6 @@ def _(
 # )
 
 
-
-# def forward(self,
-#     rms_norm_5: "f32[64, 2048, 256][524288, 256, 1]cuda:0",
-#     self____modules__layers____modules__1____modules__moe____modules__router____modules__gate____parameters__weight: "f32[8, 256][256, 1]cuda:0",
-#     self____modules__layers____modules__1____modules__moe____buffers__expert_bias: "f32[8][1]cuda:0",
-#     self____modules__layers____modules__1____modules__moe____modules__experts____parameters__w1: "f32[8, 256, 256][65536, 256, 1]cuda:0",
-#     self____modules__layers____modules__1____modules__moe____modules__experts____parameters__w3: "f32[8, 256, 256][65536, 256, 1]cuda:0",
-#     self____modules__layers____modules__1____modules__moe____modules__experts____parameters__w2: "f32[8, 256, 256][65536, 256, 1]cuda:0",
-#     self____modules__layers____modules__1____modules__moe____modules__shared_experts____modules__w1____parameters__weight: "f32[512, 256][256, 1]cuda:0",
-#     self____modules__layers____modules__1____modules__moe____modules__shared_experts____modules__w3____parameters__weight: "f32[512, 256][256, 1]cuda:0",
-#     self____modules__layers____modules__1____modules__moe____modules__shared_experts____modules__w2____parameters__weight: "f32[256, 512][512, 1]cuda:0"):
 def _moe_forward(
     x,
     router_gate_weight,
@@ -941,22 +929,33 @@ def _moe_forward(
     # This is in the local_map region
     ######################################################
 
-    expert_placements = ((Replicate(), Shard(0)),) * 3
-    in_placements = (
+    # expert_placements = ((Replicate(), Shard(0)),) * 3
+    # in_placements = (
+    #     (Shard(0), Shard(0)),
+    #     (Shard(0), Shard(0)),
+    #     (Shard(0), Shard(0)),
+    #     (Shard(0), Shard(0)),
+    # )
+    reordered_placements = (
         (Shard(0), Shard(0)),
         (Shard(0), Shard(0)),
         (Shard(0), Shard(0)),
+        (Replicate(), Shard(0)),
+        (Replicate(), Shard(0)),
+        (Replicate(), Shard(0)),
         (Shard(0), Shard(0)),
     )
+
     # assert False, f"{x.shape}, {selected_experts_indices.shape}, {top_scores.shape}, {out.shape}"
+    # [selected_experts_indices, top_scores_1, rms_norm_2, v_2, v_4, v_3, out]
     out, num_tokens_per_expert = local_map(
         local_mapped_region,
         out_placements=((Shard(0), Shard(0)), (Shard(0), Shard(0))),
-        in_placements=in_placements + expert_placements,
+        in_placements=reordered_placements,
         redistribute_inputs=True,
         in_grad_placements=None,
         device_mesh=mesh,
-    )(x, selected_experts_indices, top_scores, out, experts_w1, experts_w2, experts_w3)
+    )(selected_experts_indices, top_scores, x, experts_w1, experts_w3, experts_w2, out)
     # assert False, f"there: {out.shape}, {num_tokens_per_expert.shape}"
 
     ######################################################
@@ -1089,24 +1088,6 @@ class MoE(nn.Module):
                 self.expert_bias = torch.zeros(
                     self.experts.num_experts, dtype=torch.float32
                 )
-
-
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
-import math
-from dataclasses import dataclass, field
-from typing import Callable, ClassVar, Literal, Tuple
-
-import torch
-import torch.nn.functional as F
-from torch import nn
-from torch.nn.attention import SDPBackend, sdpa_kernel
-
-# from torchtitan.models.moe import FeedForward, MoE
 
 
 def has_cuda_capability(major: int, minor: int) -> bool:
@@ -1651,8 +1632,6 @@ if False:
         device=device,
     )
     o = model(x)
-# from IPython import embed; embed()
-
 
 bs = 4 * mesh.shape[0] * mesh.shape[1]
 seq_len = 1024
@@ -1698,7 +1677,7 @@ def input_fn():
     )
 
 
-with AutoParallel(model, input_fn, mesh) as autop:
+with AutoParallel(model, input_fn, mesh, dynamic=True) as autop:
     autop.add_parameter_memory_constraint(low=None, high=None)
 
     # x_sharding = (Shard(0), Replicate())
@@ -1708,25 +1687,38 @@ with AutoParallel(model, input_fn, mesh) as autop:
     autop.add_output_constraints([x_sharding])
 
     sharding_placement = autop.optimize_placement()
-    from IPython import embed; embed(); exit()
     parallel_mod = autop.apply_placement(sharding_placement)
 
-# run weight init on our sharded DTensor params
 parallel_mod.to_empty(device="cuda")
-parallel_mod.init_weights(
-    init_std=0.02, buffer_device="cuda"
-)  # maybe not correct value
-
-# # now let's run it
+# run weight init on our sharded DTensor params
+# TODO: plumb init_std through
+# parallel_mod.init_weights(
+#     init_std=0.02, buffer_device="cuda"
+# )  # maybe not correct value
+parallel_mod.init_weights(buffer_device="cuda")
 x = (
-    torch.randn(
-        # 0,
-        # args.vocab_size,
-        (bs // mesh.shape[0] // mesh.shape[1], seqlen, dim),
+    torch.randint(
+        0,
+        config.vocab_size,
+        (bs // mesh.shape[0] // mesh.shape[1], seq_len),
         device=torch.device("cuda"),
-        dtype=torch.bfloat16,
     ),
 )
-out = parallel_mod(*x)
-out.backward(torch.randn_like(out))
+
+# Symbolically evaluate in case you want to test running a graph bigger than your gpu
+if fake_evaluate:
+    # all gather on the tokens takes 128 GiB (4GiB * 32 ranks)
+    shape_env = ShapeEnv()
+    with FakeTensorMode(
+        allow_non_fake_inputs=True,
+        shape_env=shape_env,
+    ) as mode:
+        # # now let's run it
+        out = parallel_mod(*x)
+        out.backward(torch.randn_like(out))
+else:
+    out = parallel_mod(*x)
+    out.backward(torch.randn_like(out))
+
+
 print("All good!")
