@@ -19,6 +19,93 @@ def has_cuda_capability(major: int, minor: int) -> bool:
     )
 
 
+from torch.distributed.tensor.experimental._attention import (
+    _scaled_dot_product_ring_flash_attention,
+    _scaled_dot_product_ring_flash_attention_backward,
+)
+
+
+class _ContextParallelAttention(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, q, k, v, dropout_p, is_causal, scale, mesh):
+        ctx.scale = scale
+        ctx.is_causal = is_causal
+        ctx.dropout_p = dropout_p
+        ctx.mesh = mesh
+        # Tensor output, Tensor logsumexp, Tensor cum_seq_q, Tensor cum_seq_k, SymInt max_q, SymInt max_k, Tensor rng_state, Tensor unused, Tensor debug_attn_mask
+        (
+            out,
+            lse,
+            cum_seq_q,
+            cum_seq_k,
+            max_q,
+            max_k,
+            philox_seed,
+            philox_offset,
+            debug_attn_mask,
+        ) = _scaled_dot_product_ring_flash_attention(
+            mesh, q, k, v, dropout_p, is_causal, return_debug_mask=False, scale=scale
+        )
+        ctx.max_q = max_q
+        ctx.max_k = max_k
+        ctx.save_for_backward(
+            q, k, v, out, lse, cum_seq_q, cum_seq_k, philox_seed, philox_offset
+        )
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        (
+            q,
+            k,
+            v,
+            out,
+            lse,
+            cum_seq_q,
+            cum_seq_k,
+            philox_seed,
+            philox_offset,
+        ) = ctx.saved_tensors
+        return _scaled_dot_product_ring_flash_attention_backward(
+            ctx.mesh,
+            grad_out,
+            q,
+            k,
+            v,
+            out,
+            lse,
+            cum_seq_q,
+            cum_seq_k,
+            ctx.max_q,
+            ctx.max_k,
+            ctx.dropout_p,
+            ctx.is_causal,
+            philox_seed,
+            philox_offset,
+            scale=ctx.scale,
+        )
+
+
+from torch.distributed.tensor.placement_types import Replicate, Shard
+
+from autoparallel.collectives import get_mesh_from_global, local_map
+
+
+def context_parallel_attention(q, k, v, *, dropout_p=0.0, is_causal=False, scale=None):
+    mesh = get_mesh_from_global()
+    plc = (Shard(0), Shard(2))
+    out_placements = (plc,)
+    in_placements = (plc, plc, plc, None, None, None, None)
+    return local_map(
+        _ContextParallelAttention.apply,
+        out_placements=out_placements,
+        in_placements=in_placements,
+        redistribute_inputs=True,
+        in_grad_placements=None,
+        device_mesh=mesh,
+    )(q, k, v, dropout_p, is_causal, scale, mesh["tp"])
+
+
 class ScaledDotProductAttention(torch.nn.Module):
     backends: ClassVar[list[SDPBackend]] = []
 
@@ -49,8 +136,9 @@ class ScaledDotProductAttention(torch.nn.Module):
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
     ) -> torch.Tensor:
         assert self.backends, "SDPA Backends should not be empty."
-        with sdpa_kernel(self.backends, set_priority=True):
-            return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        # with sdpa_kernel(self.backends, set_priority=True):
+        #     return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        return context_parallel_attention(q, k, v, is_causal=True)
 
 
 def build_attention(
