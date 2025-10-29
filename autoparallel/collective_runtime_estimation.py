@@ -135,6 +135,9 @@ def redistribute_cost(
             # this redistribute in our case
             return float("inf")
 
+        # once we redistribute across one mesh dim, assume the output
+        # is now contiguous. This is generally the case for most operations,
+        # except when we fuse nd collectives into a 1d collective.
         is_contiguous = True
 
     return cost
