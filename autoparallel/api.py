@@ -598,7 +598,7 @@ class AutoParallel:
                 bw_args = [*ctx.non_tensors, *ctx.saved_tensors, *tangents]
                 assert len([n for n in ctx.bw_module.graph.nodes if n.op == "placeholder"]) == len(bw_args), "Mismatched number of inputs to bwd"
                 bw_outputs = torch.fx.Interpreter(ctx.bw_module).boxed_run(bw_args)
-                result = bw_outputs + (None,) * 2
+                result = bw_outputs + (None,) * 2  # for fw_module, bw_module
                 return result
 
         class AutoParallelPPModule(torch.nn.Module):
