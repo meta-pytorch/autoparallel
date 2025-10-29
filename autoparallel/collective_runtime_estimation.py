@@ -138,9 +138,8 @@ def redistribute_cost(
 
 def estimate_strategy_comms_cost(src_spec, tgt_spec):
     order = list(range(src_spec.mesh.ndim))
-    if src_spec.placements == (Partial(), Partial()) and tgt_spec.placements == (
-        Shard(0),
-        Shard(0),
+    if src_spec.placements == (Partial(), Partial()) and all(
+        p.is_shard() for p in tgt_spec.placements
     ):
         order = [1, 0]
     comms_cost = redistribute_cost(src_spec, tgt_spec, order)
