@@ -5,8 +5,8 @@
 
 from typing import cast
 
-import torch
 import torch.distributed.tensor._dtensor_spec as dtensor_spec
+from torch._prims_common import check_contiguous_sizes_strides
 from torch.distributed.tensor._collective_utils import (
     MeshTopoInfo,
     allgather_cost,
@@ -71,10 +71,9 @@ def redistribute_cost(
     # 3. allreduce 4. reduce_scatter
     curr_placements = [current_spec.placements[i] for i in order]
     tgt_placements = [target_spec.placements[i] for i in order]
-    # TODO: is there a better way of doing this that doesn't involve making a tensor?
-    is_contiguous: bool = torch.empty_strided(
-        current_spec.shape, current_spec.stride, device="meta"
-    ).is_contiguous()
+    is_contiguous: bool = check_contiguous_sizes_strides(
+        current_spec.shape, current_spec.stride
+    )
     for i, current, target in zip(order, curr_placements, tgt_placements):
         if current == target:
             continue
