@@ -118,7 +118,7 @@ class LastPipelineStage(PipelineStage):
         self.norm = norm
         self.output = output
 
-    def forward(self, tokens):
+    def forward(self, h):
         for layer in self.layers.values():
             h = layer(h, self.freqs_cis)
         h = self.norm(h) if self.norm is not None else h
@@ -151,10 +151,12 @@ def runtime_input_fn():
     )
 
 def runtime_input_fn_after_first_stage():
-    return torch.randn(
-        (bs // mesh.shape[0] // mesh.shape[1], seq_len, config.dim),
-        device=device,
-        dtype=torch.bfloat16,
+    return (
+        torch.randn(
+            (bs // mesh.shape[0] // mesh.shape[1], seq_len, config.dim),
+            device=device,
+            dtype=torch.bfloat16,
+        ),
     )
 
 with torch.device("meta"):
@@ -167,10 +169,15 @@ with torch.device("meta"):
     stage6 = PipelineStage(layers[6])
     stage7 = LastPipelineStage(layers[7], norm, output)
 
-model = stage0
-# model = stage1
-# input_fn = input_fn_after_first_stage
-# runtime_input_fn = runtime_input_fn_after_first_stage
+####################
+# Stage 0
+# model = stage0
+
+# Stage 1-7
+model = stage7
+input_fn = input_fn_after_first_stage
+runtime_input_fn = runtime_input_fn_after_first_stage
+####################
 
 with AutoParallel(model, input_fn, mesh, dynamic=True) as autop:
     autop.add_parameter_memory_constraint(low=None, high=None)
