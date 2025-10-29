@@ -578,6 +578,7 @@ class AutoParallel:
                 fw_module = args[-2]
                 ctx.bw_module = args[-1]
                 fw_args = list(args[:-2])
+                assert len([n for n in fw_module.graph.nodes if n.op == "placeholder"]) == len(fw_args), "Mismatched number of inputs to fwd"
                 fw_outputs = torch.fx.Interpreter(fw_module).boxed_run(fw_args)
                 num_inner_fwd_outputs = num_mutate_inputs + num_user_outputs
                 saved_intermediates = fw_outputs[num_inner_fwd_outputs:]
@@ -595,6 +596,7 @@ class AutoParallel:
             @staticmethod
             def backward(ctx, *tangents):
                 bw_args = [*ctx.non_tensors, *ctx.saved_tensors, *tangents]
+                assert len([n for n in ctx.bw_module.graph.nodes if n.op == "placeholder"]) == len(bw_args), "Mismatched number of inputs to bwd"
                 bw_outputs = torch.fx.Interpreter(ctx.bw_module).boxed_run(bw_args)
                 result = bw_outputs + (None,) * 2
                 return result
