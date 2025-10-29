@@ -5,6 +5,7 @@
 
 from typing import cast
 
+import torch
 import torch.distributed.tensor._dtensor_spec as dtensor_spec
 from torch.distributed.tensor._collective_utils import (
     MeshTopoInfo,
@@ -70,10 +71,16 @@ def redistribute_cost(
     # 3. allreduce 4. reduce_scatter
     curr_placements = [current_spec.placements[i] for i in order]
     tgt_placements = [target_spec.placements[i] for i in order]
+    # TODO: is there a better way of doing this that doesn't involve making a tensor?
+    is_contiguous: bool = torch.empty_strided(
+        current_spec.shape, current_spec.stride, device="meta"
+    ).is_contiguous()
     for i, current, target in zip(order, curr_placements, tgt_placements):
         if current == target:
             continue
         num_devices_on_mesh_dim = mesh_topo.mesh_dim_devices[i]
+        if not is_contiguous:
+            cost += compute_read_write_time(comm_bytes_gb * 2 * 1024**3)
         if current.is_shard() and target.is_replicate():
             current = cast(Shard, current)
             # allgather gives larger comm bytes
@@ -95,10 +102,6 @@ def redistribute_cost(
             cost += all_to_all_cost(comm_bytes_gb, mesh_topo, i)  # us
 
             num_copies = 0
-            is_contiguous = False
-            if not is_contiguous:
-                num_copies += 1
-
             if current.dim != 0:
                 num_copies += 1
 
@@ -132,6 +135,8 @@ def redistribute_cost(
             # ban replicate -> partial as it does not make sense to perform
             # this redistribute in our case
             return float("inf")
+
+        is_contiguous = True
 
     return cost
 
