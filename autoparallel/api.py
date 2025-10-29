@@ -572,6 +572,26 @@ class AutoParallel:
             adjusted_flat_args,
         ) = partition_joint_with_descriptors(self.joint_with_descriptors)
 
+        trace_structured(
+            "artifact",
+            metadata_fn=lambda: {
+                "name": "autoparallel_pp_fwd_graph",
+                "encoding": "string",
+            },
+            payload_fn=lambda: fw_module.print_readable(
+                print_output=False, include_stride=True, include_device=True
+            ),
+        )
+        trace_structured(
+            "artifact",
+            metadata_fn=lambda: {
+                "name": "autoparallel_pp_bwd_graph",
+                "encoding": "string",
+            },
+            payload_fn=lambda: bw_module.print_readable(
+                print_output=False, include_stride=True, include_device=True
+            ),
+        )
         class AutoParallelPPStage(torch.autograd.Function):
             @staticmethod
             def forward(ctx, *args):
