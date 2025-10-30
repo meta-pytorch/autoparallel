@@ -176,68 +176,71 @@ with torch.device("meta"):
     stage5 = PipelineStage(layers[5])
     stage6 = PipelineStage(layers[6])
     stage7 = LastPipelineStage(layers[7], norm, output)
+    stages = [
+        stage0, stage1, stage2, stage3, stage4, stage5, stage6, stage7
+    ]
+
+def parallelize_and_run(model, input_fn, runtime_input_fn):
+    with AutoParallel(model, input_fn, mesh, dynamic=True) as autop:
+        autop.add_parameter_memory_constraint(low=None, high=None)
+
+        x_sharding = (Shard(0), Shard(0))
+
+        autop.add_input_constraints([x_sharding])
+        autop.add_output_constraints([x_sharding])
+
+        sharding_placement = autop.optimize_placement()
+        pp_mod = autop.apply_placement_pp(sharding_placement)
+
+    pp_mod.to_empty(device="cuda")
+    # run weight init on our sharded DTensor params
+    # TODO: plumb init_std through
+    # pp_mod.init_weights(
+    #     init_std=0.02, buffer_device="cuda"
+    # )  # maybe not correct value
+    pp_mod.init_weights(buffer_device="cuda")
+    x = runtime_input_fn()
+
+    # Run Ivan's FSDP pass
+    #   Doesn't work :(
+    #   [rank0]: Traceback (most recent call last):
+    #   [rank0]:   File "/home/xmfan/core/a/autoparallel/tests/test_graph_partition.py", line 209, in <module>
+    #   [rank0]:     g = autop.parallel_gm.graph
+    #   [rank0]:                     ^^^^^^^^^^^^
+    #   [rank0]:   File "/home/xmfan/core/a/autoparallel/autoparallel/pipeline/passes.py", line 94, in split_fsdp_prefetch
+    #   [rank0]:     main_g = _extract_graph_with_inputs_outputs(
+    #   [rank0]:              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    #   [rank0]:   File "/home/xmfan/core/a/pytorch/torch/_functorch/partitioners.py", line 243, in _extract_graph_with_inputs_outputs
+    #   [rank0]:     assert not isinstance(env[x], InvalidNodeBase), (
+    #   [rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    #   [rank0]: AssertionError: Node add_136 was invalid, but is output
+    # g = autop.parallel_gm.graph
+    # g_pro, g_main = split_fsdp_prefetch(g)
+    # g_main, g_epi = split_fsdp_reduce_scatters_epilogue(g_main)
+
+    # Symbolically evaluate in case you want to test running a graph bigger than your gpu
+
+    with (
+        FakeTensorMode(
+            allow_non_fake_inputs=True,
+            shape_env=ShapeEnv(),
+        )
+        if fake_evaluate
+        else nullcontext()
+    ):
+        # # now let's run it
+        output = pp_mod(*x)
+        assert not isinstance(output, tuple)
+        output.backward(torch.randn_like(output))
 
 ####################
-# Stage 0
-# model = stage0
+# Run each stage one after the other
 
-# Stage 1-7
-model = stage1
-input_fn = input_fn_after_first_stage
-runtime_input_fn = runtime_input_fn_after_first_stage
-####################
-
-with AutoParallel(model, input_fn, mesh, dynamic=True) as autop:
-    autop.add_parameter_memory_constraint(low=None, high=None)
-
-    x_sharding = (Shard(0), Shard(0))
-
-    autop.add_input_constraints([x_sharding])
-    autop.add_output_constraints([x_sharding])
-
-    sharding_placement = autop.optimize_placement()
-    pp_mod = autop.apply_placement_pp(sharding_placement)
-
-pp_mod.to_empty(device="cuda")
-# run weight init on our sharded DTensor params
-# TODO: plumb init_std through
-# pp_mod.init_weights(
-#     init_std=0.02, buffer_device="cuda"
-# )  # maybe not correct value
-pp_mod.init_weights(buffer_device="cuda")
-x = runtime_input_fn()
-
-# Run Ivan's FSDP pass
-#   Doesn't work :(
-#   [rank0]: Traceback (most recent call last):
-#   [rank0]:   File "/home/xmfan/core/a/autoparallel/tests/test_graph_partition.py", line 209, in <module>
-#   [rank0]:     g = autop.parallel_gm.graph
-#   [rank0]:                     ^^^^^^^^^^^^
-#   [rank0]:   File "/home/xmfan/core/a/autoparallel/autoparallel/pipeline/passes.py", line 94, in split_fsdp_prefetch
-#   [rank0]:     main_g = _extract_graph_with_inputs_outputs(
-#   [rank0]:              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-#   [rank0]:   File "/home/xmfan/core/a/pytorch/torch/_functorch/partitioners.py", line 243, in _extract_graph_with_inputs_outputs
-#   [rank0]:     assert not isinstance(env[x], InvalidNodeBase), (
-#   [rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-#   [rank0]: AssertionError: Node add_136 was invalid, but is output
-# g = autop.parallel_gm.graph
-# g_pro, g_main = split_fsdp_prefetch(g)
-# g_main, g_epi = split_fsdp_reduce_scatters_epilogue(g_main)
-
-# Symbolically evaluate in case you want to test running a graph bigger than your gpu
-
-with (
-    FakeTensorMode(
-        allow_non_fake_inputs=True,
-        shape_env=ShapeEnv(),
-    )
-    if fake_evaluate
-    else nullcontext()
-):
-    # # now let's run it
-    output = pp_mod(*x)
-    assert not isinstance(output, tuple)
-    output.backward(torch.randn_like(output))
-
+for i, stage in enumerate(stages):
+    print(f"Running stage {i}")
+    if i == 0:
+        parallelize_and_run(stage, input_fn, runtime_input_fn)
+    else:
+        parallelize_and_run(stage, input_fn_after_first_stage, runtime_input_fn_after_first_stage)
 
 print("All good!")
