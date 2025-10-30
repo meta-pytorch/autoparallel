@@ -12,6 +12,7 @@ from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
 from torch.testing._internal.distributed.fake_pg import FakeStore
 
 from autoparallel._passes.graph_multiplex import multiplex_fw_bw_graph
+from autoparallel._passes.split_di_dw_graph import split_di_dw_graph
 from autoparallel._passes.split_fsdp_collectives import split_fsdp_prefetch
 from autoparallel._testing.models.llama3 import Transformer, TransformerModelArgs
 from autoparallel.api import AutoParallel
@@ -83,11 +84,18 @@ def model_fn():
     else:
         raise ValueError(f"{model_type} not available")
     m = Transformer(model_args)
+    # I turned of the tok_embeddings layer because:
+    # - I want the input to my joint graph to require grad,
+    #   so I can generate separate dI and dW gradients to carve out subgraphs for
+    # - The input to tok_embeddings is an integral tensor which can't require grad.
+    # Another option would be to manually apply autoparallel to a single transformer block layer.
+    m.tok_embeddings = None
     return m
 
 
 def input_fn():
-    x = torch.randint(0, vocab_size, (batch_size, seqlen), device=device)
+    # 8192 for 70B
+    x = torch.randn(batch_size, seqlen, 4096, device=device, requires_grad=True)
     return x
 
 
@@ -275,6 +283,24 @@ with AutoParallel(
         multiplexed_gm = multiplex_fw_bw_graph(main_f_gm, main_b_gm)
         print("Multiplexed Graph:")
         print(multiplexed_gm.graph)
+        # in the AOTAutograd bw graph, the first K outputs correspond
+        # to gradients for any params/buffers in the user model
+        num_weight_gradients = autop.joint_with_descriptors._aot_state.aot_config.num_params_buffers
+        main_b_gm_di, main_b_gm_dw = split_di_dw_graph(main_b_gm, num_weight_gradients=num_weight_gradients)
+        print("Gradient w.r.t inputs Graph:")
+        print(main_b_gm_di)
+        print("Gradient w.r.t weights Graph:")
+        print(main_b_gm_dw)
+        # Test just to show that input/output calling conventions are correct
+        # the pipeline runtime will need to do this
+        num_total_gradients = len(main_b_gm.graph.find_nodes(op='output')[0].args[0])
+        num_input_gradients = num_total_gradients - num_weight_gradients
+        bw_args = [x.meta['val'] for x in main_b_gm.graph.find_nodes(op="placeholder")]
+        input_grads_and_activations = main_b_gm_di(*bw_args)
+        input_grads, activations = input_grads_and_activations[:num_input_gradients], input_grads_and_activations[num_input_gradients:]
+        weight_grads = main_b_gm_dw(*activations)
+        print(f'num input grads: {len(input_grads)}')
+        print(f'num weight grads: {len(weight_grads)}')
 
 # run weight init on our sharded DTensor params
 parallel_mod.to_empty(device="cuda")
@@ -289,6 +315,6 @@ x = (
         device=torch.device("cuda"),
     ),
 )
-out = parallel_mod(*x)
-out.backward(torch.randn_like(out))
+#out = parallel_mod(*x)
+#out.backward(torch.randn_like(out))
 print("All good!")
