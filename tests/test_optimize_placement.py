@@ -9,6 +9,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch._functorch._aot_autograd.fx_utils import get_param_nodes
 from torch.distributed._tensor.experimental import local_map
 from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
 from torch.testing._internal.distributed.fake_pg import FakeStore
@@ -156,9 +157,7 @@ def test_optimization_finds_fsdp_and_ddp_1d(device_mesh_1d, high_mem, model_type
         sharding_placement = autop.optimize_placement()
 
     # check parameters are sharded as expected, i.e., either replicated or sharded
-    param_nodes = [
-        n for n in autop.gm.graph.find_nodes(op="placeholder") if "param" in n.target
-    ]
+    param_nodes = get_param_nodes(autop.gm.graph)
     placement = {None: (Shard(0),), 1.0: (Replicate(),)}[high_mem]
     for node in param_nodes:
         assert sharding_placement[node].output_specs.placements == placement
@@ -287,9 +286,7 @@ def test_optimization_finds_fsdp_tp_2d(
         sharding_placement = autop.optimize_placement()
 
     # check parameters are sharded as expected
-    param_nodes = [
-        n for n in autop.gm.graph.find_nodes(op="placeholder") if "param" in n.target
-    ]
+    param_nodes = get_param_nodes(autop.gm.graph)
     for node, expected_placement in zip(param_nodes, expected_param_placements):
         assert sharding_placement[node].output_specs.placements == expected_placement
 
@@ -494,3 +491,43 @@ def test_local_map_placement_respected(device_mesh_local_map, device="cuda"):
         == grad_v_spec.placements
         == (Shard(0), Shard(1), Replicate())
     )
+
+
+@patch("torch.cuda.device_count", lambda: 8)
+@patch("torch.cuda.get_device_name", lambda device: "H100")
+def test_world_size_larger_than_parameter(device_mesh_1d):
+    # make a parameter which is smaller than the world size
+    dim: int = device_mesh_1d.shape[0] // 2
+
+    class Model(nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            self.param = nn.Parameter(torch.rand(dim))
+
+        def forward(self, x):
+            return x + self.param
+
+        def init_weights(self):
+            self.param.uniform_()
+
+    def input_fn():
+        b = 512
+        inputs = (torch.rand(b, dim, device="cuda"),)
+        return inputs
+
+    with torch.device("meta"):
+        model = Model(dim)
+    with AutoParallel(
+        model,
+        input_fn,
+        device_mesh_1d,
+    ) as autop:
+        x_sharding = (Shard(0),)
+        autop.add_input_constraints([x_sharding])
+        autop.add_parameter_memory_constraint()
+        sharding_placement = autop.optimize_placement()
+
+    # check parameters are sharded as expected
+    param_nodes = get_param_nodes(autop.gm.graph)
+    for node in param_nodes:
+        assert sharding_placement[node].output_specs.placements == (Replicate(),)

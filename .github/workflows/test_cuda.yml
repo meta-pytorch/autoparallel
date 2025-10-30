@@ -45,3 +45,4 @@ jobs:
         python examples/example_llama3.py
         python examples/example_dcp.py
         python examples/example_local_map.py
+        python examples/example_ds3_local_map.py

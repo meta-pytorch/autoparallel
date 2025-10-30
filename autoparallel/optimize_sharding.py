@@ -752,7 +752,9 @@ class ShardingOptimizer:
                     _get_next_name("grad_param_constraint"),
                 )
 
-    def add_parameter_memory_constraint(self, memory_factor_low, memory_factor_high):
+    def add_parameter_memory_constraint(
+        self, memory_factor_low: float, memory_factor_high: float
+    ):
         """
         USER CONSTRAINTS (Category 6b): Memory constraints for parameters.
         Ensures total parameter memory usage stays within specified bounds.
@@ -760,28 +762,29 @@ class ShardingOptimizer:
         Mathematical form: Σ_{params} (size_ratio * x_{param}) ≤ memory_limit
         """
         # get all parameters
-        param_nodes = get_param_nodes(self.graph)
-        elms = []
-        num_params_to_consider = 0
-        world_size = math.prod(self.mesh.shape)
+        param_nodes: list[torch.fx.Node] = get_param_nodes(self.graph)
+        elms: list[pulp.LpAffineExpression] = []
+        num_params_to_consider: int = 0
+        world_size: int = math.prod(self.mesh.shape)
         for node in param_nodes:
             s_i = self.node_map[node]
             vv = self.num_inp_out[(s_i, 0)]
-            can_be_fully_sharded = node.meta["val"].numel() >= world_size
+            can_be_fully_sharded: bool = node.meta["val"].numel() >= world_size
             num_params_to_consider += int(can_be_fully_sharded)
             if not can_be_fully_sharded:
                 continue
             for ii in range(vv["num_output_strat"]):
                 data = self.ds[(s_i, 0, ii, 0)]
-                spec = data["inp_strat"]
-                tensor_shape = spec.tensor_meta.shape
+                spec: DTensorSpec = data["inp_strat"]
+                assert spec.tensor_meta is not None
+                tensor_shape: torch.Size = spec.tensor_meta.shape
                 new_tensor_shape, _ = _get_sharded_shape_stride(spec)
-                new_size = math.prod(new_tensor_shape)
-                old_size = math.prod(tensor_shape)
+                new_size: int = math.prod(new_tensor_shape)
+                old_size: int = math.prod(tensor_shape)
                 elms.append(data["va"] * new_size / old_size)
 
-        memory_factor_low *= num_params_to_consider  # len(param_nodes)
-        memory_factor_high *= num_params_to_consider  # len(param_nodes)
+        memory_factor_low *= num_params_to_consider
+        memory_factor_high *= num_params_to_consider
         self.prob += (pulp.lpSum(elms) <= memory_factor_high, "memory_constraint_high")
         self.prob += (pulp.lpSum(elms) >= memory_factor_low, "memory_constraint_low")
 
