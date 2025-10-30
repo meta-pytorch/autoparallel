@@ -11,6 +11,7 @@ from typing import Callable
 import torch
 import torch.distributed._tools.fake_collectives
 import torch.nn as nn
+from torch._logging import trace_structured
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.distributed.pipelining.schedules import (
     FORWARD,
@@ -335,6 +336,14 @@ def run_test(fake_evaluate: bool = False, use_fake_pg: bool = True):
     stage_graph_metas: dict[int, GraphMeta] = {}
     # Step 3. Apply AutoParallel to each logical stage assigned to this pp rank
     for stage_idx in stage_indices_current_pp_rank:
+        trace_structured(
+            "artifact",
+            metadata_fn=lambda: {
+                "name": f"begin_tracing_stage_{stage_idx}",
+                "encoding": "string",
+            },
+            payload_fn=lambda: "placeholder text",
+        )
         stage_mod = logical_stages[stage_idx]
         if stage_idx == 0:
             input_fn = tracing_input_fn
@@ -366,6 +375,14 @@ def run_test(fake_evaluate: bool = False, use_fake_pg: bool = True):
             num_user_outputs=pp_mod.graph_meta["num_user_outputs"],
             num_symints_saved_for_bw=pp_mod.graph_meta["num_symints_saved_for_bw"],
             num_weight_buffer_grads=pp_mod.graph_meta["num_weight_buffer_grads"],
+        )
+        trace_structured(
+            "artifact",
+            metadata_fn=lambda: {
+                "name": f"end_tracing_stage_{stage_idx}",
+                "encoding": "string",
+            },
+            payload_fn=lambda: "placeholder text",
         )
 
     # Two stages per pp rank
