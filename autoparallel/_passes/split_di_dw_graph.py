@@ -14,8 +14,9 @@ from functorch.compile import default_partition
 
 def remove_recompute_tags(bw_gm):
     for n in bw_gm.graph.nodes:
-        if 'recompute' in n.meta:
-            del n.meta['recompute']
+        if "recompute" in n.meta:
+            del n.meta["recompute"]
+
 
 # We are using the default partitioner to split our backward into dI and dW subgraphs.
 # We want to generate the dI subgraph *first*, because:
@@ -26,11 +27,14 @@ def remove_recompute_tags(bw_gm):
 
 
 def reorder_output_grads(bw_gm, num_weight_gradients):
-    outputs = bw_gm.graph.find_nodes(op='output')
+    outputs = bw_gm.graph.find_nodes(op="output")
     assert len(outputs) == 1
     output = outputs[0]
     assert isinstance(output.args[0], tuple)
-    grad_weights, grad_inputs = output.args[0][:num_weight_gradients], output.args[0][num_weight_gradients:]
+    grad_weights, grad_inputs = (
+        output.args[0][:num_weight_gradients],
+        output.args[0][num_weight_gradients:],
+    )
     new_out_tuple = grad_inputs + grad_weights
     with bw_gm.graph.inserting_after(output):
         # TODO: also set the new node's meta properly
@@ -43,14 +47,18 @@ def reorder_output_grads(bw_gm, num_weight_gradients):
 # TODO: in theory we can infer num_weight_gradients from the graph metadata directly
 
 
-def split_di_dw_graph(bw_gm: fx.GraphModule, *, num_weight_gradients) -> tuple[fx.GraphModule, fx.GraphModule]:
+def split_di_dw_graph(
+    bw_gm: fx.GraphModule, *, num_weight_gradients
+) -> tuple[fx.GraphModule, fx.GraphModule]:
     # we could consider doing this is a non-mutating way
     bw_gm = copy.deepcopy(bw_gm)
     remove_recompute_tags(bw_gm)
     num_input_gradients = reorder_output_grads(bw_gm, num_weight_gradients)
     bw_gm.recompile()
 
-    args = [x.meta['val'] for x in bw_gm.graph.find_nodes(op="placeholder")]
+    args = [x.meta["val"] for x in bw_gm.graph.find_nodes(op="placeholder")]
 
-    bw_inputs, bw_weights = default_partition(bw_gm, args, num_fwd_outputs=num_input_gradients)
+    bw_inputs, bw_weights = default_partition(
+        bw_gm, args, num_fwd_outputs=num_input_gradients
+    )
     return bw_inputs, bw_weights

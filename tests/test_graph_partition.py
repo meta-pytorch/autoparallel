@@ -6,6 +6,10 @@
 from contextlib import nullcontext
 
 import torch
+from torch._subclasses.fake_tensor import FakeTensorMode
+from torch.distributed.tensor.placement_types import Shard
+from torch.fx.experimental.symbolic_shapes import ShapeEnv
+from torch.testing._internal.distributed.fake_pg import FakeStore
 
 from autoparallel._testing.models.dsv3 import (
     DeepSeekV3Model,
@@ -13,10 +17,6 @@ from autoparallel._testing.models.dsv3 import (
     MoEArgs,
 )
 from autoparallel.api import AutoParallel
-from torch._subclasses.fake_tensor import FakeTensorMode
-from torch.distributed.tensor.placement_types import Shard
-from torch.fx.experimental.symbolic_shapes import ShapeEnv
-from torch.testing._internal.distributed.fake_pg import FakeStore
 
 # must symbolically evaluate to run on 32 dp ranks
 # world_size = 2048

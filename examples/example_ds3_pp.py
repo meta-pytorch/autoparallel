@@ -11,6 +11,20 @@ from typing import Callable
 import torch
 import torch.distributed._tools.fake_collectives
 import torch.nn as nn
+from torch._subclasses.fake_tensor import FakeTensorMode
+from torch.distributed.pipelining.schedules import (
+    FORWARD,
+    FULL_BACKWARD,
+    PipelineScheduleMulti,
+    _PipelineSchedule,
+    _PipelineScheduleRuntime,
+    get_schedule_class,
+)
+from torch.distributed.pipelining.stage import PipelineStage
+from torch.distributed.tensor.placement_types import Shard
+from torch.fx.experimental.symbolic_shapes import ShapeEnv
+from torch.testing._internal.distributed.fake_pg import FakeStore
+
 from autoparallel._testing.models.dsv3 import (
     DeepSeekV3Model,
     DeepSeekV3ModelArgs,
@@ -25,20 +39,6 @@ from autoparallel.graph_pp_runner import (
     run_backward_graph,
     run_forward_graph,
 )
-from torch._subclasses.fake_tensor import FakeTensorMode
-
-from torch.distributed.pipelining.schedules import (
-    _PipelineSchedule,
-    _PipelineScheduleRuntime,
-    FORWARD,
-    FULL_BACKWARD,
-    get_schedule_class,
-    PipelineScheduleMulti,
-)
-from torch.distributed.pipelining.stage import PipelineStage
-from torch.distributed.tensor.placement_types import Shard
-from torch.fx.experimental.symbolic_shapes import ShapeEnv
-from torch.testing._internal.distributed.fake_pg import FakeStore
 
 logger = logging.getLogger(__name__)
 

@@ -285,22 +285,29 @@ with AutoParallel(
         print(multiplexed_gm.graph)
         # in the AOTAutograd bw graph, the first K outputs correspond
         # to gradients for any params/buffers in the user model
-        num_weight_gradients = autop.joint_with_descriptors._aot_state.aot_config.num_params_buffers
-        main_b_gm_di, main_b_gm_dw = split_di_dw_graph(main_b_gm, num_weight_gradients=num_weight_gradients)
+        num_weight_gradients = (
+            autop.joint_with_descriptors._aot_state.aot_config.num_params_buffers
+        )
+        main_b_gm_di, main_b_gm_dw = split_di_dw_graph(
+            main_b_gm, num_weight_gradients=num_weight_gradients
+        )
         print("Gradient w.r.t inputs Graph:")
         print(main_b_gm_di)
         print("Gradient w.r.t weights Graph:")
         print(main_b_gm_dw)
         # Test just to show that input/output calling conventions are correct
         # the pipeline runtime will need to do this
-        num_total_gradients = len(main_b_gm.graph.find_nodes(op='output')[0].args[0])
+        num_total_gradients = len(main_b_gm.graph.find_nodes(op="output")[0].args[0])
         num_input_gradients = num_total_gradients - num_weight_gradients
-        bw_args = [x.meta['val'] for x in main_b_gm.graph.find_nodes(op="placeholder")]
+        bw_args = [x.meta["val"] for x in main_b_gm.graph.find_nodes(op="placeholder")]
         input_grads_and_activations = main_b_gm_di(*bw_args)
-        input_grads, activations = input_grads_and_activations[:num_input_gradients], input_grads_and_activations[num_input_gradients:]
+        input_grads, activations = (
+            input_grads_and_activations[:num_input_gradients],
+            input_grads_and_activations[num_input_gradients:],
+        )
         weight_grads = main_b_gm_dw(*activations)
-        print(f'num input grads: {len(input_grads)}')
-        print(f'num weight grads: {len(weight_grads)}')
+        print(f"num input grads: {len(input_grads)}")
+        print(f"num weight grads: {len(weight_grads)}")
 
 # run weight init on our sharded DTensor params
 parallel_mod.to_empty(device="cuda")

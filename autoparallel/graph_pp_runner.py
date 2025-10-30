@@ -5,7 +5,7 @@
 
 import itertools
 from dataclasses import dataclass
-from typing import Any, Callable, cast, Optional, Union
+from typing import Any, Callable, Optional, Union, cast
 
 import torch
 import torch.fx as fx
@@ -16,8 +16,8 @@ from torch.distributed.pipelining.schedules import (
     _wait_batch_p2p,
 )
 from torch.distributed.pipelining.stage import (
-    _normalize_model_output_as_tuple,
     PipelineStage,
+    _normalize_model_output_as_tuple,
 )
 from torch.distributed.tensor import DTensor
 

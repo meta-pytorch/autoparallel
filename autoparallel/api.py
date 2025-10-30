@@ -6,7 +6,7 @@
 import copy
 import itertools
 import warnings
-from contextlib import contextmanager, ExitStack
+from contextlib import ExitStack, contextmanager
 from types import MethodType
 from typing import Any, Optional, Union
 
@@ -122,7 +122,7 @@ def move_to_fake(model: torch.nn.Module, mode: FakeTensorMode, device: torch.dev
 # can patch the verification logic.
 @contextmanager
 def monkey_patch_export_verifier():
-    from torch._export.verifier import final, SpecViolationError, Verifier
+    from torch._export.verifier import SpecViolationError, Verifier, final
 
     prior = Verifier._check_graph_module
 
