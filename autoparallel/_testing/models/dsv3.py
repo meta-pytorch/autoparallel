@@ -1,3 +1,8 @@
+# Copyright (c) Facebook, Inc. and its affiliates. All rights reserved.
+#
+# This source code is licensed under the BSD license found in the
+# LICENSE file in the root directory of this source tree.
+
 import math
 from dataclasses import dataclass, field
 from typing import Callable, ClassVar, Literal, Optional, Tuple
@@ -123,14 +128,17 @@ def fill_indices_cpu(
     # For each local expert
     for e in range(experts_per_rank):
         write_start = write_offsets[e].item()
+        assert isinstance(write_start, int)
         # For each remote rank
         for r in range(num_ranks):
-            i = r * experts_per_rank + e
+            i: int = r * experts_per_rank + e
             start_index = start_index_values[i].item()
             length = tokens_per_expert_group[i].item()
+            assert isinstance(start_index, int)
+            assert isinstance(length, int)
             # Fill in the indices
             if length > 0:
-                end_idx = min(write_start + length, max_len)
+                end_idx: int = min(write_start + length, max_len)
                 permuted_indices[write_start:end_idx] = torch.arange(
                     start_index,
                     start_index + (end_idx - write_start),
@@ -256,6 +264,8 @@ def expert_parallel(func: Callable) -> Callable:
     ) -> torch.Tensor:
         global TOKEN_GROUP_ALIGN_SIZE_M
         if isinstance(w1, DTensor):
+            assert isinstance(w2, DTensor)
+            assert isinstance(w3, DTensor)
             w1 = w1.to_local()
             w2 = w2.to_local()
             w3 = w3.to_local()
@@ -343,19 +353,19 @@ def _run_experts_for_loop(
     w1: torch.Tensor,
     w2: torch.Tensor,
     w3: torch.Tensor,
-    x: torch.Tensor,
-    num_tokens_per_expert: torch.Tensor,
+    x_: torch.Tensor,
+    num_tokens_per_expert_: torch.Tensor,
 ) -> torch.Tensor:
     # NOTE: this would incur a synchronization between device and host
-    num_tokens_per_expert = num_tokens_per_expert.tolist()
+    num_tokens_per_expert: list[int] = num_tokens_per_expert_.tolist()
 
     # side-effect code due to the usage of generate_permute_indices
-    num_padding = x.shape[0] - sum(num_tokens_per_expert)
+    num_padding: int = x_.shape[0] - sum(num_tokens_per_expert)
 
     # a tuple of tensors indexed by experts
     # each with shape (tokens_per_expert(varying), dim)
-    x = torch.split(
-        x[: sum(num_tokens_per_expert)],
+    x: tuple[torch.Tensor, ...] = torch.split(
+        x_[: sum(num_tokens_per_expert)],
         split_size_or_sections=num_tokens_per_expert,
         dim=0,
     )
@@ -444,7 +454,7 @@ def batched_histc(
 
 
 @batched_histc.register_fake
-def batched_histc(
+def batched_histc_fake(
     x: torch.Tensor, bins: int = 100, min: int = 0, max: int = 0
 ) -> torch.Tensor:
     assert max - min == bins
@@ -987,10 +997,9 @@ class MoE(nn.Module):
             route_scale=moe_args.route_scale,
         )
         self.reorderer = TokenReorderer(num_experts=num_experts, top_k=moe_args.top_k)
-        self.shared_experts = (
-            FeedForward(dim=dim, hidden_dim=hidden_dim * moe_args.num_shared_experts)
-            if moe_args.num_shared_experts > 0
-            else None
+        assert moe_args.num_shared_experts > 0
+        self.shared_experts = FeedForward(
+            dim=dim, hidden_dim=hidden_dim * moe_args.num_shared_experts
         )
         self.score_before_experts = moe_args.score_before_experts
 
@@ -1060,6 +1069,7 @@ class MoE(nn.Module):
                 self.experts.num_experts, dtype=torch.float32
             )
             if self.load_balance_coeff is not None:
+                assert isinstance(self.expert_bias, torch.Tensor)
                 self.expert_bias = torch.zeros(
                     self.experts.num_experts, dtype=torch.float32
                 )
@@ -1513,13 +1523,14 @@ class DeepSeekV3Model(nn.Module):
         self.model_args = model_args
 
     def init_weights(self, buffer_device: torch.device | None = None) -> None:
-        buffer_device = buffer_device or self.freqs_cis.device
+        buffer_device = buffer_device or self.freqs_cis.device  # type: ignore[has-type]
         with torch.device(buffer_device):
             self.freqs_cis = precompute_freqs_cis(self.model_args)
         if self.tok_embeddings is not None:
             nn.init.normal_(self.tok_embeddings.weight)
         for layer in self.layers.values():
             if layer is not None:
+                assert isinstance(layer, TransformerBlock)
                 layer.init_weights(buffer_device=buffer_device)
         if self.norm is not None:
             self.norm.reset_parameters()

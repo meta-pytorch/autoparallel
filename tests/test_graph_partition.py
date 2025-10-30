@@ -115,14 +115,14 @@ x = (
 
 # Symbolically evaluate in case you want to test running a graph bigger than your gpu
 
-with (
-    FakeTensorMode(
+mode: nullcontext[None] | FakeTensorMode = nullcontext()
+if fake_evaluate:
+    mode = FakeTensorMode(
         allow_non_fake_inputs=True,
         shape_env=ShapeEnv(),
     )
-    if fake_evaluate
-    else nullcontext()
-):
+
+with mode:
     # # now let's run it
     outputs = pp_mod(*x)
     assert len(outputs) == 1
