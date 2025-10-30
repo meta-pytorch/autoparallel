@@ -198,12 +198,12 @@ def run_test():
     with torch.device("meta"):
         model = model_fn()
 
-    # Based on pp rank split the model into logical stages and get the logical stages
+    # Step 1. Based on pp rank split the model into logical stages and get the logical stages
     # for this rank
     logical_stage_mods: dict[int, torch.nn.Module] = {
         0: model,
     }
-    # AutoParallel API call
+    # Step 2: AutoParallel API call on every stage and extract graphs
     stage_mods: dict[int, torch.nn.Module] = {}
     stage_graphs: dict[int, GraphCallables] = {}
     stage_graph_metas: dict[int, GraphMeta] = {}
@@ -223,6 +223,7 @@ def run_test():
             pp_mod.to_empty(device="cuda")
             pp_mod.init_weights(buffer_device="cuda")
 
+            # Store each stage's information in stage_mods, stage_graphs, and stage_graph_metas
             stage_mods[stage_idx] = pp_mod
             stage_graphs[stage_idx] = GraphCallables(
                 forward=pp_mod.fw_module, backward=pp_mod.bw_module
@@ -233,9 +234,13 @@ def run_test():
                 num_symints_saved_for_bw=pp_mod.num_symints_saved_for_bw,
             )
 
+    # One per stage
+    assert len(logical_stage_mods) == len(stage_mods) == len(stage_graphs) == len(stage_graph_metas)
+
     # run weight init on our sharded DTensor params
     torch.manual_seed(pp_rank)
     stages = []
+    # Step 3. Construct stages using the graphs
     for pp_stage_idx, pp_stage_mod in stage_mods.items():
         stage = GraphPipelineStage(
             pp_stage_mod,
@@ -247,6 +252,7 @@ def run_test():
             group=world_mesh.get_group("pp"),
         )
         stages.append(stage)
+    # Step 4. Construct the pipeline runner using the stages
     schedule = build_pipeline_schedule(
         stages=stages,
         loss_fn=None,
@@ -256,9 +262,12 @@ def run_test():
         pipeline_parallel_degree=pp_degree,
     )
     assert isinstance(schedule, _PipelineScheduleRuntime)
+    # Step 5. Override the pipeline runner's F and B implementations
     schedule.register_custom_function(FORWARD, run_forward_graph)
     schedule.register_custom_function(FULL_BACKWARD, run_backward_graph)
     x = input_fn()
+
+    # Step 6. Run the whole pipeline once
     if pp_rank == 0:
         schedule.step(x)
     else:
