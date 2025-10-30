@@ -210,9 +210,8 @@ with (
     else nullcontext()
 ):
     # # now let's run it
-    outputs = pp_mod(*x)
-    assert len(outputs) == 1
-    output = outputs[0]
+    output = pp_mod(*x)
+    assert not isinstance(output, tuple)
     output.backward(torch.randn_like(output))
 
 

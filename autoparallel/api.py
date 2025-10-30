@@ -611,6 +611,8 @@ class AutoParallel:
                 ctx.non_tensors = non_tensors_to_save
 
                 user_outputs = fw_outputs[num_mutate_inputs:num_inner_fwd_outputs]
+                if len(user_outputs) == 1:
+                    user_outputs = user_outputs[0]
                 return user_outputs
 
             @staticmethod
