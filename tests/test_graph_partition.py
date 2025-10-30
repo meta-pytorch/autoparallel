@@ -3,6 +3,7 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+from autoparallel._passes.split_fsdp_collectives import split_fsdp_prefetch
 from contextlib import nullcontext
 
 import torch
@@ -19,6 +20,11 @@ from autoparallel._testing.models.dsv3 import (
     MoEArgs,
 )
 from autoparallel.api import AutoParallel
+
+from autoparallel.pipeline.passes import (
+    split_fsdp_prefetch,
+    split_fsdp_reduce_scatters_epilogue,
+)
 
 # must symbolically evaluate to run on 32 dp ranks
 # world_size = 2048
@@ -174,7 +180,7 @@ with torch.device("meta"):
 # model = stage0
 
 # Stage 1-7
-model = stage7
+model = stage1
 input_fn = input_fn_after_first_stage
 runtime_input_fn = runtime_input_fn_after_first_stage
 ####################
@@ -198,6 +204,23 @@ pp_mod.to_empty(device="cuda")
 # )  # maybe not correct value
 pp_mod.init_weights(buffer_device="cuda")
 x = runtime_input_fn()
+
+# Run Ivan's FSDP pass
+#   Doesn't work :(
+#   [rank0]: Traceback (most recent call last):
+#   [rank0]:   File "/home/xmfan/core/a/autoparallel/tests/test_graph_partition.py", line 209, in <module>
+#   [rank0]:     g = autop.parallel_gm.graph
+#   [rank0]:                     ^^^^^^^^^^^^
+#   [rank0]:   File "/home/xmfan/core/a/autoparallel/autoparallel/pipeline/passes.py", line 94, in split_fsdp_prefetch
+#   [rank0]:     main_g = _extract_graph_with_inputs_outputs(
+#   [rank0]:              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+#   [rank0]:   File "/home/xmfan/core/a/pytorch/torch/_functorch/partitioners.py", line 243, in _extract_graph_with_inputs_outputs
+#   [rank0]:     assert not isinstance(env[x], InvalidNodeBase), (
+#   [rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+#   [rank0]: AssertionError: Node add_136 was invalid, but is output
+# g = autop.parallel_gm.graph
+# g_pro, g_main = split_fsdp_prefetch(g)
+# g_main, g_epi = split_fsdp_reduce_scatters_epilogue(g_main)
 
 # Symbolically evaluate in case you want to test running a graph bigger than your gpu
 
