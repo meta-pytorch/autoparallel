@@ -87,7 +87,7 @@ def _run_forward_microbatch(stage: GraphPipelineStage, *args) -> tuple[Any, Any]
     fw_module = stage_graphs.forward
     assert len([n for n in fw_module.graph.nodes if n.op == "placeholder"]) == len(
         fw_args
-    ), "Mismatched number of inputs to fwd"
+    ), f"Mismatched number of inputs to fwd, {len([n for n in fw_module.graph.nodes if n.op == 'placeholder'])}, {len(fw_args)}"
     fw_outputs = torch.fx.Interpreter(fw_module).boxed_run(fw_args)
     num_inner_fwd_outputs = (
         stage_graph_meta.num_mutate_inputs + stage_graph_meta.num_user_outputs

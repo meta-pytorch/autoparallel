@@ -81,6 +81,54 @@ def build_pipeline_schedule(
     )
     return schedule
 
+class PipelineStage(nn.Module):
+    def __init__(self, layers, config):
+        super().__init__()
+        self.layers = layers
+        self.register_buffer(
+            "freqs_cis", precompute_freqs_cis(config), persistent=False
+        )
+
+    def forward(self, h):
+        # intermediate stages only have layers
+        for layer in self.layers.values():
+            h = layer(h, self.freqs_cis)
+        return h
+
+    def init_weights(self, buffer_device: torch.device | None = None) -> None:
+        for layer in self.layers.values():
+            if layer is not None:
+                layer.init_weights(buffer_device=buffer_device)
+
+class FirstPipelineStage(PipelineStage):
+    def __init__(self, embed, layers, config):
+        super().__init__(layers, config)
+        self.tok_embeddings = embed
+
+    def forward(self, tokens):
+        # torch.Size([1024, 1024])
+        h = (
+            self.tok_embeddings(tokens)
+            if self.tok_embeddings is not None
+            else tokens
+        )
+        # torch.Size([1024, 1024, 2048])
+        for layer in self.layers.values():
+            h = layer(h, self.freqs_cis)
+        return h
+
+class LastPipelineStage(PipelineStage):
+    def __init__(self, layers, norm, output, config):
+        super().__init__(layers, config)
+        self.norm = norm
+        self.output = output
+
+    def forward(self, h):
+        for layer in self.layers.values():
+            h = layer(h, self.freqs_cis)
+        h = self.norm(h) if self.norm is not None else h
+        output = self.output(h) if self.output is not None else h
+        return output
 
 def run_test(fake_evaluate: bool = False, use_fake_pg: bool = True):
     if not use_fake_pg:
@@ -190,55 +238,6 @@ def run_test(fake_evaluate: bool = False, use_fake_pg: bool = True):
         layers = [nn.ModuleDict({k: v}) for k, v in layers.items()]
         assert len(layers) == 8
 
-    class PipelineStage(nn.Module):
-        def __init__(self, layers):
-            super().__init__()
-            self.layers = layers
-            self.register_buffer(
-                "freqs_cis", precompute_freqs_cis(config), persistent=False
-            )
-
-        def forward(self, h):
-            # intermediate stages only have layers
-            for layer in self.layers.values():
-                h = layer(h, self.freqs_cis)
-            return h
-
-        def init_weights(self, buffer_device: torch.device | None = None) -> None:
-            for layer in self.layers.values():
-                if layer is not None:
-                    layer.init_weights(buffer_device=buffer_device)
-
-    class FirstPipelineStage(PipelineStage):
-        def __init__(self, embed, layers):
-            super().__init__(layers)
-            self.tok_embeddings = embed
-
-        def forward(self, tokens):
-            # torch.Size([1024, 1024])
-            h = (
-                self.tok_embeddings(tokens)
-                if self.tok_embeddings is not None
-                else tokens
-            )
-            # torch.Size([1024, 1024, 2048])
-            for layer in self.layers.values():
-                h = layer(h, self.freqs_cis)
-            return h
-
-    class LastPipelineStage(PipelineStage):
-        def __init__(self, layers, norm, output):
-            super().__init__(layers)
-            self.norm = norm
-            self.output = output
-
-        def forward(self, h):
-            for layer in self.layers.values():
-                h = layer(h, self.freqs_cis)
-            h = self.norm(h) if self.norm is not None else h
-            output = self.output(h) if self.output is not None else h
-            return output
-
     def tracing_input_fn():
         return torch.randint(
             0,
@@ -289,14 +288,14 @@ def run_test(fake_evaluate: bool = False, use_fake_pg: bool = True):
 
     # Step 1. Construct the logical pipeline stages
     with torch.device("meta"):
-        stage0 = FirstPipelineStage(embed, layers[0])
-        stage1 = PipelineStage(layers[1])
-        stage2 = PipelineStage(layers[2])
-        stage3 = PipelineStage(layers[3])
-        stage4 = PipelineStage(layers[4])
-        stage5 = PipelineStage(layers[5])
-        stage6 = PipelineStage(layers[6])
-        stage7 = LastPipelineStage(layers[7], norm, output)
+        stage0 = FirstPipelineStage(embed, layers[0], config)
+        stage1 = PipelineStage(layers[1], config)
+        stage2 = PipelineStage(layers[2], config)
+        stage3 = PipelineStage(layers[3], config)
+        stage4 = PipelineStage(layers[4], config)
+        stage5 = PipelineStage(layers[5], config)
+        stage6 = PipelineStage(layers[6], config)
+        stage7 = LastPipelineStage(layers[7], norm, output, config)
         logical_stages = [
             stage0,
             stage1,
@@ -334,23 +333,41 @@ def run_test(fake_evaluate: bool = False, use_fake_pg: bool = True):
     stage_graphs: dict[int, GraphCallables] = {}
     stage_graph_metas: dict[int, GraphMeta] = {}
     # Step 3. Apply AutoParallel to each logical stage assigned to this pp rank
+    use_cache = True
+    root_cache = "tmp"
+    os.makedirs(root_cache, exist_ok=True)
     for stage_idx in stage_indices_current_pp_rank:
         stage_mod = logical_stages[stage_idx]
-        if stage_idx == 0:
-            input_fn = tracing_input_fn
+        stage_file = os.path.join(root_cache, f"stage_{stage_idx}.pth")
+        if os.path.exists(stage_file) and use_cache:
+            cache = torch.load(stage_file, weights_only=False)
+            from autoparallel.api import AutoParallelPPModule
+            # if torch.distributed.get_rank() == 0:
+            #     from IPython import embed; embed();
+            # torch.distributed.barrier()
+            # exit()
+            cache[3] = {k: nn.Parameter(v.detach()) for k, v in cache[3].items()}
+            pp_mod = AutoParallelPPModule(*(cache + [stage_mod]))
         else:
-            input_fn = tracing_input_fn_after_first_stage
-        with AutoParallel(stage_mod, input_fn, mesh, dynamic=True) as autop:
-            autop.add_parameter_memory_constraint(low=None, high=None)
+            if stage_idx == 0:
+                input_fn = tracing_input_fn
+            else:
+                input_fn = tracing_input_fn_after_first_stage
+            with AutoParallel(stage_mod, input_fn, mesh, dynamic=True) as autop:
+                autop.add_parameter_memory_constraint(low=None, high=None)
 
-            # x_sharding = (Shard(0), Replicate())
-            x_sharding = (Shard(0), Shard(0))
+                # x_sharding = (Shard(0), Replicate())
+                x_sharding = (Shard(0), Shard(0))
 
-            autop.add_input_constraints([x_sharding])
-            autop.add_output_constraints([x_sharding])
+                autop.add_input_constraints([x_sharding])
+                autop.add_output_constraints([x_sharding])
 
-            sharding_placement = autop.optimize_placement()
-            pp_mod = autop.apply_placement_pp(sharding_placement)
+                sharding_placement = autop.optimize_placement(verbose=False)
+                pp_mod = autop.apply_placement_pp(sharding_placement)
+                if use_cache:
+                    cache = [pp_mod.fw_module, pp_mod.bw_module,
+                        pp_mod.graph_meta, pp_mod._sharded_param_dict, pp_mod._sharded_buffer_dict]#,pp_mod.init_weights_model]
+                    torch.save(cache, stage_file)
 
         torch.manual_seed(pp_rank)
         pp_mod.to_empty(device=device)
