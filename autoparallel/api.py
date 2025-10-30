@@ -126,15 +126,13 @@ class AutoParallelPPStage(torch.autograd.Function):
         ctx.bw_module = args[-2]
         fw_module = args[-3]
         fw_args = list(args[:-3])
-        assert len(
-            [n for n in fw_module.graph.nodes if n.op == "placeholder"]
-        ) == len(fw_args), "Mismatched number of inputs to fwd"
+        assert len([n for n in fw_module.graph.nodes if n.op == "placeholder"]) == len(
+            fw_args
+        ), "Mismatched number of inputs to fwd"
         fw_outputs = torch.fx.Interpreter(fw_module).boxed_run(fw_args)
         num_inner_fwd_outputs = num_mutate_inputs + num_user_outputs
         saved_intermediates = fw_outputs[num_inner_fwd_outputs:]
-        num_tensors_for_backward = (
-            len(saved_intermediates) - num_symints_saved_for_bw
-        )
+        num_tensors_for_backward = len(saved_intermediates) - num_symints_saved_for_bw
         tensors_to_save = saved_intermediates[:num_tensors_for_backward]
         non_tensors_to_save = saved_intermediates[num_tensors_for_backward:]
         ctx.save_for_backward(*tensors_to_save)
@@ -157,6 +155,7 @@ class AutoParallelPPStage(torch.autograd.Function):
         )  # last 3 args (fw_module, bw_module, graph_meta) don't require grads
         return result
 
+
 class AutoParallelPPModule(torch.nn.Module):
     def __init__(
         self,
@@ -165,7 +164,7 @@ class AutoParallelPPModule(torch.nn.Module):
         graph_meta: dict[str, int],
         sharded_param_dict: dict[str, torch.Tensor],
         sharded_buffer_dict: dict[str, torch.Tensor],
-        init_weights_model: torch.nn.Module
+        init_weights_model: torch.nn.Module,
     ):
         super().__init__()
         self.fw_module = fw_module
@@ -179,6 +178,7 @@ class AutoParallelPPModule(torch.nn.Module):
         # although we could snoop for other methods too.
         if hasattr(init_weights_model, "init_weights"):
             hook_params_setters(init_weights_model, self)
+
             def init_weights(_self, *args, **kwargs):
                 # this is now a deep-fake-copy of orig mod, so we don't have to use reparametrize
                 return init_weights_model.init_weights(*args, **kwargs)
@@ -186,9 +186,7 @@ class AutoParallelPPModule(torch.nn.Module):
             # assign an init_weights method onto the output mod.
             # all it does is sneakily run the original user mod's init_weights method,
             # but with our new DTensor sharded params attached to the user module.
-            self.init_weights = MethodType(
-                init_weights, self
-            )
+            self.init_weights = MethodType(init_weights, self)
 
     def _register_params_and_init_weights(
         self, sharded_param_dict, sharded_buffer_dict
@@ -202,7 +200,6 @@ class AutoParallelPPModule(torch.nn.Module):
 
         for k, v in sharded_buffer_dict.items():
             _assign_attr(v, self, k, attr_kind=_AttrKind.BUFFER)
-
 
     def forward(self, *args):
         # NB: don't close over the parameters/buffers, as the user may
@@ -741,6 +738,13 @@ class AutoParallel:
             "num_weight_buffer_grads": len(sharded_param_dict)
             + len(sharded_buffer_dict),
         }
-        self.parallel_model = AutoParallelPPModule(fw_module, bw_module, graph_meta, sharded_param_dict, sharded_buffer_dict, self.init_weights_model)
+        self.parallel_model = AutoParallelPPModule(
+            fw_module,
+            bw_module,
+            graph_meta,
+            sharded_param_dict,
+            sharded_buffer_dict,
+            self.init_weights_model,
+        )
         # self._register_params_and_init_weights(sharded_param_dict, sharded_buffer_dict)
         return self.parallel_model

@@ -82,6 +82,7 @@ def build_pipeline_schedule(
     )
     return schedule
 
+
 class PipelineStage(nn.Module):
     def __init__(self, layers, config):
         super().__init__()
@@ -101,6 +102,7 @@ class PipelineStage(nn.Module):
             if layer is not None:
                 layer.init_weights(buffer_device=buffer_device)
 
+
 class FirstPipelineStage(PipelineStage):
     def __init__(self, embed, layers, config):
         super().__init__(layers, config)
@@ -108,15 +110,10 @@ class FirstPipelineStage(PipelineStage):
 
     def forward(self, tokens):
         # torch.Size([1024, 1024])
-        h = (
-            self.tok_embeddings(tokens)
-            if self.tok_embeddings is not None
-            else tokens
-        )
+        h = self.tok_embeddings(tokens) if self.tok_embeddings is not None else tokens
         # torch.Size([1024, 1024, 2048])
-        for layer in self.layers.values():
-            h = layer(h, self.freqs_cis)
-        return h
+        return super().forward(h)
+
 
 class LastPipelineStage(PipelineStage):
     def __init__(self, layers, norm, output, config):
@@ -125,11 +122,11 @@ class LastPipelineStage(PipelineStage):
         self.output = output
 
     def forward(self, h):
-        for layer in self.layers.values():
-            h = layer(h, self.freqs_cis)
+        h = super().forward(h)
         h = self.norm(h) if self.norm is not None else h
         output = self.output(h) if self.output is not None else h
         return output
+
 
 def run_test(fake_evaluate: bool = False, use_fake_pg: bool = True):
     if not use_fake_pg:
@@ -188,6 +185,9 @@ def run_test(fake_evaluate: bool = False, use_fake_pg: bool = True):
 
         print(f"PP rank: {pp_rank}")
 
+    stages_per_rank = 2
+    logical_pp_degree = pp_degree * stages_per_rank
+
     # This is the spmd mesh to be used for tracing
     mesh = world_mesh[("dp_mod_ep", "ep")]
 
@@ -236,8 +236,16 @@ def run_test(fake_evaluate: bool = False, use_fake_pg: bool = True):
     with torch.device("meta"):
         model = DeepSeekV3Model(config).bfloat16()
         embed, layers, norm, output = list(model.children())
-        layers = [nn.ModuleDict({k: v}) for k, v in layers.items()]
-        assert len(layers) == 8
+        items = list(layers.items())
+        assert len(items) == config.n_layers
+        n_layers_per_rank = len(items) // logical_pp_degree
+        layers = [
+            nn.ModuleDict(items[i : i + n_layers_per_rank])
+            for i in range(0, len(items), n_layers_per_rank)
+        ]
+        assert len(layers) == logical_pp_degree
+        for lst in layers:
+            assert len(lst) * len(layers) == config.n_layers
 
     def tracing_input_fn():
         return torch.randint(
@@ -329,6 +337,9 @@ def run_test(fake_evaluate: bool = False, use_fake_pg: bool = True):
         2: [2, 6],
         3: [3, 7],
     }
+    assert len(pp_rank_to_stage_indices) == pp_degree
+    for stages in pp_rank_to_stage_indices.values():
+        assert len(stages) * pp_degree == len(logical_stages)
     stage_indices_current_pp_rank = pp_rank_to_stage_indices[pp_rank]
     stage_mods: dict[int, torch.nn.Module] = {}
     stage_graphs: dict[int, GraphCallables] = {}
@@ -351,6 +362,7 @@ def run_test(fake_evaluate: bool = False, use_fake_pg: bool = True):
         if os.path.exists(stage_file) and use_cache:
             cache = torch.load(stage_file, weights_only=False)
             from autoparallel.api import AutoParallelPPModule
+
             # if torch.distributed.get_rank() == 0:
             #     from IPython import embed; embed();
             # torch.distributed.barrier()
@@ -374,8 +386,13 @@ def run_test(fake_evaluate: bool = False, use_fake_pg: bool = True):
                 sharding_placement = autop.optimize_placement(verbose=False)
                 pp_mod = autop.apply_placement_pp(sharding_placement)
                 if use_cache:
-                    cache = [pp_mod.fw_module, pp_mod.bw_module,
-                        pp_mod.graph_meta, pp_mod._sharded_param_dict, pp_mod._sharded_buffer_dict]#,pp_mod.init_weights_model]
+                    cache = [
+                        pp_mod.fw_module,
+                        pp_mod.bw_module,
+                        pp_mod.graph_meta,
+                        pp_mod._sharded_param_dict,
+                        pp_mod._sharded_buffer_dict,
+                    ]  # ,pp_mod.init_weights_model]
                     torch.save(cache, stage_file)
 
         torch.manual_seed(pp_rank)
