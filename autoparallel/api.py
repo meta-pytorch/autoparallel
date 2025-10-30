@@ -569,6 +569,29 @@ class AutoParallel:
             adjusted_flat_args,
         ) = partition_joint_with_descriptors(self.joint_with_descriptors)
 
+        from autoparallel._passes.split_di_dw_graph import split_di_dw_graph
+        # Run Brian's dI/dW pass
+        #   Doesn't work :(
+        #   [rank0]: Traceback (most recent call last):
+        #   [rank0]:   File "/home/xmfan/core/a/autoparallel/tests/test_graph_partition.py", line 199, in <module>
+        #   [rank0]:     pp_mod = autop.apply_placement_pp(sharding_placement)
+        #   [rank0]:              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        #   [rank0]:   File "/home/xmfan/core/a/autoparallel/autoparallel/api.py", line 574, in apply_placement_pp
+        #   [rank0]:     main_b_gm_di, main_b_gm_dw = split_di_dw_graph(bw_module, num_weight_gradients=num_weight_gradients)
+        #   [rank0]:                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        #   [rank0]:   File "/home/xmfan/core/a/autoparallel/autoparallel/_passes/split_di_dw_graph.py", line 49, in split_di_dw_graph
+        #   [rank0]:     bw_inputs, bw_weights = default_partition(bw_gm, args, num_fwd_outputs=num_input_gradients)
+        #   [rank0]:                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        #   [rank0]:   File "/home/xmfan/core/a/pytorch/torch/_functorch/partitioners.py", line 1027, in default_partition
+        #   [rank0]:     forward_only_graph = _extract_graph_with_inputs_outputs(
+        #   [rank0]:                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        #   [rank0]:   File "/home/xmfan/core/a/pytorch/torch/_functorch/partitioners.py", line 243, in _extract_graph_with_inputs_outputs
+        #   [rank0]:     assert not isinstance(env[x], InvalidNodeBase), (
+        #   [rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        #   [rank0]: AssertionError: Node add_145 was invalid, but is output
+        # num_weight_gradients = self.joint_with_descriptors._aot_state.aot_config.num_params_buffers
+        # main_b_gm_di, main_b_gm_dw = split_di_dw_graph(bw_module, num_weight_gradients=num_weight_gradients)
+
         trace_structured(
             "artifact",
             metadata_fn=lambda: {

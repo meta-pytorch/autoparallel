@@ -144,6 +144,7 @@ def input_fn_after_first_stage():
         (bs, seq_len, config.dim),
         device=device,
         dtype=torch.bfloat16,
+        requires_grad=True,
     )
 
 def runtime_input_fn():
@@ -162,6 +163,7 @@ def runtime_input_fn_after_first_stage():
             (bs // mesh.shape[0] // mesh.shape[1], seq_len, config.dim),
             device=device,
             dtype=torch.bfloat16,
+            requires_grad=True,
         ),
     )
 
