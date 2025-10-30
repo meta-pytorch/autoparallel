@@ -13,7 +13,7 @@ from torch.distributed.pipelining.schedules import (
 )
 from torch.distributed.pipelining.stage import (
     _normalize_model_output_as_tuple,
-    _PipelineStage,
+    PipelineStage,
 )
 from torch.distributed.tensor import DTensor
 
@@ -33,9 +33,10 @@ class GraphMeta:
     num_mutate_inputs: int
     num_user_outputs: int
     num_symints_saved_for_bw: int
+    num_weight_buffer_grads: int
 
 
-class GraphPipelineStage(_PipelineStage):
+class GraphPipelineStage(PipelineStage):
     def __init__(
         self,
         submodule: torch.nn.Module,
@@ -74,13 +75,16 @@ def _run_forward_microbatch(stage: GraphPipelineStage, *args) -> tuple[Any, Any]
             dict(stage_mod.named_buffers(remove_duplicate=False)).items(),
         )
     ]
-    boxed_args = [
+    fw_args = [
         *params_and_buffers,
         *args,
     ]
     del params_and_buffers
     fw_module = stage_graphs.forward
-    fw_outputs = torch.fx.Interpreter(fw_module).boxed_run(boxed_args)
+    assert len([n for n in fw_module.graph.nodes if n.op == "placeholder"]) == len(
+        fw_args
+    ), "Mismatched number of inputs to fwd"
+    fw_outputs = torch.fx.Interpreter(fw_module).boxed_run(fw_args)
     num_inner_fwd_outputs = (
         stage_graph_meta.num_mutate_inputs + stage_graph_meta.num_user_outputs
     )
@@ -121,10 +125,31 @@ def _run_backward_microbatch(
     ), "Mismatched number of inputs to bwd"
     bw_outputs = torch.fx.Interpreter(bw_module).boxed_run(bw_args)
     result = bw_outputs
-    input_grads = result[: stage_graph_meta.num_user_outputs]
-    weight_grads = result[stage_graph_meta.num_user_outputs :]
+    param_buffer_grads = result[: stage_graph_meta.num_weight_buffer_grads]
+    input_grads = result[stage_graph_meta.num_weight_buffer_grads :]
 
-    # TODO(sanketpurandare) perform gradient accumulation here with the stage_mod weights
+    params = list(stage_mod.parameters())
+    num_params = len(params)
+    grads = param_buffer_grads[:num_params]
+
+    for param, grad in zip(params, grads):
+        if param.requires_grad and grad is not None:
+            assert isinstance(grad, torch.Tensor)
+            assert isinstance(param, torch.Tensor)
+            if isinstance(param, DTensor):
+                _grad = DTensor.from_local(
+                    grad,
+                    device_mesh=param._spec.device_mesh,
+                    placements=param._spec.placements,
+                    shape=param.shape,
+                    stride=param.stride,
+                )
+            else:
+                _grad = grad
+            if param.grad is None:
+                param.grad = _grad
+            else:
+                param.grad += _grad
 
     return input_grads
 
@@ -178,8 +203,6 @@ def run_forward_graph(
     # stage._validate_fwd_input(args, kwargs) Maybe need to validate composite args?
 
     output, saved_intermediates = _run_forward_microbatch(stage, *composite_args)
-
-    # See what a pipeline stage is supposed to do in forward
 
     # See [Note: pipeline model output type]
     output_tuple = _normalize_model_output_as_tuple(output)
@@ -251,9 +274,10 @@ def run_backward_graph(
     if backward_stage.is_last:
         # Last stage computes gradients from loss and has no gradients from
         # next stage
+        # TODO(sanketpurandare) HACK till we have loss function, we populate the tangents here manually
         bwd_kwargs = {
             "stage_output": loss,
-            "tangents": [],
+            "tangents": [torch.rand_like(stage_output)],
             "saved_intermediates": saved_intermediates,
         }
     else:

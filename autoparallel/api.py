@@ -6,7 +6,7 @@
 import copy
 import itertools
 import warnings
-from contextlib import ExitStack, contextmanager
+from contextlib import contextmanager, ExitStack
 from types import MethodType
 from typing import Any, Optional, Union
 
@@ -122,7 +122,7 @@ def move_to_fake(model: torch.nn.Module, mode: FakeTensorMode, device: torch.dev
 # can patch the verification logic.
 @contextmanager
 def monkey_patch_export_verifier():
-    from torch._export.verifier import SpecViolationError, Verifier, final
+    from torch._export.verifier import final, SpecViolationError, Verifier
 
     prior = Verifier._check_graph_module
 
@@ -569,7 +569,15 @@ class AutoParallel:
             adjusted_flat_args,
         ) = partition_joint_with_descriptors(self.joint_with_descriptors)
 
+        print(
+            f"num_user_outputs: {num_user_outputs}\n"
+            f"num_mutate_inputs: {num_mutate_inputs}\n"
+            f"num_fw_outs_saved_for_bw: {num_fw_outs_saved_for_bw}\n"
+            f"num_symints_saved_for_bw: {num_symints_saved_for_bw}"
+        )
+
         from autoparallel._passes.split_di_dw_graph import split_di_dw_graph
+
         # Run Brian's dI/dW pass
         #   Doesn't work :(
         #   [rank0]: Traceback (most recent call last):
@@ -612,13 +620,22 @@ class AutoParallel:
                 print_output=False, include_stride=True, include_device=True
             ),
         )
+
         class AutoParallelPPStage(torch.autograd.Function):
             @staticmethod
             def forward(ctx, *args):
-                fw_module = args[-2]
-                ctx.bw_module = args[-1]
-                fw_args = list(args[:-2])
-                assert len([n for n in fw_module.graph.nodes if n.op == "placeholder"]) == len(fw_args), "Mismatched number of inputs to fwd"
+                # This is ugly but require it for AOT calling convention
+                graph_meta = args[-1]
+                num_symints_saved_for_bw = graph_meta["num_symints_saved_for_bw"]
+                num_user_outputs = graph_meta["num_user_outputs"]
+                num_mutate_inputs = graph_meta["num_mutate_inputs"]
+
+                ctx.bw_module = args[-2]
+                fw_module = args[-3]
+                fw_args = list(args[:-3])
+                assert len(
+                    [n for n in fw_module.graph.nodes if n.op == "placeholder"]
+                ) == len(fw_args), "Mismatched number of inputs to fwd"
                 fw_outputs = torch.fx.Interpreter(fw_module).boxed_run(fw_args)
                 num_inner_fwd_outputs = num_mutate_inputs + num_user_outputs
                 saved_intermediates = fw_outputs[num_inner_fwd_outputs:]
@@ -638,16 +655,26 @@ class AutoParallel:
             @staticmethod
             def backward(ctx, *tangents):
                 bw_args = [*ctx.non_tensors, *ctx.saved_tensors, *tangents]
-                assert len([n for n in ctx.bw_module.graph.nodes if n.op == "placeholder"]) == len(bw_args), "Mismatched number of inputs to bwd"
+                assert len(
+                    [n for n in ctx.bw_module.graph.nodes if n.op == "placeholder"]
+                ) == len(bw_args), "Mismatched number of inputs to bwd"
                 bw_outputs = torch.fx.Interpreter(ctx.bw_module).boxed_run(bw_args)
-                result = bw_outputs + (None,) * 2  # for fw_module, bw_module
+                result = (
+                    bw_outputs + (None,) * 3
+                )  # last 3 args (fw_module, bw_module, graph_meta) don't require grads
                 return result
 
         class AutoParallelPPModule(torch.nn.Module):
-            def __init__(self, fw_module, bw_module):
+            def __init__(
+                self,
+                fw_module: torch.fx.GraphModule,
+                bw_module: torch.fx.GraphModule,
+                graph_meta: dict[str, int],
+            ):
                 super().__init__()
                 self.fw_module = fw_module
                 self.bw_module = bw_module
+                self.graph_meta = graph_meta
 
             def forward(self, *args):
                 # NB: don't close over the parameters/buffers, as the user may
@@ -665,11 +692,19 @@ class AutoParallel:
                     *args,
                     self.fw_module,
                     self.bw_module,
+                    self.graph_meta,
                 ]
                 del params_and_buffers
                 out = AutoParallelPPStage.apply(*boxed_args)
                 return out
 
-        self.parallel_model = AutoParallelPPModule(fw_module, bw_module)
+        graph_meta: dict[str, int] = {
+            "num_mutate_inputs": num_mutate_inputs,
+            "num_user_outputs": num_user_outputs,
+            "num_symints_saved_for_bw": num_symints_saved_for_bw,
+            "num_weight_buffer_grads": len(sharded_param_dict)
+            + len(sharded_buffer_dict),
+        }
+        self.parallel_model = AutoParallelPPModule(fw_module, bw_module, graph_meta)
         self._register_params_and_init_weights(sharded_param_dict, sharded_buffer_dict)
         return self.parallel_model

@@ -9,11 +9,11 @@ from torch._functorch.aot_autograd import (
     AOTConfig,
     AOTGraphCapture,
     AOTState,
+    boxed_nop_preserve_node_meta,
+    default_partition,
     JointWithDescriptors,
     OutputType,
     ViewAndMutationMeta,
-    boxed_nop_preserve_node_meta,
-    default_partition,
 )
 
 
@@ -74,9 +74,6 @@ def partition_joint_with_descriptors(
     num_mutate_inputs = len(
         [x for x in fw_metadata.input_info if x.mutates_data or x.mutates_metadata]
     )
-    print(fw_module.graph)
-    print(fw_module.graph)
-
     return (
         fw_module,
         bw_module,
