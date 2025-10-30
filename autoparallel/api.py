@@ -576,8 +576,8 @@ class AutoParallel:
             f"num_symints_saved_for_bw: {num_symints_saved_for_bw}"
         )
 
-        from autoparallel._passes.split_di_dw_graph import split_di_dw_graph
-
+        # from autoparallel._passes.split_di_dw_graph import split_di_dw_graph
+        #
         # Run Brian's dI/dW pass
         #   Doesn't work :(
         #   [rank0]: Traceback (most recent call last):

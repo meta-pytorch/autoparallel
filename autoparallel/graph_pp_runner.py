@@ -1,5 +1,9 @@
+# Copyright (c) Facebook, Inc. and its affiliates. All rights reserved.
+#
+# This source code is licensed under the BSD license found in the
+# LICENSE file in the root directory of this source tree.
+
 import itertools
-import re
 from dataclasses import dataclass
 from typing import Any, Callable, cast, Optional, Union
 
@@ -189,6 +193,7 @@ def run_forward_graph(
 
     args = arg_mbs[mb_index]  # type: ignore[index]
     kwargs = kwarg_mbs[mb_index]  # type: ignore[index]
+    assert not kwargs  # TODO: if kwargs can always be ignored, maybe remove?
 
     if stage.is_first:
         # First stage doesn't need to receive anything
@@ -197,8 +202,6 @@ def run_forward_graph(
         # Receive activations for this chunk
         # Activations only come in args form
         composite_args = stage._retrieve_recv_activations(mb_index)
-
-        composite_kwargs = kwargs or {}
 
     # stage._validate_fwd_input(args, kwargs) Maybe need to validate composite args?
 

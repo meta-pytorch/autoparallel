@@ -315,6 +315,6 @@ x = (
         device=torch.device("cuda"),
     ),
 )
-#out = parallel_mod(*x)
-#out.backward(torch.randn_like(out))
+# out = parallel_mod(*x)
+# out.backward(torch.randn_like(out))
 print("All good!")

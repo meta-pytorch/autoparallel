@@ -5,12 +5,13 @@
 
 import copy
 
-import torch
 import torch.fx as fx
 from functorch.compile import default_partition
 
 # we are running the default partitioner on the bw graph, which requires AC tags being removed.
 # At this stage we have already finished running AC anyway, since we have a bw graph
+
+
 def remove_recompute_tags(bw_gm):
     for n in bw_gm.graph.nodes:
         if 'recompute' in n.meta:
@@ -22,6 +23,8 @@ def remove_recompute_tags(bw_gm):
 # - the dI compute will potentially compute more activations that we need to plumb into dW compute
 # Today, the default partitioner requires that your split on the first K outputs of your combined graph.
 # So here, we reorder the outputs of the backward so grad_inputs are first.
+
+
 def reorder_output_grads(bw_gm, num_weight_gradients):
     outputs = bw_gm.graph.find_nodes(op='output')
     assert len(outputs) == 1
@@ -36,7 +39,10 @@ def reorder_output_grads(bw_gm, num_weight_gradients):
     bw_gm.graph.erase_node(output)
     return len(grad_inputs)
 
+
 # TODO: in theory we can infer num_weight_gradients from the graph metadata directly
+
+
 def split_di_dw_graph(bw_gm: fx.GraphModule, *, num_weight_gradients) -> tuple[fx.GraphModule, fx.GraphModule]:
     # we could consider doing this is a non-mutating way
     bw_gm = copy.deepcopy(bw_gm)
