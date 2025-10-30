@@ -334,7 +334,7 @@ def run_test(fake_evaluate: bool = False, use_fake_pg: bool = True):
     stage_graphs: dict[int, GraphCallables] = {}
     stage_graph_metas: dict[int, GraphMeta] = {}
     # Step 3. Apply AutoParallel to each logical stage assigned to this pp rank
-    use_cache = True
+    use_cache = False
     root_cache = "tmp"
     os.makedirs(root_cache, exist_ok=True)
     for stage_idx in stage_indices_current_pp_rank:

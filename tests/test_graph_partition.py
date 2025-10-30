@@ -130,3 +130,6 @@ with mode:
 
 
 print("All good!")
+
+# Cleanup: destroy process group to allow other tests to initialize their own
+torch.distributed.destroy_process_group()
