@@ -99,16 +99,16 @@ with AutoParallel(model, input_fn, mesh, dynamic=True) as autop:
     autop.add_output_constraints([x_sharding])
 
     sharding_placement = autop.optimize_placement()
-    pp_mod = autop.apply_placement_pp(sharding_placement)
+    fw_module, bw_module, graph_meta, shared_param_dict, shared_buffer_dict = autop.apply_placement_pp(sharding_placement)
+    pp_mod = autop.parallel_model
 
-fw_module, bw_module, graph_meta, shared_param_dict, shared_buffer_dict = pp_mod
-# pp_mod.to_empty(device="cuda")
+pp_mod.to_empty(device="cuda")
 # run weight init on our sharded DTensor params
 # TODO: plumb init_std through
 # pp_mod.init_weights(
 #     init_std=0.02, buffer_device="cuda"
 # )  # maybe not correct value
-# pp_mod.init_weights(buffer_device="cuda")
+pp_mod.init_weights(buffer_device="cuda")
 
 fw_g = fw_module.graph
 bw_g = bw_module.graph
