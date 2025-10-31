@@ -28,6 +28,8 @@ from torch.export._unlift import _assign_attr
 from torch.export.unflatten import _AttrKind
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
+from autoparallel._passes.graph_partition import partition_joint_with_descriptors
+
 from .activation_checkpointing import ac_joint_pass
 from .apply_sharding import apply_sharding_to_model
 from .cast_parametrization import apply_dtype_cast, canonicalize_mp, set_dtype_cast
@@ -43,15 +45,6 @@ from .optimize_sharding import ShardingOptimizer
 from .utils import _get_device_from_mesh
 
 _APPLY_VIEW_MM_VIEW_PATTERN = False
-
-
-def try_convert_fake_to_real(tensors):
-    out = {}
-    for k, t in tensors.items():
-        out[k] = torch.distributed.tensor.randn(
-            t.shape, dtype=t.dtype, device_mesh=t.device_mesh, placements=t.placements
-        )
-    return out
 
 
 def _get_decomp_table():
@@ -112,121 +105,6 @@ def move_to_fake(model: torch.nn.Module, mode: FakeTensorMode, device: torch.dev
             _move_to_fake(model, k, device, parameter=False)
 
     return model
-
-
-class AutoParallelPPStage(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, *args):
-        # This is ugly but require it for AOT calling convention
-        graph_meta = args[-1]
-        num_symints_saved_for_bw = graph_meta["num_symints_saved_for_bw"]
-        num_user_outputs = graph_meta["num_user_outputs"]
-        num_mutate_inputs = graph_meta["num_mutate_inputs"]
-
-        ctx.bw_module = args[-2]
-        fw_module = args[-3]
-        fw_args = list(args[:-3])
-        assert len([n for n in fw_module.graph.nodes if n.op == "placeholder"]) == len(
-            fw_args
-        ), "Mismatched number of inputs to fwd"
-        fw_outputs = torch.fx.Interpreter(fw_module).boxed_run(fw_args)
-        num_inner_fwd_outputs = num_mutate_inputs + num_user_outputs
-        saved_intermediates = fw_outputs[num_inner_fwd_outputs:]
-        num_tensors_for_backward = len(saved_intermediates) - num_symints_saved_for_bw
-        tensors_to_save = saved_intermediates[:num_tensors_for_backward]
-        non_tensors_to_save = saved_intermediates[num_tensors_for_backward:]
-        ctx.save_for_backward(*tensors_to_save)
-        ctx.non_tensors = non_tensors_to_save
-
-        user_outputs = fw_outputs[num_mutate_inputs:num_inner_fwd_outputs]
-        if len(user_outputs) == 1:
-            user_outputs = user_outputs[0]
-        return user_outputs
-
-    @staticmethod
-    def backward(ctx, *tangents):
-        bw_args = [*ctx.non_tensors, *ctx.saved_tensors, *tangents]
-        assert len(
-            [n for n in ctx.bw_module.graph.nodes if n.op == "placeholder"]
-        ) == len(bw_args), "Mismatched number of inputs to bwd"
-        bw_outputs = torch.fx.Interpreter(ctx.bw_module).boxed_run(bw_args)
-        result = (
-            bw_outputs + (None,) * 3
-        )  # last 3 args (fw_module, bw_module, graph_meta) don't require grads
-        return result
-
-
-class AutoParallelPPModule(torch.nn.Module):
-    def __init__(
-        self,
-        fw_module: torch.fx.GraphModule,
-        bw_module: torch.fx.GraphModule,
-        graph_meta: dict[str, int],
-        sharded_param_dict: dict[str, torch.Tensor],
-        sharded_buffer_dict: dict[str, torch.Tensor],
-        init_weights_model: torch.nn.Module,
-    ):
-        super().__init__()
-        self.fw_module = fw_module
-        self.bw_module = bw_module
-        self.graph_meta = graph_meta
-        self._register_params_and_init_weights(sharded_param_dict, sharded_buffer_dict)
-
-        # Right now we require a convention that the user model provides an init_weights method,
-        # although we could snoop for other methods too.
-        if hasattr(init_weights_model, "init_weights"):
-            hook_params_setters(init_weights_model, self)
-
-            def init_weights(_self, *args, **kwargs):
-                # this is now a deep-fake-copy of orig mod, so we don't have to use reparametrize
-                return init_weights_model.init_weights(*args, **kwargs)
-
-            # assign an init_weights method onto the output mod.
-            # all it does is sneakily run the original user mod's init_weights method,
-            # but with our new DTensor sharded params attached to the user module.
-            self.init_weights = MethodType(init_weights, self)
-
-    def _register_params_and_init_weights(
-        self, sharded_param_dict, sharded_buffer_dict
-    ):
-
-        # We construct an unflattened structure on parallel_mod,
-        # e.g. _assign_attr(v, parallel_model, k="layers.0.weight") will literally
-        # create empty nn.Modules recursively and then stash 'v' so it shows up in the right spot
-        for k, v in sharded_param_dict.items():
-            _assign_attr(v, self, k, attr_kind=_AttrKind.PARAMETER)
-
-        for k, v in sharded_buffer_dict.items():
-            _assign_attr(v, self, k, attr_kind=_AttrKind.BUFFER)
-
-    # TODO: this is a hack for caching to work.
-    def named_buffers(self, *args, **kwargs):
-        buffers = super().named_buffers(*args, **kwargs)
-        for k, v in buffers:
-            if "fw_module." not in k and "bw_module." not in k:
-                yield k, v
-
-    def forward(self, *args):
-        # NB: don't close over the parameters/buffers, as the user may
-        # reassign the module!
-        # prepare_aot_module_simplified, this seems like an API gap
-        params_and_buffers = [
-            v.to_local()
-            for k, v in itertools.chain(
-                dict(self.named_parameters(remove_duplicate=False)).items(),
-                dict(self.named_buffers(remove_duplicate=False)).items(),
-            )
-        ]
-        boxed_args = [
-            *params_and_buffers,
-            *args,
-            self.fw_module,
-            self.bw_module,
-            self.graph_meta,
-        ]
-        del params_and_buffers
-        out = AutoParallelPPStage.apply(*boxed_args)
-        return out
 
 
 # Export runs some asserts on the exported program to ensure that it is serializable,
@@ -665,14 +543,130 @@ class AutoParallel:
         self._register_params_and_init_weights(sharded_param_dict, sharded_buffer_dict)
         return self.parallel_model
 
+
+########################
+# Pipeline stuff start #
+########################
+class AutoParallelPPModule(torch.nn.Module):
+    def __init__(
+        self,
+        fw_module: torch.fx.GraphModule,
+        bw_module: torch.fx.GraphModule,
+        graph_meta: dict[str, int],
+        sharded_param_dict: dict[str, torch.Tensor],
+        sharded_buffer_dict: dict[str, torch.Tensor],
+        init_weights_model: torch.nn.Module,
+    ):
+        super().__init__()
+        self.fw_module = fw_module
+        self.bw_module = bw_module
+        self.graph_meta = graph_meta
+        self._register_params_and_init_weights(sharded_param_dict, sharded_buffer_dict)
+
+        # Right now we require a convention that the user model provides an init_weights method,
+        # although we could snoop for other methods too.
+        if hasattr(init_weights_model, "init_weights"):
+            hook_params_setters(init_weights_model, self)
+
+            def init_weights(_self, *args, **kwargs):
+                # this is now a deep-fake-copy of orig mod, so we don't have to use reparametrize
+                return init_weights_model.init_weights(*args, **kwargs)
+
+            # assign an init_weights method onto the output mod.
+            # all it does is sneakily run the original user mod's init_weights method,
+            # but with our new DTensor sharded params attached to the user module.
+            self.init_weights = MethodType(init_weights, self)
+
+    def _register_params_and_init_weights(
+        self, sharded_param_dict, sharded_buffer_dict
+    ):
+
+        # We construct an unflattened structure on parallel_mod,
+        # e.g. _assign_attr(v, parallel_model, k="layers.0.weight") will literally
+        # create empty nn.Modules recursively and then stash 'v' so it shows up in the right spot
+        for k, v in sharded_param_dict.items():
+            _assign_attr(v, self, k, attr_kind=_AttrKind.PARAMETER)
+
+        for k, v in sharded_buffer_dict.items():
+            _assign_attr(v, self, k, attr_kind=_AttrKind.BUFFER)
+
+    # TODO: this is a hack for caching to work.
+    def named_buffers(self, *args, **kwargs):
+        buffers = super().named_buffers(*args, **kwargs)
+        for k, v in buffers:
+            if "fw_module." not in k and "bw_module." not in k:
+                yield k, v
+
+    def forward(self, *args):
+        # NB: don't close over the parameters/buffers, as the user may
+        # reassign the module!
+        # prepare_aot_module_simplified, this seems like an API gap
+        params_and_buffers = [
+            v.to_local()
+            for k, v in itertools.chain(
+                dict(self.named_parameters(remove_duplicate=False)).items(),
+                dict(self.named_buffers(remove_duplicate=False)).items(),
+            )
+        ]
+        boxed_args = [
+            *params_and_buffers,
+            *args,
+            self.fw_module,
+            self.bw_module,
+            self.graph_meta,
+        ]
+        del params_and_buffers
+        out = AutoParallelPPStage.apply(*boxed_args)
+        return out
+
+
+class AutoParallelPPStage(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, *args):
+        # This is ugly but require it for AOT calling convention
+        graph_meta = args[-1]
+        num_symints_saved_for_bw = graph_meta["num_symints_saved_for_bw"]
+        num_user_outputs = graph_meta["num_user_outputs"]
+        num_mutate_inputs = graph_meta["num_mutate_inputs"]
+
+        ctx.bw_module = args[-2]
+        fw_module = args[-3]
+        fw_args = list(args[:-3])
+        assert len([n for n in fw_module.graph.nodes if n.op == "placeholder"]) == len(
+            fw_args
+        ), "Mismatched number of inputs to fwd"
+        fw_outputs = torch.fx.Interpreter(fw_module).boxed_run(fw_args)
+        num_inner_fwd_outputs = num_mutate_inputs + num_user_outputs
+        saved_intermediates = fw_outputs[num_inner_fwd_outputs:]
+        num_tensors_for_backward = len(saved_intermediates) - num_symints_saved_for_bw
+        tensors_to_save = saved_intermediates[:num_tensors_for_backward]
+        non_tensors_to_save = saved_intermediates[num_tensors_for_backward:]
+        ctx.save_for_backward(*tensors_to_save)
+        ctx.non_tensors = non_tensors_to_save
+
+        user_outputs = fw_outputs[num_mutate_inputs:num_inner_fwd_outputs]
+        if len(user_outputs) == 1:
+            user_outputs = user_outputs[0]
+        return user_outputs
+
+    @staticmethod
+    def backward(ctx, *tangents):
+        bw_args = [*ctx.non_tensors, *ctx.saved_tensors, *tangents]
+        assert len(
+            [n for n in ctx.bw_module.graph.nodes if n.op == "placeholder"]
+        ) == len(bw_args), "Mismatched number of inputs to bwd"
+        bw_outputs = torch.fx.Interpreter(ctx.bw_module).boxed_run(bw_args)
+        result = (
+            bw_outputs + (None,) * 3
+        )  # last 3 args (fw_module, bw_module, graph_meta) don't require grads
+        return result
+
+
+class AutoParallelPP(AutoParallel):
     def apply_placement_pp(self, sharding_placement=None) -> torch.nn.Module:
         sharded_param_dict, sharded_buffer_dict = self._apply_placement_common(
             sharding_placement
         )
-        from autoparallel._passes.graph_partition import (
-            partition_joint_with_descriptors,
-        )
-
         (
             fw_module,
             bw_module,
@@ -690,30 +684,6 @@ class AutoParallel:
             f"num_fw_outs_saved_for_bw: {num_fw_outs_saved_for_bw}\n"
             f"num_symints_saved_for_bw: {num_symints_saved_for_bw}"
         )
-
-        # from autoparallel._passes.split_di_dw_graph import split_di_dw_graph
-        #
-        # Run Brian's dI/dW pass
-        #   Doesn't work :(
-        #   [rank0]: Traceback (most recent call last):
-        #   [rank0]:   File "/home/xmfan/core/a/autoparallel/tests/test_graph_partition.py", line 199, in <module>
-        #   [rank0]:     pp_mod = autop.apply_placement_pp(sharding_placement)
-        #   [rank0]:              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-        #   [rank0]:   File "/home/xmfan/core/a/autoparallel/autoparallel/api.py", line 574, in apply_placement_pp
-        #   [rank0]:     main_b_gm_di, main_b_gm_dw = split_di_dw_graph(bw_module, num_weight_gradients=num_weight_gradients)
-        #   [rank0]:                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-        #   [rank0]:   File "/home/xmfan/core/a/autoparallel/autoparallel/_passes/split_di_dw_graph.py", line 49, in split_di_dw_graph
-        #   [rank0]:     bw_inputs, bw_weights = default_partition(bw_gm, args, num_fwd_outputs=num_input_gradients)
-        #   [rank0]:                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-        #   [rank0]:   File "/home/xmfan/core/a/pytorch/torch/_functorch/partitioners.py", line 1027, in default_partition
-        #   [rank0]:     forward_only_graph = _extract_graph_with_inputs_outputs(
-        #   [rank0]:                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-        #   [rank0]:   File "/home/xmfan/core/a/pytorch/torch/_functorch/partitioners.py", line 243, in _extract_graph_with_inputs_outputs
-        #   [rank0]:     assert not isinstance(env[x], InvalidNodeBase), (
-        #   [rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-        #   [rank0]: AssertionError: Node add_145 was invalid, but is output
-        # num_weight_gradients = self.joint_with_descriptors._aot_state.aot_config.num_params_buffers
-        # main_b_gm_di, main_b_gm_dw = split_di_dw_graph(bw_module, num_weight_gradients=num_weight_gradients)
 
         trace_structured(
             "artifact",
@@ -758,3 +728,8 @@ class AutoParallel:
             sharded_param_dict,
             sharded_buffer_dict,
         ]
+
+
+######################
+# Pipeline stuff end #
+######################

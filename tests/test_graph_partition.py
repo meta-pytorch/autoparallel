@@ -20,7 +20,7 @@ from autoparallel._testing.models.dsv3 import (
     DeepSeekV3ModelArgs,
     MoEArgs,
 )
-from autoparallel.api import AutoParallel
+from autoparallel.api import AutoParallelPP
 
 # must symbolically evaluate to run on 32 dp ranks
 # world_size = 2048
@@ -89,7 +89,7 @@ def input_fn():
     )
 
 
-with AutoParallel(model, input_fn, mesh, dynamic=True) as autop:
+with AutoParallelPP(model, input_fn, mesh, dynamic=True) as autop:
     autop.add_parameter_memory_constraint(low=None, high=None)
 
     # x_sharding = (Shard(0), Replicate())
@@ -99,7 +99,13 @@ with AutoParallel(model, input_fn, mesh, dynamic=True) as autop:
     autop.add_output_constraints([x_sharding])
 
     sharding_placement = autop.optimize_placement()
-    fw_module, bw_module, graph_meta, shared_param_dict, shared_buffer_dict = autop.apply_placement_pp(sharding_placement)
+    (
+        fw_module,
+        bw_module,
+        graph_meta,
+        shared_param_dict,
+        shared_buffer_dict,
+    ) = autop.apply_placement_pp(sharding_placement)
     pp_mod = autop.parallel_model
 
 pp_mod.to_empty(device="cuda")

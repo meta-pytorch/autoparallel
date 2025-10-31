@@ -32,7 +32,7 @@ from autoparallel._testing.models.dsv3 import (
     MoEArgs,
     precompute_freqs_cis,
 )
-from autoparallel.api import AutoParallel
+from autoparallel.api import AutoParallelPP
 from autoparallel.graph_pp_runner import (
     GraphCallables,
     GraphMeta,
@@ -375,7 +375,7 @@ def run_test(fake_evaluate: bool = False, use_fake_pg: bool = True):
                 input_fn = tracing_input_fn
             else:
                 input_fn = tracing_input_fn_after_first_stage
-            with AutoParallel(stage_mod, input_fn, mesh, dynamic=True) as autop:
+            with AutoParallelPP(stage_mod, input_fn, mesh, dynamic=True) as autop:
                 autop.add_parameter_memory_constraint(low=None, high=None)
 
                 # x_sharding = (Shard(0), Replicate())
