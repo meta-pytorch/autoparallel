@@ -29,8 +29,10 @@ from torch.testing._internal.distributed.fake_pg import FakeStore
 from autoparallel._testing.models.dsv3 import (
     DeepSeekV3Model,
     DeepSeekV3ModelArgs,
+    DeepSeekV3Stage0,
+    DeepSeekV3StageI,
+    DeepSeekV3StageN,
     MoEArgs,
-    precompute_freqs_cis,
 )
 from autoparallel.api import AutoParallelPP
 from autoparallel.graph_pp_runner import (
@@ -81,51 +83,6 @@ def build_pipeline_schedule(
         f"with {n_microbatches} microbatches and {num_total_stages} stages."
     )
     return schedule
-
-
-class PipelineStage(nn.Module):
-    def __init__(self, layers, config):
-        super().__init__()
-        self.layers = layers
-        self.register_buffer(
-            "freqs_cis", precompute_freqs_cis(config), persistent=False
-        )
-
-    def forward(self, h):
-        # intermediate stages only have layers
-        for layer in self.layers.values():
-            h = layer(h, self.freqs_cis)
-        return h
-
-    def init_weights(self, buffer_device: torch.device | None = None) -> None:
-        for layer in self.layers.values():
-            if layer is not None:
-                layer.init_weights(buffer_device=buffer_device)
-
-
-class FirstPipelineStage(PipelineStage):
-    def __init__(self, embed, layers, config):
-        super().__init__(layers, config)
-        self.tok_embeddings = embed
-
-    def forward(self, tokens):
-        # torch.Size([1024, 1024])
-        h = self.tok_embeddings(tokens) if self.tok_embeddings is not None else tokens
-        # torch.Size([1024, 1024, 2048])
-        return super().forward(h)
-
-
-class LastPipelineStage(PipelineStage):
-    def __init__(self, layers, norm, output, config):
-        super().__init__(layers, config)
-        self.norm = norm
-        self.output = output
-
-    def forward(self, h):
-        h = super().forward(h)
-        h = self.norm(h) if self.norm is not None else h
-        output = self.output(h) if self.output is not None else h
-        return output
 
 
 def run_test(fake_evaluate: bool = False, use_fake_pg: bool = True):
@@ -297,14 +254,14 @@ def run_test(fake_evaluate: bool = False, use_fake_pg: bool = True):
 
     # Step 1. Construct the logical pipeline stages
     with torch.device("meta"):
-        stage0 = FirstPipelineStage(embed, layers[0], config)
-        stage1 = PipelineStage(layers[1], config)
-        stage2 = PipelineStage(layers[2], config)
-        stage3 = PipelineStage(layers[3], config)
-        stage4 = PipelineStage(layers[4], config)
-        stage5 = PipelineStage(layers[5], config)
-        stage6 = PipelineStage(layers[6], config)
-        stage7 = LastPipelineStage(layers[7], norm, output, config)
+        stage0 = DeepSeekV3Stage0(embed, layers[0], config)
+        stage1 = DeepSeekV3StageI(layers[1], config)
+        stage2 = DeepSeekV3StageI(layers[2], config)
+        stage3 = DeepSeekV3StageI(layers[3], config)
+        stage4 = DeepSeekV3StageI(layers[4], config)
+        stage5 = DeepSeekV3StageI(layers[5], config)
+        stage6 = DeepSeekV3StageI(layers[6], config)
+        stage7 = DeepSeekV3StageN(layers[7], norm, output, config)
         logical_stages = [
             stage0,
             stage1,
