@@ -11,6 +11,10 @@ from torch.distributed.tensor.placement_types import Shard
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from torch.testing._internal.distributed.fake_pg import FakeStore
 
+from autoparallel._passes.split_fsdp_collectives import (
+    split_fsdp_prefetch,
+    split_fsdp_reduce_scatters_epilogue,
+)
 from autoparallel._testing.models.dsv3 import (
     DeepSeekV3Model,
     DeepSeekV3ModelArgs,
@@ -97,13 +101,21 @@ with AutoParallel(model, input_fn, mesh, dynamic=True) as autop:
     sharding_placement = autop.optimize_placement()
     pp_mod = autop.apply_placement_pp(sharding_placement)
 
-pp_mod.to_empty(device="cuda")
+fw_module, bw_module, graph_meta, shared_param_dict, shared_buffer_dict = pp_mod
+# pp_mod.to_empty(device="cuda")
 # run weight init on our sharded DTensor params
 # TODO: plumb init_std through
 # pp_mod.init_weights(
 #     init_std=0.02, buffer_device="cuda"
 # )  # maybe not correct value
-pp_mod.init_weights(buffer_device="cuda")
+# pp_mod.init_weights(buffer_device="cuda")
+
+fw_g = fw_module.graph
+bw_g = bw_module.graph
+
+fw_unshard_g, fw_main_g = split_fsdp_prefetch(fw_g)
+bw_main_g, bw_reduce_grad_g = split_fsdp_reduce_scatters_epilogue(bw_g)
+
 x = (
     torch.randint(
         0,
