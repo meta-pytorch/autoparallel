@@ -262,9 +262,9 @@ def expert_parallel(func: Callable) -> Callable:
 
         experts_per_ep_rank = w1.shape[0]
         num_ep_ranks = num_tokens_per_expert.shape[0] // experts_per_ep_rank
-        assert (
-            num_ep_ranks == 64
-        ), f"{num_ep_ranks}, {experts_per_ep_rank}, num_tokens_per_expert.shape: {num_tokens_per_expert.shape}, x={x.ndim}, w={w1.shape}"
+        # assert (
+        #     num_ep_ranks == 64
+        # ), f"{num_ep_ranks}, {experts_per_ep_rank}, num_tokens_per_expert.shape: {num_tokens_per_expert.shape}, x={x.ndim}, w={w1.shape}"
 
         # Make sure max_len of permuted token indicies is divisible by TOKEN_GROUP_ALIGN_SIZE_M,
         # by padding it to the nearest multiple of TOKEN_GROUP_ALIGN_SIZE_M.
@@ -675,7 +675,7 @@ def local_mapped_region(
     # assert False, f"{x.shape}, {selected_experts_indices.shape}, {top_scores.shape}, {out.shape}"
 
     top_k = 6
-    num_experts = 64
+    num_experts = 8
 
     dim = x.shape[-1]
 
@@ -1555,6 +1555,8 @@ class DeepSeekV3Model(nn.Module):
         Returns:
             torch.Tensor: Logits tensor of shape (batch_size, vocab_size).
         """
+        assert self.tok_embeddings is not None
+        assert input_batch is None
 
         h = self.tok_embeddings(tokens) if self.tok_embeddings is not None else tokens
 

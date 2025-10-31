@@ -70,30 +70,66 @@ config = DeepSeekV3ModelArgs(
 
 device = torch.device("cuda")
 
-# model = DeepSeekV3Model(config).to(device)
-# model.init_weights(device)
+model = DeepSeekV3Model(config).to(device)
+model.to_empty(device="cuda")
+torch.manual_seed(123)
+model.init_weights(buffer_device="cuda")
 
-# global_batch_size = 8
+global_batch_size = 1
 
-# x = torch.randint(
-#     0,
-#     config.vocab_size,
-#     (global_batch_size, seq_len),
-#     device=device,
-# )
-# fw_out = model(x)
+def log_all(x, msg):
+    rank = torch.distributed.get_rank()
+    world_size = torch.distributed.get_world_size()
+    gather_list = [torch.empty_like(x) for _ in range(world_size)]
+    torch.distributed.all_gather(gather_list, x)
+    if rank == 0:
+        for i,e in enumerate(gather_list):
+            print(f"{msg} {i} {torch.norm(e)=}")
 
-# rank = torch.distributed.get_rank()
-# world_size = torch.distributed.get_world_size()
-# gather_list = [torch.empty_like(fw_out) for _ in range(world_size)]
-# torch.distributed.all_gather(gather_list, fw_out)
-# if rank == 0:
-#     for i,e in enumerate(gather_list):
-#         print(f"{i} {torch.norm(e)=}")
-# torch.distributed.destroy_process_group()
-# exit(0)
+torch.manual_seed(123)
+x = torch.randint(
+    0,
+    config.vocab_size,
+    (global_batch_size, seq_len),
+    device=device,
+)
+log_all(x.to(torch.bfloat16), "x")
+fw_out = model(x)
+
+log_all(fw_out, "fw_out")
+torch.distributed.destroy_process_group()
+exit(0)
 
 bs = 1 * mesh.shape[0] * mesh.shape[1]
+seq_len = 1024
+
+config = DeepSeekV3ModelArgs(
+    vocab_size=102400,
+    max_seq_len=seq_len,
+    dim=2048,
+    inter_dim=10944,
+    moe_inter_dim=1408,
+    n_layers=1,  # 27,
+    n_dense_layers=0,  # 1,
+    n_heads=16,
+    moe_args=MoEArgs(
+        num_experts=64,
+        num_shared_experts=2,
+        top_k=6,
+        score_func="softmax",
+        route_norm=False,
+        score_before_experts=False,
+        mesh=mesh,
+    ),
+    q_lora_rank=0,
+    kv_lora_rank=512,
+    qk_nope_head_dim=128,
+    qk_rope_head_dim=64,
+    v_head_dim=128,
+    mscale=0.70,
+    use_flex_attn=False,
+    attn_mask_type="causal",
+)
 
 # parallelize the model
 with torch.device("meta"):
@@ -118,17 +154,8 @@ with AutoParallel(model, input_fn, mesh, dynamic=True) as autop:
     autop.add_input_constraints([x_sharding])
     autop.add_output_constraints([x_sharding])
 
-    sharding_placement = autop.optimize_placement(verbose=False)
+    sharding_placement = autop.optimize_placement()
     parallel_mod = autop.apply_placement(sharding_placement)
-
-def log_all(x, msg):
-    rank = torch.distributed.get_rank()
-    world_size = torch.distributed.get_world_size()
-    gather_list = [torch.empty_like(x) for _ in range(world_size)]
-    torch.distributed.all_gather(gather_list, x)
-    if rank == 0:
-        for i,e in enumerate(gather_list):
-            print(f"{msg} {i} {torch.norm(e)=}")
 
 parallel_mod.to_empty(device="cuda")
 # run weight init on our sharded DTensor params
@@ -136,9 +163,7 @@ parallel_mod.to_empty(device="cuda")
 # parallel_mod.init_weights(
 #     init_std=0.02, buffer_device="cuda"
 # )  # maybe not correct value
-torch.manual_seed(123)
 parallel_mod.init_weights(buffer_device="cuda")
-torch.manual_seed(123)
 x = (
     torch.randint(
         0,
@@ -147,7 +172,6 @@ x = (
         device=torch.device("cuda"),
     ),
 )
-log_all(x[0].to(torch.bfloat16), "x")
 
 # Symbolically evaluate in case you want to test running a graph bigger than your gpu
 if fake_evaluate:
@@ -161,8 +185,12 @@ if fake_evaluate:
         out = parallel_mod(*x)
         out.backward(torch.randn_like(out))
 else:
-    fw_out = parallel_mod(*x)
-    log_all(fw_out, "fw_out")
-    torch.distributed.destroy_process_group()
+    out = parallel_mod(*x)
+    print(f"{torch.norm(out)=}")
+    tangents = torch.ones_like(out)
+    out.backward(tangents)
+    for name, param in parallel_mod.named_parameters():
+        print(f"{name} {torch.norm(param.grad)=}")
+
 
 print("All good!")
