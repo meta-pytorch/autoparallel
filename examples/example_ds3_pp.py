@@ -345,9 +345,11 @@ def run_test(fake_evaluate: bool = False, use_fake_pg: bool = True):
     stage_graphs: dict[int, GraphCallables] = {}
     stage_graph_metas: dict[int, GraphMeta] = {}
     # Step 3. Apply AutoParallel to each logical stage assigned to this pp rank
-    use_cache = False
+    use_cache = True
     root_cache = "tmp"
     os.makedirs(root_cache, exist_ok=True)
+    from autoparallel.api import AutoParallelPPModule
+
     for stage_idx in stage_indices_current_pp_rank:
         trace_structured(
             "artifact",
@@ -361,7 +363,6 @@ def run_test(fake_evaluate: bool = False, use_fake_pg: bool = True):
         stage_file = os.path.join(root_cache, f"stage_{stage_idx}.pth")
         if os.path.exists(stage_file) and use_cache:
             cache = torch.load(stage_file, weights_only=False)
-            from autoparallel.api import AutoParallelPPModule
 
             # if torch.distributed.get_rank() == 0:
             #     from IPython import embed; embed();
@@ -384,15 +385,9 @@ def run_test(fake_evaluate: bool = False, use_fake_pg: bool = True):
                 autop.add_output_constraints([x_sharding])
 
                 sharding_placement = autop.optimize_placement(verbose=False)
-                pp_mod = autop.apply_placement_pp(sharding_placement)
+                cache = autop.apply_placement_pp(sharding_placement)
+                pp_mod = AutoParallelPPModule(*(cache + [autop.init_weights_model]))
                 if use_cache:
-                    cache = [
-                        pp_mod.fw_module,
-                        pp_mod.bw_module,
-                        pp_mod.graph_meta,
-                        pp_mod._sharded_param_dict,
-                        pp_mod._sharded_buffer_dict,
-                    ]  # ,pp_mod.init_weights_model]
                     torch.save(cache, stage_file)
 
         torch.manual_seed(pp_rank)

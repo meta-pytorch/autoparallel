@@ -171,8 +171,6 @@ class AutoParallelPPModule(torch.nn.Module):
         self.bw_module = bw_module
         self.graph_meta = graph_meta
         self._register_params_and_init_weights(sharded_param_dict, sharded_buffer_dict)
-        self._sharded_param_dict = sharded_param_dict
-        self._sharded_buffer_dict = sharded_buffer_dict
 
         # Right now we require a convention that the user model provides an init_weights method,
         # although we could snoop for other methods too.
@@ -200,6 +198,13 @@ class AutoParallelPPModule(torch.nn.Module):
 
         for k, v in sharded_buffer_dict.items():
             _assign_attr(v, self, k, attr_kind=_AttrKind.BUFFER)
+
+    # TODO: this is a hack for caching to work.
+    def named_buffers(self, *args, **kwargs):
+        buffers = super().named_buffers(*args, **kwargs)
+        for k, v in buffers:
+            if "fw_module." not in k and "bw_module." not in k:
+                yield k, v
 
     def forward(self, *args):
         # NB: don't close over the parameters/buffers, as the user may
@@ -746,5 +751,10 @@ class AutoParallel:
             sharded_buffer_dict,
             self.init_weights_model,
         )
-        # self._register_params_and_init_weights(sharded_param_dict, sharded_buffer_dict)
-        return self.parallel_model
+        return [
+            fw_module,
+            bw_module,
+            graph_meta,
+            sharded_param_dict,
+            sharded_buffer_dict,
+        ]
