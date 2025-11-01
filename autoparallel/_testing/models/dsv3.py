@@ -1574,3 +1574,58 @@ class DeepSeekV3Model(nn.Module):
         h = self.norm(h) if self.norm is not None else h
         output = self.output(h) if self.output is not None else h
         return output
+
+
+########################
+# Pipeline stuff start #
+########################
+
+
+class DeepSeekV3StageI(nn.Module):
+    def __init__(self, layers, config):
+        super().__init__()
+        self.layers = layers
+        self.register_buffer(
+            "freqs_cis", precompute_freqs_cis(config), persistent=False
+        )
+
+    def forward(self, h):
+        # intermediate stages only have layers
+        for layer in self.layers.values():
+            h = layer(h, self.freqs_cis)
+        return h
+
+    def init_weights(self, buffer_device: torch.device | None = None) -> None:
+        for layer in self.layers.values():
+            if layer is not None:
+                layer.init_weights(buffer_device=buffer_device)
+
+
+class DeepSeekV3Stage0(DeepSeekV3StageI):
+    def __init__(self, embed, layers, config):
+        super().__init__(layers, config)
+        self.tok_embeddings = embed
+
+    def forward(self, tokens):
+        # torch.Size([1024, 1024])
+        h = self.tok_embeddings(tokens) if self.tok_embeddings is not None else tokens
+        # torch.Size([1024, 1024, 2048])
+        return super().forward(h)
+
+
+class DeepSeekV3StageN(DeepSeekV3StageI):
+    def __init__(self, layers, norm, output, config):
+        super().__init__(layers, config)
+        self.norm = norm
+        self.output = output
+
+    def forward(self, h):
+        h = super().forward(h)
+        h = self.norm(h) if self.norm is not None else h
+        output = self.output(h) if self.output is not None else h
+        return output
+
+
+######################
+# Pipeline stuff end #
+######################

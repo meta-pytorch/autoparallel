@@ -3,6 +3,7 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+import itertools
 from contextlib import nullcontext
 
 import torch
@@ -11,12 +12,17 @@ from torch.distributed.tensor.placement_types import Shard
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from torch.testing._internal.distributed.fake_pg import FakeStore
 
+from autoparallel._passes.split_fsdp_collectives import (
+    split_fsdp_prefetch,
+    split_fsdp_reduce_scatters_epilogue,
+)
 from autoparallel._testing.models.dsv3 import (
     DeepSeekV3Model,
     DeepSeekV3ModelArgs,
     MoEArgs,
 )
-from autoparallel.api import AutoParallel
+from autoparallel.api import AutoParallelPP
+from autoparallel.graph_pp_runner import GraphMeta, _run_full_bw_module, _run_fw_module
 
 # must symbolically evaluate to run on 32 dp ranks
 # world_size = 2048
@@ -85,7 +91,7 @@ def input_fn():
     )
 
 
-with AutoParallel(model, input_fn, mesh, dynamic=True) as autop:
+with AutoParallelPP(model, input_fn, mesh, dynamic=True) as autop:
     autop.add_parameter_memory_constraint(low=None, high=None)
 
     # x_sharding = (Shard(0), Replicate())
@@ -95,7 +101,16 @@ with AutoParallel(model, input_fn, mesh, dynamic=True) as autop:
     autop.add_output_constraints([x_sharding])
 
     sharding_placement = autop.optimize_placement()
-    pp_mod = autop.apply_placement_pp(sharding_placement)
+    res = autop.apply_placement_pp(sharding_placement)
+    graph_callables = res["graph_callables"]
+    graph_meta = res["graph_meta"]
+    graph_meta = GraphMeta(
+        num_mutate_inputs=graph_meta["num_mutate_inputs"],
+        num_user_outputs=graph_meta["num_user_outputs"],
+        num_symints_saved_for_bw=graph_meta["num_symints_saved_for_bw"],
+        num_weight_buffer_grads=graph_meta["num_weight_buffer_grads"],
+    )
+    pp_mod = autop.parallel_model
 
 pp_mod.to_empty(device="cuda")
 # run weight init on our sharded DTensor params
@@ -104,6 +119,13 @@ pp_mod.to_empty(device="cuda")
 #     init_std=0.02, buffer_device="cuda"
 # )  # maybe not correct value
 pp_mod.init_weights(buffer_device="cuda")
+
+fw_g = graph_callables["fw"].graph
+bw_g = graph_callables["full_bw"].graph
+
+fw_unshard_g, fw_main_g = split_fsdp_prefetch(fw_g)
+bw_main_g, bw_reduce_grad_g = split_fsdp_reduce_scatters_epilogue(bw_g)
+
 x = (
     torch.randint(
         0,
@@ -112,22 +134,46 @@ x = (
         device=torch.device("cuda"),
     ),
 )
-
+params_buffers = [
+    v.to_local()
+    for k, v in
+    # TODO: this is very slow
+    itertools.chain(
+        dict(pp_mod.named_parameters(remove_duplicate=False)).items(),
+        dict(pp_mod.named_buffers(remove_duplicate=False)).items(),
+    )
+]
 # Symbolically evaluate in case you want to test running a graph bigger than your gpu
 
-mode: nullcontext[None] | FakeTensorMode = nullcontext()
-if fake_evaluate:
-    mode = FakeTensorMode(
+with (
+    FakeTensorMode(
         allow_non_fake_inputs=True,
         shape_env=ShapeEnv(),
     )
-
-with mode:
+    if fake_evaluate
+    else nullcontext()
+):
     # # now let's run it
-    outputs = pp_mod(*x)
-    assert len(outputs) == 1
-    output = outputs[0]
-    output.backward(torch.randn_like(output))
+    with torch.no_grad():
+        fw_args = [*params_buffers, *x]
+        output, saved_intermediates = _run_fw_module(
+            graph_callables["fw"], graph_meta, fw_args
+        )
+        tangents = [torch.randn_like(output)]
+        tensors_for_backward, non_tensors_for_backward = saved_intermediates
+
+        bw_args = [
+            *non_tensors_for_backward,
+            *tensors_for_backward,
+            *tangents,
+        ]
+
+        input_grads, param_buffer_grads = _run_full_bw_module(
+            graph_callables["full_bw"], graph_meta, bw_args
+        )
 
 
 print("All good!")
+
+# Cleanup: destroy process group to allow other tests to initialize their own
+torch.distributed.destroy_process_group()

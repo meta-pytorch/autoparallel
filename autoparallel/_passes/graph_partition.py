@@ -79,9 +79,6 @@ def partition_joint_with_descriptors(
     num_mutate_inputs = len(
         [x for x in fw_metadata.input_info if x.mutates_data or x.mutates_metadata]
     )
-    print(fw_module.graph)
-    print(fw_module.graph)
-
     return (
         fw_module,
         bw_module,
