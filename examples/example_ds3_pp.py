@@ -39,8 +39,9 @@ from autoparallel.graph_pp_runner import (
     GraphCallables,
     GraphMeta,
     GraphPipelineStage,
-    run_backward_graph,
-    run_forward_graph,
+    GraphPPRunner,
+    stage_forward,
+    stage_full_backward,
 )
 
 logger = logging.getLogger(__name__)
@@ -320,13 +321,15 @@ def run_test(fake_evaluate: bool = False, use_fake_pg: bool = True):
         stage_file = os.path.join(root_cache, f"stage_{stage_idx}.pth")
         if os.path.exists(stage_file) and use_cache:
             cache = torch.load(stage_file, weights_only=False)
-
-            # if torch.distributed.get_rank() == 0:
-            #     from IPython import embed; embed();
-            # torch.distributed.barrier()
-            # exit()
-            cache[3] = {k: nn.Parameter(v.detach()) for k, v in cache[3].items()}
-            pp_mod = AutoParallelPPModule(*(cache + [stage_mod]))
+            graph_callables = cache["graph_callables"]
+            graph_meta = cache["graph_meta"]
+            cache["sharded_param_dict"] = {
+                k: nn.Parameter(v.detach())
+                for k, v in cache["sharded_param_dict"].items()
+            }
+            pp_mod = AutoParallelPPModule(
+                cache["sharded_param_dict"], cache["sharded_buffer_dict"], stage_mod
+            )
         else:
             if stage_idx == 0:
                 input_fn = tracing_input_fn
@@ -343,7 +346,13 @@ def run_test(fake_evaluate: bool = False, use_fake_pg: bool = True):
 
                 sharding_placement = autop.optimize_placement(verbose=False)
                 cache = autop.apply_placement_pp(sharding_placement)
-                pp_mod = AutoParallelPPModule(*(cache + [autop.init_weights_model]))
+                graph_callables = cache["graph_callables"]
+                graph_meta = cache["graph_meta"]
+                pp_mod = AutoParallelPPModule(
+                    cache["sharded_param_dict"],
+                    cache["sharded_buffer_dict"],
+                    autop.init_weights_model,
+                )
                 if use_cache:
                     torch.save(cache, stage_file)
 
@@ -354,13 +363,18 @@ def run_test(fake_evaluate: bool = False, use_fake_pg: bool = True):
         # Store each stage's information in stage_mods, stage_graphs, and stage_graph_metas
         stage_mods[stage_idx] = pp_mod
         stage_graphs[stage_idx] = GraphCallables(
-            forward=pp_mod.fw_module, backward=pp_mod.bw_module
+            fw=graph_callables["fw"],
+            full_bw=graph_callables["full_bw"],
+            bw_dI=graph_callables["bw_dI"],
+            bw_dW=graph_callables["bw_dW"],
+            unshard=graph_callables["unshard"],
+            reduce_grad=graph_callables["reduce_grad"],
         )
         stage_graph_metas[stage_idx] = GraphMeta(
-            num_mutate_inputs=pp_mod.graph_meta["num_mutate_inputs"],
-            num_user_outputs=pp_mod.graph_meta["num_user_outputs"],
-            num_symints_saved_for_bw=pp_mod.graph_meta["num_symints_saved_for_bw"],
-            num_weight_buffer_grads=pp_mod.graph_meta["num_weight_buffer_grads"],
+            num_mutate_inputs=graph_meta["num_mutate_inputs"],
+            num_user_outputs=graph_meta["num_user_outputs"],
+            num_symints_saved_for_bw=graph_meta["num_symints_saved_for_bw"],
+            num_weight_buffer_grads=graph_meta["num_weight_buffer_grads"],
         )
         trace_structured(
             "artifact",
@@ -414,11 +428,15 @@ def run_test(fake_evaluate: bool = False, use_fake_pg: bool = True):
         pipeline_parallel_degree=pp_degree,
     )
     assert isinstance(schedule, _PipelineScheduleRuntime)
-    # Step 6. Override the pipeline runner's F and B implementations
-    schedule.register_custom_function(FORWARD, run_forward_graph)
-    schedule.register_custom_function(FULL_BACKWARD, run_backward_graph)
+    # Step 6. Override the pipeline runner's action implementations
+    schedule.register_custom_function(FORWARD, stage_forward)
+    schedule.register_custom_function(FULL_BACKWARD, stage_full_backward)
 
-    # Step 6. Run the whole pipeline once
+    # Step 7. Register the schedule with the graph runner
+
+    graph_pp_runner = GraphPPRunner(schedule)
+
+    # Step 8. Run the whole pipeline once using the graph runner
     with (
         FakeTensorMode(
             allow_non_fake_inputs=True,
@@ -430,9 +448,9 @@ def run_test(fake_evaluate: bool = False, use_fake_pg: bool = True):
         with torch.no_grad():
             if pp_rank == 0:
                 x = runtime_input_fn()
-                schedule.step(x)
+                graph_pp_runner.step(x)
             else:
-                schedule.step()
+                graph_pp_runner.step()
 
     print("All good!")
 

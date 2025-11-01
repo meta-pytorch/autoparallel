@@ -3,7 +3,6 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
-import itertools
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Union, cast
 
@@ -24,10 +23,10 @@ from torch.distributed.tensor import DTensor
 
 @dataclass
 class GraphCallables:
-    forward: fx.GraphModule
-    backward: fx.GraphModule
-    backward_inputs: Optional[fx.GraphModule] = None
-    backward_weights: Optional[fx.GraphModule] = None
+    fw: fx.GraphModule
+    full_bw: fx.GraphModule
+    bw_dI: Optional[fx.GraphModule] = None
+    bw_dW: Optional[fx.GraphModule] = None
     unshard: Optional[fx.GraphModule] = None
     reduce_grad: Optional[fx.GraphModule] = None
 
@@ -66,99 +65,91 @@ class GraphPipelineStage(PipelineStage):
         )
         self.graph_callables = graph_callables
         self.graph_meta = graph_meta
+        self.state: dict[str, list[Any]] = {
+            "sharded_params": [],
+            "unsharded_params": [],
+            "buffers": [],
+            "sharded_grads": [],
+            "unsharded_grads": [],
+        }
 
 
-def _run_forward_microbatch(stage: GraphPipelineStage, *args) -> tuple[Any, Any]:
-    stage_mod = stage.submod
-    stage_graphs = stage.graph_callables
-    stage_graph_meta = stage.graph_meta
-    params_and_buffers = [
-        v.to_local() if isinstance(v, DTensor) else v
-        for k, v in itertools.chain(
-            dict(stage_mod.named_parameters(remove_duplicate=False)).items(),
-            dict(stage_mod.named_buffers(remove_duplicate=False)).items(),
-        )
-    ]
-    fw_args = [
-        *params_and_buffers,
-        *args,
-    ]
-    del params_and_buffers
-    fw_module = stage_graphs.forward
+def _run_fw_module(
+    fw_module: fx.GraphModule, graph_meta: GraphMeta, fw_args: list[Any]
+) -> tuple[Any, tuple[Any, Any]]:
     assert len([n for n in fw_module.graph.nodes if n.op == "placeholder"]) == len(
         fw_args
     ), f"Mismatched number of inputs to fwd, {len([n for n in fw_module.graph.nodes if n.op == 'placeholder'])}, {len(fw_args)}"
     fw_outputs = torch.fx.Interpreter(fw_module).boxed_run(fw_args)
-    num_inner_fwd_outputs = (
-        stage_graph_meta.num_mutate_inputs + stage_graph_meta.num_user_outputs
-    )
+    num_inner_fwd_outputs = graph_meta.num_mutate_inputs + graph_meta.num_user_outputs
     saved_intermediates = fw_outputs[num_inner_fwd_outputs:]
-    user_outputs = fw_outputs[
-        stage_graph_meta.num_mutate_inputs : num_inner_fwd_outputs
-    ]
+    num_tensors_for_backward = (
+        len(saved_intermediates) - graph_meta.num_symints_saved_for_bw
+    )
+    tensors_for_backward = saved_intermediates[:num_tensors_for_backward]
+    non_tensors_for_backward = saved_intermediates[num_tensors_for_backward:]
+    save_for_backward = (tensors_for_backward, non_tensors_for_backward)
+    user_outputs = fw_outputs[graph_meta.num_mutate_inputs : num_inner_fwd_outputs]
     if len(user_outputs) == 1:
         user_outputs = user_outputs[0]
+    return user_outputs, save_for_backward
+
+
+def _run_full_bw_module(
+    bw_module: fx.GraphModule, graph_meta: GraphMeta, bw_args
+) -> tuple[Any, list[Any]]:
+    assert len([n for n in bw_module.graph.nodes if n.op == "placeholder"]) == len(
+        bw_args
+    ), "Mismatched number of inputs to bwd"
+    bw_outputs = torch.fx.Interpreter(bw_module).boxed_run(bw_args)
+    param_buffer_grads = bw_outputs[: graph_meta.num_weight_buffer_grads]
+    input_grads = bw_outputs[graph_meta.num_weight_buffer_grads :]
+    return input_grads, param_buffer_grads
+
+
+def _run_forward_microbatch(stage: GraphPipelineStage, *args) -> tuple[Any, Any]:
+    fw_args = [
+        *stage.state["unsharded_params"],
+        *stage.state["buffers"],
+        *args,
+    ]
+    user_outputs, saved_intermediates = _run_fw_module(
+        stage.graph_callables.fw, stage.graph_meta, fw_args
+    )
     return (user_outputs, saved_intermediates)
 
 
 def _run_backward_microbatch(
     backward_stage: GraphPipelineStage, bwd_kwargs: dict[str, Any]
 ):
-
-    stage_mod = backward_stage.submod
-    stage_graphs = backward_stage.graph_callables
-    stage_graph_meta = backward_stage.graph_meta
-
     tangents = bwd_kwargs["tangents"]
     saved_intermediates = bwd_kwargs["saved_intermediates"]
-    bw_module = stage_graphs.backward
-
-    num_tensors_for_backward = (
-        len(saved_intermediates) - stage_graph_meta.num_symints_saved_for_bw
-    )
-    tensors_for_backward = saved_intermediates[:num_tensors_for_backward]
-    non_tensors_for_backward = saved_intermediates[num_tensors_for_backward:]
+    tensors_for_backward, non_tensors_for_backward = saved_intermediates
 
     bw_args = [
         *non_tensors_for_backward,
         *tensors_for_backward,
         *tangents,
     ]
-    assert len([n for n in bw_module.graph.nodes if n.op == "placeholder"]) == len(
-        bw_args
-    ), "Mismatched number of inputs to bwd"
-    bw_outputs = torch.fx.Interpreter(bw_module).boxed_run(bw_args)
-    result = bw_outputs
-    param_buffer_grads = result[: stage_graph_meta.num_weight_buffer_grads]
-    input_grads = result[stage_graph_meta.num_weight_buffer_grads :]
+    input_grads, param_buffer_grads = _run_full_bw_module(
+        backward_stage.graph_callables.full_bw, backward_stage.graph_meta, bw_args
+    )
 
-    params = list(stage_mod.parameters())
-    num_params = len(params)
-    grads = param_buffer_grads[:num_params]
-
-    for param, grad in zip(params, grads):
-        if param.requires_grad and grad is not None:
-            assert isinstance(grad, torch.Tensor)
-            assert isinstance(param, torch.Tensor)
-            if isinstance(param, DTensor):
-                _grad = DTensor.from_local(
-                    grad,
-                    device_mesh=param._spec.device_mesh,
-                    placements=param._spec.placements,
-                    shape=param.shape,
-                    stride=param.stride,
-                )
+    unsharded_grads = backward_stage.state["unsharded_grads"]
+    grads_to_accumulate = param_buffer_grads[
+        : len(backward_stage.state["sharded_params"])
+    ]
+    assert len(unsharded_grads) == len(grads_to_accumulate)
+    for unsharded_grad, grad_to_accumulate in zip(unsharded_grads, grads_to_accumulate):
+        if grad_to_accumulate is not None:
+            if unsharded_grad is None:
+                unsharded_grad = grad_to_accumulate
             else:
-                _grad = grad
-            if param.grad is None:
-                param.grad = _grad
-            else:
-                param.grad += _grad
-
+                unsharded_grad += grad_to_accumulate
     return input_grads
 
 
-def run_forward_graph(
+def stage_forward(
     action: _Action,
     ctx: _PipelineContext,
 ) -> None:
@@ -230,7 +221,7 @@ def run_forward_graph(
         stage_index_to_stage[stage_index + 1].set_local_fwd_input(output, mb_index)
 
 
-def run_backward_graph(
+def stage_full_backward(
     action: _Action,
     ctx: _PipelineContext,
 ) -> None:
@@ -277,10 +268,11 @@ def run_backward_graph(
     if backward_stage.is_last:
         # Last stage computes gradients from loss and has no gradients from
         # next stage
-        # TODO(sanketpurandare) HACK till we have loss function, we populate the tangents here manually
+        # TODO(sanketpurandare)
+        # HACK till we have loss function, we populate the tangents here manually
         bwd_kwargs = {
             "stage_output": loss,
-            "tangents": [torch.rand_like(stage_output)],
+            "tangents": [torch.randn_like(stage_output)],
             "saved_intermediates": saved_intermediates,
         }
     else:
@@ -310,3 +302,116 @@ def run_backward_graph(
             backward_stage.get_local_bwd_output(backward_mb_index),
             backward_mb_index,
         )
+
+
+def stage_unshard(
+    action: _Action,
+    ctx: _PipelineContext,
+) -> None:
+    schedule = ctx.schedule_ref
+    assert isinstance(schedule, _PipelineScheduleRuntime)
+    stage_index_to_stage: dict[int, GraphPipelineStage] = {
+        stage.stage_index: cast(GraphPipelineStage, stage) for stage in schedule._stages
+    }
+    stage = stage_index_to_stage[action.stage_index]
+    if stage.graph_callables.unshard is None:
+        stage.state["unsharded_params"] = stage.state["sharded_params"]
+    # TODO (sanketpurandare): Add the fw_fsdp_all_gather graph call here
+
+
+def stage_reshard(
+    action: _Action,
+    ctx: _PipelineContext,
+):
+    schedule = ctx.schedule_ref
+    assert isinstance(schedule, _PipelineScheduleRuntime)
+    stage_index_to_stage: dict[int, GraphPipelineStage] = {
+        stage.stage_index: cast(GraphPipelineStage, stage) for stage in schedule._stages
+    }
+    stage = stage_index_to_stage[action.stage_index]
+    stage.state["unsharded_params"].clear()
+
+
+def stage_reduce_grad(
+    action: _Action,
+    ctx: _PipelineContext,
+) -> None:
+    schedule = ctx.schedule_ref
+    assert isinstance(schedule, _PipelineScheduleRuntime)
+    stage_index_to_stage: dict[int, GraphPipelineStage] = {
+        stage.stage_index: cast(GraphPipelineStage, stage) for stage in schedule._stages
+    }
+    stage = stage_index_to_stage[action.stage_index]
+    if stage.graph_callables.reduce_grad is None:
+        stage.state["sharded_grads"] = stage.state["unsharded_grads"]
+
+
+class GraphPPRunner:
+    def __init__(
+        self,
+        schedule: _PipelineScheduleRuntime,
+    ):
+        self.schedule = schedule
+
+    def _populate_stage_states(self, stage: GraphPipelineStage) -> None:
+        sharded_params = [
+            v.to_local() if isinstance(v, DTensor) else v
+            for k, v in dict(
+                stage.submod.named_parameters(remove_duplicate=False)
+            ).items()
+        ]
+        buffers = [
+            v.to_local() if isinstance(v, DTensor) else v
+            for k, v in dict(stage.submod.named_buffers(remove_duplicate=False)).items()
+        ]
+        stage.state["sharded_params"] = sharded_params
+        stage.state["buffers"] = buffers
+        stage.state["unsharded_grads"] = [None] * len(sharded_params)
+        # TODO (sanketpurandare)
+        # pipeline schedule runtime does not allow us to register a custom function
+        # for UNSHARD/RESHARD/REDUCE_GRAD action types yet
+        # HACK remove this once we support this
+        if stage.graph_callables.unshard is None:
+            stage.state["unsharded_params"] = stage.state["sharded_params"]
+
+    def _accumulate_stage_grads_and_clear_states(
+        self, stage: GraphPipelineStage
+    ) -> None:
+        # TODO (sanketpurandare)
+        # We don't have a REDUCE_GRAD action yet in the ScheduleIR yet
+        # HACK remove this once Ivan's PR lands
+        if stage.graph_callables.reduce_grad is None:
+            stage.state["sharded_grads"] = stage.state["unsharded_grads"]
+        grads = stage.state["sharded_grads"]
+        params = list(stage.submod.parameters())
+        for param, grad in zip(params, grads):
+            if param.requires_grad and grad is not None:
+                assert isinstance(grad, torch.Tensor)
+                if isinstance(param, DTensor):
+                    param_spec = param._spec
+                    _grad = DTensor.from_local(
+                        grad,
+                        device_mesh=param_spec.device_mesh,
+                        placements=param_spec.placements,
+                        shape=param_spec.shape,
+                        stride=param_spec.stride,
+                    )
+                else:
+                    _grad = grad  # type: ignore[assignment]
+                if param.grad is None:
+                    param.grad = _grad
+                else:
+                    param.grad += _grad
+        stage.state.clear()
+
+    def step(self, *args, **kwargs) -> None:
+
+        for stage in self.schedule._stages:
+            assert isinstance(stage, GraphPipelineStage)
+            self._populate_stage_states(stage)
+
+        self.schedule.step(*args, **kwargs)
+
+        for stage in self.schedule._stages:
+            assert isinstance(stage, GraphPipelineStage)
+            self._accumulate_stage_grads_and_clear_states(stage)
