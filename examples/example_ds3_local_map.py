@@ -18,7 +18,7 @@ from autoparallel.api import AutoParallel
 
 # must symbolically evaluate to run on 32 dp ranks
 # world_size = 2048
-fake_evaluate = False
+fake_evaluate = True
 
 world_size = 256
 
