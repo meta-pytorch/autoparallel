@@ -12,14 +12,11 @@ import torch
 import torch.fx.node
 import torch.utils._pytree as pytree
 from torch._functorch._aot_autograd.descriptors import AOTOutput
+from torch._functorch.partitioners import _extract_graph_with_inputs_outputs
 from torch._inductor.fx_passes.bucketing import (
     is_all_gather_into_tensor,
     is_reduce_scatter_tensor,
 )
-
-# Switch to once https://github.com/pytorch/pytorch/pull/166725 is landed
-# from torch._functorch.partitioners import _extract_graph_with_inputs_outputs
-from autoparallel._passes.utils import _extract_graph_with_inputs_outputs
 
 
 @contextmanager
@@ -40,13 +37,6 @@ exclude_wait_from_fx_side_effectful = partial(
         torch.ops._c10d_functional.wait_tensor.default,
     },
 )
-
-
-def _clear_partitioner_tag(g: torch.fx.Graph):
-    # TODO: Remove this once torch._functorch.partitioners supports ignore_must_be_in_fw_bw
-    # https://github.com/pytorch/pytorch/pull/166725
-    for n in g.nodes:
-        n.meta.pop("partitioner_tag", None)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -90,7 +80,6 @@ def split_fsdp_prefetch(g: torch.fx.Graph) -> tuple[torch.fx.Graph, torch.fx.Gra
         next(iter(g.find_nodes(op="output"))).meta.get("desc", [None] * len(g_outs))
     )
     with exclude_wait_from_fx_side_effectful():
-        _clear_partitioner_tag(g)
         prefetch_g = _extract_graph_with_inputs_outputs(
             g,
             g_ins,
@@ -143,7 +132,6 @@ def split_fsdp_reduce_scatters_epilogue(
     epi_g_ins_descs: list[AOTOutput] = [EpilogueInput() for _ in range(len(epi_g_ins))]
 
     with exclude_wait_from_fx_side_effectful():
-        _clear_partitioner_tag(g)
         main_g = _extract_graph_with_inputs_outputs(
             g,
             g_ins,
