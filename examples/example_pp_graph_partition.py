@@ -26,7 +26,7 @@ from autoparallel.graph_pp_runner import GraphMeta, _run_full_bw_module, _run_fw
 
 # must symbolically evaluate to run on 32 dp ranks
 # world_size = 2048
-fake_evaluate = False
+fake_evaluate = True
 
 world_size = 256
 
