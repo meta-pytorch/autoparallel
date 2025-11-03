@@ -22,7 +22,7 @@ from autoparallel._testing.models.dsv3 import (
     MoEArgs,
 )
 from autoparallel.api import AutoParallelPP
-from autoparallel.graph_pp_runner import GraphMeta, _run_full_bw_module, _run_fw_module
+from autoparallel.graph_pp_runner import GraphMeta, _run_fw_module, _run_split_bw_module
 
 # must symbolically evaluate to run on 32 dp ranks
 # world_size = 2048
@@ -88,12 +88,11 @@ with torch.device("meta"):
 # so we can run the dI/dW partitioning pass
 def input_fn():
     return torch.randn(
-        (bs, seq_len, dim),
-        device=device,
-        dtype=torch.bfloat16,
-        requires_grad=True
+        (bs, seq_len, dim), device=device, dtype=torch.bfloat16, requires_grad=True
     )
-#def input_fn():
+
+
+# def input_fn():
 #    return torch.randint(
 #        0,
 #        config.vocab_size,
@@ -140,20 +139,20 @@ bw_dW_g = graph_callables["bw_dW"].graph
 fw_unshard_g, fw_main_g = split_fsdp_prefetch(fw_g)
 bw_main_g, bw_reduce_grad_g = split_fsdp_reduce_scatters_epilogue(bw_g)
 
-#x = (
+# x = (
 #    torch.randint(
 #        0,
 #        config.vocab_size,
 #        (bs // mesh.shape[0] // mesh.shape[1], seq_len),
 #        device=torch.device("cuda"),
 #    ),
-#)
+# )
 x = (
     torch.randn(
         (bs // mesh.shape[0] // mesh.shape[1], seq_len, dim),
         device=torch.device("cuda"),
         dtype=torch.bfloat16,
-        requires_grad=True
+        requires_grad=True,
     ),
 )
 
@@ -196,7 +195,7 @@ with (
         #     graph_callables["full_bw"], graph_meta, bw_args
         # )
         # Split dI/dW backward
-        input_grads2, param_buffer_grads2 = _run_full_bw_module(
+        input_grads2, param_buffer_grads2 = _run_split_bw_module(
             graph_callables["bw_dI"], graph_callables["bw_dW"], graph_meta, bw_args
         )
 

@@ -4,26 +4,29 @@
 # LICENSE file in the root directory of this source tree.
 
 import copy
-import operator
 import itertools
-from autoparallel.apply_sharding import rename_placeholder_node
+import operator
 
+import sympy
 import torch
 import torch.fx as fx
-from torch.utils._ordered_set import OrderedSet
 from torch._functorch.partitioners import (
+    SavedForBackwardsAOTOutput,
     _extract_fwd_bwd_outputs,
     _extract_graph_with_inputs_outputs,
-    is_sym_node,
-    _is_primal,
-    _is_fwd_seed_offset,
-    _is_bwd_seed_offset,
     _is_backward_state,
+    _is_bwd_seed_offset,
+    _is_fwd_seed_offset,
+    _is_primal,
     _remove_by_name,
     find_symbol_binding_fx_nodes,
-    SavedForBackwardsAOTOutput,
     free_symbols,
+    is_sym_node,
+    is_symbol_binding_fx_node,
 )
+from torch.utils._ordered_set import OrderedSet
+
+from autoparallel.apply_sharding import rename_placeholder_node
 
 # we are running the default partitioner on the bw graph, which requires AC tags being removed.
 # At this stage we have already finished running AC anyway, since we have a bw graph
@@ -60,6 +63,7 @@ def reorder_output_grads(bw_gm, num_weight_gradients):
     bw_gm.graph.erase_node(output)
     return len(grad_inputs)
 
+
 # This is a copy of the function used by the default partitioner,
 # which does *not* reorder symint activations.
 # This is reordering is needed by the custom autograd.Function in AOTDispatcher,
@@ -72,9 +76,12 @@ def _extract_fwd_bwd_modules(
     *,
     num_fwd_outputs: int,
 ) -> tuple[fx.GraphModule, fx.GraphModule]:
-    fwd_outputs, bwd_outputs, fwd_outputs_descs, bwd_outputs_descs = (
-        _extract_fwd_bwd_outputs(joint_module, num_fwd_outputs=num_fwd_outputs)
-    )
+    (
+        fwd_outputs,
+        bwd_outputs,
+        fwd_outputs_descs,
+        bwd_outputs_descs,
+    ) = _extract_fwd_bwd_outputs(joint_module, num_fwd_outputs=num_fwd_outputs)
     placeholders = joint_module.graph.find_nodes(op="placeholder")
     primal_inputs = [*filter(_is_primal, placeholders)]
     fwd_seed_offset_inputs = [*filter(_is_fwd_seed_offset, placeholders)]
@@ -169,10 +176,7 @@ def _extract_fwd_bwd_modules(
     )
     bwd_graph = _extract_graph_with_inputs_outputs(
         joint_module.graph,
-        saved_values
-        + saved_sym_nodes
-        + bwd_seed_offset_inputs
-        + backward_state_inputs,
+        saved_values + saved_sym_nodes + bwd_seed_offset_inputs + backward_state_inputs,
         bwd_outputs,
         bwd_outputs_descs,
         "backward",
@@ -182,13 +186,16 @@ def _extract_fwd_bwd_modules(
     bwd_module = fx._lazy_graph_module._make_graph_module(joint_module, bwd_graph)
     return fwd_module, bwd_module
 
+
 # TODO: in theory we can infer num_weight_gradients from the graph metadata directly
-def split_di_dw_graph(bw_gm_old: fx.GraphModule, *, num_weight_gradients) -> tuple[fx.GraphModule, fx.GraphModule, int]:
+def split_di_dw_graph(
+    bw_gm_old: fx.GraphModule, *, num_weight_gradients
+) -> tuple[fx.GraphModule, fx.GraphModule, int]:
     # we could consider doing this is a non-mutating way
     bw_gm = copy.deepcopy(bw_gm_old)
-    placeholders = bw_gm.graph.find_nodes(op='placeholder')
+    placeholders = bw_gm.graph.find_nodes(op="placeholder")
     for p in placeholders:
-        if p.name.startswith('tangent'):
+        if p.name.startswith("tangent"):
             name_suffix = p.name[8:]
             rename_placeholder_node(bw_gm, p, f"not_tngnt{name_suffix}")
 
@@ -198,19 +205,21 @@ def split_di_dw_graph(bw_gm_old: fx.GraphModule, *, num_weight_gradients) -> tup
 
     args = list(bw_gm.graph.find_nodes(op="placeholder"))
 
-#    bw_inputs, bw_weights = default_partition(bw_gm, args, num_fwd_outputs=num_input_gradients)
-#    return bw_inputs, bw_weights, num_input_gradients
+    #    bw_inputs, bw_weights = default_partition(bw_gm, args, num_fwd_outputs=num_input_gradients)
+    #    return bw_inputs, bw_weights, num_input_gradients
 
-    grad_inps, grad_weights, grad_inp_descs, grad_weight_descs = (
-        _extract_fwd_bwd_outputs(bw_gm, num_fwd_outputs=num_input_gradients)
-    )
+    (
+        grad_inps,
+        grad_weights,
+        grad_inp_descs,
+        grad_weight_descs,
+    ) = _extract_fwd_bwd_outputs(bw_gm, num_fwd_outputs=num_input_gradients)
     bw_inputs_gm = _extract_graph_with_inputs_outputs(
         bw_gm.graph, args, grad_inps, grad_inp_descs, "forward"
     )
     bw_inputs_gm_node_names = OrderedSet(
         node.name for node in bw_inputs_gm.nodes if node.op != "output"
     )
-    order = {node: idx for idx, node in enumerate(bw_gm.graph.nodes)}
     saved_values = []
     saved_sym_nodes = []
 

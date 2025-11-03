@@ -587,7 +587,9 @@ class AutoParallelPPModule(torch.nn.Module):
 
 
 class AutoParallelPP(AutoParallel):
-    def apply_placement_pp(self, sharding_placement=None, generate_di_dw_split_graphs=False) -> dict[str, Any]:
+    def apply_placement_pp(
+        self, sharding_placement=None, generate_di_dw_split_graphs=False
+    ) -> dict[str, Any]:
         sharded_param_dict, sharded_buffer_dict = self._apply_placement_common(
             sharding_placement
         )
@@ -631,8 +633,13 @@ class AutoParallelPP(AutoParallel):
         )
         if generate_di_dw_split_graphs:
             from autoparallel._passes.split_di_dw_graph import split_di_dw_graph
-            num_weight_gradients = self.joint_with_descriptors._aot_state.aot_config.num_params_buffers
-            bw_dI_module, bw_dW_module, num_input_grads = split_di_dw_graph(bw_module, num_weight_gradients=num_weight_gradients)
+
+            num_weight_gradients = (
+                self.joint_with_descriptors._aot_state.aot_config.num_params_buffers
+            )
+            bw_dI_module, bw_dW_module, num_input_grads = split_di_dw_graph(
+                bw_module, num_weight_gradients=num_weight_gradients
+            )
             trace_structured(
                 "artifact",
                 metadata_fn=lambda: {
@@ -653,8 +660,15 @@ class AutoParallelPP(AutoParallel):
                     print_output=False, include_stride=True, include_device=True
                 ),
             )
-            if all(x is None for x in bw_dI_module.graph.find_nodes(op='output')[0].args[0][:num_input_grads]):
-                raise RuntimeError("attempted to run split dI/dW pass on a graph that has no input gradients. Maybe the input to your model does not require grad?")
+            if all(
+                x is None
+                for x in bw_dI_module.graph.find_nodes(op="output")[0].args[0][
+                    :num_input_grads
+                ]
+            ):
+                raise RuntimeError(
+                    "attempted to run split dI/dW pass on a graph that has no input gradients"
+                )
         else:
             bw_dI_module, bw_dW_module, num_input_grads = None, None, -1
 
@@ -664,7 +678,7 @@ class AutoParallelPP(AutoParallel):
             "num_symints_saved_for_bw": num_symints_saved_for_bw,
             "num_weight_buffer_grads": len(sharded_param_dict)
             + len(sharded_buffer_dict),
-            "num_input_grads": num_input_grads
+            "num_input_grads": num_input_grads,
         }
         graph_modules: dict[str, Optional[torch.fx.GraphModule]] = {
             "fw": fw_module,
