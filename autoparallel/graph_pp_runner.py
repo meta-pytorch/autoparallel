@@ -37,6 +37,7 @@ class GraphMeta:
     num_user_outputs: int
     num_symints_saved_for_bw: int
     num_weight_buffer_grads: int
+    num_input_grads: int
 
 
 class GraphPipelineStage(PipelineStage):
@@ -105,6 +106,20 @@ def _run_full_bw_module(
     param_buffer_grads = bw_outputs[: graph_meta.num_weight_buffer_grads]
     input_grads = bw_outputs[graph_meta.num_weight_buffer_grads :]
     return input_grads, param_buffer_grads
+
+
+def _run_split_bw_module(
+    bw_dI_gm: fx.GraphModule, bw_dW_gm: fx.GraphModule, graph_meta: GraphMeta, bw_args
+) -> tuple[Any, list[Any]]:
+    assert len([n for n in bw_dI_gm.graph.nodes if n.op == "placeholder"]) == len(
+        bw_args
+    ), "Mismatched number of inputs to bwd"
+    inp_grads_and_activations = torch.fx.Interpreter(bw_dI_gm).boxed_run(bw_args)
+    inp_grads, activations = inp_grads_and_activations[
+        : graph_meta.num_input_grads
+    ], list(inp_grads_and_activations[graph_meta.num_input_grads :])
+    weight_grads = torch.fx.Interpreter(bw_dW_gm).boxed_run(activations)
+    return inp_grads, weight_grads
 
 
 def _run_forward_microbatch(stage: GraphPipelineStage, *args) -> tuple[Any, Any]:

@@ -22,7 +22,7 @@ from autoparallel._testing.models.dsv3 import (
     MoEArgs,
 )
 from autoparallel.api import AutoParallelPP
-from autoparallel.graph_pp_runner import GraphMeta, _run_full_bw_module, _run_fw_module
+from autoparallel.graph_pp_runner import GraphMeta, _run_fw_module, _run_split_bw_module
 
 # must symbolically evaluate to run on 32 dp ranks
 # world_size = 2048
@@ -48,11 +48,12 @@ device = torch.device("cuda")
 
 bs = 4 * mesh.shape[0] * mesh.shape[1]
 seq_len = 1024
+dim = 2048
 
 config = DeepSeekV3ModelArgs(
     vocab_size=102400,
     max_seq_len=seq_len,
-    dim=2048,
+    dim=dim,
     inter_dim=10944,
     moe_inter_dim=1408,
     n_layers=1,  # 27,
@@ -80,15 +81,24 @@ config = DeepSeekV3ModelArgs(
 # parallelize the model
 with torch.device("meta"):
     model = DeepSeekV3Model(config).bfloat16()
+    model.tok_embeddings = None
 
 
+# Removing tok_embeddings from the model and passing in a float input that requires_grad,
+# so we can run the dI/dW partitioning pass
 def input_fn():
-    return torch.randint(
-        0,
-        config.vocab_size,
-        (bs, seq_len),
-        device=device,
+    return torch.randn(
+        (bs, seq_len, dim), device=device, dtype=torch.bfloat16, requires_grad=True
     )
+
+
+# def input_fn():
+#    return torch.randint(
+#        0,
+#        config.vocab_size,
+#        (bs, seq_len),
+#        device=device,
+#    )
 
 
 with AutoParallelPP(model, input_fn, mesh, dynamic=True) as autop:
@@ -101,7 +111,7 @@ with AutoParallelPP(model, input_fn, mesh, dynamic=True) as autop:
     autop.add_output_constraints([x_sharding])
 
     sharding_placement = autop.optimize_placement()
-    res = autop.apply_placement_pp(sharding_placement)
+    res = autop.apply_placement_pp(sharding_placement, generate_di_dw_split_graphs=True)
     graph_callables = res["graph_callables"]
     graph_meta = res["graph_meta"]
     graph_meta = GraphMeta(
@@ -109,6 +119,7 @@ with AutoParallelPP(model, input_fn, mesh, dynamic=True) as autop:
         num_user_outputs=graph_meta["num_user_outputs"],
         num_symints_saved_for_bw=graph_meta["num_symints_saved_for_bw"],
         num_weight_buffer_grads=graph_meta["num_weight_buffer_grads"],
+        num_input_grads=graph_meta["num_input_grads"],
     )
     pp_mod = autop.parallel_model
 
@@ -122,18 +133,29 @@ pp_mod.init_weights(buffer_device="cuda")
 
 fw_g = graph_callables["fw"].graph
 bw_g = graph_callables["full_bw"].graph
+bw_dI_g = graph_callables["bw_dI"].graph
+bw_dW_g = graph_callables["bw_dW"].graph
 
 fw_unshard_g, fw_main_g = split_fsdp_prefetch(fw_g)
 bw_main_g, bw_reduce_grad_g = split_fsdp_reduce_scatters_epilogue(bw_g)
 
+# x = (
+#    torch.randint(
+#        0,
+#        config.vocab_size,
+#        (bs // mesh.shape[0] // mesh.shape[1], seq_len),
+#        device=torch.device("cuda"),
+#    ),
+# )
 x = (
-    torch.randint(
-        0,
-        config.vocab_size,
-        (bs // mesh.shape[0] // mesh.shape[1], seq_len),
+    torch.randn(
+        (bs // mesh.shape[0] // mesh.shape[1], seq_len, dim),
         device=torch.device("cuda"),
+        dtype=torch.bfloat16,
+        requires_grad=True,
     ),
 )
+
 params_buffers = [
     v.to_local()
     for k, v in
@@ -168,8 +190,13 @@ with (
             *tangents,
         ]
 
-        input_grads, param_buffer_grads = _run_full_bw_module(
-            graph_callables["full_bw"], graph_meta, bw_args
+        # Full backward
+        # input_grads, param_buffer_grads = _run_full_bw_module(
+        #     graph_callables["full_bw"], graph_meta, bw_args
+        # )
+        # Split dI/dW backward
+        input_grads2, param_buffer_grads2 = _run_split_bw_module(
+            graph_callables["bw_dI"], graph_callables["bw_dW"], graph_meta, bw_args
         )
 
 
