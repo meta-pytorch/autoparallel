@@ -680,12 +680,11 @@ def local_mapped_region(
     experts_w3: torch.Tensor,
     experts_w2: torch.Tensor,
     out: torch.Tensor,
+    top_k: int,
+    num_experts: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     axis_name = "ep"
     # assert False, f"{x.shape}, {selected_experts_indices.shape}, {top_scores.shape}, {out.shape}"
-
-    top_k = 6
-    num_experts = 64
 
     dim = x.shape[-1]
 
@@ -865,6 +864,8 @@ def _moe_forward(
 ):
     # x: 64, 2048, 256
     bs, slen, dim = x.shape
+    top_k = 6
+    num_experts = 8
 
     # local_batch_size = 4
     # num_gpus_participating = 32 * 2
@@ -926,6 +927,8 @@ def _moe_forward(
         (Replicate(), Shard(0)),
         (Replicate(), Shard(0)),
         (Shard(0), Shard(0)),
+        None,
+        None,
     )
 
     # assert False, f"{x.shape}, {selected_experts_indices.shape}, {top_scores.shape}, {out.shape}"
@@ -937,7 +940,17 @@ def _moe_forward(
         redistribute_inputs=True,
         in_grad_placements=None,
         device_mesh=mesh,
-    )(selected_experts_indices, top_scores, x, experts_w1, experts_w3, experts_w2, out)
+    )(
+        selected_experts_indices,
+        top_scores,
+        x,
+        experts_w1,
+        experts_w3,
+        experts_w2,
+        out,
+        top_k,
+        num_experts,
+    )
     # assert False, f"there: {out.shape}, {num_tokens_per_expert.shape}"
 
     ######################################################
