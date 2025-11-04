@@ -81,12 +81,6 @@ def redistribute_cost(
         # 3. allreduce 4. reduce_scatter
         # curr_placements = [current_spec.placements[i] for i in order]
         # tgt_placements = [target_spec.placements[i] for i in order]
-        # is_contiguous: bool = check_contiguous_sizes_strides(
-        #    current_spec.shape, current_spec.stride
-        # )
-        # for i, current, target in zip(order, curr_placements, tgt_placements):
-        #   if not is_contiguous:
-        #   cost += compute_read_write_time(comm_bytes_gb * 2 * 1024**3)
     is_contiguous: bool = check_contiguous_sizes_strides(
         current_spec.shape, current_spec.stride
     )
