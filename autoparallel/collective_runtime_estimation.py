@@ -8,11 +8,10 @@ from typing import cast
 import torch.distributed.tensor._dtensor_spec as dtensor_spec
 from torch._prims_common import check_contiguous_sizes_strides
 from torch.distributed.tensor._collective_utils import (
+    MeshTopoInfo,
     allgather_cost,
     allreduce_cost,
-    MeshTopoInfo,
     reduce_scatter_cost,
-    spec_to_bytes,
 )
 from torch.distributed.tensor.placement_types import Partial, Shard
 
@@ -85,6 +84,9 @@ def redistribute_cost(
         current_spec.shape, current_spec.stride
     )
     for transform_info in transform_infos:
+        assert (
+            current_spec.tensor_meta is not None
+        ), "spec should have tensor meta defined!"
         comm_bytes_gb = (
             current_spec.tensor_meta.dtype.itemsize
             * math.prod(transform_info.logical_shape)
