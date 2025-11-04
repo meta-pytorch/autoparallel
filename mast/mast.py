@@ -167,6 +167,7 @@ def train(
             mast_env.pop(env_var, None)
 
     if not mast_env.get("ENABLE_AIRSTORE"):
+        mast_env["FUSE_SRC"] = "ws://ws.ai.nha0genai/checkpoint/infra"
         mast_env["FUSE_SRC_PATH"] = "checkpoint/infra"
 
     # Ensure that a dump dir is available
