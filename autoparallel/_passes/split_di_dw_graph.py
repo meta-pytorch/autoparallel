@@ -173,6 +173,7 @@ def _extract_fwd_bwd_modules(
             for i in range(len(saved_values) + len(saved_sym_nodes))
         ],
         "forward",
+        ignore_must_be_in_fw_bw=True,
     )
     bwd_graph = _extract_graph_with_inputs_outputs(
         joint_module.graph,
@@ -180,6 +181,7 @@ def _extract_fwd_bwd_modules(
         bwd_outputs,
         bwd_outputs_descs,
         "backward",
+        ignore_must_be_in_fw_bw=True,
     )
 
     fwd_module = fx._lazy_graph_module._make_graph_module(joint_module, fwd_graph)
@@ -215,7 +217,12 @@ def split_di_dw_graph(
         grad_weight_descs,
     ) = _extract_fwd_bwd_outputs(bw_gm, num_fwd_outputs=num_input_gradients)
     bw_inputs_gm = _extract_graph_with_inputs_outputs(
-        bw_gm.graph, args, grad_inps, grad_inp_descs, "forward"
+        bw_gm.graph,
+        args,
+        grad_inps,
+        grad_inp_descs,
+        "forward",
+        ignore_must_be_in_fw_bw=True,
     )
     bw_inputs_gm_node_names = OrderedSet(
         node.name for node in bw_inputs_gm.nodes if node.op != "output"
