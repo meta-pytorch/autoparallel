@@ -106,14 +106,13 @@ llama3_1d = {
     + [
         "--model.name=auto_parallel.llama3",
         "--compile.enable",
+        "--experimental.comms_bucket_reorder_strategy=none",
     ],
-    "llama3_autop_1d_compile_bucket_reorder": llama3_1d_common_opts
+    "llama3_autop_1d_compile_aten_bucket_reorder": llama3_1d_common_opts
     + [
         "--model.name=auto_parallel.llama3",
         "--compile.enable",
-        "--experimental.bucket_all_gathers_fx=fsdp",
-        "--experimental.bucket_reduce_scatters_fx=fsdp",
-        "--experimental.reorder_for_compute_comm_overlap",
+        "--experimental.comms_bucket_reorder_strategy=aten",
     ],
 }
 
@@ -127,41 +126,31 @@ llama3_2d = {
     + [
         "--model.name=auto_parallel.llama3",
         "--compile.enable",
+        "--experimental.comms_bucket_reorder_strategy=none",
     ],
-    "llama3_autop_2d_compile_bucket_reorder": llama3_2d_common_opts
+    "llama3_autop_2d_compile_aten_bucket_reorder": llama3_2d_common_opts
     + [
         "--model.name=auto_parallel.llama3",
         "--compile.enable",
-        "--experimental.bucket_all_gathers_fx=fsdp",
-        "--experimental.bucket_reduce_scatters_fx=fsdp",
-        "--experimental.reorder_for_compute_comm_overlap",
+        "--experimental.comms_bucket_reorder_strategy=aten",
     ],
 }
-
-test_run = {
-    "FSDP_tp_compile": llama3_2d_common_opts
-    + [
-        "--model.name=llama3",
-        "--compile.enable",
-    ],
-}
-
 
 all_runs = (
     llama3_1d
     | llama3_2d
     | {
-        "llama3_autop_1d_compile_ruisi_bucket_reorder": llama3_1d_common_opts
+        "llama3_autop_1d_compile_inductor_bucket_reorder": llama3_1d_common_opts
         + [
             "--model.name=auto_parallel.llama3",
             "--compile.enable",
-            "--experimental.enable_simplefsdp_passes",
+            "--experimental.comms_bucket_reorder_strategy=inductor",
         ],
-        "llama3_autop_2d_compile_ruisi_bucket_reorder": llama3_2d_common_opts
+        "llama3_autop_2d_compile_inductor_bucket_reorder": llama3_2d_common_opts
         + [
             "--model.name=auto_parallel.llama3",
             "--compile.enable",
-            "--experimental.enable_simplefsdp_passes",
+            "--experimental.comms_bucket_reorder_strategy=inductor",
         ],
     }
 )
@@ -178,10 +167,26 @@ sweeps = {
         [
             "llama3_FSDP_compile",
             "llama3_autop_1d_compile",
-            "llama3_autop_1d_compile_ruisi_bucket_reorder",
+            "llama3_autop_1d_compile_inductor_bucket_reorder",
             "llama3_FSDP_tp_compile",
             "llama3_autop_2d_compile",
-            "llama3_autop_2d_compile_ruisi_bucket_reorder",
+            "llama3_autop_2d_compile_inductor_bucket_reorder",
+        ]
+    ),
+    "compare_1d_bucketing": build_sweep(
+        [
+            "llama3_FSDP_compile",
+            "llama3_autop_1d_compile",
+            "llama3_autop_1d_compile_aten_bucket_reorder",
+            "llama3_autop_1d_compile_inductor_bucket_reorder",
+        ]
+    ),
+    "compare_2d_bucketing": build_sweep(
+        [
+            "llama3_FSDP_tp_compile",
+            "llama3_autop_2d_compile",
+            "llama3_autop_2d_compile_aten_bucket_reorder",
+            "llama3_autop_2d_compile_inductor_bucket_reorder",
         ]
     ),
 }
