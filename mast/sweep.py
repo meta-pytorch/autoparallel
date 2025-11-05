@@ -104,12 +104,12 @@ llama3_1d = {
     ],
     "llama3_autop_1d_compile": llama3_1d_common_opts
     + [
-        "--model.name=llama3_auto_parallel",
+        "--model.name=auto_parallel.llama3",
         "--compile.enable",
     ],
     "llama3_autop_1d_compile_bucket_reorder": llama3_1d_common_opts
     + [
-        "--model.name=llama3_auto_parallel",
+        "--model.name=auto_parallel.llama3",
         "--compile.enable",
         "--experimental.bucket_all_gathers_fx=fsdp",
         "--experimental.bucket_reduce_scatters_fx=fsdp",
@@ -125,12 +125,12 @@ llama3_2d = {
     ],
     "llama3_autop_2d_compile": llama3_2d_common_opts
     + [
-        "--model.name=llama3_auto_parallel",
+        "--model.name=auto_parallel.llama3",
         "--compile.enable",
     ],
     "llama3_autop_2d_compile_bucket_reorder": llama3_2d_common_opts
     + [
-        "--model.name=llama3_auto_parallel",
+        "--model.name=auto_parallel.llama3",
         "--compile.enable",
         "--experimental.bucket_all_gathers_fx=fsdp",
         "--experimental.bucket_reduce_scatters_fx=fsdp",
@@ -153,13 +153,13 @@ all_runs = (
     | {
         "llama3_autop_1d_compile_ruisi_bucket_reorder": llama3_1d_common_opts
         + [
-            "--model.name=llama3_auto_parallel",
+            "--model.name=auto_parallel.llama3",
             "--compile.enable",
             "--experimental.enable_simplefsdp_passes",
         ],
         "llama3_autop_2d_compile_ruisi_bucket_reorder": llama3_2d_common_opts
         + [
-            "--model.name=llama3_auto_parallel",
+            "--model.name=auto_parallel.llama3",
             "--compile.enable",
             "--experimental.enable_simplefsdp_passes",
         ],
