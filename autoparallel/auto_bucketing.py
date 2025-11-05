@@ -3,6 +3,8 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+from functools import partial
+
 import torch
 from torch._inductor.fx_passes.overlap_scheduling import schedule_overlap_bucketing
 
@@ -112,3 +114,46 @@ def aten_autobucketing_reordering_pass(
         max_in_flight_gb=configs.max_in_flight_gb,
         max_coll_distance=configs.max_coll_distance,
     )
+
+
+def configure_inductor_for_autobucketing(mode: str = "aten"):
+    # allow configuring inductor comms optimizations from torchtitan commandline
+    if mode == "aten":
+        from autoparallel.auto_bucketing import (
+            aten_autobucketing_config,
+            aten_autobucketing_reordering_pass,
+        )
+
+        # this is from the stacked pr in https://github.com/pytorch/pytorch/pull/163960
+        torch._inductor.config.reorder_for_peak_memory = False
+        torch._inductor.config.reorder_for_compute_comm_overlap = False
+        aten_autobucketing_reordering_pass = partial(
+            aten_autobucketing_reordering_pass,
+            configs=aten_autobucketing_config,  # type: ignore
+        )
+        torch._inductor.config.post_grad_custom_post_pass = (
+            aten_autobucketing_reordering_pass  # type: ignore
+        )
+    elif mode == "inductor":
+        from autoparallel.auto_bucketing import (
+            simple_fsdp_autobucketing_reordering_pass,
+            simplefsdp_autobucketing_config,
+        )
+
+        torch._inductor.config.allow_buffer_reuse = False
+        torch._inductor.config.reorder_for_peak_memory = False
+        torch._inductor.config.reorder_for_compute_comm_overlap = True
+        simplefsdp_autobucketing_config.calibrate_number = 5
+        simplefsdp_autobucketing_config.save_estimation_path = "./estimation_mast.pkl"
+        simple_fsdp_autobucketing_reordering_pass = partial(
+            simple_fsdp_autobucketing_reordering_pass,
+            configs=simplefsdp_autobucketing_config,  # type: ignore
+        )
+        torch._inductor.config.reorder_for_compute_comm_overlap_passes = [
+            simple_fsdp_autobucketing_reordering_pass
+        ]
+    elif mode == "none":
+        torch._inductor.config.reorder_for_peak_memory = False
+        torch._inductor.config.reorder_for_compute_comm_overlap = False
+    else:
+        raise ValueError(f"Unknown comms bucket reorder strategy: {mode}")
