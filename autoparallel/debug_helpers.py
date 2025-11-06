@@ -198,32 +198,32 @@ def get_tensor_repr(arg):
 def create_fake_trace(gm, custom_runtime_estimation):
     trace = {}
     trace_events = []
-    curr_time = 0
+    curr_time = {0: 0}
     global_time = {}
-    last_comm_node = None
     for node_idx, node in enumerate(gm.graph.nodes):
         dur = int(custom_runtime_estimation(node))
         tid = _get_tid(node)
+        if tid not in curr_time:
+            curr_time[tid] = curr_time[0]
         event = {"ph": "X", "cat": "kernel", "name": str(node), "pid": 0, "tid": tid}
         if _is_communication_node(node) and tid == 0:
             # if it's wait tensor, let's sync with compute stream
             comm_end_time = global_time.pop(node.args[0])
-            curr_time = max(curr_time, comm_end_time)
-            last_comm_node = None
-        elif _is_communication_node(node) and last_comm_node is not None:
-            curr_time = global_time[last_comm_node]
+            curr_time[tid] = max(curr_time[tid], comm_end_time)
+        elif _is_communication_node(node):
+            curr_time[tid] = max(curr_time[0], curr_time[tid])
 
         # curr_time = global_time[tid]
-        event["ts"] = curr_time
+        event["ts"] = curr_time[tid]
         event["dur"] = dur
         launch_overhead = 1  # 1us
         if tid == 0:
-            curr_time += dur + launch_overhead
+            curr_time[tid] += dur + launch_overhead
         else:
-            curr_time += launch_overhead
+            curr_time[0] += launch_overhead
+            curr_time[tid] += dur + launch_overhead
             # when will this comm finish
-            global_time[node] = curr_time + dur
-            last_comm_node = node
+            global_time[node] = curr_time[tid]
         args = {}
         args["order"] = node_idx
 
