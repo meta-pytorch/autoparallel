@@ -1062,7 +1062,7 @@ class MoE(nn.Module):
 
         # HOPs don't support buffer mutations, keep this outside
         with torch.no_grad():
-            self.tokens_per_expert.add_(num_tokens_per_expert)
+            self.tokens_per_expert.add_(num_tokens_per_expert)  # type: ignore[operator]
         return out
 
     def init_weights(
@@ -1076,14 +1076,10 @@ class MoE(nn.Module):
             self.shared_experts.init_weights(init_std)
 
         with torch.device(buffer_device):
-            self.tokens_per_expert = torch.zeros(
-                self.experts.num_experts, dtype=torch.float32
-            )
+            self.tokens_per_expert.zero_()  # type: ignore[operator]
             if self.load_balance_coeff is not None:
                 assert isinstance(self.expert_bias, torch.Tensor)
-                self.expert_bias = torch.zeros(
-                    self.experts.num_experts, dtype=torch.float32
-                )
+                self.expert_bias.zero_()  # type: ignore[operator]
 
 
 def has_cuda_capability(major: int, minor: int) -> bool:

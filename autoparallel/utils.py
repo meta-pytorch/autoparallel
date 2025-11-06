@@ -3,7 +3,10 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+from typing import Any, Iterable
+
 import torch
+import torch.utils._pytree as pytree
 from torch.distributed._tensor.placement_types import Placement, TensorMeta
 from torch.distributed.device_mesh import _get_device_handle
 from torch.distributed.tensor._dtensor_spec import DTensorSpec
@@ -310,3 +313,67 @@ def _get_device_from_mesh(mesh):
         return torch.device("cpu")
     device_handle = _get_device_handle(mesh.device_type)
     return torch.device(mesh.device_type, device_handle.current_device())
+
+
+# An FX graph interpreter that logs inputs and outputs of each node
+# with a few exceptions for c10d ops
+class DebugInterpreter(torch.fx.Interpreter):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._logs = []
+
+    def log(self, node: str, args: Iterable[Any], inputs_or_outputs: str):
+        leaves, _ = pytree.tree_flatten(args)
+        for i, arg in enumerate(leaves):
+            if not isinstance(arg, torch.Tensor):
+                self._logs.append(f"{node=}, {inputs_or_outputs}[{i}]={arg}")
+                continue
+
+            if arg.numel() == 0:
+                self._logs.append(f"{node=}, {inputs_or_outputs}[{i}].numel()=0")
+                continue
+
+            if arg.is_complex():
+                real = torch.hash_tensor(arg.real)
+                imag = torch.hash_tensor(arg.imag)
+                self._logs.append(f"{node=}, {inputs_or_outputs}[{i}], {real=} {imag=}")
+                continue
+
+            self._logs.append(
+                f"{node=}, {inputs_or_outputs}[{i}]={torch.hash_tensor(arg)}"
+            )
+
+    def run_node(self, n: torch.fx.Node) -> Any:
+        args, kwargs = self.fetch_args_kwargs_from_env(n)
+
+        # reading wait_tensor inputs is undefined behavior
+        if "wait_tensor" not in n.name:
+            args, _ = self.fetch_args_kwargs_from_env(n)
+            self.log(n.name, args, "args")
+
+        out = super().run_node(n)
+
+        # reading functional collectives outputs before wait_tensor is undefined behavior
+        if "c10d" not in str(n.target):
+            outs = out
+            if isinstance(outs, torch.Tensor):
+                outs = [outs]
+            self.log(n.name, outs, "outs")
+
+        return out
+
+    def get_logs(self):
+        return self._logs
+
+
+# Always prints from rank 0 to rank N
+def print_rank_by_rank(msg: Any):
+    rank = torch.distributed.get_rank()
+    world_size = torch.distributed.get_world_size()
+    torch.distributed.barrier()
+    for i in range(world_size):
+        if rank == i:
+            print(f"{rank=} start")
+            print(msg)
+            print(f"{rank=} done")
+        torch.distributed.barrier()

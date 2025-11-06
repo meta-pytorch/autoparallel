@@ -3,10 +3,11 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+import functools
 import logging
 import os
 from contextlib import nullcontext
-from typing import Callable
+from typing import Callable, Optional
 
 import torch
 import torch.distributed._tools.fake_collectives
@@ -49,6 +50,7 @@ from autoparallel.graph_pp_runner import (
     stage_reshard,
     stage_unshard,
 )
+from autoparallel.utils import print_rank_by_rank
 
 # Configure logging to show DEBUG messages
 logging.basicConfig(
@@ -98,7 +100,7 @@ def build_pipeline_schedule(
     return schedule
 
 
-def run_test(fake_evaluate: bool = True):
+def run_test(fake_evaluate: bool, debug_numerics: Optional[bool]):
     if not fake_evaluate:
         pp_degree = 2
         dp_mod_ep_degree = 2
@@ -346,7 +348,9 @@ def run_test(fake_evaluate: bool = True):
                 input_fn = tracing_input_fn
             else:
                 input_fn = tracing_input_fn_after_first_stage
-            with AutoParallelPP(stage_mod, input_fn, mesh, dynamic=True) as autop:
+            with AutoParallelPP(
+                stage_mod, input_fn, mesh, dynamic=True, compile=False
+            ) as autop:
                 autop.add_parameter_memory_constraint(low=None, high=None)
 
                 # x_sharding = (Shard(0), Replicate())
@@ -367,7 +371,6 @@ def run_test(fake_evaluate: bool = True):
                 if use_cache:
                     torch.save(cache, stage_file)
 
-        torch.manual_seed(pp_rank)
         pp_mod.to_empty(device=device)
         pp_mod.init_weights(buffer_device=device)
 
@@ -443,7 +446,10 @@ def run_test(fake_evaluate: bool = True):
     )
     assert isinstance(schedule, _PipelineScheduleRuntime)
     # Step 6. Override the pipeline runner's action implementations
-    schedule.register_custom_function(FORWARD, stage_forward)
+    numerics_logs = []
+    schedule.register_custom_function(
+        FORWARD, functools.partial(stage_forward, numerics_logs=numerics_logs)
+    )
     schedule.register_custom_function(FULL_BACKWARD, stage_full_backward)
     schedule.register_custom_function(REDUCE_GRAD, stage_reduce_grad)
     schedule.register_custom_function(RESHARD, stage_reshard)
@@ -469,6 +475,9 @@ def run_test(fake_evaluate: bool = True):
             else:
                 graph_pp_runner.step()
 
+    if debug_numerics:
+        print_rank_by_rank("\n".join(numerics_logs))
+
     print("All good!")
 
     if torch.distributed.is_initialized():
@@ -489,6 +498,16 @@ if __name__ == "__main__":
         default=False,
         help="Use fake evaluation mode with FakeTensorMode (default: False)",
     )
+    parser.add_argument(
+        "--rng-seed",
+        type=int,
+        default=None,
+        help="Use a specific rng seed and deterministic algorithms for run-to-run invariance (default: None).",
+    )
     args = parser.parse_args()
 
-    run_test(fake_evaluate=args.fake_evaluate)
+    if args.rng_seed is not None:
+        torch.use_deterministic_algorithms(True)
+        torch.manual_seed(args.rng_seed)
+
+    run_test(fake_evaluate=args.fake_evaluate, debug_numerics=args.rng_seed is not None)

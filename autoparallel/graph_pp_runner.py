@@ -5,7 +5,7 @@
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Callable, cast, Optional, Union
+from typing import Any, Callable, Optional, Union, cast
 
 import torch
 import torch.fx as fx
@@ -16,10 +16,12 @@ from torch.distributed.pipelining.schedules import (
     _wait_batch_p2p,
 )
 from torch.distributed.pipelining.stage import (
-    _normalize_model_output_as_tuple,
     PipelineStage,
+    _normalize_model_output_as_tuple,
 )
 from torch.distributed.tensor import DTensor
+
+from autoparallel.utils import DebugInterpreter
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -97,12 +99,21 @@ class GraphPipelineStage(PipelineStage):
 
 
 def _run_fw_module(
-    fw_module: fx.GraphModule, graph_meta: GraphMeta, fw_args: list[Any]
+    fw_module: fx.GraphModule,
+    graph_meta: GraphMeta,
+    fw_args: list[Any],
+    numerics_logs: Optional[list[str]] = None,
 ) -> tuple[Any, tuple[list[Any], list[Any]]]:
     assert len([n for n in fw_module.graph.nodes if n.op == "placeholder"]) == len(
         fw_args
     ), f"Mismatched number of inputs to fwd, {len([n for n in fw_module.graph.nodes if n.op == 'placeholder'])}, {len(fw_args)}"
-    fw_outputs = torch.fx.Interpreter(fw_module).boxed_run(fw_args)
+    if numerics_logs is not None:
+        debug_interpreter = DebugInterpreter(fw_module)
+        fw_outputs = debug_interpreter.boxed_run(fw_args)
+        numerics_logs += debug_interpreter.get_logs()
+    else:
+        fw_outputs = torch.fx.Interpreter(fw_module).boxed_run(fw_args)
+
     num_inner_fwd_outputs = graph_meta.num_mutate_inputs + graph_meta.num_user_outputs
     saved_intermediates = fw_outputs[num_inner_fwd_outputs:]
     num_tensors_for_backward = (
@@ -173,14 +184,16 @@ def _run_reduce_grad_module(
     return sharded_grads
 
 
-def _run_forward_microbatch(stage: GraphPipelineStage, *args) -> tuple[Any, Any]:
+def _run_forward_microbatch(
+    stage: GraphPipelineStage, *args, numerics_logs: Optional[list[str]] = None
+) -> tuple[Any, Any]:
     fw_args = [
         *stage.state["unsharded_params"],
         *stage.state["buffers"],
         *args,
     ]
     user_outputs, saved_intermediates = _run_fw_module(
-        stage.graph_callables.fw, stage.graph_meta, fw_args
+        stage.graph_callables.fw, stage.graph_meta, fw_args, numerics_logs=numerics_logs
     )
     return (user_outputs, saved_intermediates)
 
@@ -220,6 +233,7 @@ def _run_backward_microbatch(
 def stage_forward(
     action: _Action,
     ctx: _PipelineContext,
+    numerics_logs: Optional[list[str]] = None,
 ) -> None:
     schedule = ctx.schedule_ref
     assert isinstance(schedule, _PipelineScheduleRuntime)
@@ -267,7 +281,9 @@ def stage_forward(
         "GraphPPRunner running action %s",
         action,
     )
-    output, saved_intermediates = _run_forward_microbatch(stage, *composite_args)
+    output, saved_intermediates = _run_forward_microbatch(
+        stage, *composite_args, numerics_logs=numerics_logs
+    )
 
     # See [Note: pipeline model output type]
     output_tuple = _normalize_model_output_as_tuple(output)
