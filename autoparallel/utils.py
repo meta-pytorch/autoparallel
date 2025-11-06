@@ -142,7 +142,8 @@ def keep_unique_configs(op_strat: OpStrategy) -> OpStrategy:
 
             added.add(key)
         except TypeError:
-            print("Failed to hash, skipping dedup")
+            # print("Failed to hash, skipping dedup")
+            pass
         filtered_strats.append(strat)
     return OpStrategy(filtered_strats)
 

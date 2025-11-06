@@ -20,6 +20,8 @@ from torch.distributed.pipelining.stage import (
 )
 from torch.distributed.tensor import DTensor
 
+logs = []
+
 
 @dataclass
 class GraphCallables:
@@ -237,14 +239,90 @@ def stage_forward(
     if stage.is_first:
         # First stage doesn't need to receive anything
         composite_args = args
+        input_sum = composite_args[0].sum()
     else:
         # Receive activations for this chunk
         # Activations only come in args form
         composite_args = stage._retrieve_recv_activations(mb_index)
+        input_sum = composite_args[0].sum()
 
     # stage._validate_fwd_input(args, kwargs) Maybe need to validate composite args?
 
-    output, saved_intermediates = _run_forward_microbatch(stage, *composite_args)
+    ########
+    # output, saved_intermediates = _run_forward_microbatch(stage, *composite_args)
+
+    class DebugInterpreter(torch.fx.Interpreter):
+        def run_node(self, n: torch.fx.Node) -> Any:
+            # if "c10d" in str(n.target) and "wait_tensor" not in n.name:
+            rank = torch.distributed.get_rank()
+            if rank == 0 and "wait_tensor" not in n.name:
+                args, kwargs = self.fetch_args_kwargs_from_env(n)
+                for i,arg in enumerate(args):
+                    if isinstance(arg, torch.Tensor):
+                        logs.append(f"node={n.name}, args[{i}]={arg.to(dtype=torch.float32).norm()}")
+                    elif isinstance(arg, (list, tuple)):
+                        for j,a in enumerate(arg):
+                            if isinstance(a, torch.Tensor):
+                                logs.append(f"node={n.name}, args[{i}][{j}]={a.to(dtype=torch.float32).norm()}")
+                            else:
+                                logs.append(f"node={n.name}, args[{i}][{j}]={a}")
+                    else:
+                        logs.append(f"node={n.name}, args[{i}]={arg}")
+            out = super().run_node(n)
+            if rank == 0 and "c10d" not in str(n.target):
+                if isinstance(out, torch.Tensor):
+                    logs.append(f"node={n.name} out={out.to(dtype=torch.float32).norm()=}")
+                elif isinstance(out, (list, tuple)):
+                    for i,o in enumerate(out):
+                        if isinstance(o, torch.Tensor):
+                            logs.append(f"node={n.name}, outs[{i}]={o.to(dtype=torch.float32).norm()}")
+                        else:
+                            logs.append(f"node={n.name}, outs[{i}]={o}")
+                else:
+                    logs.append(f"node={n.name}, outs[{i}]={out}")
+
+
+
+            return out
+
+
+    def my_run_fw_module(
+        fw_module: fx.GraphModule, graph_meta: GraphMeta, fw_args: list[Any]
+    ) -> tuple[Any, tuple[list[Any], list[Any]]]:
+        assert len([n for n in fw_module.graph.nodes if n.op == "placeholder"]) == len(
+            fw_args
+        ), f"Mismatched number of inputs to fwd, {len([n for n in fw_module.graph.nodes if n.op == 'placeholder'])}, {len(fw_args)}"
+        fw_outputs = DebugInterpreter(fw_module).boxed_run(fw_args)
+        num_inner_fwd_outputs = graph_meta.num_mutate_inputs + graph_meta.num_user_outputs
+        saved_intermediates = fw_outputs[num_inner_fwd_outputs:]
+        num_tensors_for_backward = (
+            len(saved_intermediates) - graph_meta.num_symints_saved_for_bw
+        )
+        tensors_for_backward = saved_intermediates[:num_tensors_for_backward]
+        non_tensors_for_backward = saved_intermediates[num_tensors_for_backward:]
+        save_for_backward = (tensors_for_backward, non_tensors_for_backward)
+        user_outputs = fw_outputs[graph_meta.num_mutate_inputs : num_inner_fwd_outputs]
+        if len(user_outputs) == 1:
+            user_outputs = user_outputs[0]
+        return user_outputs, save_for_backward
+
+    fw_args = [
+        *stage.state["unsharded_params"],
+        *stage.state["buffers"],
+        *composite_args,
+    ]
+
+    logs.append(f"params={[p.norm() for p in stage.state["unsharded_params"]]}")
+    logs.append(f"buffers={[p.norm() for p in stage.state["buffers"]]}")
+    logs.append(f"composite_args={[p.to(torch.float32).norm() for p in composite_args]}")
+    output, saved_intermediates = my_run_fw_module(
+        stage.graph_callables.fw, stage.graph_meta, fw_args
+    )
+
+    rank = torch.distributed.get_rank()
+    assert len(composite_args) == 1 and isinstance(composite_args[0], torch.Tensor) and isinstance(output, torch.Tensor)
+    mystr = f"{action=} {input_sum=} {output.norm()=}"
+    logs.append(mystr)
 
     # See [Note: pipeline model output type]
     output_tuple = _normalize_model_output_as_tuple(output)
@@ -398,8 +476,12 @@ class GraphPPRunner:
     def __init__(
         self,
         schedule: _PipelineScheduleRuntime,
+        pp_rank: int,
+        ep_rank: int,
     ):
         self.schedule = schedule
+        self.pp_rank = pp_rank
+        self.ep_rank = ep_rank
 
     def _populate_stage_states(self, stage: GraphPipelineStage) -> None:
         sharded_params = [
@@ -453,12 +535,30 @@ class GraphPPRunner:
         stage.state.clear()
 
     def step(self, *args, **kwargs) -> None:
+        pp_rank = self.schedule._stages[0].group_rank
+        sched = self.schedule.pipeline_order
 
         for stage in self.schedule._stages:
             assert isinstance(stage, GraphPipelineStage)
             self._populate_stage_states(stage)
 
         self.schedule.step(*args, **kwargs)
+
+        rank = torch.distributed.get_rank()
+        if rank == 0:
+            print(f"{sched=}")
+        world_size = torch.distributed.get_world_size()
+        torch.distributed.barrier()
+        # for i in [0, 4]:
+        for i in range(world_size):
+            if rank == i:
+                print(f"{self.pp_rank=} {self.ep_rank=} start")
+                # for stage in self.schedule._stages:
+                #     print(f"params={[p.norm() for p in stage.state["unsharded_params"]]}")
+                #     print(f"buffers={[p.norm() for p in stage.state["unsharded_params"]]}")
+                print("\n".join([f"{l}" for l in logs]))
+                print(f"{self.pp_rank=} {self.ep_rank=} done")
+            torch.distributed.barrier()
 
         for stage in self.schedule._stages:
             assert isinstance(stage, GraphPipelineStage)

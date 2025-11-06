@@ -190,8 +190,8 @@ def _mark_nodes_as_must_save(must_save_nodes: list[torch.fx.Node]) -> None:
             skipped_nodes[node] = node.meta["recompute"]
             continue
         node.meta["recompute"] = CheckpointPolicy.MUST_SAVE
-    print(f"mark_nodes_as_must_save, attempting to mark nodes: {must_save_nodes}")
-    print(f"mark_nodes_as_must_save, skipping already marked nodes: {skipped_nodes}")
+    # print(f"mark_nodes_as_must_save, attempting to mark nodes: {must_save_nodes}")
+    # print(f"mark_nodes_as_must_save, skipping already marked nodes: {skipped_nodes}")
 
 
 def mark_nodes_as_must_save_to_stage_recomputation(

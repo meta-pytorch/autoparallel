@@ -1076,14 +1076,10 @@ class MoE(nn.Module):
             self.shared_experts.init_weights(init_std)
 
         with torch.device(buffer_device):
-            self.tokens_per_expert = torch.zeros(
-                self.experts.num_experts, dtype=torch.float32
-            )
+            self.tokens_per_expert.zero_()
             if self.load_balance_coeff is not None:
                 assert isinstance(self.expert_bias, torch.Tensor)
-                self.expert_bias = torch.zeros(
-                    self.experts.num_experts, dtype=torch.float32
-                )
+                self.expert_bias.zero_()
 
 
 def has_cuda_capability(major: int, minor: int) -> bool:
@@ -1476,8 +1472,9 @@ class TransformerBlock(nn.Module):
         else:
             self.feed_forward = FeedForward(model_args.dim, model_args.inter_dim)
 
-        self.weight_init_std = 0.02 / (2 * (layer_id + 1)) ** 0.5
-        self.layer_id = layer_id
+        # self.weight_init_std = 0.02 / (2 * (layer_id + 1)) ** 0.5
+        self.weight_init_std = 0.02
+        # self.layer_id = layer_id
 
     def forward(self, x: torch.Tensor, freqs_cis: torch.Tensor):
         """
@@ -1504,6 +1501,7 @@ class TransformerBlock(nn.Module):
         if self.moe_enabled:
             self.moe.init_weights(self.weight_init_std, buffer_device)
         else:
+            assert False
             self.feed_forward.init_weights(self.weight_init_std)
 
 

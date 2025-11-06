@@ -45,6 +45,7 @@ from autoparallel.graph_pp_runner import (
 )
 
 logger = logging.getLogger(__name__)
+torch.use_deterministic_algorithms(True)
 
 
 def build_pipeline_schedule(
@@ -86,10 +87,10 @@ def build_pipeline_schedule(
     return schedule
 
 
-def run_test(fake_evaluate: bool = True):
+def run_test(fake_evaluate: bool, rng_seed: int):
     if not fake_evaluate:
         pp_degree = 2
-        dp_mod_ep_degree = 2
+        dp_mod_ep_degree = 1
         ep_degree = 2
     else:
         pp_degree = 4
@@ -142,6 +143,7 @@ def run_test(fake_evaluate: bool = True):
     # Set pp_rank based on evaluation mode
     if not fake_evaluate:
         pp_rank = world_mesh["pp"].get_local_rank()
+        ep_rank = world_mesh["ep"].get_local_rank()
 
     stages_per_rank = 2
     total_pp_stages = pp_degree * stages_per_rank
@@ -334,7 +336,9 @@ def run_test(fake_evaluate: bool = True):
                 input_fn = tracing_input_fn
             else:
                 input_fn = tracing_input_fn_after_first_stage
-            with AutoParallelPP(stage_mod, input_fn, mesh, dynamic=True) as autop:
+            with AutoParallelPP(
+                stage_mod, input_fn, mesh, dynamic=True, compile=False
+            ) as autop:
                 autop.add_parameter_memory_constraint(low=None, high=None)
 
                 # x_sharding = (Shard(0), Replicate())
@@ -357,6 +361,7 @@ def run_test(fake_evaluate: bool = True):
 
         torch.manual_seed(pp_rank)
         pp_mod.to_empty(device=device)
+        torch.manual_seed(rng_seed)
         pp_mod.init_weights(buffer_device=device)
 
         # Store each stage's information in stage_mods, stage_graphs, and stage_graph_metas
@@ -435,7 +440,7 @@ def run_test(fake_evaluate: bool = True):
 
     # Step 7. Register the schedule with the graph runner
 
-    graph_pp_runner = GraphPPRunner(schedule)
+    graph_pp_runner = GraphPPRunner(schedule, pp_rank, ep_rank)
 
     # Step 8. Run the whole pipeline once using the graph runner
     with (
@@ -446,6 +451,7 @@ def run_test(fake_evaluate: bool = True):
         if fake_evaluate
         else nullcontext()
     ):
+        torch.manual_seed(rng_seed)
         with torch.no_grad():
             if pp_rank == 0:
                 x = runtime_input_fn()
@@ -473,6 +479,12 @@ if __name__ == "__main__":
         default=False,
         help="Use fake evaluation mode with FakeTensorMode (default: False)",
     )
+    parser.add_argument(
+        "--rng-seed",
+        type=int,
+        default=42,
+        help="Random number generator seed (default: 42)",
+    )
     args = parser.parse_args()
 
-    run_test(fake_evaluate=args.fake_evaluate)
+    run_test(fake_evaluate=args.fake_evaluate, rng_seed=args.rng_seed)
