@@ -147,7 +147,7 @@ def make_custom_runtime_estimation(mesh):
     return custom_runtime_estimation
 
 
-def apply_schedule_overlap_bucket(gm, args, custom_runtime_estimation):
+def get_graph_module(gm, args):
     stack = ExitStack()
     with stack:
         joint_with_descriptors = aot_export_joint_with_descriptors(
@@ -155,14 +155,18 @@ def apply_schedule_overlap_bucket(gm, args, custom_runtime_estimation):
             gm,
             tuple(x for x in args.values()),
         )
+    return joint_with_descriptors.graph_module
 
-        new_gm = schedule_overlap_bucketing(
-            joint_with_descriptors.graph_module,
-            collective_bucketing=True,
-            custom_runtime_estimation=custom_runtime_estimation,
-            max_compute_pre_fetch=100,
-            max_in_flight_gb=2.0,
-        )
+
+def apply_schedule_overlap_bucket(gm, custom_runtime_estimation):
+    new_gm = schedule_overlap_bucketing(
+        gm,
+        collective_bucketing=True,
+        custom_runtime_estimation=custom_runtime_estimation,
+        max_compute_pre_fetch=100,
+        max_in_flight_gb=2.0,
+    )
+    new_gm.recompile()
     return new_gm
 
 
@@ -206,24 +210,24 @@ def create_fake_trace(gm, custom_runtime_estimation):
         if tid not in curr_time:
             curr_time[tid] = curr_time[0]
         event = {"ph": "X", "cat": "kernel", "name": str(node), "pid": 0, "tid": tid}
-        if _is_communication_node(node) and tid == 0:
-            # if it's wait tensor, let's sync with compute stream
-            comm_end_time = global_time.pop(node.args[0])
-            curr_time[tid] = max(curr_time[tid], comm_end_time)
-        elif _is_communication_node(node):
-            curr_time[tid] = max(curr_time[0], curr_time[tid])
+        if _is_communication_node(node):
+            if tid == 0:
+                # if it's wait tensor, let's sync with compute stream
+                comm_end_time = global_time.pop(node.args[0])
+                curr_time[tid] = max(curr_time[tid], comm_end_time)
+            else:
+                curr_time[tid] = max(curr_time[0], curr_time[tid])
 
         # curr_time = global_time[tid]
         event["ts"] = curr_time[tid]
         event["dur"] = dur
         launch_overhead = 1  # 1us
-        if tid == 0:
-            curr_time[tid] += dur + launch_overhead
-        else:
+        curr_time[tid] += dur + launch_overhead
+        if tid != 0:
             curr_time[0] += launch_overhead
-            curr_time[tid] += dur + launch_overhead
             # when will this comm finish
             global_time[node] = curr_time[tid]
+
         args = {}
         args["order"] = node_idx
 
