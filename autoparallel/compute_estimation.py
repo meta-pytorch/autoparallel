@@ -242,9 +242,12 @@ def compute_memory_cost(op, args, outs):
     return read_bytes + write_bytes
 
 
-def _shard_args_for_node(node, strategy, rand_init=False):
+def _shard_args_for_node(node, strategy=None, rand_init=False):
     args = tree_map_only(torch.fx.Node, lambda x: x.meta["val"], node.args)
     kwargs = tree_map_only(torch.fx.Node, lambda x: x.meta["val"], node.kwargs)
+
+    if strategy is None:
+        return args, kwargs
 
     # TODO: handle kwargs as well, for now we assume all tensors are
     # in args
@@ -332,7 +335,8 @@ def estimate_strategy_runtime_cost(node, strategy):
     if flops == 0:
         return read_write_time
     # TODO: fix this
-    dtype = strategy.input_specs[0].tensor_meta.dtype
+    dtype = [x for x in tree_flatten(args)[0] if isinstance(x, torch.Tensor)][0].dtype
+    # dtype = strategy.input_specs[0].tensor_meta.dtype
 
     # TODO: use PyTorch's version once it's giving correct results
     gpu_flops = _get_device_tflops(dtype) * 10**12

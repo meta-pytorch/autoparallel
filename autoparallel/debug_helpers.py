@@ -1,0 +1,240 @@
+import inspect
+import json
+import re
+from contextlib import ExitStack
+
+import torch
+from torch._functorch.aot_autograd import aot_export_joint_with_descriptors
+from torch._inductor.fx_passes.overlap_scheduling import (
+    estimate_fx_collective_size,
+    schedule_overlap_bucketing,
+)
+
+from autoparallel.collective_runtime_estimation import (
+    MeshTopoInfo,
+    allgather_cost,
+    allreduce_cost,
+    reduce_scatter_cost,
+)
+from autoparallel.compute_estimation import estimate_strategy_runtime_cost
+
+
+def parse_tensor_annotation(annotation: str) -> torch.Tensor:
+    """
+    Parse a tensor annotation string and create a PyTorch tensor.
+
+    Format: dtype[shape][strides]device
+    Example: f32[384][1]cuda:0
+
+    Args:
+        annotation: String in format "dtype[shape][strides]device"
+
+    Returns:
+        A PyTorch tensor with the specified properties
+    """
+    # Parse the annotation string
+    # Pattern: dtype[shape][strides]device
+    pattern = r"([a-z0-9]+)(\[[\d,\s]+\])(\[[\d,\s]+\])(.+)"
+    match = re.match(pattern, annotation)
+
+    if not match:
+        raise ValueError(f"Invalid tensor annotation format: {annotation}")
+
+    dtype_str, shape_str, strides_str, device_str = match.groups()
+
+    # Map dtype string to PyTorch dtype
+    dtype_map = {
+        "f16": torch.float16,
+        "f32": torch.float32,
+        "f64": torch.float64,
+        "i8": torch.int8,
+        "i16": torch.int16,
+        "i32": torch.int32,
+        "i64": torch.int64,
+        "u8": torch.uint8,
+        "bool": torch.bool,
+        "bf16": torch.bfloat16,
+    }
+
+    if dtype_str not in dtype_map:
+        raise ValueError(f"Unsupported dtype: {dtype_str}")
+
+    dtype = dtype_map[dtype_str]
+
+    # Parse shape: [384] or [384,512] -> (384,) or (384, 512)
+    shape = (
+        tuple(map(int, shape_str.strip("[]").split(",")))
+        if shape_str.strip("[]")
+        else ()
+    )
+
+    # Parse strides: [1] or [512,1] -> (1,) or (512, 1)
+    strides = (
+        tuple(map(int, strides_str.strip("[]").split(",")))
+        if strides_str.strip("[]")
+        else ()
+    )
+
+    # Parse device
+    device = torch.device(device_str)
+
+    # Create tensor with specified properties
+    # We create an empty tensor and then use as_strided to set custom strides
+    if shape:
+        tensor = torch.empty_strided(shape, stride=strides, dtype=dtype, device=device)
+        if tensor.dtype.is_floating_point:
+            tensor.uniform_()
+        else:
+            tensor.random_(0, 128)
+    else:
+        # Scalar tensor
+        tensor = torch.empty((), dtype=dtype, device=device)
+
+    return tensor
+
+
+def build_arguments(fn):
+    sig = inspect.signature(fn)
+    args = {}
+    for k, v in sig.parameters.items():
+        if k == "self":
+            continue
+        anno = v.annotation
+        args[k] = parse_tensor_annotation(anno)
+    return args
+
+
+def _is_communication_node(node):
+    if not node.op == "call_function":
+        return False
+    if not isinstance(node.target, torch._ops.OpOverload):
+        return False
+
+    return node.target.namespace == "_c10d_functional"
+
+
+def make_custom_runtime_estimation(mesh):
+    def custom_runtime_estimation(node: torch.fx.Node):
+        if not node.op == "call_function":
+            return 0
+        if not isinstance(node.target, torch._ops.OpOverload):
+            return 0
+
+        if _is_communication_node(node):
+            target = node.target
+            if target == torch.ops._c10d_functional.wait_tensor.default:
+                return 0
+            # TODO: figure out mesh without reading from global scope
+            mesh_topo = MeshTopoInfo.build_from_mesh(mesh)
+            groups_name = tuple(g.group_name for g in mesh.get_all_groups())
+            group_name = node.args[-1]
+            mesh_dim = groups_name.index(group_name)
+            comm_bytes_gb = estimate_fx_collective_size(node) / 2**30
+            if target in {
+                torch.ops._c10d_functional.all_gather_into_tensor.default,
+                torch.ops._c10d_functional.all_gather_into_tensor_out.default,
+            }:
+                return allgather_cost(comm_bytes_gb, mesh_topo, mesh_dim)
+            elif target == torch.ops._c10d_functional.reduce_scatter_tensor.default:
+                return reduce_scatter_cost(comm_bytes_gb, mesh_topo, mesh_dim)
+            elif target == torch.ops._c10d_functional.all_reduce.default:
+                return allreduce_cost(comm_bytes_gb, mesh_topo, mesh_dim)
+            else:
+                # return None
+                return 0
+        return estimate_strategy_runtime_cost(node, None)
+
+    return custom_runtime_estimation
+
+
+def apply_schedule_overlap_bucket(gm, args, custom_runtime_estimation):
+    stack = ExitStack()
+    with stack:
+        joint_with_descriptors = aot_export_joint_with_descriptors(
+            stack,
+            gm,
+            tuple(x for x in args.values()),
+        )
+
+        new_gm = schedule_overlap_bucketing(
+            joint_with_descriptors.graph_module,
+            collective_bucketing=True,
+            custom_runtime_estimation=custom_runtime_estimation,
+            max_compute_pre_fetch=100,
+            max_in_flight_gb=2.0,
+        )
+    return new_gm
+
+
+def _get_tid(node):
+    if _is_communication_node(node):
+        if node.target == torch.ops._c10d_functional.wait_tensor.default:
+            return 0
+        return node.args[-1]
+    return 0
+
+
+def get_tensor_repr(arg):
+    def get_dtype_repr(dtype):
+        return str(dtype).split(".")[1]
+
+    if not isinstance(arg, torch.fx.Node):
+        if isinstance(arg, (int, float)):
+            return arg
+        if isinstance(arg, torch.dtype):
+            return get_dtype_repr(arg)
+        return {}
+    if "val" not in arg.meta:
+        return {}
+    if not isinstance(arg.meta["val"], torch.Tensor):
+        return {}
+
+    out = {}
+    out["shape"] = tuple(arg.meta["val"].shape)
+    out["dtype"] = get_dtype_repr(arg.meta["val"].dtype)
+    return out
+
+
+def create_fake_trace(gm, custom_runtime_estimation):
+    trace = {}
+    trace_events = []
+    curr_time = 0
+    global_time = {}
+    last_comm_node = None
+    for node_idx, node in enumerate(gm.graph.nodes):
+        dur = int(custom_runtime_estimation(node))
+        tid = _get_tid(node)
+        event = {"ph": "X", "cat": "kernel", "name": str(node), "pid": 0, "tid": tid}
+        if _is_communication_node(node) and tid == 0:
+            # if it's wait tensor, let's sync with compute stream
+            comm_end_time = global_time.pop(node.args[0])
+            curr_time = max(curr_time, comm_end_time)
+            last_comm_node = None
+        elif _is_communication_node(node) and last_comm_node is not None:
+            curr_time = global_time[last_comm_node]
+
+        # curr_time = global_time[tid]
+        event["ts"] = curr_time
+        event["dur"] = dur
+        launch_overhead = 1  # 1us
+        if tid == 0:
+            curr_time += dur + launch_overhead
+        else:
+            curr_time += launch_overhead
+            # when will this comm finish
+            global_time[node] = curr_time + dur
+            last_comm_node = node
+        args = {}
+        args["order"] = node_idx
+
+        args["output"] = get_tensor_repr(node)
+        node_args = []
+        for arg in node.args:
+            node_args.append(get_tensor_repr(arg))
+        args["inputs"] = node_args
+        event["args"] = args
+        trace_events.append(event)
+    trace["traceEvents"] = trace_events
+    trace["traceName"] = "fake_trace.json"
+    with open("fake_trace.json", "w") as fp:
+        json.dump(trace, fp)
