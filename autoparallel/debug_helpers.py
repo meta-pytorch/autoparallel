@@ -8,6 +8,7 @@ from torch._functorch.aot_autograd import aot_export_joint_with_descriptors
 from torch._inductor.fx_passes.overlap_scheduling import (
     estimate_fx_collective_size,
     schedule_overlap_bucketing,
+    get_group_name,
 )
 
 from autoparallel.collective_runtime_estimation import (
@@ -127,13 +128,18 @@ def make_custom_runtime_estimation(mesh):
             # TODO: figure out mesh without reading from global scope
             mesh_topo = MeshTopoInfo.build_from_mesh(mesh)
             groups_name = tuple(g.group_name for g in mesh.get_all_groups())
-            group_name = node.args[-1]
+            # group_name = node.args[-1]
+            group_name = get_group_name(node)
             mesh_dim = groups_name.index(group_name)
-            comm_bytes_gb = estimate_fx_collective_size(node) / 2**30
+            # FIXME: this estimation is wrong!
+            # comm_bytes_gb = estimate_fx_collective_size(node) / 2**30
+            t = node.args[0].meta["val"]
+            comm_bytes_gb = t.numel() * t.itemsize / 2 ** 30
             if target in {
                 torch.ops._c10d_functional.all_gather_into_tensor.default,
                 torch.ops._c10d_functional.all_gather_into_tensor_out.default,
             }:
+                comm_bytes_gb *= mesh.shape[mesh_dim]
                 return allgather_cost(comm_bytes_gb, mesh_topo, mesh_dim)
             elif target == torch.ops._c10d_functional.reduce_scatter_tensor.default:
                 return reduce_scatter_cost(comm_bytes_gb, mesh_topo, mesh_dim)
@@ -183,7 +189,7 @@ def get_tensor_repr(arg):
         return str(dtype).split(".")[1]
 
     if not isinstance(arg, torch.fx.Node):
-        if isinstance(arg, (int, float)):
+        if isinstance(arg, (int, float, str)):
             return arg
         if isinstance(arg, torch.dtype):
             return get_dtype_repr(arg)
