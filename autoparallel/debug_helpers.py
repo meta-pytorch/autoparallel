@@ -7,8 +7,8 @@ import torch
 from torch._functorch.aot_autograd import aot_export_joint_with_descriptors
 from torch._inductor.fx_passes.overlap_scheduling import (
     estimate_fx_collective_size,
-    schedule_overlap_bucketing,
     get_group_name,
+    schedule_overlap_bucketing,
 )
 
 from autoparallel.collective_runtime_estimation import (
@@ -115,7 +115,7 @@ def _is_communication_node(node):
 
 
 def make_custom_runtime_estimation(mesh):
-    def custom_runtime_estimation(node: torch.fx.Node):
+    def custom_runtime_estimation(node: torch.fx.Node, override_size=None):
         if not node.op == "call_function":
             return 0
         if not isinstance(node.target, torch._ops.OpOverload):
@@ -134,7 +134,9 @@ def make_custom_runtime_estimation(mesh):
             # FIXME: this estimation is wrong!
             # comm_bytes_gb = estimate_fx_collective_size(node) / 2**30
             t = node.args[0].meta["val"]
-            comm_bytes_gb = t.numel() * t.itemsize / 2 ** 30
+            comm_bytes_gb = t.numel() * t.itemsize / 2**30
+            if override_size is not None:
+                comm_bytes_gb = override_size
             if target in {
                 torch.ops._c10d_functional.all_gather_into_tensor.default,
                 torch.ops._c10d_functional.all_gather_into_tensor_out.default,
@@ -205,7 +207,7 @@ def get_tensor_repr(arg):
     return out
 
 
-def create_fake_trace(gm, custom_runtime_estimation):
+def create_fake_trace(gm, custom_runtime_estimation, file_path="fake_trace.json"):
     trace = {}
     trace_events = []
     curr_time = {0: 0}
@@ -246,5 +248,5 @@ def create_fake_trace(gm, custom_runtime_estimation):
         trace_events.append(event)
     trace["traceEvents"] = trace_events
     trace["traceName"] = "fake_trace.json"
-    with open("fake_trace.json", "w") as fp:
+    with open(file_path, "w") as fp:
         json.dump(trace, fp)

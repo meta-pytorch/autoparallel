@@ -27,7 +27,7 @@ torch.distributed.init_process_group(
     "fake", store=fake_store, rank=0, world_size=world_size
 )
 
-use_1d_mesh = False
+use_1d_mesh = True#False
 
 if use_1d_mesh:
     mesh = torch.distributed.device_mesh.init_device_mesh(
@@ -57,7 +57,7 @@ def model_fn():
     if model_type == "8b":
         model_args = TransformerModelArgs(
             dim=4096,
-            n_layers=32,
+            n_layers=8,#32,
             n_heads=32,
             n_kv_heads=8,
             ffn_dim_multiplier=1.3,
@@ -90,6 +90,9 @@ def input_fn():
 
 
 autobucketing_level = "aten"
+
+from autoparallel.debug_helpers import make_custom_runtime_estimation
+aten_autobucketing_config.custom_runtime_estimation = make_custom_runtime_estimation(mesh)
 
 if autobucketing_level == "aten":
     # this is from the stacked pr in https://github.com/pytorch/pytorch/pull/163960
