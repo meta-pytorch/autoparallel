@@ -4,6 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import copy
+import functools
 import itertools
 import warnings
 from contextlib import ExitStack, contextmanager
@@ -42,7 +43,11 @@ from .graph_utils import (
 )
 from .init_weights import hook_params_setters
 from .optimize_sharding import ShardingOptimizer
-from .utils import _get_device_from_mesh
+from .utils import (
+    NumericsLogger,
+    _get_device_from_mesh,
+    debug_boxed_nop_preserve_node_meta,
+)
 
 _APPLY_VIEW_MM_VIEW_PATTERN = False
 
@@ -212,6 +217,7 @@ class AutoParallel:
         reshard_after_forward: bool = True,
         dynamic: bool = False,
         loss_fn: Optional[Callable] = None,
+        numerics_logger: NumericsLogger | None = None,
         **kwargs,
     ):
         self.stack = ExitStack()
@@ -239,7 +245,14 @@ class AutoParallel:
         self.model = move_to_fake(model, self.fake_mode, device)
         self.input_fn = input_fn
         self.mesh = mesh
-        self.compiler_fn = compile_fx_inner if compile else boxed_nop_preserve_node_meta
+        if compile:
+            self.compiler_fn = compile_fx_inner
+        elif numerics_logger:
+            self.compiler_fn = functools.partial(
+                debug_boxed_nop_preserve_node_meta, numerics_logger=numerics_logger
+            )
+        else:
+            self.compiler_fn = boxed_nop_preserve_node_meta  # type: ignore[assignment]
         self.enable_ac = enable_ac
         self.ac_stage_size_in_GiB = ac_stage_size_in_GiB
         self.reshard_after_forward = reshard_after_forward

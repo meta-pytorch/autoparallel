@@ -22,7 +22,7 @@ from torch.distributed.pipelining.stage import (
 )
 from torch.distributed.tensor import DTensor
 
-from autoparallel.utils import DebugInterpreter
+from autoparallel.utils import DebugInterpreter, NumericsLogger
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -89,6 +89,8 @@ class GraphPipelineStage(PipelineStage):
         output_args: Optional[Union[torch.Tensor, tuple[torch.Tensor, ...]]] = None,
         group: Optional[torch.distributed.ProcessGroup] = None,
         dw_builder: Optional[Callable[[], Callable[..., None]]] = None,
+        numerics_logger: Optional[NumericsLogger] = None,
+        should_log_fw_outs: bool = False,
     ):
         super().__init__(
             submodule=submodule,
@@ -100,6 +102,8 @@ class GraphPipelineStage(PipelineStage):
             group=group,
             dw_builder=dw_builder,
         )
+        self.numerics_logger = numerics_logger
+        self.should_log_fw_outs = should_log_fw_outs
         self.graph_callables = graph_callables
         self.graph_meta = graph_meta
         self.state: dict[str, list[Any]] = {
@@ -376,6 +380,7 @@ def _prepare_fwd_args(
 
 
 def _post_fwd_common(
+    action: _Action,
     stage: GraphPipelineStage,
     mb_index: int,
     output: Any,
@@ -410,6 +415,14 @@ def _post_fwd_common(
         stage.output_chunks.append(output)
         if ctx.target_mbs is not None:
             ctx.schedule_ref._internal_losses.append(output)
+
+        if stage.should_log_fw_outs:
+            assert stage.numerics_logger is not None
+            stage.numerics_logger.log_diff(
+                output,
+                rank=torch.distributed.get_rank(),
+                prefix=f"mb{action.microbatch_index} fwd out",
+            )
 
     stage.fwd_cache[mb_index] = (output_tuple, saved_intermediates)  # type: ignore[assignment]
 
@@ -450,6 +463,7 @@ def stage_forward(
     )
 
     _post_fwd_common(
+        action,
         stage,
         mb_index,
         output,
@@ -793,6 +807,7 @@ def overlap_fw_bw(
     bw_stage._accumulate_stage_unsharded_grads(param_buffer_grads)
 
     _post_fwd_common(
+        action,
         fw_stage,
         fw_mb_index,
         output,
