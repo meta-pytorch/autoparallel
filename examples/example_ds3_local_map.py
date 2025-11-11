@@ -118,7 +118,8 @@ def run_test(fake_evaluate: bool, rng_seed: Optional[int], logs_dir: str):
             mscale=0.70,
         )
 
-    bs = 4 * mesh.shape[0] * mesh.shape[1]
+    local_batch_size = 2
+    global_batch_size = local_batch_size * mesh.shape[0] * mesh.shape[1]
     device = torch.device(f"cuda:{local_rank}")
 
     # parallelize the model
@@ -129,11 +130,16 @@ def run_test(fake_evaluate: bool, rng_seed: Optional[int], logs_dir: str):
         return torch.randint(
             0,
             config.vocab_size,
-            (bs, seq_len),
+            (global_batch_size, seq_len),
             device=device,
         )
 
-    with AutoParallel(model, input_fn, mesh, dynamic=True) as autop:
+    numerics_logger = None
+    if rng_seed is not None:
+        numerics_logger = NumericsLogger(logs_dir)
+    with AutoParallel(
+        model, input_fn, mesh, dynamic=True, numerics_logger=None
+    ) as autop:
         autop.add_parameter_memory_constraint(low=None, high=None)
 
         # x_sharding = (Shard(0), Replicate())
@@ -153,17 +159,22 @@ def run_test(fake_evaluate: bool, rng_seed: Optional[int], logs_dir: str):
     # )  # maybe not correct value
     parallel_mod.init_weights(buffer_device=device, seed=rng_seed)
     if rng_seed is not None:
-        numerics_logger = NumericsLogger(logs_dir)
         numerics_logger.log_model_weights(parallel_mod)
+        torch.manual_seed(rng_seed)
 
-    x = (
-        torch.randint(
-            0,
-            config.vocab_size,
-            (bs // mesh.shape[0] // mesh.shape[1], seq_len),
-            device=device,
-        ),
+    n_microbatches = 16
+    full_batch = torch.randint(
+        0,
+        config.vocab_size,
+        (local_batch_size * n_microbatches, seq_len),
+        device=device,
     )
+    microbatches = torch.split(full_batch, local_batch_size, dim=0)
+    assert len(microbatches) == n_microbatches
+    if rng_seed:
+        numerics_logger.log_diff(
+            full_batch.to(torch.float32), prefix="full batch input"
+        )
 
     # Symbolically evaluate in case you want to test running a graph bigger than your gpu
     if fake_evaluate:
@@ -173,15 +184,22 @@ def run_test(fake_evaluate: bool, rng_seed: Optional[int], logs_dir: str):
             allow_non_fake_inputs=True,
             shape_env=shape_env,
         ):
-            # # now let's run it
-            out = parallel_mod(*x)
-            out.backward(torch.randn_like(out))
+            # now let's run it
+            for x in microbatches:
+                out = parallel_mod(x)
+                out.backward(torch.ones_like(out))
     else:
-        out = parallel_mod(*x)
-        assert not torch.any(torch.isnan(out)), "Found NaNs in forward output"
+        for i, x in enumerate(microbatches):
+            assert x.shape[0] == 2
+            out = parallel_mod(x)
+            assert not torch.any(torch.isnan(out)), "Found NaNs in forward output"
+            out.backward(torch.ones_like(out))
+            if rng_seed is not None:
+                numerics_logger.log_diff(out, prefix=f"mb{i} fwd out")
+
         if rng_seed is not None:
-            numerics_logger.log_forward_output(out)
-        out.backward(torch.randn_like(out))
+            for k, v in parallel_mod.named_parameters():
+                numerics_logger.log_diff(v.grad, prefix=f"grad {k}")
 
     print("All good!")
 

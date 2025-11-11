@@ -240,6 +240,7 @@ def stage_forward(
     action: _Action,
     ctx: _PipelineContext,
     numerics_logs: Optional[list[str]] = None,
+    forward_hook: Callable | None = None,
 ) -> None:
     schedule = ctx.schedule_ref
     assert isinstance(schedule, _PipelineScheduleRuntime)
@@ -305,6 +306,8 @@ def stage_forward(
         stage.output_chunks.append(output)
         if ctx.target_mbs is not None:
             ctx.schedule_ref._internal_losses.append(output)
+    if forward_hook:
+        forward_hook(stage, action, output)
 
     stage.fwd_cache[mb_index] = (
         output_tuple,  # stage_output
