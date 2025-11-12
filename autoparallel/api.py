@@ -301,16 +301,18 @@ class AutoParallel:
         model_wrapper: Callable
         if self.loss_fn is not None:
 
-            def model_with_loss(input, target) -> Any:
-                output = self.model(input)
+            def model_with_loss(inputs, target) -> Any:
+                if not isinstance(inputs, tuple):
+                    inputs = (inputs,)
+                output = self.model(*inputs)
                 loss = self.loss_fn(output, target)  # type: ignore[misc]
                 return loss
 
             model_wrapper = model_with_loss
         else:
 
-            def model_wo_loss(input) -> Any:
-                output = self.model(input)
+            def model_wo_loss(*inputs) -> Any:
+                output = self.model(*inputs)
                 return output
 
             model_wrapper = model_wo_loss
