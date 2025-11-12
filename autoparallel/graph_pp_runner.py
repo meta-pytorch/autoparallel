@@ -5,10 +5,12 @@
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Callable, Optional, Union, cast
+from typing import Any, Callable, cast, Optional, Union
 
 import torch
 import torch.fx as fx
+
+from autoparallel.utils import DebugInterpreter
 from torch.distributed.pipelining.schedules import (
     _Action,
     _PipelineContext,
@@ -16,12 +18,10 @@ from torch.distributed.pipelining.schedules import (
     _wait_batch_p2p,
 )
 from torch.distributed.pipelining.stage import (
-    PipelineStage,
     _normalize_model_output_as_tuple,
+    PipelineStage,
 )
 from torch.distributed.tensor import DTensor
-
-from autoparallel.utils import DebugInterpreter
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -275,6 +275,11 @@ def stage_forward(
         # Receive activations for this chunk
         # Activations only come in args form
         composite_args = stage._retrieve_recv_activations(mb_index)
+        if stage.is_last and ctx.target_mbs is not None:
+            assert isinstance(
+                composite_args, tuple
+            ), f"Expected composite args to be a tuple but got {type(composite_args)}"
+            composite_args = composite_args + (ctx.target_mbs[mb_index],)  # type: ignore[index]
 
     # stage._validate_fwd_input(args, kwargs) Maybe need to validate composite args?
     logger.debug(
@@ -292,6 +297,8 @@ def stage_forward(
     # Output chunks is only used for the last stage since we only merge the output of the last stage
     if stage.is_last:
         stage.output_chunks.append(output)
+        if ctx.target_mbs is not None:
+            ctx.schedule_ref._internal_losses.append(output)
 
     stage.fwd_cache[mb_index] = (
         output_tuple,  # stage_output
@@ -360,7 +367,7 @@ def stage_full_backward(
         # HACK till we have loss function, we populate the tangents here manually
         bwd_kwargs = {
             "stage_output": loss,
-            "tangents": [torch.randn_like(stage_output[0])],
+            "tangents": [torch.ones_like(stage_output[0])],
             "saved_intermediates": saved_intermediates,
         }
     else:
@@ -525,7 +532,9 @@ class GraphPPRunner:
         stage.state.clear()
 
     def step(self, *args, **kwargs) -> None:
-
+        has_targets_and_loss = (
+            "losses" in kwargs and "targets" in kwargs if kwargs else False
+        )
         for stage in self.schedule._stages:
             assert isinstance(stage, GraphPipelineStage)
             self._populate_stage_states(stage)
@@ -535,3 +544,11 @@ class GraphPPRunner:
         for stage in self.schedule._stages:
             assert isinstance(stage, GraphPipelineStage)
             self._accumulate_stage_grads_and_clear_states(stage)
+            if stage.is_last and has_targets_and_loss:
+                losses = kwargs["losses"]
+                losses.clear()
+                assert (
+                    len(self.schedule._internal_losses) == self.schedule._n_microbatches
+                )
+                losses.extend(self.schedule._internal_losses)
+                self.schedule._internal_losses.clear()

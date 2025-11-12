@@ -8,7 +8,7 @@ import itertools
 import warnings
 from contextlib import ExitStack, contextmanager
 from types import MethodType
-from typing import Any, Optional, Union
+from typing import Any, Callable, Optional, Union
 
 import torch
 from torch._dynamo.functional_export import _dynamo_graph_capture_for_export
@@ -159,7 +159,9 @@ def enable_local_map_wrapping():
         yield
 
 
-def _export(model: torch.nn.Module, inputs: tuple[Any]) -> torch.nn.Module:
+def _export(
+    model: torch.nn.Module, model_wrapper: Callable, inputs: tuple[Any]
+) -> torch.fx.GraphModule:
     """
     Thin wrapper around graph capture output that restores the
     original calling convention and attribute fqn. TODO:
@@ -169,7 +171,7 @@ def _export(model: torch.nn.Module, inputs: tuple[Any]) -> torch.nn.Module:
     3) Be more careful about tensor constants names.
     """
     with torch._dynamo.config.patch(install_free_tensors=True):
-        gm = _dynamo_graph_capture_for_export(model)(*inputs)
+        gm = _dynamo_graph_capture_for_export(model_wrapper)(*inputs)
         _restore_state_dict(model, gm)
         return gm
 
@@ -193,6 +195,7 @@ class AutoParallel:
         ac_stage_size_in_GiB: Optional[Union[float, str]] = "auto",
         reshard_after_forward: bool = True,
         dynamic: bool = False,
+        loss_fn: Optional[Callable] = None,
         **kwargs,
     ):
         self.stack = ExitStack()
@@ -224,6 +227,7 @@ class AutoParallel:
         self.enable_ac = enable_ac
         self.ac_stage_size_in_GiB = ac_stage_size_in_GiB
         self.reshard_after_forward = reshard_after_forward
+        self.loss_fn = loss_fn
 
         if dynamic:
             self.fake_mode.shape_env = ShapeEnv()
@@ -294,11 +298,27 @@ class AutoParallel:
             inputs = self.input_fn()
             if not isinstance(inputs, tuple):
                 inputs = (inputs,)
+        model_wrapper: Callable
+        if self.loss_fn is not None:
+
+            def model_with_loss(input, target) -> Any:
+                output = self.model(input)
+                loss = self.loss_fn(output, target)  # type: ignore[misc]
+                return loss
+
+            model_wrapper = model_with_loss
+        else:
+
+            def model_wo_loss(input) -> Any:
+                output = self.model(input)
+                return output
+
+            model_wrapper = model_wo_loss
 
         with set_dtype_cast(
             True
         ), enable_local_map_wrapping(), torch._dynamo.utils._disable_saved_tensors_hooks_during_tracing():
-            torch_ir_with_fqn = _export(self.model, inputs)
+            torch_ir_with_fqn = _export(self.model, model_wrapper, inputs)
             # TODO Cna't use fake mode here because it clashes with the user level
             # fake mode. Ideally dynamo should reuse the user level fake mode.
             self.joint_with_descriptors = aot_export_joint_with_descriptors(
@@ -326,6 +346,7 @@ class AutoParallel:
                 print_output=False, include_stride=True, include_device=True
             ),
         )
+        print(gm.graph)
 
         self.gm = gm
 
