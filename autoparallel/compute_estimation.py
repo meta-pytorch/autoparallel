@@ -314,6 +314,22 @@ def compute_read_write_time(read_write_bytes):
     return read_write_time
 
 
+def _get_dtype_from_args(args, node):
+    dtype = None
+    for x in tree_flatten(args)[0]:
+        if not isinstance(x, torch.Tensor):
+            continue
+        if dtype is None:
+            dtype = x.dtype
+        else:
+            assert (
+                dtype == x.dtype
+            ), f"expected same dtypes, got {dtype}, {x.dtype} for {node}"
+    if dtype is None:
+        dtype = torch.float32
+    return dtype
+
+
 def estimate_strategy_runtime_cost(node, strategy):
     """
     This function estimates the runtime cost of a given strategy
@@ -334,9 +350,9 @@ def estimate_strategy_runtime_cost(node, strategy):
 
     if flops == 0:
         return read_write_time
-    # TODO: fix this
-    dtype = [x for x in tree_flatten(args)[0] if isinstance(x, torch.Tensor)][0].dtype
-    # dtype = strategy.input_specs[0].tensor_meta.dtype
+
+    # TODO: only pass in node and get args from it?
+    dtype = _get_dtype_from_args(args, node)
 
     # TODO: use PyTorch's version once it's giving correct results
     gpu_flops = _get_device_tflops(dtype) * 10**12
