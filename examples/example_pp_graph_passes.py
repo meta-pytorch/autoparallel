@@ -7,29 +7,29 @@ from contextlib import nullcontext
 from typing import Callable
 
 import torch
+from torch._subclasses.fake_tensor import FakeTensorMode
+from torch.distributed.tensor import DeviceMesh, DTensor
+from torch.distributed.tensor.placement_types import Replicate, Shard
+from torch.fx.experimental.symbolic_shapes import ShapeEnv
+from torch.testing._internal.distributed.fake_pg import FakeStore
 
 from autoparallel._testing.models.dsv3 import (
     DeepSeekV3Model,
     DeepSeekV3ModelArgs,
-    dsv3_loss_fn,
     MoEArgs,
+    dsv3_loss_fn,
 )
 from autoparallel.api import AutoParallelPP
 from autoparallel.graph_pp_runner import (
+    GraphCallables,
+    GraphMeta,
     _run_dI_bw_module,
     _run_dW_bw_module,
     _run_full_bw_module,
     _run_fw_module,
     _run_reduce_grad_module,
     _run_unshard_module,
-    GraphCallables,
-    GraphMeta,
 )
-from torch._subclasses.fake_tensor import FakeTensorMode
-from torch.distributed.tensor import DeviceMesh, DTensor
-from torch.distributed.tensor.placement_types import Replicate, Shard
-from torch.fx.experimental.symbolic_shapes import ShapeEnv
-from torch.testing._internal.distributed.fake_pg import FakeStore
 
 
 def _get_pp_module_and_graphs(

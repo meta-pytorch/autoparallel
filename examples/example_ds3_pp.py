@@ -7,11 +7,28 @@ import functools
 import logging
 import os
 from contextlib import nullcontext
-from typing import Callable, Optional, Union
+from typing import Callable
 
 import torch
 import torch.distributed._tools.fake_collectives
 import torch.nn as nn
+from torch._logging import trace_structured
+from torch._subclasses.fake_tensor import FakeTensorMode
+from torch.distributed.pipelining.schedules import (
+    FORWARD,
+    FULL_BACKWARD,
+    REDUCE_GRAD,
+    RESHARD,
+    UNSHARD,
+    PipelineScheduleMulti,
+    _PipelineSchedule,
+    _PipelineScheduleRuntime,
+    get_schedule_class,
+)
+from torch.distributed.pipelining.stage import PipelineStage
+from torch.distributed.tensor.placement_types import Replicate, Shard
+from torch.fx.experimental.symbolic_shapes import ShapeEnv
+from torch.testing._internal.distributed.fake_pg import FakeStore
 
 from autoparallel._testing.models.dsv3 import (
     DeepSeekV3Model,
@@ -19,8 +36,8 @@ from autoparallel._testing.models.dsv3 import (
     DeepSeekV3Stage0,
     DeepSeekV3StageI,
     DeepSeekV3StageN,
-    dsv3_loss_fn,
     MoEArgs,
+    dsv3_loss_fn,
 )
 from autoparallel.api import AutoParallelPP
 from autoparallel.graph_pp_runner import (
@@ -35,23 +52,6 @@ from autoparallel.graph_pp_runner import (
     stage_unshard,
 )
 from autoparallel.utils import print_rank_by_rank
-from torch._logging import trace_structured
-from torch._subclasses.fake_tensor import FakeTensorMode
-from torch.distributed.pipelining.schedules import (
-    _PipelineSchedule,
-    _PipelineScheduleRuntime,
-    FORWARD,
-    FULL_BACKWARD,
-    get_schedule_class,
-    PipelineScheduleMulti,
-    REDUCE_GRAD,
-    RESHARD,
-    UNSHARD,
-)
-from torch.distributed.pipelining.stage import PipelineStage
-from torch.distributed.tensor.placement_types import Replicate, Shard
-from torch.fx.experimental.symbolic_shapes import ShapeEnv
-from torch.testing._internal.distributed.fake_pg import FakeStore
 
 # Configure logging to show DEBUG messages
 logging.basicConfig(
@@ -387,14 +387,19 @@ def run_test(
             if stage_idx == 0:
                 input_fn = tracing_input_fn
             elif stage_idx == total_pp_stages - 1:
-                input_fn = lambda: (
-                    (
+
+                def inp_with_loss_fn():
+                    return (
                         tracing_input_fn_after_first_stage(),
                         tracing_target_fn(),
                     )
+
+                input_fn = (
+                    inp_with_loss_fn
                     if use_loss_fn
                     else tracing_input_fn_after_first_stage
                 )
+
             else:
                 input_fn = tracing_input_fn_after_first_stage
             with AutoParallelPP(
