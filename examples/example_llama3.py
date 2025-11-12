@@ -19,6 +19,7 @@ from autoparallel.auto_bucketing import (
     simple_fsdp_autobucketing_reordering_pass,
     simplefsdp_autobucketing_config,
 )
+from autoparallel.debug_helpers import make_custom_runtime_estimation
 
 world_size = 64
 
@@ -27,7 +28,7 @@ torch.distributed.init_process_group(
     "fake", store=fake_store, rank=0, world_size=world_size
 )
 
-use_1d_mesh = True#False
+use_1d_mesh = False
 
 if use_1d_mesh:
     mesh = torch.distributed.device_mesh.init_device_mesh(
@@ -57,7 +58,7 @@ def model_fn():
     if model_type == "8b":
         model_args = TransformerModelArgs(
             dim=4096,
-            n_layers=8,#32,
+            n_layers=32,
             n_heads=32,
             n_kv_heads=8,
             ffn_dim_multiplier=1.3,
@@ -91,10 +92,10 @@ def input_fn():
 
 autobucketing_level = "aten"
 
-from autoparallel.debug_helpers import make_custom_runtime_estimation
-aten_autobucketing_config.custom_runtime_estimation = make_custom_runtime_estimation(mesh)
-
 if autobucketing_level == "aten":
+    aten_autobucketing_config.custom_runtime_estimation = (
+        make_custom_runtime_estimation(mesh)
+    )
     # this is from the stacked pr in https://github.com/pytorch/pytorch/pull/163960
     torch._inductor.config.reorder_for_peak_memory = False
     torch._inductor.config.reorder_for_compute_comm_overlap = False

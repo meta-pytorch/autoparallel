@@ -5,8 +5,7 @@ from contextlib import ExitStack
 
 import torch
 from torch._functorch.aot_autograd import aot_export_joint_with_descriptors
-from torch._inductor.fx_passes.overlap_scheduling import (
-    estimate_fx_collective_size,
+from torch._inductor.fx_passes.overlap_scheduling import (  # estimate_fx_collective_size,
     get_group_name,
     schedule_overlap_bucketing,
 )
@@ -133,7 +132,7 @@ def make_custom_runtime_estimation(mesh):
             mesh_dim = groups_name.index(group_name)
             # FIXME: this estimation is wrong!
             # comm_bytes_gb = estimate_fx_collective_size(node) / 2**30
-            t = node.args[0].meta["val"]
+            t = node.args[0].meta["val"]  # type: ignore[union-attr]
             comm_bytes_gb = t.numel() * t.itemsize / 2**30
             if override_size is not None:
                 comm_bytes_gb = override_size
@@ -169,9 +168,9 @@ def get_graph_module(gm, args):
 def apply_schedule_overlap_bucket(gm, custom_runtime_estimation):
     new_gm = schedule_overlap_bucketing(
         gm,
-        collective_bucketing=True,
+        collective_bucketing=False,
         custom_runtime_estimation=custom_runtime_estimation,
-        max_compute_pre_fetch=100,
+        max_compute_pre_fetch=5,
         max_in_flight_gb=2.0,
     )
     new_gm.recompile()

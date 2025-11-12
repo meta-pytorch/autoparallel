@@ -3,7 +3,6 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
-from autoparallel.debug_helpers import make_custom_runtime_estimation
 import torch
 from torch._inductor.fx_passes.overlap_scheduling import schedule_overlap_bucketing
 
@@ -101,18 +100,22 @@ class aten_autobucketing_config:
 
     max_in_flight_gb = 2.0
     compute_overlap_multipler = 1.0
-    max_coll_distance = 1000
+    max_coll_distance = 100
     custom_runtime_estimation = None
+    max_compute_pre_fetch = 5
+    collective_bucketing = False
 
 
 counter = 0
+
+
 def aten_autobucketing_reordering_pass(
     gm: torch.fx.Graph, configs: "aten_autobucketing_config"
 ) -> torch.fx.GraphModule:
     new_gm = schedule_overlap_bucketing(
         gm.owning_module,
-        collective_bucketing=False,
-        max_compute_pre_fetch=5,#100,
+        collective_bucketing=configs.collective_bucketing,
+        max_compute_pre_fetch=configs.max_compute_pre_fetch,
         custom_runtime_estimation=configs.custom_runtime_estimation,
         compute_overlap_multipler=configs.compute_overlap_multipler,
         max_in_flight_gb=configs.max_in_flight_gb,
@@ -120,7 +123,10 @@ def aten_autobucketing_reordering_pass(
     )
     new_gm.recompile()
     from autoparallel.debug_helpers import create_fake_trace
+
     global counter
-    create_fake_trace(new_gm, configs.custom_runtime_estimation, f"fake_trace_{counter}.json")
+    create_fake_trace(
+        new_gm, configs.custom_runtime_estimation, f"fake_trace_{counter}.json"
+    )
     counter += 1
     return new_gm
