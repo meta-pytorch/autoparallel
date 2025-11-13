@@ -34,7 +34,7 @@ def parse_tensor_annotation(annotation: str) -> torch.Tensor:
     """
     # Parse the annotation string
     # Pattern: dtype[shape][strides]device
-    pattern = r"([a-z0-9]+)(\[[\d,\s]+\])(\[[\d,\s]+\])(.+)"
+    pattern = r"([a-z0-9]+)(\[[\d,\s]*\])(\[[\d,\s]*\])(.+)"
     match = re.match(pattern, annotation)
 
     if not match:
@@ -53,6 +53,7 @@ def parse_tensor_annotation(annotation: str) -> torch.Tensor:
         "i64": torch.int64,
         "u8": torch.uint8,
         "bool": torch.bool,
+        "b8": torch.bool,
         "bf16": torch.bfloat16,
     }
 
@@ -85,7 +86,8 @@ def parse_tensor_annotation(annotation: str) -> torch.Tensor:
         if tensor.dtype.is_floating_point:
             tensor.uniform_()
         else:
-            tensor.random_(0, 128)
+            tensor.random_()
+            tensor = tensor % 128
     else:
         # Scalar tensor
         tensor = torch.empty((), dtype=dtype, device=device)
