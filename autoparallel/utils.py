@@ -3,6 +3,7 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+from pathlib import Path
 from typing import Any, Iterable
 
 import torch
@@ -377,3 +378,88 @@ def print_rank_by_rank(msg: Any):
             print(msg)
             print(f"{rank=} done")
         torch.distributed.barrier()
+
+
+def hash_tensor(t: torch.Tensor) -> str:
+    if isinstance(t, torch.distributed.tensor.DTensor):
+        t = t.to_local()
+        return f"DTensor({hash_tensor(t)})"
+
+    if t.is_complex():
+        return f"real={hash_tensor(t.real)}, imag={hash_tensor(t.imag)})"
+
+    return f"{torch.hash_tensor(t)}"
+
+
+class NumericsLogger:
+    def __init__(self, base_dir: str):
+        self.base = Path(base_dir)
+        self.base.mkdir(parents=True, exist_ok=True)
+        self.rank = torch.distributed.get_rank()
+        self.dir = self._create_run_dir()
+
+    def _create_run_dir(self) -> Path:
+        """
+        Find the next available integer directory name under base_dir.
+        Example: base_dir/0, base_dir/1, base_dir/2, ...
+        """
+        existing = [
+            int(p.name) for p in self.base.iterdir() if p.is_dir() and p.name.isdigit()
+        ]
+        next_id = (max(existing) + 1) if existing else 0
+        run_dir = self.base / str(next_id)
+        torch.distributed.barrier()
+        if self.rank == 0:
+            run_dir.mkdir()
+        torch.distributed.barrier()
+        return run_dir
+
+    def log_model_weights(self, parallel_mod):
+        if self.rank == 0:
+            path = self.dir / "weights.log"
+
+            logs = []
+            for name, param in parallel_mod.named_parameters():
+                logs.append(f"{name=} hash={hash_tensor(param)}")
+            for name, buf in parallel_mod.named_buffers():
+                logs.append(f"{name=} hash={hash_tensor(buf)}")
+
+            with open(path, "a") as f:
+                f.write("\n".join(logs) + "\n")
+
+            print(f"Weight hashes written to {path}")
+
+    def log_pp_model_weights(self, orig_mod, stage_mods, num_world_stages, ranks):
+        path = self.dir / "pp_weights.log"
+
+        torch.distributed.barrier()
+        # First print the params of every stage
+        for i in range(num_world_stages):
+            if self.rank in ranks and i in stage_mods:
+                param_logs = []
+                real_params = dict(stage_mods[i].named_parameters())
+                for name, _ in orig_mod.named_parameters():
+                    if name not in real_params:
+                        continue
+                    param = real_params[name]
+                    param_logs.append(f"{name=} hash={hash_tensor(param)}")
+                with open(path, "a") as f:
+                    f.write("\n".join(param_logs) + "\n")
+            torch.distributed.barrier()
+
+        # Then print the buffers of every stage
+        for i in range(num_world_stages):
+            if self.rank in ranks and i in stage_mods:
+                buffer_logs = []
+                real_buffers = dict(stage_mods[i].named_buffers())
+                for name, _ in orig_mod.named_buffers():
+                    if name not in real_buffers:
+                        continue
+                    buffer = real_buffers[name]
+                    buffer_logs.append(f"{name=} hash={hash_tensor(buffer)}")
+                with open(path, "a") as f:
+                    f.write("\n".join(buffer_logs) + "\n")
+            torch.distributed.barrier()
+
+        if self.rank == 0:
+            print(f"Weight hashes written to {path}")

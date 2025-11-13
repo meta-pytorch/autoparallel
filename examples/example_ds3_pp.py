@@ -50,7 +50,7 @@ from autoparallel.graph_pp_runner import (
     stage_reshard,
     stage_unshard,
 )
-from autoparallel.utils import print_rank_by_rank
+from autoparallel.utils import NumericsLogger
 
 # Configure logging to show DEBUG messages
 logging.basicConfig(
@@ -100,7 +100,7 @@ def build_pipeline_schedule(
     return schedule
 
 
-def run_test(fake_evaluate: bool, debug_numerics: Optional[bool]):
+def run_test(fake_evaluate: bool, rng_seed: Optional[int], logs_dir: str):
     if not fake_evaluate:
         pp_degree = 2
         dp_mod_ep_degree = 2
@@ -372,7 +372,8 @@ def run_test(fake_evaluate: bool, debug_numerics: Optional[bool]):
                     torch.save(cache, stage_file)
 
         pp_mod.to_empty(device=device)
-        pp_mod.init_weights(buffer_device=device)
+        # run weight init on our sharded DTensor params
+        pp_mod.init_weights(buffer_device=device, seed=rng_seed)
 
         # Store each stage's information in stage_mods, stage_graphs, and stage_graph_metas
         stage_mods[stage_idx] = pp_mod
@@ -409,7 +410,12 @@ def run_test(fake_evaluate: bool, debug_numerics: Optional[bool]):
         == len(stage_graph_metas)
     )
 
-    # run weight init on our sharded DTensor params
+    world_size = torch.distributed.get_world_size()
+    num_world_stages = world_size * len(stage_mods)
+    if rng_seed is not None:
+        NumericsLogger(logs_dir).log_pp_model_weights(
+            model, stage_mods, num_world_stages, ranks=[0, 4]
+        )
 
     stages = []
     # Step 4. Construct pipeline stages for this pp_rank using the stage modules, graphs and metadata
@@ -446,9 +452,8 @@ def run_test(fake_evaluate: bool, debug_numerics: Optional[bool]):
     )
     assert isinstance(schedule, _PipelineScheduleRuntime)
     # Step 6. Override the pipeline runner's action implementations
-    numerics_logs = []
     schedule.register_custom_function(
-        FORWARD, functools.partial(stage_forward, numerics_logs=numerics_logs)
+        FORWARD, functools.partial(stage_forward, numerics_logs=None)
     )
     schedule.register_custom_function(FULL_BACKWARD, stage_full_backward)
     schedule.register_custom_function(REDUCE_GRAD, stage_reduce_grad)
@@ -474,9 +479,6 @@ def run_test(fake_evaluate: bool, debug_numerics: Optional[bool]):
                 graph_pp_runner.step(x)
             else:
                 graph_pp_runner.step()
-
-    if debug_numerics:
-        print_rank_by_rank("\n".join(numerics_logs))
 
     print("All good!")
 
@@ -504,10 +506,18 @@ if __name__ == "__main__":
         default=None,
         help="Use a specific rng seed and deterministic algorithms for run-to-run invariance (default: None).",
     )
+    parser.add_argument(
+        "--logs-dir",
+        type=str,
+        default="out/",
+        help="Directory to store logs (default: ./out/).",
+    )
     args = parser.parse_args()
 
     if args.rng_seed is not None:
         torch.use_deterministic_algorithms(True)
         torch.manual_seed(args.rng_seed)
 
-    run_test(fake_evaluate=args.fake_evaluate, debug_numerics=args.rng_seed is not None)
+    run_test(
+        fake_evaluate=args.fake_evaluate, rng_seed=args.rng_seed, logs_dir=args.logs_dir
+    )
