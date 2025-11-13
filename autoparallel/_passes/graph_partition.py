@@ -29,7 +29,15 @@ def partition_joint_with_descriptors(
     fw_compiler: Callable = boxed_nop_preserve_node_meta,
     bw_compiler: Callable = boxed_nop_preserve_node_meta,
 ) -> tuple[
-    torch.fx.GraphModule, torch.fx.GraphModule, int, int, int, int, list[int], list[Any]
+    torch.fx.GraphModule,
+    torch.fx.GraphModule,
+    int,
+    int,
+    int,
+    int,
+    int,
+    list[int],
+    list[Any],
 ]:
     aot_state: AOTState = jd._aot_state
     aot_graph_capture: AOTGraphCapture = jd._aot_graph_capture
@@ -79,9 +87,11 @@ def partition_joint_with_descriptors(
     num_mutate_inputs = len(
         [x for x in fw_metadata.input_info if x.mutates_data or x.mutates_metadata]
     )
+    num_params_buffers = aot_config.num_params_buffers
     return (
         fw_module,
         bw_module,
+        num_params_buffers,
         num_user_outputs,
         num_mutate_inputs,
         num_fw_outs_saved_for_bw,

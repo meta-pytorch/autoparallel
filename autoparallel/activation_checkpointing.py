@@ -66,6 +66,94 @@ def is_wait_tensor_from_fsdp(node: torch.fx.Node) -> bool:
 # mypy: ignore-errors
 
 
+def force_save_fsdp_all_gather(graph: torch.fx.Graph) -> None:
+    """
+    Force save all_gather nodes from simple fsdp in the graph.
+    This pass should be added in torch._inductor.config.joint_custom_post_pass
+    """
+    nodes_to_save = []
+    primal_origins = []
+    primals = graph.find_nodes(op="placeholder")
+    # 1. Find last all_gather from each placeholder
+    for primal in primals:
+        node = primal
+        last_ag_chain_node = None
+        while True:
+            if len(node.users) != 1:
+                break
+            user = next(iter(node.users))
+            if len(user.all_input_nodes) > 1:
+                break
+            node = user
+            if is_all_gather_into_tensor(node):
+                last_ag_chain_node = node
+        if last_ag_chain_node is not None:
+            # 2. Find last wait_tensor from last all_gather
+            last_ag_wait_node = next(iter(last_ag_chain_node.users))
+            assert is_wait_tensor(last_ag_wait_node)
+            assert is_wait_tensor_from_fsdp(last_ag_wait_node)
+            # 3. Continue the linear chain from the last wait_tensor
+            w = last_ag_wait_node
+            while True:
+                if len(w.users) != 1:
+                    # Capture this pattern:
+                    # %wait_tensor_5 : [num_users=1] = call_function[target=torch.ops._c10d_functional.wait_tensor.default](args = (%all_gather_into_tensor_5,), kwargs = {})  # noqa: E501
+                    # %split : [num_users=4] = call_function[target=torch.ops.aten.split.Tensor](args = (%wait_tensor_5, 576), kwargs = {})
+                    # %getitem_2 : [num_users=1] = call_function[target=operator.getitem](args = (%split, 0), kwargs = {})
+                    # %getitem_3 : [num_users=1] = call_function[target=operator.getitem](args = (%split, 1), kwargs = {})
+                    # %getitem_4 : [num_users=1] = call_function[target=operator.getitem](args = (%split, 2), kwargs = {})
+                    # %getitem_5 : [num_users=1] = call_function[target=operator.getitem](args = (%split, 3), kwargs = {})
+                    # %cat_1 : [num_users=1] = call_function[target=torch.ops.aten.cat.default](args = ([%getitem_2, %getitem_3, %getitem_4, %getitem_5], 1), kwargs = {})  # noqa: E501
+                    if (
+                        w.op == "call_function"
+                        and w.target == torch.ops.aten.split.Tensor
+                    ):
+                        if all(
+                            split_user.op == "call_function"
+                            and split_user.target == operator.getitem
+                            and len(split_user.users) == 1
+                            for split_user in w.users
+                        ):
+                            getitem_users = list(
+                                next(iter(getitem_node.users))
+                                for getitem_node in w.users
+                            )
+                            potential_cat_op = getitem_users[0]
+                            if all(
+                                potential_cat_op == getitem_user
+                                for getitem_user in getitem_users
+                            ) and (
+                                potential_cat_op.op == "call_function"
+                                and potential_cat_op.target
+                                == torch.ops.aten.cat.default
+                            ):
+                                w = potential_cat_op
+                                continue
+                    break
+                user = next(iter(w.users))
+                if len(user.all_input_nodes) > 1:
+                    break
+                w = user
+            # 4. Stores the last node in this chain as `last_wait_chain_user`
+            last_wait_chain_user = w
+            # 5. Check if the last node in this chain is used in backward
+            is_used_in_backward = False
+            for downstream_user in last_wait_chain_user.users:
+                if _has_tag_is_backward(downstream_user):
+                    is_used_in_backward = True
+                    break
+            if is_used_in_backward:
+                # 6. If the last node in this chain is used in backward, only then we save the wait_tensor
+                nodes_to_save.append(last_ag_wait_node)
+                primal_origins.append(primal)
+    logger.info("force_save_fsdp_all_gather, primal_origins: %s", primal_origins)
+    logger.info("force_save_fsdp_all_gather, nodes_to_save: %s", nodes_to_save)
+
+    for node in nodes_to_save:
+        node.meta["recompute"] = CheckpointPolicy.MUST_SAVE
+        node.meta["ac_graph_id"] = AP_AC_GRAPH_ID
+
+
 def force_recompute_fsdp_all_gather(graph: torch.fx.Graph) -> None:
     """
     Force recompute all_gather nodes from simple fsdp in the graph.
@@ -354,6 +442,8 @@ def ac_joint_pass(
 ):
     if reshard_after_forward:
         force_recompute_fsdp_all_gather(graph)
+    else:
+        force_save_fsdp_all_gather(graph)
     mark_nodes_as_must_save_to_stage_recomputation(
         graph, stage_size_in_GiB=ac_stage_size_in_GiB
     )

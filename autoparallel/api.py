@@ -11,7 +11,7 @@ from types import MethodType
 from typing import Any, Optional, Union
 
 import torch
-from torch._dynamo.functional_export import _dynamo_graph_capture_for_export
+from torch._dynamo.functional_export import dynamo_graph_capture_for_export
 from torch._functorch.aot_autograd import (
     aot_compile_joint_with_descriptors,
     aot_export_joint_with_descriptors,
@@ -23,7 +23,6 @@ from torch._logging import trace_structured
 from torch._subclasses import FakeTensorMode
 from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor import DeviceMesh
-from torch.export._trace import _restore_state_dict
 from torch.export._unlift import _assign_attr
 from torch.export.unflatten import _AttrKind
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
@@ -159,21 +158,6 @@ def enable_local_map_wrapping():
         yield
 
 
-def _export(model: torch.nn.Module, inputs: tuple[Any]) -> torch.nn.Module:
-    """
-    Thin wrapper around graph capture output that restores the
-    original calling convention and attribute fqn. TODO:
-    1) Use bytecode for calling convention instead of pytree for more
-       seamless UX.
-    2) Attach guards
-    3) Be more careful about tensor constants names.
-    """
-    with torch._dynamo.config.patch(install_free_tensors=True):
-        gm = _dynamo_graph_capture_for_export(model)(*inputs)
-        _restore_state_dict(model, gm)
-        return gm
-
-
 class AutoParallel:
     """
     Args:
@@ -298,7 +282,7 @@ class AutoParallel:
         with set_dtype_cast(
             True
         ), enable_local_map_wrapping(), torch._dynamo.utils._disable_saved_tensors_hooks_during_tracing():
-            torch_ir_with_fqn = _export(self.model, inputs)
+            torch_ir_with_fqn = dynamo_graph_capture_for_export(self.model)(*inputs)
             # TODO Cna't use fake mode here because it clashes with the user level
             # fake mode. Ideally dynamo should reuse the user level fake mode.
             self.joint_with_descriptors = aot_export_joint_with_descriptors(
@@ -587,13 +571,22 @@ class AutoParallelPPModule(torch.nn.Module):
 
 
 class AutoParallelPP(AutoParallel):
-    def apply_placement_pp(self, sharding_placement=None) -> dict[str, Any]:
+    def apply_placement_pp(
+        self, sharding_placement=None, graph_passes: list[str] = []
+    ) -> dict[str, Any]:
+        assert all(
+            g_pass in ["split_fsdp_collectives", "split_dI_dW"]
+            for g_pass in graph_passes
+        ), "Only split_fsdp_collectives and split_dI_dW_graph are supported"
         sharded_param_dict, sharded_buffer_dict = self._apply_placement_common(
             sharding_placement
         )
+        num_params = len(sharded_param_dict)
+        num_buffers = len(sharded_buffer_dict)
         (
             fw_module,
             bw_module,
+            num_params_buffers,
             num_user_outputs,
             num_mutate_inputs,
             num_fw_outs_saved_for_bw,
@@ -601,8 +594,11 @@ class AutoParallelPP(AutoParallel):
             _indices_of_inps_to_detach,
             adjusted_flat_args,
         ) = partition_joint_with_descriptors(self.joint_with_descriptors)
-
+        assert num_params_buffers == (
+            num_params + num_buffers
+        ), f"num_params_buffers: {num_params_buffers}, num_params: {num_params}, num_buffers: {num_buffers}"
         print(
+            f"num_params_buffers: {num_params_buffers}\n"
             f"num_user_outputs: {num_user_outputs}\n"
             f"num_mutate_inputs: {num_mutate_inputs}\n"
             f"num_fw_outs_saved_for_bw: {num_fw_outs_saved_for_bw}\n"
@@ -629,21 +625,118 @@ class AutoParallelPP(AutoParallel):
                 print_output=False, include_stride=True, include_device=True
             ),
         )
+        unshard_module: Optional[torch.fx.GraphModule] = None
+        reduce_grad_module: Optional[torch.fx.GraphModule] = None
+        if "split_fsdp_collectives" in graph_passes:
+            assert (
+                not self.reshard_after_forward
+            ), "reshard_after_forward should be False to disable FSDP all_gather in the backward pass"
+            from autoparallel._passes.split_fsdp_collectives import (
+                split_fsdp_prefetch,
+                split_fsdp_reduce_scatters_epilogue,
+            )
+
+            unshard_module, fw_module = split_fsdp_prefetch(fw_module, num_params)
+            trace_structured(
+                "artifact",
+                metadata_fn=lambda: {
+                    "name": "autoparallel_pp_unshard_graph",
+                    "encoding": "string",
+                },
+                payload_fn=lambda: unshard_module.print_readable(
+                    print_output=False, include_stride=True, include_device=True
+                ),
+            )
+            trace_structured(
+                "artifact",
+                metadata_fn=lambda: {
+                    "name": "autoparallel_pp_fwd_no_fsdp_graph",
+                    "encoding": "string",
+                },
+                payload_fn=lambda: fw_module.print_readable(
+                    print_output=False, include_stride=True, include_device=True
+                ),
+            )
+            bw_module, reduce_grad_module = split_fsdp_reduce_scatters_epilogue(
+                bw_module, num_params
+            )
+            trace_structured(
+                "artifact",
+                metadata_fn=lambda: {
+                    "name": "autoparallel_pp_bwd_no_fsdp_graph",
+                    "encoding": "string",
+                },
+                payload_fn=lambda: bw_module.print_readable(
+                    print_output=False, include_stride=True, include_device=True
+                ),
+            )
+            trace_structured(
+                "artifact",
+                metadata_fn=lambda: {
+                    "name": "autoparallel_pp_reduce_grad_graph",
+                    "encoding": "string",
+                },
+                payload_fn=lambda: reduce_grad_module.print_readable(
+                    print_output=False, include_stride=True, include_device=True
+                ),
+            )
+
+        bw_dI_module: Optional[torch.fx.GraphModule] = None
+        bw_dW_module: Optional[torch.fx.GraphModule] = None
+        num_input_grads = 0
+        if "split_dI_dW" in graph_passes:
+            from autoparallel._passes.split_di_dw_graph import split_di_dw_graph
+
+            bw_dI_module, bw_dW_module, num_input_grads = split_di_dw_graph(
+                bw_module,
+                num_weight_gradients=num_params_buffers,
+            )
+            trace_structured(
+                "artifact",
+                metadata_fn=lambda: {
+                    "name": "autoparallel_pp_bw_dI_graph",
+                    "encoding": "string",
+                },
+                payload_fn=lambda: bw_dI_module.print_readable(
+                    print_output=False, include_stride=True, include_device=True
+                ),
+            )
+            trace_structured(
+                "artifact",
+                metadata_fn=lambda: {
+                    "name": "autoparallel_pp_bw_dW_graph",
+                    "encoding": "string",
+                },
+                payload_fn=lambda: bw_dW_module.print_readable(
+                    print_output=False, include_stride=True, include_device=True
+                ),
+            )
+            if all(
+                x is None
+                for x in bw_dI_module.graph.find_nodes(op="output")[0].args[0][
+                    :num_input_grads
+                ]
+            ):
+                raise RuntimeError(
+                    "attempted to run split dI/dW pass on a graph that has no input gradients"
+                )
 
         graph_meta: dict[str, int] = {
             "num_mutate_inputs": num_mutate_inputs,
             "num_user_outputs": num_user_outputs,
             "num_symints_saved_for_bw": num_symints_saved_for_bw,
-            "num_weight_buffer_grads": len(sharded_param_dict)
-            + len(sharded_buffer_dict),
+            "num_params": num_params,
+            "num_buffers": num_buffers,
+            "num_input_grads": num_input_grads,
         }
+
         graph_modules: dict[str, Optional[torch.fx.GraphModule]] = {
             "fw": fw_module,
             "full_bw": bw_module,
-            "bw_dI": None,
-            "bw_dW": None,
-            "unshard": None,
-            "reduce_grad": None,
+            "bw_dI": bw_dI_module,
+            "bw_dW": bw_dW_module,
+            "unshard": unshard_module,
+            "reduce_grad": reduce_grad_module,
         }
         self.parallel_model = AutoParallelPPModule(
             sharded_param_dict,

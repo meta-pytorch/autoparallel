@@ -3,10 +3,11 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+import functools
 import logging
 import os
 from contextlib import nullcontext
-from typing import Callable
+from typing import Callable, Optional
 
 import torch
 import torch.distributed._tools.fake_collectives
@@ -16,6 +17,9 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.distributed.pipelining.schedules import (
     FORWARD,
     FULL_BACKWARD,
+    REDUCE_GRAD,
+    RESHARD,
+    UNSHARD,
     PipelineScheduleMulti,
     _PipelineSchedule,
     _PipelineScheduleRuntime,
@@ -42,8 +46,16 @@ from autoparallel.graph_pp_runner import (
     GraphPPRunner,
     stage_forward,
     stage_full_backward,
+    stage_reduce_grad,
+    stage_reshard,
+    stage_unshard,
 )
+from autoparallel.utils import print_rank_by_rank
 
+# Configure logging to show DEBUG messages
+logging.basicConfig(
+    level=logging.DEBUG, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
 logger = logging.getLogger(__name__)
 
 
@@ -54,6 +66,7 @@ def build_pipeline_schedule(
     microbatch_size: int,
     local_batch_size: int,
     pipeline_parallel_degree: int,
+    backward_requires_autograd: bool = False,
 ) -> _PipelineSchedule:
     """Builds a pipeline schedule for the given configuration and stages."""
     schedule_class = get_schedule_class(pipeline_parallel_schedule)
@@ -78,6 +91,7 @@ def build_pipeline_schedule(
         stages if looped_schedule else stages[0],
         n_microbatches=n_microbatches,
         loss_fn=loss_fn,
+        backward_requires_autograd=backward_requires_autograd,
     )
     logger.info(
         f"Using pipeline schedule {pipeline_parallel_schedule} "
@@ -86,43 +100,29 @@ def build_pipeline_schedule(
     return schedule
 
 
-def run_test(fake_evaluate: bool = False, use_fake_pg: bool = True):
-    if not use_fake_pg:
-        # TODO(sankepurandare): Come back to this later
-        torch.distributed.init_process_group()
-        assert "WORLD_SIZE" in os.environ, "run with torchrun --nproc-per-node 4"
-        world_size = int(os.getenv("WORLD_SIZE"))
+def run_test(fake_evaluate: bool, debug_numerics: Optional[bool]):
+    if not fake_evaluate:
         pp_degree = 2
         dp_mod_ep_degree = 2
         ep_degree = 2
-        dp_degree = dp_mod_ep_degree * ep_degree
-        assert (
-            world_size == pp_degree * dp_mod_ep_degree * ep_degree
-        ), "world_size must be pp * dp * ep"
-        world_mesh = torch.distributed.device_mesh.init_device_mesh(
-            "cuda",
-            (pp_degree, dp_mod_ep_degree, ep_degree),
-            mesh_dim_names=(
-                "pp",
-                "dp_mod_ep",
-                "ep",
-            ),
-        )
-        rank = int(os.getenv("RANK"))
-        local_rank = int(os.getenv("LOCAL_RANK"))
-        device = torch.device(f"cuda:{local_rank}")
-        pp_rank = world_mesh["pp"].get_local_rank()
     else:
-        rank = int(os.getenv("RANK"))
         pp_degree = 4
         dp_mod_ep_degree = 4
         ep_degree = 64
-        dp_degree = dp_mod_ep_degree * ep_degree
-        world_size = pp_degree * dp_mod_ep_degree * ep_degree
 
-        pp_rank = rank
-        device = torch.device(f"cuda:{pp_rank}")
+    dp_degree = dp_mod_ep_degree * ep_degree
+    world_size = pp_degree * dp_mod_ep_degree * ep_degree
 
+    # Initialize process group based on evaluation mode
+    if fake_evaluate:
+        assert (
+            "WORLD_SIZE" in os.environ
+        ), "run with torchrun --standalone --nproc-per-node 4"
+        assert (
+            int(os.getenv("WORLD_SIZE")) == pp_degree
+        ), "world_size must be 4, for fake evaluation"
+        rank = int(os.getenv("RANK"))
+        device = torch.device(f"cuda:{rank}")
         fake_store = FakeStore()
         torch.distributed.init_process_group(
             "fake",
@@ -130,21 +130,35 @@ def run_test(fake_evaluate: bool = False, use_fake_pg: bool = True):
             rank=rank * dp_degree,  # global rank is pp_rank * spmd_size
             world_size=world_size,
         )
-        # mesh = torch.distributed.device_mesh.init_device_mesh("cuda", (world_size,), mesh_dim_names=("dp",))
-        world_mesh = torch.distributed.device_mesh.init_device_mesh(
-            "cuda",
-            (pp_degree, dp_mod_ep_degree, ep_degree),
-            mesh_dim_names=(
-                "pp",
-                "dp_mod_ep",
-                "ep",
-            ),
-        )
+        pp_rank = rank
+    else:
+        assert (
+            "WORLD_SIZE" in os.environ
+        ), "run with torchrun --standalone --nproc-per-node 8"
+        assert (
+            int(os.getenv("WORLD_SIZE")) == world_size
+        ), "Need at least 8 GPUs for real evaluation"
+        local_rank = int(os.getenv("LOCAL_RANK"))
+        device = torch.device(f"cuda:{local_rank}")
+        torch.distributed.init_process_group(backend="nccl")
 
-        print(f"PP rank: {pp_rank}")
+    # Initialize device mesh (common for both modes)
+    world_mesh = torch.distributed.device_mesh.init_device_mesh(
+        "cuda",
+        (pp_degree, dp_mod_ep_degree, ep_degree),
+        mesh_dim_names=(
+            "pp",
+            "dp_mod_ep",
+            "ep",
+        ),
+    )
+
+    # Set pp_rank based on evaluation mode
+    if not fake_evaluate:
+        pp_rank = world_mesh["pp"].get_local_rank()
 
     stages_per_rank = 2
-    logical_pp_degree = pp_degree * stages_per_rank
+    total_pp_stages = pp_degree * stages_per_rank
 
     # This is the spmd mesh to be used for tracing
     mesh = world_mesh[("dp_mod_ep", "ep")]
@@ -163,45 +177,72 @@ def run_test(fake_evaluate: bool = False, use_fake_pg: bool = True):
 
     seq_len = 1024
 
-    config = DeepSeekV3ModelArgs(
-        vocab_size=102400,
-        max_seq_len=seq_len,
-        dim=2048,
-        inter_dim=10944,
-        moe_inter_dim=1408,
-        n_layers=8,  # 27,
-        n_dense_layers=0,  # 1,
-        n_heads=16,
-        moe_args=MoEArgs(
-            num_experts=64,
-            num_shared_experts=2,
-            top_k=6,
-            score_func="softmax",
-            route_norm=False,
-            score_before_experts=False,
-            mesh=mesh,
-        ),
-        q_lora_rank=0,
-        kv_lora_rank=512,
-        qk_nope_head_dim=128,
-        qk_rope_head_dim=64,
-        v_head_dim=128,
-        mscale=0.70,
-        use_flex_attn=False,
-        attn_mask_type="causal",
-    )
+    if fake_evaluate:
+        config = DeepSeekV3ModelArgs(
+            vocab_size=102400,
+            max_seq_len=seq_len,
+            dim=2048,
+            inter_dim=10944,
+            moe_inter_dim=1408,
+            n_layers=8,  # 27,
+            n_dense_layers=0,  # 1,
+            n_heads=16,
+            moe_args=MoEArgs(
+                num_experts=64,
+                num_shared_experts=2,
+                top_k=6,
+                score_func="softmax",
+                route_norm=False,
+                score_before_experts=False,
+                mesh=mesh,
+            ),
+            q_lora_rank=0,
+            kv_lora_rank=512,
+            qk_nope_head_dim=128,
+            qk_rope_head_dim=64,
+            v_head_dim=128,
+            mscale=0.70,
+            use_flex_attn=False,
+            attn_mask_type="causal",
+        )
+    else:
+        config = DeepSeekV3ModelArgs(
+            vocab_size=2048,
+            max_seq_len=seq_len,
+            dim=256,
+            inter_dim=1024,
+            moe_inter_dim=256,
+            n_layers=4,
+            n_dense_layers=0,  # 1,
+            n_heads=16,
+            moe_args=MoEArgs(
+                num_experts=4,
+                num_shared_experts=2,
+                top_k=2,
+                score_func="softmax",
+                route_norm=False,
+                score_before_experts=False,
+                mesh=mesh,
+            ),
+            q_lora_rank=0,
+            kv_lora_rank=512,
+            qk_nope_head_dim=128,
+            qk_rope_head_dim=64,
+            v_head_dim=128,
+            mscale=0.70,
+        )
 
     with torch.device("meta"):
         model = DeepSeekV3Model(config).bfloat16()
         embed, layers, norm, output = list(model.children())
         items = list(layers.items())
         assert len(items) == config.n_layers
-        n_layers_per_rank = len(items) // logical_pp_degree
+        n_layers_per_rank = len(items) // total_pp_stages
         layers = [
             nn.ModuleDict(items[i : i + n_layers_per_rank])
             for i in range(0, len(items), n_layers_per_rank)
         ]
-        assert len(layers) == logical_pp_degree
+        assert len(layers) == total_pp_stages
         for lst in layers:
             assert len(lst) * len(layers) == config.n_layers
 
@@ -255,55 +296,26 @@ def run_test(fake_evaluate: bool = False, use_fake_pg: bool = True):
 
     # Step 1. Construct the logical pipeline stages
     with torch.device("meta"):
-        stage0 = DeepSeekV3Stage0(embed, layers[0], config)
-        stage1 = DeepSeekV3StageI(layers[1], config)
-        stage2 = DeepSeekV3StageI(layers[2], config)
-        stage3 = DeepSeekV3StageI(layers[3], config)
-        stage4 = DeepSeekV3StageI(layers[4], config)
-        stage5 = DeepSeekV3StageI(layers[5], config)
-        stage6 = DeepSeekV3StageI(layers[6], config)
-        stage7 = DeepSeekV3StageN(layers[7], norm, output, config)
-        logical_stages = [
-            stage0,
-            stage1,
-            stage2,
-            stage3,
-            stage4,
-            stage5,
-            stage6,
-            stage7,
-        ]
-    # Step 2. Assign each logical stage(s) to pp ranks
-    # This mapping is dependent of the number of logical pipeline stages, the pp_degree and the schedule
-    # For interleaved 1F1B, the mapping is:
-    # pp_rank_to_stage_indices = {
-    #     0: [0, 4],
-    #     1: [1, 5],
-    #     2: [2, 6],
-    #     3: [3, 7],
-    # }
-    # For DualPipeV, the mapping is:
-    # pp_rank_to_stage_indices = {
-    #     0: [0, 7],
-    #     1: [1, 6],
-    #     2: [2, 5],
-    #     3: [3, 4],
-    # }
+        virtual_pp_stages = [DeepSeekV3Stage0(embed, layers[0], config)]
+        for i in range(1, total_pp_stages - 1):
+            virtual_pp_stages.append(DeepSeekV3StageI(layers[i], config))
+        virtual_pp_stages.append(
+            DeepSeekV3StageN(layers[total_pp_stages - 1], norm, output, config)
+        )
+    # Step 2. Assign each logical stage(s) to pp ranks for Interleaved1F1B schedule
     pp_rank_to_stage_indices: dict[int, list[int]] = {
-        0: [0, 4],
-        1: [1, 5],
-        2: [2, 6],
-        3: [3, 7],
+        rank: [rank + i * pp_degree for i in range(stages_per_rank)]
+        for rank in range(pp_degree)
     }
     assert len(pp_rank_to_stage_indices) == pp_degree
     for stages in pp_rank_to_stage_indices.values():
-        assert len(stages) * pp_degree == len(logical_stages)
+        assert len(stages) * pp_degree == len(virtual_pp_stages)
     stage_indices_current_pp_rank = pp_rank_to_stage_indices[pp_rank]
     stage_mods: dict[int, torch.nn.Module] = {}
     stage_graphs: dict[int, GraphCallables] = {}
     stage_graph_metas: dict[int, GraphMeta] = {}
     # Step 3. Apply AutoParallel to each logical stage assigned to this pp rank
-    use_cache = True
+    use_cache = fake_evaluate
     root_cache = "tmp"
     os.makedirs(root_cache, exist_ok=True)
     from autoparallel.api import AutoParallelPPModule
@@ -317,8 +329,9 @@ def run_test(fake_evaluate: bool = False, use_fake_pg: bool = True):
             },
             payload_fn=lambda: "placeholder text",
         )
-        stage_mod = logical_stages[stage_idx]
-        stage_file = os.path.join(root_cache, f"stage_{stage_idx}.pth")
+        stage_mod = virtual_pp_stages[stage_idx]
+        eval_mode = "fake" if fake_evaluate else "real"
+        stage_file = os.path.join(root_cache, f"stage_{eval_mode}_{stage_idx}.pth")
         if os.path.exists(stage_file) and use_cache:
             cache = torch.load(stage_file, weights_only=False)
             graph_callables = cache["graph_callables"]
@@ -335,7 +348,9 @@ def run_test(fake_evaluate: bool = False, use_fake_pg: bool = True):
                 input_fn = tracing_input_fn
             else:
                 input_fn = tracing_input_fn_after_first_stage
-            with AutoParallelPP(stage_mod, input_fn, mesh, dynamic=True) as autop:
+            with AutoParallelPP(
+                stage_mod, input_fn, mesh, dynamic=True, compile=False
+            ) as autop:
                 autop.add_parameter_memory_constraint(low=None, high=None)
 
                 # x_sharding = (Shard(0), Replicate())
@@ -356,7 +371,6 @@ def run_test(fake_evaluate: bool = False, use_fake_pg: bool = True):
                 if use_cache:
                     torch.save(cache, stage_file)
 
-        torch.manual_seed(pp_rank)
         pp_mod.to_empty(device=device)
         pp_mod.init_weights(buffer_device=device)
 
@@ -374,7 +388,9 @@ def run_test(fake_evaluate: bool = False, use_fake_pg: bool = True):
             num_mutate_inputs=graph_meta["num_mutate_inputs"],
             num_user_outputs=graph_meta["num_user_outputs"],
             num_symints_saved_for_bw=graph_meta["num_symints_saved_for_bw"],
-            num_weight_buffer_grads=graph_meta["num_weight_buffer_grads"],
+            num_params=graph_meta["num_params"],
+            num_buffers=graph_meta["num_buffers"],
+            num_input_grads=graph_meta["num_input_grads"],
         )
         trace_structured(
             "artifact",
@@ -403,7 +419,7 @@ def run_test(fake_evaluate: bool = False, use_fake_pg: bool = True):
             stage_graphs[pp_stage_idx],
             stage_graph_metas[pp_stage_idx],
             stage_index=pp_stage_idx,
-            num_stages=len(logical_stages),
+            num_stages=len(virtual_pp_stages),
             device=device,
             input_args=(
                 shape_inference_input_fn()
@@ -412,7 +428,7 @@ def run_test(fake_evaluate: bool = False, use_fake_pg: bool = True):
             ),
             output_args=(
                 shape_inference_output_fn_last_stage()
-                if pp_stage_idx == 7
+                if pp_stage_idx == (len(virtual_pp_stages) - 1)
                 else shape_inference_input_fn_after_first_stage()
             ),
             group=world_mesh.get_group("pp"),
@@ -426,11 +442,18 @@ def run_test(fake_evaluate: bool = False, use_fake_pg: bool = True):
         microbatch_size=microbatch_size,
         local_batch_size=local_batch_size,
         pipeline_parallel_degree=pp_degree,
+        backward_requires_autograd=False,
     )
     assert isinstance(schedule, _PipelineScheduleRuntime)
     # Step 6. Override the pipeline runner's action implementations
-    schedule.register_custom_function(FORWARD, stage_forward)
+    numerics_logs = []
+    schedule.register_custom_function(
+        FORWARD, functools.partial(stage_forward, numerics_logs=numerics_logs)
+    )
     schedule.register_custom_function(FULL_BACKWARD, stage_full_backward)
+    schedule.register_custom_function(REDUCE_GRAD, stage_reduce_grad)
+    schedule.register_custom_function(RESHARD, stage_reshard)
+    schedule.register_custom_function(UNSHARD, stage_unshard)
 
     # Step 7. Register the schedule with the graph runner
 
@@ -452,6 +475,9 @@ def run_test(fake_evaluate: bool = False, use_fake_pg: bool = True):
             else:
                 graph_pp_runner.step()
 
+    if debug_numerics:
+        print_rank_by_rank("\n".join(numerics_logs))
+
     print("All good!")
 
     if torch.distributed.is_initialized():
@@ -461,4 +487,27 @@ def run_test(fake_evaluate: bool = False, use_fake_pg: bool = True):
 
 
 if __name__ == "__main__":
-    run_test(fake_evaluate=True, use_fake_pg=True)
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Run DeepSeek V3 pipeline parallel example"
+    )
+    parser.add_argument(
+        "--fake-evaluate",
+        action="store_true",
+        default=False,
+        help="Use fake evaluation mode with FakeTensorMode (default: False)",
+    )
+    parser.add_argument(
+        "--rng-seed",
+        type=int,
+        default=None,
+        help="Use a specific rng seed and deterministic algorithms for run-to-run invariance (default: None).",
+    )
+    args = parser.parse_args()
+
+    if args.rng_seed is not None:
+        torch.use_deterministic_algorithms(True)
+        torch.manual_seed(args.rng_seed)
+
+    run_test(fake_evaluate=args.fake_evaluate, debug_numerics=args.rng_seed is not None)

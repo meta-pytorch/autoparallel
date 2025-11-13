@@ -46,4 +46,4 @@ jobs:
         python examples/example_dcp.py
         python examples/example_local_map.py
         python examples/example_ds3_local_map.py
-        python examples/example_pp_graph_partition.py
+        python examples/example_pp_graph_passes.py

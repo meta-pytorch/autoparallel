@@ -36,50 +36,8 @@ mesh = torch.distributed.device_mesh.init_device_mesh(
     ),
 )
 
-
-seq_len = 1024
-
-config = DeepSeekV3ModelArgs(
-    vocab_size=2048,
-    max_seq_len=seq_len,
-    dim=256,
-    inter_dim=1024,
-    moe_inter_dim=256,
-    n_layers=1,  # 6,
-    n_dense_layers=0,  # 1,
-    n_heads=16,
-    moe_args=MoEArgs(
-        num_experts=8,
-        num_shared_experts=2,
-        top_k=3,
-        score_func="softmax",
-        route_norm=False,
-        score_before_experts=False,
-        mesh=mesh,
-    ),
-    q_lora_rank=0,
-    kv_lora_rank=512,
-    qk_nope_head_dim=128,
-    qk_rope_head_dim=64,
-    v_head_dim=128,
-    mscale=0.70,
-)
-
 device = torch.device("cuda")
 
-if False:
-    model = DeepSeekV3Model(config)
-    model.to(device)
-
-    global_batch_size = 2
-
-    x = torch.randint(
-        0,
-        config.vocab_size,
-        (global_batch_size, seq_len),
-        device=device,
-    )
-    o = model(x)
 
 bs = 4 * mesh.shape[0] * mesh.shape[1]
 seq_len = 1024
