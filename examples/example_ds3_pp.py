@@ -251,7 +251,7 @@ def run_test(
 
     def make_input_fn(
         batch_size: int,
-        stage: str,
+        inp_type: str,
         device: torch.device,
     ):
         """
@@ -259,79 +259,82 @@ def run_test(
 
         Args:
             batch_size: Batch size (spmd_batch_size, local_batch_size, or microbatch_size)
-            stage: One of "tokens", "embeddings", or "logits"
+            inp_type: One of "tokens", "embeddings", or "logits"
             device: Device to create tensors on (cuda device or "meta")
         """
 
         def input_fn() -> torch.Tensor:
-            if stage == "tokens":
+            if inp_type == "tokens":
                 return torch.randint(
                     0,
                     config.vocab_size,
                     (batch_size, seq_len),
                     device=device,
                 )
-            elif stage == "embeddings":
+            elif inp_type == "embeddings":
                 return torch.randn(
                     (batch_size, seq_len, config.dim),
                     device=device,
                     dtype=torch.bfloat16,
                     requires_grad=True,
                 )
-            elif stage == "logits":
+            elif inp_type == "logits":
                 return torch.randn(
                     (batch_size, seq_len, config.vocab_size),
                     device=device,
                     dtype=torch.bfloat16,
                     requires_grad=True,
                 )
+            elif inp_type == "loss":
+                return torch.scalar_tensor(
+                    1.0,
+                    dtype=torch.float32,
+                    device=device,
+                    requires_grad=True,
+                )
             else:
-                raise ValueError(f"Unknown stage: {stage}")
+                raise ValueError(f"Unknown input type: {inp_type}")
 
         return input_fn
 
-    def make_target_fn(batch_size: int, device: torch.device):
-        """
-        Factory to create target generator functions for loss computation.
-
-        Args:
-            batch_size: Batch size (spmd_batch_size, local_batch_size, or microbatch_size)
-            device: Device to create tensors on (cuda device or "meta")
-        """
-
-        def target_fn() -> torch.Tensor:
-            return torch.randint(
-                0,
-                config.vocab_size,
-                (batch_size, seq_len),
-                device=device,
-            )
-
-        return target_fn
+    # Target generators (if needed for loss computation)
+    tracing_target_fn = make_input_fn(spmd_batch_size, "tokens", device)
+    runtime_target_fn = make_input_fn(local_batch_size, "tokens", device)
 
     # Tracing input functions
-    tracing_input_fn = make_input_fn(spmd_batch_size, "tokens", device)
-    tracing_input_fn_after_first_stage = make_input_fn(
+    tracing_input_fn_fist_stage = make_input_fn(spmd_batch_size, "tokens", device)
+    tracing_input_fn_intermediate_stage = make_input_fn(
         spmd_batch_size, "embeddings", device
     )
 
+    def last_stage_inp_with_loss_fn():
+        return (
+            tracing_input_fn_intermediate_stage(),
+            tracing_target_fn(),
+        )
+
+    tracing_input_fn_last_stage = (
+        last_stage_inp_with_loss_fn
+        if use_loss_fn
+        else tracing_input_fn_intermediate_stage
+    )
+
     # Runtime input function
-    runtime_input_fn = make_input_fn(local_batch_size, "tokens", device)
+    runtime_input_fn_first_stage = make_input_fn(local_batch_size, "tokens", device)
 
     # Shape inference functions
     meta_device = torch.device("meta")
-    shape_inference_input_fn = make_input_fn(microbatch_size, "tokens", meta_device)
-    shape_inference_input_fn_after_first_stage = make_input_fn(
+    shape_inference_input_fn_first_stage = make_input_fn(
+        microbatch_size, "tokens", meta_device
+    )
+    shape_inference_fn_intermediate_stage = make_input_fn(
         microbatch_size, "embeddings", meta_device
     )
-    shape_inference_output_fn_last_stage = make_input_fn(
-        microbatch_size, "logits", meta_device
+    shape_inference_output_fn_last_stage = (
+        make_input_fn(0, "loss", meta_device)
+        if use_loss_fn
+        else make_input_fn(microbatch_size, "logits", meta_device)
     )
-
-    # Target generators (if needed for loss computation)
-    tracing_target_fn = make_target_fn(spmd_batch_size, device)
-    runtime_target_fn = make_target_fn(local_batch_size, device)
-    # shape_inference_target_fn = make_target_fn(microbatch_size, meta_device)
 
     # Step 1. Construct the logical pipeline stages
     with torch.device("meta"):
@@ -385,23 +388,13 @@ def run_test(
             )
         else:
             if stage_idx == 0:
-                input_fn = tracing_input_fn
+                input_fn = tracing_input_fn_fist_stage
             elif stage_idx == total_pp_stages - 1:
 
-                def inp_with_loss_fn():
-                    return (
-                        tracing_input_fn_after_first_stage(),
-                        tracing_target_fn(),
-                    )
-
-                input_fn = (
-                    inp_with_loss_fn
-                    if use_loss_fn
-                    else tracing_input_fn_after_first_stage
-                )
+                input_fn = tracing_input_fn_last_stage
 
             else:
-                input_fn = tracing_input_fn_after_first_stage
+                input_fn = tracing_input_fn_intermediate_stage
             with AutoParallelPP(
                 stage_mod,
                 input_fn,
@@ -489,14 +482,14 @@ def run_test(
             num_stages=len(virtual_pp_stages),
             device=device,
             input_args=(
-                shape_inference_input_fn()
+                shape_inference_input_fn_first_stage()
                 if pp_stage_idx == 0
-                else shape_inference_input_fn_after_first_stage()
+                else shape_inference_fn_intermediate_stage()
             ),
             output_args=(
                 shape_inference_output_fn_last_stage()
-                if pp_stage_idx == (len(virtual_pp_stages) - 1)
-                else shape_inference_input_fn_after_first_stage()
+                if pp_stage_idx == (total_pp_stages - 1)
+                else shape_inference_fn_intermediate_stage()
             ),
             group=world_mesh.get_group("pp"),
         )
@@ -543,12 +536,13 @@ def run_test(
                 else (None, None)
             )
             if pp_rank == 0:
-                x = runtime_input_fn()
+                x = runtime_input_fn_first_stage()
                 graph_pp_runner.step(
                     x, target=target, losses=losses, return_outputs=False
                 )
             else:
                 graph_pp_runner.step(target=target, losses=losses, return_outputs=False)
+            print(losses)
 
     if debug_numerics:
         print_rank_by_rank("\n".join(numerics_logs))
@@ -576,8 +570,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--use-loss-fn",
         action="store_true",
-        default=True,
-        help="Trace loss_fn as part of model forward graph for the last stage (default: True)",
+        default=False,
+        help="Trace loss_fn as part of model forward graph for the last stage (default: False)",
     )
     parser.add_argument(
         "--rng-seed",

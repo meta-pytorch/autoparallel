@@ -184,6 +184,20 @@ def _run_reduce_grad_module(
     return sharded_grads
 
 
+def _accumulate_stage_grads(
+    unsharded_grads: list[Union[torch.Tensor, None]],
+    grads_to_accumulate: list[Union[torch.Tensor, None]],
+) -> None:
+    assert len(unsharded_grads) == len(grads_to_accumulate)
+    assert not all(grad is None for grad in grads_to_accumulate), "All grads are None"
+    for unsharded_grad, grad_to_accumulate in zip(unsharded_grads, grads_to_accumulate):
+        if grad_to_accumulate is not None:
+            if unsharded_grad is None:
+                unsharded_grad = grad_to_accumulate
+            else:
+                unsharded_grad += grad_to_accumulate
+
+
 def _run_forward_microbatch(
     stage: GraphPipelineStage, *args, numerics_logs: Optional[list[str]] = None
 ) -> tuple[Any, Any]:
@@ -216,17 +230,9 @@ def _run_backward_microbatch(
     )
 
     unsharded_grads = backward_stage.state["unsharded_grads"]
-    grads_to_accumulate = param_buffer_grads[
-        : len(backward_stage.state["sharded_params"])
-    ]
-    assert len(unsharded_grads) == len(grads_to_accumulate)
-    assert not all(grad is None for grad in grads_to_accumulate), "All grads are None"
-    for unsharded_grad, grad_to_accumulate in zip(unsharded_grads, grads_to_accumulate):
-        if grad_to_accumulate is not None:
-            if unsharded_grad is None:
-                unsharded_grad = grad_to_accumulate
-            else:
-                unsharded_grad += grad_to_accumulate
+    grads_to_accumulate = param_buffer_grads[: backward_stage.graph_meta.num_params]
+    _accumulate_stage_grads(unsharded_grads, grads_to_accumulate)
+
     return input_grads
 
 
@@ -544,11 +550,9 @@ class GraphPPRunner:
         for stage in self.schedule._stages:
             assert isinstance(stage, GraphPipelineStage)
             self._accumulate_stage_grads_and_clear_states(stage)
-            if stage.is_last and has_targets_and_loss:
-                losses = kwargs["losses"]
-                losses.clear()
-                assert (
-                    len(self.schedule._internal_losses) == self.schedule._n_microbatches
-                )
-                losses.extend(self.schedule._internal_losses)
-                self.schedule._internal_losses.clear()
+
+        if has_targets_and_loss:
+            losses = kwargs["losses"]
+            assert len(self.schedule._internal_losses) == self.schedule._n_microbatches
+            losses.extend(self.schedule._internal_losses)
+            self.schedule._internal_losses.clear()
