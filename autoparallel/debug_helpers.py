@@ -5,7 +5,7 @@ from contextlib import ExitStack
 
 import torch
 from torch._functorch.aot_autograd import aot_export_joint_with_descriptors
-from torch._inductor.fx_passes.overlap_scheduling import (  # estimate_fx_collective_size,
+from torch._inductor.fx_passes.overlap_scheduling import (
     get_group_name,
     schedule_overlap_bucketing,
 )
