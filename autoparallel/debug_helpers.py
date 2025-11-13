@@ -129,11 +129,8 @@ def make_custom_runtime_estimation(mesh):
             # TODO: figure out mesh without reading from global scope
             mesh_topo = MeshTopoInfo.build_from_mesh(mesh)
             groups_name = tuple(g.group_name for g in mesh.get_all_groups())
-            # group_name = node.args[-1]
             group_name = get_group_name(node)
             mesh_dim = groups_name.index(group_name)
-            # FIXME: this estimation is wrong!
-            # comm_bytes_gb = estimate_fx_collective_size(node) / 2**30
             t = node.args[0].meta["val"]  # type: ignore[union-attr]
             comm_bytes_gb = t.numel() * t.itemsize / 2**30
             if override_size is not None:
@@ -149,7 +146,7 @@ def make_custom_runtime_estimation(mesh):
             elif target == torch.ops._c10d_functional.all_reduce.default:
                 return allreduce_cost(comm_bytes_gb, mesh_topo, mesh_dim)
             else:
-                # return None
+                # TODO: add all_to_all cost
                 return 0
         return estimate_strategy_runtime_cost(node, None)
 
@@ -227,14 +224,13 @@ def create_fake_trace(gm, custom_runtime_estimation, file_path="fake_trace.json"
             else:
                 curr_time[tid] = max(curr_time[0], curr_time[tid])
 
-        # curr_time = global_time[tid]
         event["ts"] = curr_time[tid]
         event["dur"] = dur
         launch_overhead = 1  # 1us
         curr_time[tid] += dur + launch_overhead
         if tid != 0:
             curr_time[0] += launch_overhead
-            # when will this comm finish
+            # keep track of when a given collective will finish
             global_time[node] = curr_time[tid]
 
         args = {}
