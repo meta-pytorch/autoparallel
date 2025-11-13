@@ -314,17 +314,18 @@ def compute_read_write_time(read_write_bytes):
     return read_write_time
 
 
-def _get_dtype_from_args(args, node):
+def _get_dtype_from_args(args):
+    # suppose only one dtype per op, taking the
+    # first dtype that shows up. This might not
+    # always be the case, but it's a good
+    # first-order approximation
     dtype = None
     for x in tree_flatten(args)[0]:
         if not isinstance(x, torch.Tensor):
             continue
         if dtype is None:
             dtype = x.dtype
-        else:
-            assert (
-                dtype == x.dtype
-            ), f"expected same dtypes, got {dtype}, {x.dtype} for {node}"
+            break
     if dtype is None:
         dtype = torch.float32
     return dtype
@@ -351,8 +352,7 @@ def estimate_strategy_runtime_cost(node, strategy):
     if flops == 0:
         return read_write_time
 
-    # TODO: only pass in node and get args from it?
-    dtype = _get_dtype_from_args(args, node)
+    dtype = _get_dtype_from_args(args)
 
     # TODO: use PyTorch's version once it's giving correct results
     gpu_flops = _get_device_tflops(dtype) * 10**12

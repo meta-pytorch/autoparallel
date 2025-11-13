@@ -104,9 +104,8 @@ class aten_autobucketing_config:
     custom_runtime_estimation = None
     max_compute_pre_fetch = 5
     collective_bucketing = False
-
-
-counter = 0
+    save_trace = True
+    _counter = 0
 
 
 def aten_autobucketing_reordering_pass(
@@ -122,11 +121,14 @@ def aten_autobucketing_reordering_pass(
         max_coll_distance=configs.max_coll_distance,
     )
     new_gm.recompile()
-    from autoparallel.debug_helpers import create_fake_trace
 
-    global counter
-    create_fake_trace(
-        new_gm, configs.custom_runtime_estimation, f"fake_trace_{counter}.json"
-    )
-    counter += 1
+    if configs.save_trace:
+        from autoparallel.debug_helpers import create_fake_trace
+
+        create_fake_trace(
+            new_gm,
+            configs.custom_runtime_estimation,
+            f"fake_trace_{configs._counter}.json",
+        )
+        configs._counter += 1
     return new_gm
