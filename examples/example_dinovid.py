@@ -1648,13 +1648,14 @@ class LayerScale(nn.Module):
         return x * self.gamma
 
 
+@torch.library.custom_op("autoparallel::generate_mask", mutates_args=())
 def generate_mask(
     height: int,
     width: int,
-    box_scale: tuple[float, float],
-    box_ratio: tuple[float, float],
+    box_scale: list[float],
+    box_ratio: list[float],
     box_count: int,  # Generate at most this number of boxes
-    mask_ratio: tuple[float, float],  # Ratio of patches that will be masked
+    mask_ratio: float,  # Ratio of patches that will be masked
 ) -> Tensor:
     """
     Generate a patch-wise boolean mask (True = masked, False = visible).
@@ -1666,7 +1667,7 @@ def generate_mask(
     - At the end, if the `mask_ratio` is not reached, mask individual patches at random to reach it.
     """
     area = height * width
-    log_ratio = torch.tensor(box_ratio).log()
+    log_ratio = (math.log(box_ratio[0]), math.log(box_ratio[1]))
     target_area = area * torch.empty(box_count).uniform_(box_scale[0], box_scale[1])
     aspect_ratio = torch.exp(
         torch.empty(box_count).uniform_(log_ratio[0], log_ratio[1])
@@ -1695,6 +1696,37 @@ def generate_mask(
         mask[i, j] = True
 
     return mask  # [height, width]
+
+
+@generate_mask.register_fake
+def _(
+    height: int,
+    width: int,
+    box_scale: tuple[float, float],
+    box_ratio: tuple[float, float],
+    box_count: int,  # Generate at most this number of boxes
+    mask_ratio: tuple[float, float],  # Ratio of patches that will be masked
+) -> Tensor:
+    return torch.empty((height, width), dtype=torch.bool)
+
+
+@torch.library.custom_op("autoparallel::create_mask_nonzero", mutates_args=())
+def create_mask_nonzero(mask_bool: Tensor, num_non_zero: int) -> list[Tensor]:
+    mask_nonzero = mask_bool.flatten().nonzero()[:, 0]
+    mask_weight = 1 / mask_bool.flatten(2, 4).sum(-1).clamp_min(
+        1.0
+    )  # [B, global_crop_num]
+    mask_weight = mask_weight[:, :, None, None, None].expand_as(mask_bool)[
+        mask_bool
+    ]  # [num_masks]
+    return mask_nonzero, mask_weight
+
+
+@create_mask_nonzero.register_fake
+def _(mask_bool: Tensor, num_non_zero: int) -> list[Tensor]:
+    mask_nonzero = torch.empty(num_non_zero, dtype=torch.int64, device=mask_bool.device)
+    mask_weight = torch.empty_like(mask_nonzero, dtype=torch.float32)
+    return mask_nonzero, mask_weight
 
 
 from torch.testing._internal.distributed.fake_pg import FakeStore
@@ -1741,6 +1773,7 @@ def input_fn(B=128):
 
     num_samples_masked = round(cfg.mask_sample_ratio * B * global_crop_num)
     mask_bool = []
+    num_non_zero = 0
     for r in np.linspace(*cfg.mask_patch_ratio, num_samples_masked).tolist():
         m = generate_mask(
             h,
@@ -1750,6 +1783,7 @@ def input_fn(B=128):
             box_count=32,
             mask_ratio=r,
         )
+        num_non_zero += round(r * h * w)
         mask_bool.append(m)
     mask_bool = torch.stack(mask_bool)  # [num_samples_masked, h, w]
     mask_bool = F.pad(
@@ -1766,13 +1800,7 @@ def input_fn(B=128):
     )  # [B, global_crop_num, num_frames, h, w]
     mask_bool = mask_bool.to(device)
 
-    mask_nonzero = mask_bool.flatten().nonzero()[:, 0]
-    mask_weight = 1 / mask_bool.flatten(2, 4).sum(-1).clamp_min(
-        1.0
-    )  # [B, global_crop_num]
-    mask_weight = mask_weight[:, :, None, None, None].expand_as(mask_bool)[
-        mask_bool
-    ]  # [num_masks]
+    mask_nonzero, mask_weight = create_mask_nonzero(mask_bool, num_non_zero)
     mask_weight /= num_samples_masked  # [num_masks] sums to 1.0
     return (
         global_crops,

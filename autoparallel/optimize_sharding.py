@@ -157,6 +157,10 @@ class ShardingOptimizer:
         strats = {}
         for node in self.graph.nodes:
             if node.op == "placeholder":
+                if node.meta.get("val", None) is None:
+                    print(node, node.meta)
+                    assert len(node.users) == 0
+                    continue
                 strats[node] = _create_all_options(
                     self.mesh, node.meta["val"].shape, tensor=node.meta["val"]
                 )

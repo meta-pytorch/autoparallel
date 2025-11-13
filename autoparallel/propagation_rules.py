@@ -344,7 +344,8 @@ def split_with_sizes_rule(mesh, specs):
 
 @register_rule(torch.ops.prims.iota.default)
 def iota_rule(mesh, specs):
-    raise NotImplementedError("Needs hardening, only tested on a few cases")
+    # from IPython import embed; embed(); exit()
+    # raise NotImplementedError("Needs hardening, only tested on a few cases")
     shape = [specs[0]]
     tensor_meta = _gen_tensor_meta(shape, dtype=torch.int64)
     placement = (Replicate(),) * mesh.ndim
