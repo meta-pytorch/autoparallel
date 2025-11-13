@@ -2,6 +2,7 @@ import inspect
 import json
 import re
 from contextlib import ExitStack
+from typing import Any, Callable
 
 import torch
 from torch._functorch.aot_autograd import aot_export_joint_with_descriptors
@@ -184,34 +185,57 @@ def _get_tid(node):
     return 0
 
 
-def get_tensor_repr(arg):
+def get_repr(arg):
     def get_dtype_repr(dtype):
         return str(dtype).split(".")[1]
 
-    if not isinstance(arg, torch.fx.Node):
-        if isinstance(arg, (int, float, str)):
-            return arg
-        if isinstance(arg, torch.dtype):
-            return get_dtype_repr(arg)
-        return {}
-    if "val" not in arg.meta:
-        return {}
-    if not isinstance(arg.meta["val"], torch.Tensor):
-        return {}
+    if isinstance(arg, torch.Tensor):
+        out = {}
+        out["shape"] = tuple(arg.shape)
+        out["dtype"] = get_dtype_repr(arg.dtype)
+        return out
 
-    out = {}
-    out["shape"] = tuple(arg.meta["val"].shape)
-    out["dtype"] = get_dtype_repr(arg.meta["val"].dtype)
-    return out
+    if isinstance(arg, (int, float, str)):
+        return arg
+
+    if isinstance(arg, torch.dtype):
+        return get_dtype_repr(arg)
+
+    if isinstance(arg, torch.fx.Node):
+        if "val" not in arg.meta:
+            return f"fx node {arg}"
+
+        return get_repr(arg.meta["val"])
+
+    if isinstance(arg, (list, tuple)):
+        # TODO: make better repr that don't blow up
+        # for long lists
+        return [get_repr(x) for x in arg]
+
+    if isinstance(arg, dict):
+        # TODO: make better repr that don't blow up
+        # for long lists
+        return {k: get_repr(v) for k, v in arg.items()}
+
+    return f"arg {type(arg)}"
 
 
-def create_fake_trace(gm, custom_runtime_estimation, file_path="fake_trace.json"):
-    trace = {}
+def create_execution_trace(
+    gm: torch.fx.GraphModule,
+    runtime_estimator: Callable[[torch.fx.Node], float],
+    file_path: str = "fake_trace.json",
+):
+    """
+    Create a perfetto trace from a GraphModule representing its execution
+    trace. This is useful for inspecting communication-computation overlapping
+    for different reordering strategies.
+    """
+    trace: dict[str, Any] = {}
     trace_events = []
     curr_time = {0: 0}
-    global_time = {}
+    global_time: dict[torch.fx.Node, int] = {}
     for node_idx, node in enumerate(gm.graph.nodes):
-        dur = int(custom_runtime_estimation(node))
+        dur = int(runtime_estimator(node))
         tid = _get_tid(node)
         if tid not in curr_time:
             curr_time[tid] = curr_time[0]
@@ -233,13 +257,13 @@ def create_fake_trace(gm, custom_runtime_estimation, file_path="fake_trace.json"
             # keep track of when a given collective will finish
             global_time[node] = curr_time[tid]
 
-        args = {}
+        args: dict[str, Any] = {}
         args["order"] = node_idx
 
-        args["output"] = get_tensor_repr(node)
+        args["output"] = get_repr(node)
         node_args = []
         for arg in node.args:
-            node_args.append(get_tensor_repr(arg))
+            node_args.append(get_repr(arg))
         args["inputs"] = node_args
         event["args"] = args
         trace_events.append(event)

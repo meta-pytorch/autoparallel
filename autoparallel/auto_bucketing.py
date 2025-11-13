@@ -123,9 +123,11 @@ def aten_autobucketing_reordering_pass(
     new_gm.recompile()
 
     if configs.save_trace:
-        from autoparallel.debug_helpers import create_fake_trace
+        from autoparallel.debug_helpers import create_execution_trace
 
-        create_fake_trace(
+        assert configs.custom_runtime_estimation is not None
+
+        create_execution_trace(
             new_gm,
             configs.custom_runtime_estimation,
             f"fake_trace_{configs._counter}.json",
