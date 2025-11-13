@@ -1529,9 +1529,11 @@ class DeepSeekV3Model(nn.Module):
         )
         self.model_args = model_args
 
-    def init_weights(self, buffer_device: torch.device | None = None) -> None:
-        _init_weights_tok_embeddings(self)
-        _init_weights_layers(self, buffer_device)
+    def init_weights(
+        self, buffer_device: torch.device | None = None, seed: int | None = None
+    ) -> None:
+        _init_weights_tok_embeddings(self, seed)
+        _init_weights_layers(self, buffer_device, seed)
         _init_weights_norm_and_output(self)
 
     def forward(
@@ -1591,8 +1593,10 @@ class DeepSeekV3StageI(nn.Module):
             h = layer(h, self.freqs_cis)
         return h
 
-    def init_weights(self, buffer_device: torch.device | None = None) -> None:
-        _init_weights_layers(self, buffer_device)
+    def init_weights(
+        self, buffer_device: torch.device | None = None, seed: int | None = None
+    ) -> None:
+        _init_weights_layers(self, buffer_device, seed)
 
 
 class DeepSeekV3Stage0(DeepSeekV3StageI):
@@ -1606,9 +1610,11 @@ class DeepSeekV3Stage0(DeepSeekV3StageI):
         # torch.Size([1024, 1024, 2048])
         return super().forward(h)
 
-    def init_weights(self, buffer_device: torch.device | None = None) -> None:
-        _init_weights_tok_embeddings(self)
-        super().init_weights(buffer_device=buffer_device)
+    def init_weights(
+        self, buffer_device: torch.device | None = None, seed: int | None = None
+    ) -> None:
+        _init_weights_tok_embeddings(self, seed)
+        super().init_weights(buffer_device, seed)
 
 
 class DeepSeekV3StageN(DeepSeekV3StageI):
@@ -1624,8 +1630,10 @@ class DeepSeekV3StageN(DeepSeekV3StageI):
         output = self.output(h) if self.output is not None else h
         return output
 
-    def init_weights(self, buffer_device: torch.device | None = None) -> None:
-        super().init_weights(buffer_device=buffer_device)
+    def init_weights(
+        self, buffer_device: torch.device | None = None, seed: int | None = None
+    ) -> None:
+        super().init_weights(buffer_device, seed)
         _init_weights_norm_and_output(self)
 
 
@@ -1634,7 +1642,11 @@ class DeepSeekV3StageN(DeepSeekV3StageI):
 ######################
 
 
-def _init_weights_tok_embeddings(self: Union[DeepSeekV3Model, DeepSeekV3Stage0]):
+def _init_weights_tok_embeddings(
+    self: Union[DeepSeekV3Model, DeepSeekV3Stage0], seed: int | None = None
+):
+    if seed is not None:
+        torch.manual_seed(seed)
     if self.tok_embeddings is not None:
         nn.init.normal_(self.tok_embeddings.weight)
 
@@ -1642,15 +1654,18 @@ def _init_weights_tok_embeddings(self: Union[DeepSeekV3Model, DeepSeekV3Stage0])
 def _init_weights_layers(
     self: Union[DeepSeekV3Model, DeepSeekV3StageI],
     buffer_device: torch.device | None,
+    seed: int | None = None,
 ):
     if buffer_device is None:
         buffer_device = self.freqs_cis.device  # type: ignore[assignment]
     with torch.device(buffer_device):  # type: ignore[arg-type]
         self.freqs_cis = precompute_freqs_cis(self.model_args)
-    for layer in self.layers.values():
+    for i, layer in enumerate(self.layers.values()):
+        if seed is not None:
+            torch.manual_seed(seed)
         if layer is not None:
             assert isinstance(layer, TransformerBlock)
-            layer.init_weights(buffer_device=buffer_device)  # type: ignore[arg-type]
+            layer.init_weights(buffer_device)  # type: ignore[arg-type]
 
 
 def _init_weights_norm_and_output(self: Union[DeepSeekV3Model, DeepSeekV3StageN]):

@@ -4,6 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import time
+from functools import partial
 
 import torch
 from torch.distributed.fsdp import MixedPrecisionPolicy
@@ -12,7 +13,12 @@ from torch.testing._internal.distributed.fake_pg import FakeStore
 
 from autoparallel._testing.models.llama3 import Transformer, TransformerModelArgs
 from autoparallel.api import AutoParallel
-from autoparallel.auto_bucketing import configure_inductor_for_autobucketing
+from autoparallel.auto_bucketing import (
+    aten_autobucketing_config,
+    aten_autobucketing_reordering_pass,
+    configure_inductor_for_autobucketing,
+)
+from autoparallel.debug_helpers import make_custom_runtime_estimation
 
 world_size = 64
 
@@ -83,7 +89,27 @@ def input_fn():
     return x
 
 
-configure_inductor_for_autobucketing("aten")
+autobucketing_level = "aten"
+
+if autobucketing_level == "aten":
+    aten_autobucketing_config.custom_runtime_estimation = (
+        make_custom_runtime_estimation(mesh)
+    )
+    # this is from the stacked pr in https://github.com/pytorch/pytorch/pull/163960
+    torch._inductor.config.reorder_for_peak_memory = False
+    torch._inductor.config.reorder_for_compute_comm_overlap = False
+    aten_autobucketing_reordering_pass = partial(
+        aten_autobucketing_reordering_pass,
+        configs=aten_autobucketing_config,
+    )
+    torch._inductor.config.post_grad_custom_post_pass = (
+        aten_autobucketing_reordering_pass
+    )
+elif autobucketing_level == "inductor":
+    configure_inductor_for_autobucketing(autobucketing_level)
+else:
+    raise ValueError(f"Unknown autobucketing_level {autobucketing_level}")
+
 
 # parallelize the model
 with torch.device("meta"):
