@@ -11,10 +11,12 @@ from typing import Any, Callable
 
 import torch
 from torch._functorch.aot_autograd import aot_export_joint_with_descriptors
+from torch._inductor.fx_passes.bucketing import is_wait_tensor
 from torch._inductor.fx_passes.overlap_scheduling import (
     get_group_name,
     schedule_overlap_bucketing,
 )
+from torch.utils._dtype_abbrs import dtype_abbrs
 
 from autoparallel.collective_runtime_estimation import (
     MeshTopoInfo,
@@ -49,19 +51,7 @@ def parse_tensor_annotation(annotation: str) -> torch.Tensor:
     dtype_str, shape_str, strides_str, device_str = match.groups()
 
     # Map dtype string to PyTorch dtype
-    dtype_map = {
-        "f16": torch.float16,
-        "f32": torch.float32,
-        "f64": torch.float64,
-        "i8": torch.int8,
-        "i16": torch.int16,
-        "i32": torch.int32,
-        "i64": torch.int64,
-        "u8": torch.uint8,
-        "bool": torch.bool,
-        "b8": torch.bool,
-        "bf16": torch.bfloat16,
-    }
+    dtype_map = {v: k for k, v in dtype_abbrs.items()}
 
     if dtype_str not in dtype_map:
         raise ValueError(f"Unsupported dtype: {dtype_str}")
@@ -92,8 +82,11 @@ def parse_tensor_annotation(annotation: str) -> torch.Tensor:
         if tensor.dtype.is_floating_point:
             tensor.uniform_()
         else:
-            tensor.random_()
-            tensor = tensor % 128
+            try:
+                tensor.random_()
+                tensor = tensor % 128
+            except NotImplementedError:
+                tensor.fill_(0)
     else:
         # Scalar tensor
         tensor = torch.empty((), dtype=dtype, device=device)
@@ -192,7 +185,7 @@ def _get_tid(node):
 
 def get_repr(arg):
     def get_dtype_repr(dtype):
-        return str(dtype).split(".")[1]
+        return dtype_abbrs[dtype]
 
     if isinstance(arg, torch.Tensor):
         out = {}
@@ -246,7 +239,7 @@ def create_execution_trace(
             curr_time[tid] = curr_time[0]
         event = {"ph": "X", "cat": "kernel", "name": str(node), "pid": 0, "tid": tid}
         if _is_communication_node(node):
-            if tid == 0:
+            if tid == 0 and is_wait_tensor(node):
                 # if it's wait tensor, let's sync with compute stream
                 comm_end_time = global_time.pop(node.args[0])
                 curr_time[tid] = max(curr_time[tid], comm_end_time)
