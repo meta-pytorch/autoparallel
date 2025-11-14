@@ -153,7 +153,8 @@ def run_test(fake_evaluate: bool, rng_seed: Optional[int], logs_dir: str):
     # )  # maybe not correct value
     parallel_mod.init_weights(buffer_device=device, seed=rng_seed)
     if rng_seed is not None:
-        NumericsLogger(logs_dir).log_model_weights(parallel_mod)
+        numerics_logger = NumericsLogger(logs_dir)
+        numerics_logger.log_model_weights(parallel_mod)
 
     x = (
         torch.randint(
@@ -177,6 +178,9 @@ def run_test(fake_evaluate: bool, rng_seed: Optional[int], logs_dir: str):
             out.backward(torch.randn_like(out))
     else:
         out = parallel_mod(*x)
+        assert not torch.any(torch.isnan(out)), "Found NaNs in forward output"
+        if rng_seed is not None:
+            numerics_logger.log_forward_output(out)
         out.backward(torch.randn_like(out))
 
     print("All good!")
