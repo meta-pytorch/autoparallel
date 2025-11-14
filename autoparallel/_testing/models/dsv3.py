@@ -75,7 +75,9 @@ def _fill_indices_kernel(
 # ==============
 
 
-def fill_indices_wrapper(
+# workaround until local_map functionalization is fixed: https://github.com/pytorch/pytorch/issues/167568
+@torch.library.custom_op("autoparallel::fill_indices_functional", mutates_args=())
+def fill_indices_functional(
     tokens_per_expert_group: torch.Tensor,
     start_index_values: torch.Tensor,
     write_offsets: torch.Tensor,
@@ -84,7 +86,7 @@ def fill_indices_wrapper(
     max_len: int,
     block_size: int = 128,
     max_blocks: int = 1024,  # cap on total number of blocks to launch
-):
+) -> torch.Tensor:
     # preallocate output
     permuted_indices = torch.full(
         (max_len,), -1, dtype=torch.int32, device=tokens_per_expert_group.device
@@ -106,6 +108,22 @@ def fill_indices_wrapper(
         BLOCK_SIZE=block_size,
     )
     return permuted_indices
+
+
+@fill_indices_functional.register_fake
+def _(
+    tokens_per_expert_group: torch.Tensor,
+    start_index_values: torch.Tensor,
+    write_offsets: torch.Tensor,
+    experts_per_rank: int,
+    num_ranks: int,
+    max_len: int,
+    block_size: int = 128,
+    max_blocks: int = 1024,  # cap on total number of blocks to launch
+) -> torch.Tensor:
+    return torch.full(
+        (max_len,), -1, dtype=torch.int32, device=tokens_per_expert_group.device
+    )
 
 
 # reference
@@ -143,7 +161,6 @@ def fill_indices_cpu(
                     start_index,
                     start_index + (end_idx - write_start),
                     dtype=torch.int32,
-                    # device=device,
                 )
             write_start += length
     return permuted_indices
@@ -213,7 +230,7 @@ def generate_permute_indices(
             max_len,
         )
     else:
-        permuted_indices = fill_indices_wrapper(
+        permuted_indices = fill_indices_functional(
             tokens_per_expert_group,
             start_index_values,
             write_offsets,
