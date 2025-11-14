@@ -36,7 +36,7 @@ from autoparallel.graph_pp_runner import (
 )
 from autoparallel.utils import print_rank_by_rank
 from examples.example_ds3_pp import build_pipeline_schedule
-from torch._C._distributed_c10d import FakeProcessGroup
+from torch._C._distributed_c10d import FakeProcessGroup, PythonCallbackWork
 
 from torch._logging import trace_structured
 from torch._subclasses.fake_tensor import FakeTensorMode
@@ -49,7 +49,7 @@ from torch.distributed._local_tensor import (
     LocalTensorMode,
     maybe_disable_local_tensor_mode,
 )
-from torch.distributed._local_tensor._c10d import _attach_rank
+from torch.distributed._local_tensor._c10d import local_p2p_op
 from torch.distributed.pipelining.schedules import (
     _PipelineSchedule,
     _PipelineScheduleRuntime,
@@ -75,57 +75,99 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+_pg_groups: list[list[int]] = []
+
 
 def enumerate_pp_groups(pp_mesh: DeviceMesh) -> list[list[int]]:
     pp_full_mesh = pp_mesh._layout.remap_to_tensor(pp_mesh._rank_map)
     pp_groups = []
-    for i in range(pp_mesh.size):
+    for i in range(pp_full_mesh.size(dim=0)):
         pp_group = pp_full_mesh[i].tolist()
         pp_groups.append(pp_group)
     return pp_groups
 
 
-def expand_p2p_ops(
-    pp_mesh: DeviceMesh, ops: list[dist.P2POp], pp_src: int
-) -> list[dist.P2POp]:
-    # Fix source ranks in the ops
+def combine_works(works: list[dist.Work]) -> dist.Work:
+    def _wait_all(timeout) -> bool:
+        for w in works:
+            w.wait()
+        return True
 
-    pp_groups = enumerate_pp_groups(pp_mesh)
+    return PythonCallbackWork(_wait_all)
+
+
+def get_pp_peer(self: int, peer: int) -> torch.SymInt:
+    pp_ret = {}
+    global _pp_groups
+    for pp_group in _pp_groups:
+        global_rank = pp_group[self]
+        global_peer = pp_group[peer]
+        pp_ret[global_rank] = global_peer
+    return torch.SymInt(LocalIntNode(pp_ret))
+
+
+def expand_p2p_ops(ops: list[dist.P2POp], pp_rank: int) -> list[dist.P2POp]:
     # Ops where generated from a perspective of pp group where rank 0 is present.
-    rank_to_idx = {rank: idx for idx, rank in enumerate(pp_groups[0])}
 
-    # TODO: Because ops were generated only for the very first pp group for every op
-    # we need to create a new op for every pp group
+    def multi_isend(tensor, dst=None, group=None, tag=0, group_src=None):
+        assert group_src is not None, "Expected group rank"
+        peer = get_pp_peer(pp_rank, group_src)
+        print(f"multi_isend {peer=}")
+        works = local_p2p_op(peer, tensor, dist.isend)
+        return combine_works(works)
 
-    # NB: When PP schedule executes the ops, it will use group rank and then resolve
-    # it into a global rank, therefore here for the expanded groups we need to
-    # provide another group
+    def multi_irecv(tensor, src=None, group=None, tag=0, group_src=None):
+        assert group_src is not None, "Expected group rank"
+        peer = get_pp_peer(pp_rank, group_src)
+        print(f"multi_irecv {peer=}")
+        works = local_p2p_op(peer, tensor, dist.irecv)
+        return combine_works(works)
 
-    # TODO: Attach global rank that is the source of the op to the tensor in the op
-    # using _attach_rank
+    send_ops = []
+    recv_ops = []
+    for p2p_op in ops:
+        op = p2p_op.op
+        if op is dist.isend:
+            p2p_op.op = multi_isend
+            send_ops.append(p2p_op)
+        elif op is dist.irecv:
+            p2p_op.op = multi_irecv
+            recv_ops.append(p2p_op)
+        else:
+            raise AssertionError("Unxpected op {op}")
 
-    return ops
+    # Execute send ops first and then recv because the latter are blocking
+    return send_ops + recv_ops
 
 
 class LocalGraphPipelineStage(GraphPipelineStage):
     def _get_recv_ops(self, recv_infos: tuple[InputInfo, ...]) -> list[dist.P2POp]:
         ops = super()._get_recv_ops(recv_infos)
-        print(f"{self.group_rank} _get_recv_ops {ops}")
+        ops = expand_p2p_ops(ops, self.group_rank)
+
+        # print(f"{self.group_rank} _get_recv_ops {ops}")
         return ops
 
     def get_fwd_send_ops(self, fwd_chunk_id: int) -> list[dist.P2POp]:
         ops = super().get_fwd_send_ops(fwd_chunk_id)
-        print(f"{self.group_rank} get_fwd_send_ops {ops}")
+        ops = expand_p2p_ops(ops, self.group_rank)
+
+        # print(f"{self.group_rank} get_fwd_send_ops {ops}")
         return ops
 
     def get_bwd_send_ops(self, bwd_chunk_id: int) -> list[dist.P2POp]:
         ops = super().get_bwd_send_ops(bwd_chunk_id)
-        print(f"{self.group_rank} get_bwd_send_ops {ops}")
+        ops = expand_p2p_ops(ops, self.group_rank)
+
+        # print(f"{self.group_rank} get_bwd_send_ops {ops}")
         return ops
 
     def _get_init_p2p_neighbors_ops(self) -> list[dist.P2POp]:
         ops = super()._get_init_p2p_neighbors_ops()
-        print(f"{self.group_rank} _get_init_p2p_neighbors_ops {ops}")
+        ops = expand_p2p_ops(ops, self.group_rank)
+
+        # print(f"{self.group_rank} _get_init_p2p_neighbors_ops {ops}")
+        # breakpoint()
         return ops
 
 
@@ -143,7 +185,7 @@ def run_test(run_local: bool, debug_numerics: Optional[bool]):
             "WORLD_SIZE" in os.environ
         ), "run with torchrun --standalone --nproc-per-node 1"
         device = torch.device(f"cuda")
-        torch.distributed.init_process_group(
+        default_pg = torch.distributed.init_process_group(
             "fake",
             rank=0,
             world_size=world_size,
@@ -157,7 +199,7 @@ def run_test(run_local: bool, debug_numerics: Optional[bool]):
         ), "Need at least 8 GPUs for real evaluation"
         local_rank = int(os.getenv("LOCAL_RANK"))
         device = torch.device(f"cuda:{local_rank}")
-        torch.distributed.init_process_group(backend="nccl")
+        default_pg = torch.distributed.init_process_group(backend="nccl")
 
     # Initialize device mesh (common for both modes)
     world_mesh = torch.distributed.device_mesh.init_device_mesh(
@@ -371,6 +413,12 @@ def run_test(run_local: bool, debug_numerics: Optional[bool]):
 
     # At this point all stages have been compiles and parallelized.
     # NB: PP rank code
+    if run_local:
+        global _pp_groups
+        _pp_groups = enumerate_pp_groups(world_mesh["pp"])
+        # for pp_group_ranks in pp_groups:
+        #     _pp_groups.append(default_pg.split_group(pp_group_ranks))
+
     def run_pp_rank(pp_rank: int):
         maybe_local_context = (
             LocalTensorMode(world_size) if run_local else nullcontext()
