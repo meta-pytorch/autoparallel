@@ -190,12 +190,12 @@ def _accumulate_stage_grads(
 ) -> None:
     assert len(unsharded_grads) == len(grads_to_accumulate)
     assert not all(grad is None for grad in grads_to_accumulate), "All grads are None"
-    for unsharded_grad, grad_to_accumulate in zip(unsharded_grads, grads_to_accumulate):
-        if grad_to_accumulate is not None:
-            if unsharded_grad is None:
-                unsharded_grad = grad_to_accumulate
+    for i in range(len(unsharded_grads)):
+        if grads_to_accumulate[i] is not None:
+            if unsharded_grads[i] is None:
+                unsharded_grads[i] = grads_to_accumulate[i]
             else:
-                unsharded_grad += grad_to_accumulate
+                unsharded_grads[i] += grads_to_accumulate[i]
 
 
 def _run_forward_microbatch(
@@ -374,6 +374,7 @@ def stage_full_backward(
         # next stage
         # TODO(sanketpurandare)
         # HACK till we have loss function, we populate the tangents here manually
+        assert len(stage_output) == 1
         bwd_kwargs = {
             "stage_output": loss,
             "tangents": [torch.ones_like(stage_output[0])],

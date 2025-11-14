@@ -93,6 +93,7 @@ def build_pipeline_schedule(
         n_microbatches=n_microbatches,
         loss_fn=loss_fn,
         backward_requires_autograd=backward_requires_autograd,
+        scale_grads=False,
     )
     logger.info(
         f"Using pipeline schedule {pipeline_parallel_schedule} "
