@@ -1584,6 +1584,12 @@ class DeepSeekV3Model(nn.Module):
         return output
 
 
+def dsv3_loss_fn(pred: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    return torch.nn.functional.cross_entropy(
+        pred.flatten(0, 1).float(), labels.flatten(0, 1)
+    )
+
+
 ########################
 # Pipeline stuff start #
 ########################

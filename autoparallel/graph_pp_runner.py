@@ -184,6 +184,20 @@ def _run_reduce_grad_module(
     return sharded_grads
 
 
+def _accumulate_stage_grads(
+    unsharded_grads: list[Union[torch.Tensor, None]],
+    grads_to_accumulate: list[Union[torch.Tensor, None]],
+) -> None:
+    assert len(unsharded_grads) == len(grads_to_accumulate)
+    assert not all(grad is None for grad in grads_to_accumulate), "All grads are None"
+    for unsharded_grad, grad_to_accumulate in zip(unsharded_grads, grads_to_accumulate):
+        if grad_to_accumulate is not None:
+            if unsharded_grad is None:
+                unsharded_grad = grad_to_accumulate
+            else:
+                unsharded_grad += grad_to_accumulate
+
+
 def _run_forward_microbatch(
     stage: GraphPipelineStage, *args, numerics_logs: Optional[list[str]] = None
 ) -> tuple[Any, Any]:
@@ -216,17 +230,9 @@ def _run_backward_microbatch(
     )
 
     unsharded_grads = backward_stage.state["unsharded_grads"]
-    grads_to_accumulate = param_buffer_grads[
-        : len(backward_stage.state["sharded_params"])
-    ]
-    assert len(unsharded_grads) == len(grads_to_accumulate)
-    assert not all(grad is None for grad in grads_to_accumulate), "All grads are None"
-    for unsharded_grad, grad_to_accumulate in zip(unsharded_grads, grads_to_accumulate):
-        if grad_to_accumulate is not None:
-            if unsharded_grad is None:
-                unsharded_grad = grad_to_accumulate
-            else:
-                unsharded_grad += grad_to_accumulate
+    grads_to_accumulate = param_buffer_grads[: backward_stage.graph_meta.num_params]
+    _accumulate_stage_grads(unsharded_grads, grads_to_accumulate)
+
     return input_grads
 
 
@@ -275,6 +281,11 @@ def stage_forward(
         # Receive activations for this chunk
         # Activations only come in args form
         composite_args = stage._retrieve_recv_activations(mb_index)
+        if stage.is_last and ctx.target_mbs is not None:
+            assert isinstance(
+                composite_args, tuple
+            ), f"Expected composite args to be a tuple but got {type(composite_args)}"
+            composite_args = composite_args + (ctx.target_mbs[mb_index],)  # type: ignore[index]
 
     # stage._validate_fwd_input(args, kwargs) Maybe need to validate composite args?
     logger.debug(
@@ -292,6 +303,8 @@ def stage_forward(
     # Output chunks is only used for the last stage since we only merge the output of the last stage
     if stage.is_last:
         stage.output_chunks.append(output)
+        if ctx.target_mbs is not None:
+            ctx.schedule_ref._internal_losses.append(output)
 
     stage.fwd_cache[mb_index] = (
         output_tuple,  # stage_output
@@ -360,7 +373,7 @@ def stage_full_backward(
         # HACK till we have loss function, we populate the tangents here manually
         bwd_kwargs = {
             "stage_output": loss,
-            "tangents": [torch.randn_like(stage_output[0])],
+            "tangents": [torch.ones_like(stage_output[0])],
             "saved_intermediates": saved_intermediates,
         }
     else:
@@ -525,7 +538,9 @@ class GraphPPRunner:
         stage.state.clear()
 
     def step(self, *args, **kwargs) -> None:
-
+        has_targets_and_loss = (
+            "losses" in kwargs and "targets" in kwargs if kwargs else False
+        )
         for stage in self.schedule._stages:
             assert isinstance(stage, GraphPipelineStage)
             self._populate_stage_states(stage)
@@ -535,3 +550,9 @@ class GraphPPRunner:
         for stage in self.schedule._stages:
             assert isinstance(stage, GraphPipelineStage)
             self._accumulate_stage_grads_and_clear_states(stage)
+
+        if has_targets_and_loss:
+            losses = kwargs["losses"]
+            assert len(self.schedule._internal_losses) == self.schedule._n_microbatches
+            losses.extend(self.schedule._internal_losses)
+            self.schedule._internal_losses.clear()

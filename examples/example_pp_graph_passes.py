@@ -9,7 +9,7 @@ from typing import Callable
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.distributed.tensor import DeviceMesh, DTensor
-from torch.distributed.tensor.placement_types import Shard
+from torch.distributed.tensor.placement_types import Replicate, Shard
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from torch.testing._internal.distributed.fake_pg import FakeStore
 
@@ -17,6 +17,7 @@ from autoparallel._testing.models.dsv3 import (
     DeepSeekV3Model,
     DeepSeekV3ModelArgs,
     MoEArgs,
+    dsv3_loss_fn,
 )
 from autoparallel.api import AutoParallelPP
 from autoparallel.graph_pp_runner import (
@@ -36,6 +37,7 @@ def _get_pp_module_and_graphs(
     mesh: DeviceMesh,
     tracing_input_fn: Callable,
     graph_passes: list[str] = [],
+    use_loss_fn: bool = False,
 ) -> tuple[torch.nn.Module, GraphCallables, GraphMeta]:
 
     with AutoParallelPP(
@@ -45,14 +47,18 @@ def _get_pp_module_and_graphs(
         dynamic=True,
         compile=False,
         reshard_after_forward=False,
+        loss_fn=dsv3_loss_fn if use_loss_fn else None,
     ) as autop:
         autop.add_parameter_memory_constraint(low=None, high=None)
 
         # x_sharding = (Shard(0), Replicate())
         x_sharding = (Shard(0), Shard(0))
-
-        autop.add_input_constraints([x_sharding])
-        autop.add_output_constraints([x_sharding])
+        if autop.loss_fn is not None:
+            autop.add_input_constraints([x_sharding, x_sharding])
+            autop.add_output_constraints([(Replicate(), Replicate())])
+        else:
+            autop.add_input_constraints([x_sharding])
+            autop.add_output_constraints([x_sharding])
 
         sharding_placement = autop.optimize_placement()
         res = autop.apply_placement_pp(
@@ -90,9 +96,7 @@ def _get_pp_module_and_graphs(
 def _get_fw_inputs(
     pp_mod: torch.nn.Module, eval_input_fn: Callable
 ) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
-    x: list[torch.Tensor] = [
-        eval_input_fn(),
-    ]
+    x: list[torch.Tensor] = list(eval_input_fn())
     sharded_params = [
         v.to_local() if isinstance(v, DTensor) else v
         for k, v in dict(pp_mod.named_parameters(remove_duplicate=False)).items()
@@ -113,10 +117,11 @@ def test_graph_partition(
     tracing_input_fn: Callable,
     eval_input_fn: Callable,
     fake_evaluate: bool = True,
+    use_loss_fn: bool = True,
 ):
 
     pp_mod, graph_modules, graph_meta = _get_pp_module_and_graphs(
-        model, mesh, tracing_input_fn
+        model, mesh, tracing_input_fn, use_loss_fn=use_loss_fn
     )
     sharded_params, buffers, x = _get_fw_inputs(pp_mod, eval_input_fn)
     with (
@@ -130,10 +135,10 @@ def test_graph_partition(
         # # now let's run it
         with torch.no_grad():
             fw_args = [*sharded_params, *buffers, *x]
-            output, saved_intermediates = _run_fw_module(
+            loss_or_output, saved_intermediates = _run_fw_module(
                 graph_modules.fw, graph_meta, fw_args
             )
-            tangents = [torch.randn_like(output)]
+            tangents = [torch.ones_like(loss_or_output)]
             tensors_for_backward, non_tensors_for_backward = saved_intermediates
 
             bw_args = [
@@ -161,10 +166,15 @@ def test_split_fsdp_collectives(
     tracing_input_fn: Callable,
     eval_input_fn: Callable,
     fake_evaluate: bool = True,
+    use_loss_fn: bool = True,
 ):
 
     pp_mod, graph_modules, graph_meta = _get_pp_module_and_graphs(
-        model, mesh, tracing_input_fn, graph_passes=["split_fsdp_collectives"]
+        model,
+        mesh,
+        tracing_input_fn,
+        graph_passes=["split_fsdp_collectives"],
+        use_loss_fn=use_loss_fn,
     )
     sharded_params, buffers, x = _get_fw_inputs(pp_mod, eval_input_fn)
     with (
@@ -183,10 +193,10 @@ def test_split_fsdp_collectives(
                 graph_modules.unshard, graph_meta, unshard_args
             )
             fw_args = [*unsharded_params, *buffers, *x]
-            output, saved_intermediates = _run_fw_module(
+            loss_or_output, saved_intermediates = _run_fw_module(
                 graph_modules.fw, graph_meta, fw_args
             )
-            tangents = [torch.randn_like(output)]
+            tangents = [torch.randn_like(loss_or_output)]
             tensors_for_backward, non_tensors_for_backward = saved_intermediates
 
             bw_args = [
@@ -220,10 +230,15 @@ def test_split_dI_dW(
     tracing_input_fn: Callable,
     eval_input_fn: Callable,
     fake_evaluate: bool = True,
+    use_loss_fn: bool = True,
 ):
 
     pp_mod, graph_modules, graph_meta = _get_pp_module_and_graphs(
-        model, mesh, tracing_input_fn, graph_passes=["split_dI_dW"]
+        model,
+        mesh,
+        tracing_input_fn,
+        graph_passes=["split_dI_dW"],
+        use_loss_fn=use_loss_fn,
     )
     sharded_params, buffers, x = _get_fw_inputs(pp_mod, eval_input_fn)
     with (
@@ -237,10 +252,10 @@ def test_split_dI_dW(
         # # now let's run it
         with torch.no_grad():
             fw_args = [*sharded_params, *buffers, *x]
-            output, saved_intermediates = _run_fw_module(
+            loss_or_output, saved_intermediates = _run_fw_module(
                 graph_modules.fw, graph_meta, fw_args
             )
-            tangents = [torch.randn_like(output)]
+            tangents = [torch.randn_like(loss_or_output)]
             tensors_for_backward, non_tensors_for_backward = saved_intermediates
 
             bw_args = [
@@ -277,6 +292,7 @@ def test_combined(
     tracing_input_fn: Callable,
     eval_input_fn: Callable,
     fake_evaluate: bool = True,
+    use_loss_fn: bool = True,
 ):
 
     pp_mod, graph_modules, graph_meta = _get_pp_module_and_graphs(
@@ -284,6 +300,7 @@ def test_combined(
         mesh,
         tracing_input_fn,
         graph_passes=["split_fsdp_collectives", "split_dI_dW"],
+        use_loss_fn=use_loss_fn,
     )
     sharded_params, buffers, x = _get_fw_inputs(pp_mod, eval_input_fn)
     with (
@@ -302,10 +319,10 @@ def test_combined(
                 graph_modules.unshard, graph_meta, unshard_args
             )
             fw_args = [*unsharded_params, *buffers, *x]
-            output, saved_intermediates = _run_fw_module(
+            loss_or_output, saved_intermediates = _run_fw_module(
                 graph_modules.fw, graph_meta, fw_args
             )
-            tangents = [torch.randn_like(output)]
+            tangents = [torch.randn_like(loss_or_output)]
             tensors_for_backward, non_tensors_for_backward = saved_intermediates
 
             bw_args = [
@@ -344,6 +361,7 @@ if __name__ == "__main__":
     # must symbolically evaluate to run on 32 dp ranks
     # world_size = 2048
     fake_evaluate = True
+    use_loss_fn = True
 
     world_size = 256
 
@@ -399,27 +417,38 @@ if __name__ == "__main__":
         model = DeepSeekV3Model(config).bfloat16()
         model.tok_embeddings = None  # type: ignore[assignment]
 
-    def tracing_input_fn() -> torch.Tensor:
-        return torch.randn(
-            (bs, seq_len, config.dim),
-            device=device,
-            dtype=torch.bfloat16,
-            requires_grad=True,
-        )
+    def make_input_fn(sharded: bool = False, with_target: bool = False):
+        """Create input generator. `sharded` uses mesh-adjusted batch size."""
 
-    def eval_input_fn() -> torch.Tensor:
-        return torch.randn(
-            (bs // mesh.shape[0] // mesh.shape[1], seq_len, config.dim),
-            device=device,
-            dtype=torch.bfloat16,
-            requires_grad=True,
-        )
+        def input_fn() -> tuple[torch.Tensor, ...]:
+            batch_size = bs // (mesh.shape[0] * mesh.shape[1]) if sharded else bs
 
-    test_graph_partition(model, mesh, tracing_input_fn, eval_input_fn, fake_evaluate)
+            inputs = (
+                torch.randn(
+                    (batch_size, seq_len, config.dim),
+                    device=device,
+                    dtype=torch.bfloat16,
+                    requires_grad=True,
+                ),
+            )
+            if with_target:
+                inputs += (
+                    torch.randint(
+                        0, config.vocab_size, (batch_size, seq_len), device=device
+                    ),
+                )
+            return inputs
+
+        return input_fn
+
+    input_fn = make_input_fn(sharded=False, with_target=use_loss_fn)
+    eval_fn = make_input_fn(sharded=True, with_target=use_loss_fn)
+
+    test_graph_partition(model, mesh, input_fn, eval_fn, fake_evaluate, use_loss_fn)
     test_split_fsdp_collectives(
-        model, mesh, tracing_input_fn, eval_input_fn, fake_evaluate
+        model, mesh, input_fn, eval_fn, fake_evaluate, use_loss_fn
     )
-    test_split_dI_dW(model, mesh, tracing_input_fn, eval_input_fn, fake_evaluate)
-    test_combined(model, mesh, tracing_input_fn, eval_input_fn, fake_evaluate)
+    test_split_dI_dW(model, mesh, input_fn, eval_fn, fake_evaluate, use_loss_fn)
+    test_combined(model, mesh, input_fn, eval_fn, fake_evaluate, use_loss_fn)
     if torch.distributed.is_initialized():
         torch.distributed.destroy_process_group()

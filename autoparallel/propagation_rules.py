@@ -363,11 +363,8 @@ def randperm_rule(mesh, specs):
     return OpStrategy([OpSpec(spec, input_specs=[spec], redistribute_cost=[[0.0]])])
 
 
-# We do a few special things for factory ops
-# - use the factory rule below
-# - fake that they have input schemas so the solver doesn't freak out
-# - convert their sizes to 'local tensor sizes' (divide by mesh dim) during ApplySharding
-TENSOR_FACTORY_OPS = [
+# Factory ops that take a shape as the first argument
+_SHAPE_FACTORY_OPS = [
     torch.ops.aten.zeros.default,
     torch.ops.aten.ones.default,
     torch.ops.aten.full.default,
@@ -376,8 +373,49 @@ TENSOR_FACTORY_OPS = [
     torch.ops.aten.randn.default,
 ]
 
+# We do a few special things for factory ops
+# - use the factory rule below
+# - fake that they have input schemas so the solver doesn't freak out
+# - convert their sizes to 'local tensor sizes' (divide by mesh dim) during ApplySharding
+TENSOR_FACTORY_OPS = _SHAPE_FACTORY_OPS + [
+    torch.ops.aten.scalar_tensor.default,  # Special case: creates 0-dim tensor
+]
 
-@register_opschema_rule(TENSOR_FACTORY_OPS)
+
+@register_opschema_rule(torch.ops.aten.scalar_tensor.default)
+def scalar_tensor_rule(mesh, op_schema: OpSchema) -> OpStrategy:
+    """
+    Rule for aten.scalar_tensor which creates a scalar (0-dimensional) tensor.
+    Unlike other factory ops, this doesn't take a shape parameter.
+
+    Schema: scalar_tensor(Scalar s, *, ScalarType? dtype=None, ...) -> Tensor
+    """
+    # scalar_tensor creates a 0-dimensional tensor
+    shape = ()
+    stride = ()
+    dtype = torch.get_default_dtype()
+
+    # Check if dtype is specified in kwargs or args
+    if len(op_schema.args_schema) >= 2 and op_schema.args_schema[1] is not None:
+        dtype = op_schema.args_schema[1]  # type: ignore[assignment]
+
+    tensor_meta = TensorMeta(shape, stride, dtype)  # type: ignore[arg-type]
+
+    # For a scalar (0-dim) tensor, we can only replicate across all mesh dimensions
+    placement = (Replicate(),) * mesh.ndim
+    output_specs = DTensorSpec(mesh, placement, tensor_meta=tensor_meta)
+
+    # Similar to factory_rule, we add a dummy input_specs for solver compatibility
+    strategy = OpSpec(
+        output_specs=output_specs,
+        input_specs=[output_specs],
+        redistribute_cost=[[0.0]],
+    )
+
+    return OpStrategy([strategy])
+
+
+@register_opschema_rule(_SHAPE_FACTORY_OPS)
 def factory_rule(mesh, op_schema: OpSchema) -> OpStrategy:
     """
     This is an auto-parallel specific util that won't be upstreamed becuase of a UX mismatch.

@@ -8,7 +8,7 @@ import itertools
 import warnings
 from contextlib import ExitStack, contextmanager
 from types import MethodType
-from typing import Any, Optional, Union
+from typing import Any, Callable, Optional, Union
 
 import torch
 from torch._dynamo.functional_export import _dynamo_graph_capture_for_export
@@ -159,17 +159,35 @@ def enable_local_map_wrapping():
         yield
 
 
-def _export(model: torch.nn.Module, inputs: tuple[Any]) -> torch.nn.Module:
+def _export(
+    model: torch.nn.Module, model_wrapper: Callable, inputs: tuple[Any, ...]
+) -> torch.fx.GraphModule:
     """
-    Thin wrapper around graph capture output that restores the
-    original calling convention and attribute fqn. TODO:
-    1) Use bytecode for calling convention instead of pytree for more
-       seamless UX.
+    Capture a model graph via Dynamo and restore parameter/buffer metadata.
+
+    We need both `model` and `model_wrapper` because:
+    - `model_wrapper` is the actual callable that gets traced by Dynamo. It may wrap
+      the model with additional logic (e.g., adding a loss function on top of the model's
+      forward pass, or preparing inputs in a specific way).
+    - `model` is the original nn.Module needed to restore the correct fully-qualified
+      names (FQNs) for parameters and buffers in the traced graph. Without this, the
+      captured graph would lose the original parameter naming structure.
+
+    Args:
+        model: Original nn.Module with parameter/buffer metadata to restore
+        model_wrapper: Callable to trace (may wrap model with additional logic)
+        inputs: Input tensors for tracing
+
+    Returns:
+        GraphModule with restored parameter FQNs and calling convention
+
+    TODO:
+    1) Use bytecode for calling convention instead of pytree for more seamless UX
     2) Attach guards
-    3) Be more careful about tensor constants names.
+    3) Be more careful about tensor constants names
     """
     with torch._dynamo.config.patch(install_free_tensors=True):
-        gm = _dynamo_graph_capture_for_export(model)(*inputs)
+        gm = _dynamo_graph_capture_for_export(model_wrapper)(*inputs)
         _restore_state_dict(model, gm)
         return gm
 
@@ -193,6 +211,7 @@ class AutoParallel:
         ac_stage_size_in_GiB: Optional[Union[float, str]] = "auto",
         reshard_after_forward: bool = True,
         dynamic: bool = False,
+        loss_fn: Optional[Callable] = None,
         **kwargs,
     ):
         self.stack = ExitStack()
@@ -224,6 +243,7 @@ class AutoParallel:
         self.enable_ac = enable_ac
         self.ac_stage_size_in_GiB = ac_stage_size_in_GiB
         self.reshard_after_forward = reshard_after_forward
+        self.loss_fn = loss_fn
 
         if dynamic:
             self.fake_mode.shape_env = ShapeEnv()
@@ -291,20 +311,54 @@ class AutoParallel:
         decomp_table = _get_decomp_table()
 
         with self.fake_mode:
-            inputs = self.input_fn()
-            if not isinstance(inputs, tuple):
-                inputs = (inputs,)
+            raw_inputs = self.input_fn()
+
+        # Define model wrapper based on whether loss_fn is provided
+        model_wrapper: Callable
+        # Parse inputs based on whether loss_fn is provided
+        # If loss_fn is not None: expected format ((inp1, inp2,...), target)
+        # If loss_fn is None: expected format (inp1, inp2, ...)
+        if self.loss_fn is not None:
+            if isinstance(raw_inputs, tuple) and len(raw_inputs) == 2:
+                model_inputs, target = raw_inputs
+                # Normalize inputs to always be a tuple
+                if not isinstance(model_inputs, tuple):
+                    model_inputs = (model_inputs,)
+                formatted_inputs = (model_inputs, target)
+
+                def model_with_loss(model_inputs, target) -> Any:
+                    output = self.model(*model_inputs)
+                    loss = self.loss_fn(output, target)  # type: ignore[misc]
+                    return loss
+
+                model_wrapper = model_with_loss
+            else:
+                raise ValueError(
+                    "When loss_fn is provided, input_fn must return (inputs, target) "
+                    "where inputs can be a single tensor or tuple of tensors"
+                )
+        else:
+            # No loss function, inputs are just model inputs
+            formatted_inputs = (
+                raw_inputs if isinstance(raw_inputs, tuple) else (raw_inputs,)
+            )
+
+            def model_wo_loss(*model_inputs) -> Any:
+                output = self.model(*model_inputs)
+                return output
+
+            model_wrapper = model_wo_loss
 
         with set_dtype_cast(
             True
         ), enable_local_map_wrapping(), torch._dynamo.utils._disable_saved_tensors_hooks_during_tracing():
-            torch_ir_with_fqn = _export(self.model, inputs)
+            torch_ir_with_fqn = _export(self.model, model_wrapper, formatted_inputs)
             # TODO Cna't use fake mode here because it clashes with the user level
             # fake mode. Ideally dynamo should reuse the user level fake mode.
             self.joint_with_descriptors = aot_export_joint_with_descriptors(
                 self.stack,
                 torch_ir_with_fqn,
-                inputs,
+                formatted_inputs,
                 decompositions=decomp_table,
             )
         gm = self.joint_with_descriptors.graph_module

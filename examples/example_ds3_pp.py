@@ -26,7 +26,7 @@ from torch.distributed.pipelining.schedules import (
     get_schedule_class,
 )
 from torch.distributed.pipelining.stage import PipelineStage
-from torch.distributed.tensor.placement_types import Shard
+from torch.distributed.tensor.placement_types import Replicate, Shard
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from torch.testing._internal.distributed.fake_pg import FakeStore
 
@@ -37,6 +37,7 @@ from autoparallel._testing.models.dsv3 import (
     DeepSeekV3StageI,
     DeepSeekV3StageN,
     MoEArgs,
+    dsv3_loss_fn,
 )
 from autoparallel.api import AutoParallelPP
 from autoparallel.graph_pp_runner import (
@@ -100,7 +101,9 @@ def build_pipeline_schedule(
     return schedule
 
 
-def run_test(fake_evaluate: bool, rng_seed: Optional[int], logs_dir: str):
+def run_test(
+    fake_evaluate: bool, use_loss_fn: bool, rng_seed: Optional[int], logs_dir: str
+):
     if not fake_evaluate:
         pp_degree = 2
         dp_mod_ep_degree = 2
@@ -246,53 +249,92 @@ def run_test(fake_evaluate: bool, rng_seed: Optional[int], logs_dir: str):
         for lst in layers:
             assert len(lst) * len(layers) == config.n_layers
 
-    def tracing_input_fn():
-        return torch.randint(
-            0,
-            config.vocab_size,
-            (spmd_batch_size, seq_len),
-            device=device,
+    def make_input_fn(
+        batch_size: int,
+        inp_type: str,
+        device: torch.device,
+    ):
+        """
+        Factory to create input/output generator functions for pipeline stages.
+
+        Args:
+            batch_size: Batch size (spmd_batch_size, local_batch_size, or microbatch_size)
+            inp_type: One of "tokens", "embeddings", or "logits"
+            device: Device to create tensors on (cuda device or "meta")
+        """
+
+        def input_fn() -> torch.Tensor:
+            if inp_type == "tokens":
+                return torch.randint(
+                    0,
+                    config.vocab_size,
+                    (batch_size, seq_len),
+                    device=device,
+                )
+            elif inp_type == "embeddings":
+                return torch.randn(
+                    (batch_size, seq_len, config.dim),
+                    device=device,
+                    dtype=torch.bfloat16,
+                    requires_grad=True,
+                )
+            elif inp_type == "logits":
+                return torch.randn(
+                    (batch_size, seq_len, config.vocab_size),
+                    device=device,
+                    dtype=torch.bfloat16,
+                    requires_grad=True,
+                )
+            elif inp_type == "loss":
+                return torch.scalar_tensor(
+                    1.0,
+                    dtype=torch.float32,
+                    device=device,
+                    requires_grad=True,
+                )
+            else:
+                raise ValueError(f"Unknown input type: {inp_type}")
+
+        return input_fn
+
+    # Target generators (if needed for loss computation)
+    tracing_target_fn = make_input_fn(spmd_batch_size, "tokens", device)
+    runtime_target_fn = make_input_fn(local_batch_size, "tokens", device)
+
+    # Tracing input functions
+    tracing_input_fn_fist_stage = make_input_fn(spmd_batch_size, "tokens", device)
+    tracing_input_fn_intermediate_stage = make_input_fn(
+        spmd_batch_size, "embeddings", device
+    )
+
+    def last_stage_inp_with_loss_fn():
+        return (
+            tracing_input_fn_intermediate_stage(),
+            tracing_target_fn(),
         )
 
-    def tracing_input_fn_after_first_stage():
-        return torch.randn(
-            (spmd_batch_size, seq_len, config.dim),
-            device=device,
-            dtype=torch.bfloat16,
-            requires_grad=True,
-        )
+    tracing_input_fn_last_stage = (
+        last_stage_inp_with_loss_fn
+        if use_loss_fn
+        else tracing_input_fn_intermediate_stage
+    )
 
-    def runtime_input_fn():
-        return torch.randint(
-            0,
-            config.vocab_size,
-            (local_batch_size, seq_len),
-            device=device,
-        )
+    # Runtime input function
+    runtime_input_fn_first_stage = make_input_fn(local_batch_size, "tokens", device)
 
-    def shape_inference_input_fn():
-        return torch.randint(
-            0,
-            config.vocab_size,
-            (microbatch_size, seq_len),
-            device="meta",
-        )
-
-    def shape_inference_input_fn_after_first_stage():
-        return torch.randn(
-            (microbatch_size, seq_len, config.dim),
-            device="meta",
-            dtype=torch.bfloat16,
-            requires_grad=True,
-        )
-
-    def shape_inference_output_fn_last_stage():
-        return torch.randn(
-            (microbatch_size, seq_len, config.vocab_size),
-            device="meta",
-            dtype=torch.bfloat16,
-            requires_grad=True,
-        )
+    # Shape inference functions
+    meta_device = torch.device("meta")
+    shape_inference_input_fn_first_stage = make_input_fn(
+        microbatch_size, "tokens", meta_device
+    )
+    shape_inference_fn_intermediate_stage = make_input_fn(
+        microbatch_size, "embeddings", meta_device
+    )
+    shape_inference_output_fn_last_stage = (
+        make_input_fn(0, "loss", meta_device)
+        if use_loss_fn
+        else make_input_fn(microbatch_size, "logits", meta_device)
+    )
 
     # Step 1. Construct the logical pipeline stages
     with torch.device("meta"):
@@ -307,6 +349,7 @@ def run_test(fake_evaluate: bool, rng_seed: Optional[int], logs_dir: str):
         rank: [rank + i * pp_degree for i in range(stages_per_rank)]
         for rank in range(pp_degree)
     }
+    print(pp_rank_to_stage_indices)
     assert len(pp_rank_to_stage_indices) == pp_degree
     for stages in pp_rank_to_stage_indices.values():
         assert len(stages) * pp_degree == len(virtual_pp_stages)
@@ -345,19 +388,36 @@ def run_test(fake_evaluate: bool, rng_seed: Optional[int], logs_dir: str):
             )
         else:
             if stage_idx == 0:
-                input_fn = tracing_input_fn
+                input_fn = tracing_input_fn_fist_stage
+            elif stage_idx == total_pp_stages - 1:
+
+                input_fn = tracing_input_fn_last_stage
+
             else:
-                input_fn = tracing_input_fn_after_first_stage
+                input_fn = tracing_input_fn_intermediate_stage
             with AutoParallelPP(
-                stage_mod, input_fn, mesh, dynamic=True, compile=False
+                stage_mod,
+                input_fn,
+                mesh,
+                dynamic=True,
+                compile=False,
+                reshard_after_forward=False,
+                loss_fn=(
+                    dsv3_loss_fn
+                    if use_loss_fn and stage_idx == total_pp_stages - 1
+                    else None
+                ),
             ) as autop:
                 autop.add_parameter_memory_constraint(low=None, high=None)
 
                 # x_sharding = (Shard(0), Replicate())
                 x_sharding = (Shard(0), Shard(0))
-
-                autop.add_input_constraints([x_sharding])
-                autop.add_output_constraints([x_sharding])
+                if autop.loss_fn is not None:
+                    autop.add_input_constraints([x_sharding, x_sharding])
+                    autop.add_output_constraints([(Replicate(), Replicate())])
+                else:
+                    autop.add_input_constraints([x_sharding])
+                    autop.add_output_constraints([x_sharding])
 
                 sharding_placement = autop.optimize_placement(verbose=False)
                 cache = autop.apply_placement_pp(sharding_placement)
@@ -428,14 +488,14 @@ def run_test(fake_evaluate: bool, rng_seed: Optional[int], logs_dir: str):
             num_stages=len(virtual_pp_stages),
             device=device,
             input_args=(
-                shape_inference_input_fn()
+                shape_inference_input_fn_first_stage()
                 if pp_stage_idx == 0
-                else shape_inference_input_fn_after_first_stage()
+                else shape_inference_fn_intermediate_stage()
             ),
             output_args=(
                 shape_inference_output_fn_last_stage()
-                if pp_stage_idx == (len(virtual_pp_stages) - 1)
-                else shape_inference_input_fn_after_first_stage()
+                if pp_stage_idx == (total_pp_stages - 1)
+                else shape_inference_fn_intermediate_stage()
             ),
             group=world_mesh.get_group("pp"),
         )
@@ -465,6 +525,7 @@ def run_test(fake_evaluate: bool, rng_seed: Optional[int], logs_dir: str):
     graph_pp_runner = GraphPPRunner(schedule)
 
     # Step 8. Run the whole pipeline once using the graph runner
+    has_last_stage = (total_pp_stages - 1) in stage_mods
     with (
         FakeTensorMode(
             allow_non_fake_inputs=True,
@@ -474,11 +535,26 @@ def run_test(fake_evaluate: bool, rng_seed: Optional[int], logs_dir: str):
         else nullcontext()
     ):
         with torch.no_grad():
+            target, losses = (
+                (runtime_target_fn(), [])
+                if has_last_stage and use_loss_fn
+                else (None, None)
+            )
             if pp_rank == 0:
-                x = runtime_input_fn()
-                graph_pp_runner.step(x)
+                x = runtime_input_fn_first_stage()
+                graph_pp_runner.step(
+                    x, target=target, losses=losses, return_outputs=False
+                )
             else:
-                graph_pp_runner.step()
+                graph_pp_runner.step(target=target, losses=losses, return_outputs=False)
+            trace_structured(
+                "artifact",
+                metadata_fn=lambda: {
+                    "name": "pipeline_step_losses",
+                    "encoding": "string",
+                },
+                payload_fn=lambda: f"losses: {losses}",
+            )
 
     print("All good!")
 
@@ -501,6 +577,12 @@ if __name__ == "__main__":
         help="Use fake evaluation mode with FakeTensorMode (default: False)",
     )
     parser.add_argument(
+        "--use-loss-fn",
+        action="store_true",
+        default=False,
+        help="Trace loss_fn as part of model forward graph for the last stage (default: False)",
+    )
+    parser.add_argument(
         "--rng-seed",
         type=int,
         default=None,
@@ -519,5 +601,8 @@ if __name__ == "__main__":
         torch.manual_seed(args.rng_seed)
 
     run_test(
-        fake_evaluate=args.fake_evaluate, rng_seed=args.rng_seed, logs_dir=args.logs_dir
+        fake_evaluate=args.fake_evaluate,
+        use_loss_fn=args.use_loss_fn,
+        rng_seed=args.rng_seed,
+        logs_dir=args.logs_dir,
     )
