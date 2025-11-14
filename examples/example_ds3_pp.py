@@ -15,6 +15,8 @@ import torch.nn as nn
 from torch._logging import trace_structured
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.distributed.pipelining.schedules import (
+    BACKWARD_INPUT,
+    BACKWARD_WEIGHT,
     FORWARD,
     FULL_BACKWARD,
     REDUCE_GRAD,
@@ -45,6 +47,8 @@ from autoparallel.graph_pp_runner import (
     GraphMeta,
     GraphPipelineStage,
     GraphPPRunner,
+    stage_backward_input,
+    stage_backward_weight,
     stage_forward,
     stage_full_backward,
     stage_reduce_grad,
@@ -58,6 +62,24 @@ logging.basicConfig(
     level=logging.DEBUG, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+
+def assign_logical_stages_to_pp_rank(
+    schedule_name: str, pp_degree: int, stages_per_rank: int
+) -> dict[int, list[int]]:
+    style = "v" if schedule_name in ("ZBVZeroBubble", "DualPipeV") else "loop"
+    if style == "loop":
+        pp_rank_to_stage_indices = {
+            pp_rank: [pp_rank + s * pp_degree for s in range(stages_per_rank)]
+            for pp_rank in range(pp_degree)
+        }
+    elif style == "v":
+        total_pp_stages = pp_degree * stages_per_rank
+        pp_rank_to_stage_indices = {
+            pp_rank: [pp_rank, total_pp_stages - 1 - pp_rank]
+            for pp_rank in range(pp_degree)
+        }
+    return pp_rank_to_stage_indices
 
 
 def build_pipeline_schedule(
@@ -102,7 +124,11 @@ def build_pipeline_schedule(
 
 
 def run_test(
-    fake_evaluate: bool, use_loss_fn: bool, rng_seed: Optional[int], logs_dir: str
+    fake_evaluate: bool,
+    use_loss_fn: bool,
+    schedule_name: str,
+    rng_seed: Optional[int],
+    logs_dir: str,
 ):
     if not fake_evaluate:
         pp_degree = 2
@@ -344,11 +370,10 @@ def run_test(
         virtual_pp_stages.append(
             DeepSeekV3StageN(layers[total_pp_stages - 1], norm, output, config)
         )
-    # Step 2. Assign each logical stage(s) to pp ranks for Interleaved1F1B schedule
-    pp_rank_to_stage_indices: dict[int, list[int]] = {
-        rank: [rank + i * pp_degree for i in range(stages_per_rank)]
-        for rank in range(pp_degree)
-    }
+    # Step 2. Assign each logical stage(s) to pp ranks for the given schedule
+    pp_rank_to_stage_indices = assign_logical_stages_to_pp_rank(
+        schedule_name, pp_degree, stages_per_rank
+    )
     print(pp_rank_to_stage_indices)
     assert len(pp_rank_to_stage_indices) == pp_degree
     for stages in pp_rank_to_stage_indices.values():
@@ -420,7 +445,14 @@ def run_test(
                     autop.add_output_constraints([x_sharding])
 
                 sharding_placement = autop.optimize_placement(verbose=False)
-                cache = autop.apply_placement_pp(sharding_placement)
+                graph_passes = ["split_fsdp_collectives"]
+                if stage_idx > 0:
+                    # First stage does not produce gradients wrt to input,
+                    # hence we do not do apply the split_dI_dW pass
+                    graph_passes.extend(["split_dI_dW"])
+                cache = autop.apply_placement_pp(
+                    sharding_placement=sharding_placement, graph_passes=graph_passes
+                )
                 graph_callables = cache["graph_callables"]
                 graph_meta = cache["graph_meta"]
                 pp_mod = AutoParallelPPModule(
@@ -504,7 +536,7 @@ def run_test(
     schedule = build_pipeline_schedule(
         stages=stages,
         loss_fn=None,
-        pipeline_parallel_schedule="Interleaved1F1B",
+        pipeline_parallel_schedule=schedule_name,
         microbatch_size=microbatch_size,
         local_batch_size=local_batch_size,
         pipeline_parallel_degree=pp_degree,
@@ -519,6 +551,8 @@ def run_test(
     schedule.register_custom_function(REDUCE_GRAD, stage_reduce_grad)
     schedule.register_custom_function(RESHARD, stage_reshard)
     schedule.register_custom_function(UNSHARD, stage_unshard)
+    schedule.register_custom_function(BACKWARD_INPUT, stage_backward_input)
+    schedule.register_custom_function(BACKWARD_WEIGHT, stage_backward_weight)
 
     # Step 7. Register the schedule with the graph runner
 
@@ -594,6 +628,13 @@ if __name__ == "__main__":
         default="out/",
         help="Directory to store logs (default: ./out/).",
     )
+    parser.add_argument(
+        "--schedule-name",
+        type=str,
+        default="ZBVZeroBubble",
+        choices=["Interleaved1F1B", "ZBVZeroBubble"],
+        help="Schedule to use for PP",
+    )
     args = parser.parse_args()
 
     if args.rng_seed is not None:
@@ -603,6 +644,7 @@ if __name__ == "__main__":
     run_test(
         fake_evaluate=args.fake_evaluate,
         use_loss_fn=args.use_loss_fn,
+        schedule_name=args.schedule_name,
         rng_seed=args.rng_seed,
         logs_dir=args.logs_dir,
     )
