@@ -36,7 +36,7 @@ from autoparallel.graph_pp_runner import (
 )
 from autoparallel.utils import print_rank_by_rank
 from examples.example_ds3_pp import build_pipeline_schedule
-from torch._C._distributed_c10d import FakeProcessGroup, PythonCallbackWork
+from torch._C._distributed_c10d import FakeProcessGroup, FakeWork, PythonCallbackWork
 
 from torch._logging import trace_structured
 from torch._subclasses.fake_tensor import FakeTensorMode
@@ -87,9 +87,10 @@ def enumerate_pp_groups(pp_mesh: DeviceMesh) -> list[list[int]]:
     return pp_groups
 
 
-def combine_works(works: list[dist.Work]) -> dist.Work:
+def combine_works(works: list[dist.Work], ctx: str | None = None) -> dist.Work:
     def _wait_all(timeout) -> bool:
         for w in works:
+            print(f"{ctx} wait recv")
             w.wait()
         return True
 
@@ -106,22 +107,24 @@ def get_pp_peer(self: int, peer: int) -> torch.SymInt:
     return torch.SymInt(LocalIntNode(pp_ret))
 
 
-def expand_p2p_ops(ops: list[dist.P2POp], pp_rank: int) -> list[dist.P2POp]:
+def expand_p2p_ops(
+    ops: list[dist.P2POp], pp_rank: int, ctx: str | None = None
+) -> list[dist.P2POp]:
     # Ops where generated from a perspective of pp group where rank 0 is present.
 
     def multi_isend(tensor, dst=None, group=None, tag=0, group_src=None):
         assert group_src is not None, "Expected group rank"
         peer = get_pp_peer(pp_rank, group_src)
-        print(f"multi_isend {peer=}")
+        print(f"PP peer {group_src} {ctx} multi_isend {peer=}")
         works = local_p2p_op(peer, tensor, dist.isend)
-        return combine_works(works)
+        return FakeWork()
 
     def multi_irecv(tensor, src=None, group=None, tag=0, group_src=None):
         assert group_src is not None, "Expected group rank"
         peer = get_pp_peer(pp_rank, group_src)
-        print(f"multi_irecv {peer=}")
+        print(f"PP peer {group_src} {ctx} multi_irecv {peer=}")
         works = local_p2p_op(peer, tensor, dist.irecv)
-        return combine_works(works)
+        return combine_works(works, f"PP peer {group_src} {ctx} multi_irecv {peer=}")
 
     send_ops = []
     recv_ops = []
@@ -141,33 +144,35 @@ def expand_p2p_ops(ops: list[dist.P2POp], pp_rank: int) -> list[dist.P2POp]:
 
 
 class LocalGraphPipelineStage(GraphPipelineStage):
+    def log_name(self) -> str:
+        return (
+            f"PP rank {self.group_rank} Stage {self.stage_index} of {self.num_stages}"
+        )
+
     def _get_recv_ops(self, recv_infos: tuple[InputInfo, ...]) -> list[dist.P2POp]:
         ops = super()._get_recv_ops(recv_infos)
-        ops = expand_p2p_ops(ops, self.group_rank)
-
-        # print(f"{self.group_rank} _get_recv_ops {ops}")
+        ops = expand_p2p_ops(ops, self.group_rank, self.log_name() + " _get_recv_ops")
         return ops
 
     def get_fwd_send_ops(self, fwd_chunk_id: int) -> list[dist.P2POp]:
         ops = super().get_fwd_send_ops(fwd_chunk_id)
-        ops = expand_p2p_ops(ops, self.group_rank)
-
-        # print(f"{self.group_rank} get_fwd_send_ops {ops}")
+        ops = expand_p2p_ops(
+            ops, self.group_rank, self.log_name() + " get_fwd_send_ops"
+        )
         return ops
 
     def get_bwd_send_ops(self, bwd_chunk_id: int) -> list[dist.P2POp]:
         ops = super().get_bwd_send_ops(bwd_chunk_id)
-        ops = expand_p2p_ops(ops, self.group_rank)
-
-        # print(f"{self.group_rank} get_bwd_send_ops {ops}")
+        ops = expand_p2p_ops(
+            ops, self.group_rank, self.log_name() + " get_bwd_send_ops"
+        )
         return ops
 
     def _get_init_p2p_neighbors_ops(self) -> list[dist.P2POp]:
         ops = super()._get_init_p2p_neighbors_ops()
-        ops = expand_p2p_ops(ops, self.group_rank)
-
-        # print(f"{self.group_rank} _get_init_p2p_neighbors_ops {ops}")
-        # breakpoint()
+        ops = expand_p2p_ops(
+            ops, self.group_rank, self.log_name() + " _get_init_p2p_neighbors_ops"
+        )
         return ops
 
 
