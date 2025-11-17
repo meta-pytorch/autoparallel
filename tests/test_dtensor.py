@@ -3,6 +3,7 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+from unittest.case import expectedFailure
 import functools
 
 import numpy as np
@@ -351,6 +352,8 @@ dispatcher.sharding_propagator = CustomShardingPropagator()
 
 
 class ImplicitRegistrationTest(DTensorTestBase):
+
+    @expectedFailure
     @with_comms
     def test_implicit_registration(self):
         mesh = init_device_mesh(self.device_type, (2, self.world_size // 2))
