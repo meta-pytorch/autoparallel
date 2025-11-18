@@ -22,12 +22,11 @@ from torch.distributed.tensor._ops.utils import (
     is_tensor_shardable,
     register_op_strategy,
 )
-from torch.distributed.tensor.placement_types import Placement, Replicate, Shard
-
 from torch.distributed.tensor.debug import (
     _clear_fast_path_sharding_prop_cache,
     _clear_python_sharding_prop_cache,
 )
+from torch.distributed.tensor.placement_types import Placement, Replicate, Shard
 
 try:
     from torch.utils._cxx_pytree import tree_leaves
