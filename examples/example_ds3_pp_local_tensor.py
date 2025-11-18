@@ -62,6 +62,7 @@ from torch.distributed.pipelining.schedules import (
     UNSHARD,
 )
 from torch.distributed.pipelining.stage import InputInfo, PipelineStage
+from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import Shard
 from torch.export._unlift import _assign_attr
 from torch.export.unflatten import _AttrKind
@@ -116,6 +117,8 @@ def expand_p2p_ops(
         assert group_src is not None, "Expected group rank"
         peer = get_pp_peer(pp_rank, group_src)
         print(f"PP peer {group_src} {ctx} multi_isend {peer=}")
+        if not isinstance(tensor, LocalTensor):
+            tensor = maybe_make_tensor_local(tensor)
         works = local_p2p_op(peer, tensor, dist.isend)
         return FakeWork()
 
@@ -123,6 +126,7 @@ def expand_p2p_ops(
         assert group_src is not None, "Expected group rank"
         peer = get_pp_peer(pp_rank, group_src)
         print(f"PP peer {group_src} {ctx} multi_irecv {peer=}")
+        assert isinstance(tensor, LocalTensor), "Expected LocalTensor"
         works = local_p2p_op(peer, tensor, dist.irecv)
         return combine_works(works, f"PP peer {group_src} {ctx} multi_irecv {peer=}")
 
@@ -421,8 +425,6 @@ def run_test(run_local: bool, debug_numerics: Optional[bool]):
     if run_local:
         global _pp_groups
         _pp_groups = enumerate_pp_groups(world_mesh["pp"])
-        # for pp_group_ranks in pp_groups:
-        #     _pp_groups.append(default_pg.split_group(pp_group_ranks))
 
     def run_pp_rank(pp_rank: int):
         maybe_local_context = (
@@ -511,6 +513,7 @@ def run_test(run_local: bool, debug_numerics: Optional[bool]):
             if debug_numerics:
                 print_rank_by_rank("\n".join(numerics_logs))
 
+    # breakpoint()
     if run_local:
         with LocalRunnerMode(
             world_size,
@@ -548,6 +551,13 @@ def maybe_make_tensor_local(
 ) -> torch.Tensor:
     ltm = local_tensor_mode_if_enabled(ltm)
     if ltm is None:
+        return tensor
+
+    if isinstance(tensor, LocalTensor):
+        return tensor
+
+    if isinstance(tensor, DTensor):
+        tensor._local_tensor = maybe_make_tensor_local(tensor._local_tensor, ltm)
         return tensor
 
     local_tensor = ltm.rank_map(lambda r: tensor.clone().detach())
