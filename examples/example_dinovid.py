@@ -638,7 +638,7 @@ class DinoVideoPretraining(nn.Module):
             student_patch_logits,
             mask_weight,
         )
-        return loss, teacher_metrics | student_metrics | loss_metrics
+        return loss  # , teacher_metrics | student_metrics | loss_metrics
 
     @torch.no_grad()
     def forward_teacher(
@@ -1713,6 +1713,9 @@ def _(
 @torch.library.custom_op("autoparallel::create_mask_nonzero", mutates_args=())
 def create_mask_nonzero(mask_bool: Tensor, num_non_zero: int) -> list[Tensor]:
     mask_nonzero = mask_bool.flatten().nonzero()[:, 0]
+    assert (
+        mask_nonzero.numel() == num_non_zero
+    ), f"{mask_nonzero.numel()}, {num_non_zero}"
     mask_weight = 1 / mask_bool.flatten(2, 4).sum(-1).clamp_min(
         1.0
     )  # [B, global_crop_num]
@@ -1745,6 +1748,7 @@ mesh = torch.distributed.device_mesh.init_device_mesh(
 
 device = torch.device("cuda")
 cfg = Configuration(output_dir="")
+cfg = Configuration(output_dir="", model_size="debug")
 
 
 with torch.device("meta"):
@@ -1752,8 +1756,11 @@ with torch.device("meta"):
 # model.to(device)
 
 
-def input_fn(B=128):
-    # B = cfg.batch_size
+def input_fn(B=world_size):
+    # B = cfg.batch_size * B
+    local_batch = 2  # cfg.batch_size
+    num_gpus = B
+    B = local_batch * B
     T = cfg.num_frames
 
     # B = 2
@@ -1771,7 +1778,7 @@ def input_fn(B=128):
     timestamps_global = torch.rand(B, global_crop_num, T, device=device)
     timestamps_local = torch.rand(B, local_crop_num, T, device=device)
 
-    num_samples_masked = round(cfg.mask_sample_ratio * B * global_crop_num)
+    num_samples_masked = round(cfg.mask_sample_ratio * local_batch * global_crop_num)
     mask_bool = []
     num_non_zero = 0
     for r in np.linspace(*cfg.mask_patch_ratio, num_samples_masked).tolist():
@@ -1783,9 +1790,11 @@ def input_fn(B=128):
             box_count=32,
             mask_ratio=r,
         )
+        # print(round(r * h * w))
         num_non_zero += round(r * h * w)
         mask_bool.append(m)
     mask_bool = torch.stack(mask_bool)  # [num_samples_masked, h, w]
+    mask_bool = mask_bool.repeat(num_gpus, 1, 1)
     mask_bool = F.pad(
         mask_bool, (0, 0, 0, 0, 0, B * global_crop_num - num_samples_masked)
     )
@@ -1799,8 +1808,12 @@ def input_fn(B=128):
         mask_bool.unsqueeze(2).expand(-1, -1, T, -1, -1).clone()
     )  # [B, global_crop_num, num_frames, h, w]
     mask_bool = mask_bool.to(device)
+    # from IPython import embed; embed(); exit()
 
-    mask_nonzero, mask_weight = create_mask_nonzero(mask_bool, num_non_zero)
+    mask_nonzero, mask_weight = create_mask_nonzero(
+        mask_bool, num_non_zero * T * num_gpus
+    )
+    # print(mask_nonzero.shape)
     mask_weight /= num_samples_masked  # [num_masks] sums to 1.0
     return (
         global_crops,
@@ -1833,28 +1846,38 @@ from autoparallel.api import AutoParallel
 
 mp_policy = None
 
+# x = input_fn(B=1)
+
 with AutoParallel(
-    model, input_fn, mesh, mp_policy, compile=False, repeated_subgraphs=True
+    model,
+    input_fn,
+    mesh,
+    mp_policy,
+    compile=False,
+    repeated_subgraphs=False,  # True
 ) as autop:
     autop.add_parameter_memory_constraint(low=None, high=None)
 
     x_sharding = (Shard(0),) + (Replicate(),) * (mesh.ndim - 1)
-    out_sharding = x_sharding
+    rep_sharding = (Replicate(),) * mesh.ndim
 
-    autop.add_input_constraints([x_sharding])
-    autop.add_output_constraints([out_sharding])
+    autop.add_input_constraints([x_sharding] * 7 + [rep_sharding] * 2)
+    autop.add_output_constraints([rep_sharding])
 
     t = time.time()
     sharding_placement = autop.optimize_placement(verbose=True)
     print(f"Took {time.time() - t:.2f} s")
     parallel_mod = autop.apply_placement(sharding_placement)
+    # exit()
 
 # run weight init on our sharded DTensor params
 parallel_mod.to_empty(device="cuda")
 parallel_mod.init_weights()
 
 # now let's run it
-x = input_fn(B=2)
+x = input_fn(B=1)
+# from IPython import embed; embed(); exit()
 out = parallel_mod(*x)
-out[0].backward()
+# out[0].backward()
+out.backward()
 print("All good!")

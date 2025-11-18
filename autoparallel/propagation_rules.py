@@ -270,38 +270,40 @@ def alias_rule(mesh, specs):
     return OpStrategy(strats)
 
 
-@register_rule(torch.ops.aten.unbind.int)
-def unbind_rule(mesh, specs):
-    op_spec = specs[0]
-    dim = specs[1]
-    strats = []
+# @register_rule(torch.ops.aten.unbind.int)
+# def unbind_rule(mesh, specs):
+#     op_spec = specs[0]
+#     dim = 0
+#     if len(specs) > 1:
+#         dim = specs[1]
+#     strats = []
 
-    banned_idxs = set()
-    for i, ss in enumerate(op_spec.strategies):
-        for placement in ss.output_spec.placements:
-            if placement.is_shard(dim) or placement.is_partial():
-                banned_idxs.add(i)
-    for strat in op_spec.strategies:
-        input_specs = strat.output_spec
-        tensor_meta = input_specs.tensor_meta
-        inp_t = _build_meta_tensor(tensor_meta)
-        out_ts = inp_t.unbind(dim)
-        placements = input_specs.placements
-        if any(p.is_shard(dim) or p.is_partial() for p in placements):
-            continue
-        output_specs = tuple(
-            DTensorSpec(mesh, placements, tensor_meta=_gen_tensor_meta(out_t))
-            for out_t in out_ts
-        )
+#     banned_idxs = set()
+#     for i, ss in enumerate(op_spec.strategies):
+#         for placement in ss.output_spec.placements:
+#             if placement.is_shard(dim) or placement.is_partial():
+#                 banned_idxs.add(i)
+#     for strat in op_spec.strategies:
+#         input_specs = strat.output_spec
+#         tensor_meta = input_specs.tensor_meta
+#         inp_t = _build_meta_tensor(tensor_meta)
+#         out_ts = inp_t.unbind(dim)
+#         placements = input_specs.placements
+#         if any(p.is_shard(dim) or p.is_partial() for p in placements):
+#             continue
+#         output_specs = tuple(
+#             DTensorSpec(mesh, placements, tensor_meta=_gen_tensor_meta(out_t))
+#             for out_t in out_ts
+#         )
 
-        redistribute_costs = generate_redistribute_costs(op_spec, output_specs[0])
-        for banned in banned_idxs:
-            redistribute_costs[banned] = math.inf
+#         redistribute_costs = generate_redistribute_costs(op_spec, output_specs[0])
+#         for banned in banned_idxs:
+#             redistribute_costs[banned] = math.inf
 
-        s = OpSpec(output_specs, input_specs=(input_specs,))
-        s.redistribute_cost = [redistribute_costs]
-        strats.append(s)
-    return OpStrategy(strats)
+#         s = OpSpec(output_specs, input_specs=(input_specs,))
+#         s.redistribute_cost = [redistribute_costs]
+#         strats.append(s)
+#     return OpStrategy(strats)
 
 
 @register_rule(torch.ops.aten.split_with_sizes.default)
@@ -647,6 +649,40 @@ def convert_element_type_rule(mesh, op_schema):
     return out_strat
 
 
+@register_opschema_rule(torch.ops.aten.constant_pad_nd.default)
+def constant_pad_nd_rule(mesh, op_schema):
+    from torch.distributed.tensor._ops._tensor_ops import (
+        propagate_single_input_strategy,
+    )
+
+    out_strat = propagate_single_input_strategy(op_schema)
+    pad = op_schema.args_schema[1]
+    ndim = len(out_strat.strategies[0].output_specs.tensor_meta.shape)
+    dims_to_remove = [
+        ndim - i - 1
+        for i in range(len(pad) // 2)
+        if pad[i * 2] != 0 or pad[i * 2 + 1] != 0
+    ]
+
+    to_remove = []
+    filtered_strats = []
+    for idx, strat in enumerate(out_strat.strategies):
+        remove_this = False
+        for plc in strat.output_specs.placements:
+            if plc.is_shard() and plc.dim in dims_to_remove:
+                to_remove.append(idx)
+                remove_this = True
+                break
+        if not remove_this:
+            filtered_strats.append(strat)
+
+    for strat in filtered_strats:
+        for idx in to_remove:
+            strat.redistribute_cost[0][idx] = math.inf
+
+    return OpStrategy(filtered_strats)
+
+
 @register_opschema_rule(torch.ops.aten.split.Tensor)
 def split_rule(mesh, op_schema):
     strat = op_schema.args_schema
@@ -677,45 +713,45 @@ def _unsafe_index_rule(mesh, op_schema):
     raise NotImplementedError()
 
 
-@register_opschema_rule(torch.ops.aten.index.Tensor)
-def index_rule(mesh, op_schema):
-    raise NotImplementedError("Needs hardening, only tested on a few cases")
-    strat = op_schema.args_schema
-    specs = strat  # TODO: clean this up
-    res = []
-    idxs_placements = [(Replicate(), Replicate()), (Shard(0), Replicate())]
-    if strat[1].childs[0] is None:
-        idxs_placements = idxs_placements[:1]
-    else:
-        idxs_placements = idxs_placements[1:]
-    # TODO: this is a nasty hack and won't work for most of the cases
-    for i, ss in enumerate(strat[0].strategies):
-        for plt in idxs_placements:
-            ispec = ss.input_specs[0]
-            ospec = DTensorSpec(mesh=mesh, placements=ispec.placements)
-            assert ss.output_spec == ispec
-            idxs_strats = [
-                DTensorSpec(mesh, placements=plt)
-                for x in strat[1].childs
-                if x is not None
-            ]
-            if len(idxs_strats) == 2:
-                # TODO: VERY NASTY HACK
-                idxs_strats[1] = DTensorSpec(
-                    mesh, placements=(Replicate(), Replicate())
-                )
-            kspc = [x for x in strat[1].childs if x is not None]
-            s = OpSpec(output_specs=ospec, input_specs=[ispec] + idxs_strats)
+# @register_opschema_rule(torch.ops.aten.index.Tensor)
+# def index_rule(mesh, op_schema):
+#     raise NotImplementedError("Needs hardening, only tested on a few cases")
+#     strat = op_schema.args_schema
+#     specs = strat  # TODO: clean this up
+#     res = []
+#     idxs_placements = [(Replicate(), Replicate()), (Shard(0), Replicate())]
+#     if strat[1].childs[0] is None:
+#         idxs_placements = idxs_placements[:1]
+#     else:
+#         idxs_placements = idxs_placements[1:]
+#     # TODO: this is a nasty hack and won't work for most of the cases
+#     for i, ss in enumerate(strat[0].strategies):
+#         for plt in idxs_placements:
+#             ispec = ss.input_specs[0]
+#             ospec = DTensorSpec(mesh=mesh, placements=ispec.placements)
+#             assert ss.output_spec == ispec
+#             idxs_strats = [
+#                 DTensorSpec(mesh, placements=plt)
+#                 for x in strat[1].childs
+#                 if x is not None
+#             ]
+#             if len(idxs_strats) == 2:
+#                 # TODO: VERY NASTY HACK
+#                 idxs_strats[1] = DTensorSpec(
+#                     mesh, placements=(Replicate(), Replicate())
+#                 )
+#             kspc = [x for x in strat[1].childs if x is not None]
+#             s = OpSpec(output_specs=ospec, input_specs=[ispec] + idxs_strats)
 
-            redistribute_costs = [generate_redistribute_costs(specs[0], ospec),] + [
-                generate_redistribute_costs(kk, idxs_strat)
-                for kk, idxs_strat in zip(kspc, idxs_strats)
-            ]
-            s.redistribute_cost = redistribute_costs
+#             redistribute_costs = [generate_redistribute_costs(specs[0], ospec),] + [
+#                 generate_redistribute_costs(kk, idxs_strat)
+#                 for kk, idxs_strat in zip(kspc, idxs_strats)
+#             ]
+#             s.redistribute_cost = redistribute_costs
 
-            res.append(s)
-    out_strat = OpStrategy(res)
-    return out_strat
+#             res.append(s)
+#     out_strat = OpStrategy(res)
+#     return out_strat
 
 
 def sdpa_rule(op, mesh, op_schema):
@@ -786,23 +822,23 @@ def expand_rule(mesh, op_schema_):
     input_strat = op_schema.args_schema[0]
     orig_shape = input_strat.strategies[0].output_specs.tensor_meta.shape
     dest_shape = op_schema.args_schema[1]
-    expand_dim = [
+    expand_dims = [
         i
         for i, (s1, s2) in enumerate(zip(orig_shape, dest_shape))
         if s1 == 1 and s2 != s1
     ]
-    if len(expand_dim) != 1:
-        assert len(expand_dim) == 0
+    if len(expand_dims) == 0:
         return get_op_strategy(op, op_schema)
-    assert len(expand_dim) == 1, f"{expand_dim}"
-    expand_dim = expand_dim[0]
+    # assert len(expand_dim) == 1, f"{expand_dim}"
+    # expand_dim = expand_dims[0]
     to_remove = []
-    for i, ss in enumerate(input_strat.strategies):
-        for plc in ss.output_spec.placements:
-            if plc.is_shard(expand_dim):
-                # need to remove this and add back afterwards
-                to_remove.append(i)
-                break
+    for expand_dim in expand_dims:
+        for i, ss in enumerate(input_strat.strategies):
+            for plc in ss.output_spec.placements:
+                if plc.is_shard(expand_dim) and i not in to_remove:
+                    # need to remove this and add back afterwards
+                    to_remove.append(i)
+                    break
 
     removed = []
     for i in reversed(to_remove):

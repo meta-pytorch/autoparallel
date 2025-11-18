@@ -52,7 +52,7 @@ def update_joint_with_descriptors(
     """
     # TODO: should we upstream a util like this?
     placeholders = [n for n in updated_gm.graph.nodes if n.op == "placeholder"]
-    new_local_args = [n.meta["val"] for n in placeholders]
+    new_local_args = [n.meta.get("val", None) for n in placeholders]
     joint_with_descriptors.graph_module = updated_gm
     joint_with_descriptors._aot_graph_capture.graph_module = updated_gm
 
@@ -60,8 +60,10 @@ def update_joint_with_descriptors(
     for orig, new in zip(joint_with_descriptors._aot_state.flat_args, new_local_args):
         if isinstance(orig, torch.nn.Parameter):
             new_flat_args.append(torch.nn.Parameter(new))
-        else:
+        elif new is not None:
             new_flat_args.append(new)
+        else:
+            new_flat_args.append(orig)
 
     tangent_idx = len(joint_with_descriptors._aot_state.flat_args)
     new_local_tangents = new_local_args[tangent_idx:]
