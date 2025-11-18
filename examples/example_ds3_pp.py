@@ -19,6 +19,7 @@ from torch.distributed.pipelining.schedules import (
     BACKWARD_WEIGHT,
     FORWARD,
     FULL_BACKWARD,
+    OVERLAP_F_B,
     REDUCE_GRAD,
     RESHARD,
     UNSHARD,
@@ -47,6 +48,8 @@ from autoparallel.graph_pp_runner import (
     GraphMeta,
     GraphPipelineStage,
     GraphPPRunner,
+    get_multiplexed_graph_callables,
+    overlap_fw_bw,
     stage_backward_input,
     stage_backward_weight,
     stage_forward,
@@ -553,6 +556,11 @@ def run_test(
     schedule.register_custom_function(UNSHARD, stage_unshard)
     schedule.register_custom_function(BACKWARD_INPUT, stage_backward_input)
     schedule.register_custom_function(BACKWARD_WEIGHT, stage_backward_weight)
+    if schedule_name == "DualPipeV":
+        multiplexed_graph_callables = get_multiplexed_graph_callables(stage_graphs)
+        schedule.register_custom_function(
+            OVERLAP_F_B, functools.partial(overlap_fw_bw, multiplexed_graph_callables)
+        )
 
     # Step 7. Register the schedule with the graph runner
 
@@ -631,8 +639,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--schedule-name",
         type=str,
-        default="ZBVZeroBubble",
-        choices=["Interleaved1F1B", "ZBVZeroBubble"],
+        default="DualPipeV",
+        choices=["Interleaved1F1B", "ZBVZeroBubble", "DualPipeV"],
         help="Schedule to use for PP",
     )
     args = parser.parse_args()

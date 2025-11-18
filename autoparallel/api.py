@@ -667,10 +667,14 @@ class AutoParallelPP(AutoParallel):
         assert num_params_buffers == (
             num_params + num_buffers
         ), f"num_params_buffers: {num_params_buffers}, num_params: {num_params}, num_buffers: {num_buffers}"
+        num_input_grads = (
+            len(bw_module.graph.find_nodes(op="output")[0].args[0]) - num_params_buffers
+        )
         print(
             f"num_params_buffers: {num_params_buffers}\n"
             f"num_user_outputs: {num_user_outputs}\n"
             f"num_mutate_inputs: {num_mutate_inputs}\n"
+            f"num_input_grads: {num_input_grads}\n"
             f"num_fw_outs_saved_for_bw: {num_fw_outs_saved_for_bw}\n"
             f"num_symints_saved_for_bw: {num_symints_saved_for_bw}"
         )
@@ -753,7 +757,6 @@ class AutoParallelPP(AutoParallel):
 
         bw_dI_module: Optional[torch.fx.GraphModule] = None
         bw_dW_module: Optional[torch.fx.GraphModule] = None
-        num_input_grads = 0
         if "split_dI_dW" in graph_passes:
             from autoparallel._passes.split_di_dw_graph import split_di_dw_graph
 
