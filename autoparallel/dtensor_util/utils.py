@@ -24,6 +24,11 @@ from torch.distributed.tensor._ops.utils import (
 )
 from torch.distributed.tensor.placement_types import Placement, Replicate, Shard
 
+from torch.distributed.tensor.debug import (
+    _clear_fast_path_sharding_prop_cache,
+    _clear_python_sharding_prop_cache,
+)
+
 try:
     from torch.utils._cxx_pytree import tree_leaves
 except ImportError:
@@ -82,7 +87,8 @@ def op_strategy_context(op_overload, strategy_func, schema_info=None):
                 del propagator.op_to_schema_info[op_overload]
         else:
             propagator.op_to_schema_info[op_overload] = _origin_op_strategy_schema
-        propagator.propagate_op_sharding.cache.cache_clear()
+        _clear_fast_path_sharding_prop_cache()
+        _clear_python_sharding_prop_cache()
 
 
 # -------------define universal op strategy-------------
