@@ -41,7 +41,7 @@ VIT_SIZES: dict[str, VitSize] = {
 def sinkhorn_knopp(
     x: Tensor, temperature: float = 0.1, n_iterations: int = 3
 ) -> Tensor:
-    # x: [B, K]
+    # x: [(B0, B1, ...,) B, K]
 
     # Like the numerator of a softmax, subtract vmax for stability
     x = x.float() / temperature
@@ -50,13 +50,15 @@ def sinkhorn_knopp(
     x = x - vmax
     x = x.exp()
 
+    dims1 = tuple(i for i in range(x.ndim - 1))
+    dims2 = x.ndim - 1
     for _ in range(n_iterations):
         # Each column sums to 1
-        sum_B = x.sum(dim=0, keepdim=True)
+        sum_B = x.sum(dim=dims1, keepdim=True)
         # torch.distributed.all_reduce(sum_B)
         x /= sum_B
         # Each row sums to 1, like a probability distribution
-        x /= x.sum(axis=1, keepdims=True)
+        x /= x.sum(axis=dims2, keepdims=True)
 
     return x
 
@@ -75,6 +77,18 @@ def koleo_batched(x: Tensor) -> Tensor:
     dist = F.pairwise_distance(x, pair, p=2.0)  # [B, N]
     loss = -torch.log(dist + 1e-8).mean()
     return loss
+
+
+def cross_entropy(inputs, targets):
+    """
+    dispatches to cross-entropy, but
+    considers 3d tensors as [B, S, K]
+    instead of [B, K, S]
+    """
+    if inputs.ndim == 3:
+        inputs = inputs.transpose(1, 2)
+        targets = targets.transpose(1, 2)
+    return F.cross_entropy(inputs, targets, reduction="none")
 
 
 @dataclasses.dataclass
@@ -684,8 +698,10 @@ class DinoVideoPretraining(nn.Module):
 
         # IBOT head on patches that are masked for the student
         patch_logits = self.teacher.ibot_head(
-            patch_feats.flatten(0, 4)[mask_nonzero]
-        ).float()  # [num_masks, K]
+            patch_feats.flatten(0, 4)
+            .unflatten(0, (mask_nonzero.shape[0], -1))
+            .gather(1, mask_nonzero[..., None].expand(-1, -1, patch_feats.shape[-1]))
+        ).float()  # [num_gpu, num_masks, K]
         patch_probs = sinkhorn_knopp(patch_logits, temperature)  # [num_masks, K]
         if with_metrics:
             metrics["teacher_patch_avg_entropy"] = (
@@ -751,7 +767,13 @@ class DinoVideoPretraining(nn.Module):
         cls_logits = cls_logits.unflatten(0, (B, crop_num))  # [B, crop_num, K]
 
         # IBOT head on masked patches
-        x = patch_feats_global.flatten(0, 4)[mask_nonzero]  # [num_masks, D]
+        x = (
+            patch_feats_global.flatten(0, 4)
+            .unflatten(0, (mask_nonzero.shape[0], -1))
+            .gather(
+                1, mask_nonzero[..., None].expand(-1, -1, patch_feats_global.shape[-1])
+            )
+        )  # [ngpu, num_masks, D]
         patch_logits_global = self.student.ibot_head(x).float()  # [num_masks, K]
         if with_metrics:
             patch_probs = (patch_logits_global.detach() / self.ibot_temp).softmax(-1)
@@ -789,8 +811,8 @@ class DinoVideoPretraining(nn.Module):
         loss_dict["dino_loss_local"] = dino_loss_local.detach()
         loss += self.cfg.dino_loss_weight * dino_loss
 
-        ibot_loss = F.cross_entropy(
-            student_patch_logits / self.ibot_temp, teacher_patch_probs, reduction="none"
+        ibot_loss = cross_entropy(
+            student_patch_logits / self.ibot_temp, teacher_patch_probs
         )
         ibot_loss = torch.sum(ibot_loss * mask_weight)  # [num_masks]
         loss_dict["ibot_loss"] = ibot_loss.detach()
@@ -1711,23 +1733,33 @@ def _(
 
 
 @torch.library.custom_op("autoparallel::create_mask_nonzero", mutates_args=())
-def create_mask_nonzero(mask_bool: Tensor, num_non_zero: int) -> list[Tensor]:
-    mask_nonzero = mask_bool.flatten().nonzero()[:, 0]
+def create_mask_nonzero(
+    mask_bool: Tensor, num_non_zero: int, num_gpus: int
+) -> list[Tensor]:
+    mask_nonzero = (
+        mask_bool.flatten()
+        .unflatten(0, (num_gpus, -1))
+        .nonzero()[:, -1]
+        .unflatten(0, (num_gpus, -1))
+    )
     assert (
-        mask_nonzero.numel() == num_non_zero
-    ), f"{mask_nonzero.numel()}, {num_non_zero}"
+        mask_nonzero.numel() == num_non_zero * num_gpus
+    ), f"{mask_nonzero.numel()}, {num_non_zero}, {num_gpus}"
     mask_weight = 1 / mask_bool.flatten(2, 4).sum(-1).clamp_min(
         1.0
     )  # [B, global_crop_num]
     mask_weight = mask_weight[:, :, None, None, None].expand_as(mask_bool)[
         mask_bool
     ]  # [num_masks]
+    mask_weight = mask_weight.unflatten(0, (num_gpus, -1))
     return mask_nonzero, mask_weight
 
 
 @create_mask_nonzero.register_fake
-def _(mask_bool: Tensor, num_non_zero: int) -> list[Tensor]:
-    mask_nonzero = torch.empty(num_non_zero, dtype=torch.int64, device=mask_bool.device)
+def _(mask_bool: Tensor, num_non_zero: int, num_gpus: int) -> list[Tensor]:
+    mask_nonzero = torch.empty(
+        num_gpus, num_non_zero, dtype=torch.int64, device=mask_bool.device
+    )
     mask_weight = torch.empty_like(mask_nonzero, dtype=torch.float32)
     return mask_nonzero, mask_weight
 
@@ -1811,7 +1843,7 @@ def input_fn(B=world_size):
     # from IPython import embed; embed(); exit()
 
     mask_nonzero, mask_weight = create_mask_nonzero(
-        mask_bool, num_non_zero * T * num_gpus
+        mask_bool, num_non_zero * T, num_gpus
     )
     # print(mask_nonzero.shape)
     mask_weight /= num_samples_masked  # [num_masks] sums to 1.0
@@ -1846,7 +1878,15 @@ from autoparallel.api import AutoParallel
 
 mp_policy = None
 
-# x = input_fn(B=1)
+if False:
+    # the UX of debugging shape errors during tracing is
+    # not great, we need to improve it
+    model = DinoVideoPretraining(cfg)
+    model.to(device)
+    x = input_fn(B=1)
+    x = tuple(i.to(device) if isinstance(i, torch.Tensor) else i for i in x)
+    o = model(*x)
+    exit()
 
 with AutoParallel(
     model,
