@@ -44,7 +44,7 @@ from .init_weights import hook_params_setters
 from .optimize_sharding import ShardingOptimizer
 from .utils import _get_device_from_mesh
 
-_APPLY_VIEW_MM_VIEW_PATTERN = False
+_APPLY_VIEW_MM_VIEW_PATTERN = True
 
 
 def _get_decomp_table():
