@@ -270,40 +270,6 @@ def alias_rule(mesh, specs):
     return OpStrategy(strats)
 
 
-@register_rule(torch.ops.aten.unbind.int)
-def unbind_rule(mesh, specs):
-    op_spec = specs[0]
-    dim = specs[1]
-    strats = []
-
-    banned_idxs = set()
-    for i, ss in enumerate(op_spec.strategies):
-        for placement in ss.output_spec.placements:
-            if placement.is_shard(dim) or placement.is_partial():
-                banned_idxs.add(i)
-    for strat in op_spec.strategies:
-        input_specs = strat.output_spec
-        tensor_meta = input_specs.tensor_meta
-        inp_t = _build_meta_tensor(tensor_meta)
-        out_ts = inp_t.unbind(dim)
-        placements = input_specs.placements
-        if any(p.is_shard(dim) or p.is_partial() for p in placements):
-            continue
-        output_specs = tuple(
-            DTensorSpec(mesh, placements, tensor_meta=_gen_tensor_meta(out_t))
-            for out_t in out_ts
-        )
-
-        redistribute_costs = generate_redistribute_costs(op_spec, output_specs[0])
-        for banned in banned_idxs:
-            redistribute_costs[banned] = math.inf
-
-        s = OpSpec(output_specs, input_specs=(input_specs,))
-        s.redistribute_cost = [redistribute_costs]
-        strats.append(s)
-    return OpStrategy(strats)
-
-
 @register_rule(torch.ops.aten.split_with_sizes.default)
 def split_with_sizes_rule(mesh, specs):
     op_spec = specs[0]
@@ -710,47 +676,6 @@ def _unsafe_index_rule(mesh, op_schema):
     raise NotImplementedError()
 
 
-@register_opschema_rule(torch.ops.aten.index.Tensor)
-def index_rule(mesh, op_schema):
-    raise NotImplementedError("Needs hardening, only tested on a few cases")
-    strat = op_schema.args_schema
-    specs = strat  # TODO: clean this up
-    res = []
-    idxs_placements = [(Replicate(), Replicate()), (Shard(0), Replicate())]
-    if strat[1].childs[0] is None:
-        idxs_placements = idxs_placements[:1]
-    else:
-        idxs_placements = idxs_placements[1:]
-    # TODO: this is a nasty hack and won't work for most of the cases
-    for i, ss in enumerate(strat[0].strategies):
-        for plt in idxs_placements:
-            ispec = ss.input_specs[0]
-            ospec = DTensorSpec(mesh=mesh, placements=ispec.placements)
-            assert ss.output_spec == ispec
-            idxs_strats = [
-                DTensorSpec(mesh, placements=plt)
-                for x in strat[1].childs
-                if x is not None
-            ]
-            if len(idxs_strats) == 2:
-                # TODO: VERY NASTY HACK
-                idxs_strats[1] = DTensorSpec(
-                    mesh, placements=(Replicate(), Replicate())
-                )
-            kspc = [x for x in strat[1].childs if x is not None]
-            s = OpSpec(output_specs=ospec, input_specs=[ispec] + idxs_strats)
-
-            redistribute_costs = [generate_redistribute_costs(specs[0], ospec),] + [
-                generate_redistribute_costs(kk, idxs_strat)
-                for kk, idxs_strat in zip(kspc, idxs_strats)
-            ]
-            s.redistribute_cost = redistribute_costs
-
-            res.append(s)
-    out_strat = OpStrategy(res)
-    return out_strat
-
-
 def sdpa_rule(op, mesh, op_schema):
     out_strat = get_op_strategy(op, op_schema)
     # remove wrong context-parallel strategy
@@ -826,8 +751,6 @@ def expand_rule(mesh, op_schema_):
     ]
     if len(expand_dims) == 0:
         return get_op_strategy(op, op_schema)
-    # assert len(expand_dim) == 1, f"{expand_dim}"
-    # expand_dim = expand_dims[0]
     to_remove = []
     for expand_dim in expand_dims:
         for i, ss in enumerate(input_strat.strategies):
