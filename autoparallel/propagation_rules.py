@@ -646,31 +646,6 @@ def convert_element_type_rule(mesh, op_schema):
     return out_strat
 
 
-@register_opschema_rule(torch.ops.aten.split.Tensor)
-def split_rule(mesh, op_schema):
-    strat = op_schema.args_schema
-    op = torch.ops.aten.split.Tensor
-    from torch.distributed.tensor._ops._tensor_ops import split_rule
-
-    res = []
-    oo = []
-    for i, ss in enumerate(strat[0].strategies):
-        ispec = ss.input_specs[0]
-        assert ss.output_spec == ispec
-        o = split_rule(OpSchema(op, (ispec, strat[1], strat[2]), {}))
-        # res.append(o)
-        oo.append(o)
-        if o.output_spec is not None:
-            s = OpSpec(o.output_spec, input_specs=(ispec,))
-            s.redistribute_cost = [[math.inf] * len(ss.redistribute_cost[0])]
-            # s.redistribute_cost = [[0.0] * len(ss.redistribute_cost[0])]
-            s.redistribute_cost[0][i] = 0.0
-            res.append(s)
-
-    out_strat = OpStrategy(res)
-    return out_strat
-
-
 @register_opschema_rule(torch.ops.aten._unsafe_index.Tensor)
 def _unsafe_index_rule(mesh, op_schema):
     raise NotImplementedError()

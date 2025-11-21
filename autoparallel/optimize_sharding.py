@@ -157,6 +157,18 @@ class ShardingOptimizer:
         strats = {}
         for node in self.graph.nodes:
             if node.op == "placeholder":
+                if node.meta.get("val", None) is None:
+                    # For non-tensor inputs, they are considered as being
+                    # replicated across all ranks. Given that those inputs
+                    # seems to have been baked into the graph, we don't
+                    # actually will use this OpStrategy
+                    strats[node] = _create_all_options(self.mesh, ())
+                    # for now, seems like non-tensor inputs are baked in the graph
+                    # so let's assert that this is indeed the case
+                    assert (
+                        len(node.users) == 0
+                    ), f"{node} nas {len(node.users)}, expected 0"
+                    continue
                 strats[node] = _create_all_options(
                     self.mesh, node.meta["val"].shape, tensor=node.meta["val"]
                 )
@@ -828,15 +840,24 @@ class ShardingOptimizer:
         if input_placements is not None:
             mut_ips = {i: p for i, p in enumerate(input_placements)}
 
-        for desc, (node, grad_node) in get_plain_input_and_grad_nodes(
-            self.graph
-        ).items():
+        inputs_and_grads = get_plain_input_and_grad_nodes(self.graph)
+        if mut_ips is not None and len(mut_ips) != len(inputs_and_grads):
+            raise ValueError(
+                f"Expected to have {len(inputs_and_grads)} "
+                f"input placements, got {len(mut_ips)}"
+            )
+
+        for desc, (node, grad_node) in inputs_and_grads.items():
             if input_placements is None:
                 placement = None
             else:
                 assert isinstance(desc, PlainAOTInput)
                 assert mut_ips is not None
                 placement = mut_ips.pop(desc.idx)
+
+            if placement is None and "val" not in node.meta:
+                # this is a non-tensor input, we don't do anything about it
+                continue
 
             self.add_node_constraint(
                 node, placement, constraint_name="input_constraint"

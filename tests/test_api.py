@@ -117,6 +117,55 @@ def test_init(device_mesh_1d):
     )
 
 
+def test_non_tensor_input(device_mesh_1d):
+    dim = 128
+
+    class Model(nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            self.dim = dim
+            self.linear = nn.Linear(dim, dim)
+
+        def forward(self, x, input_dim: int):
+            return self.linear(x).chunk(2, dim=input_dim)
+
+        def init_weights(self):
+            dim = self.dim
+            self.linear.weight = torch.nn.Parameter(torch.ones(dim, dim) * 9.0)
+            with torch.no_grad():
+                self.linear.bias.fill_(98.6)
+
+    def input_fn():
+        b = 512
+        inputs = torch.rand(b, dim, device="cuda")
+        input_dim = 1
+        return (inputs, input_dim)
+
+    with torch.device("meta"):
+        model = Model(dim)
+    with AutoParallel(
+        model,
+        input_fn,
+        device_mesh_1d,
+    ) as autop:
+        x_sharding = (Shard(0),)
+        autop.add_input_constraints([x_sharding, None])
+        sharding_placement = autop.optimize_placement()
+
+        # AutoParallel produces a module with meta-DTensor parameters that need to be initialized
+        parallel_mod = autop.apply_placement(sharding_placement)
+    parallel_mod.to_empty(device="cuda")
+    parallel_mod.init_weights()
+    assert torch.equal(
+        parallel_mod.get_parameter("linear.weight").full_tensor(),
+        torch.full((dim, dim), 9.0, device="cuda"),
+    )
+    assert torch.equal(
+        parallel_mod.get_parameter("linear.bias").full_tensor(),
+        torch.full((dim,), 98.6, device="cuda"),
+    )
+
+
 def test_fx_graph_annotate(device_mesh_1d):
     dim = 128
 
