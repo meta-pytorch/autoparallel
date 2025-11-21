@@ -70,7 +70,9 @@ def get_multiplexed_graph_callables(
         for fw_stage_idx, fw_stage_graph_callables in stage_graphs.items():
             if bw_stage_idx != fw_stage_idx:
                 fw_bw_module = multiplex_fw_bw_graph(
-                    fw_stage_graph_callables.fw, bw_stage_graph_callables.full_bw
+                    fw_stage_graph_callables.fw,
+                    bw_stage_graph_callables.full_bw,
+                    overlap_with_annotations=True,
                 )
                 multiplexed_graph_callables[(fw_stage_idx, bw_stage_idx)] = fw_bw_module
     return multiplexed_graph_callables
