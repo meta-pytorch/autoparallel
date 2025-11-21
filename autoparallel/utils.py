@@ -33,21 +33,30 @@ from .propagation_rules import (
 )
 
 
-def propagate_tensor_meta(op, user_args, user_kwargs, out_strat):
+def _get_meta_tensors_for_op(op, user_args, user_kwargs):
     out_t = op(*user_args, **user_kwargs)
 
     if isinstance(out_t, torch.Tensor):
-        new_tensor_meta = TensorMeta(out_t.shape, out_t.stride(), out_t.dtype)
+        out_tensor_meta = TensorMeta(out_t.shape, out_t.stride(), out_t.dtype)
     else:
-        new_tensor_meta = tree_map_only(
+        out_tensor_meta = tree_map_only(
             torch.Tensor, lambda x: TensorMeta(x.shape, x.stride(), x.dtype), out_t
         )
 
-    tensor_metas = tree_flatten(user_args)[0]
-    tensor_metas = tree_map_only(
-        torch.Tensor, lambda x: TensorMeta(x.shape, x.stride(), x.dtype), tensor_metas
+    input_tensor_metas = tree_flatten(user_args)[0]
+    input_tensor_metas = tree_map_only(
+        torch.Tensor,
+        lambda x: TensorMeta(x.shape, x.stride(), x.dtype),
+        input_tensor_metas,
     )
-    tensor_metas = tuple(x for x in tensor_metas if isinstance(x, TensorMeta))
+    input_tensor_metas = tuple(
+        x for x in input_tensor_metas if isinstance(x, TensorMeta)
+    )
+    return out_tensor_meta, input_tensor_metas
+
+
+def propagate_tensor_meta(op, user_args, user_kwargs, out_strat):
+    new_tensor_meta, tensor_metas = _get_meta_tensors_for_op(op, user_args, user_kwargs)
 
     for strat in out_strat.strategies:
         if isinstance(new_tensor_meta, TensorMeta):
@@ -120,6 +129,7 @@ def fill_missing_redistribute_cost(op, specs, out_strat):
                 torch.ops.aten.empty_like.default,
                 torch.ops.prims.convert_element_type.default,
                 torch.ops.aten.slice.Tensor,
+                torch.ops.aten.select.int,
             }
             assert op in handled_ops, f"got {op}, supported ops here are {handled_ops}"
             # assert len(specs) == 1, f"Expected len(specs) == 1, got {len(specs)}"
