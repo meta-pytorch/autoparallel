@@ -3,10 +3,10 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
-import functools
 import logging
 import os
 from contextlib import nullcontext
+from functools import partial
 from typing import Callable, Optional
 
 import torch
@@ -384,6 +384,7 @@ def run_test(
     for stages in pp_rank_to_stage_indices.values():
         assert len(stages) * pp_degree == len(virtual_pp_stages)
     stage_indices_current_pp_rank = pp_rank_to_stage_indices[pp_rank]
+    should_log_weights = should_log_fw_outs = False
     if rng_seed:
         # Compute the ranks to log from
         # 1. for fw_outs, log from coord [pp_rank_containing_last_stage, 0, 0]
@@ -591,9 +592,14 @@ def run_test(
     schedule.register_custom_function(BACKWARD_INPUT, stage_backward_input)
     schedule.register_custom_function(BACKWARD_WEIGHT, stage_backward_weight)
     if schedule_name == "DualPipeV":
-        multiplexed_graph_callables = get_multiplexed_graph_callables(stage_graphs)
+        from autoparallel._passes.graph_multiplex import multiplex_fw_bw_graph
+
+        multiplexed_graph_callables = get_multiplexed_graph_callables(
+            stage_graphs,
+            partial(multiplex_fw_bw_graph, overlap_with_annotations=True),
+        )
         schedule.register_custom_function(
-            OVERLAP_F_B, functools.partial(overlap_fw_bw, multiplexed_graph_callables)
+            OVERLAP_F_B, partial(overlap_fw_bw, multiplexed_graph_callables)
         )
 
     # Step 7. Register the schedule with the graph runner
@@ -618,7 +624,7 @@ def run_test(
             )
             if pp_rank == 0:
                 x = runtime_input_fn_first_stage()
-                if rng_seed:
+                if numerics_logger is not None:
                     numerics_logger.log_diff(
                         x.to(torch.float32), prefix="full batch input"
                     )
@@ -635,10 +641,10 @@ def run_test(
                 },
                 payload_fn=lambda: f"losses: {losses}",
             )
-
-        numerics_logger.log_pp_grads(
-            model, stage_mods, num_world_stages, should_log=should_log_weights
-        )
+        if numerics_logger is not None:
+            numerics_logger.log_pp_grads(
+                model, stage_mods, num_world_stages, should_log=should_log_weights
+            )
 
     print("All good!")
 
