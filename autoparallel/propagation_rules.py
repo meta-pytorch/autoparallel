@@ -646,6 +646,40 @@ def convert_element_type_rule(mesh, op_schema):
     return out_strat
 
 
+@register_opschema_rule(torch.ops.aten.constant_pad_nd.default)
+def constant_pad_nd_rule(mesh, op_schema):
+    from torch.distributed.tensor._ops._tensor_ops import (
+        propagate_single_input_strategy,
+    )
+
+    out_strat = propagate_single_input_strategy(op_schema)
+    pad = op_schema.args_schema[1]
+    ndim = len(out_strat.strategies[0].output_specs.tensor_meta.shape)
+    dims_to_remove = [
+        ndim - i - 1
+        for i in range(len(pad) // 2)
+        if pad[i * 2] != 0 or pad[i * 2 + 1] != 0
+    ]
+
+    to_remove = []
+    filtered_strats = []
+    for idx, strat in enumerate(out_strat.strategies):
+        remove_this = False
+        for plc in strat.output_specs.placements:
+            if plc.is_shard() and plc.dim in dims_to_remove:
+                to_remove.append(idx)
+                remove_this = True
+                break
+        if not remove_this:
+            filtered_strats.append(strat)
+
+    for strat in filtered_strats:
+        for idx in to_remove:
+            strat.redistribute_cost[0][idx] = math.inf
+
+    return OpStrategy(filtered_strats)
+
+
 @register_opschema_rule(torch.ops.aten.split.Tensor)
 def split_rule(mesh, op_schema):
     strat = op_schema.args_schema
@@ -785,23 +819,23 @@ def expand_rule(mesh, op_schema_):
     input_strat = op_schema.args_schema[0]
     orig_shape = input_strat.strategies[0].output_specs.tensor_meta.shape
     dest_shape = op_schema.args_schema[1]
-    expand_dim = [
+    expand_dims = [
         i
         for i, (s1, s2) in enumerate(zip(orig_shape, dest_shape))
         if s1 == 1 and s2 != s1
     ]
-    if len(expand_dim) != 1:
-        assert len(expand_dim) == 0
+    if len(expand_dims) == 0:
         return get_op_strategy(op, op_schema)
-    assert len(expand_dim) == 1, f"{expand_dim}"
-    expand_dim = expand_dim[0]
+    # assert len(expand_dim) == 1, f"{expand_dim}"
+    # expand_dim = expand_dims[0]
     to_remove = []
-    for i, ss in enumerate(input_strat.strategies):
-        for plc in ss.output_spec.placements:
-            if plc.is_shard(expand_dim):
-                # need to remove this and add back afterwards
-                to_remove.append(i)
-                break
+    for expand_dim in expand_dims:
+        for i, ss in enumerate(input_strat.strategies):
+            for plc in ss.output_spec.placements:
+                if plc.is_shard(expand_dim) and i not in to_remove:
+                    # need to remove this and add back afterwards
+                    to_remove.append(i)
+                    break
 
     removed = []
     for i in reversed(to_remove):
