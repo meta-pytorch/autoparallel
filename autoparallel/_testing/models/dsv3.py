@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from typing import Callable, ClassVar, Literal, Optional, Tuple, Union
 
 import torch
+import torch.fx.traceback as fx_traceback
 import torch.nn.functional as F
 import triton
 import triton.language as tl
@@ -631,61 +632,63 @@ class TokenReorderer(nn.Module):
 
 
 def _token_dispatch(routed_input, num_tokens_per_expert, axis_name):
-    # annotate module input placements/sharding with input_layouts
-    # ep_size = device_mesh.shape[0]
-    ep_size = axis_size(axis_name)
+    with fx_traceback.annotate({"comm_region": "token_dispatch"}):
+        # annotate module input placements/sharding with input_layouts
+        # ep_size = device_mesh.shape[0]
+        ep_size = axis_size(axis_name)
 
-    # generate the input splits and output splits for all-to-all
-    with torch.no_grad():
-        num_tokens_per_expert_group = all_to_all(
-            num_tokens_per_expert,
-            None,
-            None,
+        # generate the input splits and output splits for all-to-all
+        with torch.no_grad():
+            num_tokens_per_expert_group = all_to_all(
+                num_tokens_per_expert,
+                None,
+                None,
+                axis_name,
+            )
+            input_splits = (
+                num_tokens_per_expert.view(ep_size, -1)
+                .sum(dim=1)
+                .to(torch.device("cpu"), non_blocking=True)
+            )
+            # NOTE: this would incur a device-to-host sync
+            output_splits = (
+                num_tokens_per_expert_group.view(ep_size, -1)
+                .sum(dim=1)
+                .to(torch.device("cpu"), non_blocking=False)
+            )
+            input_splits = input_splits.tolist()
+            output_splits = output_splits.tolist()
+
+        # perform all-to-all
+        routed_input = all_to_all(
+            routed_input,
+            output_splits,
+            input_splits,
             axis_name,
         )
-        input_splits = (
-            num_tokens_per_expert.view(ep_size, -1)
-            .sum(dim=1)
-            .to(torch.device("cpu"), non_blocking=True)
-        )
-        # NOTE: this would incur a device-to-host sync
-        output_splits = (
-            num_tokens_per_expert_group.view(ep_size, -1)
-            .sum(dim=1)
-            .to(torch.device("cpu"), non_blocking=False)
-        )
-        input_splits = input_splits.tolist()
-        output_splits = output_splits.tolist()
 
-    # perform all-to-all
-    routed_input = all_to_all(
-        routed_input,
-        output_splits,
-        input_splits,
-        axis_name,
-    )
+        # NOTE: After this all-to-all, the routed input is put on proper EP rank.
+        # However, the num_tokens_per_expert_group is not of the final target format
+        # [#tokens for local expert 0, #tokens for local expert 1, ...]
+        # Rather, it is of the format
+        # [#tokens for local expert 0 from EP rank 0, #tokens for local expert 1 from EP rank 0, ...,
+        #  #tokens for local expert 0 from EP rank 1, #tokens for local expert 1 from EP rank 1, ...]
+        # We need to perform another shuffle to get the correct format -- this is done via the function
+        # generate_permute_indices in moe.py, which also does padding to make sure the number of tokens
+        # each expert gets locally is a multiple of ALIGN_SIZE_M.
 
-    # NOTE: After this all-to-all, the routed input is put on proper EP rank.
-    # However, the num_tokens_per_expert_group is not of the final target format
-    # [#tokens for local expert 0, #tokens for local expert 1, ...]
-    # Rather, it is of the format
-    # [#tokens for local expert 0 from EP rank 0, #tokens for local expert 1 from EP rank 0, ...,
-    #  #tokens for local expert 0 from EP rank 1, #tokens for local expert 1 from EP rank 1, ...]
-    # We need to perform another shuffle to get the correct format -- this is done via the function
-    # generate_permute_indices in moe.py, which also does padding to make sure the number of tokens
-    # each expert gets locally is a multiple of ALIGN_SIZE_M.
-
-    return routed_input, num_tokens_per_expert_group, input_splits, output_splits
+        return routed_input, num_tokens_per_expert_group, input_splits, output_splits
 
 
 def _token_combine(routed_output, input_splits, output_splits, axis_name):
-    routed_output = all_to_all(
-        routed_output,
-        input_splits,
-        output_splits,
-        axis_name,
-    )
-    return routed_output
+    with fx_traceback.annotate({"comm_region": "token_combine"}):
+        routed_output = all_to_all(
+            routed_output,
+            input_splits,
+            output_splits,
+            axis_name,
+        )
+        return routed_output
 
 
 # @torch.library.custom_op("autoparallel::local_mapped_region", mutates_args=())

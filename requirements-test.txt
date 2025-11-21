@@ -3,6 +3,7 @@ numpy
 pulp
 pytest >= 8.1
 expecttest
+psutil
 
 black == 22.3.0
 flake8 == 6.1.0
