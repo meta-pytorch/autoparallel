@@ -358,3 +358,62 @@ def test_inference_mode_compilation(device_mesh_1d):
         ]
         # Should only have 2 placeholders: weight and input (no tangents for inference)
         assert len(placeholders) == 2
+
+
+def test_moduledict_preservation(device_mesh_1d):
+    """Test that nn.ModuleDict structure is preserved during _assign_attr."""
+    dim = 128
+
+    class Model(nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            # Create a ModuleDict to test preservation
+            self.layers = nn.ModuleDict(
+                {
+                    "layer1": nn.Linear(dim, dim),
+                    "layer2": nn.Linear(dim, dim),
+                }
+            )
+
+        def forward(self, x):
+            x = self.layers["layer1"](x)
+            x = self.layers["layer2"](x)
+            return x
+
+    def input_fn():
+        b = 512
+        inputs = (torch.rand(b, dim, device="cuda"),)
+        return inputs
+
+    with torch.device("meta"):
+        model = Model(dim)
+
+    # Verify original model has ModuleDict
+    assert isinstance(model.layers, nn.ModuleDict)
+
+    with AutoParallel(
+        model,
+        input_fn,
+        device_mesh_1d,
+    ) as autop:
+        x_sharding = (Shard(0),)
+        autop.add_input_constraints([x_sharding])
+        sharding_placement = autop.optimize_placement()
+
+        # AutoParallel produces a module with meta-DTensor parameters that need to be initialized
+        parallel_mod = autop.apply_placement(sharding_placement)
+
+    # Verify that the parallel_mod preserves the ModuleDict structure
+    assert isinstance(
+        parallel_mod.layers, nn.ModuleDict
+    ), f"Expected nn.ModuleDict but got {type(parallel_mod.layers)}"
+
+    # Verify that the ModuleDict contains the expected layers
+    assert "layer1" in parallel_mod.layers
+    assert "layer2" in parallel_mod.layers
+    assert isinstance(parallel_mod.layers["layer1"], nn.Module)
+    assert isinstance(parallel_mod.layers["layer2"], nn.Module)
+
+    # Verify parameters are accessible through the ModuleDict structure
+    assert hasattr(parallel_mod.layers["layer1"], "weight")
+    assert hasattr(parallel_mod.layers["layer2"], "weight")
