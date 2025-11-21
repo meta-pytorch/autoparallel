@@ -152,17 +152,13 @@ def test_non_tensor_input(device_mesh_1d):
         autop.add_input_constraints([x_sharding, None])
         sharding_placement = autop.optimize_placement()
 
-        # AutoParallel produces a module with meta-DTensor parameters that need to be initialized
         parallel_mod = autop.apply_placement(sharding_placement)
     parallel_mod.to_empty(device="cuda")
     parallel_mod.init_weights()
-    assert torch.equal(
-        parallel_mod.get_parameter("linear.weight").full_tensor(),
-        torch.full((dim, dim), 9.0, device="cuda"),
-    )
-    assert torch.equal(
-        parallel_mod.get_parameter("linear.bias").full_tensor(),
-        torch.full((dim,), 98.6, device="cuda"),
+    placeholders = autop.gm.graph.find_nodes(op="placeholder")
+    non_tensor_input = placeholders[3]
+    assert sharding_placement[non_tensor_input].output_specs.placements == (
+        Replicate(),
     )
 
 
