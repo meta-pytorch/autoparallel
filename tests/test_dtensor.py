@@ -6,6 +6,7 @@
 import functools
 
 import numpy as np
+import pytest
 import torch
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor, Replicate, Shard, distribute_tensor
@@ -352,6 +353,7 @@ dispatcher.sharding_propagator = CustomShardingPropagator()
 
 class ImplicitRegistrationTest(DTensorTestBase):
     @with_comms
+    @pytest.mark.xfail(reason="https://github.com/meta-pytorch/autoparallel/issues/256")
     def test_implicit_registration(self):
         mesh = init_device_mesh(self.device_type, (2, self.world_size // 2))
         test_op = torch.ops.mylib.numpy_sin.default
