@@ -49,7 +49,7 @@ from .utils import (
     debug_boxed_nop_preserve_node_meta,
 )
 
-_APPLY_VIEW_MM_VIEW_PATTERN = False
+_APPLY_VIEW_MM_VIEW_PATTERN = True
 
 
 def _get_decomp_table():
