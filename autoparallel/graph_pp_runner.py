@@ -5,7 +5,7 @@
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Callable, Optional, Union, cast
+from typing import Any, Callable, Optional, Protocol, Union, cast
 
 import torch
 import torch.fx as fx
@@ -48,29 +48,77 @@ class GraphMeta:
     num_input_grads: int
 
 
+class MultiplexFwBwGraphPass(Protocol):
+    """Protocol defining the contract for forward-backward graph multiplexing passes.
+
+    Implementations must accept two GraphModules (forward and backward) and return a fused
+    GraphModule that multiplexes their execution.
+
+    Contract Requirements:
+        1. Input placeholders ordering: The returned GraphModule's placeholders must be ordered
+           as ``bw_placeholders + fw_placeholders`` (backward placeholders concatenated with
+           forward placeholders, each maintaining their original order from the input graphs).
+
+        2. Output node args ordering: The returned GraphModule's output node args must contain
+           outputs ordered as ``bw_outputs + fw_outputs`` (backward outputs concatenated with
+           forward outputs, each maintaining their original order from the input graphs).
+
+    Example::
+
+        def my_multiplex_pass(
+            fw_graph: fx.GraphModule,
+            bw_graph: fx.GraphModule
+        ) -> fx.GraphModule:
+            # Implementation that satisfies the contract
+            ...
+            return multiplexed_graph
+    """
+
+    def __call__(
+        self,
+        fw_graph: fx.GraphModule,
+        bw_graph: fx.GraphModule,
+    ) -> fx.GraphModule:
+        """Multiplex forward and backward graphs into a single fused graph.
+
+        Args:
+            fw_graph (fx.GraphModule): Forward graph module.
+            bw_graph (fx.GraphModule): Backward graph module.
+
+        Returns:
+            fx.GraphModule: Fused graph module satisfying the contract requirements.
+        """
+        ...
+
+
 def get_multiplexed_graph_callables(
-    stage_graphs: dict[int, GraphCallables]
+    stage_graphs: dict[int, GraphCallables],
+    multiplex_fw_bw_graph_pass: MultiplexFwBwGraphPass,
 ) -> dict[tuple[int, int], fx.GraphModule]:
     """Generate multiplexed graph modules that fuse forward and backward passes from different stages.
 
     Creates fused modules for all stage pairs where fw_stage_idx != bw_stage_idx. This enables
-    pipeline schedules (e.g., ZeroBubble) to overlap computation and reduce bubbles.
+    pipeline schedules (e.g., DualPipe) to overlap communication with computation.
 
     Args:
-        stage_graphs: Mapping from stage index to GraphCallables containing forward/backward modules.
+        stage_graphs (dict[int, GraphCallables]): Mapping from stage index to GraphCallables
+            containing forward/backward modules.
+        multiplex_fw_bw_graph_pass (MultiplexFwBwGraphPass): A callable that takes two
+            GraphModules (forward and backward) and returns a fused GraphModule that multiplexes
+            their execution. Must satisfy the contract defined in
+            :class:`MultiplexFwBwGraphPass`.
 
     Returns:
-        Mapping from (fw_stage_idx, bw_stage_idx) to fused GraphModule that executes
-        forward from fw_stage_idx and backward from bw_stage_idx.
+        dict[tuple[int, int], fx.GraphModule]: Mapping from (fw_stage_idx, bw_stage_idx) to fused
+            GraphModule that executes forward from fw_stage_idx and backward from bw_stage_idx.
     """
-    from autoparallel._passes.graph_multiplex import multiplex_fw_bw_graph
-
     multiplexed_graph_callables: dict[tuple[int, int], torch.fx.GraphModule] = {}
     for bw_stage_idx, bw_stage_graph_callables in stage_graphs.items():
         for fw_stage_idx, fw_stage_graph_callables in stage_graphs.items():
             if bw_stage_idx != fw_stage_idx:
-                fw_bw_module = multiplex_fw_bw_graph(
-                    fw_stage_graph_callables.fw, bw_stage_graph_callables.full_bw
+                fw_bw_module = multiplex_fw_bw_graph_pass(
+                    fw_stage_graph_callables.fw,
+                    bw_stage_graph_callables.full_bw,
                 )
                 multiplexed_graph_callables[(fw_stage_idx, bw_stage_idx)] = fw_bw_module
     return multiplexed_graph_callables
