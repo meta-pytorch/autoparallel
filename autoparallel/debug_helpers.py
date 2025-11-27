@@ -183,7 +183,7 @@ def _get_tid(node):
     return 0
 
 
-def get_repr(arg):
+def get_repr(arg, mode="full"):
     def get_dtype_repr(dtype):
         return dtype_abbrs[dtype]
 
@@ -200,20 +200,20 @@ def get_repr(arg):
         return get_dtype_repr(arg)
 
     if isinstance(arg, torch.fx.Node):
-        if "val" not in arg.meta:
-            return f"fx node {arg}"
-
-        return get_repr(arg.meta["val"])
+        if mode == "name_only" or "val" not in arg.meta:
+            return f"fx node {arg.name}"
+        elif mode == "full":
+            return {"name": arg.name, "data": get_repr(arg.meta["val"])}
+        elif mode == "content_only":
+            return get_repr(arg.meta["val"])
+        else:
+            raise ValueError(f"Unknown mode {mode}")
 
     if isinstance(arg, (list, tuple)):
-        # TODO: make better repr that don't blow up
-        # for long lists
-        return [get_repr(x) for x in arg]
+        return [get_repr(x, mode="name_only") for x in arg]
 
     if isinstance(arg, dict):
-        # TODO: make better repr that don't blow up
-        # for long lists
-        return {k: get_repr(v) for k, v in arg.items()}
+        return {k: get_repr(v, mode="name_only") for k, v in arg.items()}
 
     return f"arg {type(arg)}"
 
@@ -239,7 +239,7 @@ def create_execution_trace(
             curr_time[tid] = curr_time[0]
         event = {"ph": "X", "cat": "kernel", "name": str(node), "pid": 0, "tid": tid}
         if _is_communication_node(node):
-            if tid == 0 and is_wait_tensor(node):
+            if tid == 0 and is_wait_tensor(node) and node.args[0].op != "placeholder":
                 # if it's wait tensor, let's sync with compute stream
                 comm_end_time = global_time.pop(node.args[0])
                 curr_time[tid] = max(curr_time[tid], comm_end_time)
@@ -258,7 +258,7 @@ def create_execution_trace(
         args: dict[str, Any] = {}
         args["order"] = node_idx
 
-        args["output"] = get_repr(node)
+        args["output"] = get_repr(node, mode="content_only")
         node_args = []
         for arg in node.args:
             node_args.append(get_repr(arg))
