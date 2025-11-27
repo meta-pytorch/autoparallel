@@ -501,9 +501,19 @@ def native_layer_norm_rule(mesh, op_schema):
         if is_valid:
             output_spec = strategy.output_specs
             input_spec = strategy.input_specs[0]
-            output_spec.tensor_meta = input_spec.tensor_meta
-            assert output_spec.tensor_meta is not None
             mesh = strategy.mesh
+
+            # Create output tensor_meta with same shape as input but contiguous strides
+            # (LayerNorm forward returns contiguous tensor even if input was non-contiguous)
+            output_tensor_meta = _gen_tensor_meta(
+                input_spec.tensor_meta.shape, input_spec.tensor_meta.dtype
+            )
+            output_spec = DTensorSpec(
+                mesh=mesh,
+                placements=output_spec.placements,
+                tensor_meta=output_tensor_meta,
+            )
+
             # the output spec is the same as input spec
             shape = input_spec.tensor_meta.shape[:axis] + (1,) * len(normalized_size)
             mean_std_tgt_spec = DTensorSpec(
@@ -565,15 +575,19 @@ def native_layer_norm_backward_rule(mesh, op_schema):
                 break
         if is_valid:
             mesh = strategy.mesh
+            # Create grad_input tensor_meta with same shape as input but contiguous strides
+            # (LayerNorm backward returns contiguous gradient even if input was non-contiguous)
+            grad_input_tensor_meta = _gen_tensor_meta(
+                input_spec.tensor_meta.shape, input_spec.tensor_meta.dtype
+            )
             grad_input_spec = DTensorSpec(
                 mesh=mesh,
                 placements=strategy.output_specs.placements,
-                tensor_meta=strategy.output_specs.tensor_meta,
+                tensor_meta=grad_input_tensor_meta,
             )
+            assert grad_input_spec.tensor_meta is not None
             weight_spec = strategy.input_specs[4]
             bias_spec = strategy.input_specs[5]
-            grad_input_spec.tensor_meta = input_spec.tensor_meta
-            assert grad_input_spec.tensor_meta is not None
             weight_tgt_spec = DTensorSpec(
                 mesh=mesh,
                 placements=weight_spec.placements,
