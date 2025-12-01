@@ -6,6 +6,7 @@
 """
 Script to run DS3 numerics check by comparing outputs from local_map and pipeline parallel.
 """
+import os
 import shutil
 import subprocess
 import tempfile
@@ -32,6 +33,11 @@ def main(args):
     # Create a temporary directory
     temp_dir = tempfile.mkdtemp(prefix="ds3_numerics_check_")
     print(f"Created temporary directory: {temp_dir}")
+    repo_dir = Path(__file__).parent.parent
+    if "PYTHONPATH" in os.environ:
+        os.environ["PYTHONPATH"] = os.environ["PYTHONPATH"] + f":{repo_dir}"
+    else:
+        os.environ["PYTHONPATH"] = f"{repo_dir}"
 
     try:
         examples_dir = Path(__file__).parent
@@ -48,6 +54,12 @@ def main(args):
         cmd2 = f"torchrun --standalone --nproc-per-node 8 {examples_dir}/example_ds3_pp.py --rng-seed 42 --schedule-name={schedule_name}"
         run_command(cmd2, temp_dir)
 
+        print("\n" + "=" * 80)
+        print("Running PP example with Local Tensor...")
+        print("=" * 80)
+        cmd3 = f"torchrun --standalone --nproc-per-node 1 {examples_dir}/example_ds3_pp.py --rng-seed 42 --schedule-name={schedule_name} --run-mode=local_tensor"
+        run_command(cmd3, temp_dir)
+
         out_dir = Path(temp_dir) / "out"
         if not out_dir.exists():
             raise RuntimeError(f"Output directory {out_dir} does not exist")
@@ -56,11 +68,13 @@ def main(args):
         print("Comparing weights.log files...")
         print("=" * 80)
         run_command("diff out/0/weights.log out/1/pp_weights.log", temp_dir)
+        run_command("diff out/0/weights.log out/2/pp_weights.log", temp_dir)
 
         print("\n" + "=" * 80)
         print("Comparing diff.log files...")
         print("=" * 80)
         run_command("diff out/0/diff.log out/1/diff.log", temp_dir)
+        run_command("diff out/0/diff.log out/2/diff.log", temp_dir)
 
         print("\n" + "=" * 80)
         print("Numerics check completed successfully!")

@@ -7,48 +7,35 @@ import functools
 import logging
 import os
 from contextlib import nullcontext
+from enum import Enum
 from typing import Callable, Optional
 
 import torch
 import torch.distributed._tools.fake_collectives
 import torch.nn as nn
-from torch._logging import trace_structured
-from torch._subclasses.fake_tensor import FakeTensorMode
-from torch.distributed.pipelining.schedules import (
-    BACKWARD_INPUT,
-    BACKWARD_WEIGHT,
-    FORWARD,
-    FULL_BACKWARD,
-    OVERLAP_F_B,
-    REDUCE_GRAD,
-    RESHARD,
-    UNSHARD,
-    PipelineScheduleMulti,
-    _PipelineSchedule,
-    _PipelineScheduleRuntime,
-    get_schedule_class,
+from autoparallel._testing._local_tensor import (
+    cache_pp_groups,
+    create_local_tensor_mode,
+    LocalGraphPipelineStage,
+    maybe_make_module_local,
+    maybe_make_tensor_local,
 )
-from torch.distributed.pipelining.stage import PipelineStage
-from torch.distributed.tensor.placement_types import Replicate, Shard
-from torch.fx.experimental.symbolic_shapes import ShapeEnv
-from torch.testing._internal.distributed.fake_pg import FakeStore
-
 from autoparallel._testing.models.dsv3 import (
     DeepSeekV3Model,
     DeepSeekV3ModelArgs,
     DeepSeekV3Stage0,
     DeepSeekV3StageI,
     DeepSeekV3StageN,
-    MoEArgs,
     dsv3_loss_fn,
+    MoEArgs,
 )
 from autoparallel.api import AutoParallelPP
 from autoparallel.graph_pp_runner import (
+    get_multiplexed_graph_callables,
     GraphCallables,
     GraphMeta,
     GraphPipelineStage,
     GraphPPRunner,
-    get_multiplexed_graph_callables,
     overlap_fw_bw,
     stage_backward_input,
     stage_backward_weight,
@@ -59,6 +46,27 @@ from autoparallel.graph_pp_runner import (
     stage_unshard,
 )
 from autoparallel.utils import NumericsLogger
+from torch._logging import trace_structured
+from torch._subclasses.fake_tensor import FakeTensorMode
+from torch.distributed._local_tensor import LocalRunnerMode, LocalTensorMode
+from torch.distributed.pipelining.schedules import (
+    _PipelineSchedule,
+    _PipelineScheduleRuntime,
+    BACKWARD_INPUT,
+    BACKWARD_WEIGHT,
+    FORWARD,
+    FULL_BACKWARD,
+    get_schedule_class,
+    OVERLAP_F_B,
+    PipelineScheduleMulti,
+    REDUCE_GRAD,
+    RESHARD,
+    UNSHARD,
+)
+from torch.distributed.pipelining.stage import PipelineStage
+from torch.distributed.tensor.placement_types import Replicate, Shard
+from torch.fx.experimental.symbolic_shapes import ShapeEnv
+from torch.testing._internal.distributed.fake_pg import FakeStore
 
 # Configure logging to show DEBUG messages
 logging.basicConfig(
@@ -128,14 +136,23 @@ def build_pipeline_schedule(
     return schedule
 
 
+class RunMode(Enum):
+    MULTI_PROCESS = "multi_process"
+    LOCAL_TENSOR = "local_tensor"
+    FAKE_EVALUATE = "fake_evaluate"
+
+    def __str__(self):
+        return self.value
+
+
 def run_test(
-    fake_evaluate: bool,
+    run_mode: RunMode,
     use_loss_fn: bool,
     schedule_name: str,
     rng_seed: Optional[int],
     logs_dir: str,
 ):
-    if not fake_evaluate:
+    if run_mode is not RunMode.FAKE_EVALUATE:
         pp_degree = 2
         dp_mod_ep_degree = 2
         ep_degree = 2
@@ -148,7 +165,7 @@ def run_test(
     world_size = pp_degree * dp_mod_ep_degree * ep_degree
 
     # Initialize process group based on evaluation mode
-    if fake_evaluate:
+    if run_mode is RunMode.FAKE_EVALUATE:
         assert (
             "WORLD_SIZE" in os.environ
         ), "run with torchrun --standalone --nproc-per-node 4"
@@ -165,6 +182,16 @@ def run_test(
             world_size=world_size,
         )
         pp_rank = rank
+    elif run_mode is RunMode.LOCAL_TENSOR:
+        assert (
+            "WORLD_SIZE" in os.environ
+        ), "run with torchrun --standalone --nproc-per-node 1"
+        device = torch.device(f"cuda")
+        default_pg = torch.distributed.init_process_group(
+            "fake",
+            rank=0,
+            world_size=world_size,
+        )
     else:
         assert (
             "WORLD_SIZE" in os.environ
@@ -187,10 +214,6 @@ def run_test(
         ),
     )
 
-    # Set pp_rank based on evaluation mode
-    if not fake_evaluate:
-        pp_rank = world_mesh["pp"].get_local_rank()
-
     stages_per_rank = 2
     total_pp_stages = pp_degree * stages_per_rank
 
@@ -211,7 +234,7 @@ def run_test(
 
     seq_len = 1024
 
-    if fake_evaluate:
+    if run_mode is RunMode.FAKE_EVALUATE:
         config = DeepSeekV3ModelArgs(
             vocab_size=102400,
             max_seq_len=seq_len,
@@ -383,7 +406,7 @@ def run_test(
     assert len(pp_rank_to_stage_indices) == pp_degree
     for stages in pp_rank_to_stage_indices.values():
         assert len(stages) * pp_degree == len(virtual_pp_stages)
-    stage_indices_current_pp_rank = pp_rank_to_stage_indices[pp_rank]
+
     if rng_seed:
         # Compute the ranks to log from
         # 1. for fw_outs, log from coord [pp_rank_containing_last_stage, 0, 0]
@@ -404,21 +427,33 @@ def run_test(
 
         # 2. for weights, log from coords [:, 0, 0]
         pp_world_size = world_mesh.shape[world_mesh._get_mesh_dim_by_name("pp")]
-        log_weights_rank_coordinates = [(i, 0, 0) for i in range(pp_world_size)]
-        should_log_weights = (
-            tuple(world_mesh.get_coordinate()) in log_weights_rank_coordinates
-        )
+        # log_weights_rank_coordinates = [(i, 0, 0) for i in range(pp_world_size)]
+        # should_log_weights = (
+        #     tuple(world_mesh.get_coordinate()) in log_weights_rank_coordinates
+        # )
+        should_log_weights = True
 
     stage_mods: dict[int, torch.nn.Module] = {}
     stage_graphs: dict[int, GraphCallables] = {}
     stage_graph_metas: dict[int, GraphMeta] = {}
     # Step 3. Apply AutoParallel to each logical stage assigned to this pp rank
-    use_cache = fake_evaluate
+    use_cache = run_mode is RunMode.FAKE_EVALUATE
     root_cache = "tmp"
     os.makedirs(root_cache, exist_ok=True)
     from autoparallel.api import AutoParallelPPModule
 
-    for stage_idx in stage_indices_current_pp_rank:
+    # Set pp_rank based on evaluation mode
+    if run_mode is RunMode.LOCAL_TENSOR:
+        stage_indices = list(range(len(virtual_pp_stages)))
+    else:
+        pp_rank = world_mesh["pp"].get_local_rank()
+        stage_indices = pp_rank_to_stage_indices[pp_rank]
+
+    numerics_logger = None
+    if rng_seed is not None:
+        numerics_logger = NumericsLogger(logs_dir)
+
+    for stage_idx in stage_indices:
         trace_structured(
             "artifact",
             metadata_fn=lambda: {
@@ -428,7 +463,7 @@ def run_test(
             payload_fn=lambda: "placeholder text",
         )
         stage_mod = virtual_pp_stages[stage_idx]
-        eval_mode = "fake" if fake_evaluate else "real"
+        eval_mode = "fake" if run_mode is RunMode.FAKE_EVALUATE else "real"
         stage_file = os.path.join(root_cache, f"stage_{eval_mode}_{stage_idx}.pth")
         if os.path.exists(stage_file) and use_cache:
             cache = torch.load(stage_file, weights_only=False)
@@ -462,6 +497,7 @@ def run_test(
                     if use_loss_fn and stage_idx == total_pp_stages - 1
                     else None
                 ),
+                numerics_logger=numerics_logger,
             ) as autop:
                 autop.add_parameter_memory_constraint(low=None, high=None)
 
@@ -494,8 +530,6 @@ def run_test(
                     torch.save(cache, stage_file)
 
         pp_mod.to_empty(device=device)
-        # run weight init on our sharded DTensor params
-        pp_mod.init_weights(buffer_device=device, seed=rng_seed)
 
         # Store each stage's information in stage_mods, stage_graphs, and stage_graph_metas
         stage_mods[stage_idx] = pp_mod
@@ -526,119 +560,175 @@ def run_test(
 
     # Two stages per pp rank
     assert (
-        len(stage_indices_current_pp_rank)
+        len(stage_indices)
         == len(stage_mods)
         == len(stage_graphs)
         == len(stage_graph_metas)
     )
 
+    if run_mode is RunMode.LOCAL_TENSOR:
+        cache_pp_groups(world_mesh["pp"])
+
     world_size = torch.distributed.get_world_size()
     num_world_stages = world_size * len(stage_mods)
 
-    numerics_logger = None
-    if rng_seed is not None:
-        numerics_logger = NumericsLogger(logs_dir)
-        numerics_logger.log_pp_model_weights(
-            model, stage_mods, num_world_stages, should_log=should_log_weights
+    def run_pp_rank(pp_rank: int):
+        maybe_local_context = (
+            create_local_tensor_mode(mesh, pp_rank)
+            if run_mode is RunMode.LOCAL_TENSOR
+            else nullcontext()
         )
-        torch.manual_seed(rng_seed)
+        with maybe_local_context:
+            # Step 4. Construct pipeline stages for this pp_rank using the stage modules, graphs and metadata
+            stage_indices_current_pp_rank = pp_rank_to_stage_indices[pp_rank]
+            stages = []
+            rank_stage_mods = {}
+            for pp_stage_idx in stage_indices_current_pp_rank:
+                pp_stage_mod = stage_mods[pp_stage_idx]
 
-    stages = []
-    # Step 4. Construct pipeline stages for this pp_rank using the stage modules, graphs and metadata
-    for pp_stage_idx, pp_stage_mod in stage_mods.items():
-        stage = GraphPipelineStage(
-            pp_stage_mod,
-            stage_graphs[pp_stage_idx],
-            stage_graph_metas[pp_stage_idx],
-            stage_index=pp_stage_idx,
-            num_stages=len(virtual_pp_stages),
-            device=device,
-            input_args=(
-                shape_inference_input_fn_first_stage()
-                if pp_stage_idx == 0
-                else shape_inference_fn_intermediate_stage()
-            ),
-            output_args=(
-                shape_inference_output_fn_last_stage()
-                if pp_stage_idx == (total_pp_stages - 1)
-                else shape_inference_fn_intermediate_stage()
-            ),
-            group=world_mesh.get_group("pp"),
-            numerics_logger=numerics_logger,
-            should_log_fw_outs=should_log_fw_outs,
-        )
-        stages.append(stage)
+                # Convert module to local if running under local tensor mode
+                if run_mode is RunMode.LOCAL_TENSOR:
+                    maybe_make_module_local(pp_stage_mod)
+                    should_log_fw_outs = True
 
-    # Step 5. Construct the pipeline runner using the pipeline stages for this pp_rank
-    schedule = build_pipeline_schedule(
-        stages=stages,
-        loss_fn=None,
-        pipeline_parallel_schedule=schedule_name,
-        microbatch_size=microbatch_size,
-        local_batch_size=local_batch_size,
-        pipeline_parallel_degree=pp_degree,
-        backward_requires_autograd=False,
-        scale_grads=rng_seed is None,  # In determinism mode, don't scale grads
-    )
-    assert isinstance(schedule, _PipelineScheduleRuntime)
+                # run weight init on our sharded DTensor params
+                pp_stage_mod.init_weights(buffer_device=device, seed=rng_seed)
 
-    # Step 6. Override the pipeline runner's action implementations
-    schedule.register_custom_function(FORWARD, stage_forward)
-    schedule.register_custom_function(FULL_BACKWARD, stage_full_backward)
-    schedule.register_custom_function(REDUCE_GRAD, stage_reduce_grad)
-    schedule.register_custom_function(RESHARD, stage_reshard)
-    schedule.register_custom_function(UNSHARD, stage_unshard)
-    schedule.register_custom_function(BACKWARD_INPUT, stage_backward_input)
-    schedule.register_custom_function(BACKWARD_WEIGHT, stage_backward_weight)
-    if schedule_name == "DualPipeV":
-        multiplexed_graph_callables = get_multiplexed_graph_callables(stage_graphs)
-        schedule.register_custom_function(
-            OVERLAP_F_B, functools.partial(overlap_fw_bw, multiplexed_graph_callables)
-        )
-
-    # Step 7. Register the schedule with the graph runner
-
-    graph_pp_runner = GraphPPRunner(schedule)
-
-    # Step 8. Run the whole pipeline once using the graph runner
-    has_last_stage = (total_pp_stages - 1) in stage_mods
-    with (
-        FakeTensorMode(
-            allow_non_fake_inputs=True,
-            shape_env=ShapeEnv(),
-        )
-        if fake_evaluate
-        else nullcontext()
-    ):
-        with torch.no_grad():
-            target, losses = (
-                (runtime_target_fn(), [])
-                if has_last_stage and use_loss_fn
-                else (None, None)
-            )
-            if pp_rank == 0:
-                x = runtime_input_fn_first_stage()
-                if rng_seed:
-                    numerics_logger.log_diff(
-                        x.to(torch.float32), prefix="full batch input"
-                    )
-                graph_pp_runner.step(
-                    x, target=target, losses=losses, return_outputs=False
+                pipeline_stage_class = (
+                    LocalGraphPipelineStage
+                    if run_mode is RunMode.LOCAL_TENSOR
+                    else GraphPipelineStage
                 )
-            else:
-                graph_pp_runner.step(target=target, losses=losses, return_outputs=False)
-            trace_structured(
-                "artifact",
-                metadata_fn=lambda: {
-                    "name": "pipeline_step_losses",
-                    "encoding": "string",
-                },
-                payload_fn=lambda: f"losses: {losses}",
-            )
 
-        numerics_logger.log_pp_grads(
-            model, stage_mods, num_world_stages, should_log=should_log_weights
-        )
+                stage = pipeline_stage_class(
+                    pp_stage_mod,
+                    stage_graphs[pp_stage_idx],
+                    stage_graph_metas[pp_stage_idx],
+                    stage_index=pp_stage_idx,
+                    num_stages=len(virtual_pp_stages),
+                    device=device,
+                    input_args=(
+                        shape_inference_input_fn_first_stage()
+                        if pp_stage_idx == 0
+                        else shape_inference_fn_intermediate_stage()
+                    ),
+                    output_args=(
+                        shape_inference_output_fn_last_stage()
+                        if pp_stage_idx == (total_pp_stages - 1)
+                        else shape_inference_fn_intermediate_stage()
+                    ),
+                    group=world_mesh.get_group("pp"),
+                    numerics_logger=numerics_logger,
+                    should_log_fw_outs=should_log_fw_outs,
+                )
+
+                # NB: This is clearly a hack. The purpose of it is to override pp rank
+                # that the stage obtained from the process group. Stage computes peers to
+                # work with based on group rank.
+                if run_mode is RunMode.LOCAL_TENSOR:
+                    stage.group_rank = pp_rank
+
+                stages.append(stage)
+                rank_stage_mods[pp_stage_idx] = pp_stage_mod
+
+            # Step 5. Construct the pipeline runner using the pipeline stages for this pp_rank
+            schedule = build_pipeline_schedule(
+                stages=stages,
+                loss_fn=None,
+                pipeline_parallel_schedule=schedule_name,
+                microbatch_size=microbatch_size,
+                local_batch_size=local_batch_size,
+                pipeline_parallel_degree=pp_degree,
+                backward_requires_autograd=False,
+                scale_grads=rng_seed is None,  # In determinism mode, don't scale grads
+            )
+            assert isinstance(schedule, _PipelineScheduleRuntime)
+
+            # Step 6. Override the pipeline runner's action implementations
+            schedule.register_custom_function(FORWARD, stage_forward)
+            schedule.register_custom_function(FULL_BACKWARD, stage_full_backward)
+            schedule.register_custom_function(REDUCE_GRAD, stage_reduce_grad)
+            schedule.register_custom_function(RESHARD, stage_reshard)
+            schedule.register_custom_function(UNSHARD, stage_unshard)
+            schedule.register_custom_function(BACKWARD_INPUT, stage_backward_input)
+            schedule.register_custom_function(BACKWARD_WEIGHT, stage_backward_weight)
+            if schedule_name == "DualPipeV":
+                multiplexed_graph_callables = get_multiplexed_graph_callables(
+                    stage_graphs
+                )
+                schedule.register_custom_function(
+                    OVERLAP_F_B,
+                    functools.partial(overlap_fw_bw, multiplexed_graph_callables),
+                )
+
+            if rng_seed is not None:
+                numerics_logger.log_pp_model_weights(
+                    model,
+                    rank_stage_mods,
+                    num_world_stages,
+                    should_log=should_log_weights,
+                )
+                torch.manual_seed(rng_seed)
+
+            # Step 7. Register the schedule with the graph runner
+            graph_pp_runner = GraphPPRunner(schedule)
+
+            # Step 8. Run the whole pipeline once using the graph runner
+            has_last_stage = (total_pp_stages - 1) in rank_stage_mods
+            maybe_fake_context = (
+                FakeTensorMode(
+                    allow_non_fake_inputs=True,
+                    shape_env=ShapeEnv(),
+                )
+                if run_mode is RunMode.FAKE_EVALUATE
+                else nullcontext()
+            )
+            with maybe_fake_context:
+                with torch.no_grad():
+                    target, losses = (
+                        (runtime_target_fn(), [])
+                        if has_last_stage and use_loss_fn
+                        else (None, None)
+                    )
+                    if pp_rank == 0:
+                        x = runtime_input_fn_first_stage()
+                        if rng_seed:
+                            numerics_logger.log_diff(
+                                x.to(torch.float32), prefix="full batch input"
+                            )
+                        graph_pp_runner.step(
+                            x, target=target, losses=losses, return_outputs=False
+                        )
+                    else:
+                        graph_pp_runner.step(
+                            target=target, losses=losses, return_outputs=False
+                        )
+                    trace_structured(
+                        "artifact",
+                        metadata_fn=lambda: {
+                            "name": "pipeline_step_losses",
+                            "encoding": "string",
+                        },
+                        payload_fn=lambda: f"losses: {losses}",
+                    )
+
+                numerics_logger.log_pp_grads(
+                    model,
+                    stage_mods,
+                    num_world_stages,
+                    should_log=should_log_weights,
+                )
+
+    if run_mode is RunMode.LOCAL_TENSOR:
+        with LocalRunnerMode(
+            world_size,
+            pp_degree,
+            run_pp_rank,
+        ):
+            pass
+    else:
+        pp_rank = world_mesh["pp"].get_local_rank()
+        run_pp_rank(pp_rank)
 
     print("All good!")
 
@@ -655,9 +745,10 @@ if __name__ == "__main__":
         description="Run DeepSeek V3 pipeline parallel example"
     )
     parser.add_argument(
-        "--fake-evaluate",
-        action="store_true",
-        default=False,
+        "--run-mode",
+        type=RunMode,
+        choices=list(RunMode),
+        default=RunMode.MULTI_PROCESS,
         help="Use fake evaluation mode with FakeTensorMode (default: False)",
     )
     parser.add_argument(
@@ -692,7 +783,7 @@ if __name__ == "__main__":
         torch.manual_seed(args.rng_seed)
 
     run_test(
-        fake_evaluate=args.fake_evaluate,
+        run_mode=args.run_mode,
         use_loss_fn=args.use_loss_fn,
         schedule_name=args.schedule_name,
         rng_seed=args.rng_seed,
