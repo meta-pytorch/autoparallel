@@ -208,13 +208,18 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
 
         # apply sharding to constructor functions as well
         if target in TENSOR_FACTORY_OPS:
-            val = list(new_args[0])
-            spec = self.sharding_placement[node].output_specs
-            for mesh_size, placement in zip(spec.mesh.shape, spec.placements):
-                if placement.is_shard():
-                    # TODO: fix uneven cases ?
-                    val[placement.dim] //= mesh_size
-            new_args[0] = tuple(val)
+            # scalar_tensor has a scalar as first arg, not a shape
+            if target == torch.ops.aten.scalar_tensor.default:
+                # scalar tensors can't be sharded, so no transformation needed
+                pass
+            else:
+                val = list(new_args[0])
+                spec = self.sharding_placement[node].output_specs
+                for mesh_size, placement in zip(spec.mesh.shape, spec.placements):
+                    if placement.is_shard():
+                        # TODO: fix uneven cases ?
+                        val[placement.dim] //= mesh_size
+                new_args[0] = tuple(val)
 
         # use DTensor machinery to ensure the view ops are valid
         # otherwise we would end-up forcing global shapes on local tensors

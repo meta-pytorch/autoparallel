@@ -3,6 +3,7 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+from pathlib import Path
 from typing import Any, Iterable
 
 import torch
@@ -32,21 +33,30 @@ from .propagation_rules import (
 )
 
 
-def propagate_tensor_meta(op, user_args, user_kwargs, out_strat):
+def _get_meta_tensors_for_op(op, user_args, user_kwargs):
     out_t = op(*user_args, **user_kwargs)
 
     if isinstance(out_t, torch.Tensor):
-        new_tensor_meta = TensorMeta(out_t.shape, out_t.stride(), out_t.dtype)
+        out_tensor_meta = TensorMeta(out_t.shape, out_t.stride(), out_t.dtype)
     else:
-        new_tensor_meta = tree_map_only(
+        out_tensor_meta = tree_map_only(
             torch.Tensor, lambda x: TensorMeta(x.shape, x.stride(), x.dtype), out_t
         )
 
-    tensor_metas = tree_flatten(user_args)[0]
-    tensor_metas = tree_map_only(
-        torch.Tensor, lambda x: TensorMeta(x.shape, x.stride(), x.dtype), tensor_metas
+    input_tensor_metas = tree_flatten(user_args)[0]
+    input_tensor_metas = tree_map_only(
+        torch.Tensor,
+        lambda x: TensorMeta(x.shape, x.stride(), x.dtype),
+        input_tensor_metas,
     )
-    tensor_metas = tuple(x for x in tensor_metas if isinstance(x, TensorMeta))
+    input_tensor_metas = tuple(
+        x for x in input_tensor_metas if isinstance(x, TensorMeta)
+    )
+    return out_tensor_meta, input_tensor_metas
+
+
+def propagate_tensor_meta(op, user_args, user_kwargs, out_strat):
+    new_tensor_meta, tensor_metas = _get_meta_tensors_for_op(op, user_args, user_kwargs)
 
     for strat in out_strat.strategies:
         if isinstance(new_tensor_meta, TensorMeta):
@@ -119,6 +129,7 @@ def fill_missing_redistribute_cost(op, specs, out_strat):
                 torch.ops.aten.empty_like.default,
                 torch.ops.prims.convert_element_type.default,
                 torch.ops.aten.slice.Tensor,
+                torch.ops.aten.select.int,
             }
             assert op in handled_ops, f"got {op}, supported ops here are {handled_ops}"
             # assert len(specs) == 1, f"Expected len(specs) == 1, got {len(specs)}"
@@ -340,7 +351,7 @@ class DebugInterpreter(torch.fx.Interpreter):
                 continue
 
             self._logs.append(
-                f"{node=}, {inputs_or_outputs}[{i}]={torch.hash_tensor(arg)}"
+                f"{node=}, {inputs_or_outputs}[{i}]={torch.hash_tensor(arg)} nan={torch.any(torch.isnan(arg))}"
             )
 
     def run_node(self, n: torch.fx.Node) -> Any:
@@ -377,3 +388,138 @@ def print_rank_by_rank(msg: Any):
             print(msg)
             print(f"{rank=} done")
         torch.distributed.barrier()
+
+
+def hash_tensor(t: torch.Tensor) -> str:
+    if isinstance(t, torch.distributed.tensor.DTensor):
+        t = t.to_local()
+        return f"DTensor({hash_tensor(t)})"
+
+    if t.is_complex():
+        return f"real={hash_tensor(t.real)}, imag={hash_tensor(t.imag)})"
+
+    return f"{torch.hash_tensor(t)}"
+
+
+class NumericsLogger:
+    def __init__(self, base_dir: str):
+        self.base = Path(base_dir)
+        self.base.mkdir(parents=True, exist_ok=True)
+        self.rank = torch.distributed.get_rank()
+        self.dir = self._create_run_dir()
+
+    def _create_run_dir(self) -> Path:
+        """
+        Find the next available integer directory name under base_dir.
+        Example: base_dir/0, base_dir/1, base_dir/2, ...
+        """
+        existing = [
+            int(p.name) for p in self.base.iterdir() if p.is_dir() and p.name.isdigit()
+        ]
+        next_id = (max(existing) + 1) if existing else 0
+        run_dir = self.base / str(next_id)
+        torch.distributed.barrier()
+        if self.rank == 0:
+            run_dir.mkdir()
+        torch.distributed.barrier()
+        return run_dir
+
+    def log_model_weights(self, parallel_mod):
+        if self.rank == 0:
+            path = self.dir / "weights.log"
+
+            logs = []
+            for name, param in parallel_mod.named_parameters():
+                logs.append(f"{name=} hash={hash_tensor(param)}")
+            for name, buf in parallel_mod.named_buffers():
+                logs.append(f"{name=} hash={hash_tensor(buf)}")
+
+            with open(path, "a") as f:
+                f.write("\n".join(logs) + "\n")
+
+            print(f"Weight hashes written to {path}")
+
+    def log_fw_intermediates(self, logs):
+        rank = torch.distributed.get_rank()
+        path = self.dir / f"rank_{rank}_fw_intermediates.log"
+        with open(path, "a") as f:
+            f.write("\n".join(logs) + "\n")
+
+    def log_diff(self, t, rank=0, prefix="?"):
+        if self.rank == rank:
+            path = self.dir / "diff.log"
+            if isinstance(t, torch.distributed.tensor.DTensor):
+                t = t.to_local()
+            with open(path, "a") as f:
+                f.write(f"[{prefix}] hash={hash_tensor(t)}, norm={torch.norm(t)}\n")
+
+    def log_pp_model_weights(self, orig_mod, stage_mods, num_world_stages, should_log):
+        path = self.dir / "pp_weights.log"
+
+        torch.distributed.barrier()
+        # First print the params of every stage
+        for i in range(num_world_stages):
+            if should_log and i in stage_mods:
+                param_logs = []
+                real_params = dict(stage_mods[i].named_parameters())
+                for name, _ in orig_mod.named_parameters():
+                    if name not in real_params:
+                        continue
+                    param = real_params[name]
+                    param_logs.append(f"{name=} hash={hash_tensor(param)}")
+                with open(path, "a") as f:
+                    f.write("\n".join(param_logs) + "\n")
+            torch.distributed.barrier()
+
+        # Then print the buffers of every stage
+        for i in range(num_world_stages):
+            if should_log and i in stage_mods:
+                buffer_logs = []
+                real_buffers = dict(stage_mods[i].named_buffers())
+                for name, _ in orig_mod.named_buffers():
+                    if name not in real_buffers:
+                        continue
+                    buffer = real_buffers[name]
+                    buffer_logs.append(f"{name=} hash={hash_tensor(buffer)}")
+                with open(path, "a") as f:
+                    f.write("\n".join(buffer_logs) + "\n")
+            torch.distributed.barrier()
+
+        if self.rank == 0:
+            print(f"Weight hashes written to {path}")
+
+    def log_pp_grads(self, orig_mod, stage_mods, num_world_stages, should_log):
+        path = self.dir / "diff.log"
+
+        for i in range(num_world_stages):
+            if should_log and i in stage_mods:
+                grad_logs = []
+                real_params = dict(stage_mods[i].named_parameters())
+                for name, _ in orig_mod.named_parameters():
+                    if name not in real_params:
+                        continue
+                    grad = real_params[name].grad
+                    if grad is None:
+                        grad_logs.append(f"[grad {name}] None")
+                    else:
+                        grad = grad.to_local()
+                        grad_logs.append(
+                            f"[grad {name}] hash={hash_tensor(grad)}, norm={torch.norm(grad)}"
+                        )
+                with open(path, "a") as f:
+                    f.write("\n".join(grad_logs) + "\n")
+            torch.distributed.barrier()
+
+
+def debug_boxed_nop_preserve_node_meta(fx_g, example_inputs, numerics_logger):
+    def run(args):
+        with torch.fx.traceback.preserve_node_meta():
+            interp = DebugInterpreter(fx_g)
+            out = interp.boxed_run(args)
+            mylogs = interp.get_logs()
+            if numerics_logger:
+                numerics_logger.log_fw_intermediates(mylogs)
+            return out
+
+    run._boxed_call = True
+    return run

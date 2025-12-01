@@ -75,7 +75,9 @@ def _fill_indices_kernel(
 # ==============
 
 
-def fill_indices_wrapper(
+# workaround until local_map functionalization is fixed: https://github.com/pytorch/pytorch/issues/167568
+@torch.library.custom_op("autoparallel::fill_indices_functional", mutates_args=())
+def fill_indices_functional(
     tokens_per_expert_group: torch.Tensor,
     start_index_values: torch.Tensor,
     write_offsets: torch.Tensor,
@@ -84,7 +86,7 @@ def fill_indices_wrapper(
     max_len: int,
     block_size: int = 128,
     max_blocks: int = 1024,  # cap on total number of blocks to launch
-):
+) -> torch.Tensor:
     # preallocate output
     permuted_indices = torch.full(
         (max_len,), -1, dtype=torch.int32, device=tokens_per_expert_group.device
@@ -106,6 +108,22 @@ def fill_indices_wrapper(
         BLOCK_SIZE=block_size,
     )
     return permuted_indices
+
+
+@fill_indices_functional.register_fake
+def _(
+    tokens_per_expert_group: torch.Tensor,
+    start_index_values: torch.Tensor,
+    write_offsets: torch.Tensor,
+    experts_per_rank: int,
+    num_ranks: int,
+    max_len: int,
+    block_size: int = 128,
+    max_blocks: int = 1024,  # cap on total number of blocks to launch
+) -> torch.Tensor:
+    return torch.full(
+        (max_len,), -1, dtype=torch.int32, device=tokens_per_expert_group.device
+    )
 
 
 # reference
@@ -143,7 +161,6 @@ def fill_indices_cpu(
                     start_index,
                     start_index + (end_idx - write_start),
                     dtype=torch.int32,
-                    # device=device,
                 )
             write_start += length
     return permuted_indices
@@ -213,7 +230,7 @@ def generate_permute_indices(
             max_len,
         )
     else:
-        permuted_indices = fill_indices_wrapper(
+        permuted_indices = fill_indices_functional(
             tokens_per_expert_group,
             start_index_values,
             write_offsets,
@@ -1529,9 +1546,11 @@ class DeepSeekV3Model(nn.Module):
         )
         self.model_args = model_args
 
-    def init_weights(self, buffer_device: torch.device | None = None) -> None:
-        _init_weights_tok_embeddings(self)
-        _init_weights_layers(self, buffer_device)
+    def init_weights(
+        self, buffer_device: torch.device | None = None, seed: int | None = None
+    ) -> None:
+        _init_weights_tok_embeddings(self, seed)
+        _init_weights_layers(self, buffer_device, seed)
         _init_weights_norm_and_output(self)
 
     def forward(
@@ -1565,6 +1584,12 @@ class DeepSeekV3Model(nn.Module):
         return output
 
 
+def dsv3_loss_fn(pred: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    return torch.nn.functional.cross_entropy(
+        pred.flatten(0, 1).float(), labels.flatten(0, 1)
+    )
+
+
 ########################
 # Pipeline stuff start #
 ########################
@@ -1585,8 +1610,10 @@ class DeepSeekV3StageI(nn.Module):
             h = layer(h, self.freqs_cis)
         return h
 
-    def init_weights(self, buffer_device: torch.device | None = None) -> None:
-        _init_weights_layers(self, buffer_device)
+    def init_weights(
+        self, buffer_device: torch.device | None = None, seed: int | None = None
+    ) -> None:
+        _init_weights_layers(self, buffer_device, seed)
 
 
 class DeepSeekV3Stage0(DeepSeekV3StageI):
@@ -1600,9 +1627,11 @@ class DeepSeekV3Stage0(DeepSeekV3StageI):
         # torch.Size([1024, 1024, 2048])
         return super().forward(h)
 
-    def init_weights(self, buffer_device: torch.device | None = None) -> None:
-        _init_weights_tok_embeddings(self)
-        super().init_weights(buffer_device=buffer_device)
+    def init_weights(
+        self, buffer_device: torch.device | None = None, seed: int | None = None
+    ) -> None:
+        _init_weights_tok_embeddings(self, seed)
+        super().init_weights(buffer_device, seed)
 
 
 class DeepSeekV3StageN(DeepSeekV3StageI):
@@ -1618,8 +1647,10 @@ class DeepSeekV3StageN(DeepSeekV3StageI):
         output = self.output(h) if self.output is not None else h
         return output
 
-    def init_weights(self, buffer_device: torch.device | None = None) -> None:
-        super().init_weights(buffer_device=buffer_device)
+    def init_weights(
+        self, buffer_device: torch.device | None = None, seed: int | None = None
+    ) -> None:
+        super().init_weights(buffer_device, seed)
         _init_weights_norm_and_output(self)
 
 
@@ -1628,7 +1659,11 @@ class DeepSeekV3StageN(DeepSeekV3StageI):
 ######################
 
 
-def _init_weights_tok_embeddings(self: Union[DeepSeekV3Model, DeepSeekV3Stage0]):
+def _init_weights_tok_embeddings(
+    self: Union[DeepSeekV3Model, DeepSeekV3Stage0], seed: int | None = None
+):
+    if seed is not None:
+        torch.manual_seed(seed)
     if self.tok_embeddings is not None:
         nn.init.normal_(self.tok_embeddings.weight)
 
@@ -1636,15 +1671,18 @@ def _init_weights_tok_embeddings(self: Union[DeepSeekV3Model, DeepSeekV3Stage0])
 def _init_weights_layers(
     self: Union[DeepSeekV3Model, DeepSeekV3StageI],
     buffer_device: torch.device | None,
+    seed: int | None = None,
 ):
     if buffer_device is None:
         buffer_device = self.freqs_cis.device  # type: ignore[assignment]
     with torch.device(buffer_device):  # type: ignore[arg-type]
         self.freqs_cis = precompute_freqs_cis(self.model_args)
-    for layer in self.layers.values():
+    for i, layer in enumerate(self.layers.values()):
+        if seed is not None:
+            torch.manual_seed(seed)
         if layer is not None:
             assert isinstance(layer, TransformerBlock)
-            layer.init_weights(buffer_device=buffer_device)  # type: ignore[arg-type]
+            layer.init_weights(buffer_device)  # type: ignore[arg-type]
 
 
 def _init_weights_norm_and_output(self: Union[DeepSeekV3Model, DeepSeekV3StageN]):

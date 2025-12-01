@@ -103,17 +103,39 @@ class aten_autobucketing_config:
     max_in_flight_gb = 2.0
     compute_overlap_multipler = 1.0
     max_coll_distance = 100
+    custom_runtime_estimation = None
+    max_compute_pre_fetch = 5
+    collective_bucketing = False
+    save_trace = True
+    _counter = 0
 
 
 def aten_autobucketing_reordering_pass(
     gm: torch.fx.Graph, configs: "aten_autobucketing_config"
 ) -> torch.fx.GraphModule:
-    return schedule_overlap_bucketing(
+    new_gm = schedule_overlap_bucketing(
         gm.owning_module,
+        collective_bucketing=configs.collective_bucketing,
+        max_compute_pre_fetch=configs.max_compute_pre_fetch,
+        custom_runtime_estimation=configs.custom_runtime_estimation,
         compute_overlap_multipler=configs.compute_overlap_multipler,
         max_in_flight_gb=configs.max_in_flight_gb,
         max_coll_distance=configs.max_coll_distance,
     )
+    new_gm.recompile()
+
+    if configs.save_trace:
+        from autoparallel.debug_helpers import create_execution_trace
+
+        assert configs.custom_runtime_estimation is not None
+
+        create_execution_trace(
+            new_gm,
+            configs.custom_runtime_estimation,
+            f"fake_trace_{configs._counter}.json",
+        )
+        configs._counter += 1
+    return new_gm
 
 
 def configure_inductor_for_autobucketing(mode: str = "aten"):
