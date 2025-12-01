@@ -909,3 +909,49 @@ def scatter_strategy(mesh, op_schema: OpSchema):
     return expand_to_full_mesh_op_strategy(
         mesh, op_schema, single_mesh_dim_strategies, input_index=1
     )
+
+
+@register_opschema_rule(torch.ops.aten.stack.default)
+def stack_strategy(mesh, op_schema: OpSchema):
+    from torch.distributed.tensor._ops._tensor_ops import (
+        PlacementList,
+        TupleStrategy,
+        cast,
+        expand_to_full_mesh_op_strategy,
+        normalize_dim,
+    )
+
+    input_tuple_strategy = op_schema.args_schema[0]
+    assert isinstance(input_tuple_strategy, TupleStrategy)
+
+    num_input_tensor = len(input_tuple_strategy.children)
+    first_input_strategy = input_tuple_strategy.children[0]
+    assert isinstance(first_input_strategy, OpStrategy)
+    common_input_ndim = first_input_strategy.ndim
+
+    dim = cast(int, op_schema.args_schema[1]) if len(op_schema.args_schema) > 1 else 0
+    # normalize the dim to be within the common input ndim
+    dim = normalize_dim(dim, common_input_ndim)
+
+    possible_input_strategies: PlacementList = [Replicate()] + [  # type: ignore[assignment]
+        Shard(i) for i in range(common_input_ndim)
+    ]
+    possible_output_strategies: PlacementList = (
+        [Replicate()]  # type: ignore[assignment]
+        + [Shard(i) for i in range(dim)]
+        + [Shard(i + 1) for i in range(dim, common_input_ndim)]
+    )
+
+    single_mesh_dim_strategies = []
+    for input_strategy, output_strategy in zip(
+        possible_input_strategies, possible_output_strategies
+    ):
+        strategy: PlacementList = [output_strategy] + [
+            input_strategy
+        ] * num_input_tensor
+        single_mesh_dim_strategies.append(strategy)
+
+    s = expand_to_full_mesh_op_strategy(
+        mesh, op_schema, single_mesh_dim_strategies, input_index=1
+    )
+    return s
