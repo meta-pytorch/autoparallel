@@ -91,7 +91,6 @@ def enumerate_pp_groups(pp_mesh: DeviceMesh) -> list[list[int]]:
 def combine_works(works: list[dist.Work], ctx: str | None = None) -> dist.Work:
     def _wait_all(timeout) -> bool:
         for w in works:
-            print(f"{ctx} wait recv")
             w.wait()
         return True
 
@@ -116,7 +115,6 @@ def expand_p2p_ops(
     def multi_isend(tensor, dst=None, group=None, tag=0, group_src=None):
         assert group_src is not None, "Expected group rank"
         peer = get_pp_peer(pp_rank, group_src)
-        print(f"PP peer {group_src} {ctx} multi_isend {peer=}")
         if not isinstance(tensor, LocalTensor):
             tensor = maybe_make_tensor_local(tensor)
         works = local_p2p_op(peer, tensor, dist.isend)
@@ -125,10 +123,9 @@ def expand_p2p_ops(
     def multi_irecv(tensor, src=None, group=None, tag=0, group_src=None):
         assert group_src is not None, "Expected group rank"
         peer = get_pp_peer(pp_rank, group_src)
-        print(f"PP peer {group_src} {ctx} multi_irecv {peer=}")
         assert isinstance(tensor, LocalTensor), "Expected LocalTensor"
         works = local_p2p_op(peer, tensor, dist.irecv)
-        return combine_works(works, f"PP peer {group_src} {ctx} multi_irecv {peer=}")
+        return combine_works(works)
 
     send_ops = []
     recv_ops = []

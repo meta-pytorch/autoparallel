@@ -4,14 +4,17 @@
 # LICENSE file in the root directory of this source tree.
 
 import copy
+import functools
 import itertools
 import warnings
-from contextlib import ExitStack, contextmanager
+from contextlib import contextmanager, ExitStack
 from types import MethodType
-from typing import Any, Optional, Union
+from typing import Any, Callable, Optional, Union
 
 import torch
-from torch._dynamo.functional_export import dynamo_graph_capture_for_export
+
+from autoparallel._passes.graph_partition import partition_joint_with_descriptors
+from torch._dynamo.functional_export import _dynamo_graph_capture_for_export
 from torch._functorch.aot_autograd import (
     aot_compile_joint_with_descriptors,
     aot_export_joint_with_descriptors,
@@ -23,11 +26,10 @@ from torch._logging import trace_structured
 from torch._subclasses import FakeTensorMode
 from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor import DeviceMesh
+from torch.export._trace import _restore_state_dict
 from torch.export._unlift import _assign_attr
 from torch.export.unflatten import _AttrKind
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
-
-from autoparallel._passes.graph_partition import partition_joint_with_descriptors
 
 from .activation_checkpointing import ac_joint_pass
 from .apply_sharding import apply_sharding_to_model
@@ -41,7 +43,11 @@ from .graph_utils import (
 )
 from .init_weights import hook_params_setters
 from .optimize_sharding import ShardingOptimizer
-from .utils import _get_device_from_mesh
+from .utils import (
+    _get_device_from_mesh,
+    debug_boxed_nop_preserve_node_meta,
+    NumericsLogger,
+)
 
 _APPLY_VIEW_MM_VIEW_PATTERN = False
 
@@ -114,7 +120,7 @@ def move_to_fake(model: torch.nn.Module, mode: FakeTensorMode, device: torch.dev
 # can patch the verification logic.
 @contextmanager
 def monkey_patch_export_verifier():
-    from torch._export.verifier import SpecViolationError, Verifier, final
+    from torch._export.verifier import final, SpecViolationError, Verifier
 
     prior = Verifier._check_graph_module
 
@@ -158,6 +164,39 @@ def enable_local_map_wrapping():
         yield
 
 
+def _export(
+    model: torch.nn.Module, model_wrapper: Callable, inputs: tuple[Any, ...]
+) -> torch.fx.GraphModule:
+    """
+    Capture a model graph via Dynamo and restore parameter/buffer metadata.
+
+    We need both `model` and `model_wrapper` because:
+    - `model_wrapper` is the actual callable that gets traced by Dynamo. It may wrap
+      the model with additional logic (e.g., adding a loss function on top of the model's
+      forward pass, or preparing inputs in a specific way).
+    - `model` is the original nn.Module needed to restore the correct fully-qualified
+      names (FQNs) for parameters and buffers in the traced graph. Without this, the
+      captured graph would lose the original parameter naming structure.
+
+    Args:
+        model: Original nn.Module with parameter/buffer metadata to restore
+        model_wrapper: Callable to trace (may wrap model with additional logic)
+        inputs: Input tensors for tracing
+
+    Returns:
+        GraphModule with restored parameter FQNs and calling convention
+
+    TODO:
+    1) Use bytecode for calling convention instead of pytree for more seamless UX
+    2) Attach guards
+    3) Be more careful about tensor constants names
+    """
+    with torch._dynamo.config.patch(install_free_tensors=True):
+        gm = _dynamo_graph_capture_for_export(model_wrapper)(*inputs)
+        _restore_state_dict(model, gm)
+        return gm
+
+
 class AutoParallel:
     """
     Args:
@@ -177,6 +216,8 @@ class AutoParallel:
         ac_stage_size_in_GiB: Optional[Union[float, str]] = "auto",
         reshard_after_forward: bool = True,
         dynamic: bool = False,
+        loss_fn: Optional[Callable] = None,
+        numerics_logger: NumericsLogger | None = None,
         **kwargs,
     ):
         self.stack = ExitStack()
@@ -204,10 +245,18 @@ class AutoParallel:
         self.model = move_to_fake(model, self.fake_mode, device)
         self.input_fn = input_fn
         self.mesh = mesh
-        self.compiler_fn = compile_fx_inner if compile else boxed_nop_preserve_node_meta
+        if compile:
+            self.compiler_fn = compile_fx_inner
+        elif numerics_logger:
+            self.compiler_fn = functools.partial(
+                debug_boxed_nop_preserve_node_meta, numerics_logger=numerics_logger
+            )
+        else:
+            self.compiler_fn = boxed_nop_preserve_node_meta  # type: ignore[assignment]
         self.enable_ac = enable_ac
         self.ac_stage_size_in_GiB = ac_stage_size_in_GiB
         self.reshard_after_forward = reshard_after_forward
+        self.loss_fn = loss_fn
 
         if dynamic:
             self.fake_mode.shape_env = ShapeEnv()
@@ -275,20 +324,54 @@ class AutoParallel:
         decomp_table = _get_decomp_table()
 
         with self.fake_mode:
-            inputs = self.input_fn()
-            if not isinstance(inputs, tuple):
-                inputs = (inputs,)
+            raw_inputs = self.input_fn()
+
+        # Define model wrapper based on whether loss_fn is provided
+        model_wrapper: Callable
+        # Parse inputs based on whether loss_fn is provided
+        # If loss_fn is not None: expected format ((inp1, inp2,...), target)
+        # If loss_fn is None: expected format (inp1, inp2, ...)
+        if self.loss_fn is not None:
+            if isinstance(raw_inputs, tuple) and len(raw_inputs) == 2:
+                model_inputs, target = raw_inputs
+                # Normalize inputs to always be a tuple
+                if not isinstance(model_inputs, tuple):
+                    model_inputs = (model_inputs,)
+                formatted_inputs = (model_inputs, target)
+
+                def model_with_loss(model_inputs, target) -> Any:
+                    output = self.model(*model_inputs)
+                    loss = self.loss_fn(output, target)  # type: ignore[misc]
+                    return loss
+
+                model_wrapper = model_with_loss
+            else:
+                raise ValueError(
+                    "When loss_fn is provided, input_fn must return (inputs, target) "
+                    "where inputs can be a single tensor or tuple of tensors"
+                )
+        else:
+            # No loss function, inputs are just model inputs
+            formatted_inputs = (
+                raw_inputs if isinstance(raw_inputs, tuple) else (raw_inputs,)
+            )
+
+            def model_wo_loss(*model_inputs) -> Any:
+                output = self.model(*model_inputs)
+                return output
+
+            model_wrapper = model_wo_loss
 
         with set_dtype_cast(
             True
         ), enable_local_map_wrapping(), torch._dynamo.utils._disable_saved_tensors_hooks_during_tracing():
-            torch_ir_with_fqn = dynamo_graph_capture_for_export(self.model)(*inputs)
+            torch_ir_with_fqn = _export(self.model, model_wrapper, formatted_inputs)
             # TODO Cna't use fake mode here because it clashes with the user level
             # fake mode. Ideally dynamo should reuse the user level fake mode.
             self.joint_with_descriptors = aot_export_joint_with_descriptors(
                 self.stack,
                 torch_ir_with_fqn,
-                inputs,
+                formatted_inputs,
                 decompositions=decomp_table,
             )
         gm = self.joint_with_descriptors.graph_module
@@ -597,10 +680,14 @@ class AutoParallelPP(AutoParallel):
         assert num_params_buffers == (
             num_params + num_buffers
         ), f"num_params_buffers: {num_params_buffers}, num_params: {num_params}, num_buffers: {num_buffers}"
+        num_input_grads = (
+            len(bw_module.graph.find_nodes(op="output")[0].args[0]) - num_params_buffers
+        )
         print(
             f"num_params_buffers: {num_params_buffers}\n"
             f"num_user_outputs: {num_user_outputs}\n"
             f"num_mutate_inputs: {num_mutate_inputs}\n"
+            f"num_input_grads: {num_input_grads}\n"
             f"num_fw_outs_saved_for_bw: {num_fw_outs_saved_for_bw}\n"
             f"num_symints_saved_for_bw: {num_symints_saved_for_bw}"
         )
@@ -683,7 +770,6 @@ class AutoParallelPP(AutoParallel):
 
         bw_dI_module: Optional[torch.fx.GraphModule] = None
         bw_dW_module: Optional[torch.fx.GraphModule] = None
-        num_input_grads = 0
         if "split_dI_dW" in graph_passes:
             from autoparallel._passes.split_di_dw_graph import split_di_dw_graph
 

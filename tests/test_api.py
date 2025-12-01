@@ -305,3 +305,56 @@ def test_fx_graph_annotate_overlap_pass(device_mesh_1d):
     #     %add : [num_users=1] = call_function[target=torch.ops.aten.add.Tensor](args = (%primals_1, 10), kwargs = {})
     #     %add_2 : [num_users=1] = call_function[target=torch.ops.aten.add.Tensor](args = (%add_1, 30), kwargs = {})
     #     return ((add, add_2), (tangents_1, None))
+
+
+def test_inference_mode_compilation(device_mesh_1d):
+    """Test that inference mode (no gradients) works with compile=True.
+
+    This test verifies the fix for the bug where updated_flat_args was incorrectly
+    formatted as a tuple for inference mode, causing compilation to fail.
+
+    Regression test for: updated_flat_args should be a list for inference mode,
+    not a tuple of (primals, tangents).
+    """
+    dim = 128
+
+    class SimpleLinear(nn.Module):
+        def __init__(self, in_features, out_features):
+            super().__init__()
+            self.linear = nn.Linear(in_features, out_features, bias=False)
+
+        def forward(self, x):
+            return self.linear(x)
+
+    def input_fn():
+        batch_size = 256
+        return torch.rand(batch_size, dim, device="cuda")
+
+    with torch.device("meta"):
+        model = SimpleLinear(dim, dim * 2)
+
+    # Set model to inference mode (no gradients)
+    for param in model.parameters():
+        param.requires_grad = False
+
+    # Test with compile=True - this should succeed with the fix
+    with AutoParallel(model, input_fn, device_mesh_1d, None, compile=True) as autop:
+        autop.add_parameter_memory_constraint(low=None, high=device_mesh_1d.ndim)
+
+        # R -> S(0)
+        autop.add_input_constraints([(Replicate(),)])
+        autop.add_output_constraints([(Shard(0),)])
+
+        sharding_placement = autop.optimize_placement()
+        parallel_mod = autop.apply_placement(sharding_placement)
+
+        # Verify the model was created
+        assert parallel_mod is not None
+        assert hasattr(autop, "parallel_gm")
+
+        # Verify graph has expected structure (forward-only, no backward pass)
+        placeholders = [
+            n for n in autop.parallel_gm.graph.nodes if n.op == "placeholder"
+        ]
+        # Should only have 2 placeholders: weight and input (no tangents for inference)
+        assert len(placeholders) == 2
