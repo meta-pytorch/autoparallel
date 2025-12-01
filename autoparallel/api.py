@@ -7,11 +7,13 @@ import copy
 import functools
 import itertools
 import warnings
-from contextlib import ExitStack, contextmanager
+from contextlib import contextmanager, ExitStack
 from types import MethodType
 from typing import Any, Callable, Optional, Union
 
 import torch
+
+from autoparallel._passes.graph_partition import partition_joint_with_descriptors
 from torch._dynamo.functional_export import _dynamo_graph_capture_for_export
 from torch._functorch.aot_autograd import (
     aot_compile_joint_with_descriptors,
@@ -29,8 +31,6 @@ from torch.export._unlift import _assign_attr
 from torch.export.unflatten import _AttrKind
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
-from autoparallel._passes.graph_partition import partition_joint_with_descriptors
-
 from .activation_checkpointing import ac_joint_pass
 from .apply_sharding import apply_sharding_to_model
 from .cast_parametrization import apply_dtype_cast, canonicalize_mp, set_dtype_cast
@@ -44,9 +44,9 @@ from .graph_utils import (
 from .init_weights import hook_params_setters
 from .optimize_sharding import ShardingOptimizer
 from .utils import (
-    NumericsLogger,
     _get_device_from_mesh,
     debug_boxed_nop_preserve_node_meta,
+    NumericsLogger,
 )
 
 _APPLY_VIEW_MM_VIEW_PATTERN = False
@@ -120,7 +120,7 @@ def move_to_fake(model: torch.nn.Module, mode: FakeTensorMode, device: torch.dev
 # can patch the verification logic.
 @contextmanager
 def monkey_patch_export_verifier():
-    from torch._export.verifier import SpecViolationError, Verifier, final
+    from torch._export.verifier import final, SpecViolationError, Verifier
 
     prior = Verifier._check_graph_module
 

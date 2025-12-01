@@ -8,6 +8,9 @@ from typing import Any, Iterable
 
 import torch
 import torch.utils._pytree as pytree
+
+from autoparallel.propagation_rules import generate_dummy_redistribute_costs
+from torch.distributed._local_tensor import LocalTensor
 from torch.distributed._tensor.placement_types import Placement, TensorMeta
 from torch.distributed.device_mesh import _get_device_handle
 from torch.distributed.tensor._dtensor_spec import DTensorSpec
@@ -22,14 +25,12 @@ from torch.distributed.tensor._ops.utils import generate_redistribute_costs
 from torch.distributed.tensor.placement_types import Replicate
 from torch.utils._pytree import tree_flatten, tree_map_only
 
-from autoparallel.propagation_rules import generate_dummy_redistribute_costs
-
 from .dtensor_util import get_op_strategy, with_implicit_strategies
 from .propagation_rules import (
-    TENSOR_FACTORY_OPS,
     _op_partial_rules,
     _op_rules,
     remove_invalid_configs,
+    TENSOR_FACTORY_OPS,
 )
 
 
@@ -466,7 +467,7 @@ class NumericsLogger:
                     if name not in real_params:
                         continue
                     param = real_params[name]
-                    param_logs.append(f"{name=} hash={hash_tensor(param)}")
+                    param_logs.append(f"rank={name=} hash={hash_tensor(param)}")
                 with open(path, "a") as f:
                     f.write("\n".join(param_logs) + "\n")
             torch.distributed.barrier()
@@ -490,7 +491,6 @@ class NumericsLogger:
 
     def log_pp_grads(self, orig_mod, stage_mods, num_world_stages, should_log):
         path = self.dir / "diff.log"
-
         for i in range(num_world_stages):
             if should_log and i in stage_mods:
                 grad_logs = []
