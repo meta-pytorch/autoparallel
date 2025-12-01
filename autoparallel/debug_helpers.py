@@ -166,10 +166,12 @@ def get_graph_module(gm, args):
 def apply_schedule_overlap_bucket(gm, custom_runtime_estimation):
     new_gm = schedule_overlap_bucketing(
         gm,
-        collective_bucketing=False,
+        collective_bucketing=True,
         custom_runtime_estimation=custom_runtime_estimation,
-        max_compute_pre_fetch=5,
-        max_in_flight_gb=2.0,
+        # max_compute_pre_fetch=5,
+        # max_in_flight_gb=2.0,
+        max_memory_increase_gb=4.0,
+        max_memory_increase_ratio=None,
     )
     new_gm.recompile()
     return new_gm

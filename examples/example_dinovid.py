@@ -1781,6 +1781,8 @@ mesh = torch.distributed.device_mesh.init_device_mesh(
 device = torch.device("cuda")
 cfg = Configuration(output_dir="")
 cfg = Configuration(output_dir="", model_size="debug")
+cfg = Configuration(output_dir="", batch_size=16, model_size="large")
+# cfg = Configuration(output_dir="", batch_size=16, model_size="debug")
 
 
 with torch.device("meta"):
@@ -1790,7 +1792,7 @@ with torch.device("meta"):
 
 def input_fn(B=world_size):
     # B = cfg.batch_size * B
-    local_batch = 2  # cfg.batch_size
+    local_batch = cfg.batch_size
     num_gpus = B
     B = local_batch * B
     T = cfg.num_frames
@@ -1872,11 +1874,14 @@ def input_fn(B=world_size):
 
 import time
 
+from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
 
 from autoparallel.api import AutoParallel
 
-mp_policy = None
+mp_policy = MixedPrecisionPolicy(
+    param_dtype=DTYPES[cfg.param_dtype], reduce_dtype=DTYPES[cfg.reduce_dtype]
+)
 
 if False:
     # the UX of debugging shape errors during tracing is
