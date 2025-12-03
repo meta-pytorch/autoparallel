@@ -17,10 +17,10 @@ from torch.distributed.tensor._op_schema import (
     OpStrategy,
     StrategyType,
 )
+from torch.distributed.tensor._ops.registration import register_op_strategy
 from torch.distributed.tensor._ops.utils import (
     generate_redistribute_costs,
     is_tensor_shardable,
-    register_op_strategy,
 )
 from torch.distributed.tensor.placement_types import Placement, Replicate, Shard
 
