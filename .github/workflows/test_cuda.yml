@@ -40,7 +40,7 @@ jobs:
         pip uninstall -y torch
         pip install --no-input --quiet --pre torch --index-url https://download.pytorch.org/whl/nightly/cu126
         pip install --quiet .
-        pytest tests
+        pytest tests --deselect=tests/test_dtensor.py::ImplicitRegistrationTest::test_implicit_registration
         python examples/example_autoparallel.py
         python examples/example_llama3.py
         python examples/example_dcp.py

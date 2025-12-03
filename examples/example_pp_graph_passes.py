@@ -4,15 +4,20 @@
 # LICENSE file in the root directory of this source tree.
 
 from contextlib import nullcontext
-from typing import Callable
+from typing import Callable, Union
 
 import torch
-from torch._subclasses.fake_tensor import FakeTensorMode
+from torch._subclasses.fake_tensor import (
+    FakeTensor,
+    FakeTensorMode,
+    unset_fake_temporarily,
+)
 from torch.distributed.tensor import DeviceMesh, DTensor
 from torch.distributed.tensor.placement_types import Replicate, Shard
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from torch.testing._internal.distributed.fake_pg import FakeStore
 
+from autoparallel._passes.graph_multiplex import multiplex_fw_bw_graph
 from autoparallel._testing.models.dsv3 import (
     DeepSeekV3Model,
     DeepSeekV3ModelArgs,
@@ -27,9 +32,61 @@ from autoparallel.graph_pp_runner import (
     _run_dW_bw_module,
     _run_full_bw_module,
     _run_fw_module,
+    _run_multiplexed_fw_bw_module,
     _run_reduce_grad_module,
     _run_unshard_module,
 )
+
+
+def compare_tuples(tuple1: Union[list, tuple], tuple2: Union[list, tuple]) -> bool:
+    """Compare two tuples element-by-element with specialized comparison logic.
+
+    For each element pair:
+    - If both are FakeTensor: compare shape, stride, and dtype
+    - If both are Tensor: use torch.allclose for numerical comparison
+    - Otherwise: skip the comparison (always matches)
+
+    Args:
+        tuple1: First tuple to compare.
+        tuple2: Second tuple to compare.
+
+    Returns:
+        True if all comparable elements match according to the rules above, False otherwise.
+    """
+    if len(tuple1) != len(tuple2):
+        return False
+    with unset_fake_temporarily():
+        for elem1, elem2 in zip(tuple1, tuple2):
+            # Check if both are FakeTensor
+            if isinstance(elem1, FakeTensor):
+                if not isinstance(elem2, FakeTensor):
+                    return False
+                if elem1.dtype != elem2.dtype:
+                    return False
+                # Try to compare strides or shape, but skip if it would trigger data-dependent guards
+                try:
+                    if elem1.shape != elem2.shape:
+                        return False
+                    if elem1.stride() != elem2.stride():
+                        return False
+                except (
+                    torch.fx.experimental.symbolic_shapes.GuardOnDataDependentSymNode
+                ):
+                    # Skip stride or shape comparison for symbolic shapes
+                    pass
+            # Check if both are regular Tensor (but not FakeTensor)
+            elif isinstance(elem1, torch.Tensor) and not isinstance(elem1, FakeTensor):
+                if not (
+                    isinstance(elem2, torch.Tensor)
+                    and not isinstance(elem2, FakeTensor)
+                ):
+                    return False
+                # Use torch.allclose for numerical comparison
+                if not torch.allclose(elem1, elem2):
+                    return False
+            # Otherwise, skip the comparison (neither or mismatched types)
+
+    return True
 
 
 def _get_pp_module_and_graphs(
@@ -105,10 +162,129 @@ def _get_fw_inputs(
         v.to_local() if isinstance(v, DTensor) else v
         for k, v in dict(pp_mod.named_buffers(remove_duplicate=False)).items()
     ]
-    return [sharded_params, buffers, x]
+    return (sharded_params, buffers, x)
 
 
 # Symbolically evaluate in case you want to test running a graph bigger than your gpu
+
+
+def _run_graph_test(
+    pp_mod: torch.nn.Module,
+    graph_modules: GraphCallables,
+    graph_meta: GraphMeta,
+    sharded_params: list[torch.Tensor],
+    buffers: list[torch.Tensor],
+    x: list[torch.Tensor],
+    fake_evaluate: bool,
+    use_fsdp_collectives: bool,
+    use_split_dI_dW: bool,
+    use_multiplexed_graph: bool,
+) -> None:
+    """Execute forward and backward passes with specified graph options."""
+    if use_multiplexed_graph:
+        multiplexed_fw_bw_module = multiplex_fw_bw_graph(
+            graph_modules.fw, graph_modules.full_bw
+        )
+
+    with (
+        FakeTensorMode(
+            allow_non_fake_inputs=True,
+            shape_env=ShapeEnv(),
+        )
+        if fake_evaluate
+        else nullcontext()
+    ):
+        with torch.no_grad():
+            # Forward pass setup
+            if use_fsdp_collectives:
+                unshard_args = list(sharded_params)
+                assert graph_modules.unshard is not None
+                unsharded_params = _run_unshard_module(
+                    graph_modules.unshard, graph_meta, unshard_args
+                )
+                fw_args = [*unsharded_params, *buffers, *x]
+            else:
+                fw_args = [*sharded_params, *buffers, *x]
+            if use_multiplexed_graph:
+                m_fw_args = list(fw_args)
+            # Forward pass
+            loss_or_output, saved_intermediates = _run_fw_module(
+                graph_modules.fw, graph_meta, fw_args
+            )
+            tangents = [torch.ones_like(loss_or_output)]
+            tensors_for_backward, non_tensors_for_backward = saved_intermediates
+
+            # Backward pass setup
+            bw_args = [
+                *non_tensors_for_backward,
+                *tensors_for_backward,
+                *tangents,
+            ]
+            if use_multiplexed_graph:
+                m_bw_args = list(bw_args)
+                joint_args = m_bw_args + m_fw_args
+                del m_bw_args, m_fw_args
+                (
+                    m_input_grads,
+                    m_param_buffer_grads,
+                    m_loss_or_output,
+                    m_saved_intermediates,
+                ) = _run_multiplexed_fw_bw_module(
+                    multiplexed_fw_bw_module, graph_meta, graph_meta, joint_args
+                )
+                (
+                    m_tensors_for_backward,
+                    m_non_tensors_for_backward,
+                ) = m_saved_intermediates
+                assert compare_tuples((m_loss_or_output,), (loss_or_output,))
+                assert compare_tuples(m_tensors_for_backward, tensors_for_backward)
+                assert compare_tuples(
+                    m_non_tensors_for_backward, non_tensors_for_backward
+                )
+                del (
+                    m_non_tensors_for_backward,
+                    m_tensors_for_backward,
+                    m_loss_or_output,
+                )
+            del (
+                tensors_for_backward,
+                non_tensors_for_backward,
+                tangents,
+                saved_intermediates,
+            )
+
+            # Backward pass
+            if use_split_dI_dW:
+                assert graph_modules.bw_dI is not None
+                input_grads, activations_for_backward = _run_dI_bw_module(
+                    graph_modules.bw_dI, graph_meta, bw_args
+                )
+                dw_args = list(activations_for_backward)
+                del activations_for_backward
+                assert graph_modules.bw_dW is not None
+                param_buffer_grads = _run_dW_bw_module(
+                    graph_modules.bw_dW, graph_meta, dw_args
+                )
+            else:
+                input_grads, param_buffer_grads = _run_full_bw_module(
+                    graph_modules.full_bw, graph_meta, bw_args
+                )
+            if use_multiplexed_graph:
+                assert compare_tuples(m_param_buffer_grads, param_buffer_grads)
+                assert compare_tuples(m_input_grads, input_grads)
+                del m_param_buffer_grads, m_input_grads
+            assert len(param_buffer_grads) == (len(sharded_params) + len(buffers))
+            unsharded_grads = list(param_buffer_grads[: len(sharded_params)])
+            del param_buffer_grads, input_grads
+            # Gradient reduction (if using FSDP collectives)
+            if use_fsdp_collectives:
+                assert graph_modules.reduce_grad is not None
+                sharded_grads = _run_reduce_grad_module(
+                    graph_modules.reduce_grad, graph_meta, unsharded_grads
+                )
+            else:
+                sharded_grads = unsharded_grads
+            assert len(sharded_grads) == len(sharded_params)
 
 
 def test_graph_partition(
@@ -119,44 +295,22 @@ def test_graph_partition(
     fake_evaluate: bool = True,
     use_loss_fn: bool = True,
 ):
-
     pp_mod, graph_modules, graph_meta = _get_pp_module_and_graphs(
         model, mesh, tracing_input_fn, use_loss_fn=use_loss_fn
     )
     sharded_params, buffers, x = _get_fw_inputs(pp_mod, eval_input_fn)
-    with (
-        FakeTensorMode(
-            allow_non_fake_inputs=True,
-            shape_env=ShapeEnv(),
-        )
-        if fake_evaluate
-        else nullcontext()
-    ):
-        # # now let's run it
-        with torch.no_grad():
-            fw_args = [*sharded_params, *buffers, *x]
-            loss_or_output, saved_intermediates = _run_fw_module(
-                graph_modules.fw, graph_meta, fw_args
-            )
-            tangents = [torch.ones_like(loss_or_output)]
-            tensors_for_backward, non_tensors_for_backward = saved_intermediates
-
-            bw_args = [
-                *non_tensors_for_backward,
-                *tensors_for_backward,
-                *tangents,
-            ]
-            del (
-                tensors_for_backward,
-                non_tensors_for_backward,
-                tangents,
-                saved_intermediates,
-            )
-
-            input_grads, param_buffer_grads = _run_full_bw_module(
-                graph_modules.full_bw, graph_meta, bw_args
-            )
-
+    _run_graph_test(
+        pp_mod,
+        graph_modules,
+        graph_meta,
+        sharded_params,
+        buffers,
+        x,
+        fake_evaluate,
+        use_fsdp_collectives=False,
+        use_split_dI_dW=False,
+        use_multiplexed_graph=True,
+    )
     print("All good!")
 
 
@@ -168,7 +322,6 @@ def test_split_fsdp_collectives(
     fake_evaluate: bool = True,
     use_loss_fn: bool = True,
 ):
-
     pp_mod, graph_modules, graph_meta = _get_pp_module_and_graphs(
         model,
         mesh,
@@ -177,50 +330,18 @@ def test_split_fsdp_collectives(
         use_loss_fn=use_loss_fn,
     )
     sharded_params, buffers, x = _get_fw_inputs(pp_mod, eval_input_fn)
-    with (
-        FakeTensorMode(
-            allow_non_fake_inputs=True,
-            shape_env=ShapeEnv(),
-        )
-        if fake_evaluate
-        else nullcontext()
-    ):
-        # # now let's run it
-        with torch.no_grad():
-            unshard_args = list(sharded_params)
-            assert graph_modules.unshard is not None
-            unsharded_params = _run_unshard_module(
-                graph_modules.unshard, graph_meta, unshard_args
-            )
-            fw_args = [*unsharded_params, *buffers, *x]
-            loss_or_output, saved_intermediates = _run_fw_module(
-                graph_modules.fw, graph_meta, fw_args
-            )
-            tangents = [torch.randn_like(loss_or_output)]
-            tensors_for_backward, non_tensors_for_backward = saved_intermediates
-
-            bw_args = [
-                *non_tensors_for_backward,
-                *tensors_for_backward,
-                *tangents,
-            ]
-            del (
-                tensors_for_backward,
-                non_tensors_for_backward,
-                tangents,
-                saved_intermediates,
-            )
-            input_grads, unsharded_param_buffer_grads = _run_full_bw_module(
-                graph_modules.full_bw, graph_meta, bw_args
-            )
-            unsharded_grads = list(unsharded_param_buffer_grads[: len(sharded_params)])
-            del unsharded_param_buffer_grads, input_grads
-            assert graph_modules.reduce_grad is not None
-            sharded_grads = _run_reduce_grad_module(
-                graph_modules.reduce_grad, graph_meta, unsharded_grads
-            )
-            assert len(sharded_grads) == len(sharded_params)
-
+    _run_graph_test(
+        pp_mod,
+        graph_modules,
+        graph_meta,
+        sharded_params,
+        buffers,
+        x,
+        fake_evaluate,
+        use_fsdp_collectives=True,
+        use_split_dI_dW=False,
+        use_multiplexed_graph=True,
+    )
     print("All good!")
 
 
@@ -232,7 +353,6 @@ def test_split_dI_dW(
     fake_evaluate: bool = True,
     use_loss_fn: bool = True,
 ):
-
     pp_mod, graph_modules, graph_meta = _get_pp_module_and_graphs(
         model,
         mesh,
@@ -241,48 +361,18 @@ def test_split_dI_dW(
         use_loss_fn=use_loss_fn,
     )
     sharded_params, buffers, x = _get_fw_inputs(pp_mod, eval_input_fn)
-    with (
-        FakeTensorMode(
-            allow_non_fake_inputs=True,
-            shape_env=ShapeEnv(),
-        )
-        if fake_evaluate
-        else nullcontext()
-    ):
-        # # now let's run it
-        with torch.no_grad():
-            fw_args = [*sharded_params, *buffers, *x]
-            loss_or_output, saved_intermediates = _run_fw_module(
-                graph_modules.fw, graph_meta, fw_args
-            )
-            tangents = [torch.randn_like(loss_or_output)]
-            tensors_for_backward, non_tensors_for_backward = saved_intermediates
-
-            bw_args = [
-                *non_tensors_for_backward,
-                *tensors_for_backward,
-                *tangents,
-            ]
-            del (
-                tensors_for_backward,
-                non_tensors_for_backward,
-                tangents,
-                saved_intermediates,
-            )
-            assert graph_modules.bw_dI is not None
-            input_grads, activations_for_backward = _run_dI_bw_module(
-                graph_modules.bw_dI, graph_meta, bw_args
-            )
-            dw_args = list(activations_for_backward)
-            del activations_for_backward
-            assert graph_modules.bw_dW is not None
-            sharded_param_buffer_grads = _run_dW_bw_module(
-                graph_modules.bw_dW, graph_meta, dw_args
-            )
-            assert len(sharded_param_buffer_grads) == (
-                len(sharded_params) + len(buffers)
-            )
-
+    _run_graph_test(
+        pp_mod,
+        graph_modules,
+        graph_meta,
+        sharded_params,
+        buffers,
+        x,
+        fake_evaluate,
+        use_fsdp_collectives=False,
+        use_split_dI_dW=True,
+        use_multiplexed_graph=True,
+    )
     print("All good!")
 
 
@@ -294,7 +384,6 @@ def test_combined(
     fake_evaluate: bool = True,
     use_loss_fn: bool = True,
 ):
-
     pp_mod, graph_modules, graph_meta = _get_pp_module_and_graphs(
         model,
         mesh,
@@ -303,57 +392,18 @@ def test_combined(
         use_loss_fn=use_loss_fn,
     )
     sharded_params, buffers, x = _get_fw_inputs(pp_mod, eval_input_fn)
-    with (
-        FakeTensorMode(
-            allow_non_fake_inputs=True,
-            shape_env=ShapeEnv(),
-        )
-        if fake_evaluate
-        else nullcontext()
-    ):
-        # # now let's run it
-        with torch.no_grad():
-            unshard_args = list(sharded_params)
-            assert graph_modules.unshard is not None
-            unsharded_params = _run_unshard_module(
-                graph_modules.unshard, graph_meta, unshard_args
-            )
-            fw_args = [*unsharded_params, *buffers, *x]
-            loss_or_output, saved_intermediates = _run_fw_module(
-                graph_modules.fw, graph_meta, fw_args
-            )
-            tangents = [torch.randn_like(loss_or_output)]
-            tensors_for_backward, non_tensors_for_backward = saved_intermediates
-
-            bw_args = [
-                *non_tensors_for_backward,
-                *tensors_for_backward,
-                *tangents,
-            ]
-            del (
-                tensors_for_backward,
-                non_tensors_for_backward,
-                tangents,
-                saved_intermediates,
-            )
-            assert graph_modules.bw_dI is not None
-            input_grads, activations_for_backward = _run_dI_bw_module(
-                graph_modules.bw_dI, graph_meta, bw_args
-            )
-            dw_args = list(activations_for_backward)
-            del activations_for_backward
-            assert graph_modules.bw_dW is not None
-            unsharded_param_buffer_grads = _run_dW_bw_module(
-                graph_modules.bw_dW, graph_meta, dw_args
-            )
-            unsharded_grads = list(unsharded_param_buffer_grads[: len(sharded_params)])
-            del unsharded_param_buffer_grads, input_grads
-            assert graph_modules.reduce_grad is not None
-            sharded_grads = _run_reduce_grad_module(
-                graph_modules.reduce_grad, graph_meta, unsharded_grads
-            )
-            assert len(sharded_grads) == len(sharded_params)
-
+    _run_graph_test(
+        pp_mod,
+        graph_modules,
+        graph_meta,
+        sharded_params,
+        buffers,
+        x,
+        fake_evaluate,
+        use_fsdp_collectives=True,
+        use_split_dI_dW=True,
+        use_multiplexed_graph=True,
+    )
     print("All good!")
 
 

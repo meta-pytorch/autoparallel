@@ -351,7 +351,7 @@ class DebugInterpreter(torch.fx.Interpreter):
                 continue
 
             self._logs.append(
-                f"{node=}, {inputs_or_outputs}[{i}]={torch.hash_tensor(arg)}"
+                f"{node=}, {inputs_or_outputs}[{i}]={torch.hash_tensor(arg)} nan={torch.any(torch.isnan(arg))}"
             )
 
     def run_node(self, n: torch.fx.Node) -> Any:
@@ -439,13 +439,27 @@ class NumericsLogger:
 
             print(f"Weight hashes written to {path}")
 
-    def log_pp_model_weights(self, orig_mod, stage_mods, num_world_stages, ranks):
+    def log_fw_intermediates(self, logs):
+        rank = torch.distributed.get_rank()
+        path = self.dir / f"rank_{rank}_fw_intermediates.log"
+        with open(path, "a") as f:
+            f.write("\n".join(logs) + "\n")
+
+    def log_diff(self, t, rank=0, prefix="?"):
+        if self.rank == rank:
+            path = self.dir / "diff.log"
+            if isinstance(t, torch.distributed.tensor.DTensor):
+                t = t.to_local()
+            with open(path, "a") as f:
+                f.write(f"[{prefix}] hash={hash_tensor(t)}, norm={torch.norm(t)}\n")
+
+    def log_pp_model_weights(self, orig_mod, stage_mods, num_world_stages, should_log):
         path = self.dir / "pp_weights.log"
 
         torch.distributed.barrier()
         # First print the params of every stage
         for i in range(num_world_stages):
-            if self.rank in ranks and i in stage_mods:
+            if should_log and i in stage_mods:
                 param_logs = []
                 real_params = dict(stage_mods[i].named_parameters())
                 for name, _ in orig_mod.named_parameters():
@@ -459,7 +473,7 @@ class NumericsLogger:
 
         # Then print the buffers of every stage
         for i in range(num_world_stages):
-            if self.rank in ranks and i in stage_mods:
+            if should_log and i in stage_mods:
                 buffer_logs = []
                 real_buffers = dict(stage_mods[i].named_buffers())
                 for name, _ in orig_mod.named_buffers():
@@ -473,3 +487,39 @@ class NumericsLogger:
 
         if self.rank == 0:
             print(f"Weight hashes written to {path}")
+
+    def log_pp_grads(self, orig_mod, stage_mods, num_world_stages, should_log):
+        path = self.dir / "diff.log"
+
+        for i in range(num_world_stages):
+            if should_log and i in stage_mods:
+                grad_logs = []
+                real_params = dict(stage_mods[i].named_parameters())
+                for name, _ in orig_mod.named_parameters():
+                    if name not in real_params:
+                        continue
+                    grad = real_params[name].grad
+                    if grad is None:
+                        grad_logs.append(f"[grad {name}] None")
+                    else:
+                        grad = grad.to_local()
+                        grad_logs.append(
+                            f"[grad {name}] hash={hash_tensor(grad)}, norm={torch.norm(grad)}"
+                        )
+                with open(path, "a") as f:
+                    f.write("\n".join(grad_logs) + "\n")
+            torch.distributed.barrier()
+
+
+def debug_boxed_nop_preserve_node_meta(fx_g, example_inputs, numerics_logger):
+    def run(args):
+        with torch.fx.traceback.preserve_node_meta():
+            interp = DebugInterpreter(fx_g)
+            out = interp.boxed_run(args)
+            mylogs = interp.get_logs()
+            if numerics_logger:
+                numerics_logger.log_fw_intermediates(mylogs)
+            return out
+
+    run._boxed_call = True
+    return run

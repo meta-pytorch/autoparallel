@@ -15,8 +15,11 @@ import torch.nn as nn
 from torch._logging import trace_structured
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.distributed.pipelining.schedules import (
+    BACKWARD_INPUT,
+    BACKWARD_WEIGHT,
     FORWARD,
     FULL_BACKWARD,
+    OVERLAP_F_B,
     REDUCE_GRAD,
     RESHARD,
     UNSHARD,
@@ -45,6 +48,10 @@ from autoparallel.graph_pp_runner import (
     GraphMeta,
     GraphPipelineStage,
     GraphPPRunner,
+    get_multiplexed_graph_callables,
+    overlap_fw_bw,
+    stage_backward_input,
+    stage_backward_weight,
     stage_forward,
     stage_full_backward,
     stage_reduce_grad,
@@ -60,6 +67,24 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def assign_logical_stages_to_pp_rank(
+    schedule_name: str, pp_degree: int, stages_per_rank: int
+) -> dict[int, list[int]]:
+    style = "v" if schedule_name in ("ZBVZeroBubble", "DualPipeV") else "loop"
+    if style == "loop":
+        pp_rank_to_stage_indices = {
+            pp_rank: [pp_rank + s * pp_degree for s in range(stages_per_rank)]
+            for pp_rank in range(pp_degree)
+        }
+    elif style == "v":
+        total_pp_stages = pp_degree * stages_per_rank
+        pp_rank_to_stage_indices = {
+            pp_rank: [pp_rank, total_pp_stages - 1 - pp_rank]
+            for pp_rank in range(pp_degree)
+        }
+    return pp_rank_to_stage_indices
+
+
 def build_pipeline_schedule(
     stages: list[PipelineStage],
     loss_fn: Callable,
@@ -68,6 +93,7 @@ def build_pipeline_schedule(
     local_batch_size: int,
     pipeline_parallel_degree: int,
     backward_requires_autograd: bool = False,
+    scale_grads: bool = True,
 ) -> _PipelineSchedule:
     """Builds a pipeline schedule for the given configuration and stages."""
     schedule_class = get_schedule_class(pipeline_parallel_schedule)
@@ -93,6 +119,7 @@ def build_pipeline_schedule(
         n_microbatches=n_microbatches,
         loss_fn=loss_fn,
         backward_requires_autograd=backward_requires_autograd,
+        scale_grads=scale_grads,
     )
     logger.info(
         f"Using pipeline schedule {pipeline_parallel_schedule} "
@@ -102,7 +129,11 @@ def build_pipeline_schedule(
 
 
 def run_test(
-    fake_evaluate: bool, use_loss_fn: bool, rng_seed: Optional[int], logs_dir: str
+    fake_evaluate: bool,
+    use_loss_fn: bool,
+    schedule_name: str,
+    rng_seed: Optional[int],
+    logs_dir: str,
 ):
     if not fake_evaluate:
         pp_degree = 2
@@ -166,9 +197,9 @@ def run_test(
     # This is the spmd mesh to be used for tracing
     mesh = world_mesh[("dp_mod_ep", "ep")]
 
-    global_batch_size = 32 * dp_degree
     # Batch size that will be supplied to the schedule and will be broken down into microbatches
-    local_batch_size = global_batch_size // dp_degree
+    local_batch_size = 32
+    # global_batch_size = local_batch_size * dp_degree
     n_microbatches = 16
     # Batch size with which the spmd graphs will actually be executed
     microbatch_size = local_batch_size // n_microbatches
@@ -344,16 +375,40 @@ def run_test(
         virtual_pp_stages.append(
             DeepSeekV3StageN(layers[total_pp_stages - 1], norm, output, config)
         )
-    # Step 2. Assign each logical stage(s) to pp ranks for Interleaved1F1B schedule
-    pp_rank_to_stage_indices: dict[int, list[int]] = {
-        rank: [rank + i * pp_degree for i in range(stages_per_rank)]
-        for rank in range(pp_degree)
-    }
+    # Step 2. Assign each logical stage(s) to pp ranks for the given schedule
+    pp_rank_to_stage_indices = assign_logical_stages_to_pp_rank(
+        schedule_name, pp_degree, stages_per_rank
+    )
     print(pp_rank_to_stage_indices)
     assert len(pp_rank_to_stage_indices) == pp_degree
     for stages in pp_rank_to_stage_indices.values():
         assert len(stages) * pp_degree == len(virtual_pp_stages)
     stage_indices_current_pp_rank = pp_rank_to_stage_indices[pp_rank]
+    if rng_seed:
+        # Compute the ranks to log from
+        # 1. for fw_outs, log from coord [pp_rank_containing_last_stage, 0, 0]
+        last_stage_idx = total_pp_stages - 1
+        pp_rank_containing_last_stage = None
+        for pp_rank_, stage_indices in pp_rank_to_stage_indices.items():
+            if last_stage_idx in stage_indices:
+                assert pp_rank_containing_last_stage is None
+                pp_rank_containing_last_stage = pp_rank_
+
+        log_fw_out_rank_coordinate = []
+        for mesh_dim_name in world_mesh.mesh_dim_names:
+            if mesh_dim_name == "pp":
+                log_fw_out_rank_coordinate.append(pp_rank_containing_last_stage)
+            else:
+                log_fw_out_rank_coordinate.append(0)
+        should_log_fw_outs = world_mesh.get_coordinate() == log_fw_out_rank_coordinate
+
+        # 2. for weights, log from coords [:, 0, 0]
+        pp_world_size = world_mesh.shape[world_mesh._get_mesh_dim_by_name("pp")]
+        log_weights_rank_coordinates = [(i, 0, 0) for i in range(pp_world_size)]
+        should_log_weights = (
+            tuple(world_mesh.get_coordinate()) in log_weights_rank_coordinates
+        )
+
     stage_mods: dict[int, torch.nn.Module] = {}
     stage_graphs: dict[int, GraphCallables] = {}
     stage_graph_metas: dict[int, GraphMeta] = {}
@@ -420,7 +475,14 @@ def run_test(
                     autop.add_output_constraints([x_sharding])
 
                 sharding_placement = autop.optimize_placement(verbose=False)
-                cache = autop.apply_placement_pp(sharding_placement)
+                graph_passes = ["split_fsdp_collectives"]
+                if stage_idx > 0:
+                    # First stage does not produce gradients wrt to input,
+                    # hence we do not do apply the split_dI_dW pass
+                    graph_passes.extend(["split_dI_dW"])
+                cache = autop.apply_placement_pp(
+                    sharding_placement=sharding_placement, graph_passes=graph_passes
+                )
                 graph_callables = cache["graph_callables"]
                 graph_meta = cache["graph_meta"]
                 pp_mod = AutoParallelPPModule(
@@ -472,10 +534,14 @@ def run_test(
 
     world_size = torch.distributed.get_world_size()
     num_world_stages = world_size * len(stage_mods)
+
+    numerics_logger = None
     if rng_seed is not None:
-        NumericsLogger(logs_dir).log_pp_model_weights(
-            model, stage_mods, num_world_stages, ranks=[0, 4]
+        numerics_logger = NumericsLogger(logs_dir)
+        numerics_logger.log_pp_model_weights(
+            model, stage_mods, num_world_stages, should_log=should_log_weights
         )
+        torch.manual_seed(rng_seed)
 
     stages = []
     # Step 4. Construct pipeline stages for this pp_rank using the stage modules, graphs and metadata
@@ -498,27 +564,37 @@ def run_test(
                 else shape_inference_fn_intermediate_stage()
             ),
             group=world_mesh.get_group("pp"),
+            numerics_logger=numerics_logger,
+            should_log_fw_outs=should_log_fw_outs,
         )
         stages.append(stage)
+
     # Step 5. Construct the pipeline runner using the pipeline stages for this pp_rank
     schedule = build_pipeline_schedule(
         stages=stages,
         loss_fn=None,
-        pipeline_parallel_schedule="Interleaved1F1B",
+        pipeline_parallel_schedule=schedule_name,
         microbatch_size=microbatch_size,
         local_batch_size=local_batch_size,
         pipeline_parallel_degree=pp_degree,
         backward_requires_autograd=False,
+        scale_grads=rng_seed is None,  # In determinism mode, don't scale grads
     )
     assert isinstance(schedule, _PipelineScheduleRuntime)
+
     # Step 6. Override the pipeline runner's action implementations
-    schedule.register_custom_function(
-        FORWARD, functools.partial(stage_forward, numerics_logs=None)
-    )
+    schedule.register_custom_function(FORWARD, stage_forward)
     schedule.register_custom_function(FULL_BACKWARD, stage_full_backward)
     schedule.register_custom_function(REDUCE_GRAD, stage_reduce_grad)
     schedule.register_custom_function(RESHARD, stage_reshard)
     schedule.register_custom_function(UNSHARD, stage_unshard)
+    schedule.register_custom_function(BACKWARD_INPUT, stage_backward_input)
+    schedule.register_custom_function(BACKWARD_WEIGHT, stage_backward_weight)
+    if schedule_name == "DualPipeV":
+        multiplexed_graph_callables = get_multiplexed_graph_callables(stage_graphs)
+        schedule.register_custom_function(
+            OVERLAP_F_B, functools.partial(overlap_fw_bw, multiplexed_graph_callables)
+        )
 
     # Step 7. Register the schedule with the graph runner
 
@@ -542,6 +618,10 @@ def run_test(
             )
             if pp_rank == 0:
                 x = runtime_input_fn_first_stage()
+                if rng_seed:
+                    numerics_logger.log_diff(
+                        x.to(torch.float32), prefix="full batch input"
+                    )
                 graph_pp_runner.step(
                     x, target=target, losses=losses, return_outputs=False
                 )
@@ -555,6 +635,10 @@ def run_test(
                 },
                 payload_fn=lambda: f"losses: {losses}",
             )
+
+        numerics_logger.log_pp_grads(
+            model, stage_mods, num_world_stages, should_log=should_log_weights
+        )
 
     print("All good!")
 
@@ -594,6 +678,13 @@ if __name__ == "__main__":
         default="out/",
         help="Directory to store logs (default: ./out/).",
     )
+    parser.add_argument(
+        "--schedule-name",
+        type=str,
+        default="DualPipeV",
+        choices=["Interleaved1F1B", "ZBVZeroBubble", "DualPipeV"],
+        help="Schedule to use for PP",
+    )
     args = parser.parse_args()
 
     if args.rng_seed is not None:
@@ -603,6 +694,7 @@ if __name__ == "__main__":
     run_test(
         fake_evaluate=args.fake_evaluate,
         use_loss_fn=args.use_loss_fn,
+        schedule_name=args.schedule_name,
         rng_seed=args.rng_seed,
         logs_dir=args.logs_dir,
     )

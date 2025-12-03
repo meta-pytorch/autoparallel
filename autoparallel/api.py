@@ -4,6 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import copy
+import functools
 import itertools
 import warnings
 from contextlib import ExitStack, contextmanager
@@ -42,7 +43,11 @@ from .graph_utils import (
 )
 from .init_weights import hook_params_setters
 from .optimize_sharding import ShardingOptimizer
-from .utils import _get_device_from_mesh
+from .utils import (
+    NumericsLogger,
+    _get_device_from_mesh,
+    debug_boxed_nop_preserve_node_meta,
+)
 
 _APPLY_VIEW_MM_VIEW_PATTERN = False
 
@@ -213,6 +218,7 @@ class AutoParallel:
         reshard_after_forward: bool = True,
         dynamic: bool = False,
         loss_fn: Optional[Callable] = None,
+        numerics_logger: NumericsLogger | None = None,
         **kwargs,
     ):
         self.stack = ExitStack()
@@ -240,7 +246,14 @@ class AutoParallel:
         self.model = move_to_fake(model, self.fake_mode, device)
         self.input_fn = input_fn
         self.mesh = mesh
-        self.compiler_fn = compile_fx_inner if compile else boxed_nop_preserve_node_meta
+        if compile:
+            self.compiler_fn = compile_fx_inner
+        elif numerics_logger:
+            self.compiler_fn = functools.partial(
+                debug_boxed_nop_preserve_node_meta, numerics_logger=numerics_logger
+            )
+        else:
+            self.compiler_fn = boxed_nop_preserve_node_meta  # type: ignore[assignment]
         self.enable_ac = enable_ac
         self.ac_stage_size_in_GiB = ac_stage_size_in_GiB
         self.reshard_after_forward = reshard_after_forward
@@ -668,10 +681,14 @@ class AutoParallelPP(AutoParallel):
         assert num_params_buffers == (
             num_params + num_buffers
         ), f"num_params_buffers: {num_params_buffers}, num_params: {num_params}, num_buffers: {num_buffers}"
+        num_input_grads = (
+            len(bw_module.graph.find_nodes(op="output")[0].args[0]) - num_params_buffers
+        )
         print(
             f"num_params_buffers: {num_params_buffers}\n"
             f"num_user_outputs: {num_user_outputs}\n"
             f"num_mutate_inputs: {num_mutate_inputs}\n"
+            f"num_input_grads: {num_input_grads}\n"
             f"num_fw_outs_saved_for_bw: {num_fw_outs_saved_for_bw}\n"
             f"num_symints_saved_for_bw: {num_symints_saved_for_bw}"
         )
@@ -754,7 +771,6 @@ class AutoParallelPP(AutoParallel):
 
         bw_dI_module: Optional[torch.fx.GraphModule] = None
         bw_dW_module: Optional[torch.fx.GraphModule] = None
-        num_input_grads = 0
         if "split_dI_dW" in graph_passes:
             from autoparallel._passes.split_di_dw_graph import split_di_dw_graph
 

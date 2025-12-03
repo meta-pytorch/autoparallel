@@ -67,10 +67,17 @@ def update_joint_with_descriptors(
 
     tangent_idx = len(joint_with_descriptors._aot_state.flat_args)
     new_local_tangents = new_local_args[tangent_idx:]
-    joint_with_descriptors._aot_graph_capture.updated_flat_args = (
-        new_flat_args,
-        new_local_tangents,
-    )
+
+    # For inference mode (no tangents), updated_flat_args should be a list.
+    # For autograd mode (with tangents), it should be a tuple of (primals, tangents).
+    if new_local_tangents:
+        joint_with_descriptors._aot_graph_capture.updated_flat_args = (
+            new_flat_args,
+            new_local_tangents,
+        )
+    else:
+        joint_with_descriptors._aot_graph_capture.updated_flat_args = new_flat_args
+
     joint_with_descriptors._aot_state.flat_args = new_flat_args
     joint_with_descriptors._aot_state.fw_metadata.traced_tangents = new_local_tangents
 
