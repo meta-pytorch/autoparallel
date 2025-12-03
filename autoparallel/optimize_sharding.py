@@ -77,6 +77,7 @@ The solver finds the globally optimal sharding strategy that minimizes total
 runtime cost while satisfying all constraints.
 """
 
+import logging
 import math
 import operator
 import time
@@ -104,6 +105,8 @@ from .compute_estimation import (
 from .graph_clustering import get_identical_regions
 from .propagation_rules import _create_all_options
 from .utils import get_local_map_placement_option, get_placement_options
+
+logger = logging.getLogger(__name__)
 
 
 def _debug_node(node):
@@ -924,11 +927,16 @@ class ShardingOptimizer:
             ), f"{node}, {len(strat0.redistribute_cost)}, {num_input_nodes}"
             ospec = strat0.output_specs
             if isinstance(ospec, (list, tuple)):
-                for spec in ospec:
-                    if spec:
-                        assert (
-                            spec.tensor_meta is not None
-                        ), f"{node} doesn't have a tensor_meta"
+                for i, spec in enumerate(ospec):
+                    if spec is not None:
+                        if spec.tensor_meta is None:
+                            # PyTorch DTensor strategy can legitimately populate DTensorSpec without tensor_meta.
+                            # In such cases, we attempt to do fake tensor propagation to populate tensor_meta, but
+                            # for some ops, one or more outputs can legtimiately be None depending on inputs
+                            # (e.g., convolution.backward with certain output_mask).
+                            logger.warning(
+                                f"Output #{i} spec {spec} for `{node}` has no tensor_meta"
+                            )
             elif ospec is None:
                 # e.g. getitem on scalars
                 pass
