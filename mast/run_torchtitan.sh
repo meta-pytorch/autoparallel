@@ -78,4 +78,5 @@ python torchtitan/train.py \
 --validation.dataset_path "${dataset_path}" \
 --metrics.save_tb_folder "${save_tb_folder}" \
 --metrics.disable_color_printing \
+--job.save_config_file "params.json" \
 $overrides
