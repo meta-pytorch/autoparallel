@@ -183,9 +183,8 @@ def _run_graph_test(
     """Execute forward and backward passes with specified graph options."""
     if use_multiplexed_graph:
         multiplexed_fw_bw_module = multiplex_fw_bw_graph(
-            graph_modules.fw, graph_modules.full_bw
+            graph_modules.fw, graph_modules.full_bw, overlap_with_annotations=True
         )
-
     with (
         FakeTensorMode(
             allow_non_fake_inputs=True,
