@@ -102,12 +102,14 @@ class aten_autobucketing_config:
 
     max_in_flight_gb = 2.0
     compute_overlap_multipler = 1.0
-    max_coll_distance = 100
+    max_coll_distance = 200
     custom_runtime_estimation = None
-    max_compute_pre_fetch = 5
+    max_compute_pre_fetch = 200
     collective_bucketing = False
     save_trace = True
     _counter = 0
+    max_memory_increase_gb = 4.0
+    max_memory_increase_ratio = None
 
 
 def aten_autobucketing_reordering_pass(
@@ -121,6 +123,8 @@ def aten_autobucketing_reordering_pass(
         compute_overlap_multipler=configs.compute_overlap_multipler,
         max_in_flight_gb=configs.max_in_flight_gb,
         max_coll_distance=configs.max_coll_distance,
+        max_memory_increase_gb=configs.max_memory_increase_gb,
+        max_memory_increase_ratio=configs.max_memory_increase_ratio,
     )
     new_gm.recompile()
 

@@ -1893,12 +1893,36 @@ if False:
     o = model(*x)
     exit()
 
+from autoparallel.auto_bucketing import (
+    aten_autobucketing_config,
+    aten_autobucketing_reordering_pass,
+    configure_inductor_for_autobucketing,
+)
+from autoparallel.debug_helpers import make_custom_runtime_estimation
+
+autobucketing_level = "aten"
+if autobucketing_level == "aten":
+    aten_autobucketing_config.custom_runtime_estimation = (
+        make_custom_runtime_estimation(mesh)
+    )
+    # this is from the stacked pr in https://github.com/pytorch/pytorch/pull/163960
+    torch._inductor.config.reorder_for_peak_memory = False
+    torch._inductor.config.reorder_for_compute_comm_overlap = False
+    aten_autobucketing_reordering_pass = partial(
+        aten_autobucketing_reordering_pass,
+        configs=aten_autobucketing_config,
+    )
+    torch._inductor.config.post_grad_custom_post_pass = (
+        aten_autobucketing_reordering_pass
+    )
+
+
 with AutoParallel(
     model,
     input_fn,
     mesh,
     mp_policy,
-    compile=False,
+    compile=True,
     repeated_subgraphs=False,  # True
 ) as autop:
     autop.add_parameter_memory_constraint(low=None, high=None)
