@@ -48,7 +48,8 @@ jobs:
 
         # Run TorchTitan training with AutoParallel
         NGPU=4 CONFIG_FILE="./torchtitan/models/llama3/train_configs/debug_model.toml" ./run_train.sh \
-          --model.name auto_parallel.llama3 \
+          --model.name autoparallel.llama3 \
           --parallelism.tensor_parallel_degree 4 \
           --training.dataset c4 \
           --compile.enable
+          --job.custom_config_module=torchtitan.experiments.autoparallel.job_config
