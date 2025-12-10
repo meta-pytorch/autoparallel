@@ -120,6 +120,8 @@ def remove_invalid_configs(out_strat, mesh):
         for spec in specs:
             if spec is None:
                 continue
+            if spec.tensor_meta is None:
+                continue
             shape = list(spec.tensor_meta.shape)
             for mesh_shape, plc in zip(mesh.shape, spec.placements):
                 if plc.is_shard():
