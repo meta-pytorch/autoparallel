@@ -41,8 +41,8 @@ jobs:
         pip install --no-input --quiet --pre torch --index-url https://download.pytorch.org/whl/nightly/cu126
         pip install --quiet .
 
-        # Clone TorchTitan on autoparallel branch
-        git clone --branch autoparallel https://github.com/pytorch/torchtitan.git
+        # Clone TorchTitan
+        git clone https://github.com/pytorch/torchtitan.git
         cd torchtitan
         pip install --quiet -r requirements.txt
 
