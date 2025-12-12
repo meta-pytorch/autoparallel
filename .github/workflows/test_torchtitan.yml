@@ -51,5 +51,5 @@ jobs:
           --model.name autoparallel.llama3 \
           --parallelism.tensor_parallel_degree 4 \
           --training.dataset c4 \
-          --compile.enable
+          --compile.enable \
           --job.custom_config_module=torchtitan.experiments.autoparallel.job_config
