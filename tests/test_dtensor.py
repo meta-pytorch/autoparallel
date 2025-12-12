@@ -16,7 +16,6 @@ from torch.distributed.tensor._op_schema import (
     OpSpec,
     OpStrategy,
     OutputSharding,
-    OutputSpecType,
     RuntimeSchemaInfo,
     TupleStrategy,
 )
@@ -241,7 +240,7 @@ class CustomShardingPropagator(
                     # for ops that return multiple tensors and the output_specs is not
                     # a tuple, we use a tuple of that single output spec as the new
                     # output_specs
-                    output_specs: OutputSpecType = output_strategy.output_specs
+                    output_specs = output_strategy.output_specs
                     if isinstance(output_specs, DTensorSpec):
                         output_specs = tuple(
                             [

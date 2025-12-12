@@ -9,6 +9,9 @@ import torch
 import torch.distributed.distributed_c10d as c10d
 from torch.distributed._tensor.experimental import local_map as _local_map
 
+# Import GroupName for type checking
+GroupName = c10d.GroupName
+
 _local_map_device_mesh = None
 
 
@@ -51,7 +54,7 @@ def axis_index(axis_name):
 def _all_gather_tensor(
     x: torch.Tensor,
     gather_dim: int,
-    group_name: str,
+    group_name: GroupName,
 ) -> torch.Tensor:
     x = x.contiguous()
     group_size = c10d._get_group_size_by_name(group_name)
@@ -67,7 +70,7 @@ def _all_gather_tensor(
 
 
 def _reduce_scatter_tensor(
-    self: torch.Tensor, reduceOp: str, scatter_dim: int, group_name: str
+    self: torch.Tensor, reduceOp: str, scatter_dim: int, group_name: GroupName
 ):
     group_size = c10d._get_group_size_by_name(group_name)
 
@@ -88,7 +91,7 @@ def _reduce_scatter_tensor(
     return res
 
 
-def _all_reduce(self: torch.Tensor, reduceOp: str, group_name: str):
+def _all_reduce(self: torch.Tensor, reduceOp: str, group_name: GroupName):
     tensor = torch.ops._c10d_functional.all_reduce(self, reduceOp.lower(), group_name)
     res = torch.ops._c10d_functional.wait_tensor(tensor)
     return res
@@ -98,7 +101,7 @@ def _all_to_all(
     self: torch.Tensor,
     output_split_sizes: Optional[list[int]],
     input_split_sizes: Optional[list[int]],
-    group_name: str,
+    group_name: GroupName,
 ):
     group_size = c10d._get_group_size_by_name(group_name)
     if output_split_sizes is None or input_split_sizes is None:
