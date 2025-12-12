@@ -358,3 +358,63 @@ def test_inference_mode_compilation(device_mesh_1d):
         ]
         # Should only have 2 placeholders: weight and input (no tangents for inference)
         assert len(placeholders) == 2
+
+
+def test_convolution_forward_backward(device_mesh_1d):
+    """Test that convolution operations work with forward and backward passes.
+    Convolution backward has multiple outputs, some of which can be None. In such cases,
+    we don't want AutoParallel to assert on tensor_meta being populated.
+    """
+    in_channels = 3
+    out_channels = 64
+    kernel_size = 3
+
+    class SimpleConvNet(nn.Module):
+        """Simple network with a single Conv2d operation."""
+
+        def __init__(self, in_channels, out_channels, kernel_size):
+            super().__init__()
+            self.conv = nn.Conv2d(
+                in_channels,
+                out_channels,
+                kernel_size,
+                padding=kernel_size // 2,
+                bias=False,
+            )
+
+        def forward(self, x):
+            return self.conv(x)
+
+    def input_fn():
+        return torch.rand(256, in_channels, 224, 224, device="cuda")
+
+    # Create model on meta device
+    with torch.device("meta"):
+        model = SimpleConvNet(in_channels, out_channels, kernel_size)
+
+    with AutoParallel(model, input_fn, device_mesh_1d, compile=True) as autop:
+        x_sharding = (Replicate(),)
+        autop.add_input_constraints([x_sharding])
+        autop.add_output_constraints([x_sharding])
+
+        sharding_placement = autop.optimize_placement()
+        parallel_mod = autop.apply_placement(sharding_placement)
+
+        # Verify the model was created successfully
+        assert parallel_mod is not None
+        assert hasattr(autop, "parallel_gm")
+
+        # Verify that both convolution.default and convolution_backward.default
+        # are in the parallel graph
+        parallel_graph_ops = {
+            n.target for n in autop.parallel_gm.graph.nodes if n.op == "call_function"
+        }
+        assert torch.ops.aten.convolution.default in parallel_graph_ops
+        assert torch.ops.aten.convolution_backward.default in parallel_graph_ops
+
+        # Verify sharding strategies were computed for all nodes
+        for node in autop.gm.graph.nodes:
+            if node.op == "call_function":
+                assert node in autop.sharding_optimizer.strats
+                strats = autop.sharding_optimizer.strats[node]
+                assert len(strats.strategies) > 0, f"No strategies for {node}"

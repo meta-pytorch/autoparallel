@@ -120,6 +120,8 @@ def remove_invalid_configs(out_strat, mesh):
         for spec in specs:
             if spec is None:
                 continue
+            if spec.tensor_meta is None:
+                continue
             shape = list(spec.tensor_meta.shape)
             for mesh_shape, plc in zip(mesh.shape, spec.placements):
                 if plc.is_shard():
@@ -695,11 +697,22 @@ def sdpa_rule(op, mesh, op_schema):
     # remove wrong context-parallel strategy
     # https://github.com/pytorch/pytorch/pull/131351#discussion_r1716164659
     new_strats = []
+    mesh = out_strat.mesh
+
+    def none_to_replicate(spec):
+        if spec is None:
+            return DTensorSpec(mesh=mesh, placements=(Replicate(),) * mesh.ndim)
+        return spec
+
     for ss in out_strat.strategies:
         if (
             torch.distributed.tensor.placement_types.Shard(2)
             not in ss.input_specs[0].placements
         ):
+            # convert None placements to Replicate, we should do it
+            # directly in PyTorch and remove this implicit behavior where
+            # None can be Replicate
+            ss.output_specs = tuple(map(none_to_replicate, ss.output_specs))
             new_strats.append(ss)
     out_strat.strategies = new_strats
     return out_strat
@@ -888,4 +901,68 @@ def stack_strategy(mesh, op_schema: OpSchema):
     s = expand_to_full_mesh_op_strategy(
         mesh, op_schema, single_mesh_dim_strategies, input_index=1
     )
+    return s
+
+
+@register_opschema_rule(torch.ops.aten.convolution_backward.default)
+def conv_backward_strategy(mesh, op_schema: OpSchema):
+    from torch.distributed.tensor._ops._tensor_ops import (
+        PlacementList,
+        cast,
+        expand_to_full_mesh_op_strategy,
+    )
+
+    (
+        grad_o_strategy,
+        input_strategy,
+        weight_strategy,
+        bias_shape,
+        stride,
+        padding,
+        dilation,
+        transposed,
+        output_padding,
+        groups,
+        output_mask,
+    ) = op_schema.args_schema
+
+    bias_shape = cast(list[int], bias_shape)
+    output_mask = cast(tuple[bool, bool, bool], output_mask)
+
+    has_bias = bias_shape[0] > 0
+
+    possible_input_strategies: PlacementList = [Replicate(), Shard(0)]
+    possible_weight_strategies: PlacementList = [Replicate()]
+
+    single_mesh_dim_strategies = []
+
+    for input_strategy, weight_strategy in itertools.product(
+        possible_input_strategies, possible_weight_strategies
+    ):
+        out_strategy = []
+        if output_mask[0]:
+            out_strategy.append(input_strategy)
+        else:
+            out_strategy.append(Replicate())
+        if output_mask[1]:
+            out_strategy.append(weight_strategy)
+        else:
+            out_strategy.append(Replicate())
+        if output_mask[2] and has_bias:
+            out_strategy.append(weight_strategy)
+        else:
+            out_strategy.append(Replicate())
+        bias_strategy = [weight_strategy] if has_bias else []
+        strategy: PlacementList = (
+            out_strategy
+            + [input_strategy, input_strategy, weight_strategy]
+            + bias_strategy
+        )
+        single_mesh_dim_strategies.append(strategy)
+
+    input_index = 3  # sum(output_mask)
+    s = expand_to_full_mesh_op_strategy(
+        mesh, op_schema, single_mesh_dim_strategies, input_index=input_index
+    )
+    # from IPython import embed; embed(); exit()
     return s

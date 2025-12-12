@@ -37,11 +37,20 @@ def _get_meta_tensors_for_op(op, user_args, user_kwargs):
     out_t = op(*user_args, **user_kwargs)
 
     if isinstance(out_t, torch.Tensor):
-        out_tensor_meta = TensorMeta(out_t.shape, out_t.stride(), out_t.dtype)
+        out_tensor_metas = TensorMeta(out_t.shape, out_t.stride(), out_t.dtype)
     else:
-        out_tensor_meta = tree_map_only(
+        out_tensor_metas = tree_map_only(
             torch.Tensor, lambda x: TensorMeta(x.shape, x.stride(), x.dtype), out_t
         )
+    # out_tensor_metas = tree_flatten(out_t)[0]
+    # out_tensor_metas = tree_map_only(
+    #     torch.Tensor,
+    #     lambda x: TensorMeta(x.shape, x.stride(), x.dtype),
+    #     out_tensor_metas,
+    # )
+    # out_tensor_metas = tuple(
+    #     x for x in out_tensor_metas if isinstance(x, TensorMeta)
+    # )
 
     input_tensor_metas = tree_flatten(user_args)[0]
     input_tensor_metas = tree_map_only(
@@ -52,33 +61,33 @@ def _get_meta_tensors_for_op(op, user_args, user_kwargs):
     input_tensor_metas = tuple(
         x for x in input_tensor_metas if isinstance(x, TensorMeta)
     )
-    return out_tensor_meta, input_tensor_metas
+    return out_tensor_metas, input_tensor_metas
 
 
 def propagate_tensor_meta(op, user_args, user_kwargs, out_strat):
-    new_tensor_meta, tensor_metas = _get_meta_tensors_for_op(op, user_args, user_kwargs)
+    out_tensor_meta, tensor_metas = _get_meta_tensors_for_op(op, user_args, user_kwargs)
 
     for strat in out_strat.strategies:
-        if isinstance(new_tensor_meta, TensorMeta):
-            strat.output_spec.tensor_meta = new_tensor_meta
+        if isinstance(out_tensor_meta, TensorMeta):
+            strat.output_spec.tensor_meta = out_tensor_meta
         else:
             # This is basically trying to workaround this behavior of DTensor
             # https://github.com/pytorch/pytorch/pull/159205#issuecomment-3121562920
             # would be good to have changed in main
             new_output_specs = []
-            mesh = strat.mesh
-            for ospec, tm in zip(strat.output_specs, new_tensor_meta):
+            # mesh = strat.mesh
+            for ospec, tm in zip(strat.output_specs, out_tensor_meta):
                 # replace None with Replicate() in the output_spec
                 # as this is done by default but somewhere further
                 # down the line in DTensor
-                if ospec is None and isinstance(tm, TensorMeta):
-                    ospec = DTensorSpec(
-                        mesh=mesh, placements=(Replicate(),) * mesh.ndim
-                    )
+                # if ospec is None and isinstance(tm, TensorMeta):
+                #     ospec = DTensorSpec(
+                #         mesh=mesh, placements=(Replicate(),) * mesh.ndim
+                #     )
                 new_output_specs.append(ospec)
             strat.output_specs = tuple(new_output_specs)
 
-            for ospec, tm in zip(strat.output_specs, new_tensor_meta):
+            for ospec, tm in zip(strat.output_specs, out_tensor_meta):
                 if ospec is not None:
                     if ospec.tensor_meta != tm:
                         # This is overcoming some limitations of the lack of
