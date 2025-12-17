@@ -5,7 +5,7 @@ pytest >= 8.1
 expecttest
 psutil
 
-black == 22.3.0
+black == 24.3.0
 flake8 == 6.1.0
 flake8-copyright
 isort == 5.7.0
