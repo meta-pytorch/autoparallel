@@ -14,8 +14,11 @@ import torch.fx.node
 import torch.utils._pytree as pytree
 from torch._functorch._aot_autograd.descriptors import AOTOutput
 from torch._functorch.partitioners import _extract_graph_with_inputs_outputs
-from torch._inductor.fx_passes.bucketing import (
-    is_all_gather_into_tensor,
+
+from autoparallel.activation_checkpointing import (
+    find_last_all_gather_in_chain,
+    find_last_non_view_node_in_chain,
+    find_last_user_in_wait_chain,
     is_reduce_scatter_tensor,
     is_wait_tensor,
 )
@@ -63,23 +66,24 @@ def split_fsdp_prefetch(
     prefetch_g_outs_map = []
 
     for param_g_in in param_g_ins:
-        n = param_g_in
-        last_ag = None
-        while True:
-            if len(n.users) != 1:
-                break
-            user = next(iter(n.users))
-            if len(user.all_input_nodes) > 1:
-                break
-            n = user
-            if is_all_gather_into_tensor(n):
-                last_ag = n
-        if last_ag is None:
+        # 1. Find last all_gather from each placeholder
+        last_ag_node = find_last_all_gather_in_chain(param_g_in)
+        if last_ag_node is None:
             prefetch_g_outs_map.append(param_g_in)
         else:
-            w_n = next(iter(last_ag.users))
-            assert is_wait_tensor(w_n)
-            prefetch_g_outs_map.append(w_n)
+            # 2. Find last wait_tensor from last all_gather
+            last_ag_wait_node = next(iter(last_ag_node.users))
+            assert is_wait_tensor(last_ag_wait_node)
+
+            # 3. Continue the linear chain from the last wait_tensor
+            last_wait_chain_user = find_last_user_in_wait_chain(last_ag_wait_node)
+
+            # 4. Get the last non-view node in the wait chain
+            last_non_view_wait_chain_user = find_last_non_view_node_in_chain(
+                last_wait_chain_user
+            )
+
+            prefetch_g_outs_map.append(last_non_view_wait_chain_user)
 
     prefetch_g_outs = prefetch_g_outs_map
     prefetch_g_outs_descs: list[AOTOutput] = [
