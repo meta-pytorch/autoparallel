@@ -454,5 +454,6 @@ def ac_joint_pass(
         torch.ops.aten.mm.default,
         torch.ops.aten._scaled_dot_product_efficient_attention.default,
         torch.ops.aten._scaled_dot_product_flash_attention.default,
+        torch.ops.aten._scaled_dot_product_cudnn_attention.default,
     }
     _apply_ac_policy(graph, save_list=save_list)
