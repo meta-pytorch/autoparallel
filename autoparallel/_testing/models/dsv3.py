@@ -16,7 +16,7 @@ from torch import nn
 
 # from torchtitan.distributed.expert_parallel import expert_parallel
 from torch.distributed.tensor import DeviceMesh, DTensor
-from torch.distributed.tensor.placement_types import Replicate, Shard
+from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from autoparallel.collectives import all_to_all, axis_size, local_map
@@ -773,7 +773,7 @@ def local_mapped_region(
     routed_output = routed_output.view(shape)
 
     out = out.scatter_add(dim=1, index=token_indices_experts_sorted, src=routed_output)
-    return out, total_tokens_per_expert[None, :]
+    return out, total_tokens_per_expert
 
 
 # @local_mapped_region.register_fake
@@ -955,7 +955,10 @@ def _moe_forward(
     # [selected_experts_indices, top_scores_1, rms_norm_2, v_2, v_4, v_3, out]
     out, num_tokens_per_expert = local_map(
         local_mapped_region,
-        out_placements=((Shard(0), Shard(0)), (Shard(0), Shard(0))),
+        out_placements=(
+            (Shard(0), Shard(0)),
+            (Partial(reduce_op="sum"), Partial(reduce_op="sum")),
+        ),
         in_placements=reordered_placements,
         redistribute_inputs=True,
         in_grad_placements=None,
@@ -986,7 +989,7 @@ def _moe_forward(
 
     # assert False, f"{out.shape}, {token_indices_experts_sorted.shape}, {routed_output.shape}"
     out = out.reshape(bs, slen, dim)
-    return out, num_tokens_per_expert.sum(0)
+    return out, num_tokens_per_expert
 
 
 @dataclass
