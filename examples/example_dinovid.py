@@ -1670,100 +1670,6 @@ class LayerScale(nn.Module):
         return x * self.gamma
 
 
-@torch.library.custom_op("autoparallel::generate_mask", mutates_args=())
-def generate_mask(
-    height: int,
-    width: int,
-    box_scale: list[float],
-    box_ratio: list[float],
-    box_count: int,  # Generate at most this number of boxes
-    mask_ratio: float,  # Ratio of patches that will be masked
-) -> Tensor:
-    """
-    Generate a patch-wise boolean mask (True = masked, False = visible).
-
-    Algorithm:
-    - Start from a mask full of False values, i.e. fully visible.
-    - Sample rectangular boxes and add them to the mask at random locations with roll.
-    - Continue adding boxes until `mask_ratio` is reached or `box_count` boxes are added.
-    - At the end, if the `mask_ratio` is not reached, mask individual patches at random to reach it.
-    """
-    area = height * width
-    log_ratio = (math.log(box_ratio[0]), math.log(box_ratio[1]))
-    target_area = area * torch.empty(box_count).uniform_(box_scale[0], box_scale[1])
-    aspect_ratio = torch.exp(
-        torch.empty(box_count).uniform_(log_ratio[0], log_ratio[1])
-    )
-
-    h = (target_area / aspect_ratio).sqrt().round().long()
-    w = (target_area * aspect_ratio).sqrt().round().long()
-    i = torch.randint(0, height, (box_count,))
-    j = torch.randint(0, width, (box_count,))
-
-    mask = torch.zeros((height, width), dtype=torch.bool)
-    target_nonzero = round(area * mask_ratio)
-    for i, j, h, w in zip(i, j, h, w):
-        new_mask = torch.zeros((height, width), dtype=torch.bool)
-        new_mask[i : i + h, j : j + w] = True
-        new_mask = torch.roll(new_mask, shifts=(i, j), dims=(0, 1))
-        new_mask |= mask
-        if new_mask.count_nonzero() <= target_nonzero:
-            mask = new_mask
-
-    num_missing = target_nonzero - mask.count_nonzero()
-    if num_missing > 0:
-        idx_missing = mask.logical_not().nonzero()
-        idx_missing = idx_missing[torch.randperm(idx_missing.shape[0])]
-        i, j = idx_missing[:num_missing].T
-        mask[i, j] = True
-
-    return mask  # [height, width]
-
-
-@generate_mask.register_fake
-def _(
-    height: int,
-    width: int,
-    box_scale: tuple[float, float],
-    box_ratio: tuple[float, float],
-    box_count: int,  # Generate at most this number of boxes
-    mask_ratio: tuple[float, float],  # Ratio of patches that will be masked
-) -> Tensor:
-    return torch.empty((height, width), dtype=torch.bool)
-
-
-@torch.library.custom_op("autoparallel::create_mask_nonzero", mutates_args=())
-def create_mask_nonzero(
-    mask_bool: Tensor, num_non_zero: int, num_gpus: int
-) -> list[Tensor]:
-    mask_nonzero = (
-        mask_bool.flatten()
-        .unflatten(0, (num_gpus, -1))
-        .nonzero()[:, -1]
-        .unflatten(0, (num_gpus, -1))
-    )
-    assert (
-        mask_nonzero.numel() == num_non_zero * num_gpus
-    ), f"{mask_nonzero.numel()}, {num_non_zero}, {num_gpus}"
-    mask_weight = 1 / mask_bool.flatten(2, 4).sum(-1).clamp_min(
-        1.0
-    )  # [B, global_crop_num]
-    mask_weight = mask_weight[:, :, None, None, None].expand_as(mask_bool)[
-        mask_bool
-    ]  # [num_masks]
-    mask_weight = mask_weight.unflatten(0, (num_gpus, -1))
-    return mask_nonzero, mask_weight
-
-
-@create_mask_nonzero.register_fake
-def _(mask_bool: Tensor, num_non_zero: int, num_gpus: int) -> list[Tensor]:
-    mask_nonzero = torch.empty(
-        num_gpus, num_non_zero, dtype=torch.int64, device=mask_bool.device
-    )
-    mask_weight = torch.empty_like(mask_nonzero, dtype=torch.float32)
-    return mask_nonzero, mask_weight
-
-
 from torch.testing._internal.distributed.fake_pg import FakeStore
 
 world_size = 64
@@ -1781,8 +1687,8 @@ mesh = torch.distributed.device_mesh.init_device_mesh(
 device = torch.device("cuda")
 cfg = Configuration(output_dir="")
 cfg = Configuration(output_dir="", model_size="debug")
-cfg = Configuration(output_dir="", batch_size=16, model_size="large")
-# cfg = Configuration(output_dir="", batch_size=16, model_size="debug")
+# cfg = Configuration(output_dir="", batch_size=16, model_size="large")
+cfg = Configuration(output_dir="", batch_size=16, model_size="debug")
 
 
 with torch.device("meta"):
@@ -1816,14 +1722,7 @@ def input_fn(B=world_size):
     mask_bool = []
     num_non_zero = 0
     for r in np.linspace(*cfg.mask_patch_ratio, num_samples_masked).tolist():
-        m = generate_mask(
-            h,
-            w,
-            box_scale=(0.08, r),
-            box_ratio=(1 / 3, 3 / 1),
-            box_count=32,
-            mask_ratio=r,
-        )
+        m = torch.randint(0, 2, (h, w), dtype=torch.bool)
         # print(round(r * h * w))
         num_non_zero += round(r * h * w)
         mask_bool.append(m)
@@ -1844,10 +1743,20 @@ def input_fn(B=world_size):
     mask_bool = mask_bool.to(device)
     # from IPython import embed; embed(); exit()
 
-    mask_nonzero, mask_weight = create_mask_nonzero(
-        mask_bool, num_non_zero * T, num_gpus
+    mask_nonzero = (
+        mask_bool.flatten()
+        .unflatten(0, (num_gpus, -1))
+        .nonzero_static(size=num_non_zero * T * num_gpus)[:, -1]
+        .unflatten(0, (num_gpus, -1))
     )
-    # print(mask_nonzero.shape)
+    mask_weight = 1 / mask_bool.flatten(2, 4).sum(-1).clamp_min(
+        1.0
+    )  # [B, global_crop_num]
+    mask_weight = mask_weight[:, :, None, None, None].expand_as(mask_bool)
+    mask_weight = (
+        mask_weight.flatten().unflatten(0, (num_gpus, -1)).gather(1, mask_nonzero)
+    )
+
     mask_weight /= num_samples_masked  # [num_masks] sums to 1.0
     return (
         global_crops,
@@ -1922,7 +1831,7 @@ with AutoParallel(
     input_fn,
     mesh,
     mp_policy,
-    compile=True,
+    compile=False,
     repeated_subgraphs=False,  # True
 ) as autop:
     autop.add_parameter_memory_constraint(low=None, high=None)
