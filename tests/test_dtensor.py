@@ -19,6 +19,7 @@ from torch.distributed.tensor._op_schema import (
     RuntimeSchemaInfo,
     TupleStrategy,
 )
+from torch.distributed.tensor._sharding_prop import _select_min_cost_strategy
 from torch.testing._internal.common_utils import run_tests
 from torch.testing._internal.distributed._tensor.common_dtensor import (
     DTensorTestBase,
@@ -120,6 +121,7 @@ class CustomShardingPropagator(
         self.op_to_schema_info = propagator.op_to_schema_info
 
     def propagate(self, op_info: OpInfo) -> None:
+        assert op_info.schema is not None
         op_info.output_sharding = self.propagate_op_sharding_non_cached(op_info.schema)
 
     def propagate_op_sharding_non_cached(self, op_schema: OpSchema) -> OutputSharding:
@@ -189,7 +191,7 @@ class CustomShardingPropagator(
 
             if isinstance(op_strategy, OpStrategy):
                 # single Op strategy
-                output_strategy = self._select_strategy(op_strategy)
+                output_strategy = _select_min_cost_strategy(op_strategy, op_schema)
                 # check if we need to redistribute the input
                 needs_redistribute = False
                 expected_input_specs: list[DTensorSpec] = []
@@ -274,7 +276,7 @@ class CustomShardingPropagator(
                 out_spec_list: list[DTensorSpec] = []
                 for strategy in op_strategy.children:
                     assert isinstance(strategy, OpStrategy)
-                    selected_strategy = self._select_strategy(strategy)
+                    selected_strategy = _select_min_cost_strategy(strategy, op_schema)
                     selected_strategies.append(selected_strategy)
                     out_spec_list.append(selected_strategy.output_spec)
 
