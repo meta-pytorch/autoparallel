@@ -8,7 +8,7 @@ from functools import partial
 import torch
 from torch._inductor.fx_passes.overlap_scheduling import schedule_overlap_bucketing
 
-from .autobucketing_util import bucket_func, bucket_plan, bucket_utils, reorder
+from .autobucketing_inductor import bucket_func, bucket_plan, bucket_utils, reorder
 
 
 class simplefsdp_autobucketing_config:
@@ -125,7 +125,7 @@ def aten_autobucketing_reordering_pass(
     new_gm.recompile()
 
     if configs.save_trace:
-        from autoparallel.debug_helpers import create_execution_trace
+        from autoparallel.graph_passes.debug_helpers import create_execution_trace
 
         assert configs.custom_runtime_estimation is not None
 
@@ -150,7 +150,7 @@ def configure_inductor_for_autobucketing(mode: str = "aten"):
         torch._inductor.config.aten_distributed_optimizations.insert_overlap_deps = True
         torch._inductor.config.aten_distributed_optimizations.max_compute_pre_fetch = 10
     elif mode == "inductor":
-        from autoparallel.auto_bucketing import (
+        from autoparallel.graph_passes.auto_bucketing import (
             simple_fsdp_autobucketing_reordering_pass,
             simplefsdp_autobucketing_config,
         )

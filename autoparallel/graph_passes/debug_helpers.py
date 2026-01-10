@@ -18,13 +18,13 @@ from torch._inductor.fx_passes.overlap_scheduling import (
 )
 from torch.utils._dtype_abbrs import dtype_abbrs
 
-from autoparallel.collective_runtime_estimation import (
+from autoparallel.cost_models.collective_runtime_estimation import (
     MeshTopoInfo,
     allgather_cost,
     allreduce_cost,
     reduce_scatter_cost,
 )
-from autoparallel.compute_estimation import estimate_strategy_runtime_cost
+from autoparallel.cost_models.compute_estimation import estimate_strategy_runtime_cost
 
 
 def parse_tensor_annotation(annotation: str) -> torch.Tensor:

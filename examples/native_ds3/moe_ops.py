@@ -13,7 +13,7 @@ from torch.distributed.tensor._op_schema import OpSchema, OpStrategy
 from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
 from torch.utils.flop_counter import register_flop_formula
 
-from autoparallel.propagation_rules import register_opschema_rule
+from autoparallel.shardings.propagation_rules import register_opschema_rule
 
 from .moe_placements import PartitionedShard
 from .moe_utils import (
