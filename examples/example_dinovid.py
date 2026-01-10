@@ -1826,31 +1826,95 @@ if autobucketing_level == "aten":
     )
 
 
+# with AutoParallel(
+#     model,
+#     input_fn,
+#     mesh,
+#     mp_policy,
+#     compile=False,
+#     repeated_subgraphs=False,  # True
+# ) as autop:
+#     autop.add_parameter_memory_constraint(low=None, high=None)
+
+#     x_sharding = (Shard(0),) + (Replicate(),) * (mesh.ndim - 1)
+#     rep_sharding = (Replicate(),) * mesh.ndim
+
+#     autop.add_input_constraints([x_sharding] * 7 + [rep_sharding] * 2)
+#     autop.add_output_constraints([rep_sharding])
+
+#     t = time.time()
+#     sharding_placement = autop.optimize_placement(verbose=True)
+#     print(f"Took {time.time() - t:.2f} s")
+#     parallel_mod = autop.apply_placement(sharding_placement)
+#     # exit()
+
+# # run weight init on our sharded DTensor params
+# parallel_mod.to_empty(device="cuda")
+# parallel_mod.init_weights()
+
+
+dim = 128
+
+class MyLinear(nn.Module):
+    def __init__(self, dim, dim1):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(dim1, dim))
+        self.bias = nn.Parameter(torch.empty(dim1))
+
+    def forward(self, x):
+        return x @ self.weight.T + self.bias
+
+class Model(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.linear = nn.Linear(dim, dim)
+        # self.linear = MyLinear(dim, dim)
+        # self.unused = nn.Parameter(torch.empty(dim, dim))
+
+    def forward(self, x, none=None):
+        # if none is not None:
+        #     return self.linear(x)
+        return x @ self.linear.weight.T
+        # return self.linear(x)
+
+    def init_weights(self):
+        pass
+        # self.linear.weight = torch.nn.Parameter(torch.ones(dim, dim) * 9.0)
+        # with torch.no_grad():
+        #     self.linear.bias.fill_(98.6)
+        # nn.init.xavier_uniform_(self.unused)
+
+def input_fn():
+    b = 512
+    inputs = (torch.rand(b, dim, device="cuda"),)
+    return inputs
+
+from torch.distributed.fsdp import MixedPrecisionPolicy
+
+mp_policy = MixedPrecisionPolicy(
+    param_dtype=torch.bfloat16, reduce_dtype=torch.float32
+)
+mp_policy = None
+
+with torch.device("meta"):
+    model = Model(dim)
 with AutoParallel(
     model,
     input_fn,
     mesh,
     mp_policy,
-    compile=False,
-    repeated_subgraphs=False,  # True
 ) as autop:
-    autop.add_parameter_memory_constraint(low=None, high=None)
+    x_sharding = (Shard(0),)
+    autop.add_input_constraints([x_sharding])
+    sharding_placement = autop.optimize_placement()
 
-    x_sharding = (Shard(0),) + (Replicate(),) * (mesh.ndim - 1)
-    rep_sharding = (Replicate(),) * mesh.ndim
-
-    autop.add_input_constraints([x_sharding] * 7 + [rep_sharding] * 2)
-    autop.add_output_constraints([rep_sharding])
-
-    t = time.time()
-    sharding_placement = autop.optimize_placement(verbose=True)
-    print(f"Took {time.time() - t:.2f} s")
+    # AutoParallel produces a module with meta-DTensor parameters that need to be initialized
     parallel_mod = autop.apply_placement(sharding_placement)
-    # exit()
-
-# run weight init on our sharded DTensor params
+# from IPython import embed; embed(); exit()
 parallel_mod.to_empty(device="cuda")
 parallel_mod.init_weights()
+
+from IPython import embed; embed(); exit()
 
 # now let's run it
 x = input_fn(B=1)

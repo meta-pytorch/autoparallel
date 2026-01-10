@@ -116,6 +116,57 @@ def test_init(device_mesh_1d):
         parallel_mod.get_buffer("buf").full_tensor(), torch.arange(dim, device="cuda")
     )
 
+def test_unused(device_mesh_1d):
+    dim = 128
+
+    class Model(nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            self.linear = nn.Linear(dim, dim)
+            # self.unused = nn.Parameter(torch.empty(dim, dim))
+
+        def forward(self, x):
+            # if none is not None:
+            #     return self.linear(x) @ self.unused
+            return x @ self.linear.weight.T
+
+        def init_weights(self):
+            self.linear.weight = torch.nn.Parameter(torch.ones(dim, dim) * 9.0)
+            with torch.no_grad():
+                self.linear.bias.fill_(98.6)
+            # nn.init.xavier_uniform_(self.unused)
+
+    def input_fn():
+        b = 512
+        inputs = (torch.rand(b, dim, device="cuda"),)
+        return inputs
+
+    from torch.distributed.fsdp import MixedPrecisionPolicy
+
+    mp_policy = MixedPrecisionPolicy(
+        param_dtype=torch.bfloat16, reduce_dtype=torch.float32
+    )
+
+    with torch.device("meta"):
+        model = Model(dim)
+    with AutoParallel(
+        model,
+        input_fn,
+        device_mesh_1d,
+        mp_policy,
+    ) as autop:
+        x_sharding = (Shard(0),)
+        autop.add_input_constraints([x_sharding])
+        sharding_placement = autop.optimize_placement()
+
+        # AutoParallel produces a module with meta-DTensor parameters that need to be initialized
+        parallel_mod = autop.apply_placement(sharding_placement)
+    parallel_mod.to_empty(device="cuda")
+    parallel_mod.init_weights()
+    assert all(not isinstance(x, torch._subclasses.fake_tensor.FakeTensor) for x in parallel_mod.parameters())
+    x = input_fn()
+    out = parallel_mod(x)
+
 
 def test_fx_graph_annotate(device_mesh_1d):
     dim = 128

@@ -427,6 +427,8 @@ class AutoParallel:
         with set_dtype_cast(
             True
         ), enable_local_map_wrapping(), torch._dynamo.utils._disable_saved_tensors_hooks_during_tracing():
+            # with self.fake_mode:
+            #     o = self.model(*formatted_inputs)
             torch_ir_with_fqn = _export(self.model, model_wrapper, formatted_inputs)
             # TODO Cna't use fake mode here because it clashes with the user level
             # fake mode. Ideally dynamo should reuse the user level fake mode.
@@ -455,7 +457,7 @@ class AutoParallel:
                 print_output=False, include_stride=True, include_device=True
             ),
         )
-
+        # from IPython import embed; embed(); exit()
         self.gm = gm
 
     # TODO: Specify what the low/high meaning is (percentage?)
@@ -630,6 +632,47 @@ class AutoParallel:
                 attr_kind=_AttrKind.BUFFER,
             )
 
+        from torch._subclasses.fake_tensor import FakeTensor, unset_fake_temporarily
+        from torch.distributed.tensor.placement_types import Replicate, Shard  # noqa
+        from torch.distributed.tensor import DTensor
+        # when a parameter is unused, it doesn't show up as argument
+        # to the graph, and thus it isn't converted back from FakeTensor by _register_params_and_init_weights
+        # we need to fix this
+        # The reason is because _assign_attr creates a copy of the module and copies its attributes if needed
+        # we will need to handle this case (where it is not in the sharded_param_dict but in the module)
+        curr_placement = (Replicate(),) * self.mesh.ndim
+        tgt_placement = (Shard(0),) * self.mesh.ndim
+        for k, v in self.parallel_model.named_parameters(remove_duplicate=False):
+            if k not in sharded_param_dict:
+                with unset_fake_temporarily():
+                    v = torch.randn(v.shape, dtype=v.dtype, device="meta")
+                    v = DTensor.from_local(v, self.mesh, curr_placement).redistribute(
+                        self.mesh, tgt_placement
+                    )
+                    v = torch.nn.Parameter(v)
+                _assign_attr(
+                    v,
+                    self.parallel_model,
+                    self.model,
+                    k,
+                    attr_kind=_AttrKind.PARAMETER,
+                )
+
+        for k, v in self.parallel_model.named_buffers(remove_duplicate=False):
+            if k not in sharded_buffer_dict:
+                with unset_fake_temporarily():
+                    v = torch.randn(v.shape, dtype=v.dtype, device="meta")
+                    v = DTensor.from_local(v, self.mesh, curr_placement).redistribute(
+                        self.mesh, tgt_placement
+                    )
+                _assign_attr(
+                    v,
+                    self.parallel_model,
+                    self.model,
+                    k,
+                    attr_kind=_AttrKind.BUFFER,
+                )
+
         # Right now we require a convention that the user model provides an init_weights method,
         # although we could snoop for other methods too.
         hook_params_setters(self.init_weights_model, self.parallel_model)
@@ -651,6 +694,13 @@ class AutoParallel:
         sharded_param_dict, sharded_buffer_dict = self._apply_placement_common(
             sharding_placement
         )
+        # TODO: when a parameter is unused (like teacher mask_token), it doesn't show up as argument
+        # to the graph, and thus it isn't converted back from FakeTensor by _register_params_and_init_weights
+        # we need to fix this
+        # The reason is because _assign_attr creates a copy of the module and copies its attributes if needed
+        # we will need to handle this case (where it is not in the sharded_param_dict but in the module)
+        # TODO: init_weights don't work for DINOVid...
+        # from IPython import embed; embed(); exit()
 
         self.parallel_model_fn = parallel_model_fn = aot_compile_joint_with_descriptors(
             self.joint_with_descriptors,

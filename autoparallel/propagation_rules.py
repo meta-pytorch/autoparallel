@@ -322,7 +322,7 @@ def iota_rule(mesh, specs):
 
 @register_rule(torch.ops.aten.randperm.default)
 def randperm_rule(mesh, specs):
-    raise NotImplementedError("Needs hardening, only tested on a few cases")
+    # raise NotImplementedError("Needs hardening, only tested on a few cases")
     shape = [specs[0]]
     tensor_meta = _gen_tensor_meta(shape, dtype=torch.int64)
     placement = (Replicate(),) * mesh.ndim
@@ -717,6 +717,20 @@ def _(mesh, op_schema):
     op = torch.ops.aten._scaled_dot_product_flash_attention.default
     return sdpa_rule(op, mesh, op_schema)
 
+
+# import xformers
+# @register_opschema_rule(torch.ops.xformers_flash.flash_fwd.default)
+# def _(mesh, op_schema):
+#     op = torch.ops.aten._scaled_dot_product_flash_attention.default
+#     return sdpa_rule(op, mesh, op_schema)
+
+
+# @register_opschema_rule(torch.ops.xformers_flash.flash_bwd.default)
+# def _(mesh, op_schema):
+#     op = torch.ops.aten._scaled_dot_product_flash_attention_backward.default
+#     # remove grads_share_storage from schema
+#     op_schema.args_schema = op_schema.args_schema[1:]
+#     return sdpa_rule(op, mesh, op_schema)
 
 @register_opschema_rule(
     torch.ops.aten._scaled_dot_product_flash_attention_backward.default
