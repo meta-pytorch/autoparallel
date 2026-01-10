@@ -24,7 +24,7 @@ from torch.fx.experimental.proxy_tensor import make_fx
 from torch.utils._pytree import tree_flatten, tree_map_only
 
 from .graph_passes.graph_utils import cleanup_graph
-from .ordered_sharding import (
+from .shardings.ordered_sharding import (
     compute_optimal_placement_order_for_parameters,
     ordered_redistribute_local_tensor,
 )
