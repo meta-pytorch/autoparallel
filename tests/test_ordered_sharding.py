@@ -11,7 +11,9 @@ from torch import nn
 from torch.testing._internal.distributed.fake_pg import FakeStore
 
 from autoparallel.api import AutoParallel
-from autoparallel.ordered_sharding import compute_optimal_placement_order_for_parameters
+from autoparallel.shardings.ordered_sharding import (
+    compute_optimal_placement_order_for_parameters,
+)
 
 
 @pytest.fixture(scope="module", autouse=True)

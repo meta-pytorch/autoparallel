@@ -17,7 +17,6 @@ from torch.distributed.tensor.placement_types import Replicate, Shard
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from torch.testing._internal.distributed.fake_pg import FakeStore
 
-from autoparallel._passes.graph_multiplex import multiplex_fw_bw_graph
 from autoparallel._testing.models.dsv3 import (
     DeepSeekV3Model,
     DeepSeekV3ModelArgs,
@@ -25,7 +24,8 @@ from autoparallel._testing.models.dsv3 import (
     dsv3_loss_fn,
 )
 from autoparallel.api import AutoParallelPP
-from autoparallel.graph_pp_runner import (
+from autoparallel.graph_passes.graph_multiplex import multiplex_fw_bw_graph
+from autoparallel.graph_passes.graph_pp_runner import (
     GraphCallables,
     GraphMeta,
     _run_dI_bw_module,

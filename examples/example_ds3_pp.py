@@ -43,7 +43,7 @@ from autoparallel._testing.models.dsv3 import (
     dsv3_loss_fn,
 )
 from autoparallel.api import AutoParallelPP
-from autoparallel.graph_pp_runner import (
+from autoparallel.graph_passes.graph_pp_runner import (
     GraphCallables,
     GraphMeta,
     GraphPipelineStage,
@@ -58,7 +58,7 @@ from autoparallel.graph_pp_runner import (
     stage_reshard,
     stage_unshard,
 )
-from autoparallel.utils import NumericsLogger
+from autoparallel.shardings.placement_options import NumericsLogger
 
 # Configure logging to show DEBUG messages
 logging.basicConfig(
@@ -592,7 +592,7 @@ def run_test(
     schedule.register_custom_function(BACKWARD_INPUT, stage_backward_input)
     schedule.register_custom_function(BACKWARD_WEIGHT, stage_backward_weight)
     if schedule_name == "DualPipeV":
-        from autoparallel._passes.graph_multiplex import multiplex_fw_bw_graph
+        from autoparallel.graph_passes.graph_multiplex import multiplex_fw_bw_graph
 
         multiplexed_graph_callables = get_multiplexed_graph_callables(
             stage_graphs,

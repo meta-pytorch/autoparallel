@@ -28,12 +28,12 @@ from torch.export._trace import _restore_state_dict
 from torch.export.unflatten import _AttrKind
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
-from autoparallel._passes.graph_partition import partition_joint_with_descriptors
+from autoparallel.graph_passes.graph_partition import partition_joint_with_descriptors
 
-from .activation_checkpointing import ac_joint_pass
 from .apply_sharding import apply_sharding_to_model
 from .cast_parametrization import apply_dtype_cast, canonicalize_mp, set_dtype_cast
-from .graph_utils import (
+from .graph_passes.activation_checkpointing import ac_joint_pass
+from .graph_passes.graph_utils import (
     _add_alias,
     _replace_view_mm_view_with_einsum,
     assert_has_no_collectives,
@@ -42,7 +42,7 @@ from .graph_utils import (
 )
 from .init_weights import hook_params_setters
 from .optimize_sharding import ShardingOptimizer
-from .utils import (
+from .shardings.placement_options import (
     NumericsLogger,
     _get_device_from_mesh,
     debug_boxed_nop_preserve_node_meta,
@@ -799,7 +799,7 @@ class AutoParallelPP(AutoParallel):
             assert (
                 not self.reshard_after_forward
             ), "reshard_after_forward should be False to disable FSDP all_gather in the backward pass"
-            from autoparallel._passes.split_fsdp_collectives import (
+            from autoparallel.graph_passes.split_fsdp_collectives import (
                 split_fsdp_prefetch,
                 split_fsdp_reduce_scatters_epilogue,
             )
@@ -852,7 +852,7 @@ class AutoParallelPP(AutoParallel):
         bw_dI_module: Optional[torch.fx.GraphModule] = None
         bw_dW_module: Optional[torch.fx.GraphModule] = None
         if "split_dI_dW" in graph_passes:
-            from autoparallel._passes.split_di_dw_graph import split_di_dw_graph
+            from autoparallel.graph_passes.split_di_dw_graph import split_di_dw_graph
 
             bw_dI_module, bw_dW_module, num_input_grads = split_di_dw_graph(
                 bw_module,

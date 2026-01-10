@@ -22,7 +22,7 @@ from torch.distributed.pipelining.stage import (
 )
 from torch.distributed.tensor import DTensor
 
-from autoparallel.utils import DebugInterpreter, NumericsLogger
+from autoparallel.shardings.placement_options import DebugInterpreter, NumericsLogger
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
