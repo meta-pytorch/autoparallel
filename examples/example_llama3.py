@@ -16,9 +16,9 @@ from autoparallel.api import AutoParallel
 from autoparallel.auto_bucketing import (
     aten_autobucketing_config,
     aten_autobucketing_reordering_pass,
-    simple_fsdp_autobucketing_reordering_pass,
-    simplefsdp_autobucketing_config,
+    configure_inductor_for_autobucketing,
 )
+from autoparallel.debug_helpers import make_custom_runtime_estimation
 
 world_size = 64
 
@@ -96,6 +96,9 @@ def input_fn():
 autobucketing_level = "aten"
 
 if autobucketing_level == "aten":
+    aten_autobucketing_config.custom_runtime_estimation = (
+        make_custom_runtime_estimation(mesh)
+    )
     # this is from the stacked pr in https://github.com/pytorch/pytorch/pull/163960
     torch._inductor.config.reorder_for_peak_memory = False
     torch._inductor.config.reorder_for_compute_comm_overlap = False
@@ -107,18 +110,7 @@ if autobucketing_level == "aten":
         aten_autobucketing_reordering_pass
     )
 elif autobucketing_level == "inductor":
-    torch._inductor.config.allow_buffer_reuse = False
-    torch._inductor.config.reorder_for_peak_memory = False
-    torch._inductor.config.reorder_for_compute_comm_overlap = True
-    simplefsdp_autobucketing_config.calibrate_number = 5
-    simplefsdp_autobucketing_config.save_estimation_path = "./estimation_mast.pkl"
-    simple_fsdp_autobucketing_reordering_pass = partial(
-        simple_fsdp_autobucketing_reordering_pass,
-        configs=simplefsdp_autobucketing_config,
-    )
-    torch._inductor.config.reorder_for_compute_comm_overlap_passes = [
-        simple_fsdp_autobucketing_reordering_pass
-    ]
+    configure_inductor_for_autobucketing(autobucketing_level)
 else:
     raise ValueError(f"Unknown autobucketing_level {autobucketing_level}")
 

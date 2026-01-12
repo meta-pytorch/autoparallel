@@ -10,5 +10,7 @@
 
 build/
 dist/
+tmp/
+out/
 
 .vscode/

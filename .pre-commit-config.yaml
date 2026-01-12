@@ -37,6 +37,7 @@ repos:
 -   repo: local
     hooks:
     -   id: mypy
+        require_serial: true
         name: mypy
         entry: mypy
         language: system

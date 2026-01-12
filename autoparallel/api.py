@@ -4,11 +4,12 @@
 # LICENSE file in the root directory of this source tree.
 
 import copy
+import functools
 import itertools
 import warnings
 from contextlib import ExitStack, contextmanager
 from types import MethodType
-from typing import Any, Optional, Union
+from typing import Any, Callable, Optional, Union
 
 import torch
 from torch._dynamo.functional_export import _dynamo_graph_capture_for_export
@@ -24,8 +25,10 @@ from torch._subclasses import FakeTensorMode
 from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor import DeviceMesh
 from torch.export._trace import _restore_state_dict
-from torch.export._unlift import _assign_attr
 from torch.export.unflatten import _AttrKind
+from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+from autoparallel._passes.graph_partition import partition_joint_with_descriptors
 
 from .activation_checkpointing import ac_joint_pass
 from .apply_sharding import apply_sharding_to_model
@@ -39,18 +42,75 @@ from .graph_utils import (
 )
 from .init_weights import hook_params_setters
 from .optimize_sharding import ShardingOptimizer
-from .utils import _get_device_from_mesh
+from .utils import (
+    NumericsLogger,
+    _get_device_from_mesh,
+    debug_boxed_nop_preserve_node_meta,
+)
 
 _APPLY_VIEW_MM_VIEW_PATTERN = False
 
 
-def try_convert_fake_to_real(tensors):
-    out = {}
-    for k, t in tensors.items():
-        out[k] = torch.distributed.tensor.randn(
-            t.shape, dtype=t.dtype, device_mesh=t.device_mesh, placements=t.placements
-        )
-    return out
+def _assign_attr(
+    attr: Any,
+    target_module: torch.nn.Module,
+    ref_module: torch.nn.Module,
+    fqn: str,
+    attr_kind: _AttrKind,
+):
+    """
+    Custom version of torch.export._unlift._assign_attr that preserves the original
+    module structure (e.g., nn.ModuleDict) from ref_module.
+
+    Args:
+        attr: The attribute to assign (parameter/buffer/module)
+        target_module: The module to assign the attribute to
+        ref_module: Reference module to check for original structure
+        fqn: Fully qualified name of the attribute (e.g., "layers.0.weight")
+        attr_kind: Type of attribute (PARAMETER, BUFFER, etc.)
+    """
+    *prefix, field = fqn.split(".")
+
+    # Navigate to the parent module, creating submodules as needed
+    curr_mod = target_module
+    for i, attr_name in enumerate(prefix):
+        if not hasattr(curr_mod, attr_name):
+            # Check if we should create a module matching the ref_module type
+            # Navigate to the same location in ref_module
+            ref_curr_mod = ref_module
+            for ref_attr_name in prefix[:i]:
+                if hasattr(ref_curr_mod, ref_attr_name):
+                    ref_curr_mod = getattr(ref_curr_mod, ref_attr_name)
+                else:
+                    ref_curr_mod = None  # type: ignore[assignment]
+                    break
+
+            # Create an instance of the same type as in ref_module
+            if ref_curr_mod is not None and hasattr(ref_curr_mod, attr_name):
+                ref_submod = getattr(ref_curr_mod, attr_name)
+                cls = type(ref_submod)
+                try:
+                    cls = type(ref_submod)
+                    new_inst = ref_submod.__new__(cls)
+                    new_inst.__dict__ = ref_submod.__dict__.copy()
+                    setattr(curr_mod, attr_name, new_inst)
+                except Exception:
+                    # Fall back to regular Module if instantiation fails
+                    setattr(curr_mod, attr_name, torch.nn.Module())
+            else:
+                setattr(curr_mod, attr_name, torch.nn.Module())
+
+        curr_mod = getattr(curr_mod, attr_name)
+
+    # Set the final attribute
+    if attr_kind == _AttrKind.PARAMETER:
+        assert isinstance(attr, torch.nn.Parameter)
+        curr_mod.register_parameter(field, attr)
+    elif attr_kind == _AttrKind.BUFFER:
+        assert isinstance(attr, torch.Tensor)
+        curr_mod.register_buffer(field, attr)
+    else:
+        setattr(curr_mod, field, attr)
 
 
 def _get_decomp_table():
@@ -64,6 +124,7 @@ def _get_decomp_table():
     decomp_table.pop(torch.ops.aten.native_layer_norm_backward.default)
     decomp_table.pop(torch.ops.aten._softmax_backward_data.default)
     decomp_table.pop(torch.ops.aten._softmax.default)
+    decomp_table.pop(torch.ops.aten.stack.default)
 
     # decompose addmm to allow for TP on mm
     decomp_table.pop(torch.ops.aten.addmm.default)
@@ -165,17 +226,35 @@ def enable_local_map_wrapping():
         yield
 
 
-def _export(model: torch.nn.Module, inputs: tuple[Any]) -> torch.nn.Module:
+def _export(
+    model: torch.nn.Module, model_wrapper: Callable, inputs: tuple[Any, ...]
+) -> torch.fx.GraphModule:
     """
-    Thin wrapper around graph capture output that restores the
-    original calling convention and attribute fqn. TODO:
-    1) Use bytecode for calling convention instead of pytree for more
-       seamless UX.
+    Capture a model graph via Dynamo and restore parameter/buffer metadata.
+
+    We need both `model` and `model_wrapper` because:
+    - `model_wrapper` is the actual callable that gets traced by Dynamo. It may wrap
+      the model with additional logic (e.g., adding a loss function on top of the model's
+      forward pass, or preparing inputs in a specific way).
+    - `model` is the original nn.Module needed to restore the correct fully-qualified
+      names (FQNs) for parameters and buffers in the traced graph. Without this, the
+      captured graph would lose the original parameter naming structure.
+
+    Args:
+        model: Original nn.Module with parameter/buffer metadata to restore
+        model_wrapper: Callable to trace (may wrap model with additional logic)
+        inputs: Input tensors for tracing
+
+    Returns:
+        GraphModule with restored parameter FQNs and calling convention
+
+    TODO:
+    1) Use bytecode for calling convention instead of pytree for more seamless UX
     2) Attach guards
-    3) Be more careful about tensor constants names.
+    3) Be more careful about tensor constants names
     """
     with torch._dynamo.config.patch(install_free_tensors=True):
-        gm = _dynamo_graph_capture_for_export(model)(*inputs)
+        gm = _dynamo_graph_capture_for_export(model_wrapper)(*inputs)
         _restore_state_dict(model, gm)
         return gm
 
@@ -197,12 +276,17 @@ class AutoParallel:
         enable_ac: bool = True,
         # None means 'auto'
         ac_stage_size_in_GiB: Optional[Union[float, str]] = "auto",
+        reshard_after_forward: bool = True,
+        dynamic: bool = False,
+        loss_fn: Optional[Callable] = None,
+        numerics_logger: NumericsLogger | None = None,
         **kwargs,
     ):
         self.stack = ExitStack()
         self.fake_mode = (
             FakeTensorMode()
         )  # TODO: maybe need to reuse the model's fake mode
+        # self.fake_mode.allow_scalar_outputs = True
         device = _get_device_from_mesh(mesh)
         if mp_policy is not None:
             mp_policy = canonicalize_mp(mp_policy)
@@ -223,9 +307,22 @@ class AutoParallel:
         self.model = move_to_fake(model, self.fake_mode, device)
         self.input_fn = input_fn
         self.mesh = mesh
-        self.compiler_fn = compile_fx_inner if compile else boxed_nop_preserve_node_meta
+        if compile:
+            self.compiler_fn = compile_fx_inner
+        elif numerics_logger:
+            self.compiler_fn = functools.partial(
+                debug_boxed_nop_preserve_node_meta, numerics_logger=numerics_logger
+            )
+        else:
+            self.compiler_fn = boxed_nop_preserve_node_meta  # type: ignore[assignment]
         self.enable_ac = enable_ac
         self.ac_stage_size_in_GiB = ac_stage_size_in_GiB
+        self.reshard_after_forward = reshard_after_forward
+        self.loss_fn = loss_fn
+
+        if dynamic:
+            self.fake_mode.shape_env = ShapeEnv()
+            self.fake_mode.static_shapes = False
 
         # NB: rest of the construction happens in __enter__
         self.active = False
@@ -289,20 +386,54 @@ class AutoParallel:
         decomp_table = _get_decomp_table()
 
         with self.fake_mode:
-            inputs = self.input_fn()
-            if not isinstance(inputs, tuple):
-                inputs = (inputs,)
+            raw_inputs = self.input_fn()
+
+        # Define model wrapper based on whether loss_fn is provided
+        model_wrapper: Callable
+        # Parse inputs based on whether loss_fn is provided
+        # If loss_fn is not None: expected format ((inp1, inp2,...), target)
+        # If loss_fn is None: expected format (inp1, inp2, ...)
+        if self.loss_fn is not None:
+            if isinstance(raw_inputs, tuple) and len(raw_inputs) == 2:
+                model_inputs, target = raw_inputs
+                # Normalize inputs to always be a tuple
+                if not isinstance(model_inputs, tuple):
+                    model_inputs = (model_inputs,)
+                formatted_inputs = (model_inputs, target)
+
+                def model_with_loss(model_inputs, target) -> Any:
+                    output = self.model(*model_inputs)
+                    loss = self.loss_fn(output, target)  # type: ignore[misc]
+                    return loss
+
+                model_wrapper = model_with_loss
+            else:
+                raise ValueError(
+                    "When loss_fn is provided, input_fn must return (inputs, target) "
+                    "where inputs can be a single tensor or tuple of tensors"
+                )
+        else:
+            # No loss function, inputs are just model inputs
+            formatted_inputs = (
+                raw_inputs if isinstance(raw_inputs, tuple) else (raw_inputs,)
+            )
+
+            def model_wo_loss(*model_inputs) -> Any:
+                output = self.model(*model_inputs)
+                return output
+
+            model_wrapper = model_wo_loss
 
         with set_dtype_cast(
             True
         ), enable_local_map_wrapping(), torch._dynamo.utils._disable_saved_tensors_hooks_during_tracing():
-            torch_ir_with_fqn = _export(self.model, inputs)
+            torch_ir_with_fqn = _export(self.model, model_wrapper, formatted_inputs)
             # TODO Cna't use fake mode here because it clashes with the user level
             # fake mode. Ideally dynamo should reuse the user level fake mode.
             self.joint_with_descriptors = aot_export_joint_with_descriptors(
                 self.stack,
                 torch_ir_with_fqn,
-                inputs,
+                formatted_inputs,
                 decompositions=decomp_table,
             )
         gm = self.joint_with_descriptors.graph_module
@@ -388,7 +519,7 @@ class AutoParallel:
 
         return self.sharding_placement
 
-    def apply_placement(self, sharding_placement=None):
+    def _apply_placement_common(self, sharding_placement):
         self._assert_entered()
 
         if sharding_placement is None:
@@ -439,7 +570,9 @@ class AutoParallel:
         )
 
         if self.enable_ac:
-            ac_joint_pass(parallel_gm.graph, self.ac_stage_size_in_GiB)
+            ac_joint_pass(
+                parallel_gm.graph, self.ac_stage_size_in_GiB, self.reshard_after_forward
+            )
         # now rename input/param/tangent/output/grad_param/grad_input nodes following
         # our convention
         # apply_node_renaming(
@@ -466,6 +599,58 @@ class AutoParallel:
             torch.fx.node._side_effectful_functions.remove(
                 torch.ops._c10d_functional.wait_tensor.default
             )
+        return (
+            sharded_param_dict,
+            sharded_buffer_dict,
+        )
+
+    def _register_params_and_init_weights(
+        self, sharded_param_dict, sharded_buffer_dict
+    ):
+
+        # We construct an unflattened structure on parallel_mod,
+        # e.g. _assign_attr(v, parallel_model, k="layers.0.weight") will literally
+        # create empty nn.Modules recursively and then stash 'v' so it shows up in the right spot
+        # We pass self.model as reference to preserve the original module structure (e.g., nn.ModuleDict)
+        for k, v in sharded_param_dict.items():
+            _assign_attr(
+                v,
+                self.parallel_model,
+                self.model,
+                k,
+                attr_kind=_AttrKind.PARAMETER,
+            )
+
+        for k, v in sharded_buffer_dict.items():
+            _assign_attr(
+                v,
+                self.parallel_model,
+                self.model,
+                k,
+                attr_kind=_AttrKind.BUFFER,
+            )
+
+        # Right now we require a convention that the user model provides an init_weights method,
+        # although we could snoop for other methods too.
+        hook_params_setters(self.init_weights_model, self.parallel_model)
+        if hasattr(self.model, "init_weights"):
+
+            def init_weights(_self, *args, **kwargs):
+                # this is now a deep-fake-copy of orig mod, so we don't have to use reparametrize
+                return self.init_weights_model.init_weights(*args, **kwargs)
+
+            # assign an init_weights method onto the output mod.
+            # all it does is sneakily run the original user mod's init_weights method,
+            # but with our new DTensor sharded params attached to the user module.
+            self.parallel_model.init_weights = MethodType(
+                init_weights, self.parallel_model
+            )
+
+    def apply_placement(self, sharding_placement=None):
+
+        sharded_param_dict, sharded_buffer_dict = self._apply_placement_common(
+            sharding_placement
+        )
 
         self.parallel_model_fn = parallel_model_fn = aot_compile_joint_with_descriptors(
             self.joint_with_descriptors,
@@ -497,30 +682,243 @@ class AutoParallel:
                 return out
 
         self.parallel_model = AutoParallelModule()
+        self._register_params_and_init_weights(sharded_param_dict, sharded_buffer_dict)
+        return self.parallel_model
 
-        # We construct an unflattened structure on parallel_mod,
-        # e.g. _assign_attr(v, parallel_model, k="layers.0.weight") will literally
-        # create empty nn.Modules recursively and then stash 'v' so it shows up in the right spot
-        for k, v in sharded_param_dict.items():
-            _assign_attr(v, self.parallel_model, k, attr_kind=_AttrKind.PARAMETER)
 
-        for k, v in sharded_buffer_dict.items():
-            _assign_attr(v, self.parallel_model, k, attr_kind=_AttrKind.BUFFER)
+########################
+# Pipeline stuff start #
+########################
+class AutoParallelPPModule(torch.nn.Module):
+    def __init__(
+        self,
+        sharded_param_dict: dict[str, torch.nn.Parameter],
+        sharded_buffer_dict: dict[str, torch.Tensor],
+        init_weights_model: torch.nn.Module,
+        ref_model: torch.nn.Module,
+    ):
+        super().__init__()
+        self._register_params_and_buffers(
+            sharded_param_dict, sharded_buffer_dict, ref_model
+        )
 
         # Right now we require a convention that the user model provides an init_weights method,
         # although we could snoop for other methods too.
-        hook_params_setters(self.init_weights_model, self.parallel_model)
-        if hasattr(self.model, "init_weights"):
+        if hasattr(init_weights_model, "init_weights"):
+            hook_params_setters(init_weights_model, self)
 
             def init_weights(_self, *args, **kwargs):
                 # this is now a deep-fake-copy of orig mod, so we don't have to use reparametrize
-                return self.init_weights_model.init_weights(*args, **kwargs)
+                return init_weights_model.init_weights(*args, **kwargs)
 
             # assign an init_weights method onto the output mod.
             # all it does is sneakily run the original user mod's init_weights method,
             # but with our new DTensor sharded params attached to the user module.
-            self.parallel_model.init_weights = MethodType(
-                init_weights, self.parallel_model
+            self.init_weights = MethodType(init_weights, self)
+
+    def _register_params_and_buffers(
+        self, sharded_param_dict, sharded_buffer_dict, ref_model
+    ):
+
+        # We construct an unflattened structure on parallel_mod,
+        # e.g. _assign_attr(v, parallel_model, k="layers.0.weight") will literally
+        # create empty nn.Modules recursively and then stash 'v' so it shows up in the right spot
+        # We pass ref_model to preserve the original module structure (e.g., nn.ModuleDict)
+        for k, v in sharded_param_dict.items():
+            _assign_attr(v, self, ref_model, k, attr_kind=_AttrKind.PARAMETER)
+
+        for k, v in sharded_buffer_dict.items():
+            _assign_attr(v, self, ref_model, k, attr_kind=_AttrKind.BUFFER)
+
+    def forward(self, *args):
+        raise NotImplementedError("This is a placeholder for the pipeline model")
+
+
+class AutoParallelPP(AutoParallel):
+    def apply_placement_pp(
+        self, sharding_placement=None, graph_passes: list[str] = []
+    ) -> dict[str, Any]:
+        assert all(
+            g_pass in ["split_fsdp_collectives", "split_dI_dW"]
+            for g_pass in graph_passes
+        ), "Only split_fsdp_collectives and split_dI_dW_graph are supported"
+        sharded_param_dict, sharded_buffer_dict = self._apply_placement_common(
+            sharding_placement
+        )
+        num_params = len(sharded_param_dict)
+        num_buffers = len(sharded_buffer_dict)
+        (
+            fw_module,
+            bw_module,
+            num_params_buffers,
+            num_user_outputs,
+            num_mutate_inputs,
+            num_fw_outs_saved_for_bw,
+            num_symints_saved_for_bw,
+            _indices_of_inps_to_detach,
+            adjusted_flat_args,
+        ) = partition_joint_with_descriptors(self.joint_with_descriptors)
+        assert num_params_buffers == (
+            num_params + num_buffers
+        ), f"num_params_buffers: {num_params_buffers}, num_params: {num_params}, num_buffers: {num_buffers}"
+        num_input_grads = (
+            len(bw_module.graph.find_nodes(op="output")[0].args[0]) - num_params_buffers
+        )
+        print(
+            f"num_params_buffers: {num_params_buffers}\n"
+            f"num_user_outputs: {num_user_outputs}\n"
+            f"num_mutate_inputs: {num_mutate_inputs}\n"
+            f"num_input_grads: {num_input_grads}\n"
+            f"num_fw_outs_saved_for_bw: {num_fw_outs_saved_for_bw}\n"
+            f"num_symints_saved_for_bw: {num_symints_saved_for_bw}"
+        )
+
+        trace_structured(
+            "artifact",
+            metadata_fn=lambda: {
+                "name": "autoparallel_pp_fwd_graph",
+                "encoding": "string",
+            },
+            payload_fn=lambda: fw_module.print_readable(
+                print_output=False, include_stride=True, include_device=True
+            ),
+        )
+        trace_structured(
+            "artifact",
+            metadata_fn=lambda: {
+                "name": "autoparallel_pp_bwd_graph",
+                "encoding": "string",
+            },
+            payload_fn=lambda: bw_module.print_readable(
+                print_output=False, include_stride=True, include_device=True
+            ),
+        )
+        unshard_module: Optional[torch.fx.GraphModule] = None
+        reduce_grad_module: Optional[torch.fx.GraphModule] = None
+        if "split_fsdp_collectives" in graph_passes:
+            assert (
+                not self.reshard_after_forward
+            ), "reshard_after_forward should be False to disable FSDP all_gather in the backward pass"
+            from autoparallel._passes.split_fsdp_collectives import (
+                split_fsdp_prefetch,
+                split_fsdp_reduce_scatters_epilogue,
             )
 
-        return self.parallel_model
+            unshard_module, fw_module = split_fsdp_prefetch(fw_module, num_params)
+            trace_structured(
+                "artifact",
+                metadata_fn=lambda: {
+                    "name": "autoparallel_pp_unshard_graph",
+                    "encoding": "string",
+                },
+                payload_fn=lambda: unshard_module.print_readable(
+                    print_output=False, include_stride=True, include_device=True
+                ),
+            )
+            trace_structured(
+                "artifact",
+                metadata_fn=lambda: {
+                    "name": "autoparallel_pp_fwd_no_fsdp_graph",
+                    "encoding": "string",
+                },
+                payload_fn=lambda: fw_module.print_readable(
+                    print_output=False, include_stride=True, include_device=True
+                ),
+            )
+            bw_module, reduce_grad_module = split_fsdp_reduce_scatters_epilogue(
+                bw_module, num_params
+            )
+            trace_structured(
+                "artifact",
+                metadata_fn=lambda: {
+                    "name": "autoparallel_pp_bwd_no_fsdp_graph",
+                    "encoding": "string",
+                },
+                payload_fn=lambda: bw_module.print_readable(
+                    print_output=False, include_stride=True, include_device=True
+                ),
+            )
+            trace_structured(
+                "artifact",
+                metadata_fn=lambda: {
+                    "name": "autoparallel_pp_reduce_grad_graph",
+                    "encoding": "string",
+                },
+                payload_fn=lambda: reduce_grad_module.print_readable(
+                    print_output=False, include_stride=True, include_device=True
+                ),
+            )
+
+        bw_dI_module: Optional[torch.fx.GraphModule] = None
+        bw_dW_module: Optional[torch.fx.GraphModule] = None
+        if "split_dI_dW" in graph_passes:
+            from autoparallel._passes.split_di_dw_graph import split_di_dw_graph
+
+            bw_dI_module, bw_dW_module, num_input_grads = split_di_dw_graph(
+                bw_module,
+                num_weight_gradients=num_params_buffers,
+            )
+            trace_structured(
+                "artifact",
+                metadata_fn=lambda: {
+                    "name": "autoparallel_pp_bw_dI_graph",
+                    "encoding": "string",
+                },
+                payload_fn=lambda: bw_dI_module.print_readable(
+                    print_output=False, include_stride=True, include_device=True
+                ),
+            )
+            trace_structured(
+                "artifact",
+                metadata_fn=lambda: {
+                    "name": "autoparallel_pp_bw_dW_graph",
+                    "encoding": "string",
+                },
+                payload_fn=lambda: bw_dW_module.print_readable(
+                    print_output=False, include_stride=True, include_device=True
+                ),
+            )
+            if all(
+                x is None
+                for x in bw_dI_module.graph.find_nodes(op="output")[0].args[0][
+                    :num_input_grads
+                ]
+            ):
+                raise RuntimeError(
+                    "attempted to run split dI/dW pass on a graph that has no input gradients"
+                )
+
+        graph_meta: dict[str, int] = {
+            "num_mutate_inputs": num_mutate_inputs,
+            "num_user_outputs": num_user_outputs,
+            "num_symints_saved_for_bw": num_symints_saved_for_bw,
+            "num_params": num_params,
+            "num_buffers": num_buffers,
+            "num_input_grads": num_input_grads,
+        }
+
+        graph_modules: dict[str, Optional[torch.fx.GraphModule]] = {
+            "fw": fw_module,
+            "full_bw": bw_module,
+            "bw_dI": bw_dI_module,
+            "bw_dW": bw_dW_module,
+            "unshard": unshard_module,
+            "reduce_grad": reduce_grad_module,
+        }
+        self.parallel_model = AutoParallelPPModule(
+            sharded_param_dict,
+            sharded_buffer_dict,
+            self.init_weights_model,
+            self.model,
+        )
+        return {
+            "graph_callables": graph_modules,
+            "graph_meta": graph_meta,
+            "sharded_param_dict": sharded_param_dict,
+            "sharded_buffer_dict": sharded_buffer_dict,
+        }
+
+
+######################
+# Pipeline stuff end #
+######################

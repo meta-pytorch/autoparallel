@@ -3,13 +3,14 @@ conda_path_in_fbpkg = conda
 activate_conda = False
 fbpkg_ids = fb-py-spy:prod
 hpcIdentity = pytorch_distributed
-rmAttribution = pytorch4all_clients_approved
+rmAttribution = msl_infra_pytorch_dev
 workspace_fbpkg_name = torchtitan_workspace
 conda_pack_ignore_missing_files = True
 git = False
 hpcJobOncall = meta_conda
 modelTypeName = gen_ai_conda
-hpcClusterUuid = MastProdCluster
+hpcClusterUuid = MastGenAICluster
+localityConstraints = region;gtn
 forceSingleRegion = False
 use_caf = False
 
