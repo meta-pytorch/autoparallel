@@ -240,15 +240,68 @@ _CP_ATTENTION_BACKENDS = {
 }
 
 
-def context_parallel_attention(
-    q, k, v, *, backend=SDPBackend.FLASH_ATTENTION, **kwargs
-):
+def _select_cp_backend(q, k, v, dropout_p=0.0, is_causal=False, attn_mask=None):
+    """
+    Select the best available backend for context parallel attention.
+
+    Uses PyTorch's internal backend selection logic to determine which SDPA
+    backend can handle the given inputs, respecting the priority order.
+
+    Args:
+        q, k, v: Query, key, value tensors
+        dropout_p: Dropout probability
+        is_causal: Whether to use causal attention
+        attn_mask: Optional attention mask
+
+    Returns:
+        SDPBackend enum value for the selected backend
+
+    Raises:
+        RuntimeError: If no suitable backend is available
+    """
+    from torch.backends.cuda import (
+        SDPAParams,
+        can_use_cudnn_attention,
+        can_use_efficient_attention,
+        can_use_flash_attention,
+    )
+
+    # Create params object for backend selection
+    # SDPAParams signature: query, key, value, attn_mask, dropout, is_causal, enable_gqa
+    params = SDPAParams(q, k, v, attn_mask, dropout_p, is_causal, False)
+
+    # Map backend enum values to their can_use functions
+    # Only include backends we support for context parallel
+    backend_checks = {
+        SDPBackend.FLASH_ATTENTION: can_use_flash_attention,
+        SDPBackend.EFFICIENT_ATTENTION: can_use_efficient_attention,
+        SDPBackend.CUDNN_ATTENTION: can_use_cudnn_attention,
+    }
+
+    # Get priority order from PyTorch
+    priority_order = torch._C._get_sdp_priority_order()
+
+    for backend_id in priority_order:
+        for backend_enum, can_use_fn in backend_checks.items():
+            if backend_enum.value == backend_id and can_use_fn(params):
+                return backend_enum
+
+    raise RuntimeError(
+        "No suitable SDPA backend available for context parallel attention. "
+        "Supported backends are: FLASH_ATTENTION, EFFICIENT_ATTENTION, CUDNN_ATTENTION. "
+        "Check that your inputs are compatible with at least one of these backends."
+    )
+
+
+def context_parallel_attention(q, k, v, *, backend=None, **kwargs):
     """
     Generic context parallel attention supporting multiple backends.
 
     Args:
         q, k, v: Query, key, value tensors
-        backend: SDPBackend to use (FLASH_ATTENTION, EFFICIENT_ATTENTION, or CUDNN_ATTENTION)
+        backend: SDPBackend to use (FLASH_ATTENTION, EFFICIENT_ATTENTION, or CUDNN_ATTENTION).
+                 If None (default), automatically selects the best available backend using
+                 PyTorch's internal selection logic.
         **kwargs: Additional arguments passed to the attention operation (e.g., dropout_p, is_causal, scale, attn_bias)
 
     Returns:
@@ -257,6 +310,17 @@ def context_parallel_attention(
     This function is future-proof as it uses **kwargs to pass arguments, so changes
     to backend signatures won't require updating this function.
     """
+    # Auto-select backend if not specified
+    if backend is None:
+        backend = _select_cp_backend(
+            q,
+            k,
+            v,
+            dropout_p=kwargs.get("dropout_p", 0.0),
+            is_causal=kwargs.get("is_causal", False),
+            attn_mask=kwargs.get("attn_bias", None),
+        )
+
     if backend not in _CP_ATTENTION_BACKENDS:
         raise ValueError(
             f"Unsupported backend: {backend}. Supported backends: {list(_CP_ATTENTION_BACKENDS.keys())}"
