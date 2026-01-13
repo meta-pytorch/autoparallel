@@ -135,7 +135,7 @@ class _ContextParallelAttention(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, op_forward, op_backward, q, k, v, kwargs_keys_str, *kwargs_values):
+    def forward(ctx, q, k, v, op_forward, op_backward, kwargs_keys_str, *kwargs_values):
         """
         Args:
             op_forward: Forward operation (e.g., _scaled_dot_product_ring_flash_attention)
@@ -220,7 +220,7 @@ class _ContextParallelAttention(torch.autograd.Function):
         # Return gradients:
         # (None for op_forward, None for op_backward, grad_q, grad_k, grad_v, None for kwargs_keys_str, None for each kwargs_value)
         num_kwargs = len(ctx.kwargs)
-        return (None, None) + grads[:3] + (None,) + (None,) * num_kwargs
+        return grads[:3] + (None, None, None) + (None,) * num_kwargs
 
 
 # Backend registry for context parallel attention
@@ -343,7 +343,7 @@ def context_parallel_attention(q, k, v, *, backend=None, **kwargs):
     # Note: mesh is NOT passed through local_map (it would be flattened by pytree)
     # Instead, we retrieve it inside the autograd function using get_mesh_from_global()
     num_kwargs = len(kwargs)
-    in_placements = (None, None, plc, plc, plc, None) + (None,) * num_kwargs
+    in_placements = (plc, plc, plc, None, None, None) + (None,) * num_kwargs
 
     return local_map(
         _ContextParallelAttention.apply,
@@ -352,4 +352,4 @@ def context_parallel_attention(q, k, v, *, backend=None, **kwargs):
         redistribute_inputs=True,
         in_grad_placements=None,
         device_mesh=mesh,
-    )(op_forward, op_backward, q, k, v, kwargs_keys_str, *kwargs_values)
+    )(q, k, v, op_forward, op_backward, kwargs_keys_str, *kwargs_values)
