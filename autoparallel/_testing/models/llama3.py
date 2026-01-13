@@ -9,7 +9,7 @@ from typing import ClassVar, Optional
 import torch
 import torch.nn.functional as F
 from torch import nn
-from torch.nn.attention import SDPBackend  # , sdpa_kernel
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from autoparallel.ops import context_parallel_attention
 
@@ -47,37 +47,14 @@ class ScaledDotProductAttention(torch.nn.Module):
         if has_cuda_capability(10, 0):
             cls.backends.insert(0, SDPBackend.CUDNN_ATTENTION)
 
-    def _select_backend(self) -> SDPBackend:
-        """
-        Select the best available backend for context parallel attention.
-        Only considers backends that are supported by context parallel.
-        """
-        supported_cp_backends = {
-            SDPBackend.FLASH_ATTENTION,
-            SDPBackend.EFFICIENT_ATTENTION,
-            SDPBackend.CUDNN_ATTENTION,
-        }
-
-        for backend in self.backends:
-            if backend in supported_cp_backends:
-                return backend
-
-        # Fallback to flash attention if no supported backend is found
-        return SDPBackend.FLASH_ATTENTION
-
     def forward(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
     ) -> torch.Tensor:
         assert self.backends, "SDPA Backends should not be empty."
-
-        # Select the best available backend
-        backend = self._select_backend()
-
-        # Use context parallel attention with the selected backend
-        # All backend-specific arguments (is_causal, dropout_p, scale, etc.) are passed via kwargs
-        return context_parallel_attention(
-            q, k, v, backend=backend, is_causal=True, dropout_p=0.0
-        )
+        with sdpa_kernel(self.backends, set_priority=True):
+            # Use context parallel attention with the selected backend
+            # All backend-specific arguments (is_causal, dropout_p, scale, etc.) are passed via kwargs
+            return context_parallel_attention(q, k, v, is_causal=True, dropout_p=0.0)
 
 
 def build_attention(

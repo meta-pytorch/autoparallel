@@ -240,6 +240,8 @@ _CP_ATTENTION_BACKENDS = {
 }
 
 
+# TODO: using assume_constant_result isn't strictly correct, but gets the job done for now
+@torch.compiler.assume_constant_result
 def _select_cp_backend(q, k, v, dropout_p=0.0, is_causal=False, attn_mask=None):
     """
     Select the best available backend for context parallel attention.
