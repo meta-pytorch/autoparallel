@@ -691,6 +691,47 @@ def _unsafe_index_rule(mesh, op_schema):
     raise NotImplementedError()
 
 
+@register_opschema_rule(torch.ops.aten.index.Tensor)
+def _index_rule(mesh, op_schema):
+    from torch.distributed.tensor._ops._tensor_ops import (
+        PlacementList,
+        expand_to_full_mesh_op_strategy,
+        normalize_dim,
+    )
+
+    input_strategy = op_schema.args_schema[0]
+    index_strategy = op_schema.args_schema[1]
+
+    assert isinstance(input_strategy, OpStrategy)
+    assert isinstance(index_strategy, TupleStrategy)
+    assert isinstance(dim, int)
+    dim = normalize_dim(dim, input_strategy.ndim)
+    mesh = input_strategy.mesh
+    input_shape = input_strategy.shape
+    index_shape = index_strategy.shape
+
+    single_mesh_dim_strategies = []
+
+    # placement list stores placements of [output, input, index, src]
+    # first we always have replicate all for inputs and output
+    all_replicate: PlacementList = [Replicate()] * 4
+    single_mesh_dim_strategies.append(all_replicate)
+
+    if len(input_shape) == len(index_shape):
+        for d in range(len(input_shape)):
+            if d != dim and input_shape[d] == index_shape[d]:
+                sharding: PlacementList = [Shard(d), Shard(d), Shard(d), Shard(d)]
+                single_mesh_dim_strategies.append(sharding)
+
+    return expand_to_full_mesh_op_strategy(
+        mesh, op_schema, single_mesh_dim_strategies, input_index=1
+    )
+    from IPython import embed
+
+    embed()
+    exit()
+
+
 def sdpa_rule(op, mesh, op_schema):
     out_strat = get_op_strategy(op, op_schema)
     # remove wrong context-parallel strategy
@@ -731,6 +772,7 @@ def _(mesh, op_schema):
 #     # remove grads_share_storage from schema
 #     op_schema.args_schema = op_schema.args_schema[1:]
 #     return sdpa_rule(op, mesh, op_schema)
+
 
 @register_opschema_rule(
     torch.ops.aten._scaled_dot_product_flash_attention_backward.default

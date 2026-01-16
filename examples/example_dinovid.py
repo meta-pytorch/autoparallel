@@ -1563,35 +1563,52 @@ class SelfBlock(nn.Module):
         attn_mask: AttnMaskType,  # [N, N] or [B, head, N, N]
         rope: Tensor | None,  # [2, B, N', head, D_head] with N' <= N
     ) -> Tensor:
-        B, N, D = x.shape
+        n_gpu = 64
+        x = x.unflatten(0, (n_gpu, -1))
+        rope = rope.unflatten(1, (n_gpu, -1))
+        B, N, D = x.shape[1:]
         device = x.device
         sample_subset_size = max(round(B * (1 - self.sample_drop_rate)), 1)
         # scale factor > 1 because during training the network is stochastically shorter
         residual_scale_factor = B / sample_subset_size
 
         index1 = torch.randperm(B, device=device)[:sample_subset_size]
-        x_norm1 = self.norm1(x[index1])
+        # x_norm1 = self.norm1(x[index1])
+        x_norm1 = self.norm1(x.index_select(1, index1).flatten(0, 1))
         if (
             isinstance(attn_mask, Tensor)
             and not isinstance(attn_mask, X.AttentionBias)
             and attn_mask.ndim == 4
             and attn_mask.shape[0] != 1
         ):
+            # TODO: fix this
             attn_mask = attn_mask[index1]  # Different mask per-sample and per-head
-        if rope is not None and rope.shape[1] != 1:
-            rope = rope[:, index1]  # Per-sample rope
+        if rope is not None and rope.shape[2] != 1:
+            # rope = rope[:, index1]  # Per-sample rope
+            rope = rope.index_select(2, index1).flatten(1, 2)
         residual1 = self.ls1(self.attn(x_norm1, attn_mask=attn_mask, rope=rope))
         x = torch.index_add(
-            x, dim=0, source=residual_scale_factor * residual1, index=index1
+            x,
+            dim=1,
+            source=residual_scale_factor * residual1.unflatten(0, (n_gpu, -1)),
+            index=index1,
         )
 
         index2 = torch.randperm(B, device=device)[:sample_subset_size]
-        x_norm2 = self.norm2(x[index2])
+        # x_norm2 = self.norm2(x[index2])
+        x_norm2 = self.norm2(x.index_select(1, index2).flatten(0, 1))
         residual2 = self.ls2(self.mlp(x_norm2))
         x = torch.index_add(
-            x, dim=0, source=residual_scale_factor * residual2, index=index2
+            x,
+            dim=1,
+            source=residual_scale_factor * residual2.unflatten(0, (n_gpu, -1)),
+            index=index2,
         )
 
+        # print(attn_mask, rope, B)
+        # from IPython import embed; embed()
+        # exit()
+        x = x.flatten(0, 1)
         return x
 
 
@@ -1685,10 +1702,11 @@ mesh = torch.distributed.device_mesh.init_device_mesh(
 
 
 device = torch.device("cuda")
+real_kwargs = {"sample_drop_rate": 0.3}
 cfg = Configuration(output_dir="")
 cfg = Configuration(output_dir="", model_size="debug")
 # cfg = Configuration(output_dir="", batch_size=16, model_size="large")
-cfg = Configuration(output_dir="", batch_size=16, model_size="debug")
+cfg = Configuration(output_dir="", batch_size=16, model_size="debug", **real_kwargs)
 
 
 with torch.device("meta"):
@@ -1826,34 +1844,36 @@ if autobucketing_level == "aten":
     )
 
 
-# with AutoParallel(
-#     model,
-#     input_fn,
-#     mesh,
-#     mp_policy,
-#     compile=False,
-#     repeated_subgraphs=False,  # True
-# ) as autop:
-#     autop.add_parameter_memory_constraint(low=None, high=None)
+with AutoParallel(
+    model,
+    input_fn,
+    mesh,
+    mp_policy,
+    compile=False,
+    repeated_subgraphs=False,  # True
+) as autop:
+    autop.add_parameter_memory_constraint(low=None, high=None)
 
-#     x_sharding = (Shard(0),) + (Replicate(),) * (mesh.ndim - 1)
-#     rep_sharding = (Replicate(),) * mesh.ndim
+    x_sharding = (Shard(0),) + (Replicate(),) * (mesh.ndim - 1)
+    rep_sharding = (Replicate(),) * mesh.ndim
 
-#     autop.add_input_constraints([x_sharding] * 7 + [rep_sharding] * 2)
-#     autop.add_output_constraints([rep_sharding])
+    autop.add_input_constraints([x_sharding] * 7 + [rep_sharding] * 2)
+    autop.add_output_constraints([rep_sharding])
 
-#     t = time.time()
-#     sharding_placement = autop.optimize_placement(verbose=True)
-#     print(f"Took {time.time() - t:.2f} s")
-#     parallel_mod = autop.apply_placement(sharding_placement)
-#     # exit()
+    exit()
+    t = time.time()
+    sharding_placement = autop.optimize_placement(verbose=True)
+    print(f"Took {time.time() - t:.2f} s")
+    parallel_mod = autop.apply_placement(sharding_placement)
+    # exit()
 
-# # run weight init on our sharded DTensor params
-# parallel_mod.to_empty(device="cuda")
-# parallel_mod.init_weights()
+# run weight init on our sharded DTensor params
+parallel_mod.to_empty(device="cuda")
+parallel_mod.init_weights()
 
 
 dim = 128
+
 
 class MyLinear(nn.Module):
     def __init__(self, dim, dim1):
@@ -1863,6 +1883,7 @@ class MyLinear(nn.Module):
 
     def forward(self, x):
         return x @ self.weight.T + self.bias
+
 
 class Model(nn.Module):
     def __init__(self, dim):
@@ -1884,37 +1905,38 @@ class Model(nn.Module):
         #     self.linear.bias.fill_(98.6)
         # nn.init.xavier_uniform_(self.unused)
 
-def input_fn():
-    b = 512
-    inputs = (torch.rand(b, dim, device="cuda"),)
-    return inputs
 
-from torch.distributed.fsdp import MixedPrecisionPolicy
+# def input_fn():
+#     b = 512
+#     inputs = (torch.rand(b, dim, device="cuda"),)
+#     return inputs
 
-mp_policy = MixedPrecisionPolicy(
-    param_dtype=torch.bfloat16, reduce_dtype=torch.float32
-)
-mp_policy = None
+# from torch.distributed.fsdp import MixedPrecisionPolicy
 
-with torch.device("meta"):
-    model = Model(dim)
-with AutoParallel(
-    model,
-    input_fn,
-    mesh,
-    mp_policy,
-) as autop:
-    x_sharding = (Shard(0),)
-    autop.add_input_constraints([x_sharding])
-    sharding_placement = autop.optimize_placement()
+# mp_policy = MixedPrecisionPolicy(
+#     param_dtype=torch.bfloat16, reduce_dtype=torch.float32
+# )
+# mp_policy = None
 
-    # AutoParallel produces a module with meta-DTensor parameters that need to be initialized
-    parallel_mod = autop.apply_placement(sharding_placement)
+# with torch.device("meta"):
+#     model = Model(dim)
+# with AutoParallel(
+#     model,
+#     input_fn,
+#     mesh,
+#     mp_policy,
+# ) as autop:
+#     x_sharding = (Shard(0),)
+#     autop.add_input_constraints([x_sharding])
+#     sharding_placement = autop.optimize_placement()
+
+#     # AutoParallel produces a module with meta-DTensor parameters that need to be initialized
+#     parallel_mod = autop.apply_placement(sharding_placement)
 # from IPython import embed; embed(); exit()
-parallel_mod.to_empty(device="cuda")
-parallel_mod.init_weights()
+# parallel_mod.to_empty(device="cuda")
+# parallel_mod.init_weights()
 
-from IPython import embed; embed(); exit()
+# from IPython import embed; embed(); exit()
 
 # now let's run it
 x = input_fn(B=1)

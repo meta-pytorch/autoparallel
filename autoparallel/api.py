@@ -427,8 +427,8 @@ class AutoParallel:
         with set_dtype_cast(
             True
         ), enable_local_map_wrapping(), torch._dynamo.utils._disable_saved_tensors_hooks_during_tracing():
-            # with self.fake_mode:
-            #     o = self.model(*formatted_inputs)
+            with self.fake_mode:
+                o = self.model(*formatted_inputs)
             torch_ir_with_fqn = _export(self.model, model_wrapper, formatted_inputs)
             # TODO Cna't use fake mode here because it clashes with the user level
             # fake mode. Ideally dynamo should reuse the user level fake mode.
@@ -633,13 +633,16 @@ class AutoParallel:
             )
 
         from torch._subclasses.fake_tensor import FakeTensor, unset_fake_temporarily
-        from torch.distributed.tensor.placement_types import Replicate, Shard  # noqa
         from torch.distributed.tensor import DTensor
+        from torch.distributed.tensor.placement_types import Replicate, Shard  # noqa
+
         # when a parameter is unused, it doesn't show up as argument
         # to the graph, and thus it isn't converted back from FakeTensor by _register_params_and_init_weights
         # we need to fix this
         # The reason is because _assign_attr creates a copy of the module and copies its attributes if needed
         # we will need to handle this case (where it is not in the sharded_param_dict but in the module)
+        # TODO: for now, we just put None instead, because otherwise we need to handle unused parameters in the
+        # model, and the FX graph signature doesn't match
         curr_placement = (Replicate(),) * self.mesh.ndim
         tgt_placement = (Shard(0),) * self.mesh.ndim
         for k, v in self.parallel_model.named_parameters(remove_duplicate=False):
@@ -651,11 +654,11 @@ class AutoParallel:
                     )
                     v = torch.nn.Parameter(v)
                 _assign_attr(
-                    v,
+                    None,
                     self.parallel_model,
                     self.model,
                     k,
-                    attr_kind=_AttrKind.PARAMETER,
+                    attr_kind=_AttrKind.CONSTANT,
                 )
 
         for k, v in self.parallel_model.named_buffers(remove_duplicate=False):
@@ -666,11 +669,11 @@ class AutoParallel:
                         self.mesh, tgt_placement
                     )
                 _assign_attr(
-                    v,
+                    None,
                     self.parallel_model,
                     self.model,
                     k,
-                    attr_kind=_AttrKind.BUFFER,
+                    attr_kind=_AttrKind.CONSTANT,
                 )
 
         # Right now we require a convention that the user model provides an init_weights method,
