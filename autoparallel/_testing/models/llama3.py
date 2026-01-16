@@ -11,6 +11,8 @@ import torch.nn.functional as F
 from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
+from autoparallel.ops import context_parallel_attention
+
 
 def has_cuda_capability(major: int, minor: int) -> bool:
     return torch.cuda.is_available() and torch.cuda.get_device_capability() >= (
@@ -50,7 +52,9 @@ class ScaledDotProductAttention(torch.nn.Module):
     ) -> torch.Tensor:
         assert self.backends, "SDPA Backends should not be empty."
         with sdpa_kernel(self.backends, set_priority=True):
-            return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            # Use context parallel attention with the selected backend
+            # All backend-specific arguments (is_causal, dropout_p, scale, etc.) are passed via kwargs
+            return context_parallel_attention(q, k, v, is_causal=True, dropout_p=0.0)
 
 
 def build_attention(
