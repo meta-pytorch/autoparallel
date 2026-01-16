@@ -28,7 +28,7 @@ from torch._logging import trace_structured
 from torch.distributed.distributed_c10d import GroupName
 from torch.utils._ordered_set import OrderedSet
 
-import autoparallel.asynctp_ops  # noqa: F401
+import autoparallel.graph_passes.async_tp.asynctp_ops  # noqa: F401
 
 log = logging.getLogger(__name__)
 aten = torch.ops.aten

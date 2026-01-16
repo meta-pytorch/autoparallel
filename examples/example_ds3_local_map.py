@@ -18,7 +18,7 @@ from autoparallel._testing.models.dsv3 import (
     MoEArgs,
 )
 from autoparallel.api import AutoParallel
-from autoparallel.utils import NumericsLogger
+from autoparallel.shardings.placement_options import NumericsLogger
 
 
 def run_test(fake_evaluate: bool, rng_seed: Optional[int], logs_dir: str):

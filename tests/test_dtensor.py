@@ -26,7 +26,7 @@ from torch.testing._internal.distributed._tensor.common_dtensor import (
     with_comms,
 )
 
-from autoparallel.dtensor_util import (
+from autoparallel.shardings.dtensor_sharding_helpers import (
     batch_shard_strategy,
     get_op_strategy,
     op_strategy_context,

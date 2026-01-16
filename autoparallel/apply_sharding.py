@@ -23,12 +23,12 @@ from torch.distributed.tensor.placement_types import Partial, Replicate, Shard  
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.utils._pytree import tree_flatten, tree_map_only
 
-from .graph_utils import cleanup_graph
-from .ordered_sharding import (
+from .graph_passes.graph_utils import cleanup_graph
+from .shardings.ordered_sharding import (
     compute_optimal_placement_order_for_parameters,
     ordered_redistribute_local_tensor,
 )
-from .propagation_rules import TENSOR_FACTORY_OPS
+from .shardings.propagation_rules import TENSOR_FACTORY_OPS
 
 _ENABLE_ORDERED_SHARDING_OPTIMIZATION = True
 
