@@ -10,6 +10,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from autoparallel.ops import permutation
+
 DTYPES: dict[str, torch.dtype] = {
     "bfloat16": torch.bfloat16,
     "float16": torch.float16,
@@ -1572,9 +1574,19 @@ class SelfBlock(nn.Module):
         # scale factor > 1 because during training the network is stochastically shorter
         residual_scale_factor = B / sample_subset_size
 
-        index1 = torch.randperm(B, device=device)[:sample_subset_size]
+        # index1 = torch.randperm(B, device=device)[:sample_subset_size]
+        index1 = permutation(
+            torch.arange(B, device=device)[None, :].expand(n_gpu, -1),
+            axis=1,
+            independent=True,
+        )[:, :sample_subset_size]
         # x_norm1 = self.norm1(x[index1])
-        x_norm1 = self.norm1(x.index_select(1, index1).flatten(0, 1))
+        # x_norm1 = self.norm1(x.index_select(1, index1).flatten(0, 1))
+        # x_norm1 = self.norm1(x[:, index1].flatten(0, 1))
+        # x_norm1 = self.norm1(x.gather(1, index1[:, :, None, None].expand_as(x)).flatten(0, 1))
+        x_norm1 = self.norm1(
+            x.take_along_dim(index1[:, :, None, None], 1).flatten(0, 1)
+        )
         if (
             isinstance(attn_mask, Tensor)
             and not isinstance(attn_mask, X.AttentionBias)
@@ -1585,29 +1597,40 @@ class SelfBlock(nn.Module):
             attn_mask = attn_mask[index1]  # Different mask per-sample and per-head
         if rope is not None and rope.shape[2] != 1:
             # rope = rope[:, index1]  # Per-sample rope
-            rope = rope.index_select(2, index1).flatten(1, 2)
+            # rope = rope.index_select(2, index1).flatten(1, 2)
+            # rope = rope[:, :, index1].flatten(1, 2)
+            rope = rope.take_along_dim(index1[None, :, :, None, None, None], 2).flatten(
+                1, 2
+            )
         residual1 = self.ls1(self.attn(x_norm1, attn_mask=attn_mask, rope=rope))
-        x = torch.index_add(
+        x = torch.scatter_add(
             x,
             dim=1,
-            source=residual_scale_factor * residual1.unflatten(0, (n_gpu, -1)),
-            index=index1,
+            src=residual_scale_factor * residual1.unflatten(0, (n_gpu, -1)),
+            index=index1[:, :, None, None].expand(-1, -1, x.shape[2], x.shape[3]),
         )
 
-        index2 = torch.randperm(B, device=device)[:sample_subset_size]
+        # index2 = torch.randperm(B, device=device)[:sample_subset_size]
+        index2 = permutation(
+            torch.arange(B, device=device)[None, :].expand(n_gpu, -1),
+            axis=1,
+            independent=True,
+        )[:, :sample_subset_size]
         # x_norm2 = self.norm2(x[index2])
-        x_norm2 = self.norm2(x.index_select(1, index2).flatten(0, 1))
-        residual2 = self.ls2(self.mlp(x_norm2))
-        x = torch.index_add(
-            x,
-            dim=1,
-            source=residual_scale_factor * residual2.unflatten(0, (n_gpu, -1)),
-            index=index2,
+        # x_norm2 = self.norm2(x.index_select(1, index2).flatten(0, 1))
+        # x_norm2 = self.norm2(x[:, index2].flatten(0, 1))
+        x_norm2 = self.norm2(
+            x.take_along_dim(index2[:, :, None, None], 1).flatten(0, 1)
         )
 
-        # print(attn_mask, rope, B)
-        # from IPython import embed; embed()
-        # exit()
+        residual2 = self.ls2(self.mlp(x_norm2))
+        x = torch.scatter_add(
+            x,
+            dim=1,
+            src=residual_scale_factor * residual2.unflatten(0, (n_gpu, -1)),
+            index=index2[:, :, None, None].expand(-1, -1, x.shape[2], x.shape[3]),
+        )
+
         x = x.flatten(0, 1)
         return x
 
@@ -1860,7 +1883,7 @@ with AutoParallel(
     autop.add_input_constraints([x_sharding] * 7 + [rep_sharding] * 2)
     autop.add_output_constraints([rep_sharding])
 
-    exit()
+    # exit()
     t = time.time()
     sharding_placement = autop.optimize_placement(verbose=True)
     print(f"Took {time.time() - t:.2f} s")
