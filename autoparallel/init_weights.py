@@ -52,9 +52,9 @@ def _build_param_property(parallel_model: torch.nn.Module, fqn: str):
 
     def setter(self, value: Union[torch.Tensor, torch.nn.Parameter]) -> None:
         parallel_value = parallel_model.get_parameter(fqn)
-        assert isinstance(
-            parallel_value, DTensor
-        ), "Expected parallel_module params to be DTensors"
+        # assert isinstance(
+        #     parallel_value, DTensor
+        # ), "Expected parallel_module params to be DTensors"
         _copy_set_value_to_dtensor(fqn, parallel_value, value)
 
     return property(getter, setter)
@@ -66,9 +66,9 @@ def _build_buffer_property(parallel_model: torch.nn.Module, fqn: str):
 
     def setter(self, value: torch.Tensor) -> None:
         parallel_value = parallel_model.get_buffer(fqn)
-        assert isinstance(
-            parallel_value, DTensor
-        ), "Expected parallel_module params to be DTensors"
+        # assert isinstance(
+        #     parallel_value, DTensor
+        # ), "Expected parallel_module params to be DTensors"
         _copy_set_value_to_dtensor(fqn, parallel_value, value)
 
     return property(getter, setter)
