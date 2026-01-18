@@ -535,8 +535,8 @@ def test_auto_parallel_multiple_outputs(device_mesh_1d):
         def __init__(self, dim):
             super().__init__()
             # Use bias=False to avoid view ops in backward that cause partitioner issues
-            self.linear1 = nn.Linear(dim, dim, bias=False)
-            self.linear2 = nn.Linear(dim, dim, bias=False)
+            self.linear1 = nn.Linear(dim, dim, bias=True)
+            self.linear2 = nn.Linear(dim, dim, bias=True)
 
         def forward(self, x):
             return self.linear1(x), self.linear2(x)

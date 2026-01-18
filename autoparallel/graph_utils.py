@@ -94,7 +94,13 @@ def _add_alias(gm, version="v1"):
         first_user = nodes[min(node_map[n] for n in node.users)]
         with graph.inserting_before(first_user):
             alias_node = graph.call_function(torch.ops.aten.alias.default, args=(node,))
-            alias_node.meta.update(node.meta)
+            # Copy metadata but exclude partitioner_tag to avoid confusing the partitioner
+            # The partitioner uses partitioner_tag to determine if a node must be in
+            # forward or backward. Alias nodes should be neutral and placed based on
+            # their dependencies, not inherited tags.
+            alias_node.meta.update(
+                {k: v for k, v in node.meta.items() if k != "partitioner_tag"}
+            )
 
             def delete_user_cb(n):
                 return n != alias_node
@@ -146,7 +152,10 @@ def _add_alias(gm, version="v1"):
     for node in graph.find_nodes(op="output")[0].all_input_nodes:
         with graph.inserting_after(node):
             alias_node = graph.call_function(torch.ops.aten.alias.default, args=(node,))
-            alias_node.meta.update(node.meta)
+            # Copy metadata but exclude partitioner_tag
+            alias_node.meta.update(
+                {k: v for k, v in node.meta.items() if k != "partitioner_tag"}
+            )
 
             def delete_user_cb(n):
                 return n != alias_node
