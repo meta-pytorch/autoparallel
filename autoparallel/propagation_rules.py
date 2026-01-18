@@ -718,19 +718,35 @@ def _(mesh, op_schema):
     return sdpa_rule(op, mesh, op_schema)
 
 
-# import xformers
-# @register_opschema_rule(torch.ops.xformers_flash.flash_fwd.default)
-# def _(mesh, op_schema):
-#     op = torch.ops.aten._scaled_dot_product_flash_attention.default
-#     return sdpa_rule(op, mesh, op_schema)
+import xformers.ops
 
 
-# @register_opschema_rule(torch.ops.xformers_flash.flash_bwd.default)
-# def _(mesh, op_schema):
-#     op = torch.ops.aten._scaled_dot_product_flash_attention_backward.default
-#     # remove grads_share_storage from schema
-#     op_schema.args_schema = op_schema.args_schema[1:]
-#     return sdpa_rule(op, mesh, op_schema)
+@register_opschema_rule(torch.ops.xformers_flash.flash_fwd.default)
+def _(mesh, op_schema):
+    op = torch.ops.aten._scaled_dot_product_flash_attention.default
+    return sdpa_rule(op, mesh, op_schema)
+
+
+@register_opschema_rule(torch.ops.xformers_flash.flash_bwd.default)
+def _(mesh, op_schema):
+    op = torch.ops.aten._scaled_dot_product_flash_attention_backward.default
+    # remove grads_share_storage from schema
+    op_schema.args_schema = op_schema.args_schema[1:]
+    return sdpa_rule(op, mesh, op_schema)
+
+
+@register_opschema_rule(torch.ops.xformers_flash3.flash_fwd.default)
+def _(mesh, op_schema):
+    op = torch.ops.aten._scaled_dot_product_flash_attention.default
+    return sdpa_rule(op, mesh, op_schema)
+
+
+@register_opschema_rule(torch.ops.xformers_flash3.flash_bwd.default)
+def _(mesh, op_schema):
+    op = torch.ops.aten._scaled_dot_product_flash_attention_backward.default
+    # remove grads_share_storage from schema
+    op_schema.args_schema = op_schema.args_schema[1:]
+    return sdpa_rule(op, mesh, op_schema)
 
 
 @register_opschema_rule(

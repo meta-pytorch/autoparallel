@@ -1574,16 +1574,11 @@ class SelfBlock(nn.Module):
         # scale factor > 1 because during training the network is stochastically shorter
         residual_scale_factor = B / sample_subset_size
 
-        # index1 = torch.randperm(B, device=device)[:sample_subset_size]
         index1 = permutation(
             torch.arange(B, device=device)[None, :].expand(n_gpu, -1),
             axis=1,
             independent=True,
         )[:, :sample_subset_size]
-        # x_norm1 = self.norm1(x[index1])
-        # x_norm1 = self.norm1(x.index_select(1, index1).flatten(0, 1))
-        # x_norm1 = self.norm1(x[:, index1].flatten(0, 1))
-        # x_norm1 = self.norm1(x.gather(1, index1[:, :, None, None].expand_as(x)).flatten(0, 1))
         x_norm1 = self.norm1(
             x.take_along_dim(index1[:, :, None, None], 1).flatten(0, 1)
         )
@@ -1596,9 +1591,6 @@ class SelfBlock(nn.Module):
             # TODO: fix this
             attn_mask = attn_mask[index1]  # Different mask per-sample and per-head
         if rope is not None and rope.shape[2] != 1:
-            # rope = rope[:, index1]  # Per-sample rope
-            # rope = rope.index_select(2, index1).flatten(1, 2)
-            # rope = rope[:, :, index1].flatten(1, 2)
             rope = rope.take_along_dim(index1[None, :, :, None, None, None], 2).flatten(
                 1, 2
             )
@@ -1610,15 +1602,11 @@ class SelfBlock(nn.Module):
             index=index1[:, :, None, None].expand(-1, -1, x.shape[2], x.shape[3]),
         )
 
-        # index2 = torch.randperm(B, device=device)[:sample_subset_size]
         index2 = permutation(
             torch.arange(B, device=device)[None, :].expand(n_gpu, -1),
             axis=1,
             independent=True,
         )[:, :sample_subset_size]
-        # x_norm2 = self.norm2(x[index2])
-        # x_norm2 = self.norm2(x.index_select(1, index2).flatten(0, 1))
-        # x_norm2 = self.norm2(x[:, index2].flatten(0, 1))
         x_norm2 = self.norm2(
             x.take_along_dim(index2[:, :, None, None], 1).flatten(0, 1)
         )

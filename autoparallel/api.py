@@ -459,6 +459,7 @@ class AutoParallel:
         )
         # from IPython import embed; embed(); exit()
         self.gm = gm
+        self.inputs = formatted_inputs
 
     # TODO: Specify what the low/high meaning is (percentage?)
     def add_parameter_memory_constraint(self, low=None, high=None):
@@ -711,10 +712,21 @@ class AutoParallel:
             bw_compiler=self.compiler_fn,
         )
 
+        def check_args(*args):
+            for i, (arg, orig_arg) in enumerate(zip(args, self.inputs)):
+                # assert type(arg) == type(orig_arg), f"expected same types, got {type(arg)}, {type(orig_arg)}"
+                if not isinstance(arg, torch.Tensor):
+                    continue
+                assert (
+                    arg.ndim == orig_arg.ndim
+                ), f"input argument {i} expected to have {orig_arg.ndim} dims, got {arg.ndim}"
+                # assert arg.shape == orig_arg.shape, f"input argument {i} expected to have shape {orig_arg.shape}, got {arg.shape}"
+
         # TODO: this probably belongs in the AOTAutograd API
         # TODO: pytree handling
         class AutoParallelModule(torch.nn.Module):
             def forward(self, *args):
+                check_args(*args)
                 # NB: don't close over the parameters/buffers, as the user may
                 # reassign the module!
                 # TODO: It's this to just exactly match
