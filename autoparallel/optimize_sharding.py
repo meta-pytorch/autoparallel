@@ -96,14 +96,17 @@ from torch.distributed.tensor._dtensor_spec import DTensorSpec
 from torch.distributed.tensor.placement_types import Placement, Replicate, Shard
 from torch.utils._pytree import tree_flatten, tree_map_only
 
-from .collective_runtime_estimation import estimate_strategy_comms_cost
-from .compute_estimation import (
+from .cost_models.collective_runtime_estimation import estimate_strategy_comms_cost
+from .cost_models.compute_estimation import (
     _get_sharded_shape_stride,
     estimate_strategy_runtime_cost,
 )
-from .graph_clustering import get_identical_regions
-from .propagation_rules import _create_all_options
-from .utils import get_local_map_placement_option, get_placement_options
+from .graph_passes.graph_clustering import get_identical_regions
+from .shardings.placement_options import (
+    get_local_map_placement_option,
+    get_placement_options,
+)
+from .shardings.propagation_rules import _create_all_options
 
 
 def _debug_node(node):
