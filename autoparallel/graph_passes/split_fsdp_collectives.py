@@ -15,7 +15,7 @@ import torch.utils._pytree as pytree
 from torch._functorch._aot_autograd.descriptors import AOTOutput
 from torch._functorch.partitioners import _extract_graph_with_inputs_outputs
 
-from autoparallel.activation_checkpointing import (
+from autoparallel.graph_passes.activation_checkpointing import (
     find_last_all_gather_in_chain,
     find_last_non_view_node_in_chain,
     find_last_user_in_wait_chain,

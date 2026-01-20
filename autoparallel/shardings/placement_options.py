@@ -22,9 +22,9 @@ from torch.distributed.tensor._ops.utils import generate_redistribute_costs
 from torch.distributed.tensor.placement_types import Replicate
 from torch.utils._pytree import tree_flatten, tree_map_only
 
-from autoparallel.propagation_rules import generate_dummy_redistribute_costs
+from autoparallel.shardings.propagation_rules import generate_dummy_redistribute_costs
 
-from .dtensor_util import get_op_strategy, with_implicit_strategies
+from .dtensor_sharding_helpers import get_op_strategy, with_implicit_strategies
 from .propagation_rules import (
     TENSOR_FACTORY_OPS,
     _op_partial_rules,

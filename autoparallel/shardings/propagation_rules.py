@@ -40,8 +40,8 @@ from torch.distributed.tensor._ops.utils import (
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
 # need to import this to have the dtype_cast registered
-from .cast_parametrization import dtype_cast  # noqa
-from .dtensor_util import get_op_strategy
+from ..cast_parametrization import dtype_cast  # noqa
+from .dtensor_sharding_helpers import get_op_strategy
 
 # TODO: move this to PyTorch
 dim_maps[torch.t] = lambda input: dim_transpose(input.ndim, -2, -1)
