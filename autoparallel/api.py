@@ -1142,8 +1142,6 @@ def auto_parallel(
         # autop.add_parameter_memory_constraint(low=None, high=None)
         autop.add_input_constraints(input_placements)
         autop.add_output_constraints(output_placements)
-        print(input_placements, output_placements, input_fn())
-        print(autop.gm)
 
         # Optimize and apply
         sharding_placement = autop.optimize_placement(verbose=False)
