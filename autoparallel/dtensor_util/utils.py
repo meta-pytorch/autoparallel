@@ -20,7 +20,7 @@ from torch.distributed.tensor._op_schema import (
 from torch.distributed.tensor._ops.utils import (
     generate_redistribute_costs,
     is_tensor_shardable,
-    register_op_strategy
+    register_op_strategy,
 )
 from torch.distributed.tensor.debug import (
     _clear_fast_path_sharding_prop_cache,

@@ -124,11 +124,7 @@ function mount_airstore {
   fi
 
   echo "WS-Airstore: mount from $airstore_uri to $mount_dir"
-  if [[ ${OILFS_USE_LEGACY_SCRIPT+set} && "${OILFS_USE_LEGACY_SCRIPT}" == 1  ]]; then
-    /packages/oil.oilfs/scripts/airstore_wrapper.sh "$airstore_uri" "$mount_dir"
-  else
-    /packages/oil.oilfs/oilfs-wrapper --log-level debug --profile=airstore "$airstore_uri" "$mount_dir" --user "airstore-${AI_RM_ATTRIBUTION-}"
-  fi
+  /packages/oil.oilfs/oilfs-wrapper --log-level debug --profile=airstore "$airstore_uri" "$mount_dir" --user "airstore-${AI_RM_ATTRIBUTION-}"
 }
 
 setup_oilfs
