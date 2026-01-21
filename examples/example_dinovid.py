@@ -1635,7 +1635,9 @@ class QkvLinear(nn.Linear):
         bias = self.bias
         if bias is not None:
             bias = bias.reshape(3, -1)
-            bias = bias * bias.new_tensor([[0], [1], [1]])
+            # TODO: fix this
+            # bias = bias * bias.new_tensor([[0], [1], [1]])
+            bias = bias * (torch.arange(3, device=bias.device)[:, None] > 0)
             bias = bias.flatten()
         return F.linear(input, self.weight, bias)
 
@@ -1713,11 +1715,18 @@ mesh = torch.distributed.device_mesh.init_device_mesh(
 
 
 device = torch.device("cuda")
-real_kwargs = {"sample_drop_rate": 0.3}
+real_kwargs = {
+    "sample_drop_rate": 0.3,
+    "pos_embed_sincos": False,
+    "pos_embed_rotations": False,
+    "mlp_bias": True,
+    "qkv_bias": True,
+    "proj_bias": True,
+}
 cfg = Configuration(output_dir="")
 cfg = Configuration(output_dir="", model_size="debug")
-# cfg = Configuration(output_dir="", batch_size=16, model_size="large")
-cfg = Configuration(output_dir="", batch_size=16, model_size="debug", **real_kwargs)
+cfg = Configuration(output_dir="", batch_size=16, model_size="large", **real_kwargs)
+# cfg = Configuration(output_dir="", batch_size=16, model_size="debug", **real_kwargs)
 
 
 with torch.device("meta"):
