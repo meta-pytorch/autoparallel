@@ -13,6 +13,45 @@ from autoparallel import AutoParallel, with_sharding_constraint
 from autoparallel.collectives import local_map
 
 
+def get_local_map_nodes(graph, is_backward=False):
+    """Get local_map nodes from an FX graph.
+
+    Args:
+        graph: The FX graph to search.
+        is_backward: If True, return backward nodes; if False, return forward nodes.
+
+    Returns:
+        List of local_map nodes.
+    """
+    nodes = []
+    for node in graph.nodes:
+        if "local_map_kwargs" in node.meta:
+            node_is_backward = node.meta.get("partitioner_tag", "") == "is_backward"
+            if node_is_backward == is_backward:
+                nodes.append(node)
+    return nodes
+
+
+def verify_local_map_placements(sharding_placement, node, expected_placements):
+    """Verify that a local_map node has the expected output placements.
+
+    Args:
+        sharding_placement: The sharding placement dict from optimize_placement().
+        node: The FX node to check.
+        expected_placements: Expected tuple of Placement objects for output.
+    """
+    spec = sharding_placement[node]
+    # local_map nodes have tuple output_specs (output + saved activations)
+    # The first element is the actual output
+    if isinstance(spec.output_specs, tuple):
+        output_spec = spec.output_specs[0]
+    else:
+        output_spec = spec.output_specs
+    assert (
+        output_spec.placements == expected_placements
+    ), f"Expected placements {expected_placements}, got {output_spec.placements}"
+
+
 @pytest.fixture(scope="module", autouse=True)
 def init_pg():
     world_size = 64
@@ -72,6 +111,14 @@ class TestWithShardingConstraint:
             autop.add_input_constraints([(Shard(0),)])
             autop.add_output_constraints([(Shard(0),)])
             sharding_placement = autop.optimize_placement()
+
+            # Verify the with_sharding_constraint node has correct placement
+            local_map_nodes = get_local_map_nodes(autop.gm.graph, is_backward=False)
+            assert len(local_map_nodes) == 1, "Expected 1 forward local_map node"
+            verify_local_map_placements(
+                sharding_placement, local_map_nodes[0], (Shard(0),)
+            )
+
             parallel_mod = autop.apply_placement(sharding_placement)
 
         assert parallel_mod is not None
@@ -121,6 +168,16 @@ class TestWithShardingConstraint:
             autop.add_input_constraints([(Shard(0),)])
             autop.add_output_constraints([(Shard(0),)])
             sharding_placement = autop.optimize_placement()
+
+            # Verify all local_map nodes have correct placement
+            # There are 3 forward local_map nodes: compute1, with_sharding_constraint, compute2
+            local_map_nodes = get_local_map_nodes(autop.gm.graph, is_backward=False)
+            assert (
+                len(local_map_nodes) == 3
+            ), f"Expected 3 forward local_map nodes, got {len(local_map_nodes)}"
+            for node in local_map_nodes:
+                verify_local_map_placements(sharding_placement, node, (Shard(0),))
+
             parallel_mod = autop.apply_placement(sharding_placement)
 
         assert parallel_mod is not None
@@ -152,6 +209,14 @@ class TestWithShardingConstraint:
             autop.add_input_constraints([(Shard(0),)])
             autop.add_output_constraints([(Shard(0),)])
             sharding_placement = autop.optimize_placement()
+
+            # Verify the with_sharding_constraint node forces Replicate
+            local_map_nodes = get_local_map_nodes(autop.gm.graph, is_backward=False)
+            assert len(local_map_nodes) == 1, "Expected 1 forward local_map node"
+            verify_local_map_placements(
+                sharding_placement, local_map_nodes[0], (Replicate(),)
+            )
+
             parallel_mod = autop.apply_placement(sharding_placement)
 
         assert parallel_mod is not None
@@ -183,6 +248,14 @@ class TestWithShardingConstraint:
             autop.add_input_constraints([(Shard(0), Replicate())])
             autop.add_output_constraints([(Shard(0), Replicate())])
             sharding_placement = autop.optimize_placement()
+
+            # Verify the with_sharding_constraint node has correct 2D placement
+            local_map_nodes = get_local_map_nodes(autop.gm.graph, is_backward=False)
+            assert len(local_map_nodes) == 1, "Expected 1 forward local_map node"
+            verify_local_map_placements(
+                sharding_placement, local_map_nodes[0], (Shard(0), Replicate())
+            )
+
             parallel_mod = autop.apply_placement(sharding_placement)
 
         assert parallel_mod is not None
@@ -217,6 +290,18 @@ class TestWithShardingConstraint:
             autop.add_input_constraints([(Shard(0),)])
             autop.add_output_constraints([(Shard(0),)])
             sharding_placement = autop.optimize_placement()
+
+            # Verify all 3 with_sharding_constraint nodes have correct placements
+            local_map_nodes = get_local_map_nodes(autop.gm.graph, is_backward=False)
+            assert (
+                len(local_map_nodes) == 3
+            ), f"Expected 3 forward local_map nodes, got {len(local_map_nodes)}"
+
+            # Nodes should be in order: Shard(0), Replicate(), Shard(0)
+            expected_placements = [(Shard(0),), (Replicate(),), (Shard(0),)]
+            for node, expected in zip(local_map_nodes, expected_placements):
+                verify_local_map_placements(sharding_placement, node, expected)
+
             parallel_mod = autop.apply_placement(sharding_placement)
 
         assert parallel_mod is not None
