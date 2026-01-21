@@ -134,7 +134,7 @@ def format_sharding_log(
             (x["comm_cost"], x["compute_cost"], x["sharding_transition_cost"])
             for x in d
         ]
-        shard_order = getattr(node.meta, "shard_order", None)
+        shard_order = node.meta.get("shard_order")
         if shard_order:
             annotation = f"  {plc_txt}{attr_color(strat)} {shard_order=} {cost_txt}{attr_color(str(costs))}"
         else:
