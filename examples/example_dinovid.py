@@ -1836,7 +1836,7 @@ from autoparallel.auto_bucketing import (
     aten_autobucketing_reordering_pass,
     configure_inductor_for_autobucketing,
 )
-from autoparallel.debug_helpers import make_custom_runtime_estimation
+from autoparallel.graph_passes.debug_helpers import make_custom_runtime_estimation
 
 autobucketing_level = "aten"
 if autobucketing_level == "aten":
