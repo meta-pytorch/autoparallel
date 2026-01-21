@@ -163,6 +163,20 @@ DEVICE_LIMITS: Tuple[DeviceLimit, ...] = (
             torch.float16: 21.2,
         },
     ),
+    # AMD MI300
+    DeviceLimit(
+        "MI300",
+        "https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/data-sheets/amd-instinct-mi300x-data-sheet.pdf",
+        sm=(-1, -1), # sm not defined for AMD GPUs
+        gmem_bandwidth=5.3 * (1024**4),
+        gemm_tflops={
+            torch.float64: 163.4,
+            torch.float32: 653.7,
+            torch.float16: 1307.4,
+            torch.bfloat16: 1307.4,
+            torch.int8: 2614.9,
+        },
+    ),
 )
 
 
