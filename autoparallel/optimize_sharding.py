@@ -576,69 +576,21 @@ class ShardingOptimizer:
         print(f"total_cost: {total_cost:.2f}")
         print(self.get_violated_constraints_log())
 
-    def get_log(self, colored=False):
+    def get_log(self, colored=False, verbose=False):
+        from autoparallel.log_formatting import format_sharding_log
 
-        from torch.fx.graph import _color_fns, _identity
-
-        opt = {}
         nodes = list(self.graph.nodes)
+        opt = {}
         for x in self.res:
             opt.setdefault(nodes[x[0]], []).append(self.ds[x])
 
-        # TODO: use python_code to have a shorter representation
-        # of the graph. We could use node.format_node() instead
-        # but it is a bit more verbose
-        # also, this is a bit hacky as it makes a bunch of assumptions regarding lines
-        # so would be better to make it more robust
-        code = self.graph.python_code("self", colored=colored).src.strip().split("\n")
-        if colored:
-            txt_color = _color_fns["blue"]
-            attr_color = _color_fns["red"]
-        else:
-            txt_color = _identity
-            attr_color = _identity
-        l_id = 1
-        plc_txt = txt_color("# placement=")
-        cost_txt = txt_color(", cost=")
-        for node in nodes:
-            if node.op == "output":
-                continue
-            d = opt[node]
-            strat = str(d[0]["full_strat"])
-            costs = [
-                (x["comm_cost"], x["compute_cost"], x["sharding_transition_cost"])
-                for x in d
-            ]
-            shard_order = getattr(node.meta, "shard_order", None)
-            if shard_order:
-                line = f"  {plc_txt}{attr_color(strat)} {shard_order=} {cost_txt}{attr_color(str(costs))}"
-            else:
-                line = (
-                    f"  {plc_txt}{attr_color(strat)} {cost_txt}{attr_color(str(costs))}"
-                )
-            if node.op == "placeholder":
-                line = f"    # {node.name}: {line}"
-                code.insert(l_id, line)
-                l_id += 1
-                continue
-            # LOL
-            while not code[l_id].lstrip().startswith(repr(node)):
-                l_id += 1
-            code[l_id] += line
-            l_id += 1
-        code = "\n".join(code)
-        total_cost = sum(self.ds[x]["cost"] for x in self.res)
-        total_comm_cost = sum(self.ds[x]["comm_cost"] for x in self.res)
-        total_compute_cost = sum(self.ds[x]["compute_cost"] for x in self.res)
-        total_transition_cost = sum(
-            self.ds[x]["sharding_transition_cost"] for x in self.res
+        return format_sharding_log(
+            graph=self.graph,
+            opt=opt,
+            colored=colored,
+            verbose=verbose,
+            violated_constraints_log=self.get_violated_constraints_log(),
         )
-        code += f"\ntotal_cost: {total_cost:.2f}"
-        code += f"\n  comm_cost: {total_comm_cost:.2f}"
-        code += f"\n  compute_cost: {total_compute_cost:.2f}"
-        code += f"\n  transition_cost: {total_transition_cost:.2f}"
-        code += "\n" + self.get_violated_constraints_log()
-        return code
 
     def print_costs_for_node(self, node, arg=0, **kwargs):
         from tabulate import tabulate  # type: ignore

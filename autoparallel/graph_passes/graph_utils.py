@@ -78,7 +78,7 @@ def update_joint_with_descriptors(
     else:
         joint_with_descriptors._aot_graph_capture.updated_flat_args = new_flat_args
 
-    joint_with_descriptors._aot_state.flat_args = new_flat_args
+    joint_with_descriptors._aot_state.flat_args = new_flat_args  # type: ignore[assignment]
     joint_with_descriptors._aot_state.fw_metadata.traced_tangents = new_local_tangents
 
 
