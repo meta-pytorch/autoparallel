@@ -503,7 +503,7 @@ class AutoParallel:
         self.sharding_placement = self.sharding_optimizer.get_solution(verbose=False)
 
         if verbose:
-            print(self.sharding_optimizer.get_log())
+            print(self.sharding_optimizer.get_log(verbose=True))
 
         trace_structured(
             "artifact",
