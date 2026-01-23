@@ -1537,7 +1537,9 @@ class DeepSeekV3Model(nn.Module):
     """
 
     def __init__(self, model_args: DeepSeekV3ModelArgs):
-        super().__init__()
+        # Explicitly call nn.Module.__init__ to avoid MRO issues when this class
+        # is used with multiple inheritance (e.g., with ModelProtocol in torchtitan)
+        nn.Module.__init__(self)
         self.max_seq_len = model_args.max_seq_len
         self.tok_embeddings = nn.Embedding(model_args.vocab_size, model_args.dim)
         self.register_buffer(

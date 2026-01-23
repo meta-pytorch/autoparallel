@@ -209,6 +209,12 @@ class ShardingOptimizer:
                         self.mesh, node.target, user_strats, user_args, user_kwargs
                     )
                 strats[node] = strat
+            elif node.op == "get_attr":
+                # get_attr nodes represent module attributes (e.g., constant tensors)
+                # Handle similarly to placeholder nodes
+                strats[node] = _create_all_options(
+                    self.mesh, node.meta["val"].shape, tensor=node.meta["val"]
+                )
             elif node.op == "output":
                 user_strats = tree_map_only(
                     torch.fx.Node, lambda x: strats[x], node.args
@@ -418,7 +424,7 @@ class ShardingOptimizer:
         """
         # a single pair of input-output policy is chosen
         for s_i, node in enumerate(self.graph.nodes):
-            if node.op not in {"placeholder", "call_function"}:
+            if node.op not in {"placeholder", "call_function", "get_attr"}:
                 continue
             arg_vars = {}
             for arg, oi, ii in self.walk_over_options(node):
