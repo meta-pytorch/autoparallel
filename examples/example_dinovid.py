@@ -1725,8 +1725,8 @@ real_kwargs = {
 }
 cfg = Configuration(output_dir="")
 cfg = Configuration(output_dir="", model_size="debug")
-cfg = Configuration(output_dir="", batch_size=16, model_size="large", **real_kwargs)
-# cfg = Configuration(output_dir="", batch_size=16, model_size="debug", **real_kwargs)
+# cfg = Configuration(output_dir="", batch_size=16, model_size="large", **real_kwargs)
+cfg = Configuration(output_dir="", batch_size=16, model_size="debug", **real_kwargs)
 
 
 with torch.device("meta"):
@@ -1848,7 +1848,7 @@ from autoparallel.auto_bucketing import (
 from autoparallel.graph_passes.debug_helpers import make_custom_runtime_estimation
 
 autobucketing_level = "aten"
-if autobucketing_level == "aten":
+if False:  # autobucketing_level == "aten":
     aten_autobucketing_config.custom_runtime_estimation = (
         make_custom_runtime_estimation(mesh)
     )
@@ -1859,9 +1859,22 @@ if autobucketing_level == "aten":
         aten_autobucketing_reordering_pass,
         configs=aten_autobucketing_config,
     )
+
+    def aten_autobucketing_reordering_pass2(*args, **kwargs):
+        print("\n" * 10)
+        print("================================")
+        print("Doing this now!!!!!!!!!!!!!!!!")
+        print("================================")
+        print("\n" * 10)
+        return aten_autobucketing_reordering_pass(*args, **kwargs)
+
     torch._inductor.config.post_grad_custom_post_pass = (
-        aten_autobucketing_reordering_pass
+        aten_autobucketing_reordering_pass2
     )
+
+torch._inductor.config.aten_distributed_optimizations.enable_overlap_scheduling = True
+torch._inductor.config.aten_distributed_optimizations.collective_bucketing = True
+torch._inductor.config.aten_distributed_optimizations.insert_overlap_deps = False
 
 
 with AutoParallel(
