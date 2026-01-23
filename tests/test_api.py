@@ -677,3 +677,168 @@ def test_auto_parallel_with_mp_policy(device_mesh_1d):
     )
 
     assert parallel_model is not None
+
+
+# Tests for build_compile_fn and _recursive_post_grad_passes
+
+
+def test_recursive_post_grad_passes_called_when_compile_false(device_mesh_1d):
+    """Test that _recursive_post_grad_passes is called when compile=False.
+
+    This verifies the fix that ensures post-grad passes (like layout optimization)
+    are run even when not using the full inductor compilation pipeline.
+    """
+    from unittest.mock import patch
+
+    dim = 128
+
+    class Model(nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            self.linear = nn.Linear(dim, dim)
+
+        def forward(self, x):
+            return self.linear(x)
+
+    def input_fn():
+        b = 32
+        return (torch.rand(b, dim, device="cuda"),)
+
+    with torch.device("meta"):
+        model = Model(dim)
+
+    # Track if _recursive_post_grad_passes was called
+    post_grad_passes_called = []
+
+    original_recursive_post_grad_passes = None
+    try:
+        from torch._inductor.compile_fx import _recursive_post_grad_passes
+
+        original_recursive_post_grad_passes = _recursive_post_grad_passes
+    except ImportError:
+        pytest.skip("_recursive_post_grad_passes not available in this PyTorch version")
+
+    def tracking_post_grad_passes(fx_g, is_inference=False):
+        post_grad_passes_called.append((fx_g, is_inference))
+        # Call the original function
+        return original_recursive_post_grad_passes(fx_g, is_inference=is_inference)
+
+    with patch(
+        "torch._inductor.compile_fx._recursive_post_grad_passes",
+        side_effect=tracking_post_grad_passes,
+    ):
+        with AutoParallel(
+            model,
+            input_fn,
+            device_mesh_1d,
+            compile=False,  # This should use build_compile_fn
+        ) as autop:
+            autop.add_input_constraints([(Shard(0),)])
+            sharding_placement = autop.optimize_placement()
+            _ = autop.apply_placement(sharding_placement)
+
+    # Verify _recursive_post_grad_passes was called
+    assert (
+        len(post_grad_passes_called) > 0
+    ), "_recursive_post_grad_passes should be called when compile=False"
+
+    # Verify it was called with is_inference=False (for training mode)
+    for fx_g, is_inference in post_grad_passes_called:
+        assert (
+            is_inference is False
+        ), "_recursive_post_grad_passes should be called with is_inference=False"
+        # Verify a valid graph module was passed
+        assert isinstance(fx_g, torch.fx.GraphModule)
+
+
+def test_recursive_post_grad_passes_not_called_when_compile_true(device_mesh_1d):
+    """Test that build_compile_fn is NOT used when compile=True.
+
+    When compile=True, the full inductor pipeline (compile_fx_inner) should
+    be used instead of build_compile_fn.
+    """
+    dim = 128
+
+    class Model(nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            self.linear = nn.Linear(dim, dim)
+
+        def forward(self, x):
+            return self.linear(x)
+
+    def input_fn():
+        b = 32
+        return (torch.rand(b, dim, device="cuda"),)
+
+    with torch.device("meta"):
+        model = Model(dim)
+
+    from torch._inductor.compile_fx import compile_fx_inner
+
+    # When compile=True, the compiler_fn should be compile_fx_inner
+    autop = AutoParallel(
+        model,
+        input_fn,
+        device_mesh_1d,
+        compile=True,
+    )
+
+    assert autop.compiler_fn is compile_fx_inner
+
+
+def test_compile_false_end_to_end(device_mesh_1d):
+    """Test that compile=False produces a working model with post-grad passes applied.
+
+    This is an end-to-end test that verifies the model can be created and
+    potentially executed (in fake mode).
+    """
+    dim = 128
+
+    class Model(nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            self.linear = nn.Linear(dim, dim)
+            self.register_buffer("scale", torch.ones(dim))
+
+        def forward(self, x):
+            return self.linear(x) * self.scale
+
+        def init_weights(self):
+            nn.init.eye_(self.linear.weight)
+            nn.init.zeros_(self.linear.bias)
+
+    def input_fn():
+        b = 512
+        return (torch.rand(b, dim, device="cuda"),)
+
+    with torch.device("meta"):
+        model = Model(dim)
+
+    with AutoParallel(
+        model,
+        input_fn,
+        device_mesh_1d,
+        compile=False,
+    ) as autop:
+        autop.add_input_constraints([(Shard(0),)])
+        sharding_placement = autop.optimize_placement()
+        parallel_mod = autop.apply_placement(sharding_placement)
+
+    # Verify model structure
+    assert parallel_mod is not None
+    assert hasattr(parallel_mod, "linear")
+
+    # Verify parameters are DTensors
+    from torch.distributed.tensor import DTensor
+
+    for name, param in parallel_mod.named_parameters():
+        assert isinstance(param, DTensor), f"Parameter {name} should be DTensor"
+
+    # Initialize and verify
+    parallel_mod.to_empty(device="cuda")
+    parallel_mod.init_weights()
+
+    # Verify weights were initialized correctly
+    weight = parallel_mod.get_parameter("linear.weight").full_tensor()
+    assert torch.allclose(weight, torch.eye(dim, device="cuda"))
