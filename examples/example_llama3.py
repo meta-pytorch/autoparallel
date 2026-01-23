@@ -52,12 +52,16 @@ device = torch.device("cuda")
 model_type = "8b"
 enable_asynctp = False
 
+import autoparallel.collectives
+
+autoparallel.collectives._local_map_device_mesh = mesh
+
 
 def model_fn():
     if model_type == "8b":
         model_args = TransformerModelArgs(
             dim=4096,
-            n_layers=32,
+            n_layers=1,  # 32,
             n_heads=32,
             n_kv_heads=8,
             ffn_dim_multiplier=1.3,
