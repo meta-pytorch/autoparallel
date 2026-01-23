@@ -75,6 +75,18 @@ def multiplex_fw_bw_graph(
     # Start with a deep copy of the backward graph as the base
     multiplexed_gm = copy.deepcopy(bw_gm)
 
+    # Copy tensor constant attributes from fw_gm to multiplexed_gm with "fw_" prefix
+    # to avoid collision with bw's tensor constants
+    fw_tensor_constant_remap: dict[str, str] = {}
+    for attr_name in dir(fw_gm):
+        if attr_name.startswith("_tensor_constant"):
+            fw_attr = getattr(fw_gm, attr_name)
+            new_attr_name = (
+                f"fw{attr_name}"  # e.g., _tensor_constant0 -> fw_tensor_constant0
+            )
+            setattr(multiplexed_gm, new_attr_name, fw_attr)
+            fw_tensor_constant_remap[attr_name] = new_attr_name
+
     # Collect all placeholder nodes from all the graphs
     bw_placeholders = bw_gm.graph.find_nodes(op="placeholder")
     fw_placeholders = fw_gm.graph.find_nodes(op="placeholder")
@@ -130,6 +142,14 @@ def multiplex_fw_bw_graph(
                             fn, lambda x: old_node_to_new_node[x]
                         )
                         new_node.meta = copy.copy(fn.meta)
+                        # Remap get_attr targets for tensor constants to avoid collision
+                        if (
+                            new_node.op == "get_attr"
+                            and new_node.target in fw_tensor_constant_remap
+                        ):
+                            new_node.target = fw_tensor_constant_remap[
+                                str(new_node.target)
+                            ]
                         old_node_to_new_node[fn] = new_node
                     fn = next(fw_nodes_iter)
     # Insert any remaining forward nodes at the end
@@ -142,6 +162,12 @@ def multiplex_fw_bw_graph(
                 fn, lambda x: old_node_to_new_node[x]
             )
             new_node.meta = copy.copy(fn.meta)
+            # Remap get_attr targets for tensor constants to avoid collision
+            if (
+                new_node.op == "get_attr"
+                and new_node.target in fw_tensor_constant_remap
+            ):
+                new_node.target = fw_tensor_constant_remap[str(new_node.target)]
             old_node_to_new_node[fn] = new_node
         fn = next(fw_nodes_iter)
 
