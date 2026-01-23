@@ -1636,8 +1636,8 @@ class QkvLinear(nn.Linear):
         if bias is not None:
             bias = bias.reshape(3, -1)
             # TODO: fix this
-            # bias = bias * bias.new_tensor([[0], [1], [1]])
-            bias = bias * (torch.arange(3, device=bias.device)[:, None] > 0)
+            bias = bias * bias.new_tensor([[0], [1], [1]])
+            # bias = bias * (torch.arange(3, device=bias.device)[:, None] > 0)
             bias = bias.flatten()
         return F.linear(input, self.weight, bias)
 
