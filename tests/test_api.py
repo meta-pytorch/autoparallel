@@ -701,7 +701,7 @@ def test_recursive_post_grad_passes_called_when_compile_false(device_mesh_1d):
             return self.linear(x)
 
     def input_fn():
-        b = 32
+        b = 512
         return (torch.rand(b, dim, device="cuda"),)
 
     with torch.device("meta"):
@@ -768,7 +768,7 @@ def test_recursive_post_grad_passes_not_called_when_compile_true(device_mesh_1d)
             return self.linear(x)
 
     def input_fn():
-        b = 32
+        b = 512
         return (torch.rand(b, dim, device="cuda"),)
 
     with torch.device("meta"):
@@ -805,7 +805,9 @@ def test_compile_false_end_to_end(device_mesh_1d):
             return self.linear(x) * self.scale
 
         def init_weights(self):
-            nn.init.eye_(self.linear.weight)
+            # TODO: can't use eye_ because of https://github.com/pytorch/pytorch/issues/173357
+            # nn.init.eye_(self.linear.weight)
+            nn.init.ones_(self.linear.weight)
             nn.init.zeros_(self.linear.bias)
 
     def input_fn():
@@ -841,4 +843,6 @@ def test_compile_false_end_to_end(device_mesh_1d):
 
     # Verify weights were initialized correctly
     weight = parallel_mod.get_parameter("linear.weight").full_tensor()
-    assert torch.allclose(weight, torch.eye(dim, device="cuda"))
+    # TODO: can't use eye_ because of https://github.com/pytorch/pytorch/issues/173357
+    # assert torch.allclose(weight, torch.eye(dim, device="cuda"))
+    assert torch.allclose(weight, torch.ones(dim, dim, device="cuda"))
