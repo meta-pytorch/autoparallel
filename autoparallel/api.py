@@ -51,17 +51,12 @@ _APPLY_VIEW_MM_VIEW_PATTERN = False
 
 
 def build_compile_fn(fake_mode):
-    from torch._inductor.compile_fx import (
-        _recursive_post_grad_passes,
-        get_cuda_device_context,
+    from torch._inductor.fx_passes.overlap_scheduling import (
+        schedule_overlap_bucketing_from_inductor_configs,
     )
-    from torch._inductor.virtualized import V
 
     def boxed_nop_preserve_node_meta(fx_g, example_inputs):
-        with V.set_fake_mode(fake_mode):
-            cuda_context = get_cuda_device_context(fx_g)
-            with cuda_context:
-                _recursive_post_grad_passes(fx_g, is_inference=False)
+        schedule_overlap_bucketing_from_inductor_configs(fx_g)
 
         def run(args):
             with torch.fx.traceback.preserve_node_meta():

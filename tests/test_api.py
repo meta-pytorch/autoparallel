@@ -679,14 +679,14 @@ def test_auto_parallel_with_mp_policy(device_mesh_1d):
     assert parallel_model is not None
 
 
-# Tests for build_compile_fn and _recursive_post_grad_passes
+# Tests for build_compile_fn and schedule_overlap_bucketing_from_inductor_configs
 
 
-def test_recursive_post_grad_passes_called_when_compile_false(device_mesh_1d):
-    """Test that _recursive_post_grad_passes is called when compile=False.
+def test_overlap_bucketing_called_when_compile_false(device_mesh_1d):
+    """Test that schedule_overlap_bucketing_from_inductor_configs is called when compile=False.
 
-    This verifies the fix that ensures post-grad passes (like layout optimization)
-    are run even when not using the full inductor compilation pipeline.
+    This verifies the fix that ensures overlap scheduling passes are run
+    even when not using the full inductor compilation pipeline.
     """
     from unittest.mock import patch
 
@@ -707,25 +707,31 @@ def test_recursive_post_grad_passes_called_when_compile_false(device_mesh_1d):
     with torch.device("meta"):
         model = Model(dim)
 
-    # Track if _recursive_post_grad_passes was called
-    post_grad_passes_called = []
+    # Track if schedule_overlap_bucketing_from_inductor_configs was called
+    overlap_bucketing_called = []
 
-    original_recursive_post_grad_passes = None
+    original_schedule_overlap_bucketing = None
     try:
-        from torch._inductor.compile_fx import _recursive_post_grad_passes
+        from torch._inductor.fx_passes.overlap_scheduling import (
+            schedule_overlap_bucketing_from_inductor_configs,
+        )
 
-        original_recursive_post_grad_passes = _recursive_post_grad_passes
+        original_schedule_overlap_bucketing = (
+            schedule_overlap_bucketing_from_inductor_configs
+        )
     except ImportError:
-        pytest.skip("_recursive_post_grad_passes not available in this PyTorch version")
+        pytest.skip(
+            "schedule_overlap_bucketing_from_inductor_configs not available in this PyTorch version"
+        )
 
-    def tracking_post_grad_passes(fx_g, is_inference=False):
-        post_grad_passes_called.append((fx_g, is_inference))
+    def tracking_overlap_bucketing(fx_g):
+        overlap_bucketing_called.append(fx_g)
         # Call the original function
-        return original_recursive_post_grad_passes(fx_g, is_inference=is_inference)
+        return original_schedule_overlap_bucketing(fx_g)
 
     with patch(
-        "torch._inductor.compile_fx._recursive_post_grad_passes",
-        side_effect=tracking_post_grad_passes,
+        "torch._inductor.fx_passes.overlap_scheduling.schedule_overlap_bucketing_from_inductor_configs",
+        side_effect=tracking_overlap_bucketing,
     ):
         with AutoParallel(
             model,
@@ -737,17 +743,13 @@ def test_recursive_post_grad_passes_called_when_compile_false(device_mesh_1d):
             sharding_placement = autop.optimize_placement()
             _ = autop.apply_placement(sharding_placement)
 
-    # Verify _recursive_post_grad_passes was called
+    # Verify schedule_overlap_bucketing_from_inductor_configs was called
     assert (
-        len(post_grad_passes_called) > 0
-    ), "_recursive_post_grad_passes should be called when compile=False"
+        len(overlap_bucketing_called) > 0
+    ), "schedule_overlap_bucketing_from_inductor_configs should be called when compile=False"
 
-    # Verify it was called with is_inference=False (for training mode)
-    for fx_g, is_inference in post_grad_passes_called:
-        assert (
-            is_inference is False
-        ), "_recursive_post_grad_passes should be called with is_inference=False"
-        # Verify a valid graph module was passed
+    # Verify a valid graph module was passed
+    for fx_g in overlap_bucketing_called:
         assert isinstance(fx_g, torch.fx.GraphModule)
 
 
