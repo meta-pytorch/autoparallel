@@ -56,7 +56,15 @@ def build_compile_fn(fake_mode):
     )
 
     def boxed_nop_preserve_node_meta(fx_g, example_inputs):
-        schedule_overlap_bucketing_from_inductor_configs(fx_g)
+        # when not running with inductor, disable additional flags which are
+        # inductor-specific
+        with torch._inductor.config.patch(
+            {
+                "aten_distributed_optimizations.insert_overlap_deps": (False),
+                "aten_distributed_optimizations.enable_fusion_regions": (False),
+            }
+        ):
+            schedule_overlap_bucketing_from_inductor_configs(fx_g)
 
         def run(args):
             with torch.fx.traceback.preserve_node_meta():
