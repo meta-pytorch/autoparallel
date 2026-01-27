@@ -47,3 +47,4 @@ jobs:
         python examples/example_local_map.py
         python examples/example_pp_graph_passes.py
         torchrun --standalone --nproc-per-node 4 examples/example_ds3_local_map.py
+        torchrun --standalone --nproc_per_node=4 examples/example_ds3_pp.py --use-loss-fn --fake-evaluate
