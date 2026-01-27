@@ -18,7 +18,6 @@ from torch._functorch.aot_autograd import (
     aot_export_joint_with_descriptors,
     boxed_nop_preserve_node_meta,
 )
-from torch._inductor.compile_fx import compile_fx_inner
 from torch._inductor.decomposition import select_decomp_table
 from torch._logging import trace_structured
 from torch._subclasses import FakeTensorMode
@@ -307,9 +306,8 @@ class AutoParallel:
         self.model = move_to_fake(model, self.fake_mode, device)
         self.input_fn = input_fn
         self.mesh = mesh
-        if compile:
-            self.compiler_fn = compile_fx_inner
-        elif numerics_logger:
+        self.compile = compile
+        if numerics_logger:
             self.compiler_fn = functools.partial(
                 debug_boxed_nop_preserve_node_meta, numerics_logger=numerics_logger
             )
@@ -683,6 +681,8 @@ class AutoParallel:
 
         self.parallel_model = AutoParallelModule()
         self._register_params_and_init_weights(sharded_param_dict, sharded_buffer_dict)
+        if self.compile:
+            self.parallel_model = torch.compile(self.parallel_model)
         return self.parallel_model
 
 
