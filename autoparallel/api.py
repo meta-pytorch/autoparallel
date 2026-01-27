@@ -276,7 +276,6 @@ class AutoParallel:
         ac_stage_size_in_GiB: Optional[Union[float, str]] = "auto",
         reshard_after_forward: bool = True,
         dynamic: bool = False,
-        loss_fn: Optional[Callable] = None,
         numerics_logger: NumericsLogger | None = None,
         **kwargs,
     ):
@@ -316,7 +315,7 @@ class AutoParallel:
         self.enable_ac = enable_ac
         self.ac_stage_size_in_GiB = ac_stage_size_in_GiB
         self.reshard_after_forward = reshard_after_forward
-        self.loss_fn = loss_fn
+        self.loss_fn = None
 
         if dynamic:
             self.fake_mode.shape_env = ShapeEnv()
@@ -380,47 +379,41 @@ class AutoParallel:
                 "AutoParallel is not reentrant, please file a bug report if you need this functionality"
             )
 
+    def _prepare_model_wrapper_and_inputs(
+        self, raw_inputs: Any
+    ) -> tuple[Callable, tuple[Any, ...]]:
+        """
+        Prepare the model wrapper and formatted inputs for tracing.
+
+        Args:
+            raw_inputs: The raw inputs from input_fn()
+
+        Returns:
+            A tuple of (model_wrapper, formatted_inputs) where:
+            - model_wrapper is a callable that will be traced
+            - formatted_inputs are the inputs to pass to model_wrapper
+        """
+        # No loss function, inputs are just model inputs
+        formatted_inputs = (
+            raw_inputs if isinstance(raw_inputs, tuple) else (raw_inputs,)
+        )
+
+        def model_wrapper(*model_inputs) -> Any:
+            output = self.model(*model_inputs)
+            return output
+
+        return model_wrapper, formatted_inputs
+
     def build_model_graph(self):
         decomp_table = _get_decomp_table()
 
         with self.fake_mode:
             raw_inputs = self.input_fn()
 
-        # Define model wrapper based on whether loss_fn is provided
-        model_wrapper: Callable
-        # Parse inputs based on whether loss_fn is provided
-        # If loss_fn is not None: expected format ((inp1, inp2,...), target)
-        # If loss_fn is None: expected format (inp1, inp2, ...)
-        if self.loss_fn is not None:
-            if isinstance(raw_inputs, tuple) and len(raw_inputs) == 2:
-                model_inputs, target = raw_inputs
-                # Normalize inputs to always be a tuple
-                if not isinstance(model_inputs, tuple):
-                    model_inputs = (model_inputs,)
-                formatted_inputs = (model_inputs, target)
-
-                def model_with_loss(model_inputs, target) -> Any:
-                    output = self.model(*model_inputs)
-                    loss = self.loss_fn(output, target)  # type: ignore[misc]
-                    return loss
-
-                model_wrapper = model_with_loss
-            else:
-                raise ValueError(
-                    "When loss_fn is provided, input_fn must return (inputs, target) "
-                    "where inputs can be a single tensor or tuple of tensors"
-                )
-        else:
-            # No loss function, inputs are just model inputs
-            formatted_inputs = (
-                raw_inputs if isinstance(raw_inputs, tuple) else (raw_inputs,)
-            )
-
-            def model_wo_loss(*model_inputs) -> Any:
-                output = self.model(*model_inputs)
-                return output
-
-            model_wrapper = model_wo_loss
+        # Prepare model wrapper and inputs for tracing
+        model_wrapper, formatted_inputs = self._prepare_model_wrapper_and_inputs(
+            raw_inputs
+        )
 
         with set_dtype_cast(
             True
