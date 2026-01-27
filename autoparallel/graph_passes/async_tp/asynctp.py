@@ -25,9 +25,10 @@ from torch._inductor.pattern_matcher import (
     PatternMatcherPass,
 )
 from torch._logging import trace_structured
+from torch.distributed.distributed_c10d import GroupName
 from torch.utils._ordered_set import OrderedSet
 
-import autoparallel.asynctp_ops  # noqa: F401
+import autoparallel.graph_passes.async_tp.asynctp_ops  # noqa: F401
 
 log = logging.getLogger(__name__)
 aten = torch.ops.aten
@@ -89,7 +90,7 @@ class _AllGatherMatch:
     ag_node: torch.fx.Node
     res_node: torch.fx.Node
     gather_dim: int
-    group_name: str
+    group_name: GroupName
 
     def replace_with(self, new_node: torch.fx.Node) -> None:
         self.res_node.replace_all_uses_with(new_node)
@@ -225,7 +226,7 @@ class _ReduceScatterMatch:
     wait_tensor_node: torch.fx.Node
     reduce_op: str
     scatter_dim: int
-    group_name: str
+    group_name: GroupName
 
     def replace_with(self, new_node: torch.fx.Node) -> None:
         # Replace all uses of the result node (wait_tensor) with the fused node.
@@ -643,7 +644,7 @@ def _insert_fused_all_gather_matmul(
     matmuls: list[_Matmul],
     shard_node: torch.fx.Node,
     gather_dim: int,
-    group_name: str,
+    group_name: GroupName,
 ) -> torch.fx.Node:
     mm_types = OrderedSet(map(type, matmuls))
     assert len(mm_types) == 1
@@ -704,7 +705,7 @@ def _insert_fused_all_gather_transpose_matmul(
     matmuls: list[_Matmul],
     shard_node: torch.fx.Node,
     gather_dim: int,
-    group_name: str,
+    group_name: GroupName,
 ) -> torch.fx.Node:
     mm_types = OrderedSet(map(type, matmuls))
     assert len(mm_types) == 1
@@ -974,7 +975,7 @@ def _insert_fused_matmul_reduce_scatter(
     matmul: _Matmul,
     reduce_op: str,
     orig_scatter_dim: int,
-    group_name: str,
+    group_name: GroupName,
     scatter_dim_after_reshape: int,  # only used for reshape -> scaled_mm -> reshape pattern
     output_shape: list[int],  # only used for reshape -> scaled_mm -> reshape pattern
 ) -> torch.fx.Node:

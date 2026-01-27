@@ -2,7 +2,3 @@
 #
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
-
-from autoparallel.api import AutoParallel, AutoParallelPP, auto_parallel
-
-__all__ = ["auto_parallel", "AutoParallel", "AutoParallelPP"]

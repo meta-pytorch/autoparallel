@@ -40,10 +40,11 @@ jobs:
         pip uninstall -y torch
         pip install --no-input --quiet --pre torch --index-url https://download.pytorch.org/whl/nightly/cu126
         pip install --quiet .
-        pytest tests --deselect=tests/test_dtensor.py::ImplicitRegistrationTest::test_implicit_registration
+        pytest tests
         python examples/example_autoparallel.py
         python examples/example_llama3.py
         python examples/example_dcp.py
         python examples/example_local_map.py
         python examples/example_pp_graph_passes.py
         torchrun --standalone --nproc-per-node 4 examples/example_ds3_local_map.py
+        torchrun --standalone --nproc_per_node=4 examples/example_ds3_pp.py --use-loss-fn --fake-evaluate

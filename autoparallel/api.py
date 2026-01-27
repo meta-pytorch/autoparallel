@@ -25,16 +25,15 @@ from torch._subclasses import FakeTensorMode
 from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor import DeviceMesh
 from torch.export._trace import _restore_state_dict
-from torch.export._unlift import _assign_attr
 from torch.export.unflatten import _AttrKind
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
-from autoparallel._passes.graph_partition import partition_joint_with_descriptors
+from autoparallel.graph_passes.graph_partition import partition_joint_with_descriptors
 
-from .activation_checkpointing import ac_joint_pass
 from .apply_sharding import apply_sharding_to_model
 from .cast_parametrization import apply_dtype_cast, canonicalize_mp, set_dtype_cast
-from .graph_utils import (
+from .graph_passes.activation_checkpointing import ac_joint_pass
+from .graph_passes.graph_utils import (
     _add_alias,
     _replace_view_mm_view_with_einsum,
     assert_has_no_collectives,
@@ -43,13 +42,75 @@ from .graph_utils import (
 )
 from .init_weights import hook_params_setters
 from .optimize_sharding import ShardingOptimizer
-from .utils import (
+from .shardings.placement_options import (
     NumericsLogger,
     _get_device_from_mesh,
     debug_boxed_nop_preserve_node_meta,
 )
 
 _APPLY_VIEW_MM_VIEW_PATTERN = False
+
+
+def _assign_attr(
+    attr: Any,
+    target_module: torch.nn.Module,
+    ref_module: torch.nn.Module,
+    fqn: str,
+    attr_kind: _AttrKind,
+):
+    """
+    Custom version of torch.export._unlift._assign_attr that preserves the original
+    module structure (e.g., nn.ModuleDict) from ref_module.
+
+    Args:
+        attr: The attribute to assign (parameter/buffer/module)
+        target_module: The module to assign the attribute to
+        ref_module: Reference module to check for original structure
+        fqn: Fully qualified name of the attribute (e.g., "layers.0.weight")
+        attr_kind: Type of attribute (PARAMETER, BUFFER, etc.)
+    """
+    *prefix, field = fqn.split(".")
+
+    # Navigate to the parent module, creating submodules as needed
+    curr_mod = target_module
+    for i, attr_name in enumerate(prefix):
+        if not hasattr(curr_mod, attr_name):
+            # Check if we should create a module matching the ref_module type
+            # Navigate to the same location in ref_module
+            ref_curr_mod = ref_module
+            for ref_attr_name in prefix[:i]:
+                if hasattr(ref_curr_mod, ref_attr_name):
+                    ref_curr_mod = getattr(ref_curr_mod, ref_attr_name)
+                else:
+                    ref_curr_mod = None  # type: ignore[assignment]
+                    break
+
+            # Create an instance of the same type as in ref_module
+            if ref_curr_mod is not None and hasattr(ref_curr_mod, attr_name):
+                ref_submod = getattr(ref_curr_mod, attr_name)
+                cls = type(ref_submod)
+                try:
+                    cls = type(ref_submod)
+                    new_inst = ref_submod.__new__(cls)
+                    new_inst.__dict__ = ref_submod.__dict__.copy()
+                    setattr(curr_mod, attr_name, new_inst)
+                except Exception:
+                    # Fall back to regular Module if instantiation fails
+                    setattr(curr_mod, attr_name, torch.nn.Module())
+            else:
+                setattr(curr_mod, attr_name, torch.nn.Module())
+
+        curr_mod = getattr(curr_mod, attr_name)
+
+    # Set the final attribute
+    if attr_kind == _AttrKind.PARAMETER:
+        assert isinstance(attr, torch.nn.Parameter)
+        curr_mod.register_parameter(field, attr)
+    elif attr_kind == _AttrKind.BUFFER:
+        assert isinstance(attr, torch.Tensor)
+        curr_mod.register_buffer(field, attr)
+    else:
+        setattr(curr_mod, field, attr)
 
 
 def _get_decomp_table():
@@ -442,7 +503,7 @@ class AutoParallel:
         self.sharding_placement = self.sharding_optimizer.get_solution(verbose=False)
 
         if verbose:
-            print(self.sharding_optimizer.get_log())
+            print(self.sharding_optimizer.get_log(verbose=True))
 
         trace_structured(
             "artifact",
@@ -550,11 +611,24 @@ class AutoParallel:
         # We construct an unflattened structure on parallel_mod,
         # e.g. _assign_attr(v, parallel_model, k="layers.0.weight") will literally
         # create empty nn.Modules recursively and then stash 'v' so it shows up in the right spot
+        # We pass self.model as reference to preserve the original module structure (e.g., nn.ModuleDict)
         for k, v in sharded_param_dict.items():
-            _assign_attr(v, self.parallel_model, k, attr_kind=_AttrKind.PARAMETER)
+            _assign_attr(
+                v,
+                self.parallel_model,
+                self.model,
+                k,
+                attr_kind=_AttrKind.PARAMETER,
+            )
 
         for k, v in sharded_buffer_dict.items():
-            _assign_attr(v, self.parallel_model, k, attr_kind=_AttrKind.BUFFER)
+            _assign_attr(
+                v,
+                self.parallel_model,
+                self.model,
+                k,
+                attr_kind=_AttrKind.BUFFER,
+            )
 
         # Right now we require a convention that the user model provides an init_weights method,
         # although we could snoop for other methods too.
@@ -621,9 +695,12 @@ class AutoParallelPPModule(torch.nn.Module):
         sharded_param_dict: dict[str, torch.nn.Parameter],
         sharded_buffer_dict: dict[str, torch.Tensor],
         init_weights_model: torch.nn.Module,
+        ref_model: torch.nn.Module,
     ):
         super().__init__()
-        self._register_params_and_buffers(sharded_param_dict, sharded_buffer_dict)
+        self._register_params_and_buffers(
+            sharded_param_dict, sharded_buffer_dict, ref_model
+        )
 
         # Right now we require a convention that the user model provides an init_weights method,
         # although we could snoop for other methods too.
@@ -639,16 +716,19 @@ class AutoParallelPPModule(torch.nn.Module):
             # but with our new DTensor sharded params attached to the user module.
             self.init_weights = MethodType(init_weights, self)
 
-    def _register_params_and_buffers(self, sharded_param_dict, sharded_buffer_dict):
+    def _register_params_and_buffers(
+        self, sharded_param_dict, sharded_buffer_dict, ref_model
+    ):
 
         # We construct an unflattened structure on parallel_mod,
         # e.g. _assign_attr(v, parallel_model, k="layers.0.weight") will literally
         # create empty nn.Modules recursively and then stash 'v' so it shows up in the right spot
+        # We pass ref_model to preserve the original module structure (e.g., nn.ModuleDict)
         for k, v in sharded_param_dict.items():
-            _assign_attr(v, self, k, attr_kind=_AttrKind.PARAMETER)
+            _assign_attr(v, self, ref_model, k, attr_kind=_AttrKind.PARAMETER)
 
         for k, v in sharded_buffer_dict.items():
-            _assign_attr(v, self, k, attr_kind=_AttrKind.BUFFER)
+            _assign_attr(v, self, ref_model, k, attr_kind=_AttrKind.BUFFER)
 
     def forward(self, *args):
         raise NotImplementedError("This is a placeholder for the pipeline model")
@@ -719,7 +799,7 @@ class AutoParallelPP(AutoParallel):
             assert (
                 not self.reshard_after_forward
             ), "reshard_after_forward should be False to disable FSDP all_gather in the backward pass"
-            from autoparallel._passes.split_fsdp_collectives import (
+            from autoparallel.graph_passes.split_fsdp_collectives import (
                 split_fsdp_prefetch,
                 split_fsdp_reduce_scatters_epilogue,
             )
@@ -772,7 +852,7 @@ class AutoParallelPP(AutoParallel):
         bw_dI_module: Optional[torch.fx.GraphModule] = None
         bw_dW_module: Optional[torch.fx.GraphModule] = None
         if "split_dI_dW" in graph_passes:
-            from autoparallel._passes.split_di_dw_graph import split_di_dw_graph
+            from autoparallel.graph_passes.split_di_dw_graph import split_di_dw_graph
 
             bw_dI_module, bw_dW_module, num_input_grads = split_di_dw_graph(
                 bw_module,
@@ -829,6 +909,7 @@ class AutoParallelPP(AutoParallel):
             sharded_param_dict,
             sharded_buffer_dict,
             self.init_weights_model,
+            self.model,
         )
         return {
             "graph_callables": graph_modules,
@@ -841,3 +922,234 @@ class AutoParallelPP(AutoParallel):
 ######################
 # Pipeline stuff end #
 ######################
+
+
+####################
+# Simple API start #
+####################
+
+
+def _extract_input_info(
+    sample_inputs: Any, mesh: DeviceMesh
+) -> tuple[list[tuple[int, ...]], list[torch.dtype], list[tuple[Any, ...]], Any]:
+    """
+    Extract tensor metadata and placements from sample inputs (supports pytrees).
+
+    For DTensor inputs, extracts global shape, dtype, and placements.
+    For regular Tensor inputs, uses shape/dtype and assumes Replicate.
+
+    Does NOT materialize tensors - just extracts metadata.
+
+    Returns:
+        - List of shapes (global shapes for DTensors)
+        - List of dtypes
+        - List of placement tuples for each tensor leaf
+        - TreeSpec for reconstructing the pytree structure
+    """
+    import torch.utils._pytree as pytree
+    from torch.distributed.tensor import DTensor
+    from torch.distributed.tensor.placement_types import Replicate
+
+    flat_inputs, treespec = pytree.tree_flatten(sample_inputs)
+
+    shapes = []
+    dtypes = []
+    input_placements = []
+
+    for inp in flat_inputs:
+        if isinstance(inp, DTensor):
+            # DTensor.shape returns the global shape
+            shapes.append(tuple(inp.shape))
+            dtypes.append(inp.dtype)
+            input_placements.append(tuple(inp.placements))
+        elif isinstance(inp, torch.Tensor):
+            shapes.append(tuple(inp.shape))
+            dtypes.append(inp.dtype)
+            input_placements.append(tuple(Replicate() for _ in range(mesh.ndim)))
+        else:
+            raise TypeError(
+                f"sample_inputs leaves must be Tensor or DTensor, got {type(inp)}"
+            )
+
+    return shapes, dtypes, input_placements, treespec
+
+
+def _make_input_fn(
+    shapes: list[tuple[int, ...]],
+    dtypes: list[torch.dtype],
+    treespec: Any,
+) -> Callable[[], tuple[Any, ...]]:
+    """
+    Create an input_fn that creates tensors with the given shapes/dtypes.
+
+    The returned function should be called inside FakeTensorMode.
+    It creates new tensors (which will be fake tensors when called in FakeTensorMode).
+
+    Returns:
+        Callable that returns inputs as a tuple.
+    """
+    import torch.utils._pytree as pytree
+
+    def input_fn() -> tuple[Any, ...]:
+        # Create tensors inside FakeTensorMode - they'll be fake tensors
+        tensors = [
+            torch.empty(shape, dtype=dtype, device="cuda")
+            for shape, dtype in zip(shapes, dtypes)
+        ]
+        result = pytree.tree_unflatten(tensors, treespec)
+
+        # AutoParallel expects input_fn to return a tuple
+        if isinstance(result, tuple):
+            return result
+        else:
+            return (result,)
+
+    return input_fn
+
+
+def _flatten_out_shardings(
+    out_shardings: Any,
+) -> list[tuple[Any, ...]]:
+    """
+    Flatten out_shardings to a list of placement tuples.
+
+    The out_shardings should match the structure of the model output.
+    Each leaf should be a tuple of Placements.
+
+    Handles nested structures by recursively walking until we find placement tuples.
+    """
+    from torch.distributed.tensor.placement_types import Placement
+
+    def is_placement_tuple(obj: Any) -> bool:
+        if not isinstance(obj, tuple):
+            return False
+        if len(obj) == 0:
+            return False
+        return all(isinstance(p, Placement) for p in obj)
+
+    def collect_placement_tuples(obj: Any, result: list) -> None:
+        """Recursively collect placement tuples from a nested structure."""
+        if is_placement_tuple(obj):
+            result.append(obj)
+        elif isinstance(obj, (list, tuple)):
+            for item in obj:
+                collect_placement_tuples(item, result)
+        elif isinstance(obj, dict):
+            for item in obj.values():
+                collect_placement_tuples(item, result)
+        else:
+            raise TypeError(
+                f"out_shardings must contain tuples of Placements, "
+                f"got {type(obj)}: {obj}"
+            )
+
+    result: list[tuple[Any, ...]] = []
+    collect_placement_tuples(out_shardings, result)
+
+    if not result:
+        raise ValueError("out_shardings must contain at least one placement tuple")
+
+    return result
+
+
+def auto_parallel(
+    model: torch.nn.Module,
+    mesh: DeviceMesh,
+    sample_inputs: Union[Any, Callable[[], Any]],
+    out_shardings: Any,
+    *,
+    mp_policy: Optional[MixedPrecisionPolicy] = None,
+    compile: bool = True,
+) -> torch.nn.Module:
+    """
+    Parallelize a model with automatic sharding optimization.
+
+    This is a simplified API that wraps the full AutoParallel context manager.
+    For more control, use the AutoParallel class directly.
+
+    Args:
+        model: Model to parallelize. Can be on meta device for large models.
+        mesh: Device mesh defining the distributed topology.
+        sample_inputs: Sample inputs for tracing. Supports pytrees (tuples, dicts,
+            nested structures). Leaves can be:
+            - DTensor: Sharding extracted from placements
+            - Tensor: Assumed Replicate on all mesh dimensions
+            Can also be a callable that returns the above.
+        out_shardings: Output sharding specification as a pytree matching the
+            model output structure. Each leaf should be a tuple of Placements.
+            For a single output, can be just the placement tuple.
+            Examples:
+                - Single output: (Shard(0), Replicate())
+                - Tuple output: ((Shard(0),), (Shard(0),))
+                - Dict output: {"logits": (Shard(0),), "loss": (Replicate(),)}
+        mp_policy: Optional mixed precision policy.
+        compile: Whether to use torch.compile (default: True).
+
+    Returns:
+        Parallelized module. Call to_empty(device="cuda") and init_weights()
+        before use.
+
+    Example with DTensor:
+        >>> mesh = init_device_mesh("cuda", (dp_size, tp_size), mesh_dim_names=("dp", "tp"))
+        >>> x = DTensor.from_local(
+        ...     torch.rand(local_bs, seq_len, dim),
+        ...     mesh,
+        ...     [Shard(0), Replicate()],
+        ... )
+        >>> parallel_model = auto_parallel(
+        ...     model, mesh,
+        ...     sample_inputs=(x,),
+        ...     out_shardings=(Shard(0), Replicate()),
+        ...     mp_policy=MixedPrecisionPolicy(param_dtype=torch.bfloat16),
+        ... )
+        >>> parallel_model.to_empty(device="cuda")
+        >>> parallel_model.init_weights()
+
+    Example with dict inputs:
+        >>> sample_inputs = {
+        ...     "input_ids": DTensor.from_local(ids, mesh, [Shard(0)]),
+        ...     "attention_mask": DTensor.from_local(mask, mesh, [Shard(0)]),
+        ... }
+        >>> parallel_model = auto_parallel(model, mesh, sample_inputs, out_shardings=...)
+    """
+    # Handle callable sample_inputs
+    if callable(sample_inputs):
+        raw_inputs = sample_inputs()
+    else:
+        raw_inputs = sample_inputs
+
+    # Extract metadata and placements (does not materialize tensors)
+    shapes, dtypes, input_placements, treespec = _extract_input_info(raw_inputs, mesh)
+
+    # Flatten out_shardings to list
+    output_placements = _flatten_out_shardings(out_shardings)
+
+    # Create input_fn that will be called inside FakeTensorMode
+    # It creates fresh tensors (which become fake tensors inside FakeTensorMode)
+    input_fn = _make_input_fn(shapes, dtypes, treespec)
+
+    # Use AutoParallel context manager
+    with AutoParallel(
+        model,
+        input_fn,
+        mesh,
+        mp_policy=mp_policy,
+        compile=compile,
+        # enable_ac=True,
+        enable_ac=False,
+    ) as autop:
+        # Add constraints
+        # autop.add_parameter_memory_constraint(low=None, high=None)
+        autop.add_input_constraints(input_placements)
+        autop.add_output_constraints(output_placements)
+
+        # Optimize and apply
+        sharding_placement = autop.optimize_placement(verbose=False)
+        parallel_model = autop.apply_placement(sharding_placement)
+
+    return parallel_model
+
+
+##################
+# Simple API end #
+##################

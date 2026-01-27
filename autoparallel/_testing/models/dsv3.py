@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from typing import Callable, ClassVar, Literal, Optional, Tuple, Union
 
 import torch
+import torch.fx.traceback as fx_traceback
 import torch.nn.functional as F
 import triton
 import triton.language as tl
@@ -15,7 +16,7 @@ from torch import nn
 
 # from torchtitan.distributed.expert_parallel import expert_parallel
 from torch.distributed.tensor import DeviceMesh, DTensor
-from torch.distributed.tensor.placement_types import Replicate, Shard
+from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from autoparallel.collectives import all_to_all, axis_size, local_map
@@ -631,61 +632,63 @@ class TokenReorderer(nn.Module):
 
 
 def _token_dispatch(routed_input, num_tokens_per_expert, axis_name):
-    # annotate module input placements/sharding with input_layouts
-    # ep_size = device_mesh.shape[0]
-    ep_size = axis_size(axis_name)
+    with fx_traceback.annotate({"comm_region": "token_dispatch"}):
+        # annotate module input placements/sharding with input_layouts
+        # ep_size = device_mesh.shape[0]
+        ep_size = axis_size(axis_name)
 
-    # generate the input splits and output splits for all-to-all
-    with torch.no_grad():
-        num_tokens_per_expert_group = all_to_all(
-            num_tokens_per_expert,
-            None,
-            None,
+        # generate the input splits and output splits for all-to-all
+        with torch.no_grad():
+            num_tokens_per_expert_group = all_to_all(
+                num_tokens_per_expert,
+                None,
+                None,
+                axis_name,
+            )
+            input_splits = (
+                num_tokens_per_expert.view(ep_size, -1)
+                .sum(dim=1)
+                .to(torch.device("cpu"), non_blocking=True)
+            )
+            # NOTE: this would incur a device-to-host sync
+            output_splits = (
+                num_tokens_per_expert_group.view(ep_size, -1)
+                .sum(dim=1)
+                .to(torch.device("cpu"), non_blocking=False)
+            )
+            input_splits = input_splits.tolist()
+            output_splits = output_splits.tolist()
+
+        # perform all-to-all
+        routed_input = all_to_all(
+            routed_input,
+            output_splits,
+            input_splits,
             axis_name,
         )
-        input_splits = (
-            num_tokens_per_expert.view(ep_size, -1)
-            .sum(dim=1)
-            .to(torch.device("cpu"), non_blocking=True)
-        )
-        # NOTE: this would incur a device-to-host sync
-        output_splits = (
-            num_tokens_per_expert_group.view(ep_size, -1)
-            .sum(dim=1)
-            .to(torch.device("cpu"), non_blocking=False)
-        )
-        input_splits = input_splits.tolist()
-        output_splits = output_splits.tolist()
 
-    # perform all-to-all
-    routed_input = all_to_all(
-        routed_input,
-        output_splits,
-        input_splits,
-        axis_name,
-    )
+        # NOTE: After this all-to-all, the routed input is put on proper EP rank.
+        # However, the num_tokens_per_expert_group is not of the final target format
+        # [#tokens for local expert 0, #tokens for local expert 1, ...]
+        # Rather, it is of the format
+        # [#tokens for local expert 0 from EP rank 0, #tokens for local expert 1 from EP rank 0, ...,
+        #  #tokens for local expert 0 from EP rank 1, #tokens for local expert 1 from EP rank 1, ...]
+        # We need to perform another shuffle to get the correct format -- this is done via the function
+        # generate_permute_indices in moe.py, which also does padding to make sure the number of tokens
+        # each expert gets locally is a multiple of ALIGN_SIZE_M.
 
-    # NOTE: After this all-to-all, the routed input is put on proper EP rank.
-    # However, the num_tokens_per_expert_group is not of the final target format
-    # [#tokens for local expert 0, #tokens for local expert 1, ...]
-    # Rather, it is of the format
-    # [#tokens for local expert 0 from EP rank 0, #tokens for local expert 1 from EP rank 0, ...,
-    #  #tokens for local expert 0 from EP rank 1, #tokens for local expert 1 from EP rank 1, ...]
-    # We need to perform another shuffle to get the correct format -- this is done via the function
-    # generate_permute_indices in moe.py, which also does padding to make sure the number of tokens
-    # each expert gets locally is a multiple of ALIGN_SIZE_M.
-
-    return routed_input, num_tokens_per_expert_group, input_splits, output_splits
+        return routed_input, num_tokens_per_expert_group, input_splits, output_splits
 
 
 def _token_combine(routed_output, input_splits, output_splits, axis_name):
-    routed_output = all_to_all(
-        routed_output,
-        input_splits,
-        output_splits,
-        axis_name,
-    )
-    return routed_output
+    with fx_traceback.annotate({"comm_region": "token_combine"}):
+        routed_output = all_to_all(
+            routed_output,
+            input_splits,
+            output_splits,
+            axis_name,
+        )
+        return routed_output
 
 
 # @torch.library.custom_op("autoparallel::local_mapped_region", mutates_args=())
@@ -699,8 +702,8 @@ def local_mapped_region(
     out: torch.Tensor,
     top_k: int,
     num_experts: int,
+    axis_name: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    axis_name = "ep"
     # assert False, f"{x.shape}, {selected_experts_indices.shape}, {top_scores.shape}, {out.shape}"
 
     dim = x.shape[-1]
@@ -770,7 +773,7 @@ def local_mapped_region(
     routed_output = routed_output.view(shape)
 
     out = out.scatter_add(dim=1, index=token_indices_experts_sorted, src=routed_output)
-    return out, total_tokens_per_expert[None, :]
+    return out, total_tokens_per_expert
 
 
 # @local_mapped_region.register_fake
@@ -875,9 +878,10 @@ def _moe_forward(
     shared_w1: torch.Tensor,
     shared_w3: torch.Tensor,
     shared_w2: torch.Tensor,
-    router: TokenChoiceTopKRouter,  # None
-    reorderer: TokenReorderer,  # None
-    mesh: Optional[DeviceMesh],  # None
+    router: TokenChoiceTopKRouter,
+    reorderer: TokenReorderer,
+    mesh: Optional[DeviceMesh],
+    axis_name: str,
 ):
     # x: 64, 2048, 256
     bs, slen, dim = x.shape
@@ -944,13 +948,17 @@ def _moe_forward(
         (Shard(0), Shard(0)),
         None,
         None,
+        None,
     )
 
     # assert False, f"{x.shape}, {selected_experts_indices.shape}, {top_scores.shape}, {out.shape}"
     # [selected_experts_indices, top_scores_1, rms_norm_2, v_2, v_4, v_3, out]
     out, num_tokens_per_expert = local_map(
         local_mapped_region,
-        out_placements=((Shard(0), Shard(0)), (Shard(0), Shard(0))),
+        out_placements=(
+            (Shard(0), Shard(0)),
+            (Partial(reduce_op="sum"), Partial(reduce_op="sum")),
+        ),
         in_placements=reordered_placements,
         redistribute_inputs=True,
         in_grad_placements=None,
@@ -965,6 +973,7 @@ def _moe_forward(
         out,
         router.top_k,
         router.num_experts,
+        axis_name,
     )
     # assert False, f"there: {out.shape}, {num_tokens_per_expert.shape}"
 
@@ -980,7 +989,7 @@ def _moe_forward(
 
     # assert False, f"{out.shape}, {token_indices_experts_sorted.shape}, {routed_output.shape}"
     out = out.reshape(bs, slen, dim)
-    return out, num_tokens_per_expert.sum(0)
+    return out, num_tokens_per_expert
 
 
 @dataclass
@@ -1010,6 +1019,7 @@ class MoE(nn.Module):
 
         num_experts = moe_args.num_experts
         self.mesh = moe_args.mesh
+        self.axis_name = "ep"
         self.experts = GroupedExperts(
             dim=dim,
             hidden_dim=hidden_dim,
@@ -1072,9 +1082,10 @@ class MoE(nn.Module):
             shared_w1,
             shared_w3,
             shared_w2,
-            self.router,  # None
-            self.reorderer,  # None
-            self.mesh,  # None
+            self.router,
+            self.reorderer,
+            self.mesh,
+            self.axis_name,
         )
 
         # HOPs don't support buffer mutations, keep this outside
@@ -1526,7 +1537,9 @@ class DeepSeekV3Model(nn.Module):
     """
 
     def __init__(self, model_args: DeepSeekV3ModelArgs):
-        super().__init__()
+        # Explicitly call nn.Module.__init__ to avoid MRO issues when this class
+        # is used with multiple inheritance (e.g., with ModelProtocol in torchtitan)
+        nn.Module.__init__(self)
         self.max_seq_len = model_args.max_seq_len
         self.tok_embeddings = nn.Embedding(model_args.vocab_size, model_args.dim)
         self.register_buffer(

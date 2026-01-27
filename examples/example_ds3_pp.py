@@ -3,10 +3,11 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
-import functools
+import copy
 import logging
 import os
 from contextlib import nullcontext
+from functools import partial
 from typing import Callable, Optional
 
 import torch
@@ -42,8 +43,8 @@ from autoparallel._testing.models.dsv3 import (
     MoEArgs,
     dsv3_loss_fn,
 )
-from autoparallel.api import AutoParallelPP
-from autoparallel.graph_pp_runner import (
+from autoparallel.api import AutoParallelPP, AutoParallelPPModule, move_to_fake
+from autoparallel.graph_passes.graph_pp_runner import (
     GraphCallables,
     GraphMeta,
     GraphPipelineStage,
@@ -58,7 +59,7 @@ from autoparallel.graph_pp_runner import (
     stage_reshard,
     stage_unshard,
 )
-from autoparallel.utils import NumericsLogger
+from autoparallel.shardings.placement_options import NumericsLogger
 
 # Configure logging to show DEBUG messages
 logging.basicConfig(
@@ -134,6 +135,7 @@ def run_test(
     schedule_name: str,
     rng_seed: Optional[int],
     logs_dir: str,
+    use_cache: bool,
 ):
     if not fake_evaluate:
         pp_degree = 2
@@ -157,6 +159,7 @@ def run_test(
         ), "world_size must be 4, for fake evaluation"
         rank = int(os.getenv("RANK"))
         device = torch.device(f"cuda:{rank}")
+        torch.cuda.set_device(device)
         fake_store = FakeStore()
         torch.distributed.init_process_group(
             "fake",
@@ -174,6 +177,7 @@ def run_test(
         ), "Need at least 8 GPUs for real evaluation"
         local_rank = int(os.getenv("LOCAL_RANK"))
         device = torch.device(f"cuda:{local_rank}")
+        torch.cuda.set_device(device)
         torch.distributed.init_process_group(backend="nccl")
 
     # Initialize device mesh (common for both modes)
@@ -384,6 +388,7 @@ def run_test(
     for stages in pp_rank_to_stage_indices.values():
         assert len(stages) * pp_degree == len(virtual_pp_stages)
     stage_indices_current_pp_rank = pp_rank_to_stage_indices[pp_rank]
+    should_log_weights = should_log_fw_outs = False
     if rng_seed:
         # Compute the ranks to log from
         # 1. for fw_outs, log from coord [pp_rank_containing_last_stage, 0, 0]
@@ -413,10 +418,8 @@ def run_test(
     stage_graphs: dict[int, GraphCallables] = {}
     stage_graph_metas: dict[int, GraphMeta] = {}
     # Step 3. Apply AutoParallel to each logical stage assigned to this pp rank
-    use_cache = fake_evaluate
     root_cache = "tmp"
     os.makedirs(root_cache, exist_ok=True)
-    from autoparallel.api import AutoParallelPPModule
 
     for stage_idx in stage_indices_current_pp_rank:
         trace_structured(
@@ -438,8 +441,16 @@ def run_test(
                 k: nn.Parameter(v.detach())
                 for k, v in cache["sharded_param_dict"].items()
             }
+            fake_mode = FakeTensorMode()
+            init_weights_model = move_to_fake(
+                copy.deepcopy(stage_mod), fake_mode, device
+            )
+            stage_mod = move_to_fake(stage_mod, fake_mode, device)
             pp_mod = AutoParallelPPModule(
-                cache["sharded_param_dict"], cache["sharded_buffer_dict"], stage_mod
+                cache["sharded_param_dict"],
+                cache["sharded_buffer_dict"],
+                init_weights_model,
+                stage_mod,
             )
         else:
             if stage_idx == 0:
@@ -485,11 +496,7 @@ def run_test(
                 )
                 graph_callables = cache["graph_callables"]
                 graph_meta = cache["graph_meta"]
-                pp_mod = AutoParallelPPModule(
-                    cache["sharded_param_dict"],
-                    cache["sharded_buffer_dict"],
-                    autop.init_weights_model,
-                )
+                pp_mod = autop.parallel_model
                 if use_cache:
                     torch.save(cache, stage_file)
 
@@ -591,25 +598,31 @@ def run_test(
     schedule.register_custom_function(BACKWARD_INPUT, stage_backward_input)
     schedule.register_custom_function(BACKWARD_WEIGHT, stage_backward_weight)
     if schedule_name == "DualPipeV":
-        multiplexed_graph_callables = get_multiplexed_graph_callables(stage_graphs)
+        from autoparallel.graph_passes.graph_multiplex import multiplex_fw_bw_graph
+
+        multiplexed_graph_callables = get_multiplexed_graph_callables(
+            stage_graphs,
+            partial(multiplex_fw_bw_graph, overlap_with_annotations=True),
+        )
         schedule.register_custom_function(
-            OVERLAP_F_B, functools.partial(overlap_fw_bw, multiplexed_graph_callables)
+            OVERLAP_F_B, partial(overlap_fw_bw, multiplexed_graph_callables)
         )
 
     # Step 7. Register the schedule with the graph runner
-
     graph_pp_runner = GraphPPRunner(schedule)
 
     # Step 8. Run the whole pipeline once using the graph runner
     has_last_stage = (total_pp_stages - 1) in stage_mods
-    with (
+    execution_fake_mode = (
         FakeTensorMode(
             allow_non_fake_inputs=True,
             shape_env=ShapeEnv(),
         )
         if fake_evaluate
         else nullcontext()
-    ):
+    )
+
+    with execution_fake_mode:
         with torch.no_grad():
             target, losses = (
                 (runtime_target_fn(), [])
@@ -618,7 +631,7 @@ def run_test(
             )
             if pp_rank == 0:
                 x = runtime_input_fn_first_stage()
-                if rng_seed:
+                if numerics_logger is not None:
                     numerics_logger.log_diff(
                         x.to(torch.float32), prefix="full batch input"
                     )
@@ -635,10 +648,10 @@ def run_test(
                 },
                 payload_fn=lambda: f"losses: {losses}",
             )
-
-        numerics_logger.log_pp_grads(
-            model, stage_mods, num_world_stages, should_log=should_log_weights
-        )
+        if numerics_logger is not None:
+            numerics_logger.log_pp_grads(
+                model, stage_mods, num_world_stages, should_log=should_log_weights
+            )
 
     print("All good!")
 
@@ -685,7 +698,16 @@ if __name__ == "__main__":
         choices=["Interleaved1F1B", "ZBVZeroBubble", "DualPipeV"],
         help="Schedule to use for PP",
     )
+    parser.add_argument(
+        "--use-cache",
+        action="store_true",
+        default=False,
+        help="Use cached graph files if available (default: False)",
+    )
     args = parser.parse_args()
+
+    if args.use_cache and not args.fake_evaluate:
+        parser.error("--use-cache can only be used with --fake-evaluate")
 
     if args.rng_seed is not None:
         torch.use_deterministic_algorithms(True)
@@ -697,4 +719,5 @@ if __name__ == "__main__":
         schedule_name=args.schedule_name,
         rng_seed=args.rng_seed,
         logs_dir=args.logs_dir,
+        use_cache=args.use_cache,
     )

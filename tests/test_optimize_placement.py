@@ -495,6 +495,55 @@ def test_local_map_placement_respected(device_mesh_local_map, device="cuda"):
 
 @patch("torch.cuda.device_count", lambda: 8)
 @patch("torch.cuda.get_device_name", lambda device: "H100")
+def test_get_attr_nodes(device_mesh_1d):
+    """Test that get_attr nodes (module attributes like constant tensors) are handled correctly."""
+    dim1 = 256
+    dim2 = dim1 * 4
+    bs = 8 * device_mesh_1d.shape[0]
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = nn.Linear(dim1, dim2)
+
+        def forward(self, x):
+            # new_tensor creates a constant tensor that becomes a get_attr node in the FX graph
+            y = x.new_tensor([0, 1, 2, 3, 4, 5, 6, 7])[None, :, None]
+            return self.linear(x) + y
+
+    def input_fn():
+        return torch.rand(bs, 8, dim1, device="cuda", requires_grad=True)
+
+    with torch.device("meta"):
+        model = Model()
+
+    with AutoParallel(model, input_fn, device_mesh_1d) as autop:
+        autop.add_parameter_memory_constraint(low=None, high=None)
+
+        x_sharding = (Shard(0),)
+        autop.add_input_constraints([x_sharding])
+        autop.add_output_constraints([x_sharding])
+
+        sharding_placement = autop.optimize_placement()
+
+    # Find get_attr nodes in the graph
+    get_attr_nodes = [node for node in autop.gm.graph.nodes if node.op == "get_attr"]
+    assert len(get_attr_nodes) > 0, "Expected at least one get_attr node"
+
+    # The get_attr node should have a valid sharding placement
+    for node in get_attr_nodes:
+        assert (
+            node in sharding_placement
+        ), f"get_attr node {node} missing from sharding_placement"
+        spec = sharding_placement[node]
+        # The constant tensor is small and used in broadcasting, so it should be replicated
+        assert spec.output_specs.placements == (
+            Replicate(),
+        ), f"Expected get_attr node to be Replicate(), got {spec.output_specs.placements}"
+
+
+@patch("torch.cuda.device_count", lambda: 8)
+@patch("torch.cuda.get_device_name", lambda device: "H100")
 def test_world_size_larger_than_parameter(device_mesh_1d):
     # make a parameter which is smaller than the world size
     dim: int = device_mesh_1d.shape[0] // 2

@@ -81,7 +81,7 @@ def update_joint_with_descriptors(
     else:
         joint_with_descriptors._aot_graph_capture.updated_flat_args = new_flat_args
 
-    joint_with_descriptors._aot_state.flat_args = new_flat_args
+    joint_with_descriptors._aot_state.flat_args = new_flat_args  # type: ignore[assignment]
     joint_with_descriptors._aot_state.fw_metadata.traced_tangents = new_local_tangents
 
 
@@ -99,7 +99,12 @@ def _add_alias(gm, version="v1"):
         first_user = nodes[min(node_map[n] for n in node.users)]
         with graph.inserting_before(first_user):
             alias_node = graph.call_function(torch.ops.aten.alias.default, args=(node,))
-            alias_node.meta.update(node.meta)
+            # for some reason tangents have "partitioner_tag" marked as "is_forward"
+            # which can mess up with the partitioner
+            meta = {k: v for k, v in node.meta.items()}
+            if "tangents" in node.name and "partitioner_tag" in meta:
+                del meta["partitioner_tag"]
+            alias_node.meta.update(meta)
 
             def delete_user_cb(n):
                 return n != alias_node
@@ -151,7 +156,12 @@ def _add_alias(gm, version="v1"):
     for node in graph.find_nodes(op="output")[0].all_input_nodes:
         with graph.inserting_after(node):
             alias_node = graph.call_function(torch.ops.aten.alias.default, args=(node,))
-            alias_node.meta.update(node.meta)
+            # for some reason tangents have "partitioner_tag" marked as "is_forward"
+            # which can mess up with the partitioner
+            meta = {k: v for k, v in node.meta.items()}
+            if "tangents" in node.name and "partitioner_tag" in meta:
+                del meta["partitioner_tag"]
+            alias_node.meta.update(meta)
 
             def delete_user_cb(n):
                 return n != alias_node

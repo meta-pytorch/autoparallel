@@ -13,12 +13,12 @@ from torch.testing._internal.distributed.fake_pg import FakeStore
 
 from autoparallel._testing.models.llama3 import Transformer, TransformerModelArgs
 from autoparallel.api import AutoParallel
-from autoparallel.auto_bucketing import (
+from autoparallel.graph_passes.auto_bucketing import (
     aten_autobucketing_config,
     aten_autobucketing_reordering_pass,
     configure_inductor_for_autobucketing,
 )
-from autoparallel.debug_helpers import make_custom_runtime_estimation
+from autoparallel.graph_passes.debug_helpers import make_custom_runtime_estimation
 
 world_size = 64
 
