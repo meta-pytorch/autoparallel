@@ -108,17 +108,6 @@ from .shardings.placement_options import (
 )
 from .shardings.propagation_rules import _create_all_options
 
-
-def _debug_node(node):
-    def my_print(x):
-        x = x.meta["val"]
-        if isinstance(x, torch.Tensor):
-            return (x.shape, x.stride())
-        return x
-
-    print(tree_map_only(torch.fx.Node, my_print, node.args))
-
-
 _GLOBAL_NAMES: dict[str, int] = {}
 
 
@@ -560,20 +549,6 @@ class ShardingOptimizer:
             for cc, v in c.items():
                 log_str += f"\n{cc}, coeff={v}, value={cc.value()}"
         return log_str
-
-    def print_old(self):
-        ds = self.ds
-        res = self.res
-
-        import pprint
-
-        nodes = list(self.graph.nodes)
-        pprint.pprint(
-            [(nodes[x[0]], str(ds[x]["full_strat"]), ds[x]["cost"]) for x in res]
-        )
-        total_cost = sum(ds[x]["cost"] for x in res)
-        print(f"total_cost: {total_cost:.2f}")
-        print(self.get_violated_constraints_log())
 
     def get_log(self, colored=False, verbose=False):
         from autoparallel.log_formatting import format_sharding_log

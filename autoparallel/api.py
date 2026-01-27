@@ -6,7 +6,6 @@
 import copy
 import functools
 import itertools
-import warnings
 from contextlib import ExitStack, contextmanager
 from types import MethodType
 from typing import Any, Callable, Optional, Union
@@ -172,47 +171,6 @@ def move_to_fake(model: torch.nn.Module, mode: FakeTensorMode, device: torch.dev
             _move_to_fake(model, k, device, parameter=False)
 
     return model
-
-
-# Export runs some asserts on the exported program to ensure that it is serializable,
-# and some safety checks e.g. whether the graph metadata is consistent with what's been traced.
-#
-# In autoparallel, we don't care about the serializability of this initial
-# trace, but we do want those same safety checks. In the short term, we
-# can patch the verification logic.
-@contextmanager
-def monkey_patch_export_verifier():
-    from torch._export.verifier import SpecViolationError, Verifier, final
-
-    prior = Verifier._check_graph_module
-
-    # Export validates the output module to ensure metadata isn't missing, that it is serializable, etc.
-    # We don't need them for the most part, please allowlist them here:
-    def expected_error(e: Exception):
-        okay = [
-            "Operator 'autoparallel.dtype_cast' is not an allowed operator type",
-            "call_local_map",
-        ]
-        e_str = str(e)
-        for msg in okay:
-            if msg in e_str:
-                return True
-        return False
-
-    @final
-    def _try_check_graph_module(self: Verifier, gm: torch.fx.GraphModule) -> None:
-        try:
-            return prior(self, gm)
-        except SpecViolationError as e:
-            if not expected_error(e):
-                raise
-            warnings.warn(f"Ignoring strict-mode export verifier error: {e}")
-
-    try:
-        Verifier._check_graph_module = _try_check_graph_module
-        yield
-    finally:
-        Verifier._check_graph_module = prior
 
 
 @contextmanager
