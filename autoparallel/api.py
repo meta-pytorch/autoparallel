@@ -27,8 +27,6 @@ from torch.export._trace import _restore_state_dict
 from torch.export.unflatten import _AttrKind
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
-from autoparallel.graph_passes.graph_partition import partition_joint_with_descriptors
-
 from .apply_sharding import apply_sharding_to_model
 from .cast_parametrization import apply_dtype_cast, canonicalize_mp, set_dtype_cast
 from .graph_passes.activation_checkpointing import ac_joint_pass
@@ -236,7 +234,6 @@ class AutoParallel:
         ac_stage_size_in_GiB: Optional[Union[float, str]] = "auto",
         reshard_after_forward: bool = True,
         dynamic: bool = False,
-        loss_fn: Optional[Callable] = None,
         numerics_logger: NumericsLogger | None = None,
         **kwargs,
     ):
@@ -276,7 +273,7 @@ class AutoParallel:
         self.enable_ac = enable_ac
         self.ac_stage_size_in_GiB = ac_stage_size_in_GiB
         self.reshard_after_forward = reshard_after_forward
-        self.loss_fn = loss_fn
+        self.loss_fn = None
 
         if dynamic:
             self.fake_mode.shape_env = ShapeEnv()
@@ -340,47 +337,41 @@ class AutoParallel:
                 "AutoParallel is not reentrant, please file a bug report if you need this functionality"
             )
 
+    def _prepare_model_wrapper_and_inputs(
+        self, raw_inputs: Any
+    ) -> tuple[Callable, tuple[Any, ...]]:
+        """
+        Prepare the model wrapper and formatted inputs for tracing.
+
+        Args:
+            raw_inputs: The raw inputs from input_fn()
+
+        Returns:
+            A tuple of (model_wrapper, formatted_inputs) where:
+            - model_wrapper is a callable that will be traced
+            - formatted_inputs are the inputs to pass to model_wrapper
+        """
+        # No loss function, inputs are just model inputs
+        formatted_inputs = (
+            raw_inputs if isinstance(raw_inputs, tuple) else (raw_inputs,)
+        )
+
+        def model_wrapper(*model_inputs) -> Any:
+            output = self.model(*model_inputs)
+            return output
+
+        return model_wrapper, formatted_inputs
+
     def build_model_graph(self):
         decomp_table = _get_decomp_table()
 
         with self.fake_mode:
             raw_inputs = self.input_fn()
 
-        # Define model wrapper based on whether loss_fn is provided
-        model_wrapper: Callable
-        # Parse inputs based on whether loss_fn is provided
-        # If loss_fn is not None: expected format ((inp1, inp2,...), target)
-        # If loss_fn is None: expected format (inp1, inp2, ...)
-        if self.loss_fn is not None:
-            if isinstance(raw_inputs, tuple) and len(raw_inputs) == 2:
-                model_inputs, target = raw_inputs
-                # Normalize inputs to always be a tuple
-                if not isinstance(model_inputs, tuple):
-                    model_inputs = (model_inputs,)
-                formatted_inputs = (model_inputs, target)
-
-                def model_with_loss(model_inputs, target) -> Any:
-                    output = self.model(*model_inputs)
-                    loss = self.loss_fn(output, target)  # type: ignore[misc]
-                    return loss
-
-                model_wrapper = model_with_loss
-            else:
-                raise ValueError(
-                    "When loss_fn is provided, input_fn must return (inputs, target) "
-                    "where inputs can be a single tensor or tuple of tensors"
-                )
-        else:
-            # No loss function, inputs are just model inputs
-            formatted_inputs = (
-                raw_inputs if isinstance(raw_inputs, tuple) else (raw_inputs,)
-            )
-
-            def model_wo_loss(*model_inputs) -> Any:
-                output = self.model(*model_inputs)
-                return output
-
-            model_wrapper = model_wo_loss
+        # Prepare model wrapper and inputs for tracing
+        model_wrapper, formatted_inputs = self._prepare_model_wrapper_and_inputs(
+            raw_inputs
+        )
 
         with set_dtype_cast(
             True
@@ -642,244 +633,6 @@ class AutoParallel:
         self.parallel_model = AutoParallelModule()
         self._register_params_and_init_weights(sharded_param_dict, sharded_buffer_dict)
         return self.parallel_model
-
-
-########################
-# Pipeline stuff start #
-########################
-class AutoParallelPPModule(torch.nn.Module):
-    def __init__(
-        self,
-        sharded_param_dict: dict[str, torch.nn.Parameter],
-        sharded_buffer_dict: dict[str, torch.Tensor],
-        init_weights_model: torch.nn.Module,
-        ref_model: torch.nn.Module,
-    ):
-        super().__init__()
-        self._register_params_and_buffers(
-            sharded_param_dict, sharded_buffer_dict, ref_model
-        )
-
-        # Right now we require a convention that the user model provides an init_weights method,
-        # although we could snoop for other methods too.
-        if hasattr(init_weights_model, "init_weights"):
-            hook_params_setters(init_weights_model, self)
-
-            def init_weights(_self, *args, **kwargs):
-                # this is now a deep-fake-copy of orig mod, so we don't have to use reparametrize
-                return init_weights_model.init_weights(*args, **kwargs)
-
-            # assign an init_weights method onto the output mod.
-            # all it does is sneakily run the original user mod's init_weights method,
-            # but with our new DTensor sharded params attached to the user module.
-            self.init_weights = MethodType(init_weights, self)
-
-    def _register_params_and_buffers(
-        self, sharded_param_dict, sharded_buffer_dict, ref_model
-    ):
-
-        # We construct an unflattened structure on parallel_mod,
-        # e.g. _assign_attr(v, parallel_model, k="layers.0.weight") will literally
-        # create empty nn.Modules recursively and then stash 'v' so it shows up in the right spot
-        # We pass ref_model to preserve the original module structure (e.g., nn.ModuleDict)
-        for k, v in sharded_param_dict.items():
-            _assign_attr(v, self, ref_model, k, attr_kind=_AttrKind.PARAMETER)
-
-        for k, v in sharded_buffer_dict.items():
-            _assign_attr(v, self, ref_model, k, attr_kind=_AttrKind.BUFFER)
-
-    def forward(self, *args):
-        raise NotImplementedError("This is a placeholder for the pipeline model")
-
-
-class AutoParallelPP(AutoParallel):
-    def apply_placement_pp(
-        self, sharding_placement=None, graph_passes: list[str] = []
-    ) -> dict[str, Any]:
-        assert all(
-            g_pass in ["split_fsdp_collectives", "split_dI_dW"]
-            for g_pass in graph_passes
-        ), "Only split_fsdp_collectives and split_dI_dW_graph are supported"
-        sharded_param_dict, sharded_buffer_dict = self._apply_placement_common(
-            sharding_placement
-        )
-        num_params = len(sharded_param_dict)
-        num_buffers = len(sharded_buffer_dict)
-        (
-            fw_module,
-            bw_module,
-            num_params_buffers,
-            num_user_outputs,
-            num_mutate_inputs,
-            num_fw_outs_saved_for_bw,
-            num_symints_saved_for_bw,
-            _indices_of_inps_to_detach,
-            adjusted_flat_args,
-        ) = partition_joint_with_descriptors(self.joint_with_descriptors)
-        assert num_params_buffers == (
-            num_params + num_buffers
-        ), f"num_params_buffers: {num_params_buffers}, num_params: {num_params}, num_buffers: {num_buffers}"
-        num_input_grads = (
-            len(bw_module.graph.find_nodes(op="output")[0].args[0]) - num_params_buffers
-        )
-        print(
-            f"num_params_buffers: {num_params_buffers}\n"
-            f"num_user_outputs: {num_user_outputs}\n"
-            f"num_mutate_inputs: {num_mutate_inputs}\n"
-            f"num_input_grads: {num_input_grads}\n"
-            f"num_fw_outs_saved_for_bw: {num_fw_outs_saved_for_bw}\n"
-            f"num_symints_saved_for_bw: {num_symints_saved_for_bw}"
-        )
-
-        trace_structured(
-            "artifact",
-            metadata_fn=lambda: {
-                "name": "autoparallel_pp_fwd_graph",
-                "encoding": "string",
-            },
-            payload_fn=lambda: fw_module.print_readable(
-                print_output=False, include_stride=True, include_device=True
-            ),
-        )
-        trace_structured(
-            "artifact",
-            metadata_fn=lambda: {
-                "name": "autoparallel_pp_bwd_graph",
-                "encoding": "string",
-            },
-            payload_fn=lambda: bw_module.print_readable(
-                print_output=False, include_stride=True, include_device=True
-            ),
-        )
-        unshard_module: Optional[torch.fx.GraphModule] = None
-        reduce_grad_module: Optional[torch.fx.GraphModule] = None
-        if "split_fsdp_collectives" in graph_passes:
-            assert (
-                not self.reshard_after_forward
-            ), "reshard_after_forward should be False to disable FSDP all_gather in the backward pass"
-            from autoparallel.graph_passes.split_fsdp_collectives import (
-                split_fsdp_prefetch,
-                split_fsdp_reduce_scatters_epilogue,
-            )
-
-            unshard_module, fw_module = split_fsdp_prefetch(fw_module, num_params)
-            trace_structured(
-                "artifact",
-                metadata_fn=lambda: {
-                    "name": "autoparallel_pp_unshard_graph",
-                    "encoding": "string",
-                },
-                payload_fn=lambda: unshard_module.print_readable(
-                    print_output=False, include_stride=True, include_device=True
-                ),
-            )
-            trace_structured(
-                "artifact",
-                metadata_fn=lambda: {
-                    "name": "autoparallel_pp_fwd_no_fsdp_graph",
-                    "encoding": "string",
-                },
-                payload_fn=lambda: fw_module.print_readable(
-                    print_output=False, include_stride=True, include_device=True
-                ),
-            )
-            bw_module, reduce_grad_module = split_fsdp_reduce_scatters_epilogue(
-                bw_module, num_params
-            )
-            trace_structured(
-                "artifact",
-                metadata_fn=lambda: {
-                    "name": "autoparallel_pp_bwd_no_fsdp_graph",
-                    "encoding": "string",
-                },
-                payload_fn=lambda: bw_module.print_readable(
-                    print_output=False, include_stride=True, include_device=True
-                ),
-            )
-            trace_structured(
-                "artifact",
-                metadata_fn=lambda: {
-                    "name": "autoparallel_pp_reduce_grad_graph",
-                    "encoding": "string",
-                },
-                payload_fn=lambda: reduce_grad_module.print_readable(
-                    print_output=False, include_stride=True, include_device=True
-                ),
-            )
-
-        bw_dI_module: Optional[torch.fx.GraphModule] = None
-        bw_dW_module: Optional[torch.fx.GraphModule] = None
-        if "split_dI_dW" in graph_passes:
-            from autoparallel.graph_passes.split_di_dw_graph import split_di_dw_graph
-
-            bw_dI_module, bw_dW_module, num_input_grads = split_di_dw_graph(
-                bw_module,
-                num_weight_gradients=num_params_buffers,
-            )
-            trace_structured(
-                "artifact",
-                metadata_fn=lambda: {
-                    "name": "autoparallel_pp_bw_dI_graph",
-                    "encoding": "string",
-                },
-                payload_fn=lambda: bw_dI_module.print_readable(
-                    print_output=False, include_stride=True, include_device=True
-                ),
-            )
-            trace_structured(
-                "artifact",
-                metadata_fn=lambda: {
-                    "name": "autoparallel_pp_bw_dW_graph",
-                    "encoding": "string",
-                },
-                payload_fn=lambda: bw_dW_module.print_readable(
-                    print_output=False, include_stride=True, include_device=True
-                ),
-            )
-            if all(
-                x is None
-                for x in bw_dI_module.graph.find_nodes(op="output")[0].args[0][
-                    :num_input_grads
-                ]
-            ):
-                raise RuntimeError(
-                    "attempted to run split dI/dW pass on a graph that has no input gradients"
-                )
-
-        graph_meta: dict[str, int] = {
-            "num_mutate_inputs": num_mutate_inputs,
-            "num_user_outputs": num_user_outputs,
-            "num_symints_saved_for_bw": num_symints_saved_for_bw,
-            "num_params": num_params,
-            "num_buffers": num_buffers,
-            "num_input_grads": num_input_grads,
-        }
-
-        graph_modules: dict[str, Optional[torch.fx.GraphModule]] = {
-            "fw": fw_module,
-            "full_bw": bw_module,
-            "bw_dI": bw_dI_module,
-            "bw_dW": bw_dW_module,
-            "unshard": unshard_module,
-            "reduce_grad": reduce_grad_module,
-        }
-        self.parallel_model = AutoParallelPPModule(
-            sharded_param_dict,
-            sharded_buffer_dict,
-            self.init_weights_model,
-            self.model,
-        )
-        return {
-            "graph_callables": graph_modules,
-            "graph_meta": graph_meta,
-            "sharded_param_dict": sharded_param_dict,
-            "sharded_buffer_dict": sharded_buffer_dict,
-        }
-
-
-######################
-# Pipeline stuff end #
-######################
 
 
 ####################
