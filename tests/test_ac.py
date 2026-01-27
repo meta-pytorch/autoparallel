@@ -243,34 +243,59 @@ def test_ac_torch_compile_preserves_custom_policy_tags(device_mesh_1d):
         )
         pre_compile_mm = _validate_mm_has_checkpoint_tag(graph)
 
-        # Store the recompute tags for verification
-        pre_compile_mm_tags = [
-            (node.name, node.meta.get("recompute")) for node in pre_compile_mm
-        ]
+    # Capture the graph that torch.compile sees using a custom backend
+    captured_graphs = []
 
-    # Now apply torch.compile
-    compiled_mod = torch.compile(parallel_mod)
+    def capture_backend(gm, example_inputs):
+        """Backend that captures the graph for inspection."""
+        captured_graphs.append(gm)
+        # Return the graph module as-is (eager execution)
+        return gm
 
-    # The graph inside parallel_mod should still have the checkpoint tags
-    # (torch.compile wraps but doesn't modify the original module's internal graph)
-    assert autop.parallel_gm is not None
+    # Apply torch.compile with our capturing backend
+    compiled_mod = torch.compile(parallel_mod, backend=capture_backend)
 
-    # Verify the original graph still has the tags
-    graph = autop.parallel_gm.graph
-    post_compile_tagged = _validate_checkpoint_tags_custom_policy(
-        graph, _custom_policy_fn
+    # Initialize the model and run it to trigger compilation
+    parallel_mod.to_empty(device="cuda")
+    # Initialize weights with simple values
+    for p in parallel_mod.parameters():
+        p.data.fill_(0.01)
+
+    # Run the compiled model to trigger compilation
+    local_bs = bs // device_mesh_1d.size()
+    x = torch.rand(local_bs, seq_len, dim, device="cuda")
+    _ = compiled_mod(x)
+
+    # Verify we captured a graph
+    assert len(captured_graphs) > 0, "Expected to capture at least one graph"
+
+    # Check that the captured graph has nodes with checkpoint-related metadata
+    # The compiled graph should preserve the recompute tags with custom policy values
+    compiled_graph = captured_graphs[0].graph
+    compiled_tagged = []
+    compiled_mm_with_tags = []
+    for node in compiled_graph.nodes:
+        # Check for recompute tag (the key metadata for checkpoint behavior)
+        if node.meta.get("recompute") is not None:
+            compiled_tagged.append(node)
+            # Check if this is an mm node
+            if node.target == torch.ops.aten.mm.default:
+                compiled_mm_with_tags.append(node)
+
+    # Verify that checkpoint tags are preserved in the compiled graph
+    assert len(compiled_tagged) > 0, (
+        "Expected nodes with 'recompute' metadata in compiled graph. "
+        "This indicates checkpoint tags were not preserved through torch.compile."
     )
-    post_compile_mm = _validate_mm_has_checkpoint_tag(graph)
 
-    # Verify same nodes are tagged
-    assert len(pre_compile_tagged) == len(post_compile_tagged)
-    assert len(pre_compile_mm) == len(post_compile_mm)
-
-    # Verify mm tags are preserved
-    post_compile_mm_tags = [
-        (node.name, node.meta.get("recompute")) for node in post_compile_mm
-    ]
-    assert pre_compile_mm_tags == post_compile_mm_tags
+    # Verify mm nodes have the expected MUST_SAVE policy
+    assert len(compiled_mm_with_tags) > 0, (
+        "Expected mm nodes with 'recompute' metadata in compiled graph."
+    )
+    for mm_node in compiled_mm_with_tags:
+        assert mm_node.meta.get("recompute") == CheckpointPolicy.MUST_SAVE, (
+            f"mm node {mm_node} should have MUST_SAVE policy"
+        )
 
     assert compiled_mod is not None
 
@@ -299,12 +324,49 @@ def test_ac_torch_compile_preserves_basic_checkpoint_tags(device_mesh_1d):
         graph = autop.parallel_gm.graph
         pre_compile_tagged = _get_checkpoint_tagged_nodes(graph)
 
-    # Apply torch.compile
-    compiled_mod = torch.compile(parallel_mod)
+    # Verify we have checkpoint-tagged nodes before compile
+    assert len(pre_compile_tagged) > 0, "Expected checkpoint-tagged nodes before compile"
 
-    # Verify tags are still in the original graph
-    post_compile_tagged = _get_checkpoint_tagged_nodes(autop.parallel_gm.graph)
-    assert len(pre_compile_tagged) == len(post_compile_tagged)
+    # Capture the graph that torch.compile sees using a custom backend
+    captured_graphs = []
+
+    def capture_backend(gm, example_inputs):
+        """Backend that captures the graph for inspection."""
+        captured_graphs.append(gm)
+        # Return the graph module as-is (eager execution)
+        return gm
+
+    # Apply torch.compile with our capturing backend
+    compiled_mod = torch.compile(parallel_mod, backend=capture_backend)
+
+    # Initialize the model and run it to trigger compilation
+    parallel_mod.to_empty(device="cuda")
+    # Initialize weights with simple values
+    for p in parallel_mod.parameters():
+        p.data.fill_(0.01)
+
+    # Run the compiled model to trigger compilation
+    local_bs = bs // device_mesh_1d.size()
+    x = torch.rand(local_bs, seq_len, dim, device="cuda")
+    _ = compiled_mod(x)
+
+    # Verify we captured a graph
+    assert len(captured_graphs) > 0, "Expected to capture at least one graph"
+
+    # Check that the captured graph has nodes with checkpoint-related metadata
+    # The compiled graph should preserve the recompute tags
+    compiled_graph = captured_graphs[0].graph
+    compiled_tagged = []
+    for node in compiled_graph.nodes:
+        # Check for recompute tag (the key metadata for checkpoint behavior)
+        if node.meta.get("recompute") is not None:
+            compiled_tagged.append(node)
+
+    # Verify that checkpoint tags are preserved in the compiled graph
+    assert len(compiled_tagged) > 0, (
+        "Expected nodes with 'recompute' metadata in compiled graph. "
+        "This indicates checkpoint tags were not preserved through torch.compile."
+    )
 
     assert compiled_mod is not None
 
