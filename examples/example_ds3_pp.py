@@ -43,7 +43,8 @@ from autoparallel._testing.models.dsv3 import (
     MoEArgs,
     dsv3_loss_fn,
 )
-from autoparallel.api import AutoParallelPP, AutoParallelPPModule, move_to_fake
+from autoparallel.api import move_to_fake
+from autoparallel.api_pp import AutoParallelPP, AutoParallelPPModule
 from autoparallel.graph_passes.graph_pp_runner import (
     GraphCallables,
     GraphMeta,
