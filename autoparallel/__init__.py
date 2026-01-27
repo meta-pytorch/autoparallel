@@ -4,5 +4,11 @@
 # LICENSE file in the root directory of this source tree.
 
 from autoparallel.api import AutoParallel, AutoParallelPP, auto_parallel
+from autoparallel.collectives import with_sharding_constraint
 
-__all__ = ["auto_parallel", "AutoParallel", "AutoParallelPP"]
+__all__ = [
+    "auto_parallel",
+    "AutoParallel",
+    "AutoParallelPP",
+    "with_sharding_constraint",
+]
