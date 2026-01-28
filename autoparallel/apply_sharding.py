@@ -250,6 +250,12 @@ def shard_node_given_placements(node, sharding_placement, *, meta: bool):
     mesh = tgt_spec.mesh
     # all tensors start as replicated
     curr_placement = (Replicate(),) * mesh.ndim
+    if "val" not in node.meta:
+        # for non-tensor inputs, they are considered as being
+        # baked in the graph, so we don't need to do anything
+        # and just return a dummy value
+        assert len(node.users) == 0
+        return "arbitrary value"
     tensor = node.meta["val"]
 
     ctx: Any
@@ -303,7 +309,7 @@ def _get_inductor_decomp_table():
 
 def apply_sharding_to_model(gm, sharding_placement, params_spec, buffers_spec):
     args = shard_nodes_given_placements(gm, sharding_placement)
-    local_args = [arg.to_local() for arg in args]
+    local_args = tree_map_only(DTensor, lambda x: x.to_local(), args)
 
     decomp_table = _get_inductor_decomp_table()
     # run with DTensor to apply the collectives given the graph
