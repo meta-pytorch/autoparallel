@@ -805,10 +805,6 @@ class AutoParallel:
                         dict(self.named_buffers(remove_duplicate=False)).items(),
                     )
                 ]
-                from IPython import embed
-
-                embed()
-                exit()
                 # new_args = flatten_fn(*args)
                 filtered_args = [x for x in args if isinstance(x, torch.Tensor)]
                 boxed_args = [*params, *filtered_args]
