@@ -94,7 +94,7 @@ def get_redistributed_input_placements(
         x for x in tree_flatten(node.args)[0] if isinstance(x, torch.fx.Node)
     ]
     num_input_nodes = len(all_input_nodes)
-    curr_specs: list[Union[DTensorSpec, tuple[Optional[DTensorSpec], ...]]] = [
+    curr_specs: list[Union[DTensorSpec, tuple[Optional[DTensorSpec], ...], None]] = [
         sharding_placement[n].output_specs for n in all_input_nodes
     ]  # FIXME ?
     if node.target == operator.getitem:
