@@ -186,7 +186,7 @@ def compute_optimal_placement_order_for_parameters(module, sharding_placement):
                 user_src_placement = list(d.values())[0][0]
                 mesh_ndim = len(user_src_placement)
 
-    param_grad_map = {p: g for p, g in param_and_grad_nodes}
+    param_grad_map = dict(param_and_grad_nodes)
     aligned_pg = []
     for param_or_grad_node in redistribution_map.keys():
         # just allow for arbitrary execution order if both param and grad
