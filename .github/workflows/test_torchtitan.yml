@@ -59,3 +59,14 @@ jobs:
           --parallelism.data_parallel_shard_degree 4 \
           --parallelism.expert_parallel_degree 4 \
           --job.custom_config_module=torchtitan.experiments.autoparallel.job_config
+
+        # TorchTitan DSv3 SimpleFSDP with auto_bucketing passes
+        NGPU=4 CONFIG_FILE=./torchtitan/models/deepseek_v3/train_configs/debug_model.toml ./run_train.sh \
+          --model.name simple_fsdp.deepseek_v3 \
+          --parallelism.tensor_parallel_degree 1 \
+          --parallelism.expert_parallel_degree 4 \
+          --job.custom_config_module=torchtitan.experiments.simple_fsdp.job_config \
+          --compile.graph_passes auto_bucketing \
+          --activation_checkpoint.mode "none" \
+          --compile.backend inductor \
+          --compile.enable
