@@ -209,7 +209,9 @@ def test_ac_basic_checkpoint_tags(device_mesh_1d):
         # For basic checkpoint, nodes should still have stack_trace with "checkpoint"
         graph = autop.parallel_gm.graph
         tagged_nodes = _get_checkpoint_tagged_nodes(graph)
-        assert len(tagged_nodes) > 0, "Expected some nodes with checkpoint in stack_trace"
+        assert (
+            len(tagged_nodes) > 0
+        ), "Expected some nodes with checkpoint in stack_trace"
 
     assert parallel_mod is not None
 
@@ -227,11 +229,25 @@ def test_ac_torch_compile_preserves_custom_policy_tags(device_mesh_1d):
     with torch.device("meta"):
         model = AttentionBlockWithCustomPolicy(nheads, dim)
 
+    captured_graphs = []
+
+    def boxed_nop_preserve_node_meta(gm: torch.fx.GraphModule, example_inputs):
+        def run(args):
+            with torch.fx.traceback.preserve_node_meta():
+                # nonlocal captured_graphs
+                # captured_graphs.append(gm)
+                return torch.fx.Interpreter(gm).boxed_run(args)
+
+        run._boxed_call = True  # type: ignore[attr-defined]
+        return run
+
     # First, apply autoparallel without compile to check tags
     with AutoParallel(model, input_fn, device_mesh_1d, compile=False) as autop:
         x_sharding = (Shard(0),)
         autop.add_input_constraints([x_sharding])
         autop.add_output_constraints([x_sharding])
+
+        autop.compiler_fn = boxed_nop_preserve_node_meta
 
         sharding_placement = autop.optimize_placement()
         parallel_mod = autop.apply_placement(sharding_placement)
@@ -243,17 +259,11 @@ def test_ac_torch_compile_preserves_custom_policy_tags(device_mesh_1d):
         )
         pre_compile_mm = _validate_mm_has_checkpoint_tag(graph)
 
-    # Capture the graph that torch.compile sees using a custom backend
-    captured_graphs = []
-
     def capture_backend(gm, example_inputs):
         """Backend that captures the graph for inspection."""
-        captured_graphs.append(gm)
+        # captured_graphs.append(gm)
         # Return the graph module as-is (eager execution)
         return gm
-
-    # Apply torch.compile with our capturing backend
-    compiled_mod = torch.compile(parallel_mod, backend=capture_backend)
 
     # Initialize the model and run it to trigger compilation
     parallel_mod.to_empty(device="cuda")
@@ -261,9 +271,15 @@ def test_ac_torch_compile_preserves_custom_policy_tags(device_mesh_1d):
     for p in parallel_mod.parameters():
         p.data.fill_(0.01)
 
-    # Run the compiled model to trigger compilation
     local_bs = bs // device_mesh_1d.size()
     x = torch.rand(local_bs, seq_len, dim, device="cuda")
+    _ = parallel_mod(x)
+
+    # Apply torch.compile with our capturing backend
+    # compiled_mod = torch.compile(parallel_mod, backend=capture_backend)
+    compiled_mod = torch.compile(parallel_mod)
+
+    # Run the compiled model to trigger compilation
     _ = compiled_mod(x)
 
     # Verify we captured a graph
@@ -289,13 +305,13 @@ def test_ac_torch_compile_preserves_custom_policy_tags(device_mesh_1d):
     )
 
     # Verify mm nodes have the expected MUST_SAVE policy
-    assert len(compiled_mm_with_tags) > 0, (
-        "Expected mm nodes with 'recompute' metadata in compiled graph."
-    )
+    assert (
+        len(compiled_mm_with_tags) > 0
+    ), "Expected mm nodes with 'recompute' metadata in compiled graph."
     for mm_node in compiled_mm_with_tags:
-        assert mm_node.meta.get("recompute") == CheckpointPolicy.MUST_SAVE, (
-            f"mm node {mm_node} should have MUST_SAVE policy"
-        )
+        assert (
+            mm_node.meta.get("recompute") == CheckpointPolicy.MUST_SAVE
+        ), f"mm node {mm_node} should have MUST_SAVE policy"
 
     assert compiled_mod is not None
 
@@ -325,7 +341,9 @@ def test_ac_torch_compile_preserves_basic_checkpoint_tags(device_mesh_1d):
         pre_compile_tagged = _get_checkpoint_tagged_nodes(graph)
 
     # Verify we have checkpoint-tagged nodes before compile
-    assert len(pre_compile_tagged) > 0, "Expected checkpoint-tagged nodes before compile"
+    assert (
+        len(pre_compile_tagged) > 0
+    ), "Expected checkpoint-tagged nodes before compile"
 
     # Capture the graph that torch.compile sees using a custom backend
     captured_graphs = []
@@ -401,7 +419,9 @@ def test_ac_compile_true_applies_torch_compile(device_mesh_1d):
     # We can check this by looking at the type
     assert parallel_mod is not None
     # torch.compile returns an OptimizedModule
-    assert hasattr(parallel_mod, "_orig_mod") or "Optimized" in type(parallel_mod).__name__
+    assert (
+        hasattr(parallel_mod, "_orig_mod") or "Optimized" in type(parallel_mod).__name__
+    )
 
 
 def test_ac_backward_nodes_have_matching_seq_nr(device_mesh_1d):
