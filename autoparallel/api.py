@@ -83,7 +83,6 @@ def normalize_placeholder_name(name: str) -> str:
 
 def create_graph_removing_unused_inputs_and_adding_unused_parameters(
     src_gm: torch.fx.GraphModule,
-    # model: nn.Module,
     fake_mode,
 ) -> tuple[torch.fx.GraphModule, list[torch.Tensor]]:
     """
@@ -94,19 +93,59 @@ def create_graph_removing_unused_inputs_and_adding_unused_parameters(
 
     Returns (new_gm, inputs) where inputs are the non-param/buffer placeholder values.
     """
+    from torch._subclasses.fake_tensor import FakeTensor
     from torch.export.unflatten import _assign_attr, _AttrKind
 
-    # fake_mode = src_gm.meta["fake_mode"]
+    # Helper to create fresh fake tensors in the target fake mode
+    def to_fake(t: torch.Tensor) -> torch.Tensor:
+        with fake_mode:
+            fake_t = torch.empty_strided(
+                t.shape,
+                t.stride(),
+                dtype=t.dtype,
+                device=t.device,
+                requires_grad=t.requires_grad,
+            )
+        if isinstance(t, torch.nn.Parameter):
+            return torch.nn.Parameter(fake_t, requires_grad=t.requires_grad)
+        return fake_t
+
+    # Helper to convert example_value in node metadata to the target fake mode
+    def convert_node_meta(meta: dict) -> dict:
+        new_meta = meta.copy()
+        example_val = new_meta.get("example_value")
+        if example_val is not None:
+            if isinstance(example_val, FakeTensor) and hasattr(example_val, "shape"):
+                new_meta["example_value"] = to_fake(example_val)
+            elif isinstance(example_val, (list, tuple)):
+                # Handle tuple/list of tensors
+                converted = []
+                for v in example_val:
+                    if isinstance(v, FakeTensor) and hasattr(v, "shape"):
+                        converted.append(to_fake(v))
+                    else:
+                        converted.append(v)
+                new_meta["example_value"] = type(example_val)(converted)
+        return new_meta
+
     # Create new GraphModule and register all parameters/buffers from src_gm
+    # Convert them to the target fake mode to avoid fake mode mixing
     gm = torch.fx.GraphModule(torch.nn.Module(), torch.fx.Graph())
+
+    # Only copy specific metadata keys we need, avoiding tracing_context and other
+    # internal state that might hold references to dynamo's fake mode
+    for key in ["dynamo_flat_name_to_original_fqn", "module_call_specs"]:
+        if key in src_gm.meta:
+            gm.meta[key] = src_gm.meta[key]
+    gm.meta["fake_mode"] = fake_mode
+
     for name, mod in src_gm.named_children():
         if isinstance(mod, torch.fx.GraphModule):
             gm.add_submodule(name, mod)
-        # gm.add_submodule(name, mod)
     for fqn, param in src_gm.named_parameters():
-        _assign_attr(param, gm, fqn, _AttrKind.PARAMETER)
+        _assign_attr(to_fake(param), gm, fqn, _AttrKind.PARAMETER)
     for fqn, buf in src_gm.named_buffers():
-        _assign_attr(buf, gm, fqn, _AttrKind.BUFFER)
+        _assign_attr(to_fake(buf), gm, fqn, _AttrKind.BUFFER)
 
     # Build lookup from normalized name to FQN using dynamo_flat_name_to_original_fqn
     # The keys in dynamo_flat_name_to_original_fqn are created by module_key_name(source.name)
@@ -142,32 +181,27 @@ def create_graph_removing_unused_inputs_and_adding_unused_parameters(
             if is_param:
                 # Parameter placeholder -> get_attr
                 get_attr_node = graph.get_attr(fqn)
-                get_attr_node.meta = node.meta.copy()
+                get_attr_node.meta = convert_node_meta(node.meta)
                 val_map[node] = get_attr_node
                 used_params.add(fqn)
             elif is_buffer:
                 # Buffer placeholder -> get_attr
                 get_attr_node = graph.get_attr(fqn)
-                get_attr_node.meta = node.meta.copy()
+                get_attr_node.meta = convert_node_meta(node.meta)
                 val_map[node] = get_attr_node
                 used_buffers.add(fqn)
             else:
                 # Regular input placeholder - copy as-is
-                val_map[node] = graph.node_copy(node, lambda n: val_map[n])
+                new_node = graph.node_copy(node, lambda n: val_map[n])
+                new_node.meta = convert_node_meta(node.meta)
                 if example_val is not None and hasattr(example_val, "shape"):
-                    with fake_mode:
-                        inputs.append(
-                            torch.empty_strided(
-                                example_val.shape,
-                                example_val.stride(),
-                                dtype=example_val.dtype,
-                                device=example_val.device,
-                                requires_grad=example_val.requires_grad,
-                            )
-                        )
+                    inputs.append(to_fake(example_val))
+                val_map[node] = new_node
         else:
-            # Copy all other nodes
-            val_map[node] = graph.node_copy(node, lambda n: val_map[n])
+            # Copy all other nodes and convert their metadata
+            new_node = graph.node_copy(node, lambda n: val_map[n])
+            new_node.meta = convert_node_meta(node.meta)
+            val_map[node] = new_node
 
     # Add get_attr for unused parameters (not in the original graph)
     # Insert before the first non-placeholder/non-get_attr node
@@ -539,7 +573,6 @@ class AutoParallel:
         with set_dtype_cast(
             True
         ), enable_local_map_wrapping(), torch._dynamo.utils._disable_saved_tensors_hooks_during_tracing():
-            # torch_ir_with_fqn = _export(self.model, model_wrapper, formatted_inputs)
             from torch._dynamo.functional_export import dynamo_graph_capture_for_export
 
             torch_ir_with_fqn = dynamo_graph_capture_for_export(self.model)(
@@ -547,20 +580,18 @@ class AutoParallel:
             )
             self.flatten_fn = torch_ir_with_fqn._dynamo_bytecode_flatten
             self.unflatten_fn = torch_ir_with_fqn._dynamo_bytecode_unflatten
-            # from IPython import embed; embed(); exit()
             (
                 torch_ir_with_fqn2,
                 inputs2,
             ) = create_graph_removing_unused_inputs_and_adding_unused_parameters(
                 torch_ir_with_fqn, self.fake_mode
             )
-            # from IPython import embed; embed(); exit()
-            # TODO Cna't use fake mode here because it clashes with the user level
-            # fake mode. Ideally dynamo should reuse the user level fake mode.
+            # Clear references to the original dynamo graph to help garbage collection
+            # and reduce state leakage between uses
+            del torch_ir_with_fqn
             self.joint_with_descriptors = aot_export_joint_with_descriptors(
                 self.stack,
                 torch_ir_with_fqn2,
-                # formatted_inputs,
                 inputs2,
                 decompositions=decomp_table,
             )
