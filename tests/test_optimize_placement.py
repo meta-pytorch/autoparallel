@@ -16,6 +16,13 @@ from torch.testing._internal.distributed.fake_pg import FakeStore
 
 from autoparallel.api import AutoParallel
 
+# @pytest.fixture(autouse=True)
+# def reset_dynamo():
+#     """Reset dynamo state before each test to ensure test isolation."""
+#     torch._dynamo.reset()
+#     yield
+#     torch._dynamo.reset()
+
 
 @pytest.fixture(scope="module", autouse=True)
 def init_pg():

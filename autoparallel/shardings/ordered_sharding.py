@@ -149,7 +149,11 @@ def compute_optimal_placement_order_for_parameters(module, sharding_placement):
     param_and_grad_users = {}
     param_grad_chain = {}
     for param, grad in param_and_grad_nodes:
-        last_p = list(param.users)[0]
+        param_users = list(param.users)
+        if not param_users:
+            # if unused parameter, don't bother with it
+            continue
+        last_p = param_users[0]
         p_chain = [param]
         # get all linear chain of users of the parameter
         while len(last_p.all_input_nodes) == 1:

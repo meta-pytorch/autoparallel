@@ -117,6 +117,53 @@ def test_init(device_mesh_1d):
     )
 
 
+def test_non_tensor_input(device_mesh_1d):
+    dim = 128
+
+    class Model(nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            self.dim = dim
+            self.linear = nn.Linear(dim, dim)
+            self.unused = nn.Parameter(torch.rand(1))
+
+        def forward(self, x, input_dim: int, has_compute: bool):
+            if has_compute:
+                return self.linear(x) + input_dim, x.shape
+            else:
+                return x
+
+        def init_weights(self):
+            dim = self.dim
+            self.linear.weight = torch.nn.Parameter(torch.ones(dim, dim) * 9.0)
+            with torch.no_grad():
+                self.linear.bias.fill_(98.6)
+
+    def input_fn(divisor=1):
+        b = 512 // divisor
+        inputs = torch.rand(b, dim, device="cuda")
+        input_dim = 1
+        has_compute = True
+        return (inputs, input_dim, has_compute)
+
+    with torch.device("meta"):
+        model = Model(dim)
+    with AutoParallel(model, input_fn, device_mesh_1d, compile=True) as autop:
+        x_sharding = (Shard(0),)
+        autop.add_input_constraints([x_sharding, None])
+        sharding_placement = autop.optimize_placement()
+
+        parallel_mod = autop.apply_placement(sharding_placement)
+    parallel_mod.to_empty(device="cuda")
+    parallel_mod.init_weights()
+    placeholders = autop.gm.graph.find_nodes(op="placeholder")
+    # 2 used parameters, 1 unused parameter, 1 input and 1 tangent
+    assert len(placeholders) == 5
+    inputs = input_fn(device_mesh_1d.shape[0])
+    out, shape = parallel_mod(*inputs)
+    assert input_fn()[0].shape == shape
+
+
 def test_fx_graph_annotate(device_mesh_1d):
     dim = 128
 
