@@ -3,17 +3,282 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+from contextlib import ExitStack
 from unittest.mock import patch
 
 import pytest
 import torch
 from torch import nn
+from torch._functorch._aot_autograd.fx_utils import get_param_and_grad_nodes
+from torch._functorch.aot_autograd import aot_export_joint_with_descriptors
 from torch.testing._internal.distributed.fake_pg import FakeStore
 
 from autoparallel.api import AutoParallel
 from autoparallel.shardings.ordered_sharding import (
+    build_param_grad_linear_chains,
     compute_optimal_placement_order_for_parameters,
 )
+
+
+class SimpleLinearModel(nn.Module):
+    """A simple model with a single trainable linear layer."""
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.linear = nn.Linear(dim, dim, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.linear(x)
+
+
+class MixedTrainableModel(nn.Module):
+    """A model with both trainable and non-trainable linear layers."""
+
+    def __init__(self, dim: int):
+        super().__init__()
+        # Trainable linear layer
+        self.trainable_linear = nn.Linear(dim, dim, bias=False)
+        # Non-trainable linear layer
+        self.frozen_linear = nn.Linear(dim, dim, bias=False)
+        self.frozen_linear.weight.requires_grad = False
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.trainable_linear(x)
+        x = self.frozen_linear(x)
+        return x
+
+
+class TwoLayerModel(nn.Module):
+    """A model with two trainable linear layers."""
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.linear1 = nn.Linear(dim, dim, bias=False)
+        self.linear2 = nn.Linear(dim, dim, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.linear1(x)
+        x = self.linear2(x)
+        return x
+
+
+def _get_joint_graph(model: nn.Module, sample_input: torch.Tensor):
+    """Helper to get a joint forward+backward graph using aot_export_joint_with_descriptors."""
+    with ExitStack() as stack:
+        joint_with_descriptors = aot_export_joint_with_descriptors(
+            stack,
+            model,
+            (sample_input,),
+        )
+        # Return the graph module - we need to use it before exiting the stack
+        # So we extract what we need here
+        gm = joint_with_descriptors.graph_module
+        param_grad_nodes = list(get_param_and_grad_nodes(gm.graph).values())
+        return gm, param_grad_nodes
+
+
+class TestBuildParamGradLinearChains:
+    """Tests for build_param_grad_linear_chains function."""
+
+    def test_single_trainable_linear(self):
+        """Test with a single trainable linear layer.
+
+        The parameter chain should include the parameter node and its users
+        up to the first node with multiple inputs (the matmul).
+        """
+        dim = 64
+        model = SimpleLinearModel(dim)
+        sample_input = torch.randn(8, dim, requires_grad=True)
+
+        gm, param_grad_nodes = _get_joint_graph(model, sample_input)
+
+        # Should have exactly one param-grad pair
+        assert len(param_grad_nodes) == 1
+        param_node, grad_node = param_grad_nodes[0]
+
+        # The parameter should have a gradient (it's trainable)
+        assert grad_node is not None
+
+        # Build the chains
+        node_to_source, source_to_chain = build_param_grad_linear_chains(
+            param_grad_nodes
+        )
+
+        # Verify param chain exists and starts with the param node
+        assert param_node in source_to_chain
+        param_chain = source_to_chain[param_node]
+
+        # For a Linear layer (y = x @ W.T), the param chain should be:
+        # [param_placeholder, transpose]
+        # The chain stops before mm/matmul because that has 2 inputs
+        assert len(param_chain) == 2
+        assert param_chain[0] == param_node
+        assert param_chain[0].op == "placeholder"
+        assert param_chain[1].target == torch.ops.aten.t.default
+
+        # Verify node_to_source mappings for param chain
+        assert node_to_source[param_chain[0]] == param_node
+        assert node_to_source[param_chain[1]] == param_node
+
+        # Verify grad chain exists and check its structure
+        assert grad_node in source_to_chain
+        grad_chain = source_to_chain[grad_node]
+
+        # The grad chain traces backward from the gradient output
+        # For a simple linear, the grad w.r.t. weight is: x.T @ grad_output
+        # The chain should be [grad_node] since grad_node typically has multiple inputs
+        # or is directly connected to multi-input nodes
+        assert len(grad_chain) >= 0  # May be empty if grad_node has multiple inputs
+        for node in grad_chain:
+            assert node_to_source[node] == grad_node
+
+    def test_non_trainable_parameter_has_no_grad_chain(self):
+        """Test that non-trainable parameters have grad=None and no grad chain."""
+        dim = 64
+        model = MixedTrainableModel(dim)
+        sample_input = torch.randn(8, dim, requires_grad=True)
+
+        gm, param_grad_nodes = _get_joint_graph(model, sample_input)
+
+        # Should have two param-grad pairs (one trainable, one frozen)
+        assert len(param_grad_nodes) == 2
+
+        # Build the chains
+        node_to_source, source_to_chain = build_param_grad_linear_chains(
+            param_grad_nodes
+        )
+
+        # Find the trainable and frozen parameters
+        trainable_pair = None
+        frozen_pair = None
+        for param_node, grad_node in param_grad_nodes:
+            if grad_node is None:
+                frozen_pair = (param_node, grad_node)
+            else:
+                trainable_pair = (param_node, grad_node)
+
+        # Verify we found both
+        assert frozen_pair is not None, "Expected to find a frozen parameter"
+        assert trainable_pair is not None, "Expected to find a trainable parameter"
+
+        frozen_param, frozen_grad = frozen_pair
+        trainable_param, trainable_grad = trainable_pair
+
+        # Frozen parameter should have a param chain but no grad chain
+        assert frozen_param in source_to_chain
+        frozen_param_chain = source_to_chain[frozen_param]
+
+        # Frozen param chain structure: [param_placeholder, transpose]
+        assert len(frozen_param_chain) == 2
+        assert frozen_param_chain[0] == frozen_param
+        assert frozen_param_chain[0].op == "placeholder"
+        assert frozen_param_chain[1].target == torch.ops.aten.t.default
+
+        # Verify node_to_source for frozen param chain
+        assert node_to_source[frozen_param_chain[0]] == frozen_param
+        assert node_to_source[frozen_param_chain[1]] == frozen_param
+
+        # Frozen grad is None, so no grad chain
+        assert frozen_grad is None
+        assert frozen_grad not in source_to_chain
+
+        # Trainable parameter should have both param and grad chains
+        assert trainable_param in source_to_chain
+        trainable_param_chain = source_to_chain[trainable_param]
+
+        # Trainable param chain structure: [param_placeholder, transpose]
+        assert len(trainable_param_chain) == 2
+        assert trainable_param_chain[0] == trainable_param
+        assert trainable_param_chain[0].op == "placeholder"
+        assert trainable_param_chain[1].target == torch.ops.aten.t.default
+
+        # Verify node_to_source for trainable param chain
+        assert node_to_source[trainable_param_chain[0]] == trainable_param
+        assert node_to_source[trainable_param_chain[1]] == trainable_param
+
+        # Trainable grad should have a chain
+        assert trainable_grad in source_to_chain
+
+    def test_two_layer_model_has_separate_chains(self):
+        """Test that a two-layer model has separate chains for each parameter."""
+        dim = 64
+        model = TwoLayerModel(dim)
+        sample_input = torch.randn(8, dim, requires_grad=True)
+
+        gm, param_grad_nodes = _get_joint_graph(model, sample_input)
+
+        # Should have two param-grad pairs
+        assert len(param_grad_nodes) == 2
+
+        # Build the chains
+        node_to_source, source_to_chain = build_param_grad_linear_chains(
+            param_grad_nodes
+        )
+
+        # Each parameter should have its own chain with the same structure
+        for param_node, grad_node in param_grad_nodes:
+            assert param_node in source_to_chain
+            param_chain = source_to_chain[param_node]
+
+            # Each Linear param chain: [param_placeholder, transpose]
+            assert len(param_chain) == 2
+            assert param_chain[0] == param_node
+            assert param_chain[0].op == "placeholder"
+            assert param_chain[1].target == torch.ops.aten.t.default
+
+            # All nodes in param chain should map back to this param
+            assert node_to_source[param_chain[0]] == param_node
+            assert node_to_source[param_chain[1]] == param_node
+
+            # Gradient should also have a chain
+            assert grad_node is not None
+            assert grad_node in source_to_chain
+            grad_chain = source_to_chain[grad_node]
+
+            # All nodes in grad chain should map back to this grad
+            for node in grad_chain:
+                assert node_to_source[node] == grad_node
+
+        # Verify the two param chains are disjoint (no shared nodes)
+        param1, _ = param_grad_nodes[0]
+        param2, _ = param_grad_nodes[1]
+        chain1_nodes = set(source_to_chain[param1])
+        chain2_nodes = set(source_to_chain[param2])
+        assert chain1_nodes.isdisjoint(chain2_nodes), "Param chains should be disjoint"
+
+    def test_chains_contain_only_single_input_nodes(self):
+        """Test that chains only include nodes with single inputs (linear dependency)."""
+        dim = 64
+        model = SimpleLinearModel(dim)
+        sample_input = torch.randn(8, dim, requires_grad=True)
+
+        gm, param_grad_nodes = _get_joint_graph(model, sample_input)
+
+        node_to_source, source_to_chain = build_param_grad_linear_chains(
+            param_grad_nodes
+        )
+
+        param_node, grad_node = param_grad_nodes[0]
+        param_chain = source_to_chain[param_node]
+
+        # Verify chain structure
+        assert len(param_chain) == 2
+        assert param_chain[0].op == "placeholder"  # param has 0 inputs
+        assert (
+            param_chain[1].target == torch.ops.aten.t.default
+        )  # transpose has 1 input
+
+        # All nodes in the chain (except the first/param itself) should have single input
+        for i, node in enumerate(param_chain):
+            if i == 0:
+                # First node is the param placeholder, has 0 inputs
+                assert len(node.all_input_nodes) == 0
+                continue
+            # Nodes in the chain should have exactly 1 input
+            assert len(node.all_input_nodes) == 1, (
+                f"Node {node.name} in chain has {len(node.all_input_nodes)} inputs, "
+                f"expected 1"
+            )
 
 
 @pytest.fixture(scope="module", autouse=True)
