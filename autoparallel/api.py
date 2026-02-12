@@ -15,7 +15,6 @@ from torch._dynamo.functional_export import _dynamo_graph_capture_for_export
 from torch._functorch.aot_autograd import (
     aot_compile_joint_with_descriptors,
     aot_export_joint_with_descriptors,
-    boxed_nop_preserve_node_meta,
 )
 from torch._inductor.compile_fx import compile_fx_inner
 from torch._inductor.decomposition import select_decomp_table
@@ -46,6 +45,32 @@ from .shardings.placement_options import (
 )
 
 _APPLY_VIEW_MM_VIEW_PATTERN = False
+
+
+def build_compile_fn(fake_mode):
+    from torch._inductor.fx_passes.overlap_scheduling import (
+        schedule_overlap_bucketing_from_inductor_configs,
+    )
+
+    def boxed_nop_preserve_node_meta(fx_g, example_inputs):
+        # when not running with inductor, disable additional flags which are
+        # inductor-specific
+        with torch._inductor.config.patch(
+            {
+                "aten_distributed_optimizations.insert_overlap_deps": (False),
+                "aten_distributed_optimizations.enable_fusion_regions": (False),
+            }
+        ):
+            schedule_overlap_bucketing_from_inductor_configs(fx_g)
+
+        def run(args):
+            with torch.fx.traceback.preserve_node_meta():
+                return torch.fx.Interpreter(fx_g).boxed_run(args)
+
+        run._boxed_call = True
+        return run
+
+    return boxed_nop_preserve_node_meta
 
 
 def _assign_attr(
@@ -269,7 +294,7 @@ class AutoParallel:
                 debug_boxed_nop_preserve_node_meta, numerics_logger=numerics_logger
             )
         else:
-            self.compiler_fn = boxed_nop_preserve_node_meta  # type: ignore[assignment]
+            self.compiler_fn = build_compile_fn(self.fake_mode)  # type: ignore[assignment]
         self.enable_ac = enable_ac
         self.ac_stage_size_in_GiB = ac_stage_size_in_GiB
         self.reshard_after_forward = reshard_after_forward
