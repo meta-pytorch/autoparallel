@@ -11,12 +11,16 @@ import torch
 from torch import nn
 from torch._functorch._aot_autograd.fx_utils import get_param_and_grad_nodes
 from torch._functorch.aot_autograd import aot_export_joint_with_descriptors
+from torch.distributed._tensor.placement_types import DTensorSpec
+from torch.distributed.tensor._op_schema import OpSpec
+from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
 from torch.testing._internal.distributed.fake_pg import FakeStore
 
 from autoparallel.api import AutoParallel
 from autoparallel.shardings.ordered_sharding import (
     build_param_grad_linear_chains,
     compute_optimal_placement_order_for_parameters,
+    get_redistributed_input_placements,
 )
 
 
@@ -455,22 +459,6 @@ def test_compute_optimal_placement_order_with_all_non_trainable_params(device_me
         assert len(placement_order) == 0
 
 
-class SimpleMLP(nn.Module):
-    """A simple MLP model for testing ordered sharding redistribution patterns."""
-
-    def __init__(self, dim):
-        super().__init__()
-        self.linear = nn.Linear(dim, dim, bias=False)
-
-    def forward(self, x):
-        return self.linear(x)
-
-
-# TODO: add test for get_redistributed_input_placements
-
-
-@patch("torch.cuda.device_count", lambda: 8)
-@patch("torch.cuda.get_device_name", lambda device: "H100")
 def test_compute_optimal_placement_order_ss_to_rs(device_mesh_2d):
     """Test the S(0)S(0) -> RS(0) and PS(0) -> S(0)S(0) optimization case.
 
@@ -483,167 +471,143 @@ def test_compute_optimal_placement_order_ss_to_rs(device_mesh_2d):
     - PS(0): Partial on first mesh dim, Shard(0) on second
     - S(0)S(0): Shard(0) on both mesh dimensions
     """
-    from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
+    dim = 64
+    model = SimpleLinearModel(dim)
+    sample_input = torch.randn(8, dim, requires_grad=True)
 
-    from autoparallel.shardings.ordered_sharding import (
-        get_redistributed_input_placements,
+    gm, param_grad_nodes = _get_joint_graph(model, sample_input)
+
+    # Should have exactly one param-grad pair
+    assert len(param_grad_nodes) == 1
+    param, grad = param_grad_nodes[0]
+    assert grad is not None
+
+    # Build the chains to identify the nodes we need to populate
+    node_to_source, source_to_chain = build_param_grad_linear_chains(param_grad_nodes)
+
+    param_chain = source_to_chain[param]
+    grad_chain = source_to_chain[grad]
+
+    # param_chain = [param_placeholder, t_node]
+    assert len(param_chain) == 2
+    t_node = param_chain[1]
+    assert t_node.target == torch.ops.aten.t.default
+
+    # grad_chain traces backward from grad through single-input nodes
+    assert len(grad_chain) >= 1
+
+    # The boundary node is the input of the last node in the grad chain
+    # (the node where the chain stopped because it has multiple inputs)
+    grad_boundary_node = grad_chain[-1].all_input_nodes[0]
+
+    # Manually construct sharding_placement dict with the S(0)S(0)->RS(0) pattern
+    ss_spec = DTensorSpec(device_mesh_2d, (Shard(0), Shard(0)))
+    rs_spec = DTensorSpec(device_mesh_2d, (Replicate(), Shard(0)))
+    ps_spec = DTensorSpec(device_mesh_2d, (Partial(), Shard(0)))
+
+    sharding_placement = {
+        # param output is S(0)S(0)
+        param: OpSpec(output_specs=ss_spec),
+        # t_node expects input as R,S(0) — triggers S(0)S(0)->RS(0) redistribution
+        t_node: OpSpec(output_specs=rs_spec, input_specs=[rs_spec]),
+        # Boundary node (e.g. mm backward) output is P,S(0)
+        grad_boundary_node: OpSpec(output_specs=ps_spec),
+    }
+
+    # Add entries for all grad chain nodes — each has SS output and expects SS input.
+    # The redistribution PS(0)->S(0)S(0) is detected at the last chain node
+    # (where its input boundary_node has PS output but the chain node expects SS).
+    for node in grad_chain:
+        sharding_placement[node] = OpSpec(output_specs=ss_spec, input_specs=[ss_spec])
+
+    # Call the function
+    placement_order = compute_optimal_placement_order_for_parameters(
+        gm, sharding_placement
     )
 
-    dim = 512
-    device = "cuda"
+    # Verify that param and grad nodes are in placement_order
+    assert param in placement_order
+    assert grad in placement_order
 
-    def model_fn():
-        return SimpleMLP(dim)
+    # Verify OrderInfo values for param chain nodes
+    # param: first in chain, before target → is_target_reversed_order=True, need_reorder=False
+    assert placement_order[param].is_target_reversed_order is True
+    assert placement_order[param].need_reorder is False
 
-    def input_fn():
-        return torch.randn(512, dim, device=device, requires_grad=True)
+    # t_node: target of param chain → is_target_reversed_order=False, need_reorder=True
+    assert placement_order[t_node].is_target_reversed_order is False
+    assert placement_order[t_node].need_reorder is True
 
-    with torch.device("meta"):
-        model = model_fn()
+    # Verify OrderInfo values for grad chain nodes
+    # The last node in the grad chain is where redistribution happens (need_reorder=True)
+    grad_redistrib_target = grad_chain[-1]
+    assert placement_order[grad_redistrib_target].is_target_reversed_order is True
+    assert placement_order[grad_redistrib_target].need_reorder is True
 
-    with AutoParallel(model, input_fn, device_mesh_2d) as autop:
-        # Set input sharding: S(0) on dp dim, R on tp dim (batch-parallel on dp)
-        x_sharding = (Shard(0), Replicate())
-        autop.add_input_constraints([x_sharding])
-        autop.add_output_constraints([x_sharding])
-        # Force parameter sharding by constraining memory
-        autop.add_parameter_memory_constraint(low=0, high=None)
-        mm_nodes = autop.gm.graph.find_nodes(
-            op="call_function", target=torch.ops.aten.mm.default
-        )
-        autop.sharding_optimizer.add_node_constraint(mm_nodes[0], (Shard(0), Shard(1)))
-        sharding_placement = autop.optimize_placement(verbose=True)
+    # All earlier nodes in grad chain should have need_reorder=False
+    for node in grad_chain[:-1]:
+        assert placement_order[node].is_target_reversed_order is True
+        assert placement_order[node].need_reorder is False
 
-        # Call the function to compute optimal placement order
-        placement_order = compute_optimal_placement_order_for_parameters(
-            autop.gm, sharding_placement
-        )
-
-        # Check the results - we should have placement order for param nodes
-        assert isinstance(placement_order, dict)
-
-        # Check that nodes have the expected shard_order metadata set
-        from torch._functorch._aot_autograd.fx_utils import get_param_and_grad_nodes
-
-        param_and_grad_nodes = list(get_param_and_grad_nodes(autop.gm.graph).values())
-
-        # Check that we have parameter-gradient pairs
-        assert len(param_and_grad_nodes) == 1
-
-        param, grad = param_and_grad_nodes[0]
-        assert param in placement_order
-        assert grad in placement_order
-
-        assert sharding_placement[param].output_spec.placements == (Shard(0), Shard(0))
-        assert sharding_placement[grad].output_spec.placements == (Shard(0), Shard(0))
-
-        # assert sharding_placement[list(param.users)[0].users]
-        # assert sharding_placement[
-        #     grad.input_nodes[0].input_nodes[0]
-        # ].output_specs.placements == (Shard(1), Shard(1))
-
-        # assert False, f"{sharding_placement}"
-        # Verify the structure of the result
-        for node, order_info in placement_order.items():
-            # Each entry should have is_target_reversed_order and need_reorder fields
-            assert hasattr(order_info, "is_target_reversed_order")
-            assert hasattr(order_info, "need_reorder")
-            # The node should have shard_order metadata set
-            assert "shard_order" in node.meta
-
-        # Verify that we can inspect the redistribution patterns
-        has_ss_to_rs_pattern = False
-        has_ps_to_ss_pattern = False
-
-        for node in autop.gm.graph.nodes:
-            if node in sharding_placement:
-                redistrib = get_redistributed_input_placements(node, sharding_placement)
-                for input_node, (curr_plc, tgt_plc) in redistrib.items():
-                    # Check for S(0)S(0) -> RS(0) pattern
-                    if curr_plc == (Shard(0), Shard(0)) and tgt_plc == (
-                        Replicate(),
-                        Shard(0),
-                    ):
-                        has_ss_to_rs_pattern = True
-                    # Check for PS(0) -> S(0)S(0) pattern
-                    if curr_plc == (Partial(), Shard(0)) and tgt_plc == (
-                        Shard(0),
-                        Shard(0),
-                    ):
-                        has_ps_to_ss_pattern = True
-
-        # Log what patterns we found (useful for debugging if test fails)
-        if not has_ss_to_rs_pattern:
-            # If we didn't find the pattern, at least verify the function ran correctly
-            print("Note: S(0)S(0) -> RS(0) pattern not found in this model/mesh config")
-        if not has_ps_to_ss_pattern:
-            print("Note: PS(0) -> S(0)S(0) pattern not found in this model/mesh config")
+    # All nodes in placement_order should have shard_order metadata
+    for node in placement_order:
+        assert "shard_order" in node.meta
 
 
-@patch("torch.cuda.device_count", lambda: 8)
-@patch("torch.cuda.get_device_name", lambda device: "H100")
 def test_compute_optimal_placement_order_verifies_redistribution_map(device_mesh_2d):
-    """Test that the redistribution map is correctly populated for parameter nodes.
+    """Test that get_redistributed_input_placements correctly identifies redistribution.
 
-    This test verifies that get_redistributed_input_placements correctly identifies
-    nodes that require redistribution and returns their current and target placements.
+    This test verifies that when a node's input has different placements than what
+    the node expects, get_redistributed_input_placements returns the correct
+    current and target placements.
     """
-    from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
+    dim = 64
+    model = SimpleLinearModel(dim)
+    sample_input = torch.randn(8, dim, requires_grad=True)
 
-    from autoparallel.shardings.ordered_sharding import (
-        get_redistributed_input_placements,
-    )
+    gm, param_grad_nodes = _get_joint_graph(model, sample_input)
 
-    dim = 256
-    device = "cuda"
+    # Build chains to find the t node (transpose of param)
+    node_to_source, source_to_chain = build_param_grad_linear_chains(param_grad_nodes)
 
-    def model_fn():
-        return SimpleMLP(dim)
+    param, grad = param_grad_nodes[0]
+    param_chain = source_to_chain[param]
+    t_node = param_chain[1]
+    assert t_node.target == torch.ops.aten.t.default
 
-    def input_fn():
-        return torch.randn(512, dim, device=device, requires_grad=True)
+    # Construct sharding_placement where param output has S(0)S(0)
+    # but t_node expects RS(0) as input — a redistribution mismatch
+    ss_spec = DTensorSpec(device_mesh_2d, (Shard(0), Shard(0)))
+    rs_spec = DTensorSpec(device_mesh_2d, (Replicate(), Shard(0)))
 
-    with torch.device("meta"):
-        model = model_fn()
+    sharding_placement = {
+        param: OpSpec(output_specs=ss_spec),
+        t_node: OpSpec(output_specs=rs_spec, input_specs=[rs_spec]),
+    }
 
-    with AutoParallel(model, input_fn, device_mesh_2d) as autop:
-        # Set input/output sharding constraints
-        x_sharding = (Shard(0), Replicate())
-        autop.add_input_constraints([x_sharding])
-        autop.add_output_constraints([x_sharding])
-        autop.add_parameter_memory_constraint(low=0, high=None)
-        sharding_placement = autop.optimize_placement(verbose=False)
+    # Call get_redistributed_input_placements directly
+    redistrib = get_redistributed_input_placements(t_node, sharding_placement)
 
-        # Collect all redistribution patterns
-        redistribution_patterns = []
-        for node in autop.gm.graph.nodes:
-            if node in sharding_placement:
-                redistrib = get_redistributed_input_placements(node, sharding_placement)
-                for input_node, (curr_plc, tgt_plc) in redistrib.items():
-                    redistribution_patterns.append(
-                        {
-                            "node_name": node.name,
-                            "input_node_name": input_node.name,
-                            "current_placement": curr_plc,
-                            "target_placement": tgt_plc,
-                        }
-                    )
+    # Should find redistribution needed for the param input
+    assert param in redistrib, "Expected param node in redistribution map"
 
-        # Verify we found some redistribution patterns (model should require some)
-        assert (
-            len(redistribution_patterns) > 0
-        ), "Expected to find redistribution patterns for sharded parameters"
+    curr_plc, tgt_plc = redistrib[param]
 
-        # Verify placement tuples have correct structure (2D mesh = 2 placements)
-        for pattern in redistribution_patterns:
-            assert len(pattern["current_placement"]) == 2
-            assert len(pattern["target_placement"]) == 2
+    # Verify current placement is S(0)S(0) (from param's output)
+    assert curr_plc == (Shard(0), Shard(0))
 
-            # Each placement should be a valid Placement type
-            for plc in pattern["current_placement"]:
-                assert isinstance(plc, (Shard, Replicate, Partial))
-            for plc in pattern["target_placement"]:
-                assert isinstance(plc, (Shard, Replicate))  # target won't be Partial
+    # Verify target placement is RS(0) (what t_node expects)
+    assert tgt_plc == (Replicate(), Shard(0))
+
+    # Verify placement tuples have length 2 (matching 2D mesh)
+    assert len(curr_plc) == 2
+    assert len(tgt_plc) == 2
+
+    # Each placement should be a valid Placement type
+    for plc in curr_plc:
+        assert isinstance(plc, (Shard, Replicate, Partial))
+    for plc in tgt_plc:
+        assert isinstance(plc, (Shard, Replicate))
 
 
 class MultiLinearModel(nn.Module):
