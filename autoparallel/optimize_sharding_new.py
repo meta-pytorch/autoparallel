@@ -1,0 +1,865 @@
+# Copyright (c) Facebook, Inc. and its affiliates. All rights reserved.
+#
+# This source code is licensed under the BSD license found in the
+# LICENSE file in the root directory of this source tree.
+
+"""
+Factor-based sharding optimization using Integer Linear Programming (ILP).
+
+This module reformulates the sharding optimization problem using "factors" —
+logical dimensions of computation inspired by Shardy's factor-based propagation
+(see shardy/dialect/sdy/ir/attrs.td OpShardingRuleAttr).
+
+Key idea
+--------
+Instead of enumerating all placement combinations per op — which is O((d+1)^k)
+per tensor where d = tensor dims and k = mesh dims — each op is decomposed into
+factors, and the ILP decides which mesh dimension (if any) shards each factor.
+
+    Original ILP variables per op:  O(A × (d+1)^(2k))
+    Factor ILP variables per op:    O(F × k)
+
+    where A = args, F = factors, d = tensor dims, k = mesh dims
+
+For a matmul on a 4D mesh: ~13,000 → ~12 variables per op.
+
+Factor extraction
+-----------------
+Factors are extracted *generically* from existing DTensor OpStrategy objects by
+inspecting placement patterns on a single mesh dimension.  Because most
+OpStrategies are Cartesian products of per-mesh-dim "atoms" (via
+``expand_to_full_mesh_op_strategy``), each unique non-trivial atom corresponds
+to exactly one factor.  This means we reuse all existing DTensor op rules
+without writing per-op factor definitions.
+
+Example: ``mm(A[M,K], B[K,N]) -> C[M,N]``
+
+    1D atoms (from mesh dim 0):
+        (C=R,    A=R,    B=R   )  → all-replicate, skip
+        (C=S(0), A=S(0), B=R   )  → Factor "M": {A.dim0, C.dim0}
+        (C=S(1), A=R,    B=S(1))  → Factor "N": {B.dim1, C.dim1}
+        (C=P,    A=S(1), B=S(0))  → Factor "K": {A.dim1, B.dim0}, reduction
+
+    ≡ Shardy's  ([i,k],[k,j])->([i,j])  {i=M, j=N, k=K}  reduction={k}
+"""
+
+from __future__ import annotations
+
+import math
+from collections import defaultdict
+from dataclasses import dataclass, field
+from typing import Any, Optional
+
+import pulp
+import torch
+import torch.fx
+from torch._functorch._aot_autograd.descriptors import PlainAOTInput, PlainAOTOutput
+from torch._functorch._aot_autograd.fx_utils import (
+    get_plain_input_and_grad_nodes,
+    get_plain_output_and_tangent_nodes,
+)
+from torch.distributed._tensor.placement_types import TensorMeta
+from torch.distributed.tensor._dtensor_spec import DTensorSpec
+from torch.distributed.tensor._op_schema import OpSpec, OpStrategy
+from torch.distributed.tensor.placement_types import Placement, Replicate, Shard
+from torch.utils._pytree import tree_map_only
+
+from .cost_models.compute_estimation import estimate_strategy_runtime_cost
+from .shardings.placement_options import get_placement_options
+from .shardings.propagation_rules import _create_all_options
+
+# ---------------------------------------------------------------------------
+# Data structures
+# ---------------------------------------------------------------------------
+
+
+def _is_partial(p: Placement) -> bool:
+    """Check if a placement is Partial (reduction output)."""
+    return not isinstance(p, (Shard, Replicate))
+
+
+@dataclass
+class Factor:
+    """A computation factor — a logical dimension of the computation.
+
+    Analogous to Shardy's factor concept (from ``OpShardingRuleAttr``).
+    For ``C[M,N] = A[M,K] @ B[K,N]``, the factors are M, N, K.
+
+    Attributes
+    ----------
+    id : int
+        Unique id within the parent ``FactorRule``.
+    size : int
+        Size along this factor (e.g. M=1024).
+    is_reduction : bool
+        True if this factor is a contraction/reduction dimension (the output
+        is ``Partial`` when it is sharded).
+    operand_dims : list[int | None]
+        For each operand, the tensor dim mapped to this factor (None = not mapped).
+    result_dims : list[int | None]
+        For each result, the tensor dim mapped to this factor (None = not mapped).
+    """
+
+    id: int
+    size: int
+    is_reduction: bool = False
+    operand_dims: list = field(default_factory=list)
+    result_dims: list = field(default_factory=list)
+
+
+@dataclass
+class FactorRule:
+    """Factor decomposition for one operation.
+
+    Analogous to Shardy's ``OpShardingRuleAttr``.
+
+    Example — ``mm(A[M,K], B[K,N]) -> C[M,N]``::
+
+        factors = [
+            Factor(0, M, operand_dims=[0, None], result_dims=[0]),             # M
+            Factor(1, N, operand_dims=[None, 1],  result_dims=[1]),            # N
+            Factor(2, K, operand_dims=[1, 0],     result_dims=[], is_reduction=True),  # K
+        ]
+    """
+
+    factors: list[Factor]
+    num_operands: int
+    num_results: int
+
+
+# ---------------------------------------------------------------------------
+# Union-Find
+# ---------------------------------------------------------------------------
+
+
+class UnionFind:
+    """Disjoint-set (union-find) for merging factors across dataflow edges."""
+
+    def __init__(self) -> None:
+        self.parent: dict[int, int] = {}
+        self.rank: dict[int, int] = {}
+
+    def make_set(self, x: int) -> None:
+        if x not in self.parent:
+            self.parent[x] = x
+            self.rank[x] = 0
+
+    def find(self, x: int) -> int:
+        while self.parent[x] != x:
+            self.parent[x] = self.parent[self.parent[x]]  # path halving
+            x = self.parent[x]
+        return x
+
+    def union(self, x: int, y: int) -> int:
+        rx, ry = self.find(x), self.find(y)
+        if rx == ry:
+            return rx
+        if self.rank[rx] < self.rank[ry]:
+            rx, ry = ry, rx
+        self.parent[ry] = rx
+        if self.rank[rx] == self.rank[ry]:
+            self.rank[rx] += 1
+        return rx
+
+
+# ---------------------------------------------------------------------------
+# Factor extraction from OpStrategy
+# ---------------------------------------------------------------------------
+
+
+def _infer_factor_size(
+    node: torch.fx.Node,
+    operand_dims: list[int | None],
+    result_dims: list[int | None],
+) -> int:
+    """Infer the size of a factor from the node's tensor metadata."""
+    # Try the node's own output first.
+    val = node.meta.get("val")
+    if val is not None and isinstance(val, torch.Tensor):
+        for d in result_dims:
+            if d is not None and d < len(val.shape):
+                return val.shape[d]
+    # Fall back to operand shapes.
+    for arg_idx, d in enumerate(operand_dims):
+        if d is None or arg_idx >= len(node.args):
+            continue
+        arg = node.args[arg_idx]
+        if isinstance(arg, torch.fx.Node):
+            arg_val = arg.meta.get("val")
+            if (
+                arg_val is not None
+                and isinstance(arg_val, torch.Tensor)
+                and d < len(arg_val.shape)
+            ):
+                return arg_val.shape[d]
+    return 1  # fallback
+
+
+def extract_factors_from_strategy(
+    op_strategy: OpStrategy,
+    node: torch.fx.Node,
+) -> FactorRule:
+    """Convert an ``OpStrategy`` into a ``FactorRule``.
+
+    Each *unique* per-mesh-dimension placement pattern (excluding all-replicate)
+    in the strategy set corresponds to one factor.  We inspect mesh dim 0,
+    which is valid because ``expand_to_full_mesh_op_strategy`` replicates the
+    same ``single_mesh_dim_strategies`` across all mesh dims.
+
+    Parameters
+    ----------
+    op_strategy : OpStrategy
+        Multi-dim strategy (may have been expanded via Cartesian product).
+    node : torch.fx.Node
+        The FX node, used for shape metadata.
+
+    Returns
+    -------
+    FactorRule
+    """
+    if not op_strategy.strategies:
+        return FactorRule(factors=[], num_operands=0, num_results=1)
+
+    first_spec = op_strategy.strategies[0]
+    num_operands = len(first_spec.input_specs) if first_spec.input_specs else 0
+
+    # Collect unique 1-D "atoms" by looking at mesh dim 0.
+    seen: dict[str, tuple] = {}
+    for spec in op_strategy.strategies:
+        out_specs = spec.output_specs
+        out_p = (
+            out_specs.placements[0]
+            if isinstance(out_specs, DTensorSpec)
+            else out_specs[0].placements[0]
+        )
+        in_ps = tuple(
+            s.placements[0]
+            for s in (spec.input_specs or [])
+            if isinstance(s, DTensorSpec)
+        )
+        all_ps = (out_p,) + in_ps
+        if all(isinstance(p, Replicate) for p in all_ps):
+            continue  # skip the all-replicate atom
+        key = str(all_ps)
+        if key not in seen:
+            seen[key] = (out_p, in_ps)
+
+    # Each atom → one Factor.
+    factors: list[Factor] = []
+    for factor_id, (out_p, in_ps) in enumerate(seen.values()):
+        is_reduction = _is_partial(out_p)
+        result_dims = [out_p.dim if isinstance(out_p, Shard) else None]
+        operand_dims = [p.dim if isinstance(p, Shard) else None for p in in_ps]
+        size = _infer_factor_size(node, operand_dims, result_dims)
+        factors.append(
+            Factor(
+                id=factor_id,
+                size=size,
+                is_reduction=is_reduction,
+                operand_dims=operand_dims,
+                result_dims=result_dims,
+            )
+        )
+
+    return FactorRule(factors=factors, num_operands=num_operands, num_results=1)
+
+
+def _placeholder_factor_rule(node: torch.fx.Node) -> FactorRule:
+    """Create a ``FactorRule`` for a placeholder / get_attr node.
+
+    Each tensor dimension becomes an independent spatial factor.
+    """
+    val = node.meta.get("val")
+    if val is None or not isinstance(val, torch.Tensor):
+        return FactorRule(factors=[], num_operands=0, num_results=1)
+    shape = val.shape
+    factors = [
+        Factor(id=d, size=shape[d], operand_dims=[], result_dims=[d])
+        for d in range(len(shape))
+    ]
+    return FactorRule(factors=factors, num_operands=0, num_results=1)
+
+
+# ---------------------------------------------------------------------------
+# Factor-based sharding optimizer
+# ---------------------------------------------------------------------------
+
+
+class FactorShardingOptimizer:
+    """Sharding optimizer using factor-based ILP variables.
+
+    Public API mirrors :class:`ShardingOptimizer` where possible so
+    that it can be used as a drop-in replacement (modulo output format).
+
+    Parameters
+    ----------
+    gm : torch.fx.GraphModule
+        Traced FX graph (joint forward + backward).
+    mesh : DeviceMesh
+        Target device mesh.
+    rescale_grad_comm_cost_for_mp : float
+        Scaling factor for gradient communication costs (mixed precision).
+    """
+
+    def __init__(
+        self,
+        gm: torch.fx.GraphModule,
+        mesh: Any,
+        rescale_grad_comm_cost_for_mp: float = 1.0,
+    ) -> None:
+        self.gm = gm
+        self.graph = gm.graph
+        self.nodes = list(self.graph.nodes)
+        self.mesh = mesh
+        self.node_map: dict[torch.fx.Node, int] = {
+            n: i for i, n in enumerate(self.nodes)
+        }
+
+        # -- Step 1: build multi-dim strategies (reuses existing DTensor rules)
+        # NOTE: in a production implementation you would build strategies for a
+        # *1-D* mesh only (O(d) per node instead of O((d+1)^k)), e.g. via
+        #   flat_mesh = mesh._flatten("flat")
+        # For this POC we reuse the real mesh so that all existing op rules work
+        # unchanged.  The key savings come from the ILP reformulation below.
+        self.strats = self._build_sharding_metadata()
+
+        # -- Step 2: extract factor rules from strategies.
+        self.factor_rules: dict[torch.fx.Node, FactorRule] = {}
+        self._extract_all_factor_rules()
+
+        # -- Step 3: merge factors across dataflow edges (union-find).
+        self.uf = UnionFind()
+        self.factor_keys: dict[tuple[int, int], int] = {}  # (node_idx, local) → gid
+        self._next_gid = 0
+        self._build_factor_graph()
+
+        # -- Step 4: collect per-root metadata for cost model.
+        # root → [(node, factor, local_idx)]
+        self.factor_ops: dict[
+            int, list[tuple[torch.fx.Node, Factor, int]]
+        ] = defaultdict(list)
+        self._collect_factor_metadata()
+
+        # -- Step 5: build ILP.
+        self.prob = pulp.LpProblem("AutoParallel_Factor", pulp.LpMinimize)
+        self.y_vars: dict[tuple[int, int], pulp.LpVariable] = {}
+        self._build_ilp()
+
+    # -----------------------------------------------------------------
+    # Step 1 — strategy building (mirrors ShardingOptimizer)
+    # -----------------------------------------------------------------
+
+    def _build_sharding_metadata(self) -> dict[torch.fx.Node, OpStrategy]:
+        strats: dict[torch.fx.Node, OpStrategy] = {}
+        for node in self.graph.nodes:
+            if node.op == "placeholder":
+                strats[node] = _create_all_options(
+                    self.mesh, node.meta["val"].shape, tensor=node.meta["val"]
+                )
+            elif node.op == "call_function":
+                user_strats = tree_map_only(
+                    torch.fx.Node, lambda x: strats[x], node.args
+                )
+                user_args = tree_map_only(
+                    torch.fx.Node, lambda x: x.meta["val"], node.args
+                )
+                user_kwargs = tree_map_only(
+                    torch.fx.Node, lambda x: x.meta["val"], node.kwargs
+                )
+                strats[node] = get_placement_options(
+                    self.mesh,
+                    node.target,
+                    user_strats,
+                    user_args,
+                    user_kwargs,
+                )
+            elif node.op == "get_attr":
+                strats[node] = _create_all_options(
+                    self.mesh, node.meta["val"].shape, tensor=node.meta["val"]
+                )
+        return strats
+
+    # -----------------------------------------------------------------
+    # Step 2 — factor extraction
+    # -----------------------------------------------------------------
+
+    def _extract_all_factor_rules(self) -> None:
+        for node in self.graph.nodes:
+            if node.op in ("placeholder", "get_attr"):
+                self.factor_rules[node] = _placeholder_factor_rule(node)
+            elif node.op == "call_function" and node in self.strats:
+                self.factor_rules[node] = extract_factors_from_strategy(
+                    self.strats[node], node
+                )
+            elif node.op == "output":
+                self.factor_rules[node] = FactorRule(
+                    factors=[], num_operands=0, num_results=0
+                )
+
+    # -----------------------------------------------------------------
+    # Step 3 — factor graph (union-find merging across edges)
+    # -----------------------------------------------------------------
+
+    def _alloc_gid(self) -> int:
+        gid = self._next_gid
+        self._next_gid += 1
+        return gid
+
+    def _build_factor_graph(self) -> None:
+        # Register every factor.
+        for node in self.graph.nodes:
+            rule = self.factor_rules.get(node)
+            if rule is None:
+                continue
+            nidx = self.node_map[node]
+            for li, _ in enumerate(rule.factors):
+                gid = self._alloc_gid()
+                self.factor_keys[(nidx, li)] = gid
+                self.uf.make_set(gid)
+
+        # Merge factors across producer → consumer edges.
+        for node in self.graph.nodes:
+            if node.op != "call_function":
+                continue
+            consumer_rule = self.factor_rules.get(node)
+            if consumer_rule is None:
+                continue
+            cidx = self.node_map[node]
+
+            for arg_pos, arg in enumerate(node.args):
+                if not isinstance(arg, torch.fx.Node):
+                    continue
+                producer_rule = self.factor_rules.get(arg)
+                if producer_rule is None:
+                    continue
+                pidx = self.node_map[arg]
+
+                # Match: consumer operand dim == producer result dim on the
+                # same positional dimension → same logical factor.
+                for c_li, c_fac in enumerate(consumer_rule.factors):
+                    if arg_pos >= len(c_fac.operand_dims):
+                        continue
+                    c_dim = c_fac.operand_dims[arg_pos]
+                    if c_dim is None:
+                        continue
+                    for p_li, p_fac in enumerate(producer_rule.factors):
+                        if not p_fac.result_dims:
+                            continue
+                        p_dim = p_fac.result_dims[0]
+                        if p_dim is not None and p_dim == c_dim:
+                            pk = self.factor_keys.get((pidx, p_li))
+                            ck = self.factor_keys.get((cidx, c_li))
+                            if pk is not None and ck is not None:
+                                self.uf.union(pk, ck)
+
+    # -----------------------------------------------------------------
+    # Step 4 — metadata collection
+    # -----------------------------------------------------------------
+
+    def _collect_factor_metadata(self) -> None:
+        for node in self.graph.nodes:
+            rule = self.factor_rules.get(node)
+            if rule is None:
+                continue
+            nidx = self.node_map[node]
+            for li, fac in enumerate(rule.factors):
+                gid = self.factor_keys.get((nidx, li))
+                if gid is None:
+                    continue
+                root = self.uf.find(gid)
+                self.factor_ops[root].append((node, fac, li))
+
+    def _unique_roots(self) -> set[int]:
+        return {self.uf.find(gid) for gid in self.factor_keys.values()}
+
+    # -----------------------------------------------------------------
+    # Step 5 — ILP construction
+    # -----------------------------------------------------------------
+
+    def _build_ilp(self) -> None:
+        roots = self._unique_roots()
+
+        # --- Variables: y[root, mesh_dim] ∈ {0, 1} ---
+        for r in roots:
+            for m in range(self.mesh.ndim):
+                self.y_vars[(r, m)] = pulp.LpVariable(f"y_{r}_m{m}", cat="Binary")
+
+        # --- Constraints ---
+        self._add_factor_uniqueness(roots)
+        self._add_tensor_exclusion()
+
+        # --- Objective ---
+        self._add_objective(roots)
+
+    # ---- constraints ------------------------------------------------
+
+    def _add_factor_uniqueness(self, roots: set[int]) -> None:
+        """Each factor is assigned to *at most one* mesh dimension."""
+        for r in roots:
+            self.prob += (
+                pulp.lpSum(self.y_vars[(r, m)] for m in range(self.mesh.ndim)) <= 1,
+                f"fac_uniq_{r}",
+            )
+
+    def _add_tensor_exclusion(self) -> None:
+        """Per tensor per mesh dim, at most one factor can be sharded.
+
+        This encodes the DTensor invariant: a tensor dimension can only appear
+        as ``Shard(d)`` for a single ``d`` on each mesh dimension.
+
+        Important: multiple factors at the same node may share a root (after
+        union-find merging, e.g. nheads and head_dim from unflatten both map to
+        the hidden input dimension).  We must deduplicate by root to avoid
+        counting the same ILP variable twice, which would turn ``sum <= 1``
+        into ``2*y <= 1`` and incorrectly force that variable to 0.
+        """
+        cid = 0
+        for node in self.graph.nodes:
+            rule = self.factor_rules.get(node)
+            if rule is None or not rule.factors:
+                continue
+            nidx = self.node_map[node]
+
+            # — result tensor —
+            for m in range(self.mesh.ndim):
+                vs = []
+                seen_roots: set[int] = set()
+                for li, fac in enumerate(rule.factors):
+                    if fac.result_dims and fac.result_dims[0] is not None:
+                        gid = self.factor_keys.get((nidx, li))
+                        if gid is not None:
+                            root = self.uf.find(gid)
+                            if root not in seen_roots:
+                                seen_roots.add(root)
+                                vs.append(self.y_vars[(root, m)])
+                if len(vs) > 1:
+                    self.prob += pulp.lpSum(vs) <= 1, f"tex_r_{cid}"
+                    cid += 1
+
+            # — operand tensors —
+            for oi in range(rule.num_operands):
+                for m in range(self.mesh.ndim):
+                    vs = []
+                    seen_roots: set[int] = set()
+                    for li, fac in enumerate(rule.factors):
+                        if (
+                            oi < len(fac.operand_dims)
+                            and fac.operand_dims[oi] is not None
+                        ):
+                            gid = self.factor_keys.get((nidx, li))
+                            if gid is not None:
+                                root = self.uf.find(gid)
+                                if root not in seen_roots:
+                                    seen_roots.add(root)
+                                    vs.append(self.y_vars[(root, m)])
+                    if len(vs) > 1:
+                        self.prob += pulp.lpSum(vs) <= 1, f"tex_o_{cid}"
+                        cid += 1
+
+    # ---- objective --------------------------------------------------
+
+    def _add_objective(self, roots: set[int]) -> None:
+        """Build the cost function.
+
+        For each factor *f* assigned to mesh dim *m*:
+
+        * **Reduction factor** → ``+allreduce_cost(output_bytes, mesh.shape[m])``
+        * **Spatial factor**   → ``-compute_savings(op, mesh.shape[m])``
+
+        This is a *first-order* (linear) approximation.  The true compute cost
+        depends on the product of all shard sizes, which would make the
+        objective quadratic.  The linear model captures the dominant effects:
+        allreduce penalties and per-factor parallelism benefits.
+        """
+        terms: list[Any] = []
+
+        for r in roots:
+            refs = self.factor_ops.get(r, [])
+            for m in range(self.mesh.ndim):
+                mesh_size = self.mesh.shape[m]
+                var = self.y_vars[(r, m)]
+                cost = 0.0
+
+                for node, fac, _ in refs:
+                    if node.op != "call_function":
+                        continue
+
+                    if fac.is_reduction:
+                        # Allreduce: ring algorithm ≈ 2·B·(n-1)/n
+                        out_bytes = self._output_bytes(node)
+                        ar_bytes = 2.0 * out_bytes * (mesh_size - 1) / mesh_size
+                        # Rough bandwidth model: 50 GB/s per link
+                        cost += ar_bytes / 50e9 * 1e6  # microseconds
+                    else:
+                        # Compute benefit: work is divided by mesh_size.
+                        compute = self._compute_cost(node)
+                        benefit = compute * (1.0 - 1.0 / mesh_size)
+                        cost -= benefit
+
+                if cost != 0.0:
+                    terms.append(cost * var)
+
+        if terms:
+            self.prob += pulp.lpSum(terms)
+
+    # ---- cost helpers -----------------------------------------------
+
+    @staticmethod
+    def _output_bytes(node: torch.fx.Node) -> float:
+        val = node.meta.get("val")
+        if val is not None and isinstance(val, torch.Tensor):
+            return float(val.numel() * val.element_size())
+        return 0.0
+
+    @staticmethod
+    def _compute_cost(node: torch.fx.Node) -> float:
+        try:
+            return float(estimate_strategy_runtime_cost(node, None))
+        except Exception:
+            return 0.0
+
+    # -----------------------------------------------------------------
+    # User constraints
+    # -----------------------------------------------------------------
+
+    def add_node_constraint(
+        self,
+        node: torch.fx.Node,
+        placement: tuple[Placement, ...],
+    ) -> None:
+        """Pin a node's output to a specific placement."""
+        rule = self.factor_rules.get(node)
+        if rule is None:
+            return
+        nidx = self.node_map[node]
+
+        for m, p in enumerate(placement):
+            if isinstance(p, Shard):
+                for li, fac in enumerate(rule.factors):
+                    if fac.result_dims and fac.result_dims[0] == p.dim:
+                        gid = self.factor_keys.get((nidx, li))
+                        if gid is not None:
+                            root = self.uf.find(gid)
+                            self.prob += (
+                                self.y_vars[(root, m)] == 1,
+                                f"pin_{nidx}_f{li}_m{m}",
+                            )
+                        break
+            elif isinstance(p, Replicate):
+                seen_roots: set[int] = set()
+                for li, fac in enumerate(rule.factors):
+                    if fac.result_dims and fac.result_dims[0] is not None:
+                        gid = self.factor_keys.get((nidx, li))
+                        if gid is not None:
+                            root = self.uf.find(gid)
+                            if root not in seen_roots:
+                                seen_roots.add(root)
+                                self.prob += (
+                                    self.y_vars[(root, m)] == 0,
+                                    f"rep_{nidx}_r{root}_m{m}",
+                                )
+
+    def add_input_constraints(
+        self, input_placements: list[tuple[Placement, ...] | None] | None = None
+    ) -> None:
+        """Constrain input placements (and their corresponding gradients).
+
+        Uses ``get_plain_input_and_grad_nodes`` to correctly map inputs to
+        their gradient nodes in the joint fwd+bwd graph, matching the
+        original :class:`ShardingOptimizer` behaviour.
+        """
+        mut_ips = None
+        if input_placements is not None:
+            mut_ips = {i: p for i, p in enumerate(input_placements)}
+
+        for desc, (node, grad_node) in get_plain_input_and_grad_nodes(
+            self.graph
+        ).items():
+            if input_placements is None:
+                placement = None
+            else:
+                assert isinstance(desc, PlainAOTInput)
+                assert mut_ips is not None
+                placement = mut_ips.pop(desc.idx, None)
+
+            if placement is not None:
+                self.add_node_constraint(node, tuple(placement))
+                if grad_node is not None:
+                    self.add_node_constraint(grad_node, tuple(placement))
+
+    def add_output_constraints(
+        self, output_placements: list[tuple[Placement, ...] | None] | None = None
+    ) -> None:
+        """Constrain output placements (and their corresponding tangents).
+
+        Uses ``get_plain_output_and_tangent_nodes`` to correctly map outputs to
+        their tangent nodes in the joint fwd+bwd graph, matching the
+        original :class:`ShardingOptimizer` behaviour.
+        """
+        mut_ops = None
+        if output_placements is not None:
+            mut_ops = {i: p for i, p in enumerate(output_placements)}
+
+        for desc, (node, tangent_node) in get_plain_output_and_tangent_nodes(
+            self.graph
+        ).items():
+            if output_placements is None:
+                placement = None
+            else:
+                assert isinstance(desc, PlainAOTOutput)
+                assert mut_ops is not None
+                placement = mut_ops.pop(desc.idx, None)
+
+            if placement is not None:
+                self.add_node_constraint(node, tuple(placement))
+                if tangent_node is not None:
+                    self.add_node_constraint(tangent_node, tuple(placement))
+
+    # -----------------------------------------------------------------
+    # Solve
+    # -----------------------------------------------------------------
+
+    def get_solution(self, verbose: bool = False) -> dict[torch.fx.Node, DTensorSpec]:
+        """Solve the factor ILP and reconstruct per-node DTensorSpecs."""
+        solver = pulp.PULP_CBC_CMD(msg=verbose)
+        self.prob.solve(solver)
+
+        if self.prob.status == -1:
+            diag = self._infeasibility_diagnostics()
+            raise RuntimeError(
+                "Factor-based ILP is infeasible.  "
+                "Check that input / output constraints are satisfiable.\n" + diag
+            )
+
+        # Extract factor → mesh-dim assignments.
+        assignment: dict[int, int] = {}  # root → mesh_dim
+        for (root, m), var in self.y_vars.items():
+            if var.varValue is not None and var.varValue > 0.5:
+                assignment[root] = m
+
+        # Reconstruct per-node placements.
+        result: dict[torch.fx.Node, DTensorSpec] = {}
+        for node in self.graph.nodes:
+            if node.op == "output":
+                continue
+            rule = self.factor_rules.get(node)
+            if rule is None:
+                continue
+            nidx = self.node_map[node]
+            placements: list[Placement] = [Replicate()] * self.mesh.ndim
+
+            for li, fac in enumerate(rule.factors):
+                if not fac.result_dims or fac.result_dims[0] is None:
+                    continue
+                gid = self.factor_keys.get((nidx, li))
+                if gid is None:
+                    continue
+                root = self.uf.find(gid)
+                m = assignment.get(root)
+                if m is not None:
+                    td = fac.result_dims[0]
+                    # A factor may be spatial here but reduction in another op.
+                    # For the *output* placement we use Shard(dim).
+                    placements[m] = Shard(td)
+
+            val = node.meta.get("val")
+            if val is not None and isinstance(val, torch.Tensor):
+                tensor_meta = TensorMeta(val.shape, val.stride(), val.dtype)
+                result[node] = DTensorSpec(
+                    self.mesh, tuple(placements), tensor_meta=tensor_meta
+                )
+
+        return result
+
+    # -----------------------------------------------------------------
+    # Diagnostics
+    # -----------------------------------------------------------------
+
+    def _infeasibility_diagnostics(self) -> str:
+        """Build a diagnostic string to help debug infeasible ILPs.
+
+        Scans all equality constraints to detect variables pinned to both 0 and
+        1 (the most common cause of infeasibility in the factor ILP).
+        """
+        # Collect per-variable equality constraints.
+        pinned_to_1: dict[str, list[str]] = defaultdict(list)
+        pinned_to_0: dict[str, list[str]] = defaultdict(list)
+        for name, c in self.prob.constraints.items():
+            # An equality constraint y == v has sense EQ (0) and constant = -v
+            if c.sense == 0 and len(c) == 1:
+                # single-variable equality
+                for var, coeff in c.items():
+                    val = -c.constant / coeff
+                    if abs(val - 1.0) < 1e-9:
+                        pinned_to_1[var.name].append(name)
+                    elif abs(val) < 1e-9:
+                        pinned_to_0[var.name].append(name)
+
+        conflicts = []
+        for var_name in set(pinned_to_1) & set(pinned_to_0):
+            conflicts.append(
+                f"  Variable {var_name}:\n"
+                f"    pinned to 1 by: {pinned_to_1[var_name]}\n"
+                f"    pinned to 0 by: {pinned_to_0[var_name]}"
+            )
+
+        if conflicts:
+            return "Conflicting constraints found:\n" + "\n".join(conflicts)
+        return (
+            "No direct 0-vs-1 conflicts found; infeasibility may be caused "
+            "by interacting inequality constraints (tensor exclusion, factor "
+            "uniqueness)."
+        )
+
+    def get_stats(self) -> dict[str, Any]:
+        """Return ILP size statistics (useful for comparing with original)."""
+        roots = self._unique_roots()
+
+        # Estimate original variable count.
+        orig_vars = 0
+        for node, strat in self.strats.items():
+            if not strat.strategies:
+                continue
+            n_out = len(strat.strategies)
+            first = strat.strategies[0]
+            n_args = len(first.input_specs) if first.input_specs else 0
+            orig_vars += max(n_args, 1) * n_out * n_out
+
+        n_factor_vars = len(self.y_vars)
+        return {
+            "num_graph_nodes": len(self.nodes),
+            "num_unique_factors": len(roots),
+            "num_factor_ilp_variables": n_factor_vars,
+            "num_factor_ilp_constraints": len(self.prob.constraints),
+            "mesh_shape": tuple(self.mesh.shape),
+            "estimated_original_ilp_variables": orig_vars,
+            "variable_reduction_ratio": orig_vars / max(n_factor_vars, 1),
+        }
+
+    def get_log(self, verbose: bool = False) -> str:
+        """Human-readable summary."""
+        lines: list[str] = []
+        lines.append(f"Factor ILP status: {pulp.LpStatus[self.prob.status]}")
+        s = self.get_stats()
+        lines.append(f"Unique factors:           {s['num_unique_factors']}")
+        lines.append(f"Factor ILP variables:     {s['num_factor_ilp_variables']}")
+        lines.append(f"Factor ILP constraints:   {s['num_factor_ilp_constraints']}")
+        lines.append(
+            f"Est. original ILP vars:   {s['estimated_original_ilp_variables']}"
+        )
+        lines.append(f"Variable reduction:       {s['variable_reduction_ratio']:.1f}x")
+
+        if verbose and self.prob.status == 1:
+            lines.append("")
+            lines.append("Factor assignments:")
+            for (root, m), var in sorted(self.y_vars.items()):
+                if var.varValue is not None and var.varValue > 0.5:
+                    refs = self.factor_ops.get(root, [])
+                    desc = ""
+                    if refs:
+                        _, fac, _ = refs[0]
+                        kind = "reduction" if fac.is_reduction else "spatial"
+                        desc = f" ({kind}, size={fac.size})"
+                    lines.append(f"  Factor {root} → mesh dim {m}{desc}")
+
+        return "\n".join(lines)
