@@ -1094,10 +1094,19 @@ class FactorShardingOptimizer:
                 continue
 
             # --- Build input_specs ---
-            input_specs = self._build_input_specs(node, rule, nidx, assignment)
+            if node.op in ("placeholder", "get_attr"):
+                # Convention: placeholders use output_specs as input_specs.
+                if isinstance(output_specs, DTensorSpec):
+                    input_specs = [output_specs]
+                else:
+                    input_specs = None
+            else:
+                input_specs = self._build_input_specs(
+                    node, rule, nidx, assignment
+                ) or None
 
             result[node] = OpSpec(
-                output_specs=output_specs, input_specs=input_specs or None
+                output_specs=output_specs, input_specs=input_specs
             )
 
         return result

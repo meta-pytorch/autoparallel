@@ -155,6 +155,8 @@ with AutoParallel(model, input_fn, mesh, mp_policy) as autop:
     print(f"  Solve time: {t_factor:.2f}s")
     print(factor_opt.get_log(verbose=True))
 
+    # parallel_mod = autop.apply_placement(factor_solution)
+
     # ------------------------------------------------------------------
     # 3. Comparison
     # ------------------------------------------------------------------
@@ -198,11 +200,12 @@ with AutoParallel(model, input_fn, mesh, mp_policy) as autop:
                 orig_plc = "?"
         else:
             orig_plc = "?"
-        if factor_spec is not None:
-            if isinstance(factor_spec, DTensorSpec):
-                factor_plc = tuple(factor_spec.placements)
-            elif isinstance(factor_spec, (list, tuple)) and factor_spec:
-                factor_plc = tuple(factor_spec[0].placements)
+        if factor_spec is not None and hasattr(factor_spec, "output_specs"):
+            os = factor_spec.output_specs
+            if isinstance(os, DTensorSpec):
+                factor_plc = tuple(os.placements)
+            elif isinstance(os, (list, tuple)) and os:
+                factor_plc = tuple(os[0].placements)
             else:
                 factor_plc = "?"
         else:
