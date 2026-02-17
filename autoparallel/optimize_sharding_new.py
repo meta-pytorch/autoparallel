@@ -56,6 +56,7 @@ import torch.fx
 from torch._functorch._aot_autograd.descriptors import PlainAOTInput, PlainAOTOutput
 from torch._functorch._aot_autograd.fx_utils import (
     get_param_and_grad_nodes,
+    get_param_nodes,
     get_plain_input_and_grad_nodes,
     get_plain_output_and_tangent_nodes,
 )
@@ -995,6 +996,116 @@ class FactorShardingOptimizer:
                                     f"grad_param_{pidx}_{gidx}_d{p_dim}_m{m}",
                                 )
                     break
+
+    def add_parameter_memory_constraint(
+        self, memory_factor_low: float, memory_factor_high: float
+    ) -> None:
+        """Constrain total parameter memory to stay within specified bounds.
+
+        Matches the semantics of
+        :meth:`ShardingOptimizer.add_parameter_memory_constraint`: the
+        constraint is on the sum of per-parameter memory ratios (1.0 =
+        replicated, 1/world_size = fully sharded), bounded by
+        ``[low * N, high * N]`` where *N* is the number of eligible
+        parameters.
+
+        Because a parameter's memory ratio is a *product* over mesh dims
+        (nonlinear in the ``y`` variables), we linearize by introducing
+        auxiliary indicator variables ``b_S`` for each possible subset *S*
+        of mesh dims on which the parameter could be sharded.  For typical
+        mesh dimensions (k = 2–4) this adds O(2^k) variables per parameter
+        — negligible in practice.
+        """
+        import math
+        from itertools import combinations
+
+        param_nodes: list[torch.fx.Node] = get_param_nodes(self.graph)
+        world_size: int = math.prod(self.mesh.shape)
+        k = self.mesh.ndim
+
+        # Precompute all 2^k subsets of mesh dims.
+        all_subsets: list[frozenset[int]] = []
+        for r in range(k + 1):
+            for subset in combinations(range(k), r):
+                all_subsets.append(frozenset(subset))
+
+        memory_terms: list[Any] = []
+        num_params_to_consider: int = 0
+        cid = 0
+
+        for node in param_nodes:
+            can_be_fully_sharded: bool = node.meta["val"].numel() >= world_size
+            num_params_to_consider += int(can_be_fully_sharded)
+            if not can_be_fully_sharded:
+                continue
+
+            nidx = self.node_map[node]
+            rule = self.factor_rules.get(node)
+            if rule is None:
+                continue
+
+            # s_m = sum_fi y[root_fi, m]: is param sharded on mesh dim m?
+            # (0 or 1 due to tensor-exclusion constraints.)
+            s_exprs: dict[int, list] = {}
+            for m in range(k):
+                terms: list = []
+                seen_roots: set[int] = set()
+                for li, fac in enumerate(rule.factors):
+                    if not fac.result_dims or fac.result_dims[0] is None:
+                        continue
+                    gid = self.factor_keys.get((nidx, li))
+                    if gid is None:
+                        continue
+                    root = self.uf.find(gid)
+                    if root in seen_roots:
+                        continue
+                    seen_roots.add(root)
+                    var = self.y_vars.get((root, m))
+                    if var is not None:
+                        terms.append(var)
+                s_exprs[m] = terms
+
+            # Indicator variable b_S for each subset S ⊆ {0, …, k-1}.
+            b_vars: dict[frozenset[int], pulp.LpVariable] = {}
+            for S in all_subsets:
+                tag = "".join(str(m) for m in sorted(S)) if S else "R"
+                b_vars[S] = pulp.LpVariable(
+                    f"mem_{nidx}_{tag}", cat="Binary"
+                )
+
+            # Exactly one subset is active per parameter.
+            self.prob += (
+                pulp.lpSum(b_vars.values()) == 1,
+                f"mem_one_{cid}",
+            )
+            cid += 1
+
+            # Link b to the y variables: for each mesh dim m,
+            #   sum_{S : m ∈ S} b_S  =  s_m
+            for m in range(k):
+                lhs = pulp.lpSum(b_vars[S] for S in all_subsets if m in S)
+                rhs = pulp.lpSum(s_exprs[m])
+                self.prob += (lhs == rhs, f"mem_link_{cid}")
+                cid += 1
+
+            # Memory ratio contribution: b_S * (1 / prod_{m ∈ S} M_m).
+            for S in all_subsets:
+                shard_div = math.prod(self.mesh.shape[m] for m in S) if S else 1
+                memory_terms.append(b_vars[S] * (1.0 / shard_div))
+
+        if not memory_terms or num_params_to_consider == 0:
+            return
+
+        target_low = memory_factor_low * num_params_to_consider
+        target_high = memory_factor_high * num_params_to_consider
+        self.prob += (
+            pulp.lpSum(memory_terms) >= target_low,
+            "memory_constraint_low",
+        )
+        self.prob += (
+            pulp.lpSum(memory_terms) <= target_high,
+            "memory_constraint_high",
+        )
 
     def add_input_constraints(
         self, input_placements: list[tuple[Placement, ...] | None] | None = None
