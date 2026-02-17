@@ -102,6 +102,7 @@ def input_fn():
 x_sharding = (Shard(0),) + (Replicate(),) * (mesh.ndim - 1)
 
 mp_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
+mp_policy = None
 
 # ---------------------------------------------------------------------------
 # Trace the model (reuse AutoParallel for graph capture only)
@@ -198,11 +199,7 @@ with AutoParallel(model, input_fn, mesh, mp_policy) as autop:
             orig_plc = "?"
         factor_plc = tuple(factor_spec.placements) if factor_spec is not None else "?"
         match = "OK" if str(orig_plc) == str(factor_plc) else "DIFF"
-        op_name = (
-            str(node.target).split(".")[-1]
-            if hasattr(node.target, "__name__")
-            else str(node.target)
-        )
+        op_name = str(node)
         # Truncate long op names
         if len(op_name) > 40:
             op_name = op_name[:37] + "..."

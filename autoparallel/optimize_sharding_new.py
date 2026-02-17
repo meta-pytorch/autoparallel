@@ -485,7 +485,12 @@ class FactorShardingOptimizer:
                 self.y_vars[(r, m)] = pulp.LpVariable(f"y_{r}_m{m}", cat="Binary")
 
         # --- Constraints ---
-        self._add_factor_uniqueness(roots)
+        # NOTE: we intentionally omit a factor-uniqueness constraint here.
+        # A factor MAY be assigned to multiple mesh dims simultaneously,
+        # which corresponds to placements like (Shard(0), Shard(0)) where a
+        # single tensor dim is sharded across several mesh dims.  The tensor
+        # exclusion constraint already prevents invalid combos (two different
+        # factors claiming the same tensor dim on the same mesh dim).
         self._add_tensor_exclusion()
 
         # --- Objective ---
@@ -584,17 +589,19 @@ class FactorShardingOptimizer:
                     if node.op != "call_function":
                         continue
 
+                    # Compute benefit: work is divided by mesh_size
+                    # regardless of whether the factor is a reduction
+                    # or spatial dimension.
+                    compute = self._compute_cost(node)
+                    benefit = compute * (1.0 - 1.0 / mesh_size)
+                    cost -= benefit
+
                     if fac.is_reduction:
-                        # Allreduce: ring algorithm ≈ 2·B·(n-1)/n
+                        # Allreduce penalty: ring algorithm ≈ 2·B·(n-1)/n
                         out_bytes = self._output_bytes(node)
                         ar_bytes = 2.0 * out_bytes * (mesh_size - 1) / mesh_size
                         # Rough bandwidth model: 50 GB/s per link
                         cost += ar_bytes / 50e9 * 1e6  # microseconds
-                    else:
-                        # Compute benefit: work is divided by mesh_size.
-                        compute = self._compute_cost(node)
-                        benefit = compute * (1.0 - 1.0 / mesh_size)
-                        cost -= benefit
 
                 if cost != 0.0:
                     terms.append(cost * var)
