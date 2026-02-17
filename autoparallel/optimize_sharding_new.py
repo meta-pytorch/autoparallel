@@ -449,17 +449,32 @@ class FactorShardingOptimizer:
                     if arg_pos >= len(c_fac.operand_dims):
                         continue
                     c_dim = c_fac.operand_dims[arg_pos]
-                    if c_dim is None:
-                        continue
-                    for p_li, p_fac in enumerate(producer_rule.factors):
-                        if not p_fac.result_dims:
-                            continue
-                        p_dim = p_fac.result_dims[0]
-                        if p_dim is not None and p_dim == c_dim:
-                            pk = self.factor_keys.get((pidx, p_li))
-                            ck = self.factor_keys.get((cidx, c_li))
-                            if pk is not None and ck is not None:
-                                self.uf.union(pk, ck)
+
+                    if c_dim is not None:
+                        # Spatial factor: match by dimension index.
+                        for p_li, p_fac in enumerate(producer_rule.factors):
+                            if not p_fac.result_dims:
+                                continue
+                            p_dim = p_fac.result_dims[0]
+                            if p_dim is not None and p_dim == c_dim:
+                                pk = self.factor_keys.get((pidx, p_li))
+                                ck = self.factor_keys.get((cidx, c_li))
+                                if pk is not None and ck is not None:
+                                    self.uf.union(pk, ck)
+                    elif c_fac.is_reduction:
+                        # Reduction factor pass-through (Partial → Partial).
+                        # Data-preserving ops (view, permute, alias, …) have
+                        # a strategy atom (out=Partial, in=Partial) which
+                        # produces a factor with operand_dims=[None] and
+                        # result_dims=[None].  Merge it with the producer's
+                        # reduction factor so that Partial propagates.
+                        for p_li, p_fac in enumerate(producer_rule.factors):
+                            if p_fac.is_reduction:
+                                pk = self.factor_keys.get((pidx, p_li))
+                                ck = self.factor_keys.get((cidx, c_li))
+                                if pk is not None and ck is not None:
+                                    self.uf.union(pk, ck)
+                                break  # one-to-one merge
 
     # -----------------------------------------------------------------
     # Step 4 — metadata collection
@@ -580,15 +595,19 @@ class FactorShardingOptimizer:
 
         1. **Compute benefit** (all factors): sharding any dimension divides
            work by ``mesh.shape[m]``.
-        2. **Allreduce penalty** (reduction factors): the ``Partial`` output
-           must be all-reduced before consumers can use it.
+        2. **Reduce-scatter penalty** (reduction factors at "exit" edges):
+           when a ``Partial`` output reaches a consumer that doesn't share
+           the reduction root, a reduce-scatter is needed.  Cost ≈ B·(n-1)/n.
+           (If the reduction factor propagates through data-preserving ops
+           via union-find, there is zero cost at those edges.)
         3. **All-gather penalty** (spatial factors at "exit" edges): when a
            producer is ``Shard(d)`` on mesh dim *m* but a consumer doesn't
            share that factor (via union-find), an all-gather is needed.
+           Cost ≈ B·(n-1)/n.
 
         All three are linear in the ``y`` variables, keeping the ILP linear.
         """
-        ag_bytes = self._compute_redistribution_bytes()
+        ag_bytes, rs_bytes = self._compute_redistribution_bytes()
         terms: list[Any] = []
 
         for r in roots:
@@ -609,14 +628,14 @@ class FactorShardingOptimizer:
                     benefit = compute * (1.0 - 1.0 / mesh_size)
                     cost -= benefit
 
-                    if fac.is_reduction:
-                        # Allreduce penalty: ring algorithm ≈ 2·B·(n-1)/n
-                        out_bytes = self._output_bytes(node)
-                        ar_bytes = 2.0 * out_bytes * (mesh_size - 1) / mesh_size
-                        cost += ar_bytes / self._BW * 1e6  # microseconds
+                # Reduce-scatter penalty at reduction exit edges.
+                # Only incurred where Partial doesn't propagate to the
+                # consumer (i.e. at the point where Partial is resolved).
+                if r in rs_bytes:
+                    rs_comm = rs_bytes[r] * (mesh_size - 1) / mesh_size
+                    cost += rs_comm / self._BW * 1e6
 
-                # All-gather penalty for exit edges (spatial factors whose
-                # consumers don't share the root).
+                # All-gather penalty at spatial exit edges.
                 if r in ag_bytes:
                     ag_comm = ag_bytes[r] * (mesh_size - 1) / mesh_size
                     cost += ag_comm / self._BW * 1e6
@@ -689,13 +708,18 @@ class FactorShardingOptimizer:
 
         return 0.0
 
-    def _compute_redistribution_bytes(self) -> dict[int, float]:
+    def _compute_redistribution_bytes(
+        self,
+    ) -> tuple[dict[int, float], dict[int, float]]:
         """For each factor root, total output bytes at "exit" edges.
 
-        An exit edge is a producer→consumer edge where the producer has a
-        spatial factor with root *R* but the consumer doesn't share *R*
-        (via union-find).  When *R* is assigned to a mesh dim the consumer
-        needs an all-gather on that edge.
+        Returns ``(ag_bytes, rs_bytes)``:
+
+        * **ag_bytes** — for *spatial* factors: bytes needing an all-gather
+          at edges where the consumer doesn't share the root.
+        * **rs_bytes** — for *reduction* factors: bytes needing a
+          reduce-scatter at edges where the ``Partial`` doesn't propagate
+          to the consumer.
         """
         # node_idx → set of factor roots at that node
         node_roots: dict[int, set[int]] = defaultdict(set)
@@ -703,22 +727,26 @@ class FactorShardingOptimizer:
             node_roots[nidx].add(self.uf.find(gid))
 
         ag_bytes: dict[int, float] = defaultdict(float)
+        rs_bytes: dict[int, float] = defaultdict(float)
         for root, refs in self.factor_ops.items():
             for node, fac, _li in refs:
-                # Only spatial factors produce Shard output.
-                if fac.is_reduction:
-                    continue
-                if not fac.result_dims or fac.result_dims[0] is None:
-                    continue
                 for user in node.users:
                     if user.op != "call_function":
                         continue
                     uidx = self.node_map.get(user)
                     if uidx is None:
                         continue
-                    if root not in node_roots.get(uidx, set()):
+                    if root in node_roots.get(uidx, set()):
+                        continue  # factor propagates — no redistribution
+
+                    if fac.is_reduction:
+                        # Partial exits here → reduce-scatter
+                        rs_bytes[root] += self._output_bytes(node)
+                    elif fac.result_dims and fac.result_dims[0] is not None:
+                        # Shard exits here → all-gather
                         ag_bytes[root] += self._output_bytes(node)
-        return dict(ag_bytes)
+
+        return dict(ag_bytes), dict(rs_bytes)
 
     # -----------------------------------------------------------------
     # User constraints
