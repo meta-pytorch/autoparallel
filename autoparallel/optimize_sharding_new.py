@@ -45,6 +45,7 @@ Example: ``mm(A[M,K], B[K,N]) -> C[M,N]``
 
 from __future__ import annotations
 
+import operator
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -188,11 +189,19 @@ def _infer_factor_size(
 ) -> int:
     """Infer the size of a factor from the node's tensor metadata."""
     # Try the node's own output first.
-    out = _get_primary_tensor(node.meta.get("val"))
-    if out is not None:
-        for d in result_dims:
-            if d is not None and d < len(out.shape):
-                return out.shape[d]
+    val = node.meta.get("val")
+    if val is not None:
+        if isinstance(val, torch.Tensor):
+            for d in result_dims:
+                if d is not None and d < len(val.shape):
+                    return val.shape[d]
+        elif isinstance(val, (tuple, list)):
+            # Multi-output: result_dims[ri] corresponds to output tensor ri.
+            for ri, d in enumerate(result_dims):
+                if d is not None and ri < len(val):
+                    v = val[ri]
+                    if isinstance(v, torch.Tensor) and d < len(v.shape):
+                        return v.shape[d]
     # Fall back to operand shapes.
     for arg_idx, d in enumerate(operand_dims):
         if d is None or arg_idx >= len(node.args):
@@ -233,32 +242,48 @@ def extract_factors_from_strategy(
     first_spec = op_strategy.strategies[0]
     num_operands = len(first_spec.input_specs) if first_spec.input_specs else 0
 
+    # Determine number of result tensors.
+    first_out = first_spec.output_specs
+    if isinstance(first_out, DTensorSpec):
+        num_results = 1
+    elif isinstance(first_out, (list, tuple)):
+        num_results = len(first_out)
+    else:
+        num_results = 1
+
     # Collect unique 1-D "atoms" by looking at mesh dim 0.
     seen: dict[str, tuple] = {}
     for spec in op_strategy.strategies:
         out_specs = spec.output_specs
-        out_p = (
-            out_specs.placements[0]
-            if isinstance(out_specs, DTensorSpec)
-            else out_specs[0].placements[0]
-        )
+        if isinstance(out_specs, DTensorSpec):
+            out_ps = (out_specs.placements[0],)
+        elif isinstance(out_specs, (list, tuple)):
+            out_ps = tuple(
+                s.placements[0] if isinstance(s, DTensorSpec) else None
+                for s in out_specs
+            )
+        else:
+            out_ps = (Replicate(),)
         in_ps = tuple(
             s.placements[0]
             for s in (spec.input_specs or [])
             if isinstance(s, DTensorSpec)
         )
-        all_ps = (out_p,) + in_ps
-        if all(isinstance(p, Replicate) for p in all_ps):
+        all_ps = out_ps + in_ps
+        if all(p is None or isinstance(p, Replicate) for p in all_ps):
             continue  # skip the all-replicate atom
         key = str(all_ps)
         if key not in seen:
-            seen[key] = (out_p, in_ps)
+            seen[key] = (out_ps, in_ps)
 
     # Each atom → one Factor.
     factors: list[Factor] = []
-    for factor_id, (out_p, in_ps) in enumerate(seen.values()):
-        is_reduction = _is_partial(out_p)
-        result_dims = [out_p.dim if isinstance(out_p, Shard) else None]
+    for factor_id, (out_ps, in_ps) in enumerate(seen.values()):
+        is_reduction = any(_is_partial(p) for p in out_ps if p is not None)
+        result_dims = [
+            p.dim if p is not None and isinstance(p, Shard) else None
+            for p in out_ps
+        ]
         operand_dims = [p.dim if isinstance(p, Shard) else None for p in in_ps]
         size = _infer_factor_size(node, operand_dims, result_dims)
         factors.append(
@@ -271,7 +296,7 @@ def extract_factors_from_strategy(
             )
         )
 
-    return FactorRule(factors=factors, num_operands=num_operands, num_results=1)
+    return FactorRule(factors=factors, num_operands=num_operands, num_results=num_results)
 
 
 def _placeholder_factor_rule(node: torch.fx.Node) -> FactorRule:
@@ -445,6 +470,17 @@ class FactorShardingOptimizer:
                     continue
                 pidx = self.node_map[arg]
 
+                # For getitem nodes, the consumer's operand 0 corresponds
+                # to a specific result index of the multi-output producer.
+                result_idx = 0
+                if (
+                    node.target is operator.getitem
+                    and arg_pos == 0
+                    and len(node.args) > 1
+                    and isinstance(node.args[1], int)
+                ):
+                    result_idx = node.args[1]
+
                 # Match: consumer operand dim == producer result dim on the
                 # same positional dimension → same logical factor.
                 for c_li, c_fac in enumerate(consumer_rule.factors):
@@ -456,7 +492,9 @@ class FactorShardingOptimizer:
                         for p_li, p_fac in enumerate(producer_rule.factors):
                             if not p_fac.result_dims:
                                 continue
-                            p_dim = p_fac.result_dims[0]
+                            if result_idx >= len(p_fac.result_dims):
+                                continue
+                            p_dim = p_fac.result_dims[result_idx]
                             if p_dim is not None and p_dim == c_dim:
                                 pk = self.factor_keys.get((pidx, p_li))
                                 ck = self.factor_keys.get((cidx, c_li))
@@ -609,24 +647,29 @@ class FactorShardingOptimizer:
                 continue
             nidx = self.node_map[node]
 
-            # — result tensor —
-            for m in range(self.mesh.ndim):
-                vs = []
-                seen_roots: set[int] = set()
-                for li, fac in enumerate(rule.factors):
-                    # Include both spatial and reduction factors: a
-                    # tensor can only be Shard(d) OR Partial on each
-                    # mesh dim, never both simultaneously.
-                    if (fac.result_dims and fac.result_dims[0] is not None) or fac.is_reduction:
-                        gid = self.factor_keys.get((nidx, li))
-                        if gid is not None:
-                            root = self.uf.find(gid)
-                            if root not in seen_roots:
-                                seen_roots.add(root)
-                                vs.append(self.y_vars[(root, m)])
-                if len(vs) > 1:
-                    self.prob += pulp.lpSum(vs) <= 1, f"tex_r_{cid}"
-                    cid += 1
+            # — result tensors (one exclusion set per result) —
+            for ri in range(rule.num_results):
+                for m in range(self.mesh.ndim):
+                    vs = []
+                    seen_roots: set[int] = set()
+                    for li, fac in enumerate(rule.factors):
+                        # Include both spatial and reduction factors: a
+                        # tensor can only be Shard(d) OR Partial on each
+                        # mesh dim, never both simultaneously.
+                        has_spatial = (
+                            ri < len(fac.result_dims)
+                            and fac.result_dims[ri] is not None
+                        )
+                        if has_spatial or fac.is_reduction:
+                            gid = self.factor_keys.get((nidx, li))
+                            if gid is not None:
+                                root = self.uf.find(gid)
+                                if root not in seen_roots:
+                                    seen_roots.add(root)
+                                    vs.append(self.y_vars[(root, m)])
+                    if len(vs) > 1:
+                        self.prob += pulp.lpSum(vs) <= 1, f"tex_r_{cid}"
+                        cid += 1
 
             # — operand tensors —
             for oi in range(rule.num_operands):
@@ -817,7 +860,7 @@ class FactorShardingOptimizer:
                     if fac.is_reduction:
                         # Partial exits here → reduce-scatter
                         rs_bytes[root] += self._output_bytes(node)
-                    elif fac.result_dims and fac.result_dims[0] is not None:
+                    elif any(d is not None for d in fac.result_dims):
                         # Shard exits here → all-gather
                         ag_bytes[root] += self._output_bytes(node)
 
@@ -859,7 +902,7 @@ class FactorShardingOptimizer:
             return set()
         roots: set[int] = set()
         for li, fac in enumerate(rule.factors):
-            if not fac.is_reduction and fac.result_dims and fac.result_dims[0] is not None:
+            if not fac.is_reduction and any(d is not None for d in fac.result_dims):
                 gid = self.factor_keys.get((nidx, li))
                 if gid is not None:
                     roots.add(self.uf.find(gid))
@@ -883,7 +926,7 @@ class FactorShardingOptimizer:
         for m, p in enumerate(placement):
             if isinstance(p, Shard):
                 for li, fac in enumerate(rule.factors):
-                    if fac.result_dims and fac.result_dims[0] == p.dim:
+                    if any(d == p.dim for d in fac.result_dims):
                         gid = self.factor_keys.get((nidx, li))
                         if gid is not None:
                             root = self.uf.find(gid)
@@ -895,7 +938,7 @@ class FactorShardingOptimizer:
             elif isinstance(p, Replicate):
                 seen_roots: set[int] = set()
                 for li, fac in enumerate(rule.factors):
-                    if fac.result_dims and fac.result_dims[0] is not None:
+                    if any(d is not None for d in fac.result_dims):
                         gid = self.factor_keys.get((nidx, li))
                         if gid is not None:
                             root = self.uf.find(gid)
@@ -1006,8 +1049,10 @@ class FactorShardingOptimizer:
                 if fac.is_reduction:
                     # Reduction factor → output is Partial on this mesh dim.
                     placements[m] = Partial()
-                elif fac.result_dims and fac.result_dims[0] is not None:
-                    placements[m] = Shard(fac.result_dims[0])
+                else:
+                    # Use result_dims[0] for single-output nodes.
+                    if fac.result_dims and fac.result_dims[0] is not None:
+                        placements[m] = Shard(fac.result_dims[0])
 
             val = node.meta.get("val")
             if val is not None and isinstance(val, torch.Tensor):
@@ -1016,19 +1061,31 @@ class FactorShardingOptimizer:
                     self.mesh, tuple(placements), tensor_meta=tensor_meta
                 )
             elif val is not None and isinstance(val, (tuple, list)):
-                # Multi-output op (e.g. SDPA).  The factors describe the
-                # primary (first) output.  For each output tensor, keep only
-                # Shard placements whose dim is in range for that tensor.
+                # Multi-output op (e.g. SDPA).  Build per-output placements
+                # using the corresponding result_dims index for each output.
                 specs = []
-                for v in val:
+                for ri, v in enumerate(val):
                     if isinstance(v, torch.Tensor):
-                        plc = tuple(
-                            p if not isinstance(p, Shard) or p.dim < len(v.shape)
-                            else Replicate()
-                            for p in placements
-                        )
+                        plc_list = [Replicate()] * self.mesh.ndim
+                        for li, fac in enumerate(rule.factors):
+                            gid = self.factor_keys.get((nidx, li))
+                            if gid is None:
+                                continue
+                            root = self.uf.find(gid)
+                            m_assigned = assignment.get(root)
+                            if m_assigned is None:
+                                continue
+                            if fac.is_reduction:
+                                plc_list[m_assigned] = Partial()
+                            elif (
+                                ri < len(fac.result_dims)
+                                and fac.result_dims[ri] is not None
+                            ):
+                                plc_list[m_assigned] = Shard(fac.result_dims[ri])
                         tm = TensorMeta(v.shape, v.stride(), v.dtype)
-                        specs.append(DTensorSpec(self.mesh, plc, tensor_meta=tm))
+                        specs.append(
+                            DTensorSpec(self.mesh, tuple(plc_list), tensor_meta=tm)
+                        )
                     else:
                         specs.append(None)
                 result[node] = tuple(specs)
