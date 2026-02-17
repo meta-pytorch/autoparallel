@@ -129,6 +129,37 @@ class FactorRule:
     num_results: int
 
 
+@dataclass
+class FactorEdge:
+    """An edge between two factor instances across a producer→consumer dataflow edge.
+
+    Instead of merging factors via union-find, each edge records the relationship
+    so the ILP can penalize disagreement (redistribution cost) independently.
+
+    Attributes
+    ----------
+    producer_gid : int
+        Global factor ID at the producer node.
+    consumer_gid : int
+        Global factor ID at the consumer node.
+    producer_nidx : int
+        Node index of the producer.
+    consumer_nidx : int
+        Node index of the consumer.
+    producer_node : torch.fx.Node
+        The producer FX node (used for output bytes estimation).
+    kind : str
+        ``"spatial"`` or ``"reduction"``.
+    """
+
+    producer_gid: int
+    consumer_gid: int
+    producer_nidx: int
+    consumer_nidx: int
+    producer_node: torch.fx.Node
+    kind: str  # "spatial" or "reduction"
+
+
 # ---------------------------------------------------------------------------
 # Union-Find
 # ---------------------------------------------------------------------------
@@ -364,20 +395,14 @@ class FactorShardingOptimizer:
         self.factor_rules: dict[torch.fx.Node, FactorRule] = {}
         self._extract_all_factor_rules()
 
-        # -- Step 3: merge factors across dataflow edges (union-find).
-        self.uf = UnionFind()
+        # -- Step 3: build factor edge graph (no merging; edges track relationships).
         self.factor_keys: dict[tuple[int, int], int] = {}  # (node_idx, local) → gid
         self._next_gid = 0
+        self._factor_edges: list[FactorEdge] = []
+        self._disabled_reduction_gids: set[int] = set()
         self._build_factor_graph()
 
-        # -- Step 4: collect per-root metadata for cost model.
-        # root → [(node, factor, local_idx)]
-        self.factor_ops: dict[
-            int, list[tuple[torch.fx.Node, Factor, int]]
-        ] = defaultdict(list)
-        self._collect_factor_metadata()
-
-        # -- Step 5: build ILP.
+        # -- Step 4: build ILP.
         self._cost_cache: dict[torch.fx.Node, float] = {}
         self.prob = pulp.LpProblem("AutoParallel_Factor", pulp.LpMinimize)
         self.y_vars: dict[tuple[int, int], pulp.LpVariable] = {}
@@ -435,7 +460,7 @@ class FactorShardingOptimizer:
                 )
 
     # -----------------------------------------------------------------
-    # Step 3 — factor graph (union-find merging across edges)
+    # Step 3 — factor graph (edge recording across dataflow edges)
     # -----------------------------------------------------------------
 
     def _alloc_gid(self) -> int:
@@ -453,9 +478,8 @@ class FactorShardingOptimizer:
             for li, _ in enumerate(rule.factors):
                 gid = self._alloc_gid()
                 self.factor_keys[(nidx, li)] = gid
-                self.uf.make_set(gid)
 
-        # Merge spatial factors across producer → consumer edges.
+        # Record spatial factor edges across producer → consumer dataflow.
         for node in self.graph.nodes:
             if node.op != "call_function":
                 continue
@@ -501,14 +525,15 @@ class FactorShardingOptimizer:
                                 pk = self.factor_keys.get((pidx, p_li))
                                 ck = self.factor_keys.get((cidx, c_li))
                                 if pk is not None and ck is not None:
-                                    self.uf.union(pk, ck)
+                                    self._factor_edges.append(
+                                        FactorEdge(pk, ck, pidx, cidx, arg, "spatial")
+                                    )
 
-        # Merge reduction factors (Partial → Partial pass-through) in a
-        # separate pass, after spatial merging is complete.
-        self._merge_reduction_factors()
+        # Record reduction factor edges in a separate pass.
+        self._record_reduction_edges()
 
-    def _merge_reduction_factors(self) -> None:
-        """Merge reduction factors across edges only when ALL operands agree.
+    def _record_reduction_edges(self) -> None:
+        """Record reduction factor edges across dataflow edges.
 
         For data-preserving ops (view, permute, alias, …), a Partial can
         propagate through the op because the strategy has an atom
@@ -517,9 +542,10 @@ class FactorShardingOptimizer:
 
         For multi-operand ops like add/mul, the reduction factor has
         ``operand_dims=[None, None]`` — ALL operands must be Partial.
-        We must only merge when every operand that maps to ``None`` in the
-        factor can provide a Partial from its producer.  Otherwise, the
-        resulting placement (e.g. ``add(Partial, Shard)``) is invalid.
+        We record edges only when every operand that maps to ``None`` in the
+        factor can provide a Partial from its producer.  Otherwise, if the
+        factor has null operand dims (propagation type), we disable the
+        consumer's reduction factor.
         """
         for node in self.graph.nodes:
             if node.op != "call_function":
@@ -538,12 +564,16 @@ class FactorShardingOptimizer:
 
                 # Collect producer reduction keys for each operand that
                 # needs Partial, and validate that ALL can provide it.
-                merge_pairs: list[tuple[int, int]] = []
+                # Track (pk, ck, p_nidx, arg) for edge recording.
+                merge_pairs: list[tuple[int, int, int, torch.fx.Node]] = []
                 all_valid = True
+                has_null_operand_dims = False
 
                 for arg_pos, c_od in enumerate(c_fac.operand_dims):
                     if c_od is not None:
                         continue  # Spatial dim on this operand, not Partial
+
+                    has_null_operand_dims = True
 
                     # This operand must be Partial for the factor to propagate.
                     if arg_pos >= len(node.args):
@@ -565,7 +595,7 @@ class FactorShardingOptimizer:
                         if p_fac.is_reduction:
                             pk = self.factor_keys.get((pidx, p_li))
                             if pk is not None:
-                                merge_pairs.append((pk, ck))
+                                merge_pairs.append((pk, ck, pidx, arg))
                                 found = True
                             break
                     if not found:
@@ -573,40 +603,25 @@ class FactorShardingOptimizer:
                         break
 
                 if all_valid and merge_pairs:
-                    for pk, ck_val in merge_pairs:
-                        self.uf.union(pk, ck_val)
+                    for pk, ck_val, p_nidx, arg in merge_pairs:
+                        self._factor_edges.append(
+                            FactorEdge(pk, ck_val, p_nidx, cidx, arg, "reduction")
+                        )
+                elif not all_valid and has_null_operand_dims:
+                    # Can't propagate Partial through this consumer factor.
+                    self._disabled_reduction_gids.add(ck)
 
     # -----------------------------------------------------------------
-    # Step 4 — metadata collection
-    # -----------------------------------------------------------------
-
-    def _collect_factor_metadata(self) -> None:
-        for node in self.graph.nodes:
-            rule = self.factor_rules.get(node)
-            if rule is None:
-                continue
-            nidx = self.node_map[node]
-            for li, fac in enumerate(rule.factors):
-                gid = self.factor_keys.get((nidx, li))
-                if gid is None:
-                    continue
-                root = self.uf.find(gid)
-                self.factor_ops[root].append((node, fac, li))
-
-    def _unique_roots(self) -> set[int]:
-        return {self.uf.find(gid) for gid in self.factor_keys.values()}
-
-    # -----------------------------------------------------------------
-    # Step 5 — ILP construction
+    # Step 4 — ILP construction
     # -----------------------------------------------------------------
 
     def _build_ilp(self) -> None:
-        roots = self._unique_roots()
+        all_gids = set(self.factor_keys.values())
 
-        # --- Variables: y[root, mesh_dim] ∈ {0, 1} ---
-        for r in roots:
+        # --- Variables: y[gid, mesh_dim] ∈ {0, 1} ---
+        for gid in all_gids:
             for m in range(self.mesh.ndim):
-                self.y_vars[(r, m)] = pulp.LpVariable(f"y_{r}_m{m}", cat="Binary")
+                self.y_vars[(gid, m)] = pulp.LpVariable(f"y_{gid}_m{m}", cat="Binary")
 
         # --- Constraints ---
         # NOTE: we intentionally omit a factor-uniqueness constraint here.
@@ -616,18 +631,20 @@ class FactorShardingOptimizer:
         # exclusion constraint already prevents invalid combos (two different
         # factors claiming the same tensor dim on the same mesh dim).
         self._add_tensor_exclusion()
+        self._add_reduction_propagation_constraints()
+        self._add_disabled_reduction_constraints()
 
         # --- Objective ---
-        self._add_objective(roots)
+        self._add_objective()
 
     # ---- constraints ------------------------------------------------
 
-    def _add_factor_uniqueness(self, roots: set[int]) -> None:
+    def _add_factor_uniqueness(self, gids: set[int]) -> None:
         """Each factor is assigned to *at most one* mesh dimension."""
-        for r in roots:
+        for gid in gids:
             self.prob += (
-                pulp.lpSum(self.y_vars[(r, m)] for m in range(self.mesh.ndim)) <= 1,
-                f"fac_uniq_{r}",
+                pulp.lpSum(self.y_vars[(gid, m)] for m in range(self.mesh.ndim)) <= 1,
+                f"fac_uniq_{gid}",
             )
 
     def _add_tensor_exclusion(self) -> None:
@@ -636,11 +653,8 @@ class FactorShardingOptimizer:
         This encodes the DTensor invariant: a tensor dimension can only appear
         as ``Shard(d)`` for a single ``d`` on each mesh dimension.
 
-        Important: multiple factors at the same node may share a root (after
-        union-find merging, e.g. nheads and head_dim from unflatten both map to
-        the hidden input dimension).  We must deduplicate by root to avoid
-        counting the same ILP variable twice, which would turn ``sum <= 1``
-        into ``2*y <= 1`` and incorrectly force that variable to 0.
+        Without union-find, gids are unique per (node, factor), so dedup is
+        technically unnecessary but harmless to keep.
         """
         cid = 0
         for node in self.graph.nodes:
@@ -653,7 +667,7 @@ class FactorShardingOptimizer:
             for ri in range(rule.num_results):
                 for m in range(self.mesh.ndim):
                     vs = []
-                    seen_roots: set[int] = set()
+                    seen_gids: set[int] = set()
                     for li, fac in enumerate(rule.factors):
                         # Include both spatial and reduction factors: a
                         # tensor can only be Shard(d) OR Partial on each
@@ -665,10 +679,9 @@ class FactorShardingOptimizer:
                         if has_spatial or fac.is_reduction:
                             gid = self.factor_keys.get((nidx, li))
                             if gid is not None:
-                                root = self.uf.find(gid)
-                                if root not in seen_roots:
-                                    seen_roots.add(root)
-                                    vs.append(self.y_vars[(root, m)])
+                                if gid not in seen_gids:
+                                    seen_gids.add(gid)
+                                    vs.append(self.y_vars[(gid, m)])
                     if len(vs) > 1:
                         self.prob += pulp.lpSum(vs) <= 1, f"tex_r_{cid}"
                         cid += 1
@@ -677,7 +690,7 @@ class FactorShardingOptimizer:
             for oi in range(rule.num_operands):
                 for m in range(self.mesh.ndim):
                     vs = []
-                    seen_roots: set[int] = set()
+                    seen_gids: set[int] = set()
                     for li, fac in enumerate(rule.factors):
                         if (
                             oi < len(fac.operand_dims)
@@ -685,113 +698,188 @@ class FactorShardingOptimizer:
                         ):
                             gid = self.factor_keys.get((nidx, li))
                             if gid is not None:
-                                root = self.uf.find(gid)
-                                if root not in seen_roots:
-                                    seen_roots.add(root)
-                                    vs.append(self.y_vars[(root, m)])
+                                if gid not in seen_gids:
+                                    seen_gids.add(gid)
+                                    vs.append(self.y_vars[(gid, m)])
                     if len(vs) > 1:
                         self.prob += pulp.lpSum(vs) <= 1, f"tex_o_{cid}"
                         cid += 1
 
+    def _add_reduction_propagation_constraints(self) -> None:
+        """Consumer reduction can only be active if producer reduction is.
+
+        For each reduction edge (pk → ck): y[ck, m] <= y[pk, m].
+        This prevents creating Partial from non-Partial input.
+        """
+        cid = 0
+        for edge in self._factor_edges:
+            if edge.kind != "reduction":
+                continue
+            for m in range(self.mesh.ndim):
+                self.prob += (
+                    self.y_vars[(edge.consumer_gid, m)]
+                    <= self.y_vars[(edge.producer_gid, m)],
+                    f"red_prop_{cid}",
+                )
+                cid += 1
+
+    def _add_disabled_reduction_constraints(self) -> None:
+        """Force disabled reduction factors to 0 (can't propagate Partial)."""
+        cid = 0
+        for gid in self._disabled_reduction_gids:
+            for m in range(self.mesh.ndim):
+                if (gid, m) in self.y_vars:
+                    self.prob += self.y_vars[(gid, m)] == 0, f"dis_red_{cid}"
+                    cid += 1
+
     # ---- objective --------------------------------------------------
 
-    def _add_objective(self, roots: set[int]) -> None:
+    def _add_objective(self) -> None:
         """Build the cost function.
 
-        For each factor *f* assigned to mesh dim *m* the cost coefficient
-        includes three components:
+        Three components:
 
-        1. **Compute benefit** (all factors): sharding any dimension divides
-           work by ``mesh.shape[m]``.
-        2. **Redistribution penalty** (reduction factors at "exit" edges):
-           when a ``Partial`` output reaches a consumer that doesn't share
-           the reduction root, redistribution is needed.  The exact cost
-           depends on the consumer's placement on that mesh dim:
+        1. **Compute benefit** (per node/factor/mesh_dim): sharding any
+           dimension divides work by ``mesh.shape[m]``.
+        2. **Edge disagreement costs** (per FactorEdge per mesh_dim):
 
-           - **Partial → Shard** (reduce-scatter): B·(n-1)/n
-           - **Partial → Replicate** (all-reduce): 2B·(n-1)/n
+           - *Spatial edges*: all-gather when producer shards but consumer
+             doesn't.  Cost = B·(n-1)/n.
+           - *Reduction edges*: reduce-scatter/all-reduce when producer is
+             Partial but consumer isn't.
 
-           This is captured exactly via auxiliary continuous variables that
-           linearize the product ``y[r,m] · (1 - any_consumer_spatial_on_m)``.
-        3. **All-gather penalty** (spatial factors at "exit" edges): when a
-           producer is ``Shard(d)`` on mesh dim *m* but a consumer doesn't
-           share that factor (via union-find), an all-gather is needed.
-           Cost ≈ B·(n-1)/n.
-
-        All three are linear in the ``y`` and ``z`` variables, keeping the
-        ILP linear.
+        3. **Uncovered reduction exit costs**: for reduction factors with NO
+           outgoing reduction edge to a consumer, add Partial→{Shard,Replicate}
+           linearized cost directly.
         """
-        ag_bytes, _rs_bytes = self._compute_redistribution_bytes()
-        exit_info = self._compute_reduction_exit_info()
         terms: list[Any] = []
 
-        for r in roots:
-            refs = self.factor_ops.get(r, [])
-            for m in range(self.mesh.ndim):
-                mesh_size = self.mesh.shape[m]
-                var = self.y_vars[(r, m)]
-                cost = 0.0
+        # --- A) Compute benefit ---
+        for node in self.graph.nodes:
+            if node.op != "call_function":
+                continue
+            rule = self.factor_rules.get(node)
+            if rule is None:
+                continue
+            nidx = self.node_map[node]
+            compute = self._compute_cost(node)
+            for li, fac in enumerate(rule.factors):
+                gid = self.factor_keys.get((nidx, li))
+                if gid is None:
+                    continue
+                for m in range(self.mesh.ndim):
+                    benefit = compute * (1.0 - 1.0 / self.mesh.shape[m])
+                    if benefit > 0:
+                        terms.append(-benefit * self.y_vars[(gid, m)])
 
-                for node, fac, _ in refs:
-                    if node.op != "call_function":
-                        continue
-
-                    # Compute benefit: work is divided by mesh_size
-                    # regardless of whether the factor is a reduction
-                    # or spatial dimension.
-                    compute = self._compute_cost(node)
-                    benefit = compute * (1.0 - 1.0 / mesh_size)
-                    cost -= benefit
-
-                # All-gather penalty at spatial exit edges.
-                if r in ag_bytes:
-                    ag_comm = ag_bytes[r] * (mesh_size - 1) / mesh_size
-                    cost += ag_comm / self._BW * 1e6
-
-                if cost != 0.0:
-                    terms.append(cost * var)
-
-        # Reduction exit edges: linearized Partial → {Shard, Replicate} cost.
-        #
-        # For each (reduction_root r, consumer u) exit edge, on mesh dim m:
-        #
-        #   base cost  = B·(n-1)/n · y[r,m]          (reduce-scatter)
-        #   extra cost = B·(n-1)/n · z                (upgrade to all-reduce)
-        #
-        # where z is a continuous auxiliary variable satisfying:
-        #   z ≥ y[r,m] − Σ_s y[s,m]    for consumer's spatial roots s
-        #   z ≥ 0                       (implicit from lowBound=0)
-        #
-        # Since z has a positive coefficient and we minimize, the solver
-        # sets z = max(0, y[r,m] − Σ y[s,m]).
-        #
-        # • Consumer has spatial factor on m (Σ≥1) → z=0, total = B   (reduce-scatter)
-        # • Consumer fully replicated on m  (Σ=0)  → z=y,  total = 2B (all-reduce)
+        # --- B) Edge disagreement costs ---
         z_id = 0
-        for (r, uidx), bytes_val in exit_info.items():
-            consumer_spatial = self._get_spatial_roots_at_node(uidx)
+        for edge in self._factor_edges:
+            bytes_val = self._output_bytes(edge.producer_node)
+            if bytes_val <= 0:
+                continue
+
             for m in range(self.mesh.ndim):
                 mesh_size = self.mesh.shape[m]
-                y_r_m = self.y_vars[(r, m)]
-
-                # Base reduce-scatter cost (always incurred when y[r,m]=1).
                 comm_unit = bytes_val * (mesh_size - 1) / mesh_size / self._BW * 1e6
-                terms.append(comm_unit * y_r_m)
 
-                # Extra cost for Partial → Replicate (linearized).
-                valid_roots = [s for s in consumer_spatial if (s, m) in self.y_vars]
-                if valid_roots:
-                    z = pulp.LpVariable(f"z_pr_{z_id}", lowBound=0)
-                    spatial_sum = pulp.lpSum(
-                        self.y_vars[(s, m)] for s in valid_roots
-                    )
-                    self.prob += z >= y_r_m - spatial_sum, f"z_pr_lb_{z_id}"
+                y_prod = self.y_vars[(edge.producer_gid, m)]
+                y_cons = self.y_vars[(edge.consumer_gid, m)]
+
+                if edge.kind == "spatial":
+                    # All-gather when producer shards but consumer doesn't:
+                    # z >= y[producer, m] - y[consumer, m]; z >= 0
+                    z = pulp.LpVariable(f"z_ag_{z_id}", lowBound=0)
+                    self.prob += z >= y_prod - y_cons, f"z_ag_lb_{z_id}"
                     terms.append(comm_unit * z)
                     z_id += 1
                 else:
-                    # No spatial factors at consumer → always all-reduce.
-                    # Extra cost = B·(n-1)/n · y[r,m] (doubling the base).
-                    terms.append(comm_unit * y_r_m)
+                    # Reduction edge: Partial exit when producer is Partial
+                    # but consumer isn't.
+                    # z_exit >= y[producer, m] - y[consumer, m]; z_exit >= 0
+                    z_exit = pulp.LpVariable(f"z_re_{z_id}", lowBound=0)
+                    self.prob += z_exit >= y_prod - y_cons, f"z_re_lb_{z_id}"
+                    # Base reduce-scatter cost.
+                    terms.append(comm_unit * z_exit)
+
+                    # Upgrade to all-reduce when consumer has no spatial
+                    # factor on this mesh dim:
+                    # z_ar >= z_exit - Σ_s y[s, m]; z_ar >= 0
+                    consumer_spatial = self._get_spatial_gids_at_node(edge.consumer_nidx)
+                    valid_gids = [s for s in consumer_spatial if (s, m) in self.y_vars]
+                    if valid_gids:
+                        z_ar = pulp.LpVariable(f"z_ar_{z_id}", lowBound=0)
+                        spatial_sum = pulp.lpSum(
+                            self.y_vars[(s, m)] for s in valid_gids
+                        )
+                        self.prob += z_ar >= z_exit - spatial_sum, f"z_ar_lb_{z_id}"
+                        terms.append(comm_unit * z_ar)
+                    else:
+                        # No spatial factors → always all-reduce (double cost).
+                        terms.append(comm_unit * z_exit)
+                    z_id += 1
+
+        # --- C) Uncovered reduction exit costs ---
+        # For reduction factors at nodes whose Partial output has NO outgoing
+        # reduction edge to a consumer, model the exit cost directly.
+        covered_reduction_pairs: set[tuple[int, int]] = set()
+        for edge in self._factor_edges:
+            if edge.kind == "reduction":
+                covered_reduction_pairs.add(
+                    (edge.producer_nidx, edge.consumer_nidx)
+                )
+
+        for node in self.graph.nodes:
+            rule = self.factor_rules.get(node)
+            if rule is None:
+                continue
+            nidx = self.node_map[node]
+            for li, fac in enumerate(rule.factors):
+                if not fac.is_reduction:
+                    continue
+                gid = self.factor_keys.get((nidx, li))
+                if gid is None:
+                    continue
+
+                for user in node.users:
+                    if user.op != "call_function":
+                        continue
+                    uidx = self.node_map.get(user)
+                    if uidx is None:
+                        continue
+                    if (nidx, uidx) in covered_reduction_pairs:
+                        continue  # handled by edge disagreement above
+
+                    bytes_val = self._output_bytes(node)
+                    if bytes_val <= 0:
+                        continue
+
+                    consumer_spatial = self._get_spatial_gids_at_node(uidx)
+                    for m in range(self.mesh.ndim):
+                        mesh_size = self.mesh.shape[m]
+                        y_r_m = self.y_vars[(gid, m)]
+                        comm_unit = (
+                            bytes_val * (mesh_size - 1) / mesh_size / self._BW * 1e6
+                        )
+
+                        # Base reduce-scatter cost.
+                        terms.append(comm_unit * y_r_m)
+
+                        # Extra cost for Partial → Replicate (linearized).
+                        valid_gids = [
+                            s for s in consumer_spatial if (s, m) in self.y_vars
+                        ]
+                        if valid_gids:
+                            z = pulp.LpVariable(f"z_ure_{z_id}", lowBound=0)
+                            spatial_sum = pulp.lpSum(
+                                self.y_vars[(s, m)] for s in valid_gids
+                            )
+                            self.prob += z >= y_r_m - spatial_sum, f"z_ure_lb_{z_id}"
+                            terms.append(comm_unit * z)
+                            z_id += 1
+                        else:
+                            # No spatial factors → always all-reduce.
+                            terms.append(comm_unit * y_r_m)
 
         self._num_z_vars = z_id
 
@@ -828,87 +916,19 @@ class FactorShardingOptimizer:
         self._cost_cache[node] = cost
         return cost
 
-    def _compute_redistribution_bytes(
-        self,
-    ) -> tuple[dict[int, float], dict[int, float]]:
-        """For each factor root, total output bytes at "exit" edges.
-
-        Returns ``(ag_bytes, rs_bytes)``:
-
-        * **ag_bytes** — for *spatial* factors: bytes needing an all-gather
-          at edges where the consumer doesn't share the root.
-        * **rs_bytes** — for *reduction* factors: bytes needing a
-          reduce-scatter at edges where the ``Partial`` doesn't propagate
-          to the consumer.
-        """
-        # node_idx → set of factor roots at that node
-        node_roots: dict[int, set[int]] = defaultdict(set)
-        for (nidx, _li), gid in self.factor_keys.items():
-            node_roots[nidx].add(self.uf.find(gid))
-
-        ag_bytes: dict[int, float] = defaultdict(float)
-        rs_bytes: dict[int, float] = defaultdict(float)
-        for root, refs in self.factor_ops.items():
-            for node, fac, _li in refs:
-                for user in node.users:
-                    if user.op != "call_function":
-                        continue
-                    uidx = self.node_map.get(user)
-                    if uidx is None:
-                        continue
-                    if root in node_roots.get(uidx, set()):
-                        continue  # factor propagates — no redistribution
-
-                    if fac.is_reduction:
-                        # Partial exits here → reduce-scatter
-                        rs_bytes[root] += self._output_bytes(node)
-                    elif any(d is not None for d in fac.result_dims):
-                        # Shard exits here → all-gather
-                        ag_bytes[root] += self._output_bytes(node)
-
-        return dict(ag_bytes), dict(rs_bytes)
-
-    def _compute_reduction_exit_info(self) -> dict[tuple[int, int], float]:
-        """For each (reduction_root, consumer_nidx) pair, total bytes at exits.
-
-        Used by the linearized Partial → Replicate cost model to distinguish
-        reduce-scatter (consumer is Shard) from all-reduce (consumer is
-        Replicate) on each mesh dimension.
-        """
-        node_roots: dict[int, set[int]] = defaultdict(set)
-        for (nidx, _li), gid in self.factor_keys.items():
-            node_roots[nidx].add(self.uf.find(gid))
-
-        exit_info: dict[tuple[int, int], float] = defaultdict(float)
-        for root, refs in self.factor_ops.items():
-            for node, fac, _li in refs:
-                if not fac.is_reduction:
-                    continue
-                for user in node.users:
-                    if user.op != "call_function":
-                        continue
-                    uidx = self.node_map.get(user)
-                    if uidx is None:
-                        continue
-                    if root in node_roots.get(uidx, set()):
-                        continue  # factor propagates — no redistribution
-                    exit_info[(root, uidx)] += self._output_bytes(node)
-
-        return dict(exit_info)
-
-    def _get_spatial_roots_at_node(self, nidx: int) -> set[int]:
-        """Get unique roots for spatial (non-reduction) result factors at a node."""
+    def _get_spatial_gids_at_node(self, nidx: int) -> set[int]:
+        """Get gids for spatial (non-reduction) result factors at a node."""
         node = self.nodes[nidx]
         rule = self.factor_rules.get(node)
         if rule is None:
             return set()
-        roots: set[int] = set()
+        gids: set[int] = set()
         for li, fac in enumerate(rule.factors):
             if not fac.is_reduction and any(d is not None for d in fac.result_dims):
                 gid = self.factor_keys.get((nidx, li))
                 if gid is not None:
-                    roots.add(self.uf.find(gid))
-        return roots
+                    gids.add(gid)
+        return gids
 
     # -----------------------------------------------------------------
     # User constraints
@@ -931,31 +951,29 @@ class FactorShardingOptimizer:
                     if any(d == p.dim for d in fac.result_dims):
                         gid = self.factor_keys.get((nidx, li))
                         if gid is not None:
-                            root = self.uf.find(gid)
                             self.prob += (
-                                self.y_vars[(root, m)] == 1,
+                                self.y_vars[(gid, m)] == 1,
                                 f"pin_{nidx}_f{li}_m{m}",
                             )
                         break
             elif isinstance(p, Replicate):
-                seen_roots: set[int] = set()
+                seen_gids: set[int] = set()
                 for li, fac in enumerate(rule.factors):
                     if any(d is not None for d in fac.result_dims):
                         gid = self.factor_keys.get((nidx, li))
                         if gid is not None:
-                            root = self.uf.find(gid)
-                            if root not in seen_roots:
-                                seen_roots.add(root)
+                            if gid not in seen_gids:
+                                seen_gids.add(gid)
                                 self.prob += (
-                                    self.y_vars[(root, m)] == 0,
-                                    f"rep_{nidx}_r{root}_m{m}",
+                                    self.y_vars[(gid, m)] == 0,
+                                    f"rep_{nidx}_g{gid}_m{m}",
                                 )
 
     def add_grad_param_constraints(self) -> None:
         """Ensure parameters and their gradients have matching placements.
 
         For each (param, grad) pair, constrains every spatial factor to have
-        the same mesh-dim assignment:  ``y[param_root, m] == y[grad_root, m]``
+        the same mesh-dim assignment:  ``y[pk, m] == y[gk, m]``
         for all mesh dims ``m``.
         """
         for param, grad in get_param_and_grad_nodes(self.graph).values():
@@ -975,7 +993,6 @@ class FactorShardingOptimizer:
                 pk = self.factor_keys.get((pidx, p_li))
                 if pk is None:
                     continue
-                p_root = self.uf.find(pk)
 
                 # Find the matching factor in the grad (same result dim).
                 for g_li, g_fac in enumerate(grad_rule.factors):
@@ -984,12 +1001,11 @@ class FactorShardingOptimizer:
                     gk = self.factor_keys.get((gidx, g_li))
                     if gk is None:
                         continue
-                    g_root = self.uf.find(gk)
 
-                    if p_root != g_root:
+                    if pk != gk:
                         for m in range(self.mesh.ndim):
-                            pv = self.y_vars.get((p_root, m))
-                            gv = self.y_vars.get((g_root, m))
+                            pv = self.y_vars.get((pk, m))
+                            gv = self.y_vars.get((gk, m))
                             if pv is not None and gv is not None:
                                 self.prob += (
                                     pv == gv,
@@ -1044,23 +1060,22 @@ class FactorShardingOptimizer:
             if rule is None:
                 continue
 
-            # s_m = sum_fi y[root_fi, m]: is param sharded on mesh dim m?
+            # s_m = sum_fi y[gid_fi, m]: is param sharded on mesh dim m?
             # (0 or 1 due to tensor-exclusion constraints.)
             s_exprs: dict[int, list] = {}
             for m in range(k):
                 terms: list = []
-                seen_roots: set[int] = set()
+                seen_gids: set[int] = set()
                 for li, fac in enumerate(rule.factors):
                     if not fac.result_dims or fac.result_dims[0] is None:
                         continue
                     gid = self.factor_keys.get((nidx, li))
                     if gid is None:
                         continue
-                    root = self.uf.find(gid)
-                    if root in seen_roots:
+                    if gid in seen_gids:
                         continue
-                    seen_roots.add(root)
-                    var = self.y_vars.get((root, m))
+                    seen_gids.add(gid)
+                    var = self.y_vars.get((gid, m))
                     if var is not None:
                         terms.append(var)
                 s_exprs[m] = terms
@@ -1180,10 +1195,11 @@ class FactorShardingOptimizer:
             )
 
         # Extract factor → mesh-dim assignments.
-        assignment: dict[int, int] = {}  # root → mesh_dim
-        for (root, m), var in self.y_vars.items():
+        # A gid can map to multiple mesh dims (e.g. (Shard(0), Shard(0))).
+        assignment: dict[int, list[int]] = defaultdict(list)
+        for (gid, m), var in self.y_vars.items():
             if var.varValue is not None and var.varValue > 0.5:
-                assignment[root] = m
+                assignment[gid].append(m)
 
         # Reconstruct per-node placements.
         result: dict[torch.fx.Node, OpSpec] = {}
@@ -1205,15 +1221,12 @@ class FactorShardingOptimizer:
                     gid = self.factor_keys.get((nidx, li))
                     if gid is None:
                         continue
-                    root = self.uf.find(gid)
-                    m = assignment.get(root)
-                    if m is None:
-                        continue
-                    if fac.is_reduction:
-                        placements[m] = Partial()
-                    else:
-                        if fac.result_dims and fac.result_dims[0] is not None:
-                            placements[m] = Shard(fac.result_dims[0])
+                    for m in assignment.get(gid, []):
+                        if fac.is_reduction:
+                            placements[m] = Partial()
+                        else:
+                            if fac.result_dims and fac.result_dims[0] is not None:
+                                placements[m] = Shard(fac.result_dims[0])
                 tensor_meta = TensorMeta(val.shape, val.stride(), val.dtype)
                 output_specs = DTensorSpec(
                     self.mesh, tuple(placements), tensor_meta=tensor_meta
@@ -1229,17 +1242,14 @@ class FactorShardingOptimizer:
                             gid = self.factor_keys.get((nidx, li))
                             if gid is None:
                                 continue
-                            root = self.uf.find(gid)
-                            m_assigned = assignment.get(root)
-                            if m_assigned is None:
-                                continue
-                            if fac.is_reduction:
-                                plc_list[m_assigned] = Partial()
-                            elif (
-                                ri < len(fac.result_dims)
-                                and fac.result_dims[ri] is not None
-                            ):
-                                plc_list[m_assigned] = Shard(fac.result_dims[ri])
+                            for m_assigned in assignment.get(gid, []):
+                                if fac.is_reduction:
+                                    plc_list[m_assigned] = Partial()
+                                elif (
+                                    ri < len(fac.result_dims)
+                                    and fac.result_dims[ri] is not None
+                                ):
+                                    plc_list[m_assigned] = Shard(fac.result_dims[ri])
                         tm = TensorMeta(v.shape, v.stride(), v.dtype)
                         specs.append(
                             DTensorSpec(self.mesh, tuple(plc_list), tensor_meta=tm)
@@ -1274,7 +1284,7 @@ class FactorShardingOptimizer:
         node: torch.fx.Node,
         rule: FactorRule,
         nidx: int,
-        assignment: dict[int, int],
+        assignment: dict[int, list[int]],
     ) -> list[DTensorSpec]:
         """Reconstruct input DTensorSpecs from factor assignments.
 
@@ -1299,16 +1309,13 @@ class FactorShardingOptimizer:
                 gid = self.factor_keys.get((nidx, li))
                 if gid is None:
                     continue
-                root = self.uf.find(gid)
-                m_assigned = assignment.get(root)
-                if m_assigned is None:
-                    continue
-                if oi < len(fac.operand_dims):
-                    od = fac.operand_dims[oi]
-                    if od is not None:
-                        inp_placements[m_assigned] = Shard(od)
-                    elif fac.is_reduction:
-                        inp_placements[m_assigned] = Partial()
+                for m_assigned in assignment.get(gid, []):
+                    if oi < len(fac.operand_dims):
+                        od = fac.operand_dims[oi]
+                        if od is not None:
+                            inp_placements[m_assigned] = Shard(od)
+                        elif fac.is_reduction:
+                            inp_placements[m_assigned] = Partial()
 
             # Get TensorMeta from the corresponding input node.
             inp_tm = None
@@ -1384,7 +1391,7 @@ class FactorShardingOptimizer:
 
     def get_stats(self) -> dict[str, Any]:
         """Return ILP size statistics (useful for comparing with original)."""
-        roots = self._unique_roots()
+        num_unique_factors = len(set(self.factor_keys.values()))
 
         # Estimate original variable count.
         orig_vars = 0
@@ -1400,7 +1407,8 @@ class FactorShardingOptimizer:
         n_aux_vars = getattr(self, "_num_z_vars", 0)
         return {
             "num_graph_nodes": len(self.nodes),
-            "num_unique_factors": len(roots),
+            "num_unique_factors": num_unique_factors,
+            "num_edges": len(self._factor_edges),
             "num_factor_ilp_variables": n_factor_vars + n_aux_vars,
             "num_factor_y_variables": n_factor_vars,
             "num_factor_z_variables": n_aux_vars,
@@ -1416,6 +1424,7 @@ class FactorShardingOptimizer:
         lines.append(f"Factor ILP status: {pulp.LpStatus[self.prob.status]}")
         s = self.get_stats()
         lines.append(f"Unique factors:           {s['num_unique_factors']}")
+        lines.append(f"Factor edges:             {s['num_edges']}")
         lines.append(f"Factor ILP variables:     {s['num_factor_ilp_variables']} ({s['num_factor_y_variables']} y + {s['num_factor_z_variables']} z)")
         lines.append(f"Factor ILP constraints:   {s['num_factor_ilp_constraints']}")
         lines.append(
@@ -1424,16 +1433,28 @@ class FactorShardingOptimizer:
         lines.append(f"Variable reduction:       {s['variable_reduction_ratio']:.1f}x")
 
         if verbose and self.prob.status == 1:
+            # Build reverse lookup: gid → (node, factor, local_idx)
+            gid_to_info: dict[int, tuple[torch.fx.Node, Factor, int]] = {}
+            for node in self.graph.nodes:
+                rule = self.factor_rules.get(node)
+                if rule is None:
+                    continue
+                nidx = self.node_map[node]
+                for li, fac in enumerate(rule.factors):
+                    gid = self.factor_keys.get((nidx, li))
+                    if gid is not None and gid not in gid_to_info:
+                        gid_to_info[gid] = (node, fac, li)
+
             lines.append("")
             lines.append("Factor assignments:")
-            for (root, m), var in sorted(self.y_vars.items()):
+            for (gid, m), var in sorted(self.y_vars.items()):
                 if var.varValue is not None and var.varValue > 0.5:
-                    refs = self.factor_ops.get(root, [])
+                    info = gid_to_info.get(gid)
                     desc = ""
-                    if refs:
-                        _, fac, _ = refs[0]
+                    if info is not None:
+                        _, fac, _ = info
                         kind = "reduction" if fac.is_reduction else "spatial"
                         desc = f" ({kind}, size={fac.size})"
-                    lines.append(f"  Factor {root} → mesh dim {m}{desc}")
+                    lines.append(f"  Factor {gid} → mesh dim {m}{desc}")
 
         return "\n".join(lines)
