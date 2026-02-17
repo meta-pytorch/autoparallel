@@ -45,7 +45,6 @@ Example: ``mm(A[M,K], B[K,N]) -> C[M,N]``
 
 from __future__ import annotations
 
-import math
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -60,11 +59,10 @@ from torch._functorch._aot_autograd.fx_utils import (
 )
 from torch.distributed._tensor.placement_types import TensorMeta
 from torch.distributed.tensor._dtensor_spec import DTensorSpec
-from torch.distributed.tensor._op_schema import OpSpec, OpStrategy
-from torch.distributed.tensor.placement_types import Placement, Replicate, Shard
+from torch.distributed.tensor._op_schema import OpStrategy
+from torch.distributed.tensor.placement_types import Partial, Placement, Replicate, Shard
 from torch.utils._pytree import tree_map_only
 
-from .cost_models.compute_estimation import estimate_strategy_runtime_cost
 from .shardings.placement_options import get_placement_options
 from .shardings.propagation_rules import _create_all_options
 
@@ -75,7 +73,7 @@ from .shardings.propagation_rules import _create_all_options
 
 def _is_partial(p: Placement) -> bool:
     """Check if a placement is Partial (reduction output)."""
-    return not isinstance(p, (Shard, Replicate))
+    return isinstance(p, Partial)
 
 
 @dataclass
@@ -577,16 +575,20 @@ class FactorShardingOptimizer:
     def _add_objective(self, roots: set[int]) -> None:
         """Build the cost function.
 
-        For each factor *f* assigned to mesh dim *m*:
+        For each factor *f* assigned to mesh dim *m* the cost coefficient
+        includes three components:
 
-        * **Reduction factor** → ``+allreduce_cost(output_bytes, mesh.shape[m])``
-        * **Spatial factor**   → ``-compute_savings(op, mesh.shape[m])``
+        1. **Compute benefit** (all factors): sharding any dimension divides
+           work by ``mesh.shape[m]``.
+        2. **Allreduce penalty** (reduction factors): the ``Partial`` output
+           must be all-reduced before consumers can use it.
+        3. **All-gather penalty** (spatial factors at "exit" edges): when a
+           producer is ``Shard(d)`` on mesh dim *m* but a consumer doesn't
+           share that factor (via union-find), an all-gather is needed.
 
-        This is a *first-order* (linear) approximation.  The true compute cost
-        depends on the product of all shard sizes, which would make the
-        objective quadratic.  The linear model captures the dominant effects:
-        allreduce penalties and per-factor parallelism benefits.
+        All three are linear in the ``y`` variables, keeping the ILP linear.
         """
+        ag_bytes = self._compute_redistribution_bytes()
         terms: list[Any] = []
 
         for r in roots:
@@ -611,8 +613,13 @@ class FactorShardingOptimizer:
                         # Allreduce penalty: ring algorithm ≈ 2·B·(n-1)/n
                         out_bytes = self._output_bytes(node)
                         ar_bytes = 2.0 * out_bytes * (mesh_size - 1) / mesh_size
-                        # Rough bandwidth model: 50 GB/s per link
-                        cost += ar_bytes / 50e9 * 1e6  # microseconds
+                        cost += ar_bytes / self._BW * 1e6  # microseconds
+
+                # All-gather penalty for exit edges (spatial factors whose
+                # consumers don't share the root).
+                if r in ag_bytes:
+                    ag_comm = ag_bytes[r] * (mesh_size - 1) / mesh_size
+                    cost += ag_comm / self._BW * 1e6
 
                 if cost != 0.0:
                     terms.append(cost * var)
@@ -622,19 +629,96 @@ class FactorShardingOptimizer:
 
     # ---- cost helpers -----------------------------------------------
 
+    # Rough inter-node bandwidth (bytes/s).  50 GB/s is a reasonable
+    # default for NVLink / high-end InfiniBand.
+    _BW: float = 50e9
+
     @staticmethod
     def _output_bytes(node: torch.fx.Node) -> float:
-        val = node.meta.get("val")
-        if val is not None and isinstance(val, torch.Tensor):
+        val = _get_primary_tensor(node.meta.get("val"))
+        if val is not None:
             return float(val.numel() * val.element_size())
         return 0.0
 
     @staticmethod
     def _compute_cost(node: torch.fx.Node) -> float:
-        try:
-            return float(estimate_strategy_runtime_cost(node, None))
-        except Exception:
+        """Estimate compute cost in FLOPs for compute-intensive ops."""
+        if node.op != "call_function":
             return 0.0
+        target = node.target
+
+        def _shape(n: Any) -> tuple[int, ...] | None:
+            if isinstance(n, torch.fx.Node):
+                t = _get_primary_tensor(n.meta.get("val"))
+                if t is not None:
+                    return tuple(t.shape)
+            return None
+
+        # mm(A[M,K], B[K,N]) → 2·M·K·N
+        if target == torch.ops.aten.mm.default:
+            a, b = _shape(node.args[0]), _shape(node.args[1])
+            if a and b and len(a) == 2 and len(b) == 2:
+                M, K = a
+                _, N = b
+                return 2.0 * M * K * N
+
+        # addmm(bias, A[M,K], B[K,N]) → 2·M·K·N
+        if target == torch.ops.aten.addmm.default:
+            a, b = _shape(node.args[1]), _shape(node.args[2])
+            if a and b and len(a) == 2 and len(b) == 2:
+                M, K = a
+                _, N = b
+                return 2.0 * M * K * N
+
+        # bmm(A[B,M,K], B[B,K,N]) → 2·B·M·K·N
+        if target == torch.ops.aten.bmm.default:
+            a, b = _shape(node.args[0]), _shape(node.args[1])
+            if a and b and len(a) == 3 and len(b) == 3:
+                B, M, K = a
+                _, _, N = b
+                return 2.0 * B * M * K * N
+
+        # SDPA — dominated by two bmm-like ops internally:
+        #   scores = Q·K^T → 2·B·H·S·S·D
+        #   output = scores·V → 2·B·H·S·S·D
+        if "scaled_dot_product" in str(target):
+            q = _shape(node.args[0])
+            if q and len(q) == 4:
+                B, H, S, D = q
+                return 2.0 * 2 * B * H * S * S * D  # two bmm-equivalent
+
+        return 0.0
+
+    def _compute_redistribution_bytes(self) -> dict[int, float]:
+        """For each factor root, total output bytes at "exit" edges.
+
+        An exit edge is a producer→consumer edge where the producer has a
+        spatial factor with root *R* but the consumer doesn't share *R*
+        (via union-find).  When *R* is assigned to a mesh dim the consumer
+        needs an all-gather on that edge.
+        """
+        # node_idx → set of factor roots at that node
+        node_roots: dict[int, set[int]] = defaultdict(set)
+        for (nidx, _li), gid in self.factor_keys.items():
+            node_roots[nidx].add(self.uf.find(gid))
+
+        ag_bytes: dict[int, float] = defaultdict(float)
+        for root, refs in self.factor_ops.items():
+            for node, fac, _li in refs:
+                # Only spatial factors produce Shard output.
+                if fac.is_reduction:
+                    continue
+                if not fac.result_dims or fac.result_dims[0] is None:
+                    continue
+                for user in node.users:
+                    if user.op != "call_function":
+                        continue
+                    uidx = self.node_map.get(user)
+                    if uidx is None:
+                        continue
+                    if root not in node_roots.get(uidx, set()):
+                        ag_bytes[root] += self._output_bytes(node)
+        return dict(ag_bytes)
 
     # -----------------------------------------------------------------
     # User constraints
@@ -767,18 +851,18 @@ class FactorShardingOptimizer:
             placements: list[Placement] = [Replicate()] * self.mesh.ndim
 
             for li, fac in enumerate(rule.factors):
-                if not fac.result_dims or fac.result_dims[0] is None:
-                    continue
                 gid = self.factor_keys.get((nidx, li))
                 if gid is None:
                     continue
                 root = self.uf.find(gid)
                 m = assignment.get(root)
-                if m is not None:
-                    td = fac.result_dims[0]
-                    # A factor may be spatial here but reduction in another op.
-                    # For the *output* placement we use Shard(dim).
-                    placements[m] = Shard(td)
+                if m is None:
+                    continue
+                if fac.is_reduction:
+                    # Reduction factor → output is Partial on this mesh dim.
+                    placements[m] = Partial()
+                elif fac.result_dims and fac.result_dims[0] is not None:
+                    placements[m] = Shard(fac.result_dims[0])
 
             val = node.meta.get("val")
             if val is not None and isinstance(val, torch.Tensor):
