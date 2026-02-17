@@ -60,9 +60,9 @@ from torch._functorch._aot_autograd.fx_utils import (
 )
 from torch.distributed._tensor.placement_types import TensorMeta
 from torch.distributed.tensor._dtensor_spec import DTensorSpec
-from torch.distributed.tensor._op_schema import OpStrategy
+from torch.distributed.tensor._op_schema import OpSpec, OpStrategy
 from torch.distributed.tensor.placement_types import Partial, Placement, Replicate, Shard
-from torch.utils._pytree import tree_map_only
+from torch.utils._pytree import tree_flatten, tree_map_only
 
 from .cost_models.compute_estimation import estimate_strategy_runtime_cost
 from .shardings.placement_options import get_placement_options
@@ -1009,8 +1009,8 @@ class FactorShardingOptimizer:
     # Solve
     # -----------------------------------------------------------------
 
-    def get_solution(self, verbose: bool = False) -> dict[torch.fx.Node, DTensorSpec]:
-        """Solve the factor ILP and reconstruct per-node DTensorSpecs."""
+    def get_solution(self, verbose: bool = False) -> dict[torch.fx.Node, OpSpec]:
+        """Solve the factor ILP and reconstruct per-node OpSpecs."""
         solver = pulp.PULP_CBC_CMD(msg=verbose)
         self.prob.solve(solver)
 
@@ -1028,7 +1028,7 @@ class FactorShardingOptimizer:
                 assignment[root] = m
 
         # Reconstruct per-node placements.
-        result: dict[torch.fx.Node, DTensorSpec] = {}
+        result: dict[torch.fx.Node, OpSpec] = {}
         for node in self.graph.nodes:
             if node.op == "output":
                 continue
@@ -1036,28 +1036,28 @@ class FactorShardingOptimizer:
             if rule is None:
                 continue
             nidx = self.node_map[node]
-            placements: list[Placement] = [Replicate()] * self.mesh.ndim
 
-            for li, fac in enumerate(rule.factors):
-                gid = self.factor_keys.get((nidx, li))
-                if gid is None:
-                    continue
-                root = self.uf.find(gid)
-                m = assignment.get(root)
-                if m is None:
-                    continue
-                if fac.is_reduction:
-                    # Reduction factor → output is Partial on this mesh dim.
-                    placements[m] = Partial()
-                else:
-                    # Use result_dims[0] for single-output nodes.
-                    if fac.result_dims and fac.result_dims[0] is not None:
-                        placements[m] = Shard(fac.result_dims[0])
-
+            # --- Build output_specs ---
+            output_specs = None
             val = node.meta.get("val")
+
             if val is not None and isinstance(val, torch.Tensor):
+                placements: list[Placement] = [Replicate()] * self.mesh.ndim
+                for li, fac in enumerate(rule.factors):
+                    gid = self.factor_keys.get((nidx, li))
+                    if gid is None:
+                        continue
+                    root = self.uf.find(gid)
+                    m = assignment.get(root)
+                    if m is None:
+                        continue
+                    if fac.is_reduction:
+                        placements[m] = Partial()
+                    else:
+                        if fac.result_dims and fac.result_dims[0] is not None:
+                            placements[m] = Shard(fac.result_dims[0])
                 tensor_meta = TensorMeta(val.shape, val.stride(), val.dtype)
-                result[node] = DTensorSpec(
+                output_specs = DTensorSpec(
                     self.mesh, tuple(placements), tensor_meta=tensor_meta
                 )
             elif val is not None and isinstance(val, (tuple, list)):
@@ -1088,9 +1088,92 @@ class FactorShardingOptimizer:
                         )
                     else:
                         specs.append(None)
-                result[node] = tuple(specs)
+                output_specs = tuple(specs)
+
+            if output_specs is None:
+                continue
+
+            # --- Build input_specs ---
+            input_specs = self._build_input_specs(node, rule, nidx, assignment)
+
+            result[node] = OpSpec(
+                output_specs=output_specs, input_specs=input_specs or None
+            )
 
         return result
+
+    def _build_input_specs(
+        self,
+        node: torch.fx.Node,
+        rule: FactorRule,
+        nidx: int,
+        assignment: dict[int, int],
+    ) -> list[DTensorSpec]:
+        """Reconstruct input DTensorSpecs from factor assignments.
+
+        For each operand, the placement on each mesh dim is derived from the
+        factor assigned to that mesh dim:
+
+        - ``operand_dims[oi]`` is not None → ``Shard(dim)``
+        - ``operand_dims[oi]`` is None and ``is_reduction`` → ``Partial``
+        - otherwise → ``Replicate``
+        """
+        if rule.num_operands == 0:
+            return []
+
+        # Tensor input nodes in tree_flatten order (matches operand indexing).
+        flat_args, _ = tree_flatten(node.args)
+        tensor_args = [a for a in flat_args if isinstance(a, torch.fx.Node)]
+
+        input_specs: list[DTensorSpec] = []
+        for oi in range(rule.num_operands):
+            inp_placements: list[Placement] = [Replicate()] * self.mesh.ndim
+            for li, fac in enumerate(rule.factors):
+                gid = self.factor_keys.get((nidx, li))
+                if gid is None:
+                    continue
+                root = self.uf.find(gid)
+                m_assigned = assignment.get(root)
+                if m_assigned is None:
+                    continue
+                if oi < len(fac.operand_dims):
+                    od = fac.operand_dims[oi]
+                    if od is not None:
+                        inp_placements[m_assigned] = Shard(od)
+                    elif fac.is_reduction:
+                        inp_placements[m_assigned] = Partial()
+
+            # Get TensorMeta from the corresponding input node.
+            inp_tm = None
+            if oi < len(tensor_args):
+                arg_val = tensor_args[oi].meta.get("val")
+                if isinstance(arg_val, torch.Tensor):
+                    inp_tm = TensorMeta(
+                        arg_val.shape, arg_val.stride(), arg_val.dtype
+                    )
+                elif isinstance(arg_val, (tuple, list)):
+                    # Multi-output producer (e.g. getitem consuming SDPA).
+                    # Use the getitem index to find the correct tensor.
+                    if (
+                        node.target is operator.getitem
+                        and oi == 0
+                        and len(node.args) > 1
+                        and isinstance(node.args[1], int)
+                    ):
+                        idx = node.args[1]
+                        if idx < len(arg_val) and isinstance(
+                            arg_val[idx], torch.Tensor
+                        ):
+                            v = arg_val[idx]
+                            inp_tm = TensorMeta(v.shape, v.stride(), v.dtype)
+
+            input_specs.append(
+                DTensorSpec(
+                    self.mesh, tuple(inp_placements), tensor_meta=inp_tm
+                )
+            )
+
+        return input_specs
 
     # -----------------------------------------------------------------
     # Diagnostics
