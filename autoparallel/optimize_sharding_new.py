@@ -55,6 +55,7 @@ import torch
 import torch.fx
 from torch._functorch._aot_autograd.descriptors import PlainAOTInput, PlainAOTOutput
 from torch._functorch._aot_autograd.fx_utils import (
+    get_param_and_grad_nodes,
     get_plain_input_and_grad_nodes,
     get_plain_output_and_tangent_nodes,
 )
@@ -948,6 +949,52 @@ class FactorShardingOptimizer:
                                     self.y_vars[(root, m)] == 0,
                                     f"rep_{nidx}_r{root}_m{m}",
                                 )
+
+    def add_grad_param_constraints(self) -> None:
+        """Ensure parameters and their gradients have matching placements.
+
+        For each (param, grad) pair, constrains every spatial factor to have
+        the same mesh-dim assignment:  ``y[param_root, m] == y[grad_root, m]``
+        for all mesh dims ``m``.
+        """
+        for param, grad in get_param_and_grad_nodes(self.graph).values():
+            if grad is None:
+                continue
+            param_rule = self.factor_rules.get(param)
+            grad_rule = self.factor_rules.get(grad)
+            if param_rule is None or grad_rule is None:
+                continue
+            pidx = self.node_map[param]
+            gidx = self.node_map[grad]
+
+            for p_li, p_fac in enumerate(param_rule.factors):
+                if not p_fac.result_dims or p_fac.result_dims[0] is None:
+                    continue
+                p_dim = p_fac.result_dims[0]
+                pk = self.factor_keys.get((pidx, p_li))
+                if pk is None:
+                    continue
+                p_root = self.uf.find(pk)
+
+                # Find the matching factor in the grad (same result dim).
+                for g_li, g_fac in enumerate(grad_rule.factors):
+                    if not g_fac.result_dims or g_fac.result_dims[0] != p_dim:
+                        continue
+                    gk = self.factor_keys.get((gidx, g_li))
+                    if gk is None:
+                        continue
+                    g_root = self.uf.find(gk)
+
+                    if p_root != g_root:
+                        for m in range(self.mesh.ndim):
+                            pv = self.y_vars.get((p_root, m))
+                            gv = self.y_vars.get((g_root, m))
+                            if pv is not None and gv is not None:
+                                self.prob += (
+                                    pv == gv,
+                                    f"grad_param_{pidx}_{gidx}_d{p_dim}_m{m}",
+                                )
+                    break
 
     def add_input_constraints(
         self, input_placements: list[tuple[Placement, ...] | None] | None = None
