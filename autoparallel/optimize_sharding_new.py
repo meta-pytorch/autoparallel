@@ -624,12 +624,12 @@ class FactorShardingOptimizer:
                 self.y_vars[(gid, m)] = pulp.LpVariable(f"y_{gid}_m{m}", cat="Binary")
 
         # --- Constraints ---
-        # NOTE: we intentionally omit a factor-uniqueness constraint here.
-        # A factor MAY be assigned to multiple mesh dims simultaneously,
-        # which corresponds to placements like (Shard(0), Shard(0)) where a
-        # single tensor dim is sharded across several mesh dims.  The tensor
-        # exclusion constraint already prevents invalid combos (two different
-        # factors claiming the same tensor dim on the same mesh dim).
+        # Factor uniqueness: each factor is assigned to at most one mesh dim.
+        # This prevents the solver from choosing multi-dim assignments like
+        # (Shard(0), Shard(0)) on its own, which can produce invalid placements.
+        # When the user explicitly pins (S(0), S(0)) via add_node_constraint,
+        # the uniqueness constraint for that factor is relaxed.
+        self._add_factor_uniqueness(all_gids)
         self._add_tensor_exclusion()
         self._add_reduction_propagation_constraints()
         self._add_disabled_reduction_constraints()
@@ -945,6 +945,11 @@ class FactorShardingOptimizer:
             return
         nidx = self.node_map[node]
 
+        # Track which gids are pinned to 1 on which mesh dims, so we can
+        # relax the factor uniqueness constraint for multi-dim pins like
+        # (Shard(0), Shard(0)).
+        pinned_gids: dict[int, list[int]] = defaultdict(list)
+
         for m, p in enumerate(placement):
             if isinstance(p, Shard):
                 for li, fac in enumerate(rule.factors):
@@ -955,6 +960,7 @@ class FactorShardingOptimizer:
                                 self.y_vars[(gid, m)] == 1,
                                 f"pin_{nidx}_f{li}_m{m}",
                             )
+                            pinned_gids[gid].append(m)
                         break
             elif isinstance(p, Replicate):
                 seen_gids: set[int] = set()
@@ -968,6 +974,13 @@ class FactorShardingOptimizer:
                                     self.y_vars[(gid, m)] == 0,
                                     f"rep_{nidx}_g{gid}_m{m}",
                                 )
+
+        # Relax factor uniqueness for gids pinned to multiple mesh dims.
+        for gid, mesh_dims in pinned_gids.items():
+            if len(mesh_dims) > 1:
+                constraint_name = f"fac_uniq_{gid}"
+                if constraint_name in self.prob.constraints:
+                    del self.prob.constraints[constraint_name]
 
     def add_grad_param_constraints(self) -> None:
         """Ensure parameters and their gradients have matching placements.
@@ -1286,14 +1299,18 @@ class FactorShardingOptimizer:
         nidx: int,
         assignment: dict[int, list[int]],
     ) -> list[DTensorSpec]:
-        """Reconstruct input DTensorSpecs from factor assignments.
+        """Reconstruct input DTensorSpecs from the consumer's factor assignments.
 
         For each operand, the placement on each mesh dim is derived from the
-        factor assigned to that mesh dim:
+        consumer node's factor assigned to that mesh dim:
 
         - ``operand_dims[oi]`` is not None → ``Shard(dim)``
         - ``operand_dims[oi]`` is None and ``is_reduction`` → ``Partial``
         - otherwise → ``Replicate``
+
+        The resulting input_specs tell ``apply_sharding`` what placement this
+        op needs its inputs in.  If a producer's output_specs differ,
+        ``apply_sharding`` will redistribute automatically.
         """
         if rule.num_operands == 0:
             return []
