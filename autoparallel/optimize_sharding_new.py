@@ -63,6 +63,7 @@ from torch.distributed.tensor._op_schema import OpStrategy
 from torch.distributed.tensor.placement_types import Partial, Placement, Replicate, Shard
 from torch.utils._pytree import tree_map_only
 
+from .cost_models.compute_estimation import estimate_strategy_runtime_cost
 from .shardings.placement_options import get_placement_options
 from .shardings.propagation_rules import _create_all_options
 
@@ -350,6 +351,7 @@ class FactorShardingOptimizer:
         self._collect_factor_metadata()
 
         # -- Step 5: build ILP.
+        self._cost_cache: dict[torch.fx.Node, float] = {}
         self.prob = pulp.LpProblem("AutoParallel_Factor", pulp.LpMinimize)
         self.y_vars: dict[tuple[int, int], pulp.LpVariable] = {}
         self._build_ilp()
@@ -426,7 +428,7 @@ class FactorShardingOptimizer:
                 self.factor_keys[(nidx, li)] = gid
                 self.uf.make_set(gid)
 
-        # Merge factors across producer → consumer edges.
+        # Merge spatial factors across producer → consumer edges.
         for node in self.graph.nodes:
             if node.op != "call_function":
                 continue
@@ -449,7 +451,6 @@ class FactorShardingOptimizer:
                     if arg_pos >= len(c_fac.operand_dims):
                         continue
                     c_dim = c_fac.operand_dims[arg_pos]
-
                     if c_dim is not None:
                         # Spatial factor: match by dimension index.
                         for p_li, p_fac in enumerate(producer_rule.factors):
@@ -461,20 +462,79 @@ class FactorShardingOptimizer:
                                 ck = self.factor_keys.get((cidx, c_li))
                                 if pk is not None and ck is not None:
                                     self.uf.union(pk, ck)
-                    elif c_fac.is_reduction:
-                        # Reduction factor pass-through (Partial → Partial).
-                        # Data-preserving ops (view, permute, alias, …) have
-                        # a strategy atom (out=Partial, in=Partial) which
-                        # produces a factor with operand_dims=[None] and
-                        # result_dims=[None].  Merge it with the producer's
-                        # reduction factor so that Partial propagates.
-                        for p_li, p_fac in enumerate(producer_rule.factors):
-                            if p_fac.is_reduction:
-                                pk = self.factor_keys.get((pidx, p_li))
-                                ck = self.factor_keys.get((cidx, c_li))
-                                if pk is not None and ck is not None:
-                                    self.uf.union(pk, ck)
-                                break  # one-to-one merge
+
+        # Merge reduction factors (Partial → Partial pass-through) in a
+        # separate pass, after spatial merging is complete.
+        self._merge_reduction_factors()
+
+    def _merge_reduction_factors(self) -> None:
+        """Merge reduction factors across edges only when ALL operands agree.
+
+        For data-preserving ops (view, permute, alias, …), a Partial can
+        propagate through the op because the strategy has an atom
+        ``(out=Partial, in=Partial)`` which produces a reduction factor with
+        ``operand_dims=[None]`` and ``result_dims=[None]``.
+
+        For multi-operand ops like add/mul, the reduction factor has
+        ``operand_dims=[None, None]`` — ALL operands must be Partial.
+        We must only merge when every operand that maps to ``None`` in the
+        factor can provide a Partial from its producer.  Otherwise, the
+        resulting placement (e.g. ``add(Partial, Shard)``) is invalid.
+        """
+        for node in self.graph.nodes:
+            if node.op != "call_function":
+                continue
+            consumer_rule = self.factor_rules.get(node)
+            if consumer_rule is None:
+                continue
+            cidx = self.node_map[node]
+
+            for c_li, c_fac in enumerate(consumer_rule.factors):
+                if not c_fac.is_reduction:
+                    continue
+                ck = self.factor_keys.get((cidx, c_li))
+                if ck is None:
+                    continue
+
+                # Collect producer reduction keys for each operand that
+                # needs Partial, and validate that ALL can provide it.
+                merge_pairs: list[tuple[int, int]] = []
+                all_valid = True
+
+                for arg_pos, c_od in enumerate(c_fac.operand_dims):
+                    if c_od is not None:
+                        continue  # Spatial dim on this operand, not Partial
+
+                    # This operand must be Partial for the factor to propagate.
+                    if arg_pos >= len(node.args):
+                        all_valid = False
+                        break
+                    arg = node.args[arg_pos]
+                    if not isinstance(arg, torch.fx.Node):
+                        all_valid = False
+                        break
+                    producer_rule = self.factor_rules.get(arg)
+                    if producer_rule is None:
+                        all_valid = False
+                        break
+                    pidx = self.node_map[arg]
+
+                    # Find a reduction factor at the producer.
+                    found = False
+                    for p_li, p_fac in enumerate(producer_rule.factors):
+                        if p_fac.is_reduction:
+                            pk = self.factor_keys.get((pidx, p_li))
+                            if pk is not None:
+                                merge_pairs.append((pk, ck))
+                                found = True
+                            break
+                    if not found:
+                        all_valid = False
+                        break
+
+                if all_valid and merge_pairs:
+                    for pk, ck_val in merge_pairs:
+                        self.uf.union(pk, ck_val)
 
     # -----------------------------------------------------------------
     # Step 4 — metadata collection
@@ -706,54 +766,22 @@ class FactorShardingOptimizer:
             return float(val.numel() * val.element_size())
         return 0.0
 
-    @staticmethod
-    def _compute_cost(node: torch.fx.Node) -> float:
-        """Estimate compute cost in FLOPs for compute-intensive ops."""
-        if node.op != "call_function":
-            return 0.0
-        target = node.target
+    def _compute_cost(self, node: torch.fx.Node) -> float:
+        """Estimate unsharded compute cost for a node in microseconds.
 
-        def _shape(n: Any) -> tuple[int, ...] | None:
-            if isinstance(n, torch.fx.Node):
-                t = _get_primary_tensor(n.meta.get("val"))
-                if t is not None:
-                    return tuple(t.shape)
-            return None
-
-        # mm(A[M,K], B[K,N]) → 2·M·K·N
-        if target == torch.ops.aten.mm.default:
-            a, b = _shape(node.args[0]), _shape(node.args[1])
-            if a and b and len(a) == 2 and len(b) == 2:
-                M, K = a
-                _, N = b
-                return 2.0 * M * K * N
-
-        # addmm(bias, A[M,K], B[K,N]) → 2·M·K·N
-        if target == torch.ops.aten.addmm.default:
-            a, b = _shape(node.args[1]), _shape(node.args[2])
-            if a and b and len(a) == 2 and len(b) == 2:
-                M, K = a
-                _, N = b
-                return 2.0 * M * K * N
-
-        # bmm(A[B,M,K], B[B,K,N]) → 2·B·M·K·N
-        if target == torch.ops.aten.bmm.default:
-            a, b = _shape(node.args[0]), _shape(node.args[1])
-            if a and b and len(a) == 3 and len(b) == 3:
-                B, M, K = a
-                _, _, N = b
-                return 2.0 * B * M * K * N
-
-        # SDPA — dominated by two bmm-like ops internally:
-        #   scores = Q·K^T → 2·B·H·S·S·D
-        #   output = scores·V → 2·B·H·S·S·D
-        if "scaled_dot_product" in str(target):
-            q = _shape(node.args[0])
-            if q and len(q) == 4:
-                B, H, S, D = q
-                return 2.0 * 2 * B * H * S * S * D  # two bmm-equivalent
-
-        return 0.0
+        Uses ``estimate_strategy_runtime_cost`` from ``compute_estimation.py``
+        which accounts for both FLOP-bound ops (matmul, bmm, SDPA) and
+        memory-bound ops (pointwise add, relu, etc.).  View ops return 0.
+        Results are cached per node.
+        """
+        if node in self._cost_cache:
+            return self._cost_cache[node]
+        try:
+            cost = estimate_strategy_runtime_cost(node, None)
+        except Exception:
+            cost = 0.0
+        self._cost_cache[node] = cost
+        return cost
 
     def _compute_redistribution_bytes(
         self,
