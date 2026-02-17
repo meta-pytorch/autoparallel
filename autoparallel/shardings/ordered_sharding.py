@@ -5,7 +5,7 @@
 
 import operator
 from collections import namedtuple
-from typing import Any, Optional, Union
+from typing import Optional, Union
 
 import torch
 from torch._functorch._aot_autograd.fx_utils import get_param_and_grad_nodes
@@ -19,6 +19,15 @@ from torch.distributed.tensor.placement_types import (  # noqa
     Shard,
 )
 from torch.utils._pytree import tree_flatten
+
+# Supported placement patterns for the ordered sharding optimization
+_PARAM_PLACEMENT = (Shard(0), Shard(0))
+_PARAM_TARGET_PLACEMENT = (Replicate(), Shard(0))
+_GRAD_PLACEMENT = (Partial(), Shard(0))
+_GRAD_TARGET_PLACEMENT = (Shard(0), Shard(0))
+
+# Stores ordering information for nodes that need redistribution
+OrderInfo = namedtuple("OrderInfo", ["is_target_reversed_order", "need_reorder"])
 
 
 def _optimize_same_nd_sharding_as_1d(
@@ -132,25 +141,40 @@ def get_redistributed_input_placements(
     return res
 
 
-def compute_optimal_placement_order_for_parameters(module, sharding_placement):
+def build_param_grad_linear_chains(
+    param_and_grad_nodes: list[tuple[torch.fx.Node, Optional[torch.fx.Node]]],
+) -> tuple[
+    dict[torch.fx.Node, torch.fx.Node], dict[torch.fx.Node, list[torch.fx.Node]]
+]:
     """
-    This function computes the optimal placement order for parameters and
-    gradients, based on the sharding placement. The optimal placement order is
-    defined as the order in which the parameters and gradients should be
-    placed, such that the number of communication steps is minimized.
+    Build linear dependency chains for parameters and their corresponding gradients.
 
-    For now this function only optimizes the case where the parameters are
-    distributed as S(0)S(0) -> RS(0) and the gradients are distributed
-    as PS(0) -> S(0)S(0). We should generalize this in the future.
+    For each parameter node, traces forward through users to find a linear chain
+    of nodes that depend on the parameter (i.e., nodes with single inputs).
+
+    For each gradient node (if present), traces backward through inputs to find
+    a linear chain of nodes that lead to the gradient.
+
+    Args:
+        param_and_grad_nodes: List of (parameter_node, gradient_node) pairs.
+            gradient_node can be None for non-trainable parameters.
+
+    Returns:
+        A tuple of two dictionaries:
+        - node_to_source: Maps each node in the chains back to its source
+          (the original parameter or gradient node).
+        - source_to_chain: Maps each parameter/gradient node to its linear chain
+          of dependent nodes. For parameters, the chain goes from source to
+          the last single-input user. For gradients, the chain goes from the
+          gradient node backward to the first multi-input node.
     """
-    param_and_grad_nodes = list(get_param_and_grad_nodes(module.graph).values())
-    # this is actually parameter users and gradient inputs
-    # but well, naming is hard
-    param_and_grad_users = {}
-    param_grad_chain = {}
+    node_to_source: dict[torch.fx.Node, torch.fx.Node] = {}
+    source_to_chain: dict[torch.fx.Node, list[torch.fx.Node]] = {}
+
     for param, grad in param_and_grad_nodes:
+        # Build forward chain of users for the parameter
         last_p = list(param.users)[0]
-        p_chain = [param]
+        p_chain: list[torch.fx.Node] = [param]
         # get all linear chain of users of the parameter
         while len(last_p.all_input_nodes) == 1:
             p_chain.append(last_p)
@@ -158,113 +182,179 @@ def compute_optimal_placement_order_for_parameters(module, sharding_placement):
             # maybe?
             last_p = list(last_p.users.keys())[0]
         for p in p_chain:
-            param_and_grad_users[p] = param
+            node_to_source[p] = param
         # order from source to dest
-        param_grad_chain[param] = p_chain
+        source_to_chain[param] = p_chain
 
         # TODO: optimize case where parameter doesn't require gradient
         if grad is None:
             continue
+
+        # Build backward chain of inputs for the gradient
         last_g = grad
-        g_chain = []
+        g_chain: list[torch.fx.Node] = []
         # get all linear chain of inputs that lead to the gradient
         while len(last_g.all_input_nodes) == 1:
             g_chain.append(last_g)
             last_g = last_g.all_input_nodes[0]
         for p in g_chain:
-            param_and_grad_users[p] = grad
+            node_to_source[p] = grad
         # order from dest to source
-        param_grad_chain[grad] = g_chain
+        source_to_chain[grad] = g_chain
 
-    redistribution_map = {}
-    mesh_ndim = None
-    for user_node, param_or_grad_node in param_and_grad_users.items():
-        d = get_redistributed_input_placements(user_node, sharding_placement)
-        if d:
-            redistribution_map[param_or_grad_node] = (user_node, d)
-            if mesh_ndim is None:
-                user_src_placement = list(d.values())[0][0]
-                mesh_ndim = len(user_src_placement)
+    return node_to_source, source_to_chain
 
-    param_grad_map = dict(param_and_grad_nodes)
-    aligned_pg = []
-    for param_or_grad_node in redistribution_map.keys():
-        # just allow for arbitrary execution order if both param and grad
-        # are in the map
-        if param_or_grad_node in param_grad_map:
-            param_node = param_or_grad_node
-            grad_node = param_grad_map[param_node]
-            if grad_node in redistribution_map:
-                aligned_pg.append(
-                    (
-                        param_node,
-                        grad_node,
-                        list(redistribution_map[param_node][1].values())[0],
-                        list(redistribution_map[grad_node][1].values())[0],
-                    )
-                )
 
-    # map node to (is reversed order originally?, need reorder?)
-    OrderInfo = namedtuple("OrderInfo", ["is_target_reversed_order", "need_reorder"])
-    redistribute_node_order: dict[Any, OrderInfo] = {}
+def _assign_order_info_to_chain(
+    chain: list[torch.fx.Node],
+    target_node: torch.fx.Node,
+    target_reversed_order: bool,
+    order_map: dict[torch.fx.Node, OrderInfo],
+) -> None:
+    """
+    Assign OrderInfo to nodes in a chain up to and including the target node.
+
+    For nodes before the target, they maintain their current order (need_reorder=False).
+    The target node itself needs reordering (need_reorder=True).
+
+    Args:
+        chain: List of nodes in the dependency chain.
+        target_node: The node where reordering should occur.
+        target_reversed_order: The is_target_reversed_order value for the target node.
+        order_map: Dictionary to populate with OrderInfo for each node.
+    """
+    for node in chain:
+        if node == target_node:
+            order_map[node] = OrderInfo(
+                is_target_reversed_order=target_reversed_order, need_reorder=True
+            )
+            break
+        else:
+            order_map[node] = OrderInfo(
+                is_target_reversed_order=True, need_reorder=False
+            )
+
+
+def compute_optimal_placement_order_for_parameters(
+    module: torch.fx.GraphModule,
+    sharding_placement: dict[torch.fx.Node, OpSpec],
+) -> dict[torch.fx.Node, OrderInfo]:
+    """
+    Compute the optimal placement order for parameters and gradients.
+
+    The optimal placement order minimizes the number of communication steps
+    by determining which nodes need their shard order reversed during
+    redistribution.
+
+    Currently only optimizes the case where:
+    - Parameters: S(0)S(0) -> RS(0) (forward pass)
+    - Gradients: PS(0) -> S(0)S(0) (backward pass)
+
+    Args:
+        module: The FX GraphModule containing parameter and gradient nodes.
+        sharding_placement: Mapping from nodes to their sharding OpSpec.
+
+    Returns:
+        Dictionary mapping nodes to their OrderInfo, indicating whether
+        they need reordering and their target order.
+    """
+    param_and_grad_nodes = list(get_param_and_grad_nodes(module.graph).values())
+
+    node_to_source, source_to_chain = build_param_grad_linear_chains(
+        param_and_grad_nodes
+    )
+
+    # Build map of source nodes (params/grads) to their redistribution info
+    redistribution_map: dict[
+        torch.fx.Node,
+        tuple[
+            torch.fx.Node,
+            dict[torch.fx.Node, tuple[tuple[Placement, ...], tuple[Placement, ...]]],
+        ],
+    ] = {}
+    for user_node, source_node in node_to_source.items():
+        redistribution_info = get_redistributed_input_placements(
+            user_node, sharding_placement
+        )
+        if redistribution_info:
+            redistribution_map[source_node] = (user_node, redistribution_info)
+
+    # Find param-grad pairs where both require redistribution
+    param_to_grad_map = dict(param_and_grad_nodes)
+    matched_param_grad_pairs: list[
+        tuple[
+            torch.fx.Node,
+            torch.fx.Node,
+            tuple[tuple[Placement, ...], tuple[Placement, ...]],
+            tuple[tuple[Placement, ...], tuple[Placement, ...]],
+        ]
+    ] = []
+    for source_node in redistribution_map.keys():
+        if source_node not in param_to_grad_map:
+            continue
+        param_node = source_node
+        grad_node = param_to_grad_map[param_node]
+        if grad_node not in redistribution_map:
+            continue
+        # Extract (current_placement, target_placement) for param and grad
+        param_placements = list(redistribution_map[param_node][1].values())[0]
+        grad_placements = list(redistribution_map[grad_node][1].values())[0]
+        matched_param_grad_pairs.append(
+            (param_node, grad_node, param_placements, grad_placements)
+        )
+
+    redistribute_node_order: dict[torch.fx.Node, OrderInfo] = {}
 
     for (
         param_node,
         grad_node,
-        (node_plc, node_tgt_plc),
-        (grad_plc, grad_tgt_plc),
-    ) in aligned_pg:
-        if node_plc != grad_tgt_plc:
-            # TODO: handle this
-            print("Skipping", param_node, grad_node, node_plc, grad_tgt_plc)
+        (param_curr_plc, param_tgt_plc),
+        (grad_curr_plc, grad_tgt_plc),
+    ) in matched_param_grad_pairs:
+        # Skip if param source placement doesn't match grad target placement
+        if param_curr_plc != grad_tgt_plc:
             continue
-        src_input = redistribution_map[param_node][0]
-        src_grad = redistribution_map[grad_node][0]
-        # Only support S(0)S(0) -> RS(0) and PS(0) -> S(0)S optimizations.
-        if node_plc == (Shard(0), Shard(0)) and node_tgt_plc == (
-            Replicate(),
-            Shard(0),
-        ):
-            if grad_plc == (Partial(), Shard(0)) and grad_tgt_plc == (
-                Shard(0),
-                Shard(0),
-            ):
-                # last node with single input after param use order [0, 1].
-                # note: we need to make all front nodes ordered as [1,0]
-                # handle forward pass param related nodes
-                param_node = param_and_grad_users[src_input]
-                param_chain = param_grad_chain[param_node]
-                # node that need to be reverse the order from (1,0) to (0,1)
-                node_to_reorder = src_input
-                # node between [param_and_grad_users[src_input], src_input) are under order [1,0],
-                for p in param_chain:
-                    if p == node_to_reorder:
-                        redistribute_node_order[p] = OrderInfo(
-                            is_target_reversed_order=False, need_reorder=True
-                        )
-                        break
-                    else:
-                        redistribute_node_order[p] = OrderInfo(
-                            is_target_reversed_order=True, need_reorder=False
-                        )
 
-                # handle backward pass grad related nodes
-                grad_node = param_and_grad_users[src_grad]
-                grad_chain = param_grad_chain[grad_node]
-                # node that need to be reverse the order from (0,1) to (1,0)
-                node_to_reorder = src_grad
-                # node between [param_and_grad_users[src_grad], src_grad) are under order [1,0],
-                for p in grad_chain:
-                    if p == node_to_reorder:
-                        redistribute_node_order[p] = OrderInfo(
-                            is_target_reversed_order=True, need_reorder=True
-                        )
-                        break
-                    else:
-                        # below is supposed not to be triggered
-                        redistribute_node_order[p] = OrderInfo(
-                            is_target_reversed_order=True, need_reorder=False
-                        )
-    for node, (order, _) in redistribute_node_order.items():
-        node.meta["shard_order"] = order
+        # Only support S(0)S(0) -> RS(0) and PS(0) -> S(0)S(0) optimizations
+        is_supported_param_pattern = (
+            param_curr_plc == _PARAM_PLACEMENT
+            and param_tgt_plc == _PARAM_TARGET_PLACEMENT
+        )
+        is_supported_grad_pattern = (
+            grad_curr_plc == _GRAD_PLACEMENT and grad_tgt_plc == _GRAD_TARGET_PLACEMENT
+        )
+
+        if not (is_supported_param_pattern and is_supported_grad_pattern):
+            continue
+
+        # Get the user nodes where redistribution occurs
+        param_redistrib_node = redistribution_map[param_node][0]
+        grad_redistrib_node = redistribution_map[grad_node][0]
+
+        # Handle forward pass: assign order info to param chain
+        # Nodes need order reversed from (1,0) to (0,1) at the redistribution point
+        param_source = node_to_source[param_redistrib_node]
+        param_chain = source_to_chain[param_source]
+        _assign_order_info_to_chain(
+            param_chain,
+            target_node=param_redistrib_node,
+            target_reversed_order=False,
+            order_map=redistribute_node_order,
+        )
+
+        # Handle backward pass: assign order info to grad chain
+        # Nodes need order reversed from (0,1) to (1,0) at the redistribution point
+        grad_source = node_to_source[grad_redistrib_node]
+        grad_chain = source_to_chain[grad_source]
+        _assign_order_info_to_chain(
+            grad_chain,
+            target_node=grad_redistrib_node,
+            target_reversed_order=True,
+            order_map=redistribute_node_order,
+        )
+
+    # Apply shard_order metadata to nodes
+    for node, order_info in redistribute_node_order.items():
+        node.meta["shard_order"] = order_info.is_target_reversed_order
+
     return redistribute_node_order
