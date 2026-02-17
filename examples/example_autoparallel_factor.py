@@ -178,12 +178,13 @@ with AutoParallel(model, input_fn, mesh, mp_policy) as autop:
     # ------------------------------------------------------------------
     # 4. Show per-node placement comparison
     # ------------------------------------------------------------------
+    n_show = 100
     print("\n" + "=" * 70)
-    print("PER-NODE PLACEMENT COMPARISON (first 30 call_function nodes)")
+    print(f"PER-NODE PLACEMENT COMPARISON (first {n_show} call_function nodes)")
     print("=" * 70)
 
     call_fn_nodes = [n for n in gm.graph.nodes if n.op == "call_function"]
-    for node in call_fn_nodes[:30]:
+    for node in call_fn_nodes[:n_show]:
         orig_spec = orig_solution.get(node)
         factor_spec = factor_solution.get(node)
 
@@ -197,7 +198,15 @@ with AutoParallel(model, input_fn, mesh, mp_policy) as autop:
                 orig_plc = "?"
         else:
             orig_plc = "?"
-        factor_plc = tuple(factor_spec.placements) if factor_spec is not None else "?"
+        if factor_spec is not None:
+            if isinstance(factor_spec, DTensorSpec):
+                factor_plc = tuple(factor_spec.placements)
+            elif isinstance(factor_spec, (list, tuple)) and factor_spec:
+                factor_plc = tuple(factor_spec[0].placements)
+            else:
+                factor_plc = "?"
+        else:
+            factor_plc = "?"
         match = "OK" if str(orig_plc) == str(factor_plc) else "DIFF"
         op_name = str(node)
         # Truncate long op names

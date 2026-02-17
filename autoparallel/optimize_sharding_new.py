@@ -167,6 +167,21 @@ class UnionFind:
 # ---------------------------------------------------------------------------
 
 
+def _get_primary_tensor(val: Any) -> torch.Tensor | None:
+    """Extract the primary tensor from a node's meta 'val'.
+
+    For single-tensor outputs, returns the tensor directly.
+    For tuple outputs (multi-output ops like SDPA), returns the first tensor.
+    """
+    if isinstance(val, torch.Tensor):
+        return val
+    if isinstance(val, (tuple, list)):
+        for v in val:
+            if isinstance(v, torch.Tensor):
+                return v
+    return None
+
+
 def _infer_factor_size(
     node: torch.fx.Node,
     operand_dims: list[int | None],
@@ -174,24 +189,20 @@ def _infer_factor_size(
 ) -> int:
     """Infer the size of a factor from the node's tensor metadata."""
     # Try the node's own output first.
-    val = node.meta.get("val")
-    if val is not None and isinstance(val, torch.Tensor):
+    out = _get_primary_tensor(node.meta.get("val"))
+    if out is not None:
         for d in result_dims:
-            if d is not None and d < len(val.shape):
-                return val.shape[d]
+            if d is not None and d < len(out.shape):
+                return out.shape[d]
     # Fall back to operand shapes.
     for arg_idx, d in enumerate(operand_dims):
         if d is None or arg_idx >= len(node.args):
             continue
         arg = node.args[arg_idx]
         if isinstance(arg, torch.fx.Node):
-            arg_val = arg.meta.get("val")
-            if (
-                arg_val is not None
-                and isinstance(arg_val, torch.Tensor)
-                and d < len(arg_val.shape)
-            ):
-                return arg_val.shape[d]
+            arg_out = _get_primary_tensor(arg.meta.get("val"))
+            if arg_out is not None and d < len(arg_out.shape):
+                return arg_out.shape[d]
     return 1  # fallback
 
 
@@ -269,10 +280,10 @@ def _placeholder_factor_rule(node: torch.fx.Node) -> FactorRule:
 
     Each tensor dimension becomes an independent spatial factor.
     """
-    val = node.meta.get("val")
-    if val is None or not isinstance(val, torch.Tensor):
+    out = _get_primary_tensor(node.meta.get("val"))
+    if out is None:
         return FactorRule(factors=[], num_operands=0, num_results=1)
-    shape = val.shape
+    shape = out.shape
     factors = [
         Factor(id=d, size=shape[d], operand_dims=[], result_dims=[d])
         for d in range(len(shape))
@@ -775,6 +786,23 @@ class FactorShardingOptimizer:
                 result[node] = DTensorSpec(
                     self.mesh, tuple(placements), tensor_meta=tensor_meta
                 )
+            elif val is not None and isinstance(val, (tuple, list)):
+                # Multi-output op (e.g. SDPA).  The factors describe the
+                # primary (first) output.  For each output tensor, keep only
+                # Shard placements whose dim is in range for that tensor.
+                specs = []
+                for v in val:
+                    if isinstance(v, torch.Tensor):
+                        plc = tuple(
+                            p if not isinstance(p, Shard) or p.dim < len(v.shape)
+                            else Replicate()
+                            for p in placements
+                        )
+                        tm = TensorMeta(v.shape, v.stride(), v.dtype)
+                        specs.append(DTensorSpec(self.mesh, plc, tensor_meta=tm))
+                    else:
+                        specs.append(None)
+                result[node] = tuple(specs)
 
         return result
 
