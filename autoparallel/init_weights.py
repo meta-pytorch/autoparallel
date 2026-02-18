@@ -86,25 +86,17 @@ class _InitWeightsDispatchMode(TorchDispatchMode):
     that handles redistribution automatically.
     """
 
-    def __init__(self) -> None:
-        super().__init__()
-        self._handling = False
-
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):  # type: ignore[no-untyped-def]
-        if func == torch.ops.aten.copy_.default and not self._handling:
+        if func == torch.ops.aten.copy_.default:
             dst = args[0]
             src = args[1]
             if isinstance(dst, DTensor) and not isinstance(src, DTensor):
-                self._handling = True
-                try:
-                    # Interpret src as a full/global tensor and wrap it as
-                    # Replicated, then copy into dst which redistributes
-                    # automatically (e.g. Replicate → Shard).
-                    new_src = DTensor.from_local(src, device_mesh=dst.device_mesh)
-                    with torch.no_grad():
-                        dst.copy_(new_src)
-                finally:
-                    self._handling = False
+                # Interpret src as a full/global tensor and wrap it as
+                # Replicated, then copy into dst which redistributes
+                # automatically (e.g. Replicate → Shard).
+                new_src = DTensor.from_local(src, device_mesh=dst.device_mesh)
+                with torch.no_grad():
+                    dst.copy_(new_src)
                 return dst
         return func(*args, **(kwargs or {}))
 
