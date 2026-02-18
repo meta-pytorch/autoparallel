@@ -7,6 +7,7 @@ from typing import Any, Union
 import torch
 from torch._dynamo.utils import warn_once
 from torch.distributed.tensor import DTensor
+from torch.utils._python_dispatch import TorchDispatchMode
 
 
 def _submod_setattr(model: torch.nn.Module, fqn: str, value: Any):
@@ -74,6 +75,49 @@ def _build_buffer_property(parallel_model: torch.nn.Module, fqn: str):
     return property(getter, setter)
 
 
+class _InitWeightsDispatchMode(TorchDispatchMode):
+    """Intercepts in-place copy operations on DTensor parameter local tensors
+    during init_weights execution.
+
+    When a user's init_weights does ``self.weight.data[:] = value``, the ``.data``
+    accessor on a DTensor returns the local tensor (which has shard shape for
+    sharded parameters). The ``[:] = value`` then dispatches ``aten.copy_`` from
+    the global-shaped value into the shard-shaped local tensor, causing a shape
+    mismatch. This mode intercepts such ``copy_`` calls and redirects them through
+    ``_copy_set_value_to_dtensor`` for proper redistribution.
+    """
+
+    def __init__(self, parallel_model: torch.nn.Module):
+        super().__init__()
+        self.param_data_ptrs: dict[int, tuple[str, DTensor]] = {}
+        for fqn, param in parallel_model.named_parameters():
+            if isinstance(param, DTensor):
+                self.param_data_ptrs[param.data_ptr()] = (fqn, param)
+        for fqn, buf in parallel_model.named_buffers():
+            if isinstance(buf, DTensor):
+                self.param_data_ptrs[buf.data_ptr()] = (fqn, buf)
+        self._handling = False
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):  # type: ignore[no-untyped-def]
+        if func == torch.ops.aten.copy_.default and not self._handling:
+            dst = args[0]
+            src = args[1]
+            if dst.data_ptr() in self.param_data_ptrs and not isinstance(
+                src, DTensor
+            ):
+                fqn, dtensor = self.param_data_ptrs[dst.data_ptr()]
+                # Prevent re-entrant interception: _copy_set_value_to_dtensor
+                # internally calls parallel_value.copy_(), which dispatches
+                # further copy_ ops on the same local tensor.
+                self._handling = True
+                try:
+                    _copy_set_value_to_dtensor(fqn, dtensor, src)
+                finally:
+                    self._handling = False
+                return dst
+        return func(*args, **(kwargs or {}))
+
+
 def hook_params_setters(
     init_weights_model: torch.nn.Module, parallel_model: torch.nn.Module
 ) -> None:
@@ -91,6 +135,9 @@ def hook_params_setters(
     Adds one 'property' (e.g. getter+setter) obj for each parameter name at the right spot in
     the module hierarchy.  For self.layer.weight, this would install a 'weight' property on the self.layer
     submodule.
+
+    Also wraps init_weights_model.init_weights (if present) with a TorchDispatchMode
+    to handle in-place data operations like ``self.weight.data[:] = value``.
     """
     for mod_name, mod in sorted(init_weights_model.named_modules()):
         params_dict = dict(mod.named_parameters(recurse=False))
@@ -109,3 +156,15 @@ def hook_params_setters(
         # nn.Module.__setattr__ gets in the way
         namespace["__setattr__"] = object.__setattr__
         mod.__class__ = type(f"HookedInit{cls.__name__}", (cls,), namespace)
+
+    # Wrap init_weights to activate a dispatch mode that intercepts in-place
+    # copy operations (e.g. self.weight.data[:] = value) on DTensor local tensors.
+    if hasattr(init_weights_model, "init_weights"):
+        mode = _InitWeightsDispatchMode(parallel_model)
+        original_init_weights = init_weights_model.init_weights
+
+        def wrapped_init_weights(*args, **kwargs):  # type: ignore[no-untyped-def]
+            with mode:
+                return original_init_weights(*args, **kwargs)
+
+        init_weights_model.init_weights = wrapped_init_weights
