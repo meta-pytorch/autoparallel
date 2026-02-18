@@ -66,6 +66,13 @@ from torch.distributed.tensor._op_schema import OpSpec, OpStrategy
 from torch.distributed.tensor.placement_types import Partial, Placement, Replicate, Shard
 from torch.utils._pytree import tree_flatten, tree_map_only
 
+from torch.distributed.tensor._collective_utils import (
+    MeshTopoInfo,
+    allgather_cost,
+    allreduce_cost,
+    reduce_scatter_cost,
+)
+
 from .cost_models.compute_estimation import estimate_strategy_runtime_cost
 from .shardings.placement_options import get_placement_options
 from .shardings.propagation_rules import _create_all_options
@@ -379,6 +386,7 @@ class FactorShardingOptimizer:
         self.graph = gm.graph
         self.nodes = list(self.graph.nodes)
         self.mesh = mesh
+        self.mesh_topo = MeshTopoInfo.build_from_mesh(mesh)
         self.node_map: dict[torch.fx.Node, int] = {
             n: i for i, n in enumerate(self.nodes)
         }
@@ -744,15 +752,20 @@ class FactorShardingOptimizer:
         2. **Edge disagreement costs** (per FactorEdge per mesh_dim):
 
            - *Spatial edges*: all-gather when producer shards but consumer
-             doesn't.  Cost = B·(n-1)/n.
+             doesn't.
            - *Reduction edges*: reduce-scatter/all-reduce when producer is
              Partial but consumer isn't.
 
         3. **Uncovered reduction exit costs**: for reduction factors with NO
            outgoing reduction edge to a consumer, add Partial→{Shard,Replicate}
            linearized cost directly.
+
+        Communication costs use per-mesh-dim bandwidth/latency from
+        ``MeshTopoInfo`` via ``allgather_cost``, ``reduce_scatter_cost``,
+        and ``allreduce_cost``.
         """
         terms: list[Any] = []
+        mesh_topo = self.mesh_topo
 
         # --- A) Compute benefit ---
         for node in self.graph.nodes:
@@ -778,45 +791,50 @@ class FactorShardingOptimizer:
             bytes_val = self._output_bytes(edge.producer_node)
             if bytes_val <= 0:
                 continue
+            bytes_gb = bytes_val / 1024 / 1024 / 1024
 
             for m in range(self.mesh.ndim):
-                mesh_size = self.mesh.shape[m]
-                comm_unit = bytes_val * (mesh_size - 1) / mesh_size / self._BW * 1e6
-
                 y_prod = self.y_vars[(edge.producer_gid, m)]
                 y_cons = self.y_vars[(edge.consumer_gid, m)]
 
                 if edge.kind == "spatial":
                     # All-gather when producer shards but consumer doesn't:
                     # z >= y[producer, m] - y[consumer, m]; z >= 0
+                    ag_cost = allgather_cost(bytes_gb, mesh_topo, m)
                     z = pulp.LpVariable(f"z_ag_{z_id}", lowBound=0)
                     self.prob += z >= y_prod - y_cons, f"z_ag_lb_{z_id}"
-                    terms.append(comm_unit * z)
+                    terms.append(ag_cost * z)
                     z_id += 1
                 else:
                     # Reduction edge: Partial exit when producer is Partial
                     # but consumer isn't.
                     # z_exit >= y[producer, m] - y[consumer, m]; z_exit >= 0
+                    rs_cost = reduce_scatter_cost(bytes_gb, mesh_topo, m)
                     z_exit = pulp.LpVariable(f"z_re_{z_id}", lowBound=0)
                     self.prob += z_exit >= y_prod - y_cons, f"z_re_lb_{z_id}"
                     # Base reduce-scatter cost.
-                    terms.append(comm_unit * z_exit)
+                    terms.append(rs_cost * z_exit)
 
                     # Upgrade to all-reduce when consumer has no spatial
                     # factor on this mesh dim:
                     # z_ar >= z_exit - Σ_s y[s, m]; z_ar >= 0
+                    ar_cost = allreduce_cost(bytes_gb, mesh_topo, m)
+                    ar_extra = ar_cost - rs_cost
                     consumer_spatial = self._get_spatial_gids_at_node(edge.consumer_nidx)
                     valid_gids = [s for s in consumer_spatial if (s, m) in self.y_vars]
                     if valid_gids:
-                        z_ar = pulp.LpVariable(f"z_ar_{z_id}", lowBound=0)
-                        spatial_sum = pulp.lpSum(
-                            self.y_vars[(s, m)] for s in valid_gids
-                        )
-                        self.prob += z_ar >= z_exit - spatial_sum, f"z_ar_lb_{z_id}"
-                        terms.append(comm_unit * z_ar)
+                        if ar_extra > 0:
+                            z_ar = pulp.LpVariable(f"z_ar_{z_id}", lowBound=0)
+                            spatial_sum = pulp.lpSum(
+                                self.y_vars[(s, m)] for s in valid_gids
+                            )
+                            self.prob += z_ar >= z_exit - spatial_sum, f"z_ar_lb_{z_id}"
+                            terms.append(ar_extra * z_ar)
                     else:
-                        # No spatial factors → always all-reduce (double cost).
-                        terms.append(comm_unit * z_exit)
+                        # No spatial factors → always all-reduce (extra cost
+                        # on top of reduce-scatter already added).
+                        if ar_extra > 0:
+                            terms.append(ar_extra * z_exit)
                     z_id += 1
 
         # --- C) Uncovered reduction exit costs ---
@@ -853,33 +871,35 @@ class FactorShardingOptimizer:
                     bytes_val = self._output_bytes(node)
                     if bytes_val <= 0:
                         continue
+                    bytes_gb = bytes_val / 1024 / 1024 / 1024
 
                     consumer_spatial = self._get_spatial_gids_at_node(uidx)
                     for m in range(self.mesh.ndim):
-                        mesh_size = self.mesh.shape[m]
                         y_r_m = self.y_vars[(gid, m)]
-                        comm_unit = (
-                            bytes_val * (mesh_size - 1) / mesh_size / self._BW * 1e6
-                        )
+                        rs_cost = reduce_scatter_cost(bytes_gb, mesh_topo, m)
 
                         # Base reduce-scatter cost.
-                        terms.append(comm_unit * y_r_m)
+                        terms.append(rs_cost * y_r_m)
 
                         # Extra cost for Partial → Replicate (linearized).
+                        ar_cost = allreduce_cost(bytes_gb, mesh_topo, m)
+                        ar_extra = ar_cost - rs_cost
                         valid_gids = [
                             s for s in consumer_spatial if (s, m) in self.y_vars
                         ]
                         if valid_gids:
-                            z = pulp.LpVariable(f"z_ure_{z_id}", lowBound=0)
-                            spatial_sum = pulp.lpSum(
-                                self.y_vars[(s, m)] for s in valid_gids
-                            )
-                            self.prob += z >= y_r_m - spatial_sum, f"z_ure_lb_{z_id}"
-                            terms.append(comm_unit * z)
-                            z_id += 1
+                            if ar_extra > 0:
+                                z = pulp.LpVariable(f"z_ure_{z_id}", lowBound=0)
+                                spatial_sum = pulp.lpSum(
+                                    self.y_vars[(s, m)] for s in valid_gids
+                                )
+                                self.prob += z >= y_r_m - spatial_sum, f"z_ure_lb_{z_id}"
+                                terms.append(ar_extra * z)
+                                z_id += 1
                         else:
                             # No spatial factors → always all-reduce.
-                            terms.append(comm_unit * y_r_m)
+                            if ar_extra > 0:
+                                terms.append(ar_extra * y_r_m)
 
         self._num_z_vars = z_id
 
@@ -887,10 +907,6 @@ class FactorShardingOptimizer:
             self.prob += pulp.lpSum(terms)
 
     # ---- cost helpers -----------------------------------------------
-
-    # Rough inter-node bandwidth (bytes/s).  50 GB/s is a reasonable
-    # default for NVLink / high-end InfiniBand.
-    _BW: float = 50e9
 
     @staticmethod
     def _output_bytes(node: torch.fx.Node) -> float:
