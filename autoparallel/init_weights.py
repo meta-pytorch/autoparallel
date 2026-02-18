@@ -7,6 +7,7 @@ from typing import Any, Union
 import torch
 from torch._dynamo.utils import warn_once
 from torch.distributed.tensor import DTensor
+from torch.utils._python_dispatch import TorchDispatchMode
 
 
 def _submod_setattr(model: torch.nn.Module, fqn: str, value: Any):
@@ -74,6 +75,32 @@ def _build_buffer_property(parallel_model: torch.nn.Module, fqn: str):
     return property(getter, setter)
 
 
+class _InitWeightsDispatchMode(TorchDispatchMode):
+    """Intercepts in-place copy operations on DTensors during init_weights.
+
+    When a user's init_weights does ``self.weight.data[:] = value``, the ``.data``
+    accessor on a DTensor returns a (detached) DTensor.  The ``[:] = value`` then
+    dispatches ``aten.copy_`` with a DTensor dst and a plain-tensor src, which
+    DTensor rejects as mixed types.  This mode intercepts such calls, wraps the
+    src as a Replicated DTensor, and performs a proper DTensor-to-DTensor copy
+    that handles redistribution automatically.
+    """
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):  # type: ignore[no-untyped-def]
+        if func == torch.ops.aten.copy_.default:
+            dst = args[0]
+            src = args[1]
+            if isinstance(dst, DTensor) and not isinstance(src, DTensor):
+                # Interpret src as a full/global tensor and wrap it as
+                # Replicated, then copy into dst which redistributes
+                # automatically (e.g. Replicate → Shard).
+                new_src = DTensor.from_local(src, device_mesh=dst.device_mesh)
+                with torch.no_grad():
+                    dst.copy_(new_src)
+                return dst
+        return func(*args, **(kwargs or {}))
+
+
 def hook_params_setters(
     init_weights_model: torch.nn.Module, parallel_model: torch.nn.Module
 ) -> None:
@@ -91,6 +118,9 @@ def hook_params_setters(
     Adds one 'property' (e.g. getter+setter) obj for each parameter name at the right spot in
     the module hierarchy.  For self.layer.weight, this would install a 'weight' property on the self.layer
     submodule.
+
+    Also wraps init_weights_model.init_weights (if present) with a TorchDispatchMode
+    to handle in-place data operations like ``self.weight.data[:] = value``.
     """
     for mod_name, mod in sorted(init_weights_model.named_modules()):
         params_dict = dict(mod.named_parameters(recurse=False))
@@ -109,3 +139,15 @@ def hook_params_setters(
         # nn.Module.__setattr__ gets in the way
         namespace["__setattr__"] = object.__setattr__
         mod.__class__ = type(f"HookedInit{cls.__name__}", (cls,), namespace)
+
+    # Wrap init_weights to activate a dispatch mode that intercepts in-place
+    # copy operations (e.g. self.weight.data[:] = value) on DTensor local tensors.
+    if hasattr(init_weights_model, "init_weights"):
+        mode = _InitWeightsDispatchMode()
+        original_init_weights = init_weights_model.init_weights
+
+        def wrapped_init_weights(*args, **kwargs):  # type: ignore[no-untyped-def]
+            with mode:
+                return original_init_weights(*args, **kwargs)
+
+        init_weights_model.init_weights = wrapped_init_weights  # type: ignore[assignment]

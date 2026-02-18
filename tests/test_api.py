@@ -117,6 +117,57 @@ def test_init(device_mesh_1d):
     )
 
 
+def test_init_inplace_data(device_mesh_1d):
+    """Test that init_weights using self.weight.data[:] = value works correctly."""
+    dim = 128
+
+    class Model(nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            self.linear = nn.Linear(dim, dim)
+            self.register_buffer("buf", torch.empty(dim))
+
+        def forward(self, x):
+            return self.linear(x) + self.buf
+
+        def init_weights(self):
+            self.linear.weight.data[:] = torch.ones(dim, dim) * 9.0
+            self.linear.bias.data[:] = torch.full((dim,), 98.6)
+            self.buf.data[:] = torch.arange(dim, dtype=torch.float32)
+
+    def input_fn():
+        b = 512
+        inputs = (torch.rand(b, dim, device="cuda"),)
+        return inputs
+
+    with torch.device("meta"):
+        model = Model(dim)
+    with AutoParallel(
+        model,
+        input_fn,
+        device_mesh_1d,
+    ) as autop:
+        x_sharding = (Shard(0),)
+        autop.add_input_constraints([x_sharding])
+        sharding_placement = autop.optimize_placement()
+
+        parallel_mod = autop.apply_placement(sharding_placement)
+    parallel_mod.to_empty(device="cuda")
+    parallel_mod.init_weights()
+    assert torch.equal(
+        parallel_mod.get_parameter("linear.weight").full_tensor(),
+        torch.full((dim, dim), 9.0, device="cuda"),
+    )
+    assert torch.equal(
+        parallel_mod.get_parameter("linear.bias").full_tensor(),
+        torch.full((dim,), 98.6, device="cuda"),
+    )
+    assert torch.equal(
+        parallel_mod.get_buffer("buf").full_tensor(),
+        torch.arange(dim, dtype=torch.float32, device="cuda"),
+    )
+
+
 def test_fx_graph_annotate(device_mesh_1d):
     dim = 128
 
