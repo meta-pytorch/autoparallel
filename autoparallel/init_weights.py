@@ -158,4 +158,4 @@ def hook_params_setters(
             with mode:
                 return original_init_weights(*args, **kwargs)
 
-        init_weights_model.init_weights = wrapped_init_weights
+        init_weights_model.init_weights = wrapped_init_weights  # type: ignore[assignment]
