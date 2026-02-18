@@ -43,3 +43,13 @@ exclude = [
 
 [tool.hatch.metadata]
 allow-direct-references = true
+
+[tool.black]
+exclude = "autoparallel/tools/overlap_simulator/repro_.*\\.py"
+
+[tool.isort]
+profile = "black"
+skip_glob = ["autoparallel/tools/overlap_simulator/repro_*.py"]
+
+[tool.mypy]
+exclude = ["autoparallel/tools/overlap_simulator/repro_.*\\.py"]
