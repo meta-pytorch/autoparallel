@@ -61,17 +61,21 @@ from torch._functorch._aot_autograd.fx_utils import (
     get_plain_output_and_tangent_nodes,
 )
 from torch.distributed._tensor.placement_types import TensorMeta
-from torch.distributed.tensor._dtensor_spec import DTensorSpec
-from torch.distributed.tensor._op_schema import OpSpec, OpStrategy
-from torch.distributed.tensor.placement_types import Partial, Placement, Replicate, Shard
-from torch.utils._pytree import tree_flatten, tree_map_only
-
 from torch.distributed.tensor._collective_utils import (
     MeshTopoInfo,
     allgather_cost,
     allreduce_cost,
     reduce_scatter_cost,
 )
+from torch.distributed.tensor._dtensor_spec import DTensorSpec
+from torch.distributed.tensor._op_schema import OpSpec, OpStrategy
+from torch.distributed.tensor.placement_types import (
+    Partial,
+    Placement,
+    Replicate,
+    Shard,
+)
+from torch.utils._pytree import tree_flatten, tree_map_only
 
 from .cost_models.compute_estimation import estimate_strategy_runtime_cost
 from .shardings.placement_options import get_placement_options
@@ -321,8 +325,7 @@ def extract_factors_from_strategy(
     for factor_id, (out_ps, in_ps) in enumerate(seen.values()):
         is_reduction = any(_is_partial(p) for p in out_ps if p is not None)
         result_dims = [
-            p.dim if p is not None and isinstance(p, Shard) else None
-            for p in out_ps
+            p.dim if p is not None and isinstance(p, Shard) else None for p in out_ps
         ]
         operand_dims = [p.dim if isinstance(p, Shard) else None for p in in_ps]
         size = _infer_factor_size(node, operand_dims, result_dims)
@@ -336,7 +339,9 @@ def extract_factors_from_strategy(
             )
         )
 
-    return FactorRule(factors=factors, num_operands=num_operands, num_results=num_results)
+    return FactorRule(
+        factors=factors, num_operands=num_operands, num_results=num_results
+    )
 
 
 def _placeholder_factor_rule(node: torch.fx.Node) -> FactorRule:
@@ -820,7 +825,9 @@ class FactorShardingOptimizer:
                     # z_ar >= z_exit - Σ_s y[s, m]; z_ar >= 0
                     ar_cost = allreduce_cost(bytes_gb, mesh_topo, m)
                     ar_extra = ar_cost - rs_cost
-                    consumer_spatial = self._get_spatial_gids_at_node(edge.consumer_nidx)
+                    consumer_spatial = self._get_spatial_gids_at_node(
+                        edge.consumer_nidx
+                    )
                     valid_gids = [s for s in consumer_spatial if (s, m) in self.y_vars]
                     if valid_gids:
                         if ar_extra > 0:
@@ -843,9 +850,7 @@ class FactorShardingOptimizer:
         covered_reduction_pairs: set[tuple[int, int]] = set()
         for edge in self._factor_edges:
             if edge.kind == "reduction":
-                covered_reduction_pairs.add(
-                    (edge.producer_nidx, edge.consumer_nidx)
-                )
+                covered_reduction_pairs.add((edge.producer_nidx, edge.consumer_nidx))
 
         for node in self.graph.nodes:
             rule = self.factor_rules.get(node)
@@ -893,7 +898,10 @@ class FactorShardingOptimizer:
                                 spatial_sum = pulp.lpSum(
                                     self.y_vars[(s, m)] for s in valid_gids
                                 )
-                                self.prob += z >= y_r_m - spatial_sum, f"z_ure_lb_{z_id}"
+                                self.prob += (
+                                    z >= y_r_m - spatial_sum,
+                                    f"z_ure_lb_{z_id}",
+                                )
                                 terms.append(ar_extra * z)
                                 z_id += 1
                         else:
@@ -1113,9 +1121,7 @@ class FactorShardingOptimizer:
             b_vars: dict[frozenset[int], pulp.LpVariable] = {}
             for S in all_subsets:
                 tag = "".join(str(m) for m in sorted(S)) if S else "R"
-                b_vars[S] = pulp.LpVariable(
-                    f"mem_{nidx}_{tag}", cat="Binary"
-                )
+                b_vars[S] = pulp.LpVariable(f"mem_{nidx}_{tag}", cat="Binary")
 
             # Exactly one subset is active per parameter.
             self.prob += (
@@ -1213,7 +1219,8 @@ class FactorShardingOptimizer:
 
     def get_solution(self, verbose: bool = False) -> dict[torch.fx.Node, OpSpec]:
         """Solve the factor ILP and reconstruct per-node OpSpecs."""
-        solver = pulp.PULP_CBC_CMD(msg=verbose)
+        solver = pulp.HiGHS(msg=verbose)
+        # solver = pulp.PULP_CBC_CMD(msg=verbose)
         self.prob.solve(solver)
 
         if self.prob.status == -1:
@@ -1298,13 +1305,11 @@ class FactorShardingOptimizer:
                 else:
                     input_specs = None
             else:
-                input_specs = self._build_input_specs(
-                    node, rule, nidx, assignment
-                ) or None
+                input_specs = (
+                    self._build_input_specs(node, rule, nidx, assignment) or None
+                )
 
-            result[node] = OpSpec(
-                output_specs=output_specs, input_specs=input_specs
-            )
+            result[node] = OpSpec(output_specs=output_specs, input_specs=input_specs)
 
         return result
 
@@ -1355,9 +1360,7 @@ class FactorShardingOptimizer:
             if oi < len(tensor_args):
                 arg_val = tensor_args[oi].meta.get("val")
                 if isinstance(arg_val, torch.Tensor):
-                    inp_tm = TensorMeta(
-                        arg_val.shape, arg_val.stride(), arg_val.dtype
-                    )
+                    inp_tm = TensorMeta(arg_val.shape, arg_val.stride(), arg_val.dtype)
                 elif isinstance(arg_val, (tuple, list)):
                     # Multi-output producer (e.g. getitem consuming SDPA).
                     # Use the getitem index to find the correct tensor.
@@ -1375,9 +1378,7 @@ class FactorShardingOptimizer:
                             inp_tm = TensorMeta(v.shape, v.stride(), v.dtype)
 
             input_specs.append(
-                DTensorSpec(
-                    self.mesh, tuple(inp_placements), tensor_meta=inp_tm
-                )
+                DTensorSpec(self.mesh, tuple(inp_placements), tensor_meta=inp_tm)
             )
 
         return input_specs
@@ -1447,7 +1448,9 @@ class FactorShardingOptimizer:
         s = self.get_stats()
         lines.append(f"Unique factors:           {s['num_unique_factors']}")
         lines.append(f"Factor edges:             {s['num_edges']}")
-        lines.append(f"ILP variables:            {s['num_ilp_variables']} ({s['num_y_variables']} y + {s['num_z_variables']} z)")
+        lines.append(
+            f"ILP variables:            {s['num_ilp_variables']} ({s['num_y_variables']} y + {s['num_z_variables']} z)"
+        )
         lines.append(f"ILP constraints:          {s['num_ilp_constraints']}")
 
         if verbose and self.prob.status == 1:
