@@ -751,7 +751,7 @@ class ShardingOptimizer:
             constraint_name=constraint_name,
         )
 
-    def add_sharded_input_constraint(
+    def add_input_constraints(
         self, input_placements: Optional[list[Optional[tuple[Placement, ...]]]] = None
     ):
         """
@@ -797,7 +797,7 @@ class ShardingOptimizer:
                 "the inputs before tracing to remove aliasing."
             )
 
-    def add_sharded_output_constraint(self, output_placements=None):
+    def add_output_constraints(self, output_placements=None):
         """
         USER CONSTRAINTS (Category 6a): Output placement constraints.
         Force specific placements for output nodes and their corresponding gradient outputs.
@@ -840,6 +840,17 @@ class ShardingOptimizer:
                 "stop the model from returning aliases of the tensor or clone the outputs before returning "
                 "them from the graph to avoid aliasing."
             )
+
+    def get_stats(self) -> dict:
+        """Return ILP size statistics."""
+        num_vars = len(self.ds)
+        num_constraints = len(self.prob.constraints)
+        return {
+            "num_graph_nodes": len(list(self.graph.nodes)),
+            "num_ilp_variables": num_vars,
+            "num_ilp_constraints": num_constraints,
+            "mesh_shape": tuple(self.mesh.shape),
+        }
 
     def validate(self):
         for node in self.graph.nodes:
