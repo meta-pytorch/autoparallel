@@ -76,42 +76,33 @@ def _build_buffer_property(parallel_model: torch.nn.Module, fqn: str):
 
 
 class _InitWeightsDispatchMode(TorchDispatchMode):
-    """Intercepts in-place copy operations on DTensor parameter local tensors
-    during init_weights execution.
+    """Intercepts in-place copy operations on DTensors during init_weights.
 
     When a user's init_weights does ``self.weight.data[:] = value``, the ``.data``
-    accessor on a DTensor returns the local tensor (which has shard shape for
-    sharded parameters). The ``[:] = value`` then dispatches ``aten.copy_`` from
-    the global-shaped value into the shard-shaped local tensor, causing a shape
-    mismatch. This mode intercepts such ``copy_`` calls and redirects them through
-    ``_copy_set_value_to_dtensor`` for proper redistribution.
+    accessor on a DTensor returns a (detached) DTensor.  The ``[:] = value`` then
+    dispatches ``aten.copy_`` with a DTensor dst and a plain-tensor src, which
+    DTensor rejects as mixed types.  This mode intercepts such calls, wraps the
+    src as a Replicated DTensor, and performs a proper DTensor-to-DTensor copy
+    that handles redistribution automatically.
     """
 
-    def __init__(self, parallel_model: torch.nn.Module):
+    def __init__(self) -> None:
         super().__init__()
-        self.param_data_ptrs: dict[int, tuple[str, DTensor]] = {}
-        for fqn, param in parallel_model.named_parameters():
-            if isinstance(param, DTensor):
-                self.param_data_ptrs[param.data_ptr()] = (fqn, param)
-        for fqn, buf in parallel_model.named_buffers():
-            if isinstance(buf, DTensor):
-                self.param_data_ptrs[buf.data_ptr()] = (fqn, buf)
         self._handling = False
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):  # type: ignore[no-untyped-def]
         if func == torch.ops.aten.copy_.default and not self._handling:
             dst = args[0]
             src = args[1]
-            if dst.data_ptr() in self.param_data_ptrs and not isinstance(
-                src, DTensor
-            ):
-                fqn, dtensor = self.param_data_ptrs[dst.data_ptr()]
-                # Prevent re-entrant interception: _copy_set_value_to_dtensor
-                # internally calls parallel_value.copy_(), which dispatches
-                # further copy_ ops on the same local tensor.
+            if isinstance(dst, DTensor) and not isinstance(src, DTensor):
                 self._handling = True
                 try:
-                    _copy_set_value_to_dtensor(fqn, dtensor, src)
+                    # Interpret src as a full/global tensor and wrap it as
+                    # Replicated, then copy into dst which redistributes
+                    # automatically (e.g. Replicate → Shard).
+                    new_src = DTensor.from_local(src, device_mesh=dst.device_mesh)
+                    with torch.no_grad():
+                        dst.copy_(new_src)
                 finally:
                     self._handling = False
                 return dst
@@ -160,7 +151,7 @@ def hook_params_setters(
     # Wrap init_weights to activate a dispatch mode that intercepts in-place
     # copy operations (e.g. self.weight.data[:] = value) on DTensor local tensors.
     if hasattr(init_weights_model, "init_weights"):
-        mode = _InitWeightsDispatchMode(parallel_model)
+        mode = _InitWeightsDispatchMode()
         original_init_weights = init_weights_model.init_weights
 
         def wrapped_init_weights(*args, **kwargs):  # type: ignore[no-untyped-def]
