@@ -4,14 +4,14 @@
 # LICENSE file in the root directory of this source tree.
 
 """
-Comparison of the original enumeration-based ILP vs the factor-based ILP.
+Comparison of three sharding optimizers:
+  1. Original enumeration-based ILP (ShardingOptimizer)
+  2. Factor-based ILP (FactorShardingOptimizer)
+  3. Independent per-mesh-dim ILP (IndependentShardingOptimizer)
 
 Uses the same transformer Block model as example_autoparallel.py, but instead
-of running the full AutoParallel pipeline, it:
-  1. Traces the model to obtain the FX graph.
-  2. Runs the *original* ShardingOptimizer (enumeration-based).
-  3. Runs the *factor-based* FactorShardingOptimizer on the same graph.
-  4. Prints a side-by-side comparison of ILP sizes and solutions.
+of running the full AutoParallel pipeline, it traces the model and runs all
+three optimizers on the same FX graph for comparison.
 
 Usage:
     python examples/example_autoparallel_factor.py
@@ -29,6 +29,7 @@ from torch.testing._internal.distributed.fake_pg import FakeStore
 from autoparallel.api import AutoParallel
 from autoparallel.optimize_sharding import ShardingOptimizer
 from autoparallel.optimize_sharding_new import FactorShardingOptimizer
+from autoparallel.optimize_sharding_independent import IndependentShardingOptimizer
 
 # ---------------------------------------------------------------------------
 # Model (same as example_autoparallel.py, minus activation checkpointing for
@@ -75,7 +76,7 @@ class Block(nn.Module):
 # Setup
 # ---------------------------------------------------------------------------
 
-world_size = 64
+world_size = 128 # 64
 
 fake_store = FakeStore()
 torch.distributed.init_process_group(
@@ -159,11 +160,29 @@ with AutoParallel(model, input_fn, mesh, mp_policy) as autop:
     # parallel_mod = autop.apply_placement(factor_solution)
 
     # ------------------------------------------------------------------
-    # 3. Comparison
+    # 3. Independent per-mesh-dim optimizer
+    # ------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("Running INDEPENDENT per-mesh-dim IndependentShardingOptimizer")
+    print("=" * 70)
+
+    t0 = time.perf_counter()
+    indep_opt = IndependentShardingOptimizer(gm, mesh)
+    indep_opt.add_grad_param_constraints()
+    indep_opt.add_input_constraints([x_sharding])
+    indep_opt.add_output_constraints([x_sharding])
+    indep_solution = indep_opt.get_solution(verbose=False)
+    t_indep = time.perf_counter() - t0
+
+    print(f"  Solve time: {t_indep:.2f}s")
+    print(indep_opt.get_log(verbose=True))
+
+    # ------------------------------------------------------------------
+    # 4. Comparison
     # ------------------------------------------------------------------
     stats = factor_opt.get_stats()
-
     orig_stats = orig_opt.get_stats()
+    indep_stats = indep_opt.get_stats()
 
     print("\n" + "=" * 70)
     print("COMPARISON")
@@ -171,52 +190,52 @@ with AutoParallel(model, input_fn, mesh, mp_policy) as autop:
     print(f"  Mesh shape:              {tuple(mesh.shape)}")
     print(f"  Graph nodes:             {stats['num_graph_nodes']}")
     print()
-    print(f"  Original ILP variables:  {orig_stats['num_ilp_variables']:,}")
-    print(f"  Factor ILP variables:    {stats['num_ilp_variables']:,}")
+    print(f"  Original ILP variables:     {orig_stats['num_ilp_variables']:,}")
+    print(f"  Factor ILP variables:       {stats['num_ilp_variables']:,}")
+    print(f"  Independent ILP variables:  {indep_stats['num_ilp_variables']:,}")
     print()
-    print(f"  Original ILP constraints:{orig_stats['num_ilp_constraints']:,}")
-    print(f"  Factor ILP constraints:  {stats['num_ilp_constraints']:,}")
+    print(f"  Original ILP constraints:   {orig_stats['num_ilp_constraints']:,}")
+    print(f"  Factor ILP constraints:     {stats['num_ilp_constraints']:,}")
+    print(f"  Independent ILP constraints:{indep_stats['num_ilp_constraints']:,}")
     print()
     print(f"  Unique factors:          {stats['num_unique_factors']}")
+    print()
+    print(f"  Original solve time:     {t_orig:.2f}s")
+    print(f"  Factor solve time:       {t_factor:.2f}s")
+    print(f"  Independent solve time:  {t_indep:.2f}s")
 
     # ------------------------------------------------------------------
-    # 4. Show per-node placement comparison
+    # 5. Show per-node placement comparison
     # ------------------------------------------------------------------
     n_show = 100
     print("\n" + "=" * 70)
     print(f"PER-NODE PLACEMENT COMPARISON (first {n_show} call_function nodes)")
     print("=" * 70)
 
+    def _get_placements(spec):
+        if spec is not None and hasattr(spec, "output_specs"):
+            os = spec.output_specs
+            if isinstance(os, DTensorSpec):
+                return tuple(os.placements)
+            elif isinstance(os, (list, tuple)) and os:
+                return tuple(os[0].placements)
+        return "?"
+
     call_fn_nodes = [n for n in gm.graph.nodes if n.op == "call_function"]
     for node in call_fn_nodes[:n_show]:
-        orig_spec = orig_solution.get(node)
-        factor_spec = factor_solution.get(node)
+        orig_plc = _get_placements(orig_solution.get(node))
+        factor_plc = _get_placements(factor_solution.get(node))
+        indep_plc = _get_placements(indep_solution.get(node))
 
-        if orig_spec is not None and hasattr(orig_spec, "output_specs"):
-            os = orig_spec.output_specs
-            if isinstance(os, DTensorSpec):
-                orig_plc = tuple(os.placements)
-            elif isinstance(os, (list, tuple)) and os:
-                orig_plc = tuple(os[0].placements)
-            else:
-                orig_plc = "?"
-        else:
-            orig_plc = "?"
-        if factor_spec is not None and hasattr(factor_spec, "output_specs"):
-            os = factor_spec.output_specs
-            if isinstance(os, DTensorSpec):
-                factor_plc = tuple(os.placements)
-            elif isinstance(os, (list, tuple)) and os:
-                factor_plc = tuple(os[0].placements)
-            else:
-                factor_plc = "?"
-        else:
-            factor_plc = "?"
-        match = "OK" if str(orig_plc) == str(factor_plc) else "DIFF"
+        match_f = "OK" if str(orig_plc) == str(factor_plc) else "DIFF"
+        match_i = "OK" if str(orig_plc) == str(indep_plc) else "DIFF"
         op_name = str(node)
-        # Truncate long op names
-        if len(op_name) > 40:
-            op_name = op_name[:37] + "..."
-        print(f"  [{match:4s}] {op_name:42s}  orig={orig_plc}  factor={factor_plc}")
+        if len(op_name) > 35:
+            op_name = op_name[:32] + "..."
+        print(
+            f"  {op_name:37s}  orig={str(orig_plc):30s}  "
+            f"factor[{match_f:4s}]={str(factor_plc):30s}  "
+            f"indep[{match_i:4s}]={str(indep_plc)}"
+        )
 
 print("\nDone.")
