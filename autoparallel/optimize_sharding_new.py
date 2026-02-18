@@ -387,6 +387,8 @@ class FactorShardingOptimizer:
         mesh: Any,
         rescale_grad_comm_cost_for_mp: float = 1.0,
     ) -> None:
+        import time as _time
+
         self.gm = gm
         self.graph = gm.graph
         self.nodes = list(self.graph.nodes)
@@ -395,6 +397,7 @@ class FactorShardingOptimizer:
         self.node_map: dict[torch.fx.Node, int] = {
             n: i for i, n in enumerate(self.nodes)
         }
+        self._timings: dict[str, float] = {}
 
         # -- Step 1: build multi-dim strategies (reuses existing DTensor rules)
         # NOTE: in a production implementation you would build strategies for a
@@ -402,24 +405,32 @@ class FactorShardingOptimizer:
         #   flat_mesh = mesh._flatten("flat")
         # For this POC we reuse the real mesh so that all existing op rules work
         # unchanged.  The key savings come from the ILP reformulation below.
+        _t0 = _time.perf_counter()
         self.strats = self._build_sharding_metadata()
+        self._timings["build_strategies"] = _time.perf_counter() - _t0
 
         # -- Step 2: extract factor rules from strategies.
         self.factor_rules: dict[torch.fx.Node, FactorRule] = {}
+        _t0 = _time.perf_counter()
         self._extract_all_factor_rules()
+        self._timings["extract_factor_rules"] = _time.perf_counter() - _t0
 
         # -- Step 3: build factor edge graph (no merging; edges track relationships).
         self.factor_keys: dict[tuple[int, int], int] = {}  # (node_idx, local) → gid
         self._next_gid = 0
         self._factor_edges: list[FactorEdge] = []
         self._disabled_reduction_gids: set[int] = set()
+        _t0 = _time.perf_counter()
         self._build_factor_graph()
+        self._timings["build_factor_graph"] = _time.perf_counter() - _t0
 
         # -- Step 4: build ILP.
         self._cost_cache: dict[torch.fx.Node, float] = {}
         self.prob = pulp.LpProblem("AutoParallel_Factor", pulp.LpMinimize)
         self.y_vars: dict[tuple[int, int], pulp.LpVariable] = {}
+        _t0 = _time.perf_counter()
         self._build_ilp()
+        self._timings["build_ilp"] = _time.perf_counter() - _t0
 
     # -----------------------------------------------------------------
     # Step 1 — strategy building (mirrors ShardingOptimizer)
@@ -1219,9 +1230,18 @@ class FactorShardingOptimizer:
 
     def get_solution(self, verbose: bool = False) -> dict[torch.fx.Node, OpSpec]:
         """Solve the factor ILP and reconstruct per-node OpSpecs."""
-        solver = pulp.HiGHS(msg=verbose)
-        # solver = pulp.PULP_CBC_CMD(msg=verbose)
+        import time as _time
+
+        solver = pulp.HiGHS(
+            msg=verbose,
+            options=[
+                ("mip_rel_gap", 0.01),
+                ("mip_heuristic_effort", 0.2),
+            ],
+        )
+        _t0 = _time.perf_counter()
         self.prob.solve(solver)
+        self._timings["solve"] = _time.perf_counter() - _t0
 
         if self.prob.status == -1:
             diag = self._infeasibility_diagnostics()
@@ -1430,7 +1450,7 @@ class FactorShardingOptimizer:
         n_factor_vars = len(self.y_vars)
         n_aux_vars = getattr(self, "_num_z_vars", 0)
 
-        return {
+        stats = {
             "num_graph_nodes": len(self.nodes),
             "num_unique_factors": num_unique_factors,
             "num_edges": len(self._factor_edges),
@@ -1440,6 +1460,8 @@ class FactorShardingOptimizer:
             "num_ilp_constraints": len(self.prob.constraints),
             "mesh_shape": tuple(self.mesh.shape),
         }
+        stats["timings"] = dict(self._timings)
+        return stats
 
     def get_log(self, verbose: bool = False) -> str:
         """Human-readable summary."""
@@ -1452,6 +1474,13 @@ class FactorShardingOptimizer:
             f"ILP variables:            {s['num_ilp_variables']} ({s['num_y_variables']} y + {s['num_z_variables']} z)"
         )
         lines.append(f"ILP constraints:          {s['num_ilp_constraints']}")
+
+        timings = s.get("timings", {})
+        if timings:
+            lines.append("")
+            lines.append("Timings:")
+            for step, dt in timings.items():
+                lines.append(f"  {step:30s} {dt:.3f}s")
 
         if verbose and self.prob.status == 1:
             # Build reverse lookup: gid → (node, factor, local_idx)
