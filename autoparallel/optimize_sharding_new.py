@@ -1423,32 +1423,21 @@ class FactorShardingOptimizer:
         )
 
     def get_stats(self) -> dict[str, Any]:
-        """Return ILP size statistics (useful for comparing with original)."""
+        """Return ILP size statistics."""
         num_unique_factors = len(set(self.factor_keys.values()))
-
-        # Estimate original variable count.
-        orig_vars = 0
-        for node, strat in self.strats.items():
-            if not strat.strategies:
-                continue
-            n_out = len(strat.strategies)
-            first = strat.strategies[0]
-            n_args = len(first.input_specs) if first.input_specs else 0
-            orig_vars += max(n_args, 1) * n_out * n_out
 
         n_factor_vars = len(self.y_vars)
         n_aux_vars = getattr(self, "_num_z_vars", 0)
+
         return {
             "num_graph_nodes": len(self.nodes),
             "num_unique_factors": num_unique_factors,
             "num_edges": len(self._factor_edges),
-            "num_factor_ilp_variables": n_factor_vars + n_aux_vars,
-            "num_factor_y_variables": n_factor_vars,
-            "num_factor_z_variables": n_aux_vars,
-            "num_factor_ilp_constraints": len(self.prob.constraints),
+            "num_ilp_variables": n_factor_vars + n_aux_vars,
+            "num_y_variables": n_factor_vars,
+            "num_z_variables": n_aux_vars,
+            "num_ilp_constraints": len(self.prob.constraints),
             "mesh_shape": tuple(self.mesh.shape),
-            "estimated_original_ilp_variables": orig_vars,
-            "variable_reduction_ratio": orig_vars / max(n_factor_vars, 1),
         }
 
     def get_log(self, verbose: bool = False) -> str:
@@ -1458,12 +1447,8 @@ class FactorShardingOptimizer:
         s = self.get_stats()
         lines.append(f"Unique factors:           {s['num_unique_factors']}")
         lines.append(f"Factor edges:             {s['num_edges']}")
-        lines.append(f"Factor ILP variables:     {s['num_factor_ilp_variables']} ({s['num_factor_y_variables']} y + {s['num_factor_z_variables']} z)")
-        lines.append(f"Factor ILP constraints:   {s['num_factor_ilp_constraints']}")
-        lines.append(
-            f"Est. original ILP vars:   {s['estimated_original_ilp_variables']}"
-        )
-        lines.append(f"Variable reduction:       {s['variable_reduction_ratio']:.1f}x")
+        lines.append(f"ILP variables:            {s['num_ilp_variables']} ({s['num_y_variables']} y + {s['num_z_variables']} z)")
+        lines.append(f"ILP constraints:          {s['num_ilp_constraints']}")
 
         if verbose and self.prob.status == 1:
             # Build reverse lookup: gid → (node, factor, local_idx)

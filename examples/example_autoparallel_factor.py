@@ -163,18 +163,19 @@ with AutoParallel(model, input_fn, mesh, mp_policy) as autop:
     # ------------------------------------------------------------------
     stats = factor_opt.get_stats()
 
+    orig_stats = orig_opt.get_stats()
+
     print("\n" + "=" * 70)
     print("COMPARISON")
     print("=" * 70)
     print(f"  Mesh shape:              {tuple(mesh.shape)}")
     print(f"  Graph nodes:             {stats['num_graph_nodes']}")
     print()
-    print(f"  Original ILP variables:  {len(orig_opt.ds):,}")
-    print(f"  Factor ILP variables:    {stats['num_factor_ilp_variables']:,}")
-    print(f"  Variable reduction:      {stats['variable_reduction_ratio']:.1f}x")
+    print(f"  Original ILP variables:  {orig_stats['num_ilp_variables']:,}")
+    print(f"  Factor ILP variables:    {stats['num_ilp_variables']:,}")
     print()
-    print(f"  Original ILP constraints:{len(orig_opt.prob.constraints):,}")
-    print(f"  Factor ILP constraints:  {stats['num_factor_ilp_constraints']:,}")
+    print(f"  Original ILP constraints:{orig_stats['num_ilp_constraints']:,}")
+    print(f"  Factor ILP constraints:  {stats['num_ilp_constraints']:,}")
     print()
     print(f"  Unique factors:          {stats['num_unique_factors']}")
 

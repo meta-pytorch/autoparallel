@@ -841,6 +841,17 @@ class ShardingOptimizer:
                 "them from the graph to avoid aliasing."
             )
 
+    def get_stats(self) -> dict:
+        """Return ILP size statistics."""
+        num_vars = len(self.ds)
+        num_constraints = len(self.prob.constraints)
+        return {
+            "num_graph_nodes": len(list(self.graph.nodes)),
+            "num_ilp_variables": num_vars,
+            "num_ilp_constraints": num_constraints,
+            "mesh_shape": tuple(self.mesh.shape),
+        }
+
     def validate(self):
         for node in self.graph.nodes:
             if node.op != "call_function":
