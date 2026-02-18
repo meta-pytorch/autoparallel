@@ -425,7 +425,7 @@ class AutoParallel:
         self._assert_entered()
 
         assert self.input_constraints is None, "Input constraints have already been set"
-        self.sharding_optimizer.add_sharded_input_constraint(constraints)
+        self.sharding_optimizer.add_input_constraints(constraints)
         self.input_constraints = constraints
 
     def add_output_constraints(self, constraints):
@@ -435,7 +435,7 @@ class AutoParallel:
             self.output_constraints is None
         ), "Output constraints have already been set"
         # forces sharding of fwd output to be S(0) on first dimension and R on others
-        self.sharding_optimizer.add_sharded_output_constraint(constraints)
+        self.sharding_optimizer.add_output_constraints(constraints)
         self.output_constraints = constraints
 
     def optimize_placement(self, verbose=True):

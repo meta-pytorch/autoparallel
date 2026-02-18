@@ -751,7 +751,7 @@ class ShardingOptimizer:
             constraint_name=constraint_name,
         )
 
-    def add_sharded_input_constraint(
+    def add_input_constraints(
         self, input_placements: Optional[list[Optional[tuple[Placement, ...]]]] = None
     ):
         """
@@ -797,7 +797,7 @@ class ShardingOptimizer:
                 "the inputs before tracing to remove aliasing."
             )
 
-    def add_sharded_output_constraint(self, output_placements=None):
+    def add_output_constraints(self, output_placements=None):
         """
         USER CONSTRAINTS (Category 6a): Output placement constraints.
         Force specific placements for output nodes and their corresponding gradient outputs.

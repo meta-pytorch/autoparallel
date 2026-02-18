@@ -128,8 +128,8 @@ with AutoParallel(model, input_fn, mesh, mp_policy) as autop:
     t0 = time.perf_counter()
     orig_opt = ShardingOptimizer(gm, mesh)
     orig_opt.add_grad_param_constraints()
-    orig_opt.add_sharded_input_constraint([x_sharding])
-    orig_opt.add_sharded_output_constraint([x_sharding])
+    orig_opt.add_input_constraints([x_sharding])
+    orig_opt.add_output_constraints([x_sharding])
     orig_solution = orig_opt.get_solution(verbose=False)
     t_orig = time.perf_counter() - t0
 
@@ -147,6 +147,7 @@ with AutoParallel(model, input_fn, mesh, mp_policy) as autop:
 
     t0 = time.perf_counter()
     factor_opt = FactorShardingOptimizer(gm, mesh)
+    factor_opt.add_grad_param_constraints()
     factor_opt.add_input_constraints([x_sharding])
     factor_opt.add_output_constraints([x_sharding])
     factor_solution = factor_opt.get_solution(verbose=False)
