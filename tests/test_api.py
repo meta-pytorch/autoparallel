@@ -168,6 +168,127 @@ def test_init_inplace_data(device_mesh_1d):
     )
 
 
+def test_init_aliased_buffers(device_mesh_1d):
+    """Test that init_weights works when a submodule buffer aliases a top-level buffer.
+
+    This mirrors the torchtitan Decoder pattern where rope.cache and freqs_cis
+    are the same tensor. named_buffers(remove_duplicate=True) deduplicates them,
+    so only freqs_cis ends up on the parallel model. The init_weights hook must
+    still correctly propagate values set via the aliased buffer (rope.cache).
+    """
+    dim = 128
+
+    class RoPE(nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            self.register_buffer("cache", torch.zeros(dim), persistent=False)
+
+        def forward(self, x):
+            return x + self.cache
+
+        def init_weights(self):
+            self.cache = torch.arange(dim).float()
+
+    class Model(nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            self.linear = nn.Linear(dim, dim)
+            self.rope = RoPE(dim)
+            self.register_buffer("freqs_cis", self.rope.cache, persistent=False)
+
+        def forward(self, x):
+            return self.linear(x) + self.freqs_cis
+
+        def init_weights(self):
+            with torch.no_grad():
+                self.linear.weight.fill_(1.0)
+                self.linear.bias.fill_(0.0)
+            self.rope.init_weights()
+            self.freqs_cis = self.rope.cache
+
+    def input_fn():
+        b = 512
+        inputs = (torch.rand(b, dim, device="cuda"),)
+        return inputs
+
+    with torch.device("meta"):
+        model = Model(dim)
+
+    assert model.freqs_cis is model.rope.cache
+
+    with AutoParallel(
+        model,
+        input_fn,
+        device_mesh_1d,
+    ) as autop:
+        x_sharding = (Shard(0),)
+        autop.add_input_constraints([x_sharding])
+        sharding_placement = autop.optimize_placement()
+        parallel_mod = autop.apply_placement(sharding_placement)
+
+    parallel_mod.to_empty(device="cuda")
+    parallel_mod.init_weights()
+
+    expected = torch.arange(dim).float().cuda()
+    assert torch.equal(parallel_mod.get_buffer("freqs_cis").full_tensor(), expected)
+
+
+def test_init_aliased_parameters(device_mesh_1d):
+    """Test that init_weights works when a parameter is registered under two FQNs.
+
+    This mirrors weight tying in LLMs where embed.weight and lm_head.weight
+    are the same parameter. named_parameters() deduplicates them, so the alias
+    FQN is missing from the parallel model. The init_weights hook must not
+    crash on the missing alias.
+    """
+    dim = 128
+
+    class Model(nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            self.embed = nn.Linear(dim, dim, bias=False)
+            # Weight tying: lm_head.weight aliases embed.weight.
+            # named_parameters() yields embed.weight first (canonical),
+            # lm_head.weight is the alias. Forward only uses embed.
+            self.lm_head = nn.Linear(dim, dim, bias=False)
+            self.lm_head.weight = self.embed.weight
+
+        def forward(self, x):
+            return self.embed(x)
+
+        def init_weights(self):
+            with torch.no_grad():
+                self.embed.weight.fill_(1.0)
+
+    def input_fn():
+        b = 512
+        inputs = (torch.rand(b, dim, device="cuda"),)
+        return inputs
+
+    with torch.device("meta"):
+        model = Model(dim)
+
+    assert model.lm_head.weight is model.embed.weight
+
+    with AutoParallel(
+        model,
+        input_fn,
+        device_mesh_1d,
+    ) as autop:
+        x_sharding = (Shard(0),)
+        autop.add_input_constraints([x_sharding])
+        sharding_placement = autop.optimize_placement()
+        parallel_mod = autop.apply_placement(sharding_placement)
+
+    parallel_mod.to_empty(device="cuda")
+    parallel_mod.init_weights()
+
+    expected = torch.ones(dim, dim, device="cuda")
+    assert torch.equal(
+        parallel_mod.get_parameter("embed.weight").full_tensor(), expected
+    )
+
+
 def test_fx_graph_annotate(device_mesh_1d):
     dim = 128
 
