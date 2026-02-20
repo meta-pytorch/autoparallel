@@ -122,6 +122,8 @@ def hook_params_setters(
     Also wraps init_weights_model.init_weights (if present) with a TorchDispatchMode
     to handle in-place data operations like ``self.weight.data[:] = value``.
     """
+    parallel_buffer_fqns = set(n for n, _ in parallel_model.named_buffers())
+
     for mod_name, mod in sorted(init_weights_model.named_modules()):
         params_dict = dict(mod.named_parameters(recurse=False))
         buffers_dict = dict(mod.named_buffers(recurse=False))
@@ -132,7 +134,13 @@ def hook_params_setters(
             namespace[p_name] = _build_param_property(parallel_model, fqn)
 
         for b_name in buffers_dict:
-            fqn = mod_name + "." + b_name
+            fqn = f"{mod_name}.{b_name}" if mod_name else b_name
+            # Skip buffers not present on the parallel model. This happens when
+            # the original model has aliased buffers (e.g. rope.cache and freqs_cis
+            # point to the same tensor): named_buffers() deduplicates them so only
+            # one FQN is registered on the parallel model.
+            if fqn not in parallel_buffer_fqns:
+                continue
             namespace[b_name] = _build_buffer_property(parallel_model, fqn)
 
         cls = mod.__class__
