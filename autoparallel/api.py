@@ -251,6 +251,19 @@ class AutoParallel:
         # in dtype casting and move_to_fake
         model = copy.deepcopy(model)
 
+        # Capture buffer alias info before move_to_fake breaks aliasing.
+        # named_buffers() deduplicates by default, so aliases are dropped.
+        # We record alias_fqn -> canonical_fqn so we can re-register them later.
+        self._buffer_alias_map: dict[str, str] = {}
+        canonical_by_id: dict[int, str] = {}
+        canonical_fqns: set[str] = set()
+        for fqn, buf in model.named_buffers():
+            canonical_by_id[id(buf)] = fqn
+            canonical_fqns.add(fqn)
+        for fqn, buf in model.named_buffers(remove_duplicate=False):
+            if fqn not in canonical_fqns and id(buf) in canonical_by_id:
+                self._buffer_alias_map[fqn] = canonical_by_id[id(buf)]
+
         # keep a separate copy of the fake orig model to customize for supporting init_weights
         self.init_weights_model = move_to_fake(
             copy.deepcopy(model), self.fake_mode, device
@@ -578,6 +591,20 @@ class AutoParallel:
                 k,
                 attr_kind=_AttrKind.BUFFER,
             )
+
+        # Register aliased buffers that were deduplicated during tracing.
+        # e.g. if the original model has rope.cache and freqs_cis pointing to
+        # the same tensor, only one survives in sharded_buffer_dict. We register
+        # the missing alias so the parallel model mirrors the original structure.
+        for alias_fqn, canonical_fqn in self._buffer_alias_map.items():
+            if canonical_fqn in sharded_buffer_dict:
+                _assign_attr(
+                    self.parallel_model.get_buffer(canonical_fqn),
+                    self.parallel_model,
+                    self.model,
+                    alias_fqn,
+                    attr_kind=_AttrKind.BUFFER,
+                )
 
         # Right now we require a convention that the user model provides an init_weights method,
         # although we could snoop for other methods too.
