@@ -5,7 +5,6 @@
 
 import copy
 import functools
-import itertools
 from contextlib import ExitStack, contextmanager
 from types import MethodType
 from typing import Any, Callable, Optional, Union
@@ -166,26 +165,34 @@ def move_to_fake(model: torch.nn.Module, mode: FakeTensorMode, device: torch.dev
             "meta"
         ), f"tensor {name} must be on meta device, not {t.device}"
 
+    # Use remove_duplicate=False so aliased params/buffers (e.g. rope.cache
+    # and freqs_cis pointing to the same tensor) get the same fake tensor,
+    # preserving aliasing through tracing.
+    fake_memo: dict[int, torch.Tensor] = {}
+
     def _move_to_fake(module, k, device, parameter=True):
-        # lots of ways you might try to swap params with fake params do not work, but this one does
         submod = module
         while len(k.split(".")) > 1:
             submod_name, k = k.split(".", 1)
             submod = getattr(submod, submod_name)
 
-        fake_tensor = mode.from_tensor(getattr(submod, k)).to(device)
-        if parameter:
-            fake_tensor = torch.nn.Parameter(
-                fake_tensor, requires_grad=fake_tensor.requires_grad
-            )
-
+        orig = getattr(submod, k)
+        if id(orig) in fake_memo:
+            fake_tensor = fake_memo[id(orig)]
+        else:
+            fake_tensor = mode.from_tensor(orig).to(device)
+            if parameter:
+                fake_tensor = torch.nn.Parameter(
+                    fake_tensor, requires_grad=fake_tensor.requires_grad
+                )
+            fake_memo[id(orig)] = fake_tensor
         setattr(submod, k, fake_tensor)
 
     with mode:
-        for k, p in model.named_parameters():
+        for k, p in model.named_parameters(remove_duplicate=False):
             assert_is_meta_tensor(k, p)
             _move_to_fake(model, k, device, parameter=True)
-        for k, b in model.named_buffers():
+        for k, b in model.named_buffers(remove_duplicate=False):
             assert_is_meta_tensor(k, b)
             _move_to_fake(model, k, device, parameter=False)
 
@@ -610,6 +617,8 @@ class AutoParallel:
         # e.g. if the original model has rope.cache and freqs_cis pointing to
         # the same tensor, only one survives in the sharded dict. We register
         # the missing alias so the parallel model mirrors the original structure.
+        # Note: the alias map's "canonical" may not match which FQN the tracer
+        # kept, so we check both directions.
         for alias_fqn, canonical_fqn in self._param_alias_map.items():
             if canonical_fqn in sharded_param_dict:
                 _assign_attr(
@@ -619,6 +628,14 @@ class AutoParallel:
                     alias_fqn,
                     attr_kind=_AttrKind.PARAMETER,
                 )
+            elif alias_fqn in sharded_param_dict:
+                _assign_attr(
+                    self.parallel_model.get_parameter(alias_fqn),
+                    self.parallel_model,
+                    self.model,
+                    canonical_fqn,
+                    attr_kind=_AttrKind.PARAMETER,
+                )
         for alias_fqn, canonical_fqn in self._buffer_alias_map.items():
             if canonical_fqn in sharded_buffer_dict:
                 _assign_attr(
@@ -626,6 +643,14 @@ class AutoParallel:
                     self.parallel_model,
                     self.model,
                     alias_fqn,
+                    attr_kind=_AttrKind.BUFFER,
+                )
+            elif alias_fqn in sharded_buffer_dict:
+                _assign_attr(
+                    self.parallel_model.get_buffer(alias_fqn),
+                    self.parallel_model,
+                    self.model,
+                    canonical_fqn,
                     attr_kind=_AttrKind.BUFFER,
                 )
 
@@ -659,21 +684,21 @@ class AutoParallel:
 
         # TODO: this probably belongs in the AOTAutograd API
         # TODO: pytree handling
+        # Capture the exact FQNs the compiled graph expects as primals.
+        # This avoids issues with aliased params/buffers where identity-based
+        # dedup can break after init_weights reassigns tensors.
+        graph_param_fqns = list(self.joint_with_descriptors.params_spec)
+        graph_buffer_fqns = list(self.joint_with_descriptors.buffers_spec)
+
         class AutoParallelModule(torch.nn.Module):
             def forward(self, *args):
                 # NB: don't close over the parameters/buffers, as the user may
                 # reassign the module!
-                # TODO: It's this to just exactly match
-                # prepare_aot_module_simplified, this seems like an API gap
+                # Use the exact param/buffer FQNs that the compiled graph
+                # expects, matching the primals order from tracing.
                 params = [
-                    v.to_local()
-                    for k, v in
-                    # TODO: this is very slow
-                    itertools.chain(
-                        dict(self.named_parameters(remove_duplicate=False)).items(),
-                        dict(self.named_buffers(remove_duplicate=False)).items(),
-                    )
-                ]
+                    self.get_parameter(fqn).to_local() for fqn in graph_param_fqns
+                ] + [self.get_buffer(fqn).to_local() for fqn in graph_buffer_fqns]
                 boxed_args = [*params, *args]
                 del params
                 # NB: don't do self.parallel_model_fn work around Dynamo bug
