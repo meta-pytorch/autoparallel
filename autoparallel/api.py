@@ -48,6 +48,27 @@ from .shardings.placement_options import (
 _APPLY_VIEW_MM_VIEW_PATTERN = False
 
 
+def _build_alias_map(
+    named_iter_fn: Callable[..., Any],
+) -> dict[str, str]:
+    """Build a mapping from alias FQNs to canonical FQNs.
+
+    named_parameters()/named_buffers() deduplicate by default, so when a model
+    registers the same tensor under multiple FQNs only one survives. This
+    function detects the aliases so they can be re-registered later.
+    """
+    canonical_by_id: dict[int, str] = {}
+    canonical_fqns: set[str] = set()
+    for fqn, tensor in named_iter_fn():
+        canonical_by_id[id(tensor)] = fqn
+        canonical_fqns.add(fqn)
+    alias_map: dict[str, str] = {}
+    for fqn, tensor in named_iter_fn(remove_duplicate=False):
+        if fqn not in canonical_fqns and id(tensor) in canonical_by_id:
+            alias_map[fqn] = canonical_by_id[id(tensor)]
+    return alias_map
+
+
 def _assign_attr(
     attr: Any,
     target_module: torch.nn.Module,
@@ -250,6 +271,13 @@ class AutoParallel:
         # copy user model to avoid modifying it in-place
         # in dtype casting and move_to_fake
         model = copy.deepcopy(model)
+
+        # Capture parameter and buffer alias info before move_to_fake breaks
+        # aliasing. named_parameters()/named_buffers() deduplicate by default,
+        # so aliases are dropped. We record alias_fqn -> canonical_fqn so we
+        # can re-register them later.
+        self._param_alias_map = _build_alias_map(model.named_parameters)
+        self._buffer_alias_map = _build_alias_map(model.named_buffers)
 
         # keep a separate copy of the fake orig model to customize for supporting init_weights
         self.init_weights_model = move_to_fake(
@@ -578,6 +606,29 @@ class AutoParallel:
                 k,
                 attr_kind=_AttrKind.BUFFER,
             )
+
+        # Register aliased params/buffers that were deduplicated during tracing.
+        # e.g. if the original model has rope.cache and freqs_cis pointing to
+        # the same tensor, only one survives in the sharded dict. We register
+        # the missing alias so the parallel model mirrors the original structure.
+        for alias_fqn, canonical_fqn in self._param_alias_map.items():
+            if canonical_fqn in sharded_param_dict:
+                _assign_attr(
+                    self.parallel_model.get_parameter(canonical_fqn),
+                    self.parallel_model,
+                    self.model,
+                    alias_fqn,
+                    attr_kind=_AttrKind.PARAMETER,
+                )
+        for alias_fqn, canonical_fqn in self._buffer_alias_map.items():
+            if canonical_fqn in sharded_buffer_dict:
+                _assign_attr(
+                    self.parallel_model.get_buffer(canonical_fqn),
+                    self.parallel_model,
+                    self.model,
+                    alias_fqn,
+                    attr_kind=_AttrKind.BUFFER,
+                )
 
         # Right now we require a convention that the user model provides an init_weights method,
         # although we could snoop for other methods too.
