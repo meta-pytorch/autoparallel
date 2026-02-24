@@ -301,7 +301,6 @@ class AutoParallel:
         self.enable_ac = enable_ac
         self.ac_stage_size_in_GiB = ac_stage_size_in_GiB
         self.reshard_after_forward = reshard_after_forward
-        self.loss_fn = None
 
         if dynamic:
             self.fake_mode.shape_env = ShapeEnv()
