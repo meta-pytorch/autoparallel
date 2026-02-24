@@ -7,6 +7,7 @@ from typing import Union
 
 import torch
 from torch._functorch.aot_autograd import JointWithDescriptors
+from torch._functorch._aot_autograd.schemas import sync_metadata_from_graph_descriptors
 from torch._inductor.fx_passes.joint_graph import patterns
 from torch._inductor.fx_passes.post_grad import remove_assert_ops, remove_noop_ops
 from torch._inductor.pattern_matcher import stable_topological_sort
@@ -50,21 +51,27 @@ def update_joint_with_descriptors(
     updates any copies of tensor meta/shape stored in joint_with_descriptors relating to input arguments,
     which may have changed shape since the initial trace.
     """
-    # TODO: should we upstream a util like this?
     placeholders = [n for n in updated_gm.graph.nodes if n.op == "placeholder"]
     new_local_args = [n.meta["val"] for n in placeholders]
     joint_with_descriptors.graph_module = updated_gm
     joint_with_descriptors._aot_graph_capture.graph_module = updated_gm
 
+    # Use descriptors to separate primals from tangents
     new_flat_args: list[Union[torch.Tensor, int, torch.SymInt, BackwardState]] = []
-    for orig, new in zip(joint_with_descriptors._aot_state.flat_args, new_local_args):
-        if isinstance(orig, torch.nn.Parameter):
-            new_flat_args.append(torch.nn.Parameter(new))
+    new_local_tangents: list[torch.Tensor] = []
+    for n in placeholders:
+        desc = n.meta["desc"]
+        if desc.is_tangent():
+            new_local_tangents.append(n.meta["val"])
         else:
-            new_flat_args.append(new)
-
-    tangent_idx = len(joint_with_descriptors._aot_state.flat_args)
-    new_local_tangents = new_local_args[tangent_idx:]
+            val = n.meta["val"]
+            # Find the corresponding original arg to preserve nn.Parameter wrapping
+            idx = len(new_flat_args)
+            if idx < len(joint_with_descriptors._aot_state.flat_args):
+                orig = joint_with_descriptors._aot_state.flat_args[idx]
+                if isinstance(orig, torch.nn.Parameter):
+                    val = torch.nn.Parameter(val)
+            new_flat_args.append(val)
 
     # For inference mode (no tangents), updated_flat_args should be a list.
     # For autograd mode (with tangents), it should be a tuple of (primals, tangents).
@@ -77,7 +84,9 @@ def update_joint_with_descriptors(
         joint_with_descriptors._aot_graph_capture.updated_flat_args = new_flat_args
 
     joint_with_descriptors._aot_state.flat_args = new_flat_args  # type: ignore[assignment]
-    joint_with_descriptors._aot_state.fw_metadata.traced_tangents = new_local_tangents
+    joint_with_descriptors._aot_state.fw_metadata = sync_metadata_from_graph_descriptors(
+        updated_gm.graph, joint_with_descriptors._aot_state.fw_metadata
+    )
 
 
 def _add_alias(gm, version="v1"):
