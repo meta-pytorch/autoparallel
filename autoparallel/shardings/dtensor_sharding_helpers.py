@@ -210,10 +210,92 @@ def batch_shard_strategy(
     return output_strategy
 
 
+def _try_single_dim_strategy(
+    op: torch._ops.OpOverload, op_schema: OpSchema
+) -> Optional[StrategyType]:
+    """
+    Check if the op has a single-dim strategy registered upstream and expand it.
+
+    Upstream DTensor is migrating ops from register_op_strategy (which populates
+    op_strategy_funcs) to register_single_dim_strategy (which populates
+    op_single_dim_strategy_funcs). This function handles the new path so
+    autoparallel can use strategies from either registry.
+    """
+    single_dim_info = propagator.op_single_dim_strategy_funcs.get(op)
+    if single_dim_info is None:
+        return None
+
+    from torch.distributed.tensor._ops.single_dim_strategy import (
+        _insert_single_dim_replication_strategy,
+        _ShardingPlaceholder,
+    )
+    from torch.distributed.tensor._ops.utils import expand_to_full_mesh_op_strategy
+
+    mesh = op_schema.args_strategy[0].mesh
+
+    # Compute output tensor meta via the propagator's existing infra.
+    spec_args = tuple(
+        arg.strategies[0].output_spec if isinstance(arg, OpStrategy) else arg
+        for arg in op_schema.args_schema
+    )
+    spec_schema = OpSchema(op, spec_args, op_schema.kwargs_schema)
+    out_tensor_meta = propagator._propagate_tensor_meta_non_cached(spec_schema)
+
+    # Get single-dim strategies and resolve placeholders.
+    # Upstream _fill_single_dim_strategy_placeholders only expands placeholders
+    # using shard types found in the runtime input placements. Since autoparallel
+    # explores all placements (not a single runtime one), we always resolve
+    # _ShardingPlaceholder(d) -> Shard(d).
+    from torch.distributed.tensor._dtensor_spec import TensorMeta
+
+    if out_tensor_meta is None:
+        num_outputs = 0
+    elif isinstance(out_tensor_meta, TensorMeta):
+        num_outputs = 1
+    else:
+        num_outputs = len(out_tensor_meta)
+    num_inputs = len(op_schema.args_strategy)
+    strategies = single_dim_info.func(op, op_schema.args_meta, op_schema.kwargs_meta)
+    strategies = _insert_single_dim_replication_strategy(
+        strategies, num_outputs, num_inputs
+    )
+    resolved: list[list[Placement | None]] = []
+    for s in strategies:
+        resolved.append(
+            [Shard(p.dim) if isinstance(p, _ShardingPlaceholder) else p for p in s]
+        )
+
+    result = expand_to_full_mesh_op_strategy(
+        mesh,
+        op_schema,
+        resolved,
+        input_index=num_outputs,
+        output_tensor_meta=out_tensor_meta,
+    )
+
+    # Recompute redistribute costs against autoparallel's multi-entry input
+    # OpStrategy args. The expansion computed costs against single-entry
+    # strategies (the runtime placement), but autoparallel needs costs sized
+    # to match each input's full set of placement options.
+    inputs_strategy = op_schema.args_strategy
+    for op_spec in result.strategies:
+        assert op_spec.input_specs is not None
+        op_spec.redistribute_cost = [
+            generate_redistribute_costs(strategy, spec)
+            for strategy, spec in zip(inputs_strategy, op_spec.input_specs)
+        ]
+    return result
+
+
 def get_op_strategy(op: torch._ops.OpOverload, op_schema: OpSchema) -> StrategyType:
     global enable_implicit_replication, _current_stack
 
     if op not in propagator.op_strategy_funcs:
+        # Check single-dim strategies (newer upstream DTensor registration path)
+        single_dim_result = _try_single_dim_strategy(op, op_schema)
+        if single_dim_result is not None:
+            return single_dim_result
+
         if not enable_implicit_replication:
             raise NotImplementedError(
                 f"Operator {op} does not have a sharding strategy registered."
