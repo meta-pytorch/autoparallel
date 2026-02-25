@@ -210,7 +210,9 @@ def batch_shard_strategy(
     return output_strategy
 
 
-def _try_decomp_sharding(op: torch._ops.OpOverload, op_schema: OpSchema) -> Optional[StrategyType]:
+def _try_decomp_sharding(
+    op: torch._ops.OpOverload, op_schema: OpSchema
+) -> Optional[StrategyType]:
     """
     Attempt to derive sharding strategies for an op via decomposition tracing.
 
@@ -227,9 +229,7 @@ def _try_decomp_sharding(op: torch._ops.OpOverload, op_schema: OpSchema) -> Opti
     decomp_strategy.ensure_schema_info(op)
     result = decomp_strategy.propagate_strategy(op_schema)
     if result is not None:
-        logger.info(
-            f"derived sharding strategy for `{op}` via decomposition"
-        )
+        logger.info(f"derived sharding strategy for `{op}` via decomposition")
     return result
 
 
