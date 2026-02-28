@@ -344,6 +344,11 @@ def _has_zero_cost(node):
     if node.target.is_view:
         return True
 
+    # _unsafe_view is not tagged as a view op but is semantically a reshape;
+    # its non-tensor shape args become invalid after sharding so skip costing.
+    if node.target == torch.ops.aten._unsafe_view.default:
+        return True
+
     return False
 
 
