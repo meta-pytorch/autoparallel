@@ -377,9 +377,23 @@ def run_test(
         virtual_pp_stages = [DeepSeekV3Stage0(embed, layers[0], config)]
         for i in range(1, total_pp_stages - 1):
             virtual_pp_stages.append(DeepSeekV3StageI(layers[i], config))
-        virtual_pp_stages.append(
-            DeepSeekV3StageN(layers[total_pp_stages - 1], norm, output, config)
-        )
+        last_stage = DeepSeekV3StageN(layers[total_pp_stages - 1], norm, output, config)
+        if use_loss_fn:
+
+            class ModelWithLoss(torch.nn.Module):
+                def __init__(self, model):
+                    super().__init__()
+                    self.model = model
+
+                def forward(self, h, labels):
+                    output = self.model(h)
+                    return dsv3_loss_fn(output, labels)
+
+                def init_weights(self, *args, **kwargs):
+                    return self.model.init_weights(*args, **kwargs)
+
+            last_stage = ModelWithLoss(last_stage)
+        virtual_pp_stages.append(last_stage)
     # Step 2. Assign each logical stage(s) to pp ranks for the given schedule
     pp_rank_to_stage_indices = assign_logical_stages_to_pp_rank(
         schedule_name, pp_degree, stages_per_rank
@@ -469,17 +483,12 @@ def run_test(
                 dynamic=True,
                 compile=False,
                 reshard_after_forward=False,
-                loss_fn=(
-                    dsv3_loss_fn
-                    if use_loss_fn and stage_idx == total_pp_stages - 1
-                    else None
-                ),
             ) as autop:
                 autop.add_parameter_memory_constraint(low=None, high=None)
 
                 # x_sharding = (Shard(0), Replicate())
                 x_sharding = (Shard(0), Shard(0))
-                if autop.loss_fn is not None:
+                if use_loss_fn and stage_idx == total_pp_stages - 1:
                     autop.add_input_constraints([x_sharding, x_sharding])
                     autop.add_output_constraints([(Replicate(), Replicate())])
                 else:
