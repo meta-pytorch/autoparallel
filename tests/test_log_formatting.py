@@ -11,6 +11,7 @@ import torch
 import torch.fx
 
 from autoparallel.log_formatting import format_sharding_log
+from autoparallel.optimize_sharding import DecisionVar
 
 
 class MockStrategy:
@@ -28,15 +29,18 @@ def make_opt_entry(
     comm_cost: float = 0.0,
     compute_cost: float = 0.0,
     transition_cost: float = 0.0,
-) -> dict:
+) -> DecisionVar:
     """Helper to create an optimization entry."""
-    return {
-        "full_strat": MockStrategy(strat_name),
-        "comm_cost": comm_cost,
-        "compute_cost": compute_cost,
-        "sharding_transition_cost": transition_cost,
-        "cost": comm_cost + compute_cost + transition_cost,
-    }
+    return DecisionVar(
+        var=None,
+        cost=comm_cost + compute_cost + transition_cost,
+        compute_cost=compute_cost,
+        comm_cost=comm_cost,
+        sharding_transition_cost=transition_cost,
+        strategy=MockStrategy(strat_name),
+        output_spec=None,
+        input_spec=None,
+    )
 
 
 class TestFormatShardingLog(unittest.TestCase):
