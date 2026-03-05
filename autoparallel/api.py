@@ -210,39 +210,6 @@ def enable_local_map_wrapping():
         yield
 
 
-def _export(
-    model: torch.nn.Module, model_wrapper: Callable, inputs: tuple[Any, ...]
-) -> torch.fx.GraphModule:
-    """
-    Capture a model graph via Dynamo and restore parameter/buffer metadata.
-
-    We need both `model` and `model_wrapper` because:
-    - `model_wrapper` is the actual callable that gets traced by Dynamo. It may wrap
-      the model with additional logic (e.g., adding a loss function on top of the model's
-      forward pass, or preparing inputs in a specific way).
-    - `model` is the original nn.Module needed to restore the correct fully-qualified
-      names (FQNs) for parameters and buffers in the traced graph. Without this, the
-      captured graph would lose the original parameter naming structure.
-
-    Args:
-        model: Original nn.Module with parameter/buffer metadata to restore
-        model_wrapper: Callable to trace (may wrap model with additional logic)
-        inputs: Input tensors for tracing
-
-    Returns:
-        GraphModule with restored parameter FQNs and calling convention
-
-    TODO:
-    1) Use bytecode for calling convention instead of pytree for more seamless UX
-    2) Attach guards
-    3) Be more careful about tensor constants names
-    """
-    with torch._dynamo.config.patch(install_free_tensors=True):
-        gm = _dynamo_graph_capture_for_export(model_wrapper)(*inputs)
-        _restore_state_dict(model, gm)
-        return gm
-
-
 class AutoParallel:
     """
     Args:
@@ -371,47 +338,24 @@ class AutoParallel:
                 "AutoParallel is not reentrant, please file a bug report if you need this functionality"
             )
 
-    def _prepare_model_wrapper_and_inputs(
-        self, raw_inputs: Any
-    ) -> tuple[Callable, tuple[Any, ...]]:
-        """
-        Prepare the model wrapper and formatted inputs for tracing.
-
-        Args:
-            raw_inputs: The raw inputs from input_fn()
-
-        Returns:
-            A tuple of (model_wrapper, formatted_inputs) where:
-            - model_wrapper is a callable that will be traced
-            - formatted_inputs are the inputs to pass to model_wrapper
-        """
-        # No loss function, inputs are just model inputs
-        formatted_inputs = (
-            raw_inputs if isinstance(raw_inputs, tuple) else (raw_inputs,)
-        )
-
-        def model_wrapper(*model_inputs) -> Any:
-            output = self.model(*model_inputs)
-            return output
-
-        return model_wrapper, formatted_inputs
-
     def build_model_graph(self):
         decomp_table = _get_decomp_table()
 
         with self.fake_mode:
             raw_inputs = self.input_fn()
 
-        # Prepare model wrapper and inputs for tracing
-        model_wrapper, formatted_inputs = self._prepare_model_wrapper_and_inputs(
-            raw_inputs
+        formatted_inputs = (
+            raw_inputs if isinstance(raw_inputs, tuple) else (raw_inputs,)
         )
 
         with set_dtype_cast(
             True
         ), enable_local_map_wrapping(), torch._dynamo.utils._disable_saved_tensors_hooks_during_tracing():
-            torch_ir_with_fqn = _export(self.model, model_wrapper, formatted_inputs)
-            # TODO Cna't use fake mode here because it clashes with the user level
+            torch_ir_with_fqn = _dynamo_graph_capture_for_export(self.model)(
+                *formatted_inputs
+            )
+            _restore_state_dict(self.model, torch_ir_with_fqn)
+            # TODO Can't use fake mode here because it clashes with the user level
             # fake mode. Ideally dynamo should reuse the user level fake mode.
             self.joint_with_descriptors = aot_export_joint_with_descriptors(
                 self.stack,
@@ -850,6 +794,7 @@ def auto_parallel(
     *,
     mp_policy: Optional[MixedPrecisionPolicy] = None,
     compile: bool = True,
+    parameter_memory_budget: Optional[tuple[Optional[float], Optional[float]]] = None,
 ) -> torch.nn.Module:
     """
     Parallelize a model with automatic sharding optimization.
@@ -874,6 +819,8 @@ def auto_parallel(
                 - Dict output: {"logits": (Shard(0),), "loss": (Replicate(),)}
         mp_policy: Optional mixed precision policy.
         compile: Whether to use torch.compile (default: True).
+        parameter_memory_budget: Optional (low, high) bounds for parameter memory.
+            Each bound is a float multiplier or None for unbounded.
 
     Returns:
         Parallelized module. Call to_empty(device="cuda") and init_weights()
@@ -929,8 +876,11 @@ def auto_parallel(
         enable_ac=False,
     ) as autop:
         # Add constraints
-        # autop.add_parameter_memory_constraint(low=None, high=None)
         autop.add_input_constraints(input_placements)
+        if parameter_memory_budget is not None:
+            autop.add_parameter_memory_constraint(
+                low=parameter_memory_budget[0], high=parameter_memory_budget[1]
+            )
         autop.add_output_constraints(output_placements)
 
         # Optimize and apply
