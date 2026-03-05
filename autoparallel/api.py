@@ -22,6 +22,7 @@ from torch._logging import trace_structured
 from torch._subclasses import FakeTensorMode
 from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor import DeviceMesh
+from torch.export._trace import _restore_state_dict
 from torch.export.unflatten import _AttrKind
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
@@ -353,6 +354,7 @@ class AutoParallel:
             torch_ir_with_fqn = _dynamo_graph_capture_for_export(self.model)(
                 *formatted_inputs
             )
+            _restore_state_dict(self.model, torch_ir_with_fqn)
             # TODO Can't use fake mode here because it clashes with the user level
             # fake mode. Ideally dynamo should reuse the user level fake mode.
             self.joint_with_descriptors = aot_export_joint_with_descriptors(
