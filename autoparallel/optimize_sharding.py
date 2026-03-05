@@ -59,7 +59,7 @@ subject to the following constraint categories:
    5b. Memory constraints: Σ_{params} (size_ratio * x_{param}) ≤ memory_limit
        → Implemented in: add_parameter_memory_constraint()
 
-   5c. Parameter-gradient consistency: x_{param} = x_{grad_param}
+   5c. Forward-backward consistency: x_{fwd} = x_{bwd} for paired nodes
        → Implemented in: add_grad_param_constraints()
 
    5d. General node constraints: Force specific placement for any node
@@ -670,40 +670,64 @@ class ShardingOptimizer:
                 self._get_next_name(constraint_name),
             )
 
-    def add_grad_param_constraints(self):
-        """USER (Category 5c): Ensure parameters and their gradients have matching
-        sharding strategies.
+    def _add_paired_output_constraint(self, node_a, node_b, constraint_name):
+        """Constrains two nodes to have matching output placements.
 
-        x_{param} = x_{grad_param}
+        For each output strategy of node_a that also exists in node_b, adds:
+            Σ_j x_{a, 0, oi_a, j} == Σ_j x_{b, 0, oi_b, j}
+
+        where oi_a and oi_b are output strategy indices with the same placement.
+        """
+        idx_a = self.node_map[node_a]
+        idx_b = self.node_map[node_b]
+        strat_a = [str(s.output_specs) for s in self.strats[node_a].strategies]
+        strat_b = [str(s.output_specs) for s in self.strats[node_b].strategies]
+        num_inp_a = len(self.strats[node_a].strategies[0].redistribute_cost[0])
+        num_inp_b = len(self.strats[node_b].strategies[0].redistribute_cost[0])
+        for out_idx, sp in enumerate(strat_a):
+            # TODO: fix this case
+            if sp not in strat_b:
+                continue
+            out_idx_b = strat_b.index(sp)
+            v_a = [
+                self.decision_vars[(idx_a, 0, out_idx, inp_idx)].var
+                for inp_idx in range(num_inp_a)
+            ]
+            v_b = [
+                self.decision_vars[(idx_b, 0, out_idx_b, inp_idx)].var
+                for inp_idx in range(num_inp_b)
+            ]
+            self.prob += (
+                pulp.lpSum(v_b) == pulp.lpSum(v_a),
+                self._get_next_name(constraint_name),
+            )
+
+    def add_grad_param_constraints(self):
+        """USER (Category 5c): Forward-backward consistency constraints.
+        Ensures that paired forward/backward nodes have matching output placements
+        for parameters, plain inputs, and plain outputs.
+
+        Σ_j x_{fwd, 0, oi, j} = Σ_j x_{bwd, 0, oi', j}
+        where oi and oi' have matching placements.
         """
         for param, grad in get_param_and_grad_nodes(self.graph).values():
             if grad is None:
                 continue
-            param_idx = self.node_map[param]
-            grad_idx = self.node_map[grad]
-            param_strats = self.strats[param]
-            grad_strats = self.strats[grad]
-            num_out_strat = len(param_strats.strategies)
-            num_inp_g_strat = len(grad_strats.strategies[0].redistribute_cost[0])
+            self._add_paired_output_constraint(param, grad, "grad_param_constraint")
 
-            strat_p = [str(strat.output_specs) for strat in param_strats.strategies]
-            strat_gp = [str(strat.output_specs) for strat in grad_strats.strategies]
-            for out_idx in range(num_out_strat):
-                v_p = self.decision_vars[(param_idx, 0, out_idx, 0)].var
-                sp = strat_p[out_idx]
-                # TODO: fix this case
-                if sp not in strat_gp:
-                    continue
-                grad_out_idx = strat_gp.index(sp)
-                v_gp = []
-                for inp_idx in range(num_inp_g_strat):
-                    v_gp.append(
-                        self.decision_vars[(grad_idx, 0, grad_out_idx, inp_idx)].var
-                    )
-                self.prob += (
-                    pulp.lpSum(v_gp) == v_p,
-                    self._get_next_name("grad_param_constraint"),
-                )
+        for node, grad_node in get_plain_input_and_grad_nodes(self.graph).values():
+            if grad_node is None:
+                continue
+            self._add_paired_output_constraint(node, grad_node, "grad_input_constraint")
+
+        for node, tangent_node in get_plain_output_and_tangent_nodes(
+            self.graph
+        ).values():
+            if tangent_node is None:
+                continue
+            self._add_paired_output_constraint(
+                node, tangent_node, "grad_output_constraint"
+            )
 
     def add_parameter_memory_constraint(
         self, memory_factor_low: float, memory_factor_high: float
@@ -766,16 +790,16 @@ class ShardingOptimizer:
         placements,
         desc_type,
         constraint_name,
-        grad_constraint_name,
         error_message,
     ):
         """Shared implementation for add_sharded_input_constraint and
-        add_sharded_output_constraint."""
+        add_sharded_output_constraint. Only constrains the forward-side node;
+        the backward side is handled by add_grad_param_constraints."""
         remaining = None
         if placements is not None:
             remaining = {i: p for i, p in enumerate(placements)}
 
-        for desc, (node, companion_node) in nodes_dict.items():
+        for desc, (node, _companion_node) in nodes_dict.items():
             if placements is None:
                 placement = None
             else:
@@ -784,10 +808,6 @@ class ShardingOptimizer:
                 placement = remaining.pop(desc.idx)
 
             self.add_node_constraint(node, placement, constraint_name=constraint_name)
-            if companion_node is not None:
-                self.add_node_constraint(
-                    companion_node, placement, constraint_name=grad_constraint_name
-                )
 
         ignored = []
         if remaining is not None:
@@ -801,14 +821,14 @@ class ShardingOptimizer:
     def add_sharded_input_constraint(
         self, input_placements: Optional[list[Optional[tuple[Placement, ...]]]] = None
     ):
-        """USER (Category 5a): Force specific placements for input nodes and
-        their corresponding gradient inputs."""
+        """USER (Category 5a): Force specific placements for input nodes.
+        The corresponding gradient inputs are automatically constrained via
+        add_grad_param_constraints()."""
         self._add_io_placement_constraints(
             nodes_dict=get_plain_input_and_grad_nodes(self.graph),
             placements=input_placements,
             desc_type=PlainAOTInput,
             constraint_name="input_constraint",
-            grad_constraint_name="grad_input_constraint",
             error_message=(
                 "We were unable to respect placements for inputs at indices {indices}.  "
                 "This is because the traced joint graph did not actually have a dedicated "
@@ -821,14 +841,14 @@ class ShardingOptimizer:
         )
 
     def add_sharded_output_constraint(self, output_placements=None):
-        """USER (Category 5a): Force specific placements for output nodes and
-        their corresponding gradient outputs."""
+        """USER (Category 5a): Force specific placements for output nodes.
+        The corresponding tangent/gradient nodes are automatically constrained via
+        add_grad_param_constraints()."""
         self._add_io_placement_constraints(
             nodes_dict=get_plain_output_and_tangent_nodes(self.graph),
             placements=output_placements,
             desc_type=PlainAOTOutput,
             constraint_name="output_constraint",
-            grad_constraint_name="grad_output_constraint",
             error_message=(
                 "We were unable to respect placements for outputs at indices {indices}.  "
                 "This is because the traced joint graph did not actually have a dedicated "
