@@ -39,6 +39,7 @@ from .graph_passes.graph_utils import (
 )
 from .init_weights import hook_params_setters
 from .optimize_sharding import ShardingOptimizer
+from .optimize_sharding_new import FactorShardingOptimizer
 from .shardings.placement_options import (
     NumericsLogger,
     _get_device_from_mesh,
@@ -300,12 +301,22 @@ class AutoParallel:
                 # Tiebreak, favoring performing the comms in the largest
                 # dtype
                 rescale_grad_comm_cost_for_mp *= 1.1
-        sharding_optimizer = ShardingOptimizer(
-            self.gm,
-            self.mesh,
-            rescale_grad_comm_cost_for_mp,
-            repeated_subgraphs=self.kwargs.get("repeated_subgraphs", False),
-        )
+
+        optim_type = 2
+        match optim_type:
+            case 0:
+                sharding_optimizer = ShardingOptimizer(
+                    self.gm,
+                    self.mesh,
+                    rescale_grad_comm_cost_for_mp,
+                    repeated_subgraphs=self.kwargs.get("repeated_subgraphs", False),
+                )
+            case 1:
+                sharding_optimizer = FactorShardingOptimizer(self.gm, self.mesh)
+            case 2:
+                from .optimize_sharding_independent import IndependentShardingOptimizer
+                sharding_optimizer = IndependentShardingOptimizer(self.gm, self.mesh)
+
 
         # makes sharding of params and gradients the same
         sharding_optimizer.add_grad_param_constraints()
