@@ -846,6 +846,7 @@ def auto_parallel(
     *,
     mp_policy: Optional[MixedPrecisionPolicy] = None,
     compile: bool = True,
+    parameter_memory_budget: Optional[tuple[Optional[float], Optional[float]]] = None,
 ) -> torch.nn.Module:
     """
     Parallelize a model with automatic sharding optimization.
@@ -870,6 +871,8 @@ def auto_parallel(
                 - Dict output: {"logits": (Shard(0),), "loss": (Replicate(),)}
         mp_policy: Optional mixed precision policy.
         compile: Whether to use torch.compile (default: True).
+        parameter_memory_budget: Optional (low, high) bounds for parameter memory.
+            Each bound is a float multiplier or None for unbounded.
 
     Returns:
         Parallelized module. Call to_empty(device="cuda") and init_weights()
@@ -925,8 +928,11 @@ def auto_parallel(
         enable_ac=False,
     ) as autop:
         # Add constraints
-        # autop.add_parameter_memory_constraint(low=None, high=None)
         autop.add_input_constraints(input_placements)
+        if parameter_memory_budget is not None:
+            autop.add_parameter_memory_constraint(
+                low=parameter_memory_budget[0], high=parameter_memory_budget[1]
+            )
         autop.add_output_constraints(output_placements)
 
         # Optimize and apply
