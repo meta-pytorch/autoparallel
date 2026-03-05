@@ -153,6 +153,13 @@ def test_optimization_finds_fsdp_and_ddp_1d(device_mesh_1d, high_mem, model_type
 
     with AutoParallel(model, input_fn, device_mesh_1d) as autop:
         autop.add_parameter_memory_constraint(low=low_mem, high=high_mem)
+        x_sharding = (Shard(0),)
+        if model_type == "ffn_with_multiple_input_output":
+            autop.add_input_constraints([x_sharding, x_sharding])
+            autop.add_output_constraints([x_sharding, x_sharding, x_sharding])
+        else:
+            autop.add_input_constraints([x_sharding])
+            autop.add_output_constraints([x_sharding])
 
         sharding_placement = autop.optimize_placement()
 
@@ -282,6 +289,13 @@ def test_optimization_finds_fsdp_tp_2d(
 
     with AutoParallel(model, input_fn, device_mesh_2d) as autop:
         autop.add_parameter_memory_constraint(low=low_mem, high=high_mem)
+        x_sharding = (Shard(0), Replicate())
+        if model_type == "ffn_with_multiple_input_output":
+            autop.add_input_constraints([x_sharding, x_sharding])
+            autop.add_output_constraints([x_sharding, x_sharding, x_sharding])
+        else:
+            autop.add_input_constraints([x_sharding])
+            autop.add_output_constraints([x_sharding])
 
         sharding_placement = autop.optimize_placement()
 
@@ -349,6 +363,7 @@ def test_in_graph_tensor_ctor(device_mesh_1d):
     ) as autop:
         x_sharding = (Shard(0),)
         autop.add_input_constraints([x_sharding])
+        autop.add_output_constraints([x_sharding])
         sharding_placement = autop.optimize_placement()
 
         # AutoParallel produces a module with meta-DTensor parameters that need to be initialized
@@ -573,6 +588,7 @@ def test_world_size_larger_than_parameter(device_mesh_1d):
     ) as autop:
         x_sharding = (Shard(0),)
         autop.add_input_constraints([x_sharding])
+        autop.add_output_constraints([x_sharding])
         autop.add_parameter_memory_constraint()
         sharding_placement = autop.optimize_placement()
 
