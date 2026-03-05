@@ -67,7 +67,7 @@ subject to the following constraint categories:
    6b. Memory constraints: Σ_{params} (size_ratio * x_{param}) ≤ memory_limit
        → Implemented in: add_parameter_memory_constraint()
 
-   6c. Parameter-gradient consistency: x_{param} = x_{grad_param}
+   6c. Forward-backward consistency: x_{fwd} = x_{bwd} for paired nodes
        → Implemented in: add_grad_param_constraints()
 
    6d. General node constraints: Force specific placement for any node
@@ -650,43 +650,64 @@ class ShardingOptimizer:
         for eqs in vars_per_arg.values():
             self.prob += (pulp.lpSum(eqs) == 1, _get_next_name(constraint_name))
 
+    def _add_paired_output_constraint(self, node_a, node_b, constraint_name):
+        """
+        Constrains two nodes to have matching output placements.
+
+        For each output strategy of node_a that also exists in node_b, adds:
+            Σ_ii x_{a, 0, oi_a, ii} == Σ_ii x_{b, 0, oi_b, ii}
+
+        where oi_a and oi_b are output strategy indices with the same placement.
+        """
+        s_a = self.node_map[node_a]
+        s_b = self.node_map[node_b]
+        strat_a = [str(strat.output_specs) for strat in self.strats[node_a].strategies]
+        strat_b = [str(strat.output_specs) for strat in self.strats[node_b].strategies]
+        num_inp_a = self.num_inp_out[(s_a, 0)]["num_input_strat"]
+        num_inp_b = self.num_inp_out[(s_b, 0)]["num_input_strat"]
+        for oi, sp in enumerate(strat_a):
+            # TODO: fix this case
+            if sp not in strat_b:
+                continue
+            ooi = strat_b.index(sp)
+            v_a = []
+            for ii in range(num_inp_a):
+                v_a.append(self.ds[(s_a, 0, oi, ii)]["va"])
+            v_b = []
+            for ii in range(num_inp_b):
+                v_b.append(self.ds[(s_b, 0, ooi, ii)]["va"])
+            self.prob += (
+                pulp.lpSum(v_b) == pulp.lpSum(v_a),
+                _get_next_name(constraint_name),
+            )
+
     def add_grad_param_constraints(self):
         """
-        USER CONSTRAINTS (Category 6c): Parameter-gradient consistency constraints.
-        Ensures parameters and their gradients have matching sharding strategies.
+        USER CONSTRAINTS (Category 6c): Forward-backward consistency constraints.
+        Ensures that paired forward/backward nodes have matching output placements
+        for parameters, plain inputs, and plain outputs.
 
-        Mathematical form: x_{param} = x_{grad_param}
+        Mathematical form: Σ_ii x_{fwd, 0, oi, ii} = Σ_ii x_{bwd, 0, oi', ii}
+        where oi and oi' have matching placements.
         """
         for param, grad in get_param_and_grad_nodes(self.graph).values():
             if grad is None:
                 continue
-            s_i = self.node_map[param]
-            s_j = self.node_map[grad]
-            # parameters have a single input strat, so remove one loop
-            # i.e., self.num_args[s_i] == 1 and num_inp_strat == 1
-            num_out_strat = self.num_inp_out[(s_i, 0)]["num_output_strat"]
-            num_inp_g_strat = self.num_inp_out[(s_j, 0)]["num_input_strat"]
-            strat_p = [
-                str(strat.output_specs) for strat in self.strats[param].strategies
-            ]
-            assert num_out_strat == len(strat_p)
-            strat_gp = [
-                str(strat.output_specs) for strat in self.strats[grad].strategies
-            ]
-            for oi in range(num_out_strat):
-                v_p = self.ds[(s_i, 0, oi, 0)]["va"]
-                sp = strat_p[oi]
-                # TODO: fix this case
-                if sp not in strat_gp:
-                    continue
-                v_gp = []
-                ooi = strat_gp.index(sp)
-                for ii in range(num_inp_g_strat):
-                    v_gp.append(self.ds[(s_j, 0, ooi, ii)]["va"])
-                self.prob += (
-                    pulp.lpSum(v_gp) == v_p,
-                    _get_next_name("grad_param_constraint"),
-                )
+            self._add_paired_output_constraint(param, grad, "grad_param_constraint")
+
+        for node, grad_node in get_plain_input_and_grad_nodes(self.graph).values():
+            if grad_node is None:
+                continue
+            self._add_paired_output_constraint(node, grad_node, "grad_input_constraint")
+
+        for node, tangent_node in get_plain_output_and_tangent_nodes(
+            self.graph
+        ).values():
+            if tangent_node is None:
+                continue
+            self._add_paired_output_constraint(
+                node, tangent_node, "grad_output_constraint"
+            )
 
     def add_parameter_memory_constraint(
         self, memory_factor_low: float, memory_factor_high: float
@@ -756,7 +777,8 @@ class ShardingOptimizer:
     ):
         """
         USER CONSTRAINTS (Category 6a): Input placement constraints.
-        Force specific placements for input nodes and their corresponding gradient inputs.
+        Force specific placements for input nodes. The corresponding gradient inputs
+        are automatically constrained via add_grad_param_constraints().
 
         Mathematical form: x_{i,a,o*,j*} = 1 for specified input placements (o*,j*)
         """
@@ -764,7 +786,7 @@ class ShardingOptimizer:
         if input_placements is not None:
             mut_ips = {i: p for i, p in enumerate(input_placements)}
 
-        for desc, (node, grad_node) in get_plain_input_and_grad_nodes(
+        for desc, (node, _grad_node) in get_plain_input_and_grad_nodes(
             self.graph
         ).items():
             if input_placements is None:
@@ -777,10 +799,6 @@ class ShardingOptimizer:
             self.add_node_constraint(
                 node, placement, constraint_name="input_constraint"
             )
-            if grad_node is not None:
-                self.add_node_constraint(
-                    grad_node, placement, constraint_name="grad_input_constraint"
-                )
 
         ignored_placements = []
         if mut_ips is not None:
@@ -800,7 +818,8 @@ class ShardingOptimizer:
     def add_sharded_output_constraint(self, output_placements=None):
         """
         USER CONSTRAINTS (Category 6a): Output placement constraints.
-        Force specific placements for output nodes and their corresponding gradient outputs.
+        Force specific placements for output nodes. The corresponding tangent/gradient
+        nodes are automatically constrained via add_grad_param_constraints().
 
         Mathematical form: x_{i,a,o*,j*} = 1 for specified output placements (o*,j*)
         """
@@ -809,7 +828,7 @@ class ShardingOptimizer:
             mut_ops = {i: p for i, p in enumerate(output_placements)}
 
         output_and_tangent_nodes_index = get_plain_output_and_tangent_nodes(self.graph)
-        for desc, (node, tangent_node) in output_and_tangent_nodes_index.items():
+        for desc, (node, _tangent_node) in output_and_tangent_nodes_index.items():
             if output_placements is None:
                 placement = None
             else:
@@ -820,10 +839,6 @@ class ShardingOptimizer:
             self.add_node_constraint(
                 node, placement, constraint_name="output_constraint"
             )
-            if tangent_node is not None:
-                self.add_node_constraint(
-                    tangent_node, placement, constraint_name="grad_output_constraint"
-                )
 
         ignored_placements = []
         if mut_ops is not None:
