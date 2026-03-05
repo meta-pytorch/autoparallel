@@ -18,10 +18,11 @@ import torch.fx
 
 def format_sharding_log(
     graph: torch.fx.Graph,
-    opt: dict[torch.fx.Node, list[dict[str, Any]]],
+    opt: dict[torch.fx.Node, list[dict[str, Any]]] | None = None,
     colored: bool = False,
     verbose: bool = False,
     violated_constraints_log: str = "",
+    sharding_placement: dict[torch.fx.Node, Any] | None = None,
 ) -> str:
     """
     Format the sharding optimization results as annotated Python code.
@@ -42,10 +43,29 @@ def format_sharding_log(
         colored: Whether to use ANSI color codes in the output.
         verbose: Whether to include verbose information (shapes, stack traces).
         violated_constraints_log: Optional string with violated constraints info.
+        sharding_placement: Dictionary mapping nodes to their OpSpec placements.
+            Used as an alternative to ``opt`` when detailed cost info is not
+            available. Costs will be reported as zero.
 
     Returns:
         A string containing the annotated Python code representation of the graph.
     """
+    if opt is None and sharding_placement is None:
+        raise ValueError("Either 'opt' or 'sharding_placement' must be provided")
+    if opt is None:
+        assert sharding_placement is not None
+        opt = {
+            k: [
+                {
+                    "full_strat": v,
+                    "comm_cost": 0,
+                    "compute_cost": 0,
+                    "sharding_transition_cost": 0,
+                    "cost": 0,
+                }
+            ]
+            for k, v in sharding_placement.items()
+        }
     from torch.fx.graph import _color_fns, _identity
 
     nodes = list(graph.nodes)

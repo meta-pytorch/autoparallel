@@ -38,6 +38,7 @@ from .graph_passes.graph_utils import (
 )
 from .init_weights import hook_params_setters
 from .optimize_sharding import ShardingOptimizer
+from .optimize_sharding_new import FactorShardingOptimizer
 from .shardings.placement_options import (
     NumericsLogger,
     _get_device_from_mesh,
@@ -334,12 +335,22 @@ class AutoParallel:
                 # Tiebreak, favoring performing the comms in the largest
                 # dtype
                 rescale_grad_comm_cost_for_mp *= 1.1
-        sharding_optimizer = ShardingOptimizer(
-            self.gm,
-            self.mesh,
-            rescale_grad_comm_cost_for_mp,
-            repeated_subgraphs=self.kwargs.get("repeated_subgraphs", False),
-        )
+
+        optim_type = 2
+        match optim_type:
+            case 0:
+                sharding_optimizer = ShardingOptimizer(
+                    self.gm,
+                    self.mesh,
+                    rescale_grad_comm_cost_for_mp,
+                    repeated_subgraphs=self.kwargs.get("repeated_subgraphs", False),
+                )
+            case 1:
+                sharding_optimizer = FactorShardingOptimizer(self.gm, self.mesh)
+            case 2:
+                from .optimize_sharding_independent import IndependentShardingOptimizer
+
+                sharding_optimizer = IndependentShardingOptimizer(self.gm, self.mesh)
 
         # makes sharding of params and gradients the same
         sharding_optimizer.add_grad_param_constraints()
@@ -459,7 +470,7 @@ class AutoParallel:
         self._assert_entered()
 
         assert self.input_constraints is None, "Input constraints have already been set"
-        self.sharding_optimizer.add_sharded_input_constraint(constraints)
+        self.sharding_optimizer.add_input_constraints(constraints)
         self.input_constraints = constraints
 
     def add_output_constraints(self, constraints):
@@ -469,7 +480,7 @@ class AutoParallel:
             self.output_constraints is None
         ), "Output constraints have already been set"
         # forces sharding of fwd output to be S(0) on first dimension and R on others
-        self.sharding_optimizer.add_sharded_output_constraint(constraints)
+        self.sharding_optimizer.add_output_constraints(constraints)
         self.output_constraints = constraints
 
     def optimize_placement(self, verbose=True):
@@ -487,6 +498,16 @@ class AutoParallel:
 
         if verbose:
             print(self.sharding_optimizer.get_log(verbose=True))
+            from autoparallel.log_formatting import format_sharding_log
+
+            print(
+                format_sharding_log(
+                    graph=self.gm.graph,
+                    sharding_placement=self.sharding_placement,
+                    colored=False,
+                    verbose=verbose,
+                )
+            )
 
         trace_structured(
             "artifact",
@@ -496,9 +517,6 @@ class AutoParallel:
             },
             payload_fn=lambda: self.sharding_optimizer.get_log(colored=False),
         )
-
-        if self.sharding_optimizer.prob.status == -1:
-            raise RuntimeError("Didn't find solution")
 
         return self.sharding_placement
 
