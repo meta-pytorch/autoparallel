@@ -28,7 +28,9 @@ from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
 from .apply_sharding import apply_sharding_to_model
 from .cast_parametrization import apply_dtype_cast, canonicalize_mp, set_dtype_cast
-from .graph_passes.activation_checkpointing import ac_joint_pass
+from .graph_passes.activation_checkpointing import (
+    tag_fsdp_collectives_for_recomputation,
+)
 from .graph_passes.graph_utils import (
     _add_alias,
     _replace_view_mm_view_with_einsum,
@@ -257,9 +259,6 @@ class AutoParallel:
         mesh: DeviceMesh,
         mp_policy: Optional[MixedPrecisionPolicy] = None,
         compile: bool = False,
-        enable_ac: bool = True,
-        # None means 'auto'
-        ac_stage_size_in_GiB: Optional[Union[float, str]] = "auto",
         reshard_after_forward: bool = True,
         dynamic: bool = False,
         numerics_logger: NumericsLogger | None = None,
@@ -305,8 +304,6 @@ class AutoParallel:
             )
         else:
             self.compiler_fn = boxed_nop_preserve_node_meta  # type: ignore[assignment]
-        self.enable_ac = enable_ac
-        self.ac_stage_size_in_GiB = ac_stage_size_in_GiB
         self.reshard_after_forward = reshard_after_forward
 
         if dynamic:
@@ -552,10 +549,9 @@ class AutoParallel:
             ),
         )
 
-        if self.enable_ac:
-            ac_joint_pass(
-                parallel_gm.graph, self.ac_stage_size_in_GiB, self.reshard_after_forward
-            )
+        tag_fsdp_collectives_for_recomputation(
+            parallel_gm.graph, self.reshard_after_forward
+        )
         # now rename input/param/tangent/output/grad_param/grad_input nodes following
         # our convention
         # apply_node_renaming(
@@ -921,8 +917,6 @@ def auto_parallel(
         mesh,
         mp_policy=mp_policy,
         compile=compile,
-        # enable_ac=True,
-        enable_ac=False,
     ) as autop:
         # Add constraints
         # autop.add_parameter_memory_constraint(low=None, high=None)
