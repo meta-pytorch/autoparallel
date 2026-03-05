@@ -315,8 +315,8 @@ class AutoParallel:
                 sharding_optimizer = FactorShardingOptimizer(self.gm, self.mesh)
             case 2:
                 from .optimize_sharding_independent import IndependentShardingOptimizer
-                sharding_optimizer = IndependentShardingOptimizer(self.gm, self.mesh)
 
+                sharding_optimizer = IndependentShardingOptimizer(self.gm, self.mesh)
 
         # makes sharding of params and gradients the same
         sharding_optimizer.add_grad_param_constraints()
@@ -464,6 +464,16 @@ class AutoParallel:
 
         if verbose:
             print(self.sharding_optimizer.get_log(verbose=True))
+            from autoparallel.log_formatting import format_sharding_log
+
+            print(
+                format_sharding_log(
+                    graph=self.gm.graph,
+                    sharding_placement=self.sharding_placement,
+                    colored=False,
+                    verbose=verbose,
+                )
+            )
 
         trace_structured(
             "artifact",
@@ -473,9 +483,6 @@ class AutoParallel:
             },
             payload_fn=lambda: self.sharding_optimizer.get_log(colored=False),
         )
-
-        if self.sharding_optimizer.prob.status == -1:
-            raise RuntimeError("Didn't find solution")
 
         return self.sharding_placement
 
