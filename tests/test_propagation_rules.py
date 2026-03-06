@@ -160,3 +160,46 @@ def test_iota(device_mesh_1d):
 
     out.sum().backward()
     assert parallel_mod.embed.weight.grad is not None
+
+
+def test_index_put(device_mesh_1d):
+    """Test that aten.index_put with List[Tensor] args works through the solver.
+
+    Advanced indexing (e.g. `out[:, idx] = x[:, idx]`) decomposes into
+    aten.index_put, whose `indices` argument is List[Optional[Tensor]].
+    In autoparallel's placement_options.py, list-of-OpStrategy args become
+    TupleStrategy. The _try_single_dim_strategy path must unwrap these
+    TupleStrategy children into DTensorSpecs when computing tensor meta,
+    otherwise _propagate_tensor_meta_non_cached sees TupleStrategy where
+    it expects a list of tensors.
+    """
+
+    class IndexPutModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.randn(32, 64))
+
+        def forward(self, x):
+            out = torch.zeros_like(x)
+            idx = torch.arange(x.shape[1], device=x.device)
+            out[:, idx] = x[:, idx]
+            return out @ self.weight
+
+    batch_size = 256
+
+    def input_fn():
+        return torch.randn(batch_size, 32, device="cuda")
+
+    with torch.device("meta"):
+        model = IndexPutModel()
+
+    mp_policy = MixedPrecisionPolicy(
+        param_dtype=torch.bfloat16, reduce_dtype=torch.float32
+    )
+
+    with AutoParallel(
+        model, input_fn, device_mesh_1d, mp_policy, compile=True
+    ) as autop:
+        autop.add_input_constraints([(Shard(0),)])
+        sharding_placement = autop.optimize_placement()
+        autop.apply_placement(sharding_placement)
