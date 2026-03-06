@@ -353,6 +353,12 @@ class AutoParallel:
         # to expect a traced GraphModule (with metadata like local_map_kwargs),
         # which doesn't exist during a plain forward.
         try:
+            # Temporarily allow non-fake inputs because input_fn may capture
+            # real tensors created outside FakeTensorMode (e.g. pre-allocated
+            # CUDA tensors). We use self.fake_mode rather than a new
+            # FakeTensorMode to avoid cross-mode issues with the model's
+            # already-fakified parameters and buffers.
+            self.fake_mode.allow_non_fake_inputs = True
             with self.fake_mode:
                 self.model(*formatted_inputs)
         except Exception as e:
@@ -360,6 +366,8 @@ class AutoParallel:
                 "Error running model forward pass. "
                 "Fix the model before applying AutoParallel."
             ) from e
+        finally:
+            self.fake_mode.allow_non_fake_inputs = False
 
         with set_dtype_cast(
             True
