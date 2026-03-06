@@ -11,7 +11,12 @@ from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import Replicate, Shard
 from torch.testing._internal.distributed.fake_pg import FakeStore
 
-from autoparallel.api import AutoParallel, auto_parallel
+from autoparallel.api import (
+    AutoParallel,
+    _check_forward_args,
+    _compute_expected_input_metadata,
+    auto_parallel,
+)
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -349,7 +354,7 @@ def test_aliased_buffers_both_used_in_forward(device_mesh_1d):
 
     # The key assertion is that tracing + running succeeds with both aliases
     # used in forward (no "too many values to unpack" error).
-    inp = torch.rand(512, dim, device="cuda")
+    inp = torch.rand(local_batch_size, dim, device="cuda")
     out = parallel_mod(inp)
     assert out.shape[-1] == dim
 
@@ -402,7 +407,7 @@ def test_aliased_parameters_both_used_in_forward(device_mesh_1d):
 
     # The key assertion is that tracing + running succeeds with both aliases
     # used in forward (no "too many values to unpack" error).
-    inp = torch.rand(512, dim, device="cuda")
+    inp = torch.rand(local_batch_size, dim, device="cuda")
     out = parallel_mod(inp)
     assert out.shape[-1] == dim
 
@@ -944,3 +949,122 @@ def test_auto_parallel_with_mp_policy(device_mesh_1d):
     )
 
     assert parallel_model is not None
+
+
+# Tests for forward input validation
+
+
+def test_check_forward_args():
+    """Unit test: _check_forward_args catches shape/dtype/type mismatches."""
+    expected = [("tensor", (2, 128), torch.float32)]
+
+    # Correct inputs
+    _check_forward_args((torch.rand(2, 128),), expected)
+
+    # Wrong shape
+    with pytest.raises(ValueError, match="shape"):
+        _check_forward_args((torch.rand(4, 128),), expected)
+
+    # Wrong dtype
+    with pytest.raises(ValueError, match="dtype"):
+        _check_forward_args((torch.rand(2, 128, dtype=torch.float16),), expected)
+
+    # Wrong number of arguments
+    with pytest.raises(ValueError, match="expected 1"):
+        _check_forward_args((torch.rand(2, 128), torch.rand(2, 128)), expected)
+
+    # Non-tensor when tensor expected
+    with pytest.raises(TypeError, match="Tensor"):
+        _check_forward_args((42,), expected)
+
+
+def test_check_forward_args_non_tensor_value():
+    """Unit test: _check_forward_args validates non-tensor input equality."""
+    expected = [("value", 42)]
+
+    _check_forward_args((42,), expected)
+
+    with pytest.raises(ValueError, match="value"):
+        _check_forward_args((99,), expected)
+
+
+def test_compute_expected_input_metadata(device_mesh_1d):
+    """Test local shape computation from global shape + Shard constraint."""
+    mesh = device_mesh_1d
+    world_size = mesh.size()
+
+    traced = [("tensor", (512, 128), torch.float32)]
+    constraints = [(Shard(0),)]
+
+    result = _compute_expected_input_metadata(traced, constraints, mesh)
+    assert result == [("tensor", (512 // world_size, 128), torch.float32)]
+
+
+def test_compute_expected_input_metadata_default_constraints(device_mesh_1d):
+    """Test that None constraints default to Shard(0)."""
+    mesh = device_mesh_1d
+    world_size = mesh.size()
+
+    traced = [("tensor", (512, 128), torch.float32)]
+
+    result = _compute_expected_input_metadata(traced, None, mesh)
+    assert result == [("tensor", (512 // world_size, 128), torch.float32)]
+
+
+def test_compute_expected_input_metadata_replicated(device_mesh_1d):
+    """Test that Replicate constraint leaves shape unchanged."""
+    mesh = device_mesh_1d
+
+    traced = [("tensor", (512, 128), torch.float32)]
+    constraints = [(Replicate(),)]
+
+    result = _compute_expected_input_metadata(traced, constraints, mesh)
+    assert result == [("tensor", (512, 128), torch.float32)]
+
+
+def test_forward_input_validation_integration(device_mesh_1d):
+    """Integration test: AutoParallelModule.forward rejects invalid inputs."""
+    dim = 128
+    batch_size = 512
+    local_batch_size = batch_size // device_mesh_1d.size()
+
+    class Model(nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            self.linear = nn.Linear(dim, dim)
+
+        def forward(self, x):
+            return self.linear(x)
+
+    with torch.device("meta"):
+        model = Model(dim)
+
+    x = DTensor.from_local(
+        torch.rand(local_batch_size, dim, device="cuda"),
+        device_mesh_1d,
+        [Shard(0)],
+    )
+    parallel_mod = auto_parallel(
+        model,
+        device_mesh_1d,
+        sample_inputs=(x,),
+        out_shardings=(Shard(0),),
+        compile=False,
+    )
+
+    with pytest.raises(ValueError, match="shape"):
+        parallel_mod(torch.rand(local_batch_size + 1, dim, device="cuda"))
+
+    with pytest.raises(ValueError, match="dtype"):
+        parallel_mod(
+            torch.rand(local_batch_size, dim, device="cuda", dtype=torch.float16)
+        )
+
+    with pytest.raises(ValueError, match="expected 1"):
+        parallel_mod(
+            torch.rand(local_batch_size, dim, device="cuda"),
+            torch.rand(local_batch_size, dim, device="cuda"),
+        )
+
+    with pytest.raises(TypeError, match="Tensor"):
+        parallel_mod(42)

@@ -210,6 +210,75 @@ def enable_local_map_wrapping():
         yield
 
 
+def _compute_expected_input_metadata(traced_input_info, input_constraints, mesh):
+    """Compute expected runtime input shapes by applying sharding to traced global shapes.
+
+    Returns a list of ('tensor', local_shape, dtype) or ('value', value) tuples.
+    """
+    from torch.distributed.tensor.placement_types import Replicate, Shard
+
+    default_placement = (Shard(0),) + (Replicate(),) * (mesh.ndim - 1)
+
+    result = []
+    tensor_idx = 0
+    for info in traced_input_info:
+        if info[0] == "tensor":
+            _, global_shape, dtype = info
+            if input_constraints is None:
+                placements = default_placement
+            else:
+                placements = input_constraints[tensor_idx]
+                if placements is None:
+                    placements = default_placement
+
+            local_shape = list(global_shape)
+            for mesh_dim, placement in enumerate(placements):
+                if isinstance(placement, Shard):
+                    dim = placement.dim
+                    local_shape[dim] //= mesh.size(mesh_dim)
+            result.append(("tensor", tuple(local_shape), dtype))
+            tensor_idx += 1
+        else:
+            result.append(info)
+
+    return result
+
+
+def _check_forward_args(args, expected_input_metadata):
+    """Validate that forward() args match the shapes/dtypes used during tracing."""
+    if len(args) != len(expected_input_metadata):
+        raise ValueError(
+            f"AutoParallel: expected {len(expected_input_metadata)} arguments "
+            f"but got {len(args)}"
+        )
+    for i, (arg, expected) in enumerate(zip(args, expected_input_metadata)):
+        if expected[0] == "tensor":
+            _, expected_shape, expected_dtype = expected
+            if not isinstance(arg, torch.Tensor):
+                raise TypeError(
+                    f"AutoParallel: argument {i} should be a Tensor "
+                    f"but got {type(arg).__name__}"
+                )
+            actual_shape = tuple(arg.shape)
+            if actual_shape != expected_shape:
+                raise ValueError(
+                    f"AutoParallel: argument {i} has shape {actual_shape} "
+                    f"but expected {expected_shape}"
+                )
+            if arg.dtype != expected_dtype:
+                raise ValueError(
+                    f"AutoParallel: argument {i} has dtype {arg.dtype} "
+                    f"but expected {expected_dtype}"
+                )
+        else:
+            _, expected_value = expected
+            if arg != expected_value:
+                raise ValueError(
+                    f"AutoParallel: argument {i} has value {arg!r} "
+                    f"but was traced with {expected_value!r}"
+                )
+
+
 class AutoParallel:
     """
     Args:
@@ -345,6 +414,14 @@ class AutoParallel:
         formatted_inputs = (
             raw_inputs if isinstance(raw_inputs, tuple) else (raw_inputs,)
         )
+
+        # Capture input metadata for runtime validation in forward().
+        self._traced_input_info = []
+        for inp in formatted_inputs:
+            if isinstance(inp, torch.Tensor):
+                self._traced_input_info.append(("tensor", tuple(inp.shape), inp.dtype))
+            else:
+                self._traced_input_info.append(("value", inp))
 
         with set_dtype_cast(
             True
@@ -632,8 +709,13 @@ class AutoParallel:
         graph_param_fqns = list(self.joint_with_descriptors.params_spec)
         graph_buffer_fqns = list(self.joint_with_descriptors.buffers_spec)
 
+        expected_input_metadata = _compute_expected_input_metadata(
+            self._traced_input_info, self.input_constraints, self.mesh
+        )
+
         class AutoParallelModule(torch.nn.Module):
             def forward(self, *args):
+                _check_forward_args(args, expected_input_metadata)
                 # NB: don't close over the parameters/buffers, as the user may
                 # reassign the module!
                 # Use the exact param/buffer FQNs that the compiled graph
