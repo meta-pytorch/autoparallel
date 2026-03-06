@@ -7,10 +7,11 @@ import pytest
 import torch
 import torch.fx.traceback as fx_traceback
 from torch import nn
+from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import Replicate, Shard
 from torch.testing._internal.distributed.fake_pg import FakeStore
 
-from autoparallel.api import AutoParallel
+from autoparallel.api import AutoParallel, auto_parallel
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -84,24 +85,23 @@ def test_init(device_mesh_1d):
                 self.linear.bias.fill_(98.6)
             self.buf = torch.arange(dim)
 
-    def input_fn():
-        b = 512
-        inputs = (torch.rand(b, dim, device="cuda"),)
-        return inputs
-
     with torch.device("meta"):
         model = Model(dim)
-    with AutoParallel(
-        model,
-        input_fn,
-        device_mesh_1d,
-    ) as autop:
-        x_sharding = (Shard(0),)
-        autop.add_input_constraints([x_sharding])
-        sharding_placement = autop.optimize_placement()
 
-        # AutoParallel produces a module with meta-DTensor parameters that need to be initialized
-        parallel_mod = autop.apply_placement(sharding_placement)
+    batch_size = 512
+    local_batch_size = batch_size // device_mesh_1d.size()
+    x = DTensor.from_local(
+        torch.rand(local_batch_size, dim, device="cuda"),
+        device_mesh_1d,
+        [Shard(0)],
+    )
+    parallel_mod = auto_parallel(
+        model,
+        device_mesh_1d,
+        sample_inputs=(x,),
+        out_shardings=(Shard(0),),
+        compile=False,
+    )
     parallel_mod.to_empty(device="cuda")
     parallel_mod.init_weights()
     assert torch.equal(
@@ -135,23 +135,23 @@ def test_init_inplace_data(device_mesh_1d):
             self.linear.bias.data[:] = torch.full((dim,), 98.6)
             self.buf.data[:] = torch.arange(dim, dtype=torch.float32)
 
-    def input_fn():
-        b = 512
-        inputs = (torch.rand(b, dim, device="cuda"),)
-        return inputs
-
     with torch.device("meta"):
         model = Model(dim)
-    with AutoParallel(
-        model,
-        input_fn,
-        device_mesh_1d,
-    ) as autop:
-        x_sharding = (Shard(0),)
-        autop.add_input_constraints([x_sharding])
-        sharding_placement = autop.optimize_placement()
 
-        parallel_mod = autop.apply_placement(sharding_placement)
+    batch_size = 512
+    local_batch_size = batch_size // device_mesh_1d.size()
+    x = DTensor.from_local(
+        torch.rand(local_batch_size, dim, device="cuda"),
+        device_mesh_1d,
+        [Shard(0)],
+    )
+    parallel_mod = auto_parallel(
+        model,
+        device_mesh_1d,
+        sample_inputs=(x,),
+        out_shardings=(Shard(0),),
+        compile=False,
+    )
     parallel_mod.to_empty(device="cuda")
     parallel_mod.init_weights()
     assert torch.equal(
@@ -206,25 +206,25 @@ def test_init_aliased_buffers(device_mesh_1d):
             self.rope.init_weights()
             self.freqs_cis = self.rope.cache
 
-    def input_fn():
-        b = 512
-        inputs = (torch.rand(b, dim, device="cuda"),)
-        return inputs
-
     with torch.device("meta"):
         model = Model(dim)
 
     assert model.freqs_cis is model.rope.cache
 
-    with AutoParallel(
-        model,
-        input_fn,
+    batch_size = 512
+    local_batch_size = batch_size // device_mesh_1d.size()
+    x = DTensor.from_local(
+        torch.rand(local_batch_size, dim, device="cuda"),
         device_mesh_1d,
-    ) as autop:
-        x_sharding = (Shard(0),)
-        autop.add_input_constraints([x_sharding])
-        sharding_placement = autop.optimize_placement()
-        parallel_mod = autop.apply_placement(sharding_placement)
+        [Shard(0)],
+    )
+    parallel_mod = auto_parallel(
+        model,
+        device_mesh_1d,
+        sample_inputs=(x,),
+        out_shardings=(Shard(0),),
+        compile=False,
+    )
 
     parallel_mod.to_empty(device="cuda")
     parallel_mod.init_weights()
@@ -260,25 +260,25 @@ def test_init_aliased_parameters(device_mesh_1d):
             with torch.no_grad():
                 self.embed.weight.fill_(1.0)
 
-    def input_fn():
-        b = 512
-        inputs = (torch.rand(b, dim, device="cuda"),)
-        return inputs
-
     with torch.device("meta"):
         model = Model(dim)
 
     assert model.lm_head.weight is model.embed.weight
 
-    with AutoParallel(
-        model,
-        input_fn,
+    batch_size = 512
+    local_batch_size = batch_size // device_mesh_1d.size()
+    x = DTensor.from_local(
+        torch.rand(local_batch_size, dim, device="cuda"),
         device_mesh_1d,
-    ) as autop:
-        x_sharding = (Shard(0),)
-        autop.add_input_constraints([x_sharding])
-        sharding_placement = autop.optimize_placement()
-        parallel_mod = autop.apply_placement(sharding_placement)
+        [Shard(0)],
+    )
+    parallel_mod = auto_parallel(
+        model,
+        device_mesh_1d,
+        sample_inputs=(x,),
+        out_shardings=(Shard(0),),
+        compile=False,
+    )
 
     parallel_mod.to_empty(device="cuda")
     parallel_mod.init_weights()
@@ -287,6 +287,124 @@ def test_init_aliased_parameters(device_mesh_1d):
     assert torch.equal(
         parallel_mod.get_parameter("embed.weight").full_tensor(), expected
     )
+
+
+def test_aliased_buffers_both_used_in_forward(device_mesh_1d):
+    """Test that aliased buffers work when both aliases are accessed in forward.
+
+    When move_to_fake preserves aliasing, Dynamo sees both accesses as the same
+    tensor and deduplicates the graph input. The compiled graph and the forward
+    method must agree on the number of primals.
+    """
+    dim = 128
+
+    class RoPE(nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            self.register_buffer("cache", torch.zeros(dim), persistent=False)
+
+        def forward(self, x):
+            return x + self.cache
+
+    class Model(nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            self.linear = nn.Linear(dim, dim)
+            self.rope = RoPE(dim)
+            self.register_buffer("freqs_cis", self.rope.cache, persistent=False)
+
+        def forward(self, x):
+            # Both aliases are accessed in the forward pass
+            return self.linear(x) + self.freqs_cis + self.rope.cache
+
+        def init_weights(self):
+            with torch.no_grad():
+                self.linear.weight.fill_(1.0)
+                self.linear.bias.fill_(0.0)
+            self.rope.cache = torch.arange(dim).float()
+            self.freqs_cis = self.rope.cache
+
+    with torch.device("meta"):
+        model = Model(dim)
+
+    assert model.freqs_cis is model.rope.cache
+
+    batch_size = 512
+    local_batch_size = batch_size // device_mesh_1d.size()
+    x = DTensor.from_local(
+        torch.rand(local_batch_size, dim, device="cuda"),
+        device_mesh_1d,
+        [Shard(0)],
+    )
+    parallel_mod = auto_parallel(
+        model,
+        device_mesh_1d,
+        sample_inputs=(x,),
+        out_shardings=(Shard(0),),
+        compile=False,
+    )
+
+    parallel_mod.to_empty(device="cuda")
+    parallel_mod.init_weights()
+
+    # The key assertion is that tracing + running succeeds with both aliases
+    # used in forward (no "too many values to unpack" error).
+    inp = torch.rand(512, dim, device="cuda")
+    out = parallel_mod(inp)
+    assert out.shape[-1] == dim
+
+
+def test_aliased_parameters_both_used_in_forward(device_mesh_1d):
+    """Test that aliased parameters work when both aliases are accessed in forward.
+
+    This mirrors weight tying where embed.weight and lm_head.weight point to the
+    same parameter and both are used during forward.
+    """
+    dim = 128
+
+    class Model(nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            self.embed = nn.Linear(dim, dim, bias=False)
+            self.lm_head = nn.Linear(dim, dim, bias=False)
+            self.lm_head.weight = self.embed.weight
+
+        def forward(self, x):
+            # Both aliases are used in forward
+            return self.embed(x) + self.lm_head(x)
+
+        def init_weights(self):
+            with torch.no_grad():
+                self.embed.weight.fill_(1.0)
+
+    with torch.device("meta"):
+        model = Model(dim)
+
+    assert model.lm_head.weight is model.embed.weight
+
+    batch_size = 512
+    local_batch_size = batch_size // device_mesh_1d.size()
+    x = DTensor.from_local(
+        torch.rand(local_batch_size, dim, device="cuda"),
+        device_mesh_1d,
+        [Shard(0)],
+    )
+    parallel_mod = auto_parallel(
+        model,
+        device_mesh_1d,
+        sample_inputs=(x,),
+        out_shardings=(Shard(0),),
+        compile=False,
+    )
+
+    parallel_mod.to_empty(device="cuda")
+    parallel_mod.init_weights()
+
+    # The key assertion is that tracing + running succeeds with both aliases
+    # used in forward (no "too many values to unpack" error).
+    inp = torch.rand(512, dim, device="cuda")
+    out = parallel_mod(inp)
+    assert out.shape[-1] == dim
 
 
 def test_fx_graph_annotate(device_mesh_1d):
@@ -552,28 +670,26 @@ def test_moduledict_preservation(device_mesh_1d):
             x = self.layers["layer2"](x)
             return x
 
-    def input_fn():
-        b = 512
-        inputs = (torch.rand(b, dim, device="cuda"),)
-        return inputs
-
     with torch.device("meta"):
         model = Model(dim)
 
     # Verify original model has ModuleDict
     assert isinstance(model.layers, nn.ModuleDict)
 
-    with AutoParallel(
-        model,
-        input_fn,
+    batch_size = 512
+    local_batch_size = batch_size // device_mesh_1d.size()
+    x = DTensor.from_local(
+        torch.rand(local_batch_size, dim, device="cuda"),
         device_mesh_1d,
-    ) as autop:
-        x_sharding = (Shard(0),)
-        autop.add_input_constraints([x_sharding])
-        sharding_placement = autop.optimize_placement()
-
-        # AutoParallel produces a module with meta-DTensor parameters that need to be initialized
-        parallel_mod = autop.apply_placement(sharding_placement)
+        [Shard(0)],
+    )
+    parallel_mod = auto_parallel(
+        model,
+        device_mesh_1d,
+        sample_inputs=(x,),
+        out_shardings=(Shard(0),),
+        compile=False,
+    )
 
     # Verify that the parallel_mod preserves the ModuleDict structure
     assert isinstance(
@@ -596,10 +712,6 @@ def test_moduledict_preservation(device_mesh_1d):
 
 def test_auto_parallel_basic(device_mesh_1d):
     """Test basic auto_parallel usage with DTensor input."""
-    from torch.distributed.tensor import DTensor
-
-    from autoparallel import auto_parallel
-
     dim = 128
     batch_size = 512
     local_batch_size = batch_size // device_mesh_1d.size()
@@ -650,10 +762,6 @@ def test_auto_parallel_basic(device_mesh_1d):
 
 def test_auto_parallel_tuple_inputs(device_mesh_1d):
     """Test auto_parallel with multiple DTensor inputs as tuple."""
-    from torch.distributed.tensor import DTensor
-
-    from autoparallel import auto_parallel
-
     dim = 128
     batch_size = 512
     local_batch_size = batch_size // device_mesh_1d.size()
@@ -695,10 +803,6 @@ def test_auto_parallel_tuple_inputs(device_mesh_1d):
 
 def test_auto_parallel_multiple_outputs(device_mesh_1d):
     """Test auto_parallel with multiple outputs and pytree out_shardings."""
-    from torch.distributed.tensor import DTensor
-
-    from autoparallel import auto_parallel
-
     dim = 128
     batch_size = 512
     local_batch_size = batch_size // device_mesh_1d.size()
@@ -735,8 +839,6 @@ def test_auto_parallel_multiple_outputs(device_mesh_1d):
 
 def test_auto_parallel_replicated_input(device_mesh_1d):
     """Test auto_parallel with regular tensor (assumed Replicate)."""
-    from autoparallel import auto_parallel
-
     dim = 128
     batch_size = 512
 
@@ -768,10 +870,6 @@ def test_auto_parallel_replicated_input(device_mesh_1d):
 
 def test_auto_parallel_callable_inputs(device_mesh_1d):
     """Test auto_parallel with callable sample_inputs."""
-    from torch.distributed.tensor import DTensor
-
-    from autoparallel import auto_parallel
-
     dim = 128
     batch_size = 512
     local_batch_size = batch_size // device_mesh_1d.size()
@@ -810,9 +908,6 @@ def test_auto_parallel_callable_inputs(device_mesh_1d):
 def test_auto_parallel_with_mp_policy(device_mesh_1d):
     """Test auto_parallel with mixed precision policy."""
     from torch.distributed.fsdp import MixedPrecisionPolicy
-    from torch.distributed.tensor import DTensor
-
-    from autoparallel import auto_parallel
 
     dim = 128
     batch_size = 512

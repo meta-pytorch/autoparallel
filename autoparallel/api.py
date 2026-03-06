@@ -5,7 +5,6 @@
 
 import copy
 import functools
-import itertools
 from contextlib import ExitStack, contextmanager
 from types import MethodType
 from typing import Any, Callable, Optional, Union
@@ -166,26 +165,34 @@ def move_to_fake(model: torch.nn.Module, mode: FakeTensorMode, device: torch.dev
             "meta"
         ), f"tensor {name} must be on meta device, not {t.device}"
 
+    # Use remove_duplicate=False so aliased params/buffers (e.g. rope.cache
+    # and freqs_cis pointing to the same tensor) get the same fake tensor,
+    # preserving aliasing through tracing.
+    fake_memo: dict[int, torch.Tensor] = {}
+
     def _move_to_fake(module, k, device, parameter=True):
-        # lots of ways you might try to swap params with fake params do not work, but this one does
         submod = module
         while len(k.split(".")) > 1:
             submod_name, k = k.split(".", 1)
             submod = getattr(submod, submod_name)
 
-        fake_tensor = mode.from_tensor(getattr(submod, k)).to(device)
-        if parameter:
-            fake_tensor = torch.nn.Parameter(
-                fake_tensor, requires_grad=fake_tensor.requires_grad
-            )
-
+        orig = getattr(submod, k)
+        if id(orig) in fake_memo:
+            fake_tensor = fake_memo[id(orig)]
+        else:
+            fake_tensor = mode.from_tensor(orig).to(device)
+            if parameter:
+                fake_tensor = torch.nn.Parameter(
+                    fake_tensor, requires_grad=fake_tensor.requires_grad
+                )
+            fake_memo[id(orig)] = fake_tensor
         setattr(submod, k, fake_tensor)
 
     with mode:
-        for k, p in model.named_parameters():
+        for k, p in model.named_parameters(remove_duplicate=False):
             assert_is_meta_tensor(k, p)
             _move_to_fake(model, k, device, parameter=True)
-        for k, b in model.named_buffers():
+        for k, b in model.named_buffers(remove_duplicate=False):
             assert_is_meta_tensor(k, b)
             _move_to_fake(model, k, device, parameter=False)
 
@@ -201,39 +208,6 @@ def enable_local_map_wrapping():
 
     with vt_cls.enable(), local_map_module.defer_inlining():
         yield
-
-
-def _export(
-    model: torch.nn.Module, model_wrapper: Callable, inputs: tuple[Any, ...]
-) -> torch.fx.GraphModule:
-    """
-    Capture a model graph via Dynamo and restore parameter/buffer metadata.
-
-    We need both `model` and `model_wrapper` because:
-    - `model_wrapper` is the actual callable that gets traced by Dynamo. It may wrap
-      the model with additional logic (e.g., adding a loss function on top of the model's
-      forward pass, or preparing inputs in a specific way).
-    - `model` is the original nn.Module needed to restore the correct fully-qualified
-      names (FQNs) for parameters and buffers in the traced graph. Without this, the
-      captured graph would lose the original parameter naming structure.
-
-    Args:
-        model: Original nn.Module with parameter/buffer metadata to restore
-        model_wrapper: Callable to trace (may wrap model with additional logic)
-        inputs: Input tensors for tracing
-
-    Returns:
-        GraphModule with restored parameter FQNs and calling convention
-
-    TODO:
-    1) Use bytecode for calling convention instead of pytree for more seamless UX
-    2) Attach guards
-    3) Be more careful about tensor constants names
-    """
-    with torch._dynamo.config.patch(install_free_tensors=True):
-        gm = _dynamo_graph_capture_for_export(model_wrapper)(*inputs)
-        _restore_state_dict(model, gm)
-        return gm
 
 
 class AutoParallel:
@@ -334,7 +308,7 @@ class AutoParallel:
             repeated_subgraphs=self.kwargs.get("repeated_subgraphs", False),
         )
 
-        # makes sharding of params and gradients the same
+        # links sharding of forward/backward paired nodes (params, inputs, outputs)
         sharding_optimizer.add_grad_param_constraints()
         self.sharding_optimizer = sharding_optimizer
 
@@ -364,47 +338,24 @@ class AutoParallel:
                 "AutoParallel is not reentrant, please file a bug report if you need this functionality"
             )
 
-    def _prepare_model_wrapper_and_inputs(
-        self, raw_inputs: Any
-    ) -> tuple[Callable, tuple[Any, ...]]:
-        """
-        Prepare the model wrapper and formatted inputs for tracing.
-
-        Args:
-            raw_inputs: The raw inputs from input_fn()
-
-        Returns:
-            A tuple of (model_wrapper, formatted_inputs) where:
-            - model_wrapper is a callable that will be traced
-            - formatted_inputs are the inputs to pass to model_wrapper
-        """
-        # No loss function, inputs are just model inputs
-        formatted_inputs = (
-            raw_inputs if isinstance(raw_inputs, tuple) else (raw_inputs,)
-        )
-
-        def model_wrapper(*model_inputs) -> Any:
-            output = self.model(*model_inputs)
-            return output
-
-        return model_wrapper, formatted_inputs
-
     def build_model_graph(self):
         decomp_table = _get_decomp_table()
 
         with self.fake_mode:
             raw_inputs = self.input_fn()
 
-        # Prepare model wrapper and inputs for tracing
-        model_wrapper, formatted_inputs = self._prepare_model_wrapper_and_inputs(
-            raw_inputs
+        formatted_inputs = (
+            raw_inputs if isinstance(raw_inputs, tuple) else (raw_inputs,)
         )
 
         with set_dtype_cast(
             True
         ), enable_local_map_wrapping(), torch._dynamo.utils._disable_saved_tensors_hooks_during_tracing():
-            torch_ir_with_fqn = _export(self.model, model_wrapper, formatted_inputs)
-            # TODO Cna't use fake mode here because it clashes with the user level
+            torch_ir_with_fqn = _dynamo_graph_capture_for_export(self.model)(
+                *formatted_inputs
+            )
+            _restore_state_dict(self.model, torch_ir_with_fqn)
+            # TODO Can't use fake mode here because it clashes with the user level
             # fake mode. Ideally dynamo should reuse the user level fake mode.
             self.joint_with_descriptors = aot_export_joint_with_descriptors(
                 self.stack,
@@ -610,6 +561,8 @@ class AutoParallel:
         # e.g. if the original model has rope.cache and freqs_cis pointing to
         # the same tensor, only one survives in the sharded dict. We register
         # the missing alias so the parallel model mirrors the original structure.
+        # Note: the alias map's "canonical" may not match which FQN the tracer
+        # kept, so we check both directions.
         for alias_fqn, canonical_fqn in self._param_alias_map.items():
             if canonical_fqn in sharded_param_dict:
                 _assign_attr(
@@ -619,6 +572,14 @@ class AutoParallel:
                     alias_fqn,
                     attr_kind=_AttrKind.PARAMETER,
                 )
+            elif alias_fqn in sharded_param_dict:
+                _assign_attr(
+                    self.parallel_model.get_parameter(alias_fqn),
+                    self.parallel_model,
+                    self.model,
+                    canonical_fqn,
+                    attr_kind=_AttrKind.PARAMETER,
+                )
         for alias_fqn, canonical_fqn in self._buffer_alias_map.items():
             if canonical_fqn in sharded_buffer_dict:
                 _assign_attr(
@@ -626,6 +587,14 @@ class AutoParallel:
                     self.parallel_model,
                     self.model,
                     alias_fqn,
+                    attr_kind=_AttrKind.BUFFER,
+                )
+            elif alias_fqn in sharded_buffer_dict:
+                _assign_attr(
+                    self.parallel_model.get_buffer(alias_fqn),
+                    self.parallel_model,
+                    self.model,
+                    canonical_fqn,
                     attr_kind=_AttrKind.BUFFER,
                 )
 
@@ -659,21 +628,21 @@ class AutoParallel:
 
         # TODO: this probably belongs in the AOTAutograd API
         # TODO: pytree handling
+        # Capture the exact FQNs the compiled graph expects as primals.
+        # This avoids issues with aliased params/buffers where identity-based
+        # dedup can break after init_weights reassigns tensors.
+        graph_param_fqns = list(self.joint_with_descriptors.params_spec)
+        graph_buffer_fqns = list(self.joint_with_descriptors.buffers_spec)
+
         class AutoParallelModule(torch.nn.Module):
             def forward(self, *args):
                 # NB: don't close over the parameters/buffers, as the user may
                 # reassign the module!
-                # TODO: It's this to just exactly match
-                # prepare_aot_module_simplified, this seems like an API gap
+                # Use the exact param/buffer FQNs that the compiled graph
+                # expects, matching the primals order from tracing.
                 params = [
-                    v.to_local()
-                    for k, v in
-                    # TODO: this is very slow
-                    itertools.chain(
-                        dict(self.named_parameters(remove_duplicate=False)).items(),
-                        dict(self.named_buffers(remove_duplicate=False)).items(),
-                    )
-                ]
+                    self.get_parameter(fqn).to_local() for fqn in graph_param_fqns
+                ] + [self.get_buffer(fqn).to_local() for fqn in graph_buffer_fqns]
                 boxed_args = [*params, *args]
                 del params
                 # NB: don't do self.parallel_model_fn work around Dynamo bug
@@ -821,6 +790,7 @@ def auto_parallel(
     *,
     mp_policy: Optional[MixedPrecisionPolicy] = None,
     compile: bool = True,
+    parameter_memory_budget: Optional[tuple[Optional[float], Optional[float]]] = None,
 ) -> torch.nn.Module:
     """
     Parallelize a model with automatic sharding optimization.
@@ -845,6 +815,8 @@ def auto_parallel(
                 - Dict output: {"logits": (Shard(0),), "loss": (Replicate(),)}
         mp_policy: Optional mixed precision policy.
         compile: Whether to use torch.compile (default: True).
+        parameter_memory_budget: Optional (low, high) bounds for parameter memory.
+            Each bound is a float multiplier or None for unbounded.
 
     Returns:
         Parallelized module. Call to_empty(device="cuda") and init_weights()
@@ -900,8 +872,11 @@ def auto_parallel(
         enable_ac=False,
     ) as autop:
         # Add constraints
-        # autop.add_parameter_memory_constraint(low=None, high=None)
         autop.add_input_constraints(input_placements)
+        if parameter_memory_budget is not None:
+            autop.add_parameter_memory_constraint(
+                low=parameter_memory_budget[0], high=parameter_memory_budget[1]
+            )
         autop.add_output_constraints(output_placements)
 
         # Optimize and apply

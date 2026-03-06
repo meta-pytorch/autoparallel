@@ -11,10 +11,11 @@ import torch.nn.functional as F
 from torch import nn
 from torch._functorch._aot_autograd.fx_utils import get_param_nodes
 from torch.distributed._tensor.experimental import local_map
+from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
 from torch.testing._internal.distributed.fake_pg import FakeStore
 
-from autoparallel.api import AutoParallel
+from autoparallel.api import AutoParallel, auto_parallel
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -335,24 +336,23 @@ def test_in_graph_tensor_ctor(device_mesh_1d):
                 self.linear.bias.fill_(98.6)
             self.buf = torch.arange(dim)
 
-    def input_fn():
-        b = 512
-        inputs = (torch.rand(b, dim, device="cuda"),)
-        return inputs
-
     with torch.device("meta"):
         model = Model(dim)
-    with AutoParallel(
-        model,
-        input_fn,
-        device_mesh_1d,
-    ) as autop:
-        x_sharding = (Shard(0),)
-        autop.add_input_constraints([x_sharding])
-        sharding_placement = autop.optimize_placement()
 
-        # AutoParallel produces a module with meta-DTensor parameters that need to be initialized
-        parallel_mod = autop.apply_placement(sharding_placement)
+    batch_size = 512
+    local_batch_size = batch_size // device_mesh_1d.size()
+    x = DTensor.from_local(
+        torch.rand(local_batch_size, dim, device="cuda"),
+        device_mesh_1d,
+        [Shard(0)],
+    )
+    parallel_mod = auto_parallel(
+        model,
+        device_mesh_1d,
+        sample_inputs=(x,),
+        out_shardings=(Shard(0),),
+        compile=False,
+    )
     parallel_mod.to_empty(device="cuda")
     parallel_mod.init_weights()
     assert torch.equal(

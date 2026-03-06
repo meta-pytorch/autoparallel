@@ -7,7 +7,7 @@
 > work. It's recommended that you signal your intention to contribute in the
 > issue tracker, either by filing a new issue or by claiming an existing one.
 
-This currently works on PyTorch 2.8.0.dev20250506.
+AutoParallel requires installing [PyTorch nightly](https://pytorch.org/get-started/locally/).
 
 ## Installing it
 

@@ -19,9 +19,7 @@ from torch._C._autograd import DeviceType
 from torch._C._distributed_c10d import Work as _Work
 from torch._C._distributed_c10d import _register_work, _SymmetricMemory
 from torch.distributed._symmetric_memory import get_symm_mem_workspace, rendezvous
-
-# Import GroupName for type checking
-GroupName = c10d.GroupName
+from torch.distributed.distributed_c10d import GroupName
 
 _is_test_mode: bool = False
 _mocked_group_names: set[str] | None = None
