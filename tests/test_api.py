@@ -14,7 +14,7 @@ from torch.testing._internal.distributed.fake_pg import FakeStore
 from autoparallel.api import (
     AutoParallel,
     _check_forward_args,
-    _compute_expected_input_metadata,
+    _compute_expected_inputs,
     auto_parallel,
 )
 
@@ -956,7 +956,7 @@ def test_auto_parallel_with_mp_policy(device_mesh_1d):
 
 def test_check_forward_args():
     """Unit test: _check_forward_args catches shape/dtype/type mismatches."""
-    expected = [("tensor", (2, 128), torch.float32)]
+    expected = [torch.empty(2, 128, device="meta")]
 
     # Correct inputs
     _check_forward_args((torch.rand(2, 128),), expected)
@@ -980,7 +980,7 @@ def test_check_forward_args():
 
 def test_check_forward_args_non_tensor_value():
     """Unit test: _check_forward_args validates non-tensor input equality."""
-    expected = [("value", 42)]
+    expected = [42]
 
     _check_forward_args((42,), expected)
 
@@ -988,38 +988,42 @@ def test_check_forward_args_non_tensor_value():
         _check_forward_args((99,), expected)
 
 
-def test_compute_expected_input_metadata(device_mesh_1d):
+def test_compute_expected_inputs(device_mesh_1d):
     """Test local shape computation from global shape + Shard constraint."""
     mesh = device_mesh_1d
     world_size = mesh.size()
 
-    traced = [("tensor", (512, 128), torch.float32)]
+    traced = [torch.empty(512, 128, device="meta")]
     constraints = [(Shard(0),)]
 
-    result = _compute_expected_input_metadata(traced, constraints, mesh)
-    assert result == [("tensor", (512 // world_size, 128), torch.float32)]
+    result = _compute_expected_inputs(traced, constraints, mesh)
+    assert len(result) == 1
+    assert result[0].shape == (512 // world_size, 128)
+    assert result[0].dtype == torch.float32
 
 
-def test_compute_expected_input_metadata_default_constraints(device_mesh_1d):
+def test_compute_expected_inputs_default_constraints(device_mesh_1d):
     """Test that None constraints default to Shard(0)."""
     mesh = device_mesh_1d
     world_size = mesh.size()
 
-    traced = [("tensor", (512, 128), torch.float32)]
+    traced = [torch.empty(512, 128, device="meta")]
 
-    result = _compute_expected_input_metadata(traced, None, mesh)
-    assert result == [("tensor", (512 // world_size, 128), torch.float32)]
+    result = _compute_expected_inputs(traced, None, mesh)
+    assert len(result) == 1
+    assert result[0].shape == (512 // world_size, 128)
 
 
-def test_compute_expected_input_metadata_replicated(device_mesh_1d):
+def test_compute_expected_inputs_replicated(device_mesh_1d):
     """Test that Replicate constraint leaves shape unchanged."""
     mesh = device_mesh_1d
 
-    traced = [("tensor", (512, 128), torch.float32)]
+    traced = [torch.empty(512, 128, device="meta")]
     constraints = [(Replicate(),)]
 
-    result = _compute_expected_input_metadata(traced, constraints, mesh)
-    assert result == [("tensor", (512, 128), torch.float32)]
+    result = _compute_expected_inputs(traced, constraints, mesh)
+    assert len(result) == 1
+    assert result[0].shape == (512, 128)
 
 
 def test_forward_input_validation_integration(device_mesh_1d):
