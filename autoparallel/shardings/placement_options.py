@@ -75,6 +75,13 @@ def propagate_tensor_meta(op, user_args, user_kwargs, out_strat):
                     ospec = DTensorSpec(
                         mesh=mesh, placements=(Replicate(),) * mesh.ndim
                     )
+                # Some multi-output ops (e.g. SDPA backward) have optional
+                # outputs that are None at runtime. DTensor's strategy still
+                # creates a DTensorSpec for the position, but the actual
+                # output doesn't exist (hence, tm is None). Replace with None so downstream
+                # code (remove_invalid_configs, validate) skips it gracefully.
+                elif ospec is not None and tm is None:
+                    ospec = None
                 new_output_specs.append(ospec)
             strat.output_specs = tuple(new_output_specs)
 
