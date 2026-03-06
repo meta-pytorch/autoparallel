@@ -310,13 +310,13 @@ def split_with_sizes_rule(mesh, specs):
 
 @register_rule(torch.ops.prims.iota.default)
 def iota_rule(mesh, specs):
-    # from IPython import embed; embed(); exit()
-    # raise NotImplementedError("Needs hardening, only tested on a few cases")
+    # Replicate-only: iota's output values are position-dependent
+    # ([0, 1, ..., length-1]), so Shard would require adjusting `start`
+    # per rank. Replicate is correct and cheap (small index tensors).
     shape = [specs[0]]
     tensor_meta = _gen_tensor_meta(shape, dtype=torch.int64)
     placement = (Replicate(),) * mesh.ndim
     spec = DTensorSpec(mesh, placement, tensor_meta=tensor_meta)
-    # return OpStrategy([OpSpec(spec, input_specs=[spec], redistribute_cost=[[0.0]])])
     return OpStrategy([OpSpec(spec, input_specs=[spec], redistribute_cost=[[0.0]])])
 
 
@@ -665,22 +665,18 @@ def constant_pad_nd_rule(mesh, op_schema):
 def split_rule(mesh, op_schema):
     strat = op_schema.args_schema
     op = torch.ops.aten.split.Tensor
-    from torch.distributed.tensor._ops._tensor_ops import split_rule
+    from torch.distributed.tensor._ops._tensor_ops import split_strategy
+
+    op_schema = OpSchema(op, (strat[0], strat[1], strat[2]), {})
+    upstream_strat = split_strategy(op_schema)
 
     res = []
-    oo = []
-    for i, ss in enumerate(strat[0].strategies):
-        ispec = ss.input_specs[0]
-        assert ss.output_spec == ispec
-        o = split_rule(OpSchema(op, (ispec, strat[1], strat[2]), {}))
-        # res.append(o)
-        oo.append(o)
-        if o.output_spec is not None:
-            s = OpSpec(o.output_spec, input_specs=(ispec,))
-            s.redistribute_cost = [[math.inf] * len(ss.redistribute_cost[0])]
-            # s.redistribute_cost = [[0.0] * len(ss.redistribute_cost[0])]
-            s.redistribute_cost[0][i] = 0.0
-            res.append(s)
+    n_input_strats = len(strat[0].strategies)
+    for i, os in enumerate(upstream_strat.strategies):
+        s = OpSpec(os.output_specs, input_specs=os.input_specs)
+        s.redistribute_cost = [[math.inf] * n_input_strats]
+        s.redistribute_cost[0][i] = 0.0
+        res.append(s)
 
     out_strat = OpStrategy(res)
     return out_strat

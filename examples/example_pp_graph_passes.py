@@ -104,13 +104,12 @@ def _get_pp_module_and_graphs(
         dynamic=True,
         compile=False,
         reshard_after_forward=False,
-        loss_fn=dsv3_loss_fn if use_loss_fn else None,
     ) as autop:
         autop.add_parameter_memory_constraint(low=None, high=None)
 
         # x_sharding = (Shard(0), Replicate())
         x_sharding = (Shard(0), Shard(0))
-        if autop.loss_fn is not None:
+        if use_loss_fn:
             autop.add_input_constraints([x_sharding, x_sharding])
             autop.add_output_constraints([(Replicate(), Replicate())])
         else:
@@ -465,6 +464,22 @@ if __name__ == "__main__":
     with torch.device("meta"):
         model = DeepSeekV3Model(config).bfloat16()
         model.tok_embeddings = None  # type: ignore[assignment]
+
+    if use_loss_fn:
+
+        class ModelWithLoss(torch.nn.Module):
+            def __init__(self, model):
+                super().__init__()
+                self.model = model
+
+            def forward(self, h, labels):
+                output = self.model(h)
+                return dsv3_loss_fn(output, labels)
+
+            def init_weights(self, *args, **kwargs):
+                return self.model.init_weights(*args, **kwargs)
+
+        model = ModelWithLoss(model)
 
     def make_input_fn(sharded: bool = False, with_target: bool = False):
         """Create input generator. `sharded` uses mesh-adjusted batch size."""

@@ -110,3 +110,53 @@ def test_permute_layernorm_stride_handling(device_mesh_1d):
 
     # Verify forward execution produces correct output
     assert out.abs().sum() > 0
+
+
+def test_iota(device_mesh_1d):
+    """End-to-end test: model with torch.arange (decomposes to prims.iota)."""
+    seq_len = 256
+    dim = 64
+
+    class ArangeModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = nn.Embedding(seq_len, dim)
+
+        def forward(self, x):
+            positions = torch.arange(x.shape[1], device=x.device)
+            return x + self.embed(positions)
+
+    batch_size = 256
+
+    def input_fn():
+        return torch.rand(batch_size, seq_len, dim, device="cuda")
+
+    with torch.device("meta"):
+        model = ArangeModel()
+
+    mp_policy = MixedPrecisionPolicy(
+        param_dtype=torch.float32, reduce_dtype=torch.float32
+    )
+
+    with AutoParallel(
+        model, input_fn, device_mesh_1d, mp_policy, compile=True
+    ) as autop:
+        autop.add_input_constraints([(Shard(0),)])
+        autop.add_output_constraints([(Shard(0),)])
+        sharding_placement = autop.optimize_placement()
+        parallel_mod = autop.apply_placement(sharding_placement)
+
+    parallel_mod.to_empty(device="cuda")
+    torch.nn.init.ones_(parallel_mod.embed.weight)
+
+    local_batch = batch_size // torch.distributed.get_world_size()
+    x = torch.ones(local_batch, seq_len, dim, device="cuda")
+    out = parallel_mod(x)
+
+    assert out.shape == (local_batch, seq_len, dim)
+
+    # embed(positions) with all-ones weight gives all-ones, plus all-ones input = 2.0
+    assert torch.allclose(out, torch.full_like(out, 2.0))
+
+    out.sum().backward()
+    assert parallel_mod.embed.weight.grad is not None

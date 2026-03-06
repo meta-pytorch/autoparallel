@@ -163,6 +163,62 @@ DEVICE_LIMITS: Tuple[DeviceLimit, ...] = (
             torch.float16: 21.2,
         },
     ),
+    # AMD MI200X
+    DeviceLimit(
+        "AMD Instinct MI200X",
+        "https://www.amd.com/content/dam/amd/en/documents/instinct-business-docs/product-briefs/instinct-mi210-brochure.pdf",
+        sm=(-1, -1),  # sm not defined for AMD GPUs
+        gmem_bandwidth=1.6 * (1024**4),
+        gemm_tflops={
+            torch.float64: 45.3,
+            torch.float32: 45.3,
+            torch.float16: 181.0,
+            torch.bfloat16: 181.0,
+            torch.int8: 181.0,
+        },
+    ),
+    # AMD MI300X
+    DeviceLimit(
+        "AMD Instinct MI300X",
+        "https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/data-sheets/amd-instinct-mi300x-data-sheet.pdf",
+        sm=(-1, -1),  # sm not defined for AMD GPUs
+        gmem_bandwidth=5.3 * (1024**4),
+        gemm_tflops={
+            torch.float64: 163.4,
+            torch.float32: 653.7,
+            torch.float16: 1307.4,
+            torch.bfloat16: 1307.4,
+            torch.int8: 2614.9,
+        },
+    ),
+    # AMD MI325X
+    DeviceLimit(
+        "AMD Instinct MI325X",
+        "https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/product-briefs/instinct-mi325x-datasheet.pdf",
+        sm=(-1, -1),  # sm not defined for AMD GPUs
+        gmem_bandwidth=6.0 * (1024**4),
+        gemm_tflops={
+            torch.float64: 163.4,
+            torch.float32: 653.7,
+            torch.float16: 1307.4,
+            torch.bfloat16: 1307.4,
+            torch.int8: 2614.9,
+        },
+    ),
+    # AMD MI350X
+    DeviceLimit(
+        "AMD Instinct MI350X",
+        "https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/product-briefs/amd-instinct-mi350x-gpu-brochure.pdf",
+        sm=(-1, -1),  # sm not defined for AMD GPUs
+        gmem_bandwidth=8.0 * (1024**4),
+        gemm_tflops={
+            torch.float64: 72.1,
+            torch.float32: 144.2,
+            torch.float16: 2300,
+            torch.bfloat16: 2300,
+            torch.int8: 4600,
+        },
+    ),
 )
 
 
