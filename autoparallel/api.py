@@ -308,8 +308,6 @@ class AutoParallel:
             repeated_subgraphs=self.kwargs.get("repeated_subgraphs", False),
         )
 
-        # links sharding of forward/backward paired nodes (params, inputs, outputs)
-        sharding_optimizer.add_grad_param_constraints()
         self.sharding_optimizer = sharding_optimizer
 
         self.input_constraints = None

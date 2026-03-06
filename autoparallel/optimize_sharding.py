@@ -60,7 +60,7 @@ subject to the following constraint categories:
        → Implemented in: add_parameter_memory_constraint()
 
    5c. Forward-backward consistency: x_{fwd} = x_{bwd} for paired nodes
-       → Implemented in: add_grad_param_constraints()
+       → Implemented in: add_forward_backward_consistency_constraints()
 
    5d. General node constraints: Force specific placement for any node
        → Implemented in: add_node_constraint()
@@ -555,6 +555,7 @@ class ShardingOptimizer:
         self.add_same_output_across_args_constraint()
         self.add_output_input_consistent_constraint()
         self.add_inf_cost_constraint()
+        self.add_forward_backward_consistency_constraints()
 
     # ---- Solution ----
 
@@ -702,7 +703,7 @@ class ShardingOptimizer:
                 self._get_next_name(constraint_name),
             )
 
-    def add_grad_param_constraints(self):
+    def add_forward_backward_consistency_constraints(self):
         """USER (Category 5c): Forward-backward consistency constraints.
         Ensures that paired forward/backward nodes have matching output placements
         for parameters, plain inputs, and plain outputs.
@@ -794,7 +795,7 @@ class ShardingOptimizer:
     ):
         """Shared implementation for add_sharded_input_constraint and
         add_sharded_output_constraint. Only constrains the forward-side node;
-        the backward side is handled by add_grad_param_constraints."""
+        the backward side is handled by add_forward_backward_consistency_constraints."""
         remaining = None
         if placements is not None:
             remaining = {i: p for i, p in enumerate(placements)}
@@ -823,7 +824,7 @@ class ShardingOptimizer:
     ):
         """USER (Category 5a): Force specific placements for input nodes.
         The corresponding gradient inputs are automatically constrained via
-        add_grad_param_constraints()."""
+        add_forward_backward_consistency_constraints()."""
         self._add_io_placement_constraints(
             nodes_dict=get_plain_input_and_grad_nodes(self.graph),
             placements=input_placements,
@@ -843,7 +844,7 @@ class ShardingOptimizer:
     def add_sharded_output_constraint(self, output_placements=None):
         """USER (Category 5a): Force specific placements for output nodes.
         The corresponding tangent/gradient nodes are automatically constrained via
-        add_grad_param_constraints()."""
+        add_forward_backward_consistency_constraints()."""
         self._add_io_placement_constraints(
             nodes_dict=get_plain_output_and_tangent_nodes(self.graph),
             placements=output_placements,
