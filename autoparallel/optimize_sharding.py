@@ -95,10 +95,7 @@ from .cost_models.compute_estimation import (
     estimate_strategy_runtime_cost,
 )
 from .graph_passes.graph_clustering import get_identical_regions
-from .shardings.placement_options import (
-    get_local_map_placement_option,
-    get_placement_options,
-)
+from .shardings.placement_options import get_placement_options_for_node
 from .shardings.propagation_rules import _create_all_options
 
 
@@ -164,7 +161,7 @@ class ShardingOptimizer:
     def build_sharding_metadata(self):
         strats = {}
         for node in self.graph.nodes:
-            if node.op == "placeholder":
+            if node.op in ("placeholder", "get_attr"):
                 strats[node] = _create_all_options(
                     self.mesh, node.meta["val"].shape, tensor=node.meta["val"]
                 )
@@ -179,37 +176,8 @@ class ShardingOptimizer:
                 user_kwargs = tree_map_only(
                     torch.fx.Node, lambda x: x.meta["val"], node.kwargs
                 )
-                if local_map_kwargs := node.meta.get("local_map_kwargs", {}):
-                    assert local_map_kwargs["in_placements"] is not None
-                    assert local_map_kwargs["out_placements"] is not None
-                    assert (
-                        local_map_kwargs.get("in_grad_placements", None) is None
-                    ), "Not yet implemented"
-                    assert local_map_kwargs.get("device_mesh", None) in (
-                        self.mesh,
-                        None,
-                    ), "Not yet implemented"
-                    assert not user_kwargs
-                    # TODO: get rid of this when HOP can install as a subgraph
-                    assert "call_local_map" in str(
-                        node.target
-                    ) or "call_local_map_backward" in str(node.target)
-                    strat = get_local_map_placement_option(
-                        self.mesh,
-                        user_strats,
-                        user_args,
-                        node,
-                        local_map_kwargs["in_placements"],
-                        local_map_kwargs["out_placements"],
-                    )
-                else:
-                    strat = get_placement_options(
-                        self.mesh, node.target, user_strats, user_args, user_kwargs
-                    )
-                strats[node] = strat
-            elif node.op == "get_attr":
-                strats[node] = _create_all_options(
-                    self.mesh, node.meta["val"].shape, tensor=node.meta["val"]
+                strats[node] = get_placement_options_for_node(
+                    self.mesh, node, user_strats, user_args, user_kwargs
                 )
             elif node.op == "output":
                 user_strats = tree_map_only(

@@ -207,9 +207,22 @@ def get_local_map_placement_option(
     specs,
     user_args,
     node,
-    in_placements,
-    out_placements,
+    local_map_kwargs,
 ):
+    in_placements = local_map_kwargs["in_placements"]
+    out_placements = local_map_kwargs["out_placements"]
+    assert in_placements is not None
+    assert out_placements is not None
+    assert (
+        local_map_kwargs.get("in_grad_placements", None) is None
+    ), "Not yet implemented"
+    assert local_map_kwargs.get("device_mesh", None) in (
+        mesh,
+        None,
+    ), "Not yet implemented"
+    assert "call_local_map" in str(node.target) or "call_local_map_backward" in str(
+        node.target
+    )
     in_specs = []
     num_activation_inputs = len(user_args) - len(in_placements)
     # activations are always replicated
@@ -317,6 +330,15 @@ def get_local_map_placement_option(
             )
         ]
     )
+
+
+def get_placement_options_for_node(mesh, node, specs, user_args, user_kwargs):
+    if local_map_kwargs := node.meta.get("local_map_kwargs", {}):
+        assert not user_kwargs
+        return get_local_map_placement_option(
+            mesh, specs, user_args, node, local_map_kwargs
+        )
+    return get_placement_options(mesh, node.target, specs, user_args, user_kwargs)
 
 
 def _get_device_from_mesh(mesh):
