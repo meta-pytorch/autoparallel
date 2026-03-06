@@ -25,12 +25,7 @@ from torch.utils._pytree import tree_flatten, tree_map_only
 from autoparallel.shardings.propagation_rules import generate_dummy_redistribute_costs
 
 from .dtensor_sharding_helpers import get_op_strategy, with_implicit_strategies
-from .propagation_rules import (
-    TENSOR_FACTORY_OPS,
-    _op_partial_rules,
-    _op_rules,
-    remove_invalid_configs,
-)
+from .propagation_rules import _op_partial_rules, _op_rules, remove_invalid_configs
 
 
 def _get_meta_tensors_for_op(op, user_args, user_kwargs):
@@ -108,12 +103,10 @@ def propagate_tensor_meta(op, user_args, user_kwargs, out_strat):
             )
             strat.input_specs = (strat.output_specs,)
             assert strat.redistribute_cost is None
-        # NOTE: this invariant wrt factory ops is something I believe
-        # I'll keep for the solver, so we need to have some consistency here
-        # i.e., even though factory ops don't have inputs, we do put an
-        # input spec for it which is equal to the output spec
-        if op in TENSOR_FACTORY_OPS:
-            assert len(tensor_metas) == 0, f"{op}, {len(tensor_metas)}"
+        # Factory ops and other no-input ops (e.g. iota) have 0 tensor
+        # inputs but carry a dummy input_spec equal to output_spec so
+        # the solver has something to wire up.
+        if len(tensor_metas) == 0:
             assert len(strat.input_specs) == 1, f"{op}, {len(strat.input_specs)}"
         else:
             assert len(tensor_metas) == len(
