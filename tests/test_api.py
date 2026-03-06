@@ -944,3 +944,57 @@ def test_auto_parallel_with_mp_policy(device_mesh_1d):
     )
 
     assert parallel_model is not None
+
+
+def test_forward_error_shape_mismatch(device_mesh_1d):
+    """Model with a shape mismatch raises a RuntimeError with a clear message."""
+    dim = 128
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = nn.Linear(dim, dim)
+
+        def forward(self, x):
+            # Deliberately wrong: matmul with incompatible shapes
+            return self.linear(x) + torch.ones(dim + 1)
+
+    with torch.device("meta"):
+        model = Model()
+
+    def input_fn():
+        return (torch.rand(32, dim, device="cuda"),)
+
+    with pytest.raises(
+        RuntimeError, match="Fix the model before applying AutoParallel"
+    ):
+        with AutoParallel(model, input_fn, device_mesh_1d):
+            pass
+
+
+def test_forward_error_preserves_cause(device_mesh_1d):
+    """The original exception is chained as __cause__."""
+    dim = 128
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = nn.Linear(dim, dim)
+
+        def forward(self, x):
+            raise ValueError("something is wrong")
+
+    with torch.device("meta"):
+        model = Model()
+
+    def input_fn():
+        return (torch.rand(32, dim, device="cuda"),)
+
+    with pytest.raises(
+        RuntimeError, match="Fix the model before applying AutoParallel"
+    ) as exc_info:
+        with AutoParallel(model, input_fn, device_mesh_1d):
+            pass
+
+    assert isinstance(exc_info.value.__cause__, ValueError)
+    assert "something is wrong" in str(exc_info.value.__cause__)

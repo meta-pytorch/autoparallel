@@ -346,6 +346,21 @@ class AutoParallel:
             raw_inputs if isinstance(raw_inputs, tuple) else (raw_inputs,)
         )
 
+        # Run a fake forward pass to surface errors with clearer messages
+        # than what dynamo tracing would produce.
+        # This must be outside enable_local_map_wrapping(), because
+        # defer_inlining changes the local_map FakeTensorMode codepath
+        # to expect a traced GraphModule (with metadata like local_map_kwargs),
+        # which doesn't exist during a plain forward.
+        try:
+            with self.fake_mode:
+                self.model(*formatted_inputs)
+        except Exception as e:
+            raise RuntimeError(
+                "Error running model forward pass. "
+                "Fix the model before applying AutoParallel."
+            ) from e
+
         with set_dtype_cast(
             True
         ), enable_local_map_wrapping(), torch._dynamo.utils._disable_saved_tensors_hooks_during_tracing():
