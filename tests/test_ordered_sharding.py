@@ -385,6 +385,9 @@ def test_compute_optimal_placement_order_with_non_trainable_params(device_mesh_2
     ), "Test setup error: should have some non-trainable params"
 
     with AutoParallel(model, input_fn, device_mesh_2d) as autop:
+        placement = (Shard(0), Replicate())
+        autop.add_input_constraints([placement])
+        autop.add_output_constraints([placement])
         autop.add_parameter_memory_constraint(low=0, high=None)
         sharding_placement = autop.optimize_placement()
 
@@ -446,6 +449,9 @@ def test_compute_optimal_placement_order_with_all_non_trainable_params(device_me
     ), "Test setup error: should have NO trainable params"
 
     with AutoParallel(model, input_fn, device_mesh_2d) as autop:
+        placement = (Shard(0), Replicate())
+        autop.add_input_constraints([placement])
+        autop.add_output_constraints([placement])
         autop.add_parameter_memory_constraint(low=0, high=None)
         sharding_placement = autop.optimize_placement()
 

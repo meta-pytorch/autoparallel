@@ -417,14 +417,6 @@ class AutoParallel:
     def optimize_placement(self, verbose=True):
         self._assert_entered()
 
-        if self.input_constraints is None:
-            # forces sharding of input to be S(0) on first dimension and R on others
-            self.add_input_constraints(None)
-
-        if self.output_constraints is None:
-            # forces sharding of fwd output to be S(0) on first dimension and R on others
-            self.add_output_constraints(None)
-
         self.sharding_placement = self.sharding_optimizer.get_solution(verbose=False)
 
         if verbose:
