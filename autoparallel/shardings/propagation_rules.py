@@ -310,12 +310,13 @@ def split_with_sizes_rule(mesh, specs):
 
 @register_rule(torch.ops.prims.iota.default)
 def iota_rule(mesh, specs):
-    raise NotImplementedError("Needs hardening, only tested on a few cases")
+    # Replicate-only: iota's output values are position-dependent
+    # ([0, 1, ..., length-1]), so Shard would require adjusting `start`
+    # per rank. Replicate is correct and cheap (small index tensors).
     shape = [specs[0]]
     tensor_meta = _gen_tensor_meta(shape, dtype=torch.int64)
     placement = (Replicate(),) * mesh.ndim
     spec = DTensorSpec(mesh, placement, tensor_meta=tensor_meta)
-    # return OpStrategy([OpSpec(spec, input_specs=[spec], redistribute_cost=[[0.0]])])
     return OpStrategy([OpSpec(spec, input_specs=[spec], redistribute_cost=[[0.0]])])
 
 
