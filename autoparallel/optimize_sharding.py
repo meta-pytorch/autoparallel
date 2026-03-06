@@ -42,35 +42,27 @@ subject to the following constraint categories:
    → Implemented in: add_output_input_consistent_constraint()
 
 4. COST CONSTRAINTS: Variables with infinite cost (invalid configurations) are
-   forced to zero.
+   forced to zero. Efficiency penalties for inefficient collective operations
+   (e.g., non-batch-dim shard-to-replicate) are embedded in the cost coefficients
+   computed by the cost model (see cost_models/collective_runtime_estimation.py).
 
    ∀i,a,o,j: c_{i,a,o,j} = ∞ ⟹ x_{i,a,o,j} = 0
 
    → Implemented in: add_inf_cost_constraint()
 
-5. EFFICIENCY CONSTRAINTS: Penalize inefficient collective operations like
-   non-batch dimension shard-to-replicate conversions and forbid invalid
-   transitions like replicate-to-partial.
-
-   - Shard(dim≠0) → Replicate: multiply cost by 4
-   - Replicate → Partial: x_{i,a,o,j} = 0 (forbidden)
-   - Partial → Shard(dim≠0): multiply cost by 4
-
-   → Implemented in: penalize_inefficient_collectives()
-
-6. USER CONSTRAINTS (optional): Force specific placements for inputs, outputs,
+5. USER CONSTRAINTS (optional): Force specific placements for inputs, outputs,
    parameters, or memory usage bounds.
 
-   6a. Input/Output constraints: x_{i,a,o*,j*} = 1 for specified (o*,j*)
+   5a. Input/Output constraints: x_{i,a,o*,j*} = 1 for specified (o*,j*)
        → Implemented in: add_sharded_input_constraint(), add_sharded_output_constraint()
 
-   6b. Memory constraints: Σ_{params} (size_ratio * x_{param}) ≤ memory_limit
+   5b. Memory constraints: Σ_{params} (size_ratio * x_{param}) ≤ memory_limit
        → Implemented in: add_parameter_memory_constraint()
 
-   6c. Forward-backward consistency: x_{fwd} = x_{bwd} for paired nodes
+   5c. Forward-backward consistency: x_{fwd} = x_{bwd} for paired nodes
        → Implemented in: add_grad_param_constraints()
 
-   6d. General node constraints: Force specific placement for any node
+   5d. General node constraints: Force specific placement for any node
        → Implemented in: add_node_constraint()
 
 The solver finds the globally optimal sharding strategy that minimizes total
@@ -81,7 +73,8 @@ import math
 import operator
 import time
 from collections import defaultdict
-from typing import Optional
+from dataclasses import dataclass
+from typing import Any, Optional
 
 import pulp
 import torch
@@ -108,14 +101,34 @@ from .shardings.placement_options import (
 )
 from .shardings.propagation_rules import _create_all_options
 
-_GLOBAL_NAMES: dict[str, int] = {}
+
+@dataclass
+class DecisionVar:
+    """A decision variable in the ILP, representing one (node, arg, output_placement,
+    input_placement) choice with its associated costs and strategy metadata."""
+
+    var: Any  # pulp.LpVariable
+    cost: float
+    compute_cost: float
+    comm_cost: float
+    sharding_transition_cost: float
+    strategy: Any  # OpSpec
+    output_spec: Any  # DTensorSpec or tuple[DTensorSpec | None, ...]
+    input_spec: Any  # DTensorSpec
 
 
-def _get_next_name(name):
-    global _GLOBAL_NAMES  # noqa: F824
-    idx = _GLOBAL_NAMES.setdefault(name, 0)
-    _GLOBAL_NAMES[name] += 1
-    return name + f"_{idx:03}"
+def _assert_has_tensor_meta(spec_or_specs, node, label):
+    """Assert that all DTensorSpecs in a spec (possibly a tuple) have tensor_meta."""
+    if isinstance(spec_or_specs, (list, tuple)):
+        for spec in spec_or_specs:
+            if spec:
+                assert (
+                    spec.tensor_meta is not None
+                ), f"{node} {label} doesn't have a tensor_meta"
+    elif spec_or_specs is not None:
+        assert (
+            spec_or_specs.tensor_meta is not None
+        ), f"{node} {label} doesn't have a tensor_meta"
 
 
 class ShardingOptimizer:
@@ -128,22 +141,25 @@ class ShardingOptimizer:
         self.mesh = mesh
         self.rescale_grad_comm_cost_for_mp = rescale_grad_comm_cost_for_mp
         self.node_map = {node: i for i, node in enumerate(self.graph.nodes)}
+        self._name_counters: dict[str, int] = {}
         self.strats = self.build_sharding_metadata()
 
-        self.cluster_links = {}
+        self.cluster_links: dict[tuple, tuple] = {}
         if repeated_subgraphs:
             t = time.time()
             clusters = get_identical_regions(self.gm.graph, self.strats)
             print(f"Found {len(clusters)} clusters in {time.time() - t:.2f}s")
             self.create_cluster_links(clusters)
 
-        # ds: Decision variables dictionary mapping (s_i, argi, ss, ii) -> ILP variable data
-        # Each key represents a choice of input placement ii and output placement ss
-        # for operation s_i and argument argi (corresponds to x_{i,a,o,j} in math notation)
-        self.ds, self.num_inp_out, self.num_args = self.build_ds()
+        self.decision_vars = self._build_decision_vars()
         self.validate()
         self.prob = pulp.LpProblem("AutoParallel", pulp.LpMinimize)
         self.add_default_constraints()
+
+    def _get_next_name(self, prefix):
+        idx = self._name_counters.setdefault(prefix, 0)
+        self._name_counters[prefix] += 1
+        return prefix + f"_{idx:03}"
 
     def build_sharding_metadata(self):
         strats = {}
@@ -192,8 +208,6 @@ class ShardingOptimizer:
                     )
                 strats[node] = strat
             elif node.op == "get_attr":
-                # get_attr nodes represent module attributes (e.g., constant tensors)
-                # Handle similarly to placeholder nodes
                 strats[node] = _create_all_options(
                     self.mesh, node.meta["val"].shape, tensor=node.meta["val"]
                 )
@@ -203,341 +217,400 @@ class ShardingOptimizer:
                 )
                 strats[node] = user_strats
             else:
-                raise ValueError(f"Oups {node.op}")
+                raise ValueError(f"Unexpected node op: {node.op}")
         return strats
 
     def create_cluster_links(self, clusters):
-        """
-        This function creates a mapping between optimization nodes that are
-        identical. We use this to reduce the optimization space.
-        If cluster_links[key1] == key2, this means that everywhere in the
-        optimization problem we will be using key2 instead.
-        """
+        """Create a mapping between identical optimization nodes to reduce the
+        optimization space. If cluster_links[key1] == key2, the optimization
+        problem uses key2's variable in place of key1."""
         for cluster_group in clusters:
             cluster0 = cluster_group[0]
             for cluster_i in cluster_group[1:]:
                 for n0, ni in zip(cluster0, cluster_i):
-                    s0 = self.node_map[n0]
-                    s1 = self.node_map[ni]
+                    idx0 = self.node_map[n0]
+                    idx1 = self.node_map[ni]
                     options_n0 = list(self.walk_over_options(n0))
                     options_ni = list(self.walk_over_options(ni))
                     assert options_n0 == options_ni, (
                         f"Problem with graph clustering: {n0} and {ni} don't have the same number "
                         "of input/output placements. Please report a bug"
                     )
-                    for argi, oi, ii in options_n0:
-                        self.cluster_links[(s1, argi, oi, ii)] = (s0, argi, oi, ii)
-
-    def _build_pulp_variable(self, key, ds):
-        """
-        This function creates the PuLP optimization variable, taking into
-        consideration that if there are identical nodes (defined by cluster_links)
-        then we will reuse the optimization variable.
-        """
-        s_i, argi, ss, ii = key
-        node = self.nodes[s_i]
-        if key in self.cluster_links and self.cluster_links[key] in ds:
-            # if we already have a root variable created for a similar node, use it
-            va = ds[self.cluster_links[key]]["va"]
-        elif key in self.cluster_links and self.cluster_links[key] not in ds:
-            # if we have a similar node for which the root variable has not been created yet,
-            # create the new variable early and populate the ds with "va" field
-            # the remaining fields will be populated when the root variable is created
-            new_key = self.cluster_links[key]
-            new_s_i = new_key[0]
-            new_node = self.nodes[new_s_i]
-            va = pulp.LpVariable(
-                f"n={new_node},s={new_s_i},arg={argi},output_p={ss},input_p={ii}",
-                cat=pulp.LpBinary,
-            )
-            ds[new_key] = {"va": va}
-        elif key in ds:
-            # if we are the root variable, make sure that we haven't yet
-            # been initialized. This happens if we have been created before by
-            # a similar node which isn't a root
-            va = ds[key]["va"]
-            assert "cost" not in ds[key]
-        else:
-            # we are a root variable which came first in the iteration order
-            va = pulp.LpVariable(
-                f"n={node},s={s_i},arg={argi},output_p={ss},input_p={ii}",
-                cat=pulp.LpBinary,
-            )
-        return va
-
-    def build_ds(self):
-        """
-        Build decision variables (ds) for the ILP optimization.
-
-        Creates binary variables x_{i,a,o,j} for each valid combination of:
-        - s_i: operation index
-        - argi: argument index
-        - ss: output placement strategy index (o in math notation)
-        - ii: input placement strategy index (j in math notation)
-
-        Returns:
-            ds: Dictionary mapping (s_i, argi, ss, ii) -> {
-                "va": PuLP binary variable,
-                "cost": communication + computation cost,
-                "full_strat": complete strategy object,
-                "out_strat": output placement specification,
-                "inp_strat": input placement specification
-            }
-            num_inp_out: Metadata about strategy counts per operation-argument
-            num_args: Number of arguments per operation
-        """
-        strats = self.strats
-        ds = {}
-        num_inp_out = {}
-        num_args = {}
-        grad_param_nodes = set(
-            x[1] for x in get_param_and_grad_nodes(self.graph).values()
-        )
-        sharding_transition_scale = 1
-        for s_i, (node, s) in enumerate(strats.items()):
-            if node.op == "output":
-                continue
-            num_args[s_i] = len(s.strategies[0].input_specs)
-            for argi, argv in enumerate(s.strategies[0].redistribute_cost):
-                num_inp_out[(s_i, argi)] = {
-                    "num_input_strat": len(argv),
-                    "num_output_strat": len(s.strategies),
-                }
-            for ss, ssi in enumerate(s.strategies):
-                compute_cost = estimate_strategy_runtime_cost(node, ssi)
-                for argi, xxi in enumerate(ssi.redistribute_cost):
-                    all_input_nodes = self._all_input_nodes(node)
-                    argi_strat = (
-                        self.strats[all_input_nodes[argi]] if all_input_nodes else None
-                    )
-                    for ii, comm_cost in enumerate(xxi):
-                        # Imagine we start node_i from S(0)S(0) and we want to reach node_{i+2} at
-                        # RR, and that node_{i+1} is an op with zero cost (like alias).
-                        # In this case, all of the following chains yield the same cost:
-                        # - S(0)S(0) -> S(0)R -> RR
-                        # - S(0)S(0) -> RS(0) -> RR
-                        # - S(0)S(0) -> RR -> RR
-                        # - S(0)S(0) -> S(0)S(0) -> RR
-                        # all of those cases are in principle equivalent. But if we want to
-                        # optimize S(0)S(0) -> RR to dispatch into a single collective instead of two
-                        # then we need to vafor the last two cases where redistribution happens
-                        # in a single go. To do this, we add a tie-break cost that is 1 if a redistribution
-                        # happens prior to getting to this configuration, and 0 otherwise. This way,
-                        # we will favor having fewer redistributions happening in the graph.
-                        if argi_strat is not None:
-                            src_spec = argi_strat.strategies[ii].output_specs
-                            # TODO: operator.getitem being special is something
-                            # we might want to change in the future
-                            if node.target == operator.getitem:
-                                src_spec = src_spec[node.args[1]]
-                            tgt_spec = ssi.input_specs[argi]
-                            if isinstance(src_spec, DTensorSpec) and isinstance(
-                                tgt_spec, DTensorSpec
-                            ):
-                                # we use our custom comm_cost function to estimate the cost
-                                # of the collective operation
-                                comm_cost = estimate_strategy_comms_cost(
-                                    src_spec, tgt_spec
-                                )
-
-                                redistribution_happened = (
-                                    src_spec.placements != tgt_spec.placements
-                                )
-                                sharding_transition_cost = (
-                                    int(redistribution_happened)
-                                    * sharding_transition_scale
-                                )
-                            else:
-                                # e.g. getitem returning on scalars
-                                sharding_transition_cost = 0
-                        else:
-                            sharding_transition_cost = 0
-
-                        if node in grad_param_nodes:
-                            comm_cost = comm_cost / self.rescale_grad_comm_cost_for_mp
-
-                        # update OpSpec redistribution cost with our newly-computed cost
-                        # this is useful for print_costs_for_node to print the updated cost
-                        xxi[ii] = comm_cost
-                        key = (s_i, argi, ss, ii)
-                        # NOTE: this modifies ds in-place sometimes
-                        # we might want to refactor this in the future
-                        va = self._build_pulp_variable(key, ds)
-                        ds[key] = {
-                            "va": va,
-                            "cost": comm_cost
-                            + compute_cost / num_args[s_i]
-                            + sharding_transition_cost,
-                            "compute_cost": compute_cost / num_args[s_i],
-                            "comm_cost": comm_cost,
-                            "sharding_transition_cost": sharding_transition_cost,
-                            "full_strat": ssi,
-                            "out_strat": ssi.output_specs,
-                            "inp_strat": ssi.input_specs[argi],
-                        }
-        return ds, num_inp_out, num_args
+                    for argi, out_idx, inp_idx in options_n0:
+                        self.cluster_links[(idx1, argi, out_idx, inp_idx)] = (
+                            idx0,
+                            argi,
+                            out_idx,
+                            inp_idx,
+                        )
 
     def _all_input_nodes(self, node):
-        """
-        Variant of node.all_input_nodes which preserve duplicate nodes
-        """
+        """Variant of node.all_input_nodes that preserves duplicate nodes."""
         # TODO: add kwargs?
         return [x for x in tree_flatten(node.args)[0] if isinstance(x, torch.fx.Node)]
 
     def walk_over_options(self, node, constrain_arg=None):
-        # TODO: use an iterator over node inputs, as done in penalize_inefficient_collectives
-        # the problem is when nodes don't have input_nodes, like placeholders or
-        # constructor functions. Doing it this way for now
-        tgt_op_strat = self.strats[node]
-        for argi in range(len(tgt_op_strat.strategies[0].input_specs)):
-            if constrain_arg is not None:
-                if argi != constrain_arg:
+        """Yield (argi, out_idx, inp_idx) for all valid strategy combinations."""
+        op_strategy = self.strats[node]
+        for argi in range(len(op_strategy.strategies[0].input_specs)):
+            if constrain_arg is not None and argi != constrain_arg:
+                continue
+            for out_idx, strategy in enumerate(op_strategy.strategies):
+                for inp_idx in range(len(strategy.redistribute_cost[argi])):
+                    yield argi, out_idx, inp_idx
+
+    def _create_pulp_variables(self):
+        """Create PuLP binary variables for all decision points, resolving
+        cluster links so that identical nodes share the same variable.
+
+        Returns a dict mapping every (node_idx, argi, out_idx, inp_idx) key
+        to its PuLP variable.
+        """
+        # Map each key to its canonical root key
+        root_for_key = {}
+        for node_idx, (node, _) in enumerate(self.strats.items()):
+            if node.op == "output":
+                continue
+            for argi, out_idx, inp_idx in self.walk_over_options(node):
+                key = (node_idx, argi, out_idx, inp_idx)
+                root_for_key[key] = self.cluster_links.get(key, key)
+
+        # Create one PuLP variable per unique root
+        root_variables: dict[tuple, pulp.LpVariable] = {}
+        for root_key in set(root_for_key.values()):
+            root_node_idx, argi, out_idx, inp_idx = root_key
+            root_node = self.nodes[root_node_idx]
+            root_variables[root_key] = pulp.LpVariable(
+                f"n={root_node},s={root_node_idx},arg={argi},"
+                f"output_p={out_idx},input_p={inp_idx}",
+                cat=pulp.LpBinary,
+            )
+
+        return {key: root_variables[root] for key, root in root_for_key.items()}
+
+    def _compute_edge_costs(
+        self,
+        node,
+        output_strategy,
+        argi,
+        inp_idx,
+        default_comm_cost,
+        producer_strategy,
+        grad_param_nodes,
+    ):
+        """Compute communication and sharding transition costs for transitioning
+        from input placement inp_idx to the output_strategy's expected input at argi.
+
+        The transition cost is a tie-breaker that penalizes unnecessary redistributions:
+        when multiple redistribution chains have the same communication cost, we prefer
+        fewer individual redistributions so they can be fused into single collectives.
+
+        Returns (comm_cost, sharding_transition_cost).
+        """
+        comm_cost = default_comm_cost
+        sharding_transition_cost = 0
+
+        if producer_strategy is not None:
+            src_spec = producer_strategy.strategies[inp_idx].output_specs
+            # TODO: operator.getitem being special is something
+            # we might want to change in the future
+            if node.target == operator.getitem:
+                src_spec = src_spec[node.args[1]]
+            tgt_spec = output_strategy.input_specs[argi]
+            if isinstance(src_spec, DTensorSpec) and isinstance(tgt_spec, DTensorSpec):
+                comm_cost = estimate_strategy_comms_cost(src_spec, tgt_spec)
+                if src_spec.placements != tgt_spec.placements:
+                    sharding_transition_cost = 1
+
+        if node in grad_param_nodes:
+            comm_cost = comm_cost / self.rescale_grad_comm_cost_for_mp
+
+        return comm_cost, sharding_transition_cost
+
+    def _build_decision_vars(self):
+        """Build DecisionVar entries for every (node_idx, argi, out_idx, inp_idx)
+        combination in the strategy space."""
+        pulp_variables = self._create_pulp_variables()
+        grad_param_nodes = set(
+            x[1] for x in get_param_and_grad_nodes(self.graph).values()
+        )
+
+        decision_vars = {}
+        for node_idx, (node, op_strategy) in enumerate(self.strats.items()):
+            if node.op == "output":
+                continue
+
+            all_input_nodes = self._all_input_nodes(node)
+            num_args = len(op_strategy.strategies[0].input_specs)
+
+            for out_idx, output_strategy in enumerate(op_strategy.strategies):
+                compute_cost = estimate_strategy_runtime_cost(node, output_strategy)
+                per_arg_compute = compute_cost / num_args
+
+                for argi, redist_costs in enumerate(output_strategy.redistribute_cost):
+                    producer_strategy = (
+                        self.strats[all_input_nodes[argi]] if all_input_nodes else None
+                    )
+                    for inp_idx, default_comm_cost in enumerate(redist_costs):
+                        comm_cost, transition_cost = self._compute_edge_costs(
+                            node,
+                            output_strategy,
+                            argi,
+                            inp_idx,
+                            default_comm_cost,
+                            producer_strategy,
+                            grad_param_nodes,
+                        )
+                        # Update OpSpec redistribute_cost so print_costs_for_node
+                        # reflects the recomputed costs
+                        redist_costs[inp_idx] = comm_cost
+
+                        key = (node_idx, argi, out_idx, inp_idx)
+                        decision_vars[key] = DecisionVar(
+                            var=pulp_variables[key],
+                            cost=comm_cost + per_arg_compute + transition_cost,
+                            compute_cost=per_arg_compute,
+                            comm_cost=comm_cost,
+                            sharding_transition_cost=transition_cost,
+                            strategy=output_strategy,
+                            output_spec=output_strategy.output_specs,
+                            input_spec=output_strategy.input_specs[argi],
+                        )
+
+        return decision_vars
+
+    def _collect_vars(self, node, node_idx, argi, group_by, resolve_clusters=False):
+        """Collect PuLP variables for a node's options, grouped by strategy index.
+
+        Args:
+            group_by: "out_idx" to group by output strategy index,
+                      "inp_idx" to group by input strategy index.
+            resolve_clusters: If False, skip cluster-linked keys. If True,
+                              resolve through cluster_links to root variables.
+        """
+        result = {}
+        for _, out_idx, inp_idx in self.walk_over_options(node, argi):
+            key = (node_idx, argi, out_idx, inp_idx)
+            if key in self.cluster_links:
+                if not resolve_clusters:
                     continue
-            for oi, tgt_strat in enumerate(tgt_op_strat.strategies):
-                for ii in range(len(tgt_strat.redistribute_cost[argi])):
-                    yield argi, oi, ii
+                var = self.decision_vars[self.cluster_links[key]].var
+            else:
+                var = self.decision_vars[key].var
+            group_key = out_idx if group_by == "out_idx" else inp_idx
+            result.setdefault(group_key, []).append(var)
+        return result
+
+    def validate(self):
+        for node in self.graph.nodes:
+            if node.op != "call_function":
+                continue
+            strat = self.strats[node]
+            strat0 = strat.strategies[0]
+            all_input_nodes = self._all_input_nodes(node)
+            num_input_nodes = len(all_input_nodes)
+            if len(strat0.redistribute_cost) != num_input_nodes:
+                # only constructor functions allowed here
+                assert num_input_nodes == 0, f"{num_input_nodes}"
+                assert (
+                    len(strat0.redistribute_cost) == 1
+                ), f"{len(strat0.redistribute_cost)}"
+            assert (len(strat0.redistribute_cost) == num_input_nodes) or (
+                num_input_nodes == 0 and len(strat0.redistribute_cost) == 1
+            ), f"{node}, {len(strat0.redistribute_cost)}, {num_input_nodes}"
+
+            _assert_has_tensor_meta(strat0.output_specs, node, "output_specs")
+            for input_spec in strat0.input_specs:
+                _assert_has_tensor_meta(input_spec, node, "input_spec")
+
+            for i, arg in enumerate(all_input_nodes):
+                strat_arg = self.strats[arg]
+                num_arg_strats = len(strat_arg.strategies)
+                assert (
+                    len(strat0.redistribute_cost[i]) == num_arg_strats
+                ), f"{node}, {len(strat0.redistribute_cost[i])}, {num_arg_strats}"
+
+    # ---- Default constraints ----
 
     def add_unique_decision_constraint(self):
-        """
-        UNIQUENESS CONSTRAINTS (Category 1): Each operation-argument pair must select exactly one
-        input-output placement combination.
+        """UNIQUENESS (Category 1): Each (operation, argument) pair selects exactly
+        one input-output placement combination.
 
-        Mathematical form: ∀i,a: Σ_{o,j} x_{i,a,o,j} = 1
+        ∀i,a: Σ_{o,j} x_{i,a,o,j} = 1
         """
-        # a single pair of input-output policy is chosen
-        for s_i, node in enumerate(self.graph.nodes):
+        for node_idx, node in enumerate(self.graph.nodes):
             if node.op not in {"placeholder", "call_function", "get_attr"}:
                 continue
             arg_vars = {}
-            for arg, oi, ii in self.walk_over_options(node):
-                key = (s_i, arg, oi, ii)
+            for argi, out_idx, inp_idx in self.walk_over_options(node):
+                key = (node_idx, argi, out_idx, inp_idx)
                 if key in self.cluster_links:
                     continue
-                va = self.ds[key]["va"]
-                arg_vars.setdefault(arg, []).append(va)
+                var = self.decision_vars[key].var
+                arg_vars.setdefault(argi, []).append(var)
             for eqs in arg_vars.values():
-                self.prob += (pulp.lpSum(eqs) == 1, _get_next_name("unique_decision"))
+                self.prob += (
+                    pulp.lpSum(eqs) == 1,
+                    self._get_next_name("unique_decision"),
+                )
 
     def add_same_output_across_args_constraint(self):
-        """
-        CONSISTENCY CONSTRAINTS (Category 2): For multi-argument operations, all arguments must agree
-        on the same output placement to ensure the operation can execute correctly.
+        """CONSISTENCY (Category 2): For multi-argument operations, all arguments
+        agree on the same output placement.
 
-        Mathematical form: ∀i,o: Σ_j x_{i,0,o,j} = Σ_j x_{i,1,o,j} = ... = Σ_j x_{i,A_i-1,o,j}
+        ∀i,o: Σ_j x_{i,0,o,j} = Σ_j x_{i,1,o,j} = ... = Σ_j x_{i,A_i-1,o,j}
         """
-        # enforce that the same output policy is chosen
-        # across arguments
-        for s_i, node in enumerate(self.graph.nodes):
+        for node_idx, node in enumerate(self.graph.nodes):
             if node.op != "call_function":
                 continue
             if len(self._all_input_nodes(node)) <= 1:
                 continue
             vars_per_output = {}
-            for arg, oi, ii in self.walk_over_options(node):
-                key = (s_i, arg, oi, ii)
+            for argi, out_idx, inp_idx in self.walk_over_options(node):
+                key = (node_idx, argi, out_idx, inp_idx)
                 if key in self.cluster_links:
                     continue
-                va = self.ds[key]["va"]
-                vars_per_output.setdefault((arg, oi), []).append(va)
+                var = self.decision_vars[key].var
+                vars_per_output.setdefault((argi, out_idx), []).append(var)
             eqs_per_arg = [[] for _ in self._all_input_nodes(node)]
-            for (arg, oi), value in vars_per_output.items():
-                eqs_per_arg[arg].append(pulp.lpSum(value))
+            for (argi, out_idx), value in vars_per_output.items():
+                eqs_per_arg[argi].append(pulp.lpSum(value))
             arg0 = eqs_per_arg[0]
-            for argi in eqs_per_arg[1:]:
-                assert len(arg0) == len(argi)
+            for arg_eqs in eqs_per_arg[1:]:
+                assert len(arg0) == len(arg_eqs)
                 for i in range(len(arg0)):
                     self.prob += (
-                        arg0[i] == argi[i],
-                        _get_next_name("same_across_args"),
+                        arg0[i] == arg_eqs[i],
+                        self._get_next_name("same_across_args"),
                     )
 
     def add_output_input_consistent_constraint(self):
-        """
-        FLOW CONSTRAINTS (Category 3): The output placement of producer operations must match the
-        input placement of consumer operations (dataflow consistency).
+        """FLOW (Category 3): The output placement of producer operations matches
+        the input placement of consumer operations.
 
-        Mathematical form: ∀(i→k): Σ_j x_{i,0,o,j} = Σ_j x_{k,a,j,o}
+        ∀(i→k): Σ_j x_{i,0,o,j} = Σ_j x_{k,a,j,o}
         """
-        # enforce that the input of strat_{i+1} == output of strat_{i}
-        for s_i, node in enumerate(self.graph.nodes):
+        for node_idx, node in enumerate(self.graph.nodes):
             if node.op == "output":
                 continue
-            argi = 0
+            # All args agree on the same output (ensured by consistency constraint),
+            # so we use arg 0 for the producer side.
             for user in node.users:
-                # TODO: check this
                 if user.op == "output":
                     continue
-                s_j = self.node_map[user]
-                argj = [i for i, n in enumerate(user.all_input_nodes) if n == node]
-                assert len(argj) == 1
-                argj = argj[0]
-                # argj in s_j corresponds to argi in s_i
+                user_idx = self.node_map[user]
+                user_argi = [i for i, n in enumerate(user.all_input_nodes) if n == node]
+                assert len(user_argi) == 1
+                user_argi = user_argi[0]
 
-                vars_s_i = {}
-                for _, s_i_oi, s_i_ii in self.walk_over_options(node, argi):
-                    key = (s_i, argi, s_i_oi, s_i_ii)
-                    if key in self.cluster_links:
-                        continue
-                    va = self.ds[key]["va"]
-                    vars_s_i.setdefault(s_i_oi, []).append(va)
+                vars_producer = self._collect_vars(
+                    node, node_idx, argi=0, group_by="out_idx"
+                )
+                if not vars_producer:
+                    vars_producer = self._collect_vars(
+                        node,
+                        node_idx,
+                        argi=0,
+                        group_by="out_idx",
+                        resolve_clusters=True,
+                    )
 
-                vars_s_j = {}
-                for _, s_j_oi, s_j_ii in self.walk_over_options(user, argj):
-                    key = (s_j, argj, s_j_oi, s_j_ii)
-                    if key in self.cluster_links:
-                        continue
-                    va = self.ds[key]["va"]
-                    vars_s_j.setdefault(s_j_ii, []).append(va)
+                vars_consumer = self._collect_vars(
+                    user, user_idx, argi=user_argi, group_by="inp_idx"
+                )
+                if not vars_consumer:
+                    vars_consumer = self._collect_vars(
+                        user,
+                        user_idx,
+                        argi=user_argi,
+                        group_by="inp_idx",
+                        resolve_clusters=True,
+                    )
 
-                if len(vars_s_j) == 0:
-                    vars_s_j = {}
-                    for _, s_j_oi, s_j_ii in self.walk_over_options(user, argj):
-                        key = (s_j, argj, s_j_oi, s_j_ii)
-                        if key in self.cluster_links:
-                            va = self.ds[self.cluster_links[key]]["va"]
-                        else:
-                            va = self.ds[key]["va"]
-                        vars_s_j.setdefault(s_j_ii, []).append(va)
+                assert (
+                    vars_producer.keys() == vars_consumer.keys()
+                ), f"{vars_producer}, {vars_consumer}"
 
-                if len(vars_s_i) == 0:
-                    vars_s_i = {}
-                    for _, s_i_oi, s_i_ii in self.walk_over_options(node, argi):
-                        key = (s_i, argi, s_i_oi, s_i_ii)
-                        if key in self.cluster_links:
-                            va = self.ds[self.cluster_links[key]]["va"]
-                        else:
-                            va = self.ds[key]["va"]
-                        vars_s_i.setdefault(s_i_oi, []).append(va)
-
-                assert vars_s_i.keys() == vars_s_j.keys(), f"{vars_s_i}, {vars_s_j}"
-
-                for k in vars_s_i:
+                for k in vars_producer:
                     self.prob += (
-                        pulp.lpSum(vars_s_i[k]) == pulp.lpSum(vars_s_j[k]),
-                        _get_next_name("output_input_consistent"),
+                        pulp.lpSum(vars_producer[k]) == pulp.lpSum(vars_consumer[k]),
+                        self._get_next_name("output_input_consistent"),
                     )
 
     def add_inf_cost_constraint(self):
-        """
-        COST CONSTRAINTS (Category 4): Variables with infinite cost (invalid configurations) are
-        forced to zero.
+        """COST (Category 4): Variables with infinite cost (invalid configurations)
+        are forced to zero.
 
-        Mathematical form: ∀i,a,o,j: c_{i,a,o,j} = ∞ ⟹ x_{i,a,o,j} = 0
+        ∀i,a,o,j: c_{i,a,o,j} = ∞ ⟹ x_{i,a,o,j} = 0
         """
-        # force inf cost values to be 0, as the solver doesn't accept inf
-        for key, x in self.ds.items():
-            if not math.isfinite(x["cost"]):
-                # set the cost to an arbitrary number
-                x["cost"] = 10000.0
+        for key, dv in self.decision_vars.items():
+            if not math.isfinite(dv.cost):
+                dv.cost = 10000.0
                 if key in self.cluster_links:
                     continue
-                self.prob += (x["va"] == 0, _get_next_name("inf_cases"))
+                self.prob += (dv.var == 0, self._get_next_name("inf_cases"))
 
     def add_default_constraints(self):
         self.add_unique_decision_constraint()
         self.add_same_output_across_args_constraint()
         self.add_output_input_consistent_constraint()
         self.add_inf_cost_constraint()
+
+    # ---- Solution ----
+
+    def _set_objective(self):
+        """Add the cost minimization objective to the ILP."""
+        # Deduplicate variables that appear multiple times (from cluster links)
+        cost_per_var = defaultdict(int)
+        for dv in self.decision_vars.values():
+            cost_per_var[dv.var] += dv.cost
+        self.prob += pulp.lpSum([var * cost for var, cost in cost_per_var.items()])
+
+    def _solve(self, verbose=False):
+        solver = pulp.PULP_CBC_CMD(msg=verbose)
+        self.prob.solve(solver)
+
+        self.selected_keys = [
+            key for key, dv in self.decision_vars.items() if dv.var.value() == 1
+        ]
+
+        if self.prob.status == -1:
+            print(self.get_violated_constraints_log())
+            raise RuntimeError("Unsolvable problem")
+
+    def _extract_and_validate_solution(self):
+        """Validate the ILP solution and return the optimal strategy per node."""
+        selected_by_node = {}
+        for key in self.selected_keys:
+            node = self.nodes[key[0]]
+            selected_by_node.setdefault(node, []).append(self.decision_vars[key])
+
+        # Validate: each (node, arg) pair has exactly one selection
+        seen = set()
+        for key in self.selected_keys:
+            node_arg = (key[0], key[1])
+            if node_arg in seen:
+                node = self.nodes[key[0]]
+                raise RuntimeError(
+                    f"Multiple solutions for {node}, key={node_arg}, "
+                    f"solutions: {[str(dv.strategy) for dv in selected_by_node[node]]}"
+                )
+            seen.add(node_arg)
+
+        # Validate: all args of a node agree on the same strategy
+        for node, dvs in selected_by_node.items():
+            assert all(
+                dvs[0].strategy == dv.strategy for dv in dvs
+            ), f"{[dv.var for dv in dvs]}: {[str(dv.strategy) for dv in dvs]}"
+
+        return {node: dvs[0].strategy for node, dvs in selected_by_node.items()}
+
+    def get_solution(self, verbose=False):
+        self._set_objective()
+        self._solve(verbose)
+        return self._extract_and_validate_solution()
+
+    # ---- Logging ----
 
     def get_violated_constraints_log(self):
         violated_constraints = [
@@ -553,14 +626,14 @@ class ShardingOptimizer:
     def get_log(self, colored=False, verbose=False):
         from autoparallel.log_formatting import format_sharding_log
 
-        nodes = list(self.graph.nodes)
-        opt = {}
-        for x in self.res:
-            opt.setdefault(nodes[x[0]], []).append(self.ds[x])
+        selected_by_node = {}
+        for key in self.selected_keys:
+            node = self.nodes[key[0]]
+            selected_by_node.setdefault(node, []).append(self.decision_vars[key])
 
         return format_sharding_log(
             graph=self.graph,
-            opt=opt,
+            opt=selected_by_node,
             colored=colored,
             verbose=verbose,
             violated_constraints_log=self.get_violated_constraints_log(),
@@ -576,118 +649,65 @@ class ShardingOptimizer:
             _pretty_print_spec(x.output_specs) for x in src_strat.strategies
         ]
         costs = [[str(x)] + x.redistribute_cost[arg] for x in tgt_strat.strategies]
-        # dst_placements = [str(x) for x in tgt_strat.strategies]
-        # costs = [x.redistribute_cost[arg] for x in tgt_strat.strategies]
-        # print(dst_placements)
         print(tabulate(costs, headers=src_placements, **kwargs))
 
-    def get_solution(self, verbose=False):
-        # add cost
-        opt_target = defaultdict(int)
-        # let's remove potentially duplicate variables in the program and just
-        # add their costs
-        for x in self.ds.values():
-            opt_target[x["va"]] += x["cost"]
-        self.prob += pulp.lpSum([va * cost for va, cost in opt_target.items()])
-
-        # solver = pulp.HiGHS(msg=verbose)
-        solver = pulp.PULP_CBC_CMD(msg=verbose)
-        self.prob.solve(solver)
-
-        sol = {k: v["va"].value() for k, v in self.ds.items()}
-
-        self.res = [k for k, v in sol.items() if v == 1]
-
-        if self.prob.status == -1:
-            print(self.get_violated_constraints_log())
-            raise RuntimeError("Unsolvable problem")
-
-        opt = {}
-        nodes = list(self.graph.nodes)
-        for x in self.res:
-            opt.setdefault(nodes[x[0]], []).append(self.ds[x])
-
-        # validate that a single solution is chosen
-        # per node
-        seen = set()
-        for r in self.res:
-            key = (r[0], r[1])
-            if key in seen:
-                raise RuntimeError(
-                    f"Multiple solutions for {nodes[key[0]]}, key={key}, "
-                    f"solutions: {[str(x['full_strat']) for x in opt[nodes[key[0]]]]}"
-                )
-            seen.add(key)
-
-        # Let's simplify the output representation
-        # and just return a single OpSpec
-        # for each node
-        for k in opt.values():
-            assert all(
-                k[0]["full_strat"] == kk["full_strat"] for kk in k
-            ), f"{[kk['va'] for kk in k]}: {[str(kk['full_strat']) for kk in k]}"
-
-        new_opt = {}
-        for k, v in opt.items():
-            new_opt[k] = v[0]["full_strat"]
-
-        opt = new_opt
-
-        # TODO: assert all nodes have a placement?
-        return opt
+    # ---- User constraints ----
 
     def _add_node_constraint(
         self, node, output_constraint_indices, constraint_name=None
     ):
         if constraint_name is None:
             constraint_name = "user_constraint"
-        s_i = self.node_map[node]
+        node_idx = self.node_map[node]
         vars_per_arg = {}
-        for argi, output_constraint_index, input_index in self.walk_over_options(node):
-            if output_constraint_index in output_constraint_indices:
-                va = self.ds[(s_i, argi, output_constraint_index, input_index)]["va"]
-                vars_per_arg.setdefault(argi, []).append(va)
+        for argi, out_idx, inp_idx in self.walk_over_options(node):
+            if out_idx in output_constraint_indices:
+                var = self.decision_vars[(node_idx, argi, out_idx, inp_idx)].var
+                vars_per_arg.setdefault(argi, []).append(var)
         for eqs in vars_per_arg.values():
-            self.prob += (pulp.lpSum(eqs) == 1, _get_next_name(constraint_name))
+            self.prob += (
+                pulp.lpSum(eqs) == 1,
+                self._get_next_name(constraint_name),
+            )
 
     def _add_paired_output_constraint(self, node_a, node_b, constraint_name):
-        """
-        Constrains two nodes to have matching output placements.
+        """Constrains two nodes to have matching output placements.
 
         For each output strategy of node_a that also exists in node_b, adds:
-            Σ_ii x_{a, 0, oi_a, ii} == Σ_ii x_{b, 0, oi_b, ii}
+            Σ_j x_{a, 0, oi_a, j} == Σ_j x_{b, 0, oi_b, j}
 
         where oi_a and oi_b are output strategy indices with the same placement.
         """
-        s_a = self.node_map[node_a]
-        s_b = self.node_map[node_b]
-        strat_a = [str(strat.output_specs) for strat in self.strats[node_a].strategies]
-        strat_b = [str(strat.output_specs) for strat in self.strats[node_b].strategies]
-        num_inp_a = self.num_inp_out[(s_a, 0)]["num_input_strat"]
-        num_inp_b = self.num_inp_out[(s_b, 0)]["num_input_strat"]
-        for oi, sp in enumerate(strat_a):
+        idx_a = self.node_map[node_a]
+        idx_b = self.node_map[node_b]
+        strat_a = [str(s.output_specs) for s in self.strats[node_a].strategies]
+        strat_b = [str(s.output_specs) for s in self.strats[node_b].strategies]
+        num_inp_a = len(self.strats[node_a].strategies[0].redistribute_cost[0])
+        num_inp_b = len(self.strats[node_b].strategies[0].redistribute_cost[0])
+        for out_idx, sp in enumerate(strat_a):
             # TODO: fix this case
             if sp not in strat_b:
                 continue
-            ooi = strat_b.index(sp)
-            v_a = []
-            for ii in range(num_inp_a):
-                v_a.append(self.ds[(s_a, 0, oi, ii)]["va"])
-            v_b = []
-            for ii in range(num_inp_b):
-                v_b.append(self.ds[(s_b, 0, ooi, ii)]["va"])
+            out_idx_b = strat_b.index(sp)
+            v_a = [
+                self.decision_vars[(idx_a, 0, out_idx, inp_idx)].var
+                for inp_idx in range(num_inp_a)
+            ]
+            v_b = [
+                self.decision_vars[(idx_b, 0, out_idx_b, inp_idx)].var
+                for inp_idx in range(num_inp_b)
+            ]
             self.prob += (
                 pulp.lpSum(v_b) == pulp.lpSum(v_a),
-                _get_next_name(constraint_name),
+                self._get_next_name(constraint_name),
             )
 
     def add_grad_param_constraints(self):
-        """
-        USER CONSTRAINTS (Category 6c): Forward-backward consistency constraints.
+        """USER (Category 5c): Forward-backward consistency constraints.
         Ensures that paired forward/backward nodes have matching output placements
         for parameters, plain inputs, and plain outputs.
 
-        Mathematical form: Σ_ii x_{fwd, 0, oi, ii} = Σ_ii x_{bwd, 0, oi', ii}
+        Σ_j x_{fwd, 0, oi, j} = Σ_j x_{bwd, 0, oi', j}
         where oi and oi' have matching placements.
         """
         for param, grad in get_param_and_grad_nodes(self.graph).values():
@@ -712,33 +732,30 @@ class ShardingOptimizer:
     def add_parameter_memory_constraint(
         self, memory_factor_low: float, memory_factor_high: float
     ):
-        """
-        USER CONSTRAINTS (Category 6b): Memory constraints for parameters.
-        Ensures total parameter memory usage stays within specified bounds.
+        """USER (Category 5b): Constrain total parameter memory usage.
 
-        Mathematical form: Σ_{params} (size_ratio * x_{param}) ≤ memory_limit
+        Σ_{params} (size_ratio * x_{param}) ≤ memory_limit
         """
-        # get all parameters
         param_nodes: list[torch.fx.Node] = get_param_nodes(self.graph)
         elms: list[pulp.LpAffineExpression] = []
         num_params_to_consider: int = 0
         world_size: int = math.prod(self.mesh.shape)
         for node in param_nodes:
-            s_i = self.node_map[node]
-            vv = self.num_inp_out[(s_i, 0)]
+            node_idx = self.node_map[node]
             can_be_fully_sharded: bool = node.meta["val"].numel() >= world_size
             num_params_to_consider += int(can_be_fully_sharded)
             if not can_be_fully_sharded:
                 continue
-            for ii in range(vv["num_output_strat"]):
-                data = self.ds[(s_i, 0, ii, 0)]
-                spec: DTensorSpec = data["inp_strat"]
+            num_out_strat = len(self.strats[node].strategies)
+            for out_idx in range(num_out_strat):
+                dv = self.decision_vars[(node_idx, 0, out_idx, 0)]
+                spec: DTensorSpec = dv.input_spec
                 assert spec.tensor_meta is not None
                 tensor_shape: torch.Size = spec.tensor_meta.shape
                 new_tensor_shape, _ = _get_sharded_shape_stride(spec)
                 new_size: int = math.prod(new_tensor_shape)
                 old_size: int = math.prod(tensor_shape)
-                elms.append(data["va"] * new_size / old_size)
+                elms.append(dv.var * new_size / old_size)
 
         memory_factor_low *= num_params_to_consider
         memory_factor_high *= num_params_to_consider
@@ -746,22 +763,17 @@ class ShardingOptimizer:
         self.prob += (pulp.lpSum(elms) >= memory_factor_low, "memory_constraint_low")
 
     def add_node_constraint(self, node, placement=None, constraint_name=None):
-        """
-        USER CONSTRAINTS (Category 6d): General node constraints.
-        Force specific placement for any node.
-
-        Mathematical form: x_{i,a,o*,j*} = 1 for specified (o*,j*)
-        """
+        """USER (Category 5d): Force a specific placement for a node."""
         assert node in self.strats, (node, self.strats.keys())
         strat = self.strats[node]
         if placement is None:
             # default is Shard(0) to parallelize on the batch
             placement = (Shard(0),) + (Replicate(),) * (self.mesh.ndim - 1)
-        output_constraint_indices = []
-        for output_constraint_index, s in enumerate(strat.strategies):
-            spec = s.output_specs
-            if spec.placements == placement:
-                output_constraint_indices.append(output_constraint_index)
+        output_constraint_indices = [
+            i
+            for i, s in enumerate(strat.strategies)
+            if s.output_specs.placements == placement
+        ]
         if len(output_constraint_indices) == 0:
             raise RuntimeError(
                 f"Couldn't find appropriate constraint {node} {constraint_name} {placement}"
@@ -772,138 +784,79 @@ class ShardingOptimizer:
             constraint_name=constraint_name,
         )
 
+    def _add_io_placement_constraints(
+        self,
+        nodes_dict,
+        placements,
+        desc_type,
+        constraint_name,
+        error_message,
+    ):
+        """Shared implementation for add_sharded_input_constraint and
+        add_sharded_output_constraint. Only constrains the forward-side node;
+        the backward side is handled by add_grad_param_constraints."""
+        remaining = None
+        if placements is not None:
+            remaining = {i: p for i, p in enumerate(placements)}
+
+        for desc, (node, _companion_node) in nodes_dict.items():
+            if placements is None:
+                placement = None
+            else:
+                assert isinstance(desc, desc_type)
+                assert remaining is not None
+                placement = remaining.pop(desc.idx)
+
+            self.add_node_constraint(node, placement, constraint_name=constraint_name)
+
+        ignored = []
+        if remaining is not None:
+            for i, p in remaining.items():
+                if p is not None:
+                    ignored.append(i)
+
+        if ignored:
+            raise RuntimeError(error_message.format(indices=ignored))
+
     def add_sharded_input_constraint(
         self, input_placements: Optional[list[Optional[tuple[Placement, ...]]]] = None
     ):
-        """
-        USER CONSTRAINTS (Category 6a): Input placement constraints.
-        Force specific placements for input nodes. The corresponding gradient inputs
-        are automatically constrained via add_grad_param_constraints().
-
-        Mathematical form: x_{i,a,o*,j*} = 1 for specified input placements (o*,j*)
-        """
-        mut_ips = None
-        if input_placements is not None:
-            mut_ips = {i: p for i, p in enumerate(input_placements)}
-
-        for desc, (node, _grad_node) in get_plain_input_and_grad_nodes(
-            self.graph
-        ).items():
-            if input_placements is None:
-                placement = None
-            else:
-                assert isinstance(desc, PlainAOTInput)
-                assert mut_ips is not None
-                placement = mut_ips.pop(desc.idx)
-
-            self.add_node_constraint(
-                node, placement, constraint_name="input_constraint"
-            )
-
-        ignored_placements = []
-        if mut_ips is not None:
-            for i, p in mut_ips.items():
-                if p is not None:
-                    ignored_placements.append(i)
-
-        if ignored_placements:
-            raise RuntimeError(
-                f"We were unable to respect placements for inputs at indices {ignored_placements}.  "
-                f"This is because the traced joint graph did not actually have a dedicated placeholder node for these inputs.  "
-                f"This typically occurs because some inputs aliased each other; inspect the joint graph from tlparse for more details.  "
-                f"You can either remove an explicit placement for this input (replace it with None) or clone "
-                "the inputs before tracing to remove aliasing."
-            )
+        """USER (Category 5a): Force specific placements for input nodes.
+        The corresponding gradient inputs are automatically constrained via
+        add_grad_param_constraints()."""
+        self._add_io_placement_constraints(
+            nodes_dict=get_plain_input_and_grad_nodes(self.graph),
+            placements=input_placements,
+            desc_type=PlainAOTInput,
+            constraint_name="input_constraint",
+            error_message=(
+                "We were unable to respect placements for inputs at indices {indices}.  "
+                "This is because the traced joint graph did not actually have a dedicated "
+                "placeholder node for these inputs.  "
+                "This typically occurs because some inputs aliased each other; inspect the "
+                "joint graph from tlparse for more details.  "
+                "You can either remove an explicit placement for this input (replace it with "
+                "None) or clone the inputs before tracing to remove aliasing."
+            ),
+        )
 
     def add_sharded_output_constraint(self, output_placements=None):
-        """
-        USER CONSTRAINTS (Category 6a): Output placement constraints.
-        Force specific placements for output nodes. The corresponding tangent/gradient
-        nodes are automatically constrained via add_grad_param_constraints().
-
-        Mathematical form: x_{i,a,o*,j*} = 1 for specified output placements (o*,j*)
-        """
-        mut_ops = None
-        if output_placements is not None:
-            mut_ops = {i: p for i, p in enumerate(output_placements)}
-
-        output_and_tangent_nodes_index = get_plain_output_and_tangent_nodes(self.graph)
-        for desc, (node, _tangent_node) in output_and_tangent_nodes_index.items():
-            if output_placements is None:
-                placement = None
-            else:
-                assert isinstance(desc, PlainAOTOutput)
-                assert mut_ops is not None
-                placement = mut_ops.pop(desc.idx)
-
-            self.add_node_constraint(
-                node, placement, constraint_name="output_constraint"
-            )
-
-        ignored_placements = []
-        if mut_ops is not None:
-            for i, p in mut_ops.items():
-                if p is not None:
-                    ignored_placements.append(i)
-
-        if ignored_placements:
-            raise RuntimeError(
-                f"We were unable to respect placements for outputs at indices {ignored_placements}.  "
-                f"This is because the traced joint graph did not actually have a dedicated output node for these inputs.  "
-                f"This typically occurs because some outputs aliased each other; inspect the joint graph from tlparse for more details.  "
-                f"You can either remove an explicit placement for this output (replace it with None),"
-                "stop the model from returning aliases of the tensor or clone the outputs before returning "
-                "them from the graph to avoid aliasing."
-            )
-
-    def validate(self):
-        for node in self.graph.nodes:
-            if node.op != "call_function":
-                continue
-            strat = self.strats[node]
-            strat0 = strat.strategies[0]
-            all_input_nodes = self._all_input_nodes(node)
-            num_input_nodes = len(all_input_nodes)
-            if len(strat0.redistribute_cost) != num_input_nodes:
-                # only constructor functions allowed here
-                assert num_input_nodes == 0, f"{num_input_nodes}"
-                assert (
-                    len(strat0.redistribute_cost) == 1
-                ), f"{len(strat0.redistribute_cost)}"
-            assert (len(strat0.redistribute_cost) == num_input_nodes) or (
-                num_input_nodes == 0 and len(strat0.redistribute_cost) == 1
-            ), f"{node}, {len(strat0.redistribute_cost)}, {num_input_nodes}"
-            ospec = strat0.output_specs
-            if isinstance(ospec, (list, tuple)):
-                for spec in ospec:
-                    if spec:
-                        assert (
-                            spec.tensor_meta is not None
-                        ), f"{node} doesn't have a tensor_meta"
-            elif ospec is None:
-                # e.g. getitem on scalars
-                pass
-            else:
-                assert (
-                    ospec.tensor_meta is not None
-                ), f"{node} doesn't have a tensor_meta"
-
-            for ospec in strat0.input_specs:
-                if isinstance(ospec, (list, tuple)):
-                    for spec in ospec:
-                        assert (
-                            spec.tensor_meta is not None
-                        ), f"{node} input_spec doesn't have a tensor_meta"
-                elif ospec is None:
-                    # e.g. getitem on scalars
-                    pass
-                else:
-                    assert (
-                        ospec.tensor_meta is not None
-                    ), f"{node} input_spec doesn't have a tensor_meta"
-            for i, arg in enumerate(all_input_nodes):
-                strat_arg = self.strats[arg]
-                num_arg_strats = len(strat_arg.strategies)
-                assert (
-                    len(strat0.redistribute_cost[i]) == num_arg_strats
-                ), f"{node}, {len(strat0.redistribute_cost[i])}, {num_arg_strats}"
+        """USER (Category 5a): Force specific placements for output nodes.
+        The corresponding tangent/gradient nodes are automatically constrained via
+        add_grad_param_constraints()."""
+        self._add_io_placement_constraints(
+            nodes_dict=get_plain_output_and_tangent_nodes(self.graph),
+            placements=output_placements,
+            desc_type=PlainAOTOutput,
+            constraint_name="output_constraint",
+            error_message=(
+                "We were unable to respect placements for outputs at indices {indices}.  "
+                "This is because the traced joint graph did not actually have a dedicated "
+                "output node for these inputs.  "
+                "This typically occurs because some outputs aliased each other; inspect the "
+                "joint graph from tlparse for more details.  "
+                "You can either remove an explicit placement for this output (replace it with "
+                "None), stop the model from returning aliases of the tensor or clone the "
+                "outputs before returning them from the graph to avoid aliasing."
+            ),
+        )
