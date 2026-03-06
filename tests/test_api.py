@@ -445,6 +445,7 @@ def test_fx_graph_annotate(device_mesh_1d):
     ) as autop:
         x_sharding = (Shard(0),)
         autop.add_input_constraints([x_sharding])
+        autop.add_output_constraints([x_sharding])
         sharding_placement = autop.optimize_placement()
 
         # AutoParallel produces a module with meta-DTensor parameters that need to be initialized

@@ -153,6 +153,11 @@ def test_optimization_finds_fsdp_and_ddp_1d(device_mesh_1d, high_mem, model_type
         model = model_fn()
 
     with AutoParallel(model, input_fn, device_mesh_1d) as autop:
+        placement = (Shard(0),)
+        n_inputs = 2 if model_type == "ffn_with_multiple_input_output" else 1
+        n_outputs = 3 if model_type == "ffn_with_multiple_input_output" else 1
+        autop.add_input_constraints([placement] * n_inputs)
+        autop.add_output_constraints([placement] * n_outputs)
         autop.add_parameter_memory_constraint(low=low_mem, high=high_mem)
 
         sharding_placement = autop.optimize_placement()
@@ -282,6 +287,11 @@ def test_optimization_finds_fsdp_tp_2d(
         model = model_fn()
 
     with AutoParallel(model, input_fn, device_mesh_2d) as autop:
+        placement = (Shard(0), Replicate())
+        n_inputs = 2 if model_type == "ffn_with_multiple_input_output" else 1
+        n_outputs = 3 if model_type == "ffn_with_multiple_input_output" else 1
+        autop.add_input_constraints([placement] * n_inputs)
+        autop.add_output_constraints([placement] * n_outputs)
         autop.add_parameter_memory_constraint(low=low_mem, high=high_mem)
 
         sharding_placement = autop.optimize_placement()
@@ -573,6 +583,7 @@ def test_world_size_larger_than_parameter(device_mesh_1d):
     ) as autop:
         x_sharding = (Shard(0),)
         autop.add_input_constraints([x_sharding])
+        autop.add_output_constraints([x_sharding])
         autop.add_parameter_memory_constraint()
         sharding_placement = autop.optimize_placement()
 
