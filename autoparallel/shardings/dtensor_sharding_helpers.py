@@ -16,6 +16,7 @@ from torch.distributed.tensor._op_schema import (
     OpSpec,
     OpStrategy,
     StrategyType,
+    TupleStrategy,
 )
 from torch.distributed.tensor._ops.utils import (
     generate_redistribute_costs,
@@ -257,9 +258,20 @@ def _try_single_dim_strategy(
     mesh = op_schema.args_strategy[0].mesh
 
     # Compute output tensor meta via the propagator's existing infra.
-    spec_args = tuple(
-        arg.strategies[0].output_spec if isinstance(arg, OpStrategy) else arg
-        for arg in op_schema.args_schema
+    def _extract_spec(arg: object) -> object:
+        if isinstance(arg, OpStrategy):
+            return arg.strategies[0].output_spec
+        if isinstance(arg, TupleStrategy):
+            return [
+                child.strategies[0].output_spec
+                if isinstance(child, OpStrategy)
+                else child
+                for child in arg.children
+            ]
+        return arg
+
+    spec_args: tuple[object, ...] = tuple(
+        _extract_spec(arg) for arg in op_schema.args_schema
     )
     spec_schema = OpSchema(op, spec_args, op_schema.kwargs_schema)
     out_tensor_meta = propagator._propagate_tensor_meta_non_cached(spec_schema)
