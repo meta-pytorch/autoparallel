@@ -1073,3 +1073,47 @@ def test_forward_input_validation_integration(device_mesh_1d):
 
     with pytest.raises(TypeError, match="Tensor"):
         parallel_mod(42)
+
+
+def test_enter_failure_cleans_up_fake_mode(device_mesh_1d):
+    """FakeTensorMode pushed during build_model_graph is unwound if __enter__ fails.
+
+    build_model_graph() pushes FakeTensorMode onto self.stack via
+    aot_export_joint_with_descriptors. If something after build_model_graph()
+    raises (e.g. ShardingOptimizer), Python never calls __exit__ because
+    __enter__ didn't succeed, so __enter__ must unwind self.stack explicitly.
+    Without cleanup, the leaked FakeTensorMode causes "Mixing fake modes NYI"
+    on subsequent usage.
+    """
+    from unittest.mock import patch
+
+    dim = 128
+
+    class Model(nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            self.linear = nn.Linear(dim, dim)
+
+        def forward(self, x):
+            return self.linear(x)
+
+    def input_fn():
+        return (torch.rand(32, dim, device="cuda"),)
+
+    with torch.device("meta"):
+        model1 = Model(dim)
+    auto_p = AutoParallel(model1, input_fn, device_mesh_1d)
+
+    # Make ShardingOptimizer raise to simulate __enter__ failing
+    # after build_model_graph() has already pushed FakeTensorMode.
+    with patch(
+        "autoparallel.api.ShardingOptimizer", side_effect=RuntimeError("injected")
+    ):
+        with pytest.raises(RuntimeError, match="injected"):
+            auto_p.__enter__()
+
+    # If FakeTensorMode leaked, this would fail with "Mixing fake modes NYI"
+    # during copy.deepcopy inside AutoParallel.__init__.
+    with torch.device("meta"):
+        model2 = Model(dim)
+    AutoParallel(model2, input_fn, device_mesh_1d)
