@@ -234,7 +234,7 @@ def _compute_expected_inputs(traced_inputs, input_constraints, mesh):
             for mesh_dim, placement in enumerate(placements):
                 if isinstance(placement, Shard):
                     local_shape[placement.dim] //= mesh.size(mesh_dim)
-            result.append(inp.new_empty(local_shape, device="meta"))
+            result.append(torch.empty(local_shape, dtype=inp.dtype, device="meta"))
             tensor_idx += 1
         else:
             result.append(inp)
