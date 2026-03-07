@@ -210,6 +210,70 @@ def enable_local_map_wrapping():
         yield
 
 
+def _compute_expected_inputs(traced_inputs, input_constraints, mesh):
+    """Compute expected runtime inputs by applying sharding to traced global shapes.
+
+    Returns a list of meta tensors (for tensor inputs) or raw values (for non-tensor inputs).
+    """
+    from torch.distributed.tensor.placement_types import Replicate, Shard
+
+    default_placement = (Shard(0),) + (Replicate(),) * (mesh.ndim - 1)
+
+    result = []
+    tensor_idx = 0
+    for inp in traced_inputs:
+        if isinstance(inp, torch.Tensor):
+            if input_constraints is None:
+                placements = default_placement
+            else:
+                placements = input_constraints[tensor_idx]
+                if placements is None:
+                    placements = default_placement
+
+            local_shape = list(inp.shape)
+            for mesh_dim, placement in enumerate(placements):
+                if isinstance(placement, Shard):
+                    local_shape[placement.dim] //= mesh.size(mesh_dim)
+            result.append(torch.empty(local_shape, dtype=inp.dtype, device="meta"))
+            tensor_idx += 1
+        else:
+            result.append(inp)
+
+    return result
+
+
+def _check_forward_args(args, expected_inputs):
+    """Validate that forward() args match the shapes/dtypes used during tracing."""
+    if len(args) != len(expected_inputs):
+        raise ValueError(
+            f"AutoParallel: expected {len(expected_inputs)} arguments "
+            f"but got {len(args)}"
+        )
+    for i, (arg, expected) in enumerate(zip(args, expected_inputs)):
+        if isinstance(expected, torch.Tensor):
+            if not isinstance(arg, torch.Tensor):
+                raise TypeError(
+                    f"AutoParallel: argument {i} should be a Tensor "
+                    f"but got {type(arg).__name__}"
+                )
+            if arg.shape != expected.shape:
+                raise ValueError(
+                    f"AutoParallel: argument {i} has shape {tuple(arg.shape)} "
+                    f"but expected {tuple(expected.shape)}"
+                )
+            if arg.dtype != expected.dtype:
+                raise ValueError(
+                    f"AutoParallel: argument {i} has dtype {arg.dtype} "
+                    f"but expected {expected.dtype}"
+                )
+        else:
+            if arg != expected:
+                raise ValueError(
+                    f"AutoParallel: argument {i} has value {arg!r} "
+                    f"but was traced with {expected!r}"
+                )
+
+
 class AutoParallel:
     """
     Args:
@@ -345,6 +409,9 @@ class AutoParallel:
         formatted_inputs = (
             raw_inputs if isinstance(raw_inputs, tuple) else (raw_inputs,)
         )
+
+        # Capture traced inputs for runtime validation in forward().
+        self._traced_inputs = list(formatted_inputs)
 
         with set_dtype_cast(
             True
@@ -624,8 +691,13 @@ class AutoParallel:
         graph_param_fqns = list(self.joint_with_descriptors.params_spec)
         graph_buffer_fqns = list(self.joint_with_descriptors.buffers_spec)
 
+        expected_inputs = _compute_expected_inputs(
+            self._traced_inputs, self.input_constraints, self.mesh
+        )
+
         class AutoParallelModule(torch.nn.Module):
             def forward(self, *args):
+                _check_forward_args(args, expected_inputs)
                 # NB: don't close over the parameters/buffers, as the user may
                 # reassign the module!
                 # Use the exact param/buffer FQNs that the compiled graph
