@@ -5,6 +5,8 @@
 
 import copy
 import functools
+import logging
+import time
 from contextlib import ExitStack, contextmanager
 from types import MethodType
 from typing import Any, Callable, Optional, Union
@@ -45,6 +47,8 @@ from .shardings.placement_options import (
 )
 
 _APPLY_VIEW_MM_VIEW_PATTERN = False
+
+logger = logging.getLogger(__name__)
 
 
 def _build_alias_map(
@@ -401,6 +405,7 @@ class AutoParallel:
             )
 
     def build_model_graph(self):
+        t0 = time.perf_counter()
         decomp_table = _get_decomp_table()
 
         with self.fake_mode:
@@ -449,6 +454,7 @@ class AutoParallel:
         )
 
         self.gm = gm
+        logger.info("Graph tracing took %.3fs", time.perf_counter() - t0)
 
     # TODO: Specify what the low/high meaning is (percentage?)
     def add_parameter_memory_constraint(self, low=None, high=None):
@@ -504,6 +510,7 @@ class AutoParallel:
         return self.sharding_placement
 
     def _apply_placement_common(self, sharding_placement):
+        t0 = time.perf_counter()
         self._assert_entered()
 
         if sharding_placement is None:
@@ -583,6 +590,7 @@ class AutoParallel:
             torch.fx.node._side_effectful_functions.remove(
                 torch.ops._c10d_functional.wait_tensor.default
             )
+        logger.info("Apply placements took %.3fs", time.perf_counter() - t0)
         return (
             sharded_param_dict,
             sharded_buffer_dict,

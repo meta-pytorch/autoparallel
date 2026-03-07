@@ -3,6 +3,7 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+import logging
 import time
 from functools import partial
 
@@ -19,6 +20,8 @@ from autoparallel.graph_passes.auto_bucketing import (
     configure_inductor_for_autobucketing,
 )
 from autoparallel.graph_passes.debug_helpers import make_custom_runtime_estimation
+
+logging.basicConfig(level=logging.INFO)
 
 world_size = 64
 

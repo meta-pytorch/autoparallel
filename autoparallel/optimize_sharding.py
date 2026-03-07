@@ -69,6 +69,7 @@ The solver finds the globally optimal sharding strategy that minimizes total
 runtime cost while satisfying all constraints.
 """
 
+import logging
 import math
 import operator
 import time
@@ -97,6 +98,8 @@ from .cost_models.compute_estimation import (
 from .graph_passes.graph_clustering import get_identical_regions
 from .shardings.placement_options import get_placement_options_for_node
 from .shardings.propagation_rules import _create_all_options
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -139,7 +142,9 @@ class ShardingOptimizer:
         self.rescale_grad_comm_cost_for_mp = rescale_grad_comm_cost_for_mp
         self.node_map = {node: i for i, node in enumerate(self.graph.nodes)}
         self._name_counters: dict[str, int] = {}
+        t0 = time.perf_counter()
         self.strats = self.build_sharding_metadata()
+        logger.info("Placement options took %.3fs", time.perf_counter() - t0)
 
         self.cluster_links: dict[tuple, tuple] = {}
         if repeated_subgraphs:
@@ -148,10 +153,12 @@ class ShardingOptimizer:
             print(f"Found {len(clusters)} clusters in {time.time() - t:.2f}s")
             self.create_cluster_links(clusters)
 
+        t0 = time.perf_counter()
         self.decision_vars = self._build_decision_vars()
         self.validate()
         self.prob = pulp.LpProblem("AutoParallel", pulp.LpMinimize)
         self.add_default_constraints()
+        logger.info("ILP construction took %.3fs", time.perf_counter() - t0)
 
     def _get_next_name(self, prefix):
         idx = self._name_counters.setdefault(prefix, 0)
@@ -575,8 +582,10 @@ class ShardingOptimizer:
         return {node: dvs[0].strategy for node, dvs in selected_by_node.items()}
 
     def get_solution(self, verbose=False):
+        t0 = time.perf_counter()
         self._set_objective()
         self._solve(verbose)
+        logger.info("ILP solve took %.3fs", time.perf_counter() - t0)
         return self._extract_and_validate_solution()
 
     # ---- Logging ----
