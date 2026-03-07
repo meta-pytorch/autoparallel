@@ -19,6 +19,7 @@ from autoparallel.graph_passes.auto_bucketing import (
     configure_inductor_for_autobucketing,
 )
 from autoparallel.graph_passes.debug_helpers import make_custom_runtime_estimation
+from autoparallel.graph_passes.estimate_graph_metrics import estimate_graph_metrics
 
 world_size = 64
 
@@ -91,20 +92,25 @@ def input_fn():
 
 autobucketing_level = "aten"
 
+custom_runtime_estimation = make_custom_runtime_estimation(mesh)
+
 if autobucketing_level == "aten":
-    aten_autobucketing_config.custom_runtime_estimation = (
-        make_custom_runtime_estimation(mesh)
-    )
+    aten_autobucketing_config.custom_runtime_estimation = custom_runtime_estimation
     # this is from the stacked pr in https://github.com/pytorch/pytorch/pull/163960
     torch._inductor.config.reorder_for_peak_memory = False
     torch._inductor.config.reorder_for_compute_comm_overlap = False
-    aten_autobucketing_reordering_pass = partial(
+    _aten_autobucketing_pass = partial(
         aten_autobucketing_reordering_pass,
         configs=aten_autobucketing_config,
     )
-    torch._inductor.config.post_grad_custom_post_pass = (
-        aten_autobucketing_reordering_pass
-    )
+
+    def post_grad_pass(graph):
+        new_gm = _aten_autobucketing_pass(graph)
+        metrics = estimate_graph_metrics(new_gm, custom_runtime_estimation)
+        print(metrics)
+        return new_gm
+
+    torch._inductor.config.post_grad_custom_post_pass = post_grad_pass
 elif autobucketing_level == "inductor":
     configure_inductor_for_autobucketing(autobucketing_level)
 else:
