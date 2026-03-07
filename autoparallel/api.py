@@ -294,6 +294,7 @@ class AutoParallel:
         reshard_after_forward: bool = True,
         dynamic: bool = False,
         numerics_logger: NumericsLogger | None = None,
+        enable_prefetch_overlap: bool = False,
         **kwargs,
     ):
         self.stack = ExitStack()
@@ -339,6 +340,7 @@ class AutoParallel:
         self.enable_ac = enable_ac
         self.ac_stage_size_in_GiB = ac_stage_size_in_GiB
         self.reshard_after_forward = reshard_after_forward
+        self.enable_prefetch_overlap = enable_prefetch_overlap
 
         if dynamic:
             self.fake_mode.shape_env = ShapeEnv()
@@ -370,6 +372,7 @@ class AutoParallel:
             self.mesh,
             rescale_grad_comm_cost_for_mp,
             repeated_subgraphs=self.kwargs.get("repeated_subgraphs", False),
+            enable_prefetch_overlap=self.enable_prefetch_overlap,
         )
 
         self.sharding_optimizer = sharding_optimizer
@@ -853,6 +856,7 @@ def auto_parallel(
     mp_policy: Optional[MixedPrecisionPolicy] = None,
     compile: bool = True,
     parameter_memory_budget: Optional[tuple[Optional[float], Optional[float]]] = None,
+    enable_prefetch_overlap: bool = False,
 ) -> torch.nn.Module:
     """
     Parallelize a model with automatic sharding optimization.
@@ -932,6 +936,7 @@ def auto_parallel(
         compile=compile,
         # enable_ac=True,
         enable_ac=False,
+        enable_prefetch_overlap=enable_prefetch_overlap,
     ) as autop:
         # Add constraints
         autop.add_input_constraints(input_placements)
