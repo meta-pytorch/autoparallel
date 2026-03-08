@@ -3,15 +3,33 @@ Tests for overlap_scheduling.
 
 Each test constructs a small DAG of compute/comm ops and verifies that
 the solvers produce valid schedules with expected makespan.
+
+The FX graph tests build actual torch.fx graphs with c10d functional
+collectives, run the full build_problem -> solve -> apply_schedule pipeline,
+and verify the resulting graph order.
 """
+
+from typing import Callable
+
+import torch
+import torch.fx as fx
 
 from autoparallel.overlap_scheduling import (
     COMPUTE_STREAM,
+    NodeInfo,
+    NodeKind,
     OverlapProblem,
+    build_overlap_problem,
     critical_path_length,
+    reorder_for_overlap,
     solve_greedy,
     solve_ilp,
 )
+
+# c10d functional ops for building test graphs
+_AG = torch.ops._c10d_functional.all_gather_into_tensor.default
+_RS = torch.ops._c10d_functional.reduce_scatter_tensor.default
+_WAIT = torch.ops._c10d_functional.wait_tensor.default
 
 
 def _validate_schedule(problem, schedule):
@@ -256,6 +274,367 @@ def test_ilp_vs_greedy_agreement():
     assert abs(ilp.makespan - greedy.makespan) < 1e-6
 
 
+# ---------------------------------------------------------------------------
+# FX graph integration tests
+# ---------------------------------------------------------------------------
+
+
+def _get_call_function_names(graph: fx.Graph) -> list[str]:
+    """Extract ordered names of call_function nodes."""
+    return [n.name for n in graph.nodes if n.op == "call_function"]
+
+
+def _check_fx_topo_order(graph: fx.Graph) -> None:
+    """Verify every node appears after all its inputs in the graph."""
+    seen: set[fx.Node] = set()
+    for node in graph.nodes:
+        for inp in node.all_input_nodes:
+            assert inp in seen, f"{node.name} appears before its input {inp.name}"
+        seen.add(node)
+
+
+def _make_classify(
+    costs: dict[str, float],
+) -> Callable:
+    """Build a classify function from a {node_name: duration_ms} dict.
+
+    Comm starts are identified by target; their PG name is extracted from
+    the last positional arg.  Everything else goes on the compute stream.
+    """
+
+    def classify(node: fx.Node) -> NodeInfo:
+        if node.op in ("placeholder", "output", "get_attr"):
+            return NodeInfo(NodeKind.SKIP, COMPUTE_STREAM, 0.0)
+        if node.target is _WAIT:
+            return NodeInfo(NodeKind.COMM_WAIT, COMPUTE_STREAM, 0.0)
+        if node.target in (_AG, _RS):
+            pg_name = str(node.args[-1])
+            duration = costs.get(node.name, 1.0)
+            return NodeInfo(NodeKind.COMM_START, pg_name, duration)
+        duration = costs.get(node.name, 0.0)
+        return NodeInfo(NodeKind.COMPUTE, COMPUTE_STREAM, duration)
+
+    return classify
+
+
+def _build_basic_overlap_graph() -> fx.Graph:
+    """
+    mm1(x, w) -> ag(mm1) -> wait -> mm3(wait, mm2)
+                             mm2(x, w) ---/
+
+    Original order: mm1, ag, wait, mm2, mm3
+    mm2 is independent of ag/wait and can overlap with the all_gather.
+    """
+    graph = fx.Graph()
+    x = graph.placeholder("x")
+    w = graph.placeholder("w")
+    mm1 = graph.call_function(torch.ops.aten.mm.default, (x, w))
+    mm1.name = "mm1"
+    ag = graph.call_function(_AG, (mm1, 2, "0"))
+    ag.name = "ag"
+    wait = graph.call_function(_WAIT, (ag,))
+    wait.name = "wait"
+    mm2 = graph.call_function(torch.ops.aten.mm.default, (x, w))
+    mm2.name = "mm2"
+    mm3 = graph.call_function(torch.ops.aten.mm.default, (wait, mm2))
+    mm3.name = "mm3"
+    graph.output(mm3)
+    return graph
+
+
+def test_fx_basic_reorder():
+    """
+    After reordering, mm2 should move before wait to overlap with ag.
+    Expected order: mm1, ag, mm2, wait, mm3
+    """
+    costs = {"mm1": 5.0, "ag": 10.0, "mm2": 8.0, "mm3": 3.0}
+    classify = _make_classify(costs)
+
+    for solver_name in ["ilp", "greedy"]:
+        graph = _build_basic_overlap_graph()
+        assert _get_call_function_names(graph) == [
+            "mm1",
+            "ag",
+            "wait",
+            "mm2",
+            "mm3",
+        ]
+
+        schedule = reorder_for_overlap(graph, classify, solver=solver_name)
+
+        _check_fx_topo_order(graph)
+        assert _get_call_function_names(graph) == [
+            "mm1",
+            "ag",
+            "mm2",
+            "wait",
+            "mm3",
+        ], f"{solver_name} produced wrong order: {_get_call_function_names(graph)}"
+        assert (
+            abs(schedule.makespan - 18.0) < 1e-6
+        ), f"{solver_name}: expected 18ms, got {schedule.makespan}"
+
+
+def test_fx_build_problem_correctness():
+    """Verify that build_overlap_problem produces the right abstract DAG."""
+    graph = _build_basic_overlap_graph()
+    costs = {"mm1": 5.0, "ag": 10.0, "mm2": 8.0, "mm3": 3.0}
+    classify = _make_classify(costs)
+
+    problem, op_to_node, node_to_op = build_overlap_problem(graph, classify)
+
+    # 4 ops: mm1, ag, mm2, mm3 (wait is dissolved)
+    assert problem.n == 4
+
+    # Check streams
+    compute_ops = problem.ops_on_stream(COMPUTE_STREAM)
+    comm_ops = problem.ops_on_stream("0")
+    assert len(compute_ops) == 3  # mm1, mm2, mm3
+    assert len(comm_ops) == 1  # ag
+
+    # Check that wait node maps to same op as ag
+    wait_node = None
+    ag_node = None
+    for node in graph.nodes:
+        if node.name == "wait":
+            wait_node = node
+        if node.name == "ag":
+            ag_node = node
+    assert node_to_op[wait_node] == node_to_op[ag_node]
+
+    # Check dependencies: mm3 should depend on ag (via dissolved wait) and mm2
+    mm3_op = node_to_op[next(n for n in graph.nodes if n.name == "mm3")]
+    mm3_preds = set(problem.predecessors(mm3_op))
+    ag_op = node_to_op[ag_node]
+    mm2_op = node_to_op[next(n for n in graph.nodes if n.name == "mm2")]
+    assert ag_op in mm3_preds, "mm3 should depend on ag (via dissolved wait)"
+    assert mm2_op in mm3_preds, "mm3 should depend on mm2"
+
+
+def _build_two_layer_graph() -> fx.Graph:
+    """
+    Two-layer pattern with reduce_scatters on the same PG.
+
+    mm1(x, w1) -> rs1(mm1) -> wait1 -> mm2(wait1, w2) -> rs2(mm2) -> wait2 -> mm3(wait2, w3)
+
+    Original order is fully sequential; no overlap possible because each
+    layer depends on the previous layer's reduce_scatter result... unless
+    we add an independent branch.
+
+    We add an independent mm_side that can overlap with rs1:
+
+    mm1 -> rs1 -> wait1 --> mm2 -> rs2 -> wait2 -> mm3(wait2, w3)
+       \\-> mm_side(x, w2) -/
+
+    mm_side can run during rs1, overlapping comm with compute.
+    """
+    graph = fx.Graph()
+    x = graph.placeholder("x")
+    w1 = graph.placeholder("w1")
+    w2 = graph.placeholder("w2")
+    w3 = graph.placeholder("w3")
+
+    mm1 = graph.call_function(torch.ops.aten.mm.default, (x, w1))
+    mm1.name = "mm1"
+    rs1 = graph.call_function(_RS, (mm1, "sum", 2, "0"))
+    rs1.name = "rs1"
+    wait1 = graph.call_function(_WAIT, (rs1,))
+    wait1.name = "wait1"
+    # mm_side is independent of rs1/wait1 — placed after wait1 in original
+    # order but doesn't actually depend on it
+    mm_side = graph.call_function(torch.ops.aten.mm.default, (x, w2))
+    mm_side.name = "mm_side"
+    mm2 = graph.call_function(torch.ops.aten.mm.default, (wait1, mm_side))
+    mm2.name = "mm2"
+    rs2 = graph.call_function(_RS, (mm2, "sum", 2, "0"))
+    rs2.name = "rs2"
+    wait2 = graph.call_function(_WAIT, (rs2,))
+    wait2.name = "wait2"
+    mm3 = graph.call_function(torch.ops.aten.mm.default, (wait2, w3))
+    mm3.name = "mm3"
+    graph.output(mm3)
+    return graph
+
+
+def test_fx_two_layer_reorder():
+    """
+    mm_side should move before wait1 to overlap with rs1.
+
+    Original: mm1, rs1, wait1, mm_side, mm2, rs2, wait2, mm3
+    Expected: mm1, rs1, mm_side, wait1, mm2, rs2, wait2, mm3
+    """
+    costs = {
+        "mm1": 5.0,
+        "rs1": 4.0,
+        "mm_side": 5.0,
+        "mm2": 5.0,
+        "rs2": 4.0,
+        "mm3": 2.0,
+    }
+    classify = _make_classify(costs)
+
+    for solver_name in ["ilp", "greedy"]:
+        graph = _build_two_layer_graph()
+        assert _get_call_function_names(graph) == [
+            "mm1",
+            "rs1",
+            "wait1",
+            "mm_side",
+            "mm2",
+            "rs2",
+            "wait2",
+            "mm3",
+        ]
+
+        _ = reorder_for_overlap(graph, classify, solver=solver_name)
+        names = _get_call_function_names(graph)
+        _check_fx_topo_order(graph)
+
+        # mm_side must come before wait1 (overlap with rs1)
+        assert names.index("mm_side") < names.index(
+            "wait1"
+        ), f"{solver_name}: mm_side should be before wait1, got {names}"
+        # rs1 must come before mm_side (rs1 launches first, then compute overlaps)
+        assert names.index("rs1") < names.index(
+            "mm_side"
+        ), f"{solver_name}: rs1 should be before mm_side, got {names}"
+
+
+def _build_multi_pg_graph() -> fx.Graph:
+    """
+    Two collectives on different PGs, both overlappable with big_mm.
+
+    mm0(x, w) -> ag0(mm0, pg="0") -> wait0 \\
+             \\-> ag1(mm0, pg="1") -> wait1 -> mm_final(wait0, wait1, big_mm)
+             \\-> big_mm(x, w) ----------/
+
+    Original order: mm0, ag0, wait0, ag1, wait1, big_mm, mm_final
+    Both ag0 and ag1 can overlap with big_mm since they're on different PGs.
+    """
+    graph = fx.Graph()
+    x = graph.placeholder("x")
+    w = graph.placeholder("w")
+
+    mm0 = graph.call_function(torch.ops.aten.mm.default, (x, w))
+    mm0.name = "mm0"
+    ag0 = graph.call_function(_AG, (mm0, 2, "0"))
+    ag0.name = "ag0"
+    wait0 = graph.call_function(_WAIT, (ag0,))
+    wait0.name = "wait0"
+    ag1 = graph.call_function(_AG, (mm0, 2, "1"))
+    ag1.name = "ag1"
+    wait1 = graph.call_function(_WAIT, (ag1,))
+    wait1.name = "wait1"
+    big_mm = graph.call_function(torch.ops.aten.mm.default, (x, w))
+    big_mm.name = "big_mm"
+    # mm_final depends on all three results
+    mm_final = graph.call_function(
+        torch.ops.aten.mm.default,
+        (wait0, wait1),
+    )
+    # Also add big_mm as a dependency via a dummy add
+    mm_final_2 = graph.call_function(
+        torch.ops.aten.add.Tensor,
+        (mm_final, big_mm),
+    )
+    mm_final.name = "mm_final"
+    mm_final_2.name = "mm_final_2"
+    graph.output(mm_final_2)
+    return graph
+
+
+def test_fx_multi_pg_reorder():
+    """
+    Both collectives and big_mm should be launched right after mm0.
+    big_mm should come before both waits.
+
+    Original: mm0, ag0, wait0, ag1, wait1, big_mm, mm_final, mm_final_2
+    Expected: big_mm moves before wait0 and wait1.
+    """
+    costs = {
+        "mm0": 2.0,
+        "ag0": 6.0,
+        "ag1": 8.0,
+        "big_mm": 10.0,
+        "mm_final": 1.0,
+        "mm_final_2": 0.5,
+    }
+    classify = _make_classify(costs)
+
+    for solver_name in ["ilp", "greedy"]:
+        graph = _build_multi_pg_graph()
+        schedule = reorder_for_overlap(graph, classify, solver=solver_name)
+        names = _get_call_function_names(graph)
+        _check_fx_topo_order(graph)
+
+        # big_mm should come before both waits
+        assert names.index("big_mm") < names.index(
+            "wait0"
+        ), f"{solver_name}: big_mm before wait0, got {names}"
+        assert names.index("big_mm") < names.index(
+            "wait1"
+        ), f"{solver_name}: big_mm before wait1, got {names}"
+
+        # Makespan: mm0(2) + max(ag0(6), ag1(8), big_mm(10)) + mm_final(1) + mm_final_2(0.5) = 13.5
+        assert (
+            abs(schedule.makespan - 13.5) < 1e-6
+        ), f"{solver_name}: expected 13.5ms, got {schedule.makespan}"
+
+
+def test_fx_no_reorder_needed():
+    """When the graph is already optimal, the order should be preserved."""
+    graph = fx.Graph()
+    x = graph.placeholder("x")
+    w = graph.placeholder("w")
+    # Fully sequential: no overlap possible
+    mm1 = graph.call_function(torch.ops.aten.mm.default, (x, w))
+    mm1.name = "mm1"
+    ag = graph.call_function(_AG, (mm1, 2, "0"))
+    ag.name = "ag"
+    wait = graph.call_function(_WAIT, (ag,))
+    wait.name = "wait"
+    mm2 = graph.call_function(torch.ops.aten.mm.default, (wait, w))
+    mm2.name = "mm2"
+    graph.output(mm2)
+
+    original_order = _get_call_function_names(graph)
+    classify = _make_classify({"mm1": 3.0, "ag": 5.0, "mm2": 4.0})
+    reorder_for_overlap(graph, classify)
+    assert _get_call_function_names(graph) == original_order
+    _check_fx_topo_order(graph)
+
+
+def test_fx_duplicate_deps():
+    """
+    When a node consumes a wait result via multiple args, the dependency
+    should be deduplicated (not cause issues in the solver).
+    """
+    graph = fx.Graph()
+    x = graph.placeholder("x")
+    mm1 = graph.call_function(torch.ops.aten.mm.default, (x, x))
+    mm1.name = "mm1"
+    ag = graph.call_function(_AG, (mm1, 2, "0"))
+    ag.name = "ag"
+    wait = graph.call_function(_WAIT, (ag,))
+    wait.name = "wait"
+    # mm2 uses wait result in both args -> duplicate dependency on ag
+    mm2 = graph.call_function(torch.ops.aten.mm.default, (wait, wait))
+    mm2.name = "mm2"
+    graph.output(mm2)
+
+    classify = _make_classify({"mm1": 3.0, "ag": 5.0, "mm2": 4.0})
+
+    # Should not crash due to duplicate edges
+    problem, _, node_to_op = build_overlap_problem(graph, classify)
+    ag_op = node_to_op[next(n for n in graph.nodes if n.name == "ag")]
+    mm2_op = node_to_op[next(n for n in graph.nodes if n.name == "mm2")]
+    # Should have exactly one edge from ag to mm2
+    assert problem.predecessors(mm2_op).count(ag_op) == 1
+
+    reorder_for_overlap(graph, classify)
+    _check_fx_topo_order(graph)
+
+
 if __name__ == "__main__":
     test_basic_overlap()
     test_multi_pg_overlap()
@@ -264,4 +643,10 @@ if __name__ == "__main__":
     test_same_pg_serialization()
     test_greedy_memory_budget()
     test_ilp_vs_greedy_agreement()
+    test_fx_basic_reorder()
+    test_fx_build_problem_correctness()
+    test_fx_two_layer_reorder()
+    test_fx_multi_pg_reorder()
+    test_fx_no_reorder_needed()
+    test_fx_duplicate_deps()
     print("All tests passed.")

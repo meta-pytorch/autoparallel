@@ -24,6 +24,7 @@ FX graph integration:
 
 from __future__ import annotations
 
+import heapq
 from collections import defaultdict
 from dataclasses import dataclass
 from enum import Enum
@@ -55,6 +56,7 @@ class OverlapProblem:
         self.ops: list[Op] = []
         self._succ: list[list[int]] = []
         self._pred: list[list[int]] = []
+        self._edges: set[tuple[int, int]] = set()
 
     def add_op(
         self,
@@ -70,6 +72,9 @@ class OverlapProblem:
         return idx
 
     def add_dep(self, src: int, dst: int) -> None:
+        if (src, dst) in self._edges:
+            return
+        self._edges.add((src, dst))
         self._succ[src].append(dst)
         self._pred[dst].append(src)
 
@@ -389,51 +394,90 @@ def build_overlap_problem(
 def apply_schedule(
     graph: fx.Graph,
     schedule: Schedule,
+    problem: OverlapProblem,
     op_to_node: dict[int, fx.Node],
     node_to_op: dict[fx.Node, int],
 ) -> None:
     """
     Reorder FX graph nodes to match the solved schedule.
 
-    Each FX node is assigned the start time of its corresponding op.
-    Wait nodes are placed at the completion time of their comm op
-    (= start_time + duration), so they appear just before the first
-    consumer that needs the result.
+    Uses priority-based topological sort to guarantee all FX edges are
+    respected while matching schedule start times as closely as possible.
+    Comm start nodes are placed at the collective's start time; wait nodes
+    are placed at the collective's completion time (start + duration).
     """
-    node_times: dict[fx.Node, float] = {}
+    original_order = {node: i for i, node in enumerate(graph.nodes)}
+
+    sort_key: dict[fx.Node, tuple[float, int]] = {}
     for node in graph.nodes:
-        if node not in node_to_op:
-            # placeholders get -inf, output gets +inf
-            if node.op == "placeholder":
-                node_times[node] = float("-inf")
-            elif node.op == "output":
-                node_times[node] = float("inf")
-            continue
-
-        op_id = node_to_op[node]
-        op = None
-        # Find the op — node_to_op maps wait nodes to their start's op
-        for i, o in enumerate(schedule.start_times):
-            if o == op_id:
-                break
-        # Check if this is a wait node (shares op_id with start, but is a
-        # different FX node)
-        if op_to_node.get(op_id) is not node and node.op != "placeholder":
-            # This is a wait node: place it at the comm op's completion time
-            op = schedule.start_times[op_id]
-            # TODO: look up the actual Op to get duration; using a sentinel
-            # that sorts after the start but before consumers
-            node_times[node] = op + 0.0001
+        if node.op == "placeholder":
+            sort_key[node] = (float("-inf"), original_order[node])
+        elif node.op == "output":
+            sort_key[node] = (float("inf"), original_order[node])
+        elif node in node_to_op:
+            op_id = node_to_op[node]
+            if op_to_node.get(op_id) is node:
+                # Canonical node (compute, comm start, other)
+                sort_key[node] = (
+                    schedule.start_times[op_id],
+                    original_order[node],
+                )
+            else:
+                # Wait node: place at collective's completion time
+                completion = (
+                    schedule.start_times[op_id] + problem.ops[op_id].duration_ms
+                )
+                sort_key[node] = (completion, original_order[node])
         else:
-            node_times[node] = schedule.start_times[op_id]
+            # Node not in the problem (SKIP'd get_attr, etc.): keep near
+            # original position using a small scaled value so it sorts
+            # early but after placeholders.
+            sort_key[node] = (original_order[node] * 1e-9, original_order[node])
 
-    # Reorder: move nodes to match schedule order
+    # Priority-based Kahn's topological sort: respects all FX edges while
+    # scheduling nodes in sort_key order when unconstrained.
+    in_degree: dict[fx.Node, int] = {}
+    for node in graph.nodes:
+        in_degree[node] = len(node.all_input_nodes)
+
+    heap: list[tuple[tuple[float, int], int, fx.Node]] = []
+    for node in graph.nodes:
+        if in_degree[node] == 0:
+            heapq.heappush(heap, (sort_key[node], id(node), node))
+
+    ordered: list[fx.Node] = []
+    while heap:
+        _, _, node = heapq.heappop(heap)
+        ordered.append(node)
+        for user in node.users:
+            in_degree[user] -= 1
+            if in_degree[user] == 0:
+                heapq.heappush(heap, (sort_key[user], id(user), user))
+
+    # Reorder the graph to match
     output_node = next(n for n in graph.nodes if n.op == "output")
-    sorted_nodes = sorted(
-        (n for n in graph.nodes if n.op not in ("placeholder", "output")),
-        key=lambda n: node_times.get(n, 0.0),
-    )
-    for node in sorted_nodes:
-        output_node.prepend(node)
+    for node in ordered:
+        if node.op not in ("placeholder", "output"):
+            output_node.prepend(node)
 
     graph.lint()
+
+
+def reorder_for_overlap(
+    graph: fx.Graph,
+    classify: Callable[[fx.Node], NodeInfo],
+    solver: str = "greedy",
+    memory_budget_bytes: int | None = None,
+) -> Schedule:
+    """
+    Full pipeline: build problem from FX graph, solve, and reorder in place.
+
+    Returns the Schedule for inspection.
+    """
+    problem, op_to_node, node_to_op = build_overlap_problem(graph, classify)
+    if solver == "ilp":
+        schedule = solve_ilp(problem)
+    else:
+        schedule = solve_greedy(problem, memory_budget_bytes=memory_budget_bytes)
+    apply_schedule(graph, schedule, problem, op_to_node, node_to_op)
+    return schedule
