@@ -22,6 +22,7 @@ def format_sharding_log(
     colored: bool = False,
     verbose: bool = False,
     violated_constraints_log: str = "",
+    savings_vars: list[Any] | None = None,
 ) -> str:
     """
     Format the sharding optimization results as annotated Python code.
@@ -38,6 +39,8 @@ def format_sharding_log(
         colored: Whether to use ANSI color codes in the output.
         verbose: Whether to include verbose information (shapes, stack traces).
         violated_constraints_log: Optional string with violated constraints info.
+        savings_vars: Optional list of PuLP savings variables from prefetch
+            overlap modeling.
 
     Returns:
         A string containing the annotated Python code representation of the graph.
@@ -205,6 +208,10 @@ def format_sharding_log(
     code += f"\n  comm_cost: {total_comm_cost:.2f}"
     code += f"\n  compute_cost: {total_compute_cost:.2f}"
     code += f"\n  transition_cost: {total_transition_cost:.2f}"
+    if savings_vars:
+        total_savings = sum(v.value() for v in savings_vars)
+        code += f"\n  overlap_savings: {total_savings:.2f}"
+        code += f"\n  effective_cost: {total_cost - total_savings:.2f}"
     if violated_constraints_log:
         code += "\n" + violated_constraints_log
     return code

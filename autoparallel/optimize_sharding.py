@@ -651,6 +651,12 @@ class ShardingOptimizer:
         compute_partners: dict[torch.fx.Node, list[pulp.LpVariable]] = defaultdict(list)
 
         # --- Forward scan: prefetch overlap for parameter-derived inputs ---
+        # Create savings for every edge with a param-derived input (the ILP
+        # may place the all-gather on any edge in the param chain). Only reset
+        # the compute group at boundary edges (non-param-derived node consuming
+        # a param-derived input), which marks the end of one prefetch window
+        # and the start of the next. Intermediate param-derived edges share
+        # the same compute group so the budget isn't fragmented.
         current_group: list[torch.fx.Node] = []
         for node in self.graph.nodes:
             if node.op == "output":
@@ -666,12 +672,18 @@ class ShardingOptimizer:
                     self._add_savings_var(
                         node, argi, current_group, compute_partners, "fwd"
                     )
-                current_group = []
+                # Only reset at boundary edges — the prefetch window for the
+                # next layer starts after a non-param-derived consumer.
+                if node not in param_derived:
+                    current_group = []
 
             if node in self.strats and node.op != "output":
                 current_group.append(node)
 
         # --- Reverse scan: post-compute overlap for terminal-derived nodes ---
+        # Symmetric logic: create savings for every edge into a terminal-
+        # derived node from a non-terminal-derived input (where the reduce-
+        # scatter happens). Only reset at boundary edges.
         current_group = []
         for node in reversed(list(self.graph.nodes)):
             if node.op == "output":
@@ -679,11 +691,17 @@ class ShardingOptimizer:
 
             if node in terminal_derived and current_group:
                 all_inputs = self._all_input_nodes(node)
-                for argi in range(len(all_inputs)):
-                    self._add_savings_var(
-                        node, argi, current_group, compute_partners, "bwd"
-                    )
-                current_group = []
+                boundary_args = [
+                    argi
+                    for argi, inp in enumerate(all_inputs)
+                    if inp not in terminal_derived
+                ]
+                if boundary_args:
+                    for argi in boundary_args:
+                        self._add_savings_var(
+                            node, argi, current_group, compute_partners, "bwd"
+                        )
+                    current_group = []
 
             if node in self.strats and node.op != "output":
                 current_group.append(node)
@@ -755,9 +773,9 @@ class ShardingOptimizer:
 
     # ---- Logging ----
 
-    def get_violated_constraints_log(self):
+    def get_violated_constraints_log(self, eps=1e-6):
         violated_constraints = [
-            (k, c) for k, c in self.prob.constraints.items() if not c.valid()
+            (k, c) for k, c in self.prob.constraints.items() if not c.valid(eps)
         ]
         log_str = f"Violated constraints: {[x[0] for x in violated_constraints]}"
         for cname, c in violated_constraints:
@@ -780,6 +798,7 @@ class ShardingOptimizer:
             colored=colored,
             verbose=verbose,
             violated_constraints_log=self.get_violated_constraints_log(),
+            savings_vars=self.savings_vars,
         )
 
     def print_costs_for_node(self, node, arg=0, **kwargs):
