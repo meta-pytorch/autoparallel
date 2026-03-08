@@ -599,120 +599,91 @@ class ShardingOptimizer:
                 terms.append(num_args * dv.compute_cost * dv.var)
         return pulp.lpSum(terms)
 
-    def _add_savings_var(self, node, argi, compute_group, compute_partners, prefix):
-        """Create a savings variable for overlapping comm on (node, argi) with
-        the compute budget of nodes in compute_group.
+    def _run_budget_chain(self, nodes, should_create_savings, prefix):
+        """Run a cumulative budget chain over nodes, creating savings variables.
 
-        The savings is split into per-node contributions so that the total
-        savings can draw from the combined compute of the entire group, while
-        the per-node budget constraints still prevent double-counting.
+        The budget is a continuous LP variable that grows with compute and
+        shrinks with savings as we scan:
+            B_0 = 0
+            B_i = B_{i-1} + compute(i) - savings(i)
+            B_i >= 0
+
+        The non-negativity constraint on B_i implicitly enforces that total
+        savings never exceed total accumulated compute.
+
+        Args:
+            nodes: Ordered sequence of nodes to scan.
+            should_create_savings: Function(node) -> list of arg indices that
+                need savings variables, or empty list if none.
+            prefix: Name prefix for LP variables ("fwd" or "bwd").
         """
-        comm_expr = self._comm_cost_expr_for_edge(node, argi)
-        savings = pulp.LpVariable(
-            self._get_next_name(f"{prefix}_savings"),
-            lowBound=0,
-            cat=pulp.LpContinuous,
-        )
-        self.prob += (
-            savings <= comm_expr,
-            self._get_next_name(f"{prefix}_savings_le_comm"),
-        )
-        # Split savings into per-node contributions that sum to savings.
-        # Each contribution is bounded by its node's compute budget via
-        # the aggregate constraint added later in add_prefetch_overlap_constraints.
-        contribs = []
-        for partner in compute_group:
-            contrib = pulp.LpVariable(
-                self._get_next_name(f"{prefix}_contrib"),
+        budget_prev = None
+        for node in nodes:
+            if node.op == "output":
+                continue
+
+            compute_expr = self._compute_cost_expr_for_node(node)
+            savings_args = should_create_savings(node)
+
+            node_savings = []
+            for argi in savings_args:
+                comm_expr = self._comm_cost_expr_for_edge(node, argi)
+                savings = pulp.LpVariable(
+                    self._get_next_name(f"{prefix}_savings"),
+                    lowBound=0,
+                    cat=pulp.LpContinuous,
+                )
+                self.prob += (
+                    savings <= comm_expr,
+                    self._get_next_name(f"{prefix}_savings_le_comm"),
+                )
+                node_savings.append(savings)
+                self.savings_vars.append(savings)
+
+            has_compute = node in self.strats and node.op != "output"
+            if not has_compute and not node_savings:
+                continue
+
+            budget = pulp.LpVariable(
+                self._get_next_name(f"{prefix}_budget"),
                 lowBound=0,
                 cat=pulp.LpContinuous,
             )
-            contribs.append(contrib)
-            compute_partners[partner].append(contrib)
-        self.prob += (
-            savings == pulp.lpSum(contribs),
-            self._get_next_name(f"{prefix}_savings_split"),
-        )
-        self.savings_vars.append(savings)
+            rhs = compute_expr - pulp.lpSum(node_savings)
+            if budget_prev is not None:
+                rhs += budget_prev
+            self.prob += (
+                budget == rhs,
+                self._get_next_name(f"{prefix}_budget_eq"),
+            )
+            budget_prev = budget
 
     def add_prefetch_overlap_constraints(self):
         """Model communication-computation overlap within the ILP.
 
-        Creates continuous savings variables that the solver maximizes (by
-        subtracting them from the objective). Each savings variable is bounded
-        by both the communication cost it overlaps and the available compute
-        budget from neighboring nodes, preventing double-counting.
+        Uses cumulative budget chains: a continuous LP variable that grows
+        with compute and shrinks with savings as we scan the graph. The
+        non-negativity of the budget variable naturally prevents savings
+        from exceeding available compute, and leftover compute carries
+        forward across multiple windows.
         """
         param_derived = self._build_param_derived_set()
         terminal_derived = self._build_terminal_derived_set()
 
-        # Maps each compute node to the list of contribution variables that
-        # draw from its compute budget (from either scan direction).
-        compute_partners: dict[torch.fx.Node, list[pulp.LpVariable]] = defaultdict(list)
-
         # --- Forward scan: prefetch overlap for parameter-derived inputs ---
-        # Create savings for every edge with a param-derived input (the ILP
-        # may place the all-gather on any edge in the param chain). Only reset
-        # the compute group at boundary edges (non-param-derived node consuming
-        # a param-derived input), which marks the end of one prefetch window
-        # and the start of the next. Intermediate param-derived edges share
-        # the same compute group so the budget isn't fragmented.
-        current_group: list[torch.fx.Node] = []
-        for node in self.graph.nodes:
-            if node.op == "output":
-                continue
-
+        def fwd_savings(node):
             all_inputs = self._all_input_nodes(node)
-            param_derived_args = [
-                argi for argi, inp in enumerate(all_inputs) if inp in param_derived
-            ]
+            return [argi for argi, inp in enumerate(all_inputs) if inp in param_derived]
 
-            if param_derived_args and current_group:
-                for argi in param_derived_args:
-                    self._add_savings_var(
-                        node, argi, current_group, compute_partners, "fwd"
-                    )
-                # Only reset at boundary edges — the prefetch window for the
-                # next layer starts after a non-param-derived consumer.
-                if node not in param_derived:
-                    current_group = []
+        self._run_budget_chain(self.graph.nodes, fwd_savings, "fwd")
 
-            if node in self.strats and node.op != "output":
-                current_group.append(node)
+        # --- Backward scan: post-compute overlap for terminal-derived nodes ---
+        def bwd_savings(node):
+            if node not in terminal_derived:
+                return []
+            return list(range(len(self._all_input_nodes(node))))
 
-        # --- Reverse scan: post-compute overlap for terminal-derived nodes ---
-        # Symmetric logic: create savings for every edge into a terminal-
-        # derived node from a non-terminal-derived input (where the reduce-
-        # scatter happens). Only reset at boundary edges.
-        current_group = []
-        for node in reversed(list(self.graph.nodes)):
-            if node.op == "output":
-                continue
-
-            if node in terminal_derived and current_group:
-                all_inputs = self._all_input_nodes(node)
-                boundary_args = [
-                    argi
-                    for argi, inp in enumerate(all_inputs)
-                    if inp not in terminal_derived
-                ]
-                if boundary_args:
-                    for argi in boundary_args:
-                        self._add_savings_var(
-                            node, argi, current_group, compute_partners, "bwd"
-                        )
-                    current_group = []
-
-            if node in self.strats and node.op != "output":
-                current_group.append(node)
-
-        # --- Compute budget constraints: prevent double-counting ---
-        for compute_node, savings_list in compute_partners.items():
-            compute_expr = self._compute_cost_expr_for_node(compute_node)
-            self.prob += (
-                pulp.lpSum(savings_list) <= compute_expr,
-                self._get_next_name("compute_budget"),
-            )
+        self._run_budget_chain(reversed(list(self.graph.nodes)), bwd_savings, "bwd")
 
     # ---- Solution ----
 
@@ -773,7 +744,7 @@ class ShardingOptimizer:
 
     # ---- Logging ----
 
-    def get_violated_constraints_log(self, eps=1e-6):
+    def get_violated_constraints_log(self, eps=1e-4):
         violated_constraints = [
             (k, c) for k, c in self.prob.constraints.items() if not c.valid(eps)
         ]
