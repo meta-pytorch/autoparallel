@@ -17,6 +17,8 @@ from autoparallel.graph_passes.auto_bucketing import (
     aten_autobucketing_config,
     aten_autobucketing_reordering_pass,
     configure_inductor_for_autobucketing,
+    overlap_scheduling_config,
+    overlap_scheduling_reordering_pass,
 )
 from autoparallel.graph_passes.debug_helpers import make_custom_runtime_estimation
 
@@ -89,7 +91,7 @@ def input_fn():
     return x
 
 
-autobucketing_level = "aten"
+autobucketing_level = "overlap"
 
 if autobucketing_level == "aten":
     aten_autobucketing_config.custom_runtime_estimation = (
@@ -104,6 +106,18 @@ if autobucketing_level == "aten":
     )
     torch._inductor.config.post_grad_custom_post_pass = (
         aten_autobucketing_reordering_pass
+    )
+elif autobucketing_level == "overlap":
+    overlap_scheduling_config.custom_runtime_estimation = (
+        make_custom_runtime_estimation(mesh)
+    )
+    overlap_scheduling_config.solver = "greedy"
+    overlap_scheduling_config.memory_budget_bytes = 0.01 * 1024**3  # 2 GB
+    torch._inductor.config.reorder_for_peak_memory = False
+    torch._inductor.config.reorder_for_compute_comm_overlap = False
+    torch._inductor.config.post_grad_custom_post_pass = partial(
+        overlap_scheduling_reordering_pass,
+        configs=overlap_scheduling_config,
     )
 elif autobucketing_level == "inductor":
     configure_inductor_for_autobucketing(autobucketing_level)

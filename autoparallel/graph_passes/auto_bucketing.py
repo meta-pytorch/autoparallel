@@ -138,6 +138,81 @@ def aten_autobucketing_reordering_pass(
     return new_gm
 
 
+class overlap_scheduling_config:
+    """
+    Config for overlap scheduling pass (autoparallel's own solver).
+
+    - solver: "greedy" (fast, memory-aware) or "ilp" (optimal via PuLP/CBC)
+    - save_trace: write Perfetto-compatible before/after traces
+    - custom_runtime_estimation: callable(node) -> cost in microseconds
+    """
+
+    solver = "greedy"
+    save_trace = True
+    custom_runtime_estimation = None
+    memory_budget_bytes = None
+    _counter = 0
+
+
+def overlap_scheduling_reordering_pass(
+    graph: torch.fx.Graph, configs: "overlap_scheduling_config"
+) -> None:
+    from autoparallel.graph_passes.debug_helpers import (
+        _is_communication_node,
+        create_execution_trace,
+    )
+    from autoparallel.overlap_scheduling import (
+        COMPUTE_STREAM,
+        NodeInfo,
+        NodeKind,
+        reorder_for_overlap,
+    )
+
+    runtime_estimator = configs.custom_runtime_estimation
+    assert runtime_estimator is not None
+
+    gm = graph.owning_module
+
+    def classify(node: torch.fx.Node) -> NodeInfo:
+        if node.op in ("placeholder", "output", "get_attr"):
+            return NodeInfo(NodeKind.SKIP, COMPUTE_STREAM, 0.0)
+        if node.op != "call_function":
+            return NodeInfo(NodeKind.SKIP, COMPUTE_STREAM, 0.0)
+        if _is_communication_node(node):
+            if node.target == torch.ops._c10d_functional.wait_tensor.default:
+                return NodeInfo(NodeKind.COMM_WAIT, COMPUTE_STREAM, 0.0)
+            pg_name = str(node.args[-1])
+            duration_ms = runtime_estimator(node) / 1000.0
+            return NodeInfo(NodeKind.COMM_START, pg_name, duration_ms)
+        duration_ms = runtime_estimator(node) / 1000.0
+        return NodeInfo(NodeKind.COMPUTE, COMPUTE_STREAM, duration_ms)
+
+    counter = configs._counter
+    configs._counter += 1
+
+    if configs.save_trace:
+        create_execution_trace(
+            gm, runtime_estimator, f"overlap_trace_{counter}_before.json"
+        )
+
+    import time
+
+    t = time.time()
+    reorder_for_overlap(
+        graph,
+        classify,
+        solver=configs.solver,
+        memory_budget_bytes=configs.memory_budget_bytes,
+    )
+    print(f"Reordering took {time.time() - t:.2f} seconds")
+    gm.recompile()
+
+    if configs.save_trace:
+        create_execution_trace(
+            gm, runtime_estimator, f"overlap_trace_{counter}_after.json"
+        )
+
+
 def configure_inductor_for_autobucketing(mode: str = "aten"):
     # allow configuring inductor comms optimizations from torchtitan commandline
     if mode == "aten":
