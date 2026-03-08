@@ -599,6 +599,42 @@ class ShardingOptimizer:
                 terms.append(num_args * dv.compute_cost * dv.var)
         return pulp.lpSum(terms)
 
+    def _add_savings_var(self, node, argi, compute_group, compute_partners, prefix):
+        """Create a savings variable for overlapping comm on (node, argi) with
+        the compute budget of nodes in compute_group.
+
+        The savings is split into per-node contributions so that the total
+        savings can draw from the combined compute of the entire group, while
+        the per-node budget constraints still prevent double-counting.
+        """
+        comm_expr = self._comm_cost_expr_for_edge(node, argi)
+        savings = pulp.LpVariable(
+            self._get_next_name(f"{prefix}_savings"),
+            lowBound=0,
+            cat=pulp.LpContinuous,
+        )
+        self.prob += (
+            savings <= comm_expr,
+            self._get_next_name(f"{prefix}_savings_le_comm"),
+        )
+        # Split savings into per-node contributions that sum to savings.
+        # Each contribution is bounded by its node's compute budget via
+        # the aggregate constraint added later in add_prefetch_overlap_constraints.
+        contribs = []
+        for partner in compute_group:
+            contrib = pulp.LpVariable(
+                self._get_next_name(f"{prefix}_contrib"),
+                lowBound=0,
+                cat=pulp.LpContinuous,
+            )
+            contribs.append(contrib)
+            compute_partners[partner].append(contrib)
+        self.prob += (
+            savings == pulp.lpSum(contribs),
+            self._get_next_name(f"{prefix}_savings_split"),
+        )
+        self.savings_vars.append(savings)
+
     def add_prefetch_overlap_constraints(self):
         """Model communication-computation overlap within the ILP.
 
@@ -610,8 +646,8 @@ class ShardingOptimizer:
         param_derived = self._build_param_derived_set()
         terminal_derived = self._build_terminal_derived_set()
 
-        # Maps each compute node to the list of savings variables that use its
-        # compute budget (from either scan direction).
+        # Maps each compute node to the list of contribution variables that
+        # draw from its compute budget (from either scan direction).
         compute_partners: dict[torch.fx.Node, list[pulp.LpVariable]] = defaultdict(list)
 
         # --- Forward scan: prefetch overlap for parameter-derived inputs ---
@@ -627,19 +663,9 @@ class ShardingOptimizer:
 
             if param_derived_args and current_group:
                 for argi in param_derived_args:
-                    comm_expr = self._comm_cost_expr_for_edge(node, argi)
-                    savings = pulp.LpVariable(
-                        self._get_next_name("fwd_savings"),
-                        lowBound=0,
-                        cat=pulp.LpContinuous,
+                    self._add_savings_var(
+                        node, argi, current_group, compute_partners, "fwd"
                     )
-                    self.prob += (
-                        savings <= comm_expr,
-                        self._get_next_name("fwd_savings_le_comm"),
-                    )
-                    for partner in current_group:
-                        compute_partners[partner].append(savings)
-                    self.savings_vars.append(savings)
                 current_group = []
 
             if node in self.strats and node.op != "output":
@@ -654,19 +680,9 @@ class ShardingOptimizer:
             if node in terminal_derived and current_group:
                 all_inputs = self._all_input_nodes(node)
                 for argi in range(len(all_inputs)):
-                    comm_expr = self._comm_cost_expr_for_edge(node, argi)
-                    savings = pulp.LpVariable(
-                        self._get_next_name("bwd_savings"),
-                        lowBound=0,
-                        cat=pulp.LpContinuous,
+                    self._add_savings_var(
+                        node, argi, current_group, compute_partners, "bwd"
                     )
-                    self.prob += (
-                        savings <= comm_expr,
-                        self._get_next_name("bwd_savings_le_comm"),
-                    )
-                    for partner in current_group:
-                        compute_partners[partner].append(savings)
-                    self.savings_vars.append(savings)
                 current_group = []
 
             if node in self.strats and node.op != "output":
