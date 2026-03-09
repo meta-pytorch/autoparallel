@@ -20,6 +20,7 @@ Usage:
 """
 
 import argparse
+import logging
 import math
 import time
 
@@ -30,6 +31,8 @@ from torch.testing._internal.distributed.fake_pg import FakeStore
 from transformers import AutoConfig, AutoModelForCausalLM
 
 from autoparallel.api import AutoParallel
+
+logging.basicConfig(level=logging.INFO)
 
 
 def parse_args():
