@@ -354,36 +354,45 @@ class AutoParallel:
     def __enter__(self):
         assert self.active is False
 
-        self.build_model_graph()
-        self.old_inductor_comprehensive_padding = (
-            torch._inductor.config.comprehensive_padding
-        )
-        torch._inductor.config.comprehensive_padding = False
+        # build_model_graph and the code below push context managers
+        # (including FakeTensorMode) onto self.stack via
+        # aot_export_joint_with_descriptors. If anything raises, __exit__
+        # won't be called (Python only calls __exit__ if __enter__
+        # succeeds), so we must unwind the stack ourselves.
+        try:
+            self.build_model_graph()
+            self.old_inductor_comprehensive_padding = (
+                torch._inductor.config.comprehensive_padding
+            )
+            torch._inductor.config.comprehensive_padding = False
 
-        rescale_grad_comm_cost_for_mp = 1.0
-        if self.mp_policy is not None:
-            param_size = self.mp_policy.param_dtype.itemsize
-            reduce_size = self.mp_policy.reduce_dtype.itemsize
-            if param_size != reduce_size:
-                rescale_grad_comm_cost_for_mp = reduce_size / param_size
-                # Tiebreak, favoring performing the comms in the largest
-                # dtype
-                rescale_grad_comm_cost_for_mp *= 1.1
-        sharding_optimizer = ShardingOptimizer(
-            self.gm,
-            self.mesh,
-            rescale_grad_comm_cost_for_mp,
-            repeated_subgraphs=self.kwargs.get("repeated_subgraphs", False),
-        )
+            rescale_grad_comm_cost_for_mp = 1.0
+            if self.mp_policy is not None:
+                param_size = self.mp_policy.param_dtype.itemsize
+                reduce_size = self.mp_policy.reduce_dtype.itemsize
+                if param_size != reduce_size:
+                    rescale_grad_comm_cost_for_mp = reduce_size / param_size
+                    # Tiebreak, favoring performing the comms in the largest
+                    # dtype
+                    rescale_grad_comm_cost_for_mp *= 1.1
+            sharding_optimizer = ShardingOptimizer(
+                self.gm,
+                self.mesh,
+                rescale_grad_comm_cost_for_mp,
+                repeated_subgraphs=self.kwargs.get("repeated_subgraphs", False),
+            )
 
-        self.sharding_optimizer = sharding_optimizer
+            self.sharding_optimizer = sharding_optimizer
 
-        self.input_constraints = None
-        self.output_constraints = None
+            self.input_constraints = None
+            self.output_constraints = None
 
-        self.active = True
+            self.active = True
 
-        self.stack.__enter__()
+            self.stack.__enter__()
+        except BaseException:
+            self.stack.__exit__(None, None, None)
+            raise
 
         return self
 
