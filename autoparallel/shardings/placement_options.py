@@ -286,6 +286,7 @@ def get_placement_options(mesh, op, specs, user_args, user_kwargs):
             if user_kwargs
             else (),
         )
+        hash(cache_key)  # fail fast if key contains unhashable types (e.g. SymInts)
     except TypeError:
         cache_key = None
 
