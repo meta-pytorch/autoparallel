@@ -3,6 +3,9 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+import collections
+import logging
+import time
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -26,6 +29,8 @@ from autoparallel.shardings.propagation_rules import generate_dummy_redistribute
 
 from .dtensor_sharding_helpers import get_op_strategy, with_implicit_strategies
 from .propagation_rules import _op_partial_rules, _op_rules, remove_invalid_configs
+
+logger = logging.getLogger(__name__)
 
 
 def _get_meta_tensors_for_op(op, user_args, user_kwargs):
@@ -161,13 +166,76 @@ def keep_unique_configs(op_strat: OpStrategy) -> OpStrategy:
     return OpStrategy(filtered_strats)
 
 
+class PlacementOptionsTimer:
+    """Accumulates per-phase timing for get_placement_options calls."""
+
+    def __init__(self):
+        self.strategy_gen = 0.0
+        self.propagate_meta = 0.0
+        self.fill_redist_cost = 0.0
+        self.filter_dedup = 0.0
+        self.call_count = 0
+        # Per-op breakdown: op -> (total_time, count)
+        self.per_op: dict[str, tuple[float, int]] = collections.defaultdict(
+            lambda: (0.0, 0)
+        )
+
+    def record_op(self, op, elapsed):
+        key = str(op)
+        prev_time, prev_count = self.per_op[key]
+        self.per_op[key] = (prev_time + elapsed, prev_count + 1)
+
+    def report(self):
+        total = (
+            self.strategy_gen
+            + self.propagate_meta
+            + self.fill_redist_cost
+            + self.filter_dedup
+        )
+        logger.info(
+            "placement_options breakdown (%d calls, %.3fs total): "
+            "strategy_gen=%.3fs, propagate_meta=%.3fs, "
+            "fill_redist_cost=%.3fs, filter_dedup=%.3fs",
+            self.call_count,
+            total,
+            self.strategy_gen,
+            self.propagate_meta,
+            self.fill_redist_cost,
+            self.filter_dedup,
+        )
+        top_ops = sorted(self.per_op.items(), key=lambda kv: -kv[1][0])[:10]
+        for op_name, (op_time, op_count) in top_ops:
+            logger.info("  %-60s %.3fs (%d calls)", op_name, op_time, op_count)
+
+
+_placement_options_timer = PlacementOptionsTimer()
+
+
+def get_placement_options_timer():
+    return _placement_options_timer
+
+
+def reset_placement_options_timer():
+    global _placement_options_timer
+    _placement_options_timer = PlacementOptionsTimer()
+
+
 def get_placement_options(mesh, op, specs, user_args, user_kwargs):
     assert len(specs) == len(user_args)
+    timer = _placement_options_timer
+    t_start = time.perf_counter()
 
     if op in _op_rules:
+        t0 = time.perf_counter()
         out_strat = _op_rules[op](mesh, specs)
+        t1 = time.perf_counter()
         out_strat = remove_invalid_configs(out_strat, mesh)
         out_strat = keep_unique_configs(out_strat)
+        t2 = time.perf_counter()
+        timer.strategy_gen += t1 - t0
+        timer.filter_dedup += t2 - t1
+        timer.call_count += 1
+        timer.record_op(op, t2 - t_start)
         return out_strat
 
     strat = []
@@ -188,16 +256,30 @@ def get_placement_options(mesh, op, specs, user_args, user_kwargs):
 
     op_schema = OpSchema(op, strat, {}, RuntimeSchemaInfo(needs_pytree=needs_pytree))
 
+    t0 = time.perf_counter()
     if op in _op_partial_rules:
         out_strat = _op_partial_rules[op](mesh, op_schema)
     else:
         with with_implicit_strategies():
             out_strat = get_op_strategy(op, op_schema)
+    t1 = time.perf_counter()
 
     propagate_tensor_meta(op, user_args, user_kwargs, out_strat)
+    t2 = time.perf_counter()
+
     fill_missing_redistribute_cost(op, specs, out_strat)
+    t3 = time.perf_counter()
+
     out_strat = remove_invalid_configs(out_strat, mesh)
     out_strat = keep_unique_configs(out_strat)
+    t4 = time.perf_counter()
+
+    timer.strategy_gen += t1 - t0
+    timer.propagate_meta += t2 - t1
+    timer.fill_redist_cost += t3 - t2
+    timer.filter_dedup += t4 - t3
+    timer.call_count += 1
+    timer.record_op(op, t4 - t_start)
 
     return out_strat
 
