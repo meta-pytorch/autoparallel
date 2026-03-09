@@ -173,19 +173,32 @@ def overlap_scheduling_reordering_pass(
 
     gm = graph.owning_module
 
+    def _output_memory_bytes(node: torch.fx.Node) -> int:
+        val = node.meta.get("val")
+        if isinstance(val, torch.Tensor):
+            return val.numel() * val.element_size()
+        if isinstance(val, (list, tuple)):
+            total = 0
+            for v in val:
+                if isinstance(v, torch.Tensor):
+                    total += v.numel() * v.element_size()
+            return total
+        return 0
+
     def classify(node: torch.fx.Node) -> NodeInfo:
         if node.op in ("placeholder", "output", "get_attr"):
             return NodeInfo(NodeKind.SKIP, COMPUTE_STREAM, 0.0)
         if node.op != "call_function":
             return NodeInfo(NodeKind.SKIP, COMPUTE_STREAM, 0.0)
+        mem = _output_memory_bytes(node)
         if _is_communication_node(node):
             if node.target == torch.ops._c10d_functional.wait_tensor.default:
                 return NodeInfo(NodeKind.COMM_WAIT, COMPUTE_STREAM, 0.0)
             pg_name = str(node.args[-1])
             duration_ms = runtime_estimator(node) / 1000.0
-            return NodeInfo(NodeKind.COMM_START, pg_name, duration_ms)
+            return NodeInfo(NodeKind.COMM_START, pg_name, duration_ms, mem)
         duration_ms = runtime_estimator(node) / 1000.0
-        return NodeInfo(NodeKind.COMPUTE, COMPUTE_STREAM, duration_ms)
+        return NodeInfo(NodeKind.COMPUTE, COMPUTE_STREAM, duration_ms, mem)
 
     counter = configs._counter
     configs._counter += 1

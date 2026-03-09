@@ -112,7 +112,7 @@ elif autobucketing_level == "overlap":
         make_custom_runtime_estimation(mesh)
     )
     overlap_scheduling_config.solver = "greedy"
-    overlap_scheduling_config.memory_budget_bytes = 0.01 * 1024**3  # 2 GB
+    overlap_scheduling_config.memory_budget_bytes = 2 * 1024**3  # 2 GB
     torch._inductor.config.reorder_for_peak_memory = False
     torch._inductor.config.reorder_for_compute_comm_overlap = False
     torch._inductor.config.post_grad_custom_post_pass = partial(
