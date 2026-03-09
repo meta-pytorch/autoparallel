@@ -166,6 +166,53 @@ def keep_unique_configs(op_strat: OpStrategy) -> OpStrategy:
     return OpStrategy(filtered_strats)
 
 
+def _fingerprint_spec(spec):
+    """Hashable fingerprint for a DTensorSpec or tuple of them."""
+    if spec is None:
+        return None
+    if isinstance(spec, DTensorSpec):
+        return (spec.placements, spec.tensor_meta)
+    # tuple of Optional[DTensorSpec]
+    return tuple(_fingerprint_spec(s) for s in spec)
+
+
+def _fingerprint_arg(arg):
+    """Create a hashable fingerprint for a get_placement_options argument."""
+    if isinstance(arg, OpStrategy):
+        return tuple(_fingerprint_spec(s.output_specs) for s in arg.strategies)
+    if isinstance(arg, torch.Tensor):
+        return (arg.shape, arg.stride(), arg.dtype)
+    if isinstance(arg, (list, tuple)):
+        return tuple(_fingerprint_arg(a) for a in arg)
+    # int, float, None, bool, dtype, etc. — already hashable
+    return arg
+
+
+def _copy_op_strategy(op_strategy):
+    """Lightweight copy of an OpStrategy: new OpSpec wrappers, shared DTensorSpecs."""
+    return OpStrategy(
+        [
+            OpSpec(
+                output_specs=s.output_specs,
+                input_specs=s.input_specs,
+                redistribute_cost=(
+                    [list(row) for row in s.redistribute_cost]
+                    if s.redistribute_cost is not None
+                    else None
+                ),
+            )
+            for s in op_strategy.strategies
+        ]
+    )
+
+
+_placement_options_cache: dict[tuple, OpStrategy] = {}
+
+
+def reset_placement_options_cache():
+    _placement_options_cache.clear()
+
+
 class PlacementOptionsTimer:
     """Accumulates per-phase timing for get_placement_options calls."""
 
@@ -175,6 +222,8 @@ class PlacementOptionsTimer:
         self.fill_redist_cost = 0.0
         self.filter_dedup = 0.0
         self.call_count = 0
+        self.cache_hits = 0
+        self.cache_misses = 0
         # Per-op breakdown: op -> (total_time, count)
         self.per_op: dict[str, tuple[float, int]] = collections.defaultdict(
             lambda: (0.0, 0)
@@ -195,13 +244,16 @@ class PlacementOptionsTimer:
         logger.info(
             "placement_options breakdown (%d calls, %.3fs total): "
             "strategy_gen=%.3fs, propagate_meta=%.3fs, "
-            "fill_redist_cost=%.3fs, filter_dedup=%.3fs",
+            "fill_redist_cost=%.3fs, filter_dedup=%.3fs, "
+            "cache_hits=%d, cache_misses=%d",
             self.call_count,
             total,
             self.strategy_gen,
             self.propagate_meta,
             self.fill_redist_cost,
             self.filter_dedup,
+            self.cache_hits,
+            self.cache_misses,
         )
         top_ops = sorted(self.per_op.items(), key=lambda kv: -kv[1][0])[:10]
         for op_name, (op_time, op_count) in top_ops:
@@ -225,6 +277,25 @@ def get_placement_options(mesh, op, specs, user_args, user_kwargs):
     timer = _placement_options_timer
     t_start = time.perf_counter()
 
+    try:
+        cache_key = (
+            op,
+            tuple(_fingerprint_arg(s) for s in specs),
+            tuple(_fingerprint_arg(a) for a in user_args),
+            tuple(_fingerprint_arg(v) for v in user_kwargs.values())
+            if user_kwargs
+            else (),
+        )
+    except TypeError:
+        cache_key = None
+
+    if cache_key is not None and cache_key in _placement_options_cache:
+        out_strat = _copy_op_strategy(_placement_options_cache[cache_key])
+        timer.call_count += 1
+        timer.cache_hits += 1
+        timer.record_op(op, time.perf_counter() - t_start)
+        return out_strat
+
     if op in _op_rules:
         t0 = time.perf_counter()
         out_strat = _op_rules[op](mesh, specs)
@@ -235,7 +306,10 @@ def get_placement_options(mesh, op, specs, user_args, user_kwargs):
         timer.strategy_gen += t1 - t0
         timer.filter_dedup += t2 - t1
         timer.call_count += 1
+        timer.cache_misses += 1
         timer.record_op(op, t2 - t_start)
+        if cache_key is not None:
+            _placement_options_cache[cache_key] = out_strat
         return out_strat
 
     strat = []
@@ -279,8 +353,11 @@ def get_placement_options(mesh, op, specs, user_args, user_kwargs):
     timer.fill_redist_cost += t3 - t2
     timer.filter_dedup += t4 - t3
     timer.call_count += 1
+    timer.cache_misses += 1
     timer.record_op(op, t4 - t_start)
 
+    if cache_key is not None:
+        _placement_options_cache[cache_key] = out_strat
     return out_strat
 
 
