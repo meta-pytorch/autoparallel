@@ -5,6 +5,8 @@
 
 import copy
 import functools
+import logging
+import time
 from contextlib import ExitStack, contextmanager
 from types import MethodType
 from typing import Any, Callable, Optional, Union
@@ -45,6 +47,8 @@ from .shardings.placement_options import (
 )
 
 _APPLY_VIEW_MM_VIEW_PATTERN = False
+
+logger = logging.getLogger(__name__)
 
 
 def _build_alias_map(
@@ -350,36 +354,45 @@ class AutoParallel:
     def __enter__(self):
         assert self.active is False
 
-        self.build_model_graph()
-        self.old_inductor_comprehensive_padding = (
-            torch._inductor.config.comprehensive_padding
-        )
-        torch._inductor.config.comprehensive_padding = False
+        # build_model_graph and the code below push context managers
+        # (including FakeTensorMode) onto self.stack via
+        # aot_export_joint_with_descriptors. If anything raises, __exit__
+        # won't be called (Python only calls __exit__ if __enter__
+        # succeeds), so we must unwind the stack ourselves.
+        try:
+            self.build_model_graph()
+            self.old_inductor_comprehensive_padding = (
+                torch._inductor.config.comprehensive_padding
+            )
+            torch._inductor.config.comprehensive_padding = False
 
-        rescale_grad_comm_cost_for_mp = 1.0
-        if self.mp_policy is not None:
-            param_size = self.mp_policy.param_dtype.itemsize
-            reduce_size = self.mp_policy.reduce_dtype.itemsize
-            if param_size != reduce_size:
-                rescale_grad_comm_cost_for_mp = reduce_size / param_size
-                # Tiebreak, favoring performing the comms in the largest
-                # dtype
-                rescale_grad_comm_cost_for_mp *= 1.1
-        sharding_optimizer = ShardingOptimizer(
-            self.gm,
-            self.mesh,
-            rescale_grad_comm_cost_for_mp,
-            repeated_subgraphs=self.kwargs.get("repeated_subgraphs", False),
-        )
+            rescale_grad_comm_cost_for_mp = 1.0
+            if self.mp_policy is not None:
+                param_size = self.mp_policy.param_dtype.itemsize
+                reduce_size = self.mp_policy.reduce_dtype.itemsize
+                if param_size != reduce_size:
+                    rescale_grad_comm_cost_for_mp = reduce_size / param_size
+                    # Tiebreak, favoring performing the comms in the largest
+                    # dtype
+                    rescale_grad_comm_cost_for_mp *= 1.1
+            sharding_optimizer = ShardingOptimizer(
+                self.gm,
+                self.mesh,
+                rescale_grad_comm_cost_for_mp,
+                repeated_subgraphs=self.kwargs.get("repeated_subgraphs", False),
+            )
 
-        self.sharding_optimizer = sharding_optimizer
+            self.sharding_optimizer = sharding_optimizer
 
-        self.input_constraints = None
-        self.output_constraints = None
+            self.input_constraints = None
+            self.output_constraints = None
 
-        self.active = True
+            self.active = True
 
-        self.stack.__enter__()
+            self.stack.__enter__()
+        except BaseException:
+            self.stack.__exit__(None, None, None)
+            raise
 
         return self
 
@@ -401,6 +414,7 @@ class AutoParallel:
             )
 
     def build_model_graph(self):
+        t0 = time.perf_counter()
         decomp_table = _get_decomp_table()
 
         with self.fake_mode:
@@ -449,6 +463,7 @@ class AutoParallel:
         )
 
         self.gm = gm
+        logger.info("Graph tracing took %.3fs", time.perf_counter() - t0)
 
     # TODO: Specify what the low/high meaning is (percentage?)
     def add_parameter_memory_constraint(self, low=None, high=None):
@@ -504,6 +519,7 @@ class AutoParallel:
         return self.sharding_placement
 
     def _apply_placement_common(self, sharding_placement):
+        t0 = time.perf_counter()
         self._assert_entered()
 
         if sharding_placement is None:
@@ -583,6 +599,7 @@ class AutoParallel:
             torch.fx.node._side_effectful_functions.remove(
                 torch.ops._c10d_functional.wait_tensor.default
             )
+        logger.info("Apply placements took %.3fs", time.perf_counter() - t0)
         return (
             sharded_param_dict,
             sharded_buffer_dict,

@@ -5,6 +5,7 @@
 
 
 import functools
+import logging
 
 import torch
 from torch import nn
@@ -14,6 +15,8 @@ from torch.testing._internal.distributed.fake_pg import FakeStore
 from torch.utils.checkpoint import create_selective_checkpoint_contexts
 
 from autoparallel.api import AutoParallel
+
+logging.basicConfig(level=logging.INFO)
 
 
 def policy_fn(ctx, op, *args, **kwargs):
