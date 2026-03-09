@@ -316,7 +316,7 @@ class ShardingOptimizer:
         """Build DecisionVar entries for every (node_idx, argi, out_idx, inp_idx)
         combination in the strategy space."""
         t_pulp_start = time.perf_counter()
-        pulp_variables = self._create_pulp_variables()
+        self.pulp_variables = self._create_pulp_variables()
         t_pulp_end = time.perf_counter()
         grad_param_nodes = set(
             x[1] for x in get_param_and_grad_nodes(self.graph).values()
@@ -324,7 +324,7 @@ class ShardingOptimizer:
 
         # Precompute which node indices are cluster-linked so we can
         # copy costs from the root instead of recomputing them.
-        cluster_linked_node_idxs = {key[0] for key in self.cluster_links}
+        self._cluster_linked_node_idxs = {key[0] for key in self.cluster_links}
 
         t_compute = 0.0
         t_edge = 0.0
@@ -339,7 +339,7 @@ class ShardingOptimizer:
             for node_idx, (node, op_strategy) in strats_items:
                 if node.op == "output":
                     continue
-                is_linked = node_idx in cluster_linked_node_idxs
+                is_linked = node_idx in self._cluster_linked_node_idxs
                 if is_linked != is_linked_pass:
                     continue
 
@@ -392,17 +392,22 @@ class ShardingOptimizer:
 
                             redist_costs[inp_idx] = comm_cost
 
-                            decision_vars[key] = DecisionVar(
-                                var=pulp_variables[key],
-                                cost=comm_cost + per_arg_compute + transition_cost,
-                                compute_cost=per_arg_compute,
-                                comm_cost=comm_cost,
-                                sharding_transition_cost=transition_cost,
-                                strategy=output_strategy,
-                                output_spec=output_strategy.output_specs,
-                                input_spec=output_strategy.input_specs[argi],
-                            )
+                            if not is_linked:
+                                decision_vars[key] = DecisionVar(
+                                    var=self.pulp_variables[key],
+                                    cost=comm_cost + per_arg_compute + transition_cost,
+                                    compute_cost=per_arg_compute,
+                                    comm_cost=comm_cost,
+                                    sharding_transition_cost=transition_cost,
+                                    strategy=output_strategy,
+                                    output_spec=output_strategy.output_specs,
+                                    input_spec=output_strategy.input_specs[argi],
+                                )
                             n_vars += 1
+
+        self._root_to_linked: dict[tuple, list[tuple]] = defaultdict(list)
+        for linked_key, root_key in self.cluster_links.items():
+            self._root_to_linked[root_key].append(linked_key)
 
         logger.info(
             "_build_decision_vars breakdown (%d vars, %d cluster-copied): "
@@ -414,6 +419,26 @@ class ShardingOptimizer:
             t_edge,
         )
         return decision_vars
+
+    def _resolve_decision_var(self, key):
+        """Return a DecisionVar for key, reconstructing on the fly for linked keys."""
+        dv = self.decision_vars.get(key)
+        if dv is not None:
+            return dv
+        root_key = self.cluster_links[key]
+        root_dv = self.decision_vars[root_key]
+        node_idx, argi, out_idx, _ = key
+        strategy = self.strats[self.nodes[node_idx]].strategies[out_idx]
+        return DecisionVar(
+            var=self.pulp_variables[key],
+            cost=root_dv.cost,
+            compute_cost=root_dv.compute_cost,
+            comm_cost=root_dv.comm_cost,
+            sharding_transition_cost=root_dv.sharding_transition_cost,
+            strategy=strategy,
+            output_spec=strategy.output_specs,
+            input_spec=strategy.input_specs[argi],
+        )
 
     def _collect_vars(self, node, node_idx, argi, group_by, resolve_clusters=False):
         """Collect PuLP variables for a node's options, grouped by strategy index.
@@ -430,9 +455,9 @@ class ShardingOptimizer:
             if key in self.cluster_links:
                 if not resolve_clusters:
                     continue
-                var = self.decision_vars[self.cluster_links[key]].var
+                var = self.pulp_variables[self.cluster_links[key]]
             else:
-                var = self.decision_vars[key].var
+                var = self.pulp_variables[key]
             group_key = out_idx if group_by == "out_idx" else inp_idx
             result.setdefault(group_key, []).append(var)
         return result
@@ -477,12 +502,12 @@ class ShardingOptimizer:
         for node_idx, node in enumerate(self.graph.nodes):
             if node.op not in {"placeholder", "call_function", "get_attr"}:
                 continue
+            if node_idx in self._cluster_linked_node_idxs:
+                continue
             arg_vars = {}
             for argi, out_idx, inp_idx in self.walk_over_options(node):
                 key = (node_idx, argi, out_idx, inp_idx)
-                if key in self.cluster_links:
-                    continue
-                var = self.decision_vars[key].var
+                var = self.pulp_variables[key]
                 arg_vars.setdefault(argi, []).append(var)
             for eqs in arg_vars.values():
                 self.prob += (
@@ -499,14 +524,14 @@ class ShardingOptimizer:
         for node_idx, node in enumerate(self.graph.nodes):
             if node.op != "call_function":
                 continue
+            if node_idx in self._cluster_linked_node_idxs:
+                continue
             if len(self._all_input_nodes(node)) <= 1:
                 continue
             vars_per_output = {}
             for argi, out_idx, inp_idx in self.walk_over_options(node):
                 key = (node_idx, argi, out_idx, inp_idx)
-                if key in self.cluster_links:
-                    continue
-                var = self.decision_vars[key].var
+                var = self.pulp_variables[key]
                 vars_per_output.setdefault((argi, out_idx), []).append(var)
             eqs_per_arg = [[] for _ in self._all_input_nodes(node)]
             for (argi, out_idx), value in vars_per_output.items():
@@ -529,12 +554,17 @@ class ShardingOptimizer:
         for node_idx, node in enumerate(self.graph.nodes):
             if node.op == "output":
                 continue
+            producer_is_linked = node_idx in self._cluster_linked_node_idxs
             # All args agree on the same output (ensured by consistency constraint),
             # so we use arg 0 for the producer side.
             for user in node.users:
                 if user.op == "output":
                     continue
                 user_idx = self.node_map[user]
+                # Skip edges where both endpoints are cluster-linked;
+                # the root-to-root edge already covers this.
+                if producer_is_linked and user_idx in self._cluster_linked_node_idxs:
+                    continue
                 user_argi = [i for i, n in enumerate(user.all_input_nodes) if n == node]
                 assert len(user_argi) == 1
                 user_argi = user_argi[0]
@@ -582,8 +612,6 @@ class ShardingOptimizer:
         for key, dv in self.decision_vars.items():
             if not math.isfinite(dv.cost):
                 dv.cost = 10000.0
-                if key in self.cluster_links:
-                    continue
                 self.prob += (dv.var == 0, self._get_next_name("inf_cases"))
 
     def add_default_constraints(self):
@@ -597,11 +625,11 @@ class ShardingOptimizer:
 
     def _set_objective(self):
         """Add the cost minimization objective to the ILP."""
-        # Deduplicate variables that appear multiple times (from cluster links)
-        cost_per_var = defaultdict(int)
-        for dv in self.decision_vars.values():
-            cost_per_var[dv.var] += dv.cost
-        self.prob += pulp.lpSum([var * cost for var, cost in cost_per_var.items()])
+        terms = []
+        for key, dv in self.decision_vars.items():
+            multiplier = 1 + len(self._root_to_linked.get(key, []))
+            terms.append(dv.var * dv.cost * multiplier)
+        self.prob += pulp.lpSum(terms)
 
     def _solve(self, verbose=False):
         solver = pulp.PULP_CBC_CMD(msg=verbose)
@@ -610,6 +638,8 @@ class ShardingOptimizer:
         self.selected_keys = [
             key for key, dv in self.decision_vars.items() if dv.var.value() == 1
         ]
+        for root_key in list(self.selected_keys):
+            self.selected_keys.extend(self._root_to_linked.get(root_key, []))
 
         if self.prob.status == -1:
             print(self.get_violated_constraints_log())
@@ -620,7 +650,9 @@ class ShardingOptimizer:
         selected_by_node = {}
         for key in self.selected_keys:
             node = self.nodes[key[0]]
-            selected_by_node.setdefault(node, []).append(self.decision_vars[key])
+            selected_by_node.setdefault(node, []).append(
+                self._resolve_decision_var(key)
+            )
 
         # Validate: each (node, arg) pair has exactly one selection
         seen = set()
@@ -668,7 +700,9 @@ class ShardingOptimizer:
         selected_by_node = {}
         for key in self.selected_keys:
             node = self.nodes[key[0]]
-            selected_by_node.setdefault(node, []).append(self.decision_vars[key])
+            selected_by_node.setdefault(node, []).append(
+                self._resolve_decision_var(key)
+            )
 
         return format_sharding_log(
             graph=self.graph,
@@ -701,7 +735,7 @@ class ShardingOptimizer:
         vars_per_arg = {}
         for argi, out_idx, inp_idx in self.walk_over_options(node):
             if out_idx in output_constraint_indices:
-                var = self.decision_vars[(node_idx, argi, out_idx, inp_idx)].var
+                var = self.pulp_variables[(node_idx, argi, out_idx, inp_idx)]
                 vars_per_arg.setdefault(argi, []).append(var)
         for eqs in vars_per_arg.values():
             self.prob += (
@@ -729,11 +763,11 @@ class ShardingOptimizer:
                 continue
             out_idx_b = strat_b.index(sp)
             v_a = [
-                self.decision_vars[(idx_a, 0, out_idx, inp_idx)].var
+                self.pulp_variables[(idx_a, 0, out_idx, inp_idx)]
                 for inp_idx in range(num_inp_a)
             ]
             v_b = [
-                self.decision_vars[(idx_b, 0, out_idx_b, inp_idx)].var
+                self.pulp_variables[(idx_b, 0, out_idx_b, inp_idx)]
                 for inp_idx in range(num_inp_b)
             ]
             self.prob += (
@@ -787,7 +821,7 @@ class ShardingOptimizer:
                 continue
             num_out_strat = len(self.strats[node].strategies)
             for out_idx in range(num_out_strat):
-                dv = self.decision_vars[(node_idx, 0, out_idx, 0)]
+                dv = self._resolve_decision_var((node_idx, 0, out_idx, 0))
                 spec: DTensorSpec = dv.input_spec
                 assert spec.tensor_meta is not None
                 tensor_shape: torch.Size = spec.tensor_meta.shape
