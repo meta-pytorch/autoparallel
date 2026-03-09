@@ -157,14 +157,20 @@ def estimate_strategy_comms_cost(src_spec, tgt_spec):
         tgt_spec.placements,
         tgt_spec.tensor_meta,
     )
-    cached = _comms_cost_cache.get(key)
-    if cached is not None:
-        return cached
+    try:
+        hash(key)  # fail fast if key contains unhashable types (e.g. SymInts)
+    except TypeError:
+        key = None
+    if key is not None:
+        cached = _comms_cost_cache.get(key)
+        if cached is not None:
+            return cached
     order = list(range(src_spec.mesh.ndim))
     if src_spec.placements == (Partial(), Partial()) and all(
         p.is_shard() for p in tgt_spec.placements
     ):
         order = [1, 0]
     cost = redistribute_cost(src_spec, tgt_spec, order)
-    _comms_cost_cache[key] = cost
+    if key is not None:
+        _comms_cost_cache[key] = cost
     return cost
