@@ -34,6 +34,7 @@ from torch.distributed.tensor.placement_types import Replicate, Shard
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from torch.testing._internal.distributed.fake_pg import FakeStore
 
+import autoparallel._testing.models.dsv3 as dsv3_module
 from autoparallel._testing.models.dsv3 import (
     DeepSeekV3Model,
     DeepSeekV3ModelArgs,
@@ -137,6 +138,7 @@ def run_test(
     rng_seed: Optional[int],
     logs_dir: str,
     use_cache: bool,
+    use_inductor: bool = False,
 ):
     if not fake_evaluate:
         pp_degree = 2
@@ -619,7 +621,7 @@ def run_test(
         )
 
     # Step 7. Register the schedule with the graph runner
-    graph_pp_runner = GraphPPRunner(schedule)  # inductor=True to compile with Inductor
+    graph_pp_runner = GraphPPRunner(schedule, inductor=use_inductor)
 
     # Step 8. Run the whole pipeline once using the graph runner
     has_last_stage = (total_pp_stages - 1) in stage_mods
@@ -714,6 +716,12 @@ if __name__ == "__main__":
         default=False,
         help="Use cached graph files if available (default: False)",
     )
+    parser.add_argument(
+        "--inductor",
+        action="store_true",
+        default=False,
+        help="Compile subgraphs with Inductor (also forces balanced MoE routing)",
+    )
     args = parser.parse_args()
 
     if args.use_cache and not args.fake_evaluate:
@@ -723,6 +731,12 @@ if __name__ == "__main__":
         torch.use_deterministic_algorithms(True)
         torch.manual_seed(args.rng_seed)
 
+    if args.inductor:
+        # The DSv3 MoE implementation uses .tolist() and data-dependent grouped_mm
+        # offsets, which Inductor cannot compile. Force balanced routing to make
+        # all token counts static.
+        dsv3_module.FORCE_BALANCED_ROUTING = True
+
     run_test(
         fake_evaluate=args.fake_evaluate,
         use_loss_fn=args.use_loss_fn,
@@ -730,4 +744,5 @@ if __name__ == "__main__":
         rng_seed=args.rng_seed,
         logs_dir=args.logs_dir,
         use_cache=args.use_cache,
+        use_inductor=args.inductor,
     )
