@@ -143,11 +143,34 @@ def redistribute_cost(
     return cost
 
 
+_comms_cost_cache: dict[tuple, float] = {}
+
+
+def reset_comms_cost_cache():
+    _comms_cost_cache.clear()
+
+
 def estimate_strategy_comms_cost(src_spec, tgt_spec):
+    key = (
+        src_spec.placements,
+        src_spec.tensor_meta,
+        tgt_spec.placements,
+        tgt_spec.tensor_meta,
+    )
+    try:
+        hash(key)  # fail fast if key contains unhashable types (e.g. SymInts)
+    except TypeError:
+        key = None
+    if key is not None:
+        cached = _comms_cost_cache.get(key)
+        if cached is not None:
+            return cached
     order = list(range(src_spec.mesh.ndim))
     if src_spec.placements == (Partial(), Partial()) and all(
         p.is_shard() for p in tgt_spec.placements
     ):
         order = [1, 0]
-    comms_cost = redistribute_cost(src_spec, tgt_spec, order)
-    return comms_cost
+    cost = redistribute_cost(src_spec, tgt_spec, order)
+    if key is not None:
+        _comms_cost_cache[key] = cost
+    return cost

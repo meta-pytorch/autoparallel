@@ -158,10 +158,20 @@ class ShardingOptimizer:
 
         t0 = time.perf_counter()
         self.decision_vars = self._build_decision_vars()
+        t1 = time.perf_counter()
         self.validate()
+        t2 = time.perf_counter()
         self.prob = pulp.LpProblem("AutoParallel", pulp.LpMinimize)
         self.add_default_constraints()
-        logger.info("ILP construction took %.3fs", time.perf_counter() - t0)
+        t3 = time.perf_counter()
+        logger.info(
+            "ILP construction took %.3fs "
+            "(decision_vars=%.3fs, validate=%.3fs, constraints=%.3fs)",
+            t3 - t0,
+            t1 - t0,
+            t2 - t1,
+            t3 - t2,
+        )
 
     def _get_next_name(self, prefix):
         idx = self._name_counters.setdefault(prefix, 0)
@@ -308,10 +318,17 @@ class ShardingOptimizer:
     def _build_decision_vars(self):
         """Build DecisionVar entries for every (node_idx, argi, out_idx, inp_idx)
         combination in the strategy space."""
+        t_pulp_start = time.perf_counter()
         pulp_variables = self._create_pulp_variables()
+        t_pulp_end = time.perf_counter()
         grad_param_nodes = set(
             x[1] for x in get_param_and_grad_nodes(self.graph).values()
         )
+
+        t_compute = 0.0
+        t_edge = 0.0
+        t_decvar = 0.0
+        n_vars = 0
 
         decision_vars = {}
         for node_idx, (node, op_strategy) in enumerate(self.strats.items()):
@@ -322,7 +339,10 @@ class ShardingOptimizer:
             num_args = len(op_strategy.strategies[0].input_specs)
 
             for out_idx, output_strategy in enumerate(op_strategy.strategies):
+                tc0 = time.perf_counter()
                 compute_cost = estimate_strategy_runtime_cost(node, output_strategy)
+                tc1 = time.perf_counter()
+                t_compute += tc1 - tc0
                 per_arg_compute = compute_cost / num_args
 
                 for argi, redist_costs in enumerate(output_strategy.redistribute_cost):
@@ -330,6 +350,7 @@ class ShardingOptimizer:
                         self.strats[all_input_nodes[argi]] if all_input_nodes else None
                     )
                     for inp_idx, default_comm_cost in enumerate(redist_costs):
+                        te0 = time.perf_counter()
                         comm_cost, transition_cost = self._compute_edge_costs(
                             node,
                             output_strategy,
@@ -339,11 +360,14 @@ class ShardingOptimizer:
                             producer_strategy,
                             grad_param_nodes,
                         )
+                        te1 = time.perf_counter()
+                        t_edge += te1 - te0
                         # Update OpSpec redistribute_cost so print_costs_for_node
                         # reflects the recomputed costs
                         redist_costs[inp_idx] = comm_cost
 
                         key = (node_idx, argi, out_idx, inp_idx)
+                        td0 = time.perf_counter()
                         decision_vars[key] = DecisionVar(
                             var=pulp_variables[key],
                             cost=comm_cost + per_arg_compute + transition_cost,
@@ -354,7 +378,19 @@ class ShardingOptimizer:
                             output_spec=output_strategy.output_specs,
                             input_spec=output_strategy.input_specs[argi],
                         )
+                        t_decvar += time.perf_counter() - td0
+                        n_vars += 1
 
+        logger.info(
+            "_build_decision_vars breakdown (%d vars): "
+            "pulp_vars=%.3fs, compute_cost=%.3fs, edge_cost=%.3fs, "
+            "decvar_create=%.3fs",
+            n_vars,
+            t_pulp_end - t_pulp_start,
+            t_compute,
+            t_edge,
+            t_decvar,
+        )
         return decision_vars
 
     def _collect_vars(self, node, node_idx, argi, group_by, resolve_clusters=False):
