@@ -124,10 +124,20 @@ elif autobucketing_level == "overlap":
     overlap_scheduling_config.memory_budget_bytes = 2 * 1024**3  # 2 GB
     torch._inductor.config.reorder_for_peak_memory = False
     torch._inductor.config.reorder_for_compute_comm_overlap = False
-    torch._inductor.config.post_grad_custom_post_pass = partial(
+    overlap_pass = partial(
         overlap_scheduling_reordering_pass,
         configs=overlap_scheduling_config,
     )
+
+    def post_grad_pass(graph):
+        overlap_pass(graph)
+        gm = graph.owning_module
+        metrics = estimate_graph_metrics(gm, custom_runtime_estimation)
+        print(metrics)
+        return gm
+
+    torch._inductor.config.post_grad_custom_post_pass = post_grad_pass
+
 elif autobucketing_level == "inductor":
     configure_inductor_for_autobucketing(autobucketing_level)
 else:
@@ -264,7 +274,7 @@ with AutoParallel(
         torch._inductor.config.post_grad_custom_post_pass = _pass
 
     t = time.time()
-    sharding_placement = autop.optimize_placement(verbose=True)
+    sharding_placement = autop.optimize_placement(verbose=False)
     print(f"Took {time.time() - t:.2f} s")
     parallel_mod = autop.apply_placement(sharding_placement)
 
