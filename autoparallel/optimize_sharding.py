@@ -325,71 +325,96 @@ class ShardingOptimizer:
             x[1] for x in get_param_and_grad_nodes(self.graph).values()
         )
 
+        # Precompute which node indices are cluster-linked so we can
+        # copy costs from the root instead of recomputing them.
+        cluster_linked_node_idxs = {key[0] for key in self.cluster_links}
+
         t_compute = 0.0
         t_edge = 0.0
-        t_decvar = 0.0
         n_vars = 0
+        n_cluster_copied = 0
 
         decision_vars = {}
-        for node_idx, (node, op_strategy) in enumerate(self.strats.items()):
-            if node.op == "output":
-                continue
+        strats_items = list(enumerate(self.strats.items()))
 
-            all_input_nodes = self._all_input_nodes(node)
-            num_args = len(op_strategy.strategies[0].input_specs)
+        # Two passes: root nodes first (so their entries exist), then linked nodes.
+        for is_linked_pass in (False, True):
+            for node_idx, (node, op_strategy) in strats_items:
+                if node.op == "output":
+                    continue
+                is_linked = node_idx in cluster_linked_node_idxs
+                if is_linked != is_linked_pass:
+                    continue
 
-            for out_idx, output_strategy in enumerate(op_strategy.strategies):
-                tc0 = time.perf_counter()
-                compute_cost = estimate_strategy_runtime_cost(node, output_strategy)
-                tc1 = time.perf_counter()
-                t_compute += tc1 - tc0
-                per_arg_compute = compute_cost / num_args
+                num_args = len(op_strategy.strategies[0].input_specs)
 
-                for argi, redist_costs in enumerate(output_strategy.redistribute_cost):
-                    producer_strategy = (
-                        self.strats[all_input_nodes[argi]] if all_input_nodes else None
-                    )
-                    for inp_idx, default_comm_cost in enumerate(redist_costs):
-                        te0 = time.perf_counter()
-                        comm_cost, transition_cost = self._compute_edge_costs(
-                            node,
-                            output_strategy,
-                            argi,
-                            inp_idx,
-                            default_comm_cost,
-                            producer_strategy,
-                            grad_param_nodes,
+                for out_idx, output_strategy in enumerate(op_strategy.strategies):
+                    if is_linked:
+                        root_key = self.cluster_links[(node_idx, 0, out_idx, 0)]
+                        per_arg_compute = decision_vars[root_key].compute_cost
+                    else:
+                        tc0 = time.perf_counter()
+                        compute_cost = estimate_strategy_runtime_cost(
+                            node, output_strategy
                         )
-                        te1 = time.perf_counter()
-                        t_edge += te1 - te0
-                        # Update OpSpec redistribute_cost so print_costs_for_node
-                        # reflects the recomputed costs
-                        redist_costs[inp_idx] = comm_cost
+                        tc1 = time.perf_counter()
+                        t_compute += tc1 - tc0
+                        per_arg_compute = compute_cost / num_args
 
-                        key = (node_idx, argi, out_idx, inp_idx)
-                        td0 = time.perf_counter()
-                        decision_vars[key] = DecisionVar(
-                            var=pulp_variables[key],
-                            cost=comm_cost + per_arg_compute + transition_cost,
-                            compute_cost=per_arg_compute,
-                            comm_cost=comm_cost,
-                            sharding_transition_cost=transition_cost,
-                            strategy=output_strategy,
-                            output_spec=output_strategy.output_specs,
-                            input_spec=output_strategy.input_specs[argi],
-                        )
-                        t_decvar += time.perf_counter() - td0
-                        n_vars += 1
+                    for argi, redist_costs in enumerate(
+                        output_strategy.redistribute_cost
+                    ):
+                        for inp_idx, default_comm_cost in enumerate(redist_costs):
+                            key = (node_idx, argi, out_idx, inp_idx)
+
+                            if is_linked:
+                                root_key = self.cluster_links[key]
+                                root_dv = decision_vars[root_key]
+                                comm_cost = root_dv.comm_cost
+                                transition_cost = root_dv.sharding_transition_cost
+                                n_cluster_copied += 1
+                            else:
+                                all_input_nodes = self._all_input_nodes(node)
+                                producer_strategy = (
+                                    self.strats[all_input_nodes[argi]]
+                                    if all_input_nodes
+                                    else None
+                                )
+                                te0 = time.perf_counter()
+                                comm_cost, transition_cost = self._compute_edge_costs(
+                                    node,
+                                    output_strategy,
+                                    argi,
+                                    inp_idx,
+                                    default_comm_cost,
+                                    producer_strategy,
+                                    grad_param_nodes,
+                                )
+                                te1 = time.perf_counter()
+                                t_edge += te1 - te0
+
+                            redist_costs[inp_idx] = comm_cost
+
+                            decision_vars[key] = DecisionVar(
+                                var=pulp_variables[key],
+                                cost=comm_cost + per_arg_compute + transition_cost,
+                                compute_cost=per_arg_compute,
+                                comm_cost=comm_cost,
+                                sharding_transition_cost=transition_cost,
+                                strategy=output_strategy,
+                                output_spec=output_strategy.output_specs,
+                                input_spec=output_strategy.input_specs[argi],
+                            )
+                            n_vars += 1
 
         logger.info(
-            "_build_decision_vars breakdown (%d vars): "
-            "pulp_vars=%.3fs, compute_cost=%.3fs, edge_cost=%.3fs, "
-            "decvar_create=%.3fs",
+            "_build_decision_vars breakdown (%d vars, %d cluster-copied): "
+            "pulp_vars=%.3fs, compute_cost=%.3fs, edge_cost=%.3fs",
             n_vars,
+            n_cluster_copied,
             t_pulp_end - t_pulp_start,
             t_compute,
             t_edge,
-            t_decvar,
         )
         return decision_vars
 
