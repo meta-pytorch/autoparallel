@@ -145,6 +145,9 @@ class ShardingOptimizer:
         t0 = time.perf_counter()
         self.strats = self.build_sharding_metadata()
         logger.info("Placement options took %.3fs", time.perf_counter() - t0)
+        from autoparallel.shardings.placement_options import get_placement_options_timer
+
+        get_placement_options_timer().report()
 
         self.cluster_links: dict[tuple, tuple] = {}
         if repeated_subgraphs:
