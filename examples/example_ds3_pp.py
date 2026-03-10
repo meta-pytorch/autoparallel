@@ -619,7 +619,7 @@ def run_test(
         )
 
     # Step 7. Register the schedule with the graph runner
-    graph_pp_runner = GraphPPRunner(schedule)
+    graph_pp_runner = GraphPPRunner(schedule)  # inductor=True to compile with Inductor
 
     # Step 8. Run the whole pipeline once using the graph runner
     has_last_stage = (total_pp_stages - 1) in stage_mods
