@@ -554,9 +554,11 @@ class AutoParallel:
                 self.joint_with_descriptors.params_spec,
                 self.joint_with_descriptors.buffers_spec,
             )
+        t_apply = time.perf_counter()
         # clean it up by removing the added aliases from previous pass
         # as well as redundant views
         cleanup_graph(parallel_gm, aggressive=True)
+        t_cleanup = time.perf_counter()
 
         trace_structured(
             "artifact",
@@ -568,11 +570,13 @@ class AutoParallel:
                 print_output=False, include_stride=True, include_device=True
             ),
         )
+        t_trace = time.perf_counter()
 
         if self.enable_ac:
             ac_joint_pass(
                 parallel_gm.graph, self.ac_stage_size_in_GiB, self.reshard_after_forward
             )
+        t_ac = time.perf_counter()
         # now rename input/param/tangent/output/grad_param/grad_input nodes following
         # our convention
         # apply_node_renaming(
@@ -599,7 +603,15 @@ class AutoParallel:
             torch.fx.node._side_effectful_functions.remove(
                 torch.ops._c10d_functional.wait_tensor.default
             )
-        logger.info("Apply placements took %.3fs", time.perf_counter() - t0)
+        logger.info(
+            "Apply placements took %.3fs "
+            "(apply_sharding=%.3fs, cleanup=%.3fs, trace=%.3fs, ac=%.3fs)",
+            time.perf_counter() - t0,
+            t_apply - t0,
+            t_cleanup - t_apply,
+            t_trace - t_cleanup,
+            t_ac - t_trace,
+        )
         return (
             sharded_param_dict,
             sharded_buffer_dict,
