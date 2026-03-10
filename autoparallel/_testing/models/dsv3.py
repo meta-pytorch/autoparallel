@@ -21,6 +21,11 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from autoparallel.collectives import all_to_all, axis_size, local_map
 
+# When True, MoE uses uniform token routing and balanced all-to-all splits,
+# eliminating data-dependent ops (.tolist(), dynamic grouped_mm offsets) that
+# prevent Inductor compilation.
+FORCE_BALANCED_ROUTING: bool = False
+
 
 # parallelized kernel
 @triton.jit
@@ -633,11 +638,8 @@ class TokenReorderer(nn.Module):
 
 def _token_dispatch(routed_input, num_tokens_per_expert, axis_name):
     with fx_traceback.annotate({"comm_region": "token_dispatch"}):
-        # annotate module input placements/sharding with input_layouts
-        # ep_size = device_mesh.shape[0]
         ep_size = axis_size(axis_name)
 
-        # generate the input splits and output splits for all-to-all
         with torch.no_grad():
             num_tokens_per_expert_group = all_to_all(
                 num_tokens_per_expert,
@@ -645,21 +647,26 @@ def _token_dispatch(routed_input, num_tokens_per_expert, axis_name):
                 None,
                 axis_name,
             )
-            input_splits = (
-                num_tokens_per_expert.view(ep_size, -1)
-                .sum(dim=1)
-                .to(torch.device("cpu"), non_blocking=True)
-            )
-            # NOTE: this would incur a device-to-host sync
-            output_splits = (
-                num_tokens_per_expert_group.view(ep_size, -1)
-                .sum(dim=1)
-                .to(torch.device("cpu"), non_blocking=False)
-            )
-            input_splits = input_splits.tolist()
-            output_splits = output_splits.tolist()
 
-        # perform all-to-all
+        if FORCE_BALANCED_ROUTING:
+            input_splits = None
+            output_splits = None
+        else:
+            with torch.no_grad():
+                input_splits = (
+                    num_tokens_per_expert.view(ep_size, -1)
+                    .sum(dim=1)
+                    .to(torch.device("cpu"), non_blocking=True)
+                )
+                # NOTE: this would incur a device-to-host sync
+                output_splits = (
+                    num_tokens_per_expert_group.view(ep_size, -1)
+                    .sum(dim=1)
+                    .to(torch.device("cpu"), non_blocking=False)
+                )
+                input_splits = input_splits.tolist()
+                output_splits = output_splits.tolist()
+
         routed_input = all_to_all(
             routed_input,
             output_splits,
@@ -708,13 +715,24 @@ def local_mapped_region(
 
     dim = x.shape[-1]
 
-    # num_tokens_per_expert = torch.ops.autoparallel.batched_histc(
-    num_tokens_per_expert = torch.histc(
-        selected_experts_indices.flatten(),
-        bins=num_experts,
-        min=0,
-        max=num_experts,
-    )
+    if FORCE_BALANCED_ROUTING:
+        # Uniform distribution: same number of tokens per expert.
+        # Eliminates data-dependent grouped_mm offsets for Inductor.
+        total_tokens = selected_experts_indices.numel()
+        num_tokens_per_expert = torch.full(
+            (num_experts,),
+            total_tokens // num_experts,
+            device=x.device,
+            dtype=torch.int32,
+        )
+    else:
+        # num_tokens_per_expert = torch.ops.autoparallel.batched_histc(
+        num_tokens_per_expert = torch.histc(
+            selected_experts_indices.flatten(),
+            bins=num_experts,
+            min=0,
+            max=num_experts,
+        )
 
     # total_tokens_per_expert = all_reduce(num_tokens_per_expert, axis_name)
     total_tokens_per_expert = num_tokens_per_expert
