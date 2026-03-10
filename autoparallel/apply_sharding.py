@@ -5,7 +5,9 @@
 
 import contextlib
 import copy
+import logging
 import operator
+import time
 from typing import Any
 
 import torch
@@ -31,6 +33,8 @@ from .shardings.ordered_sharding import (
 from .shardings.propagation_rules import TENSOR_FACTORY_OPS
 
 _ENABLE_ORDERED_SHARDING_OPTIMIZATION = True
+
+logger = logging.getLogger(__name__)
 
 
 class ApplyShardingInterpreter(torch.fx.Interpreter):
@@ -302,25 +306,34 @@ def _get_inductor_decomp_table():
 
 
 def apply_sharding_to_model(gm, sharding_placement, params_spec, buffers_spec):
+    t0 = time.perf_counter()
     args = shard_nodes_given_placements(gm, sharding_placement)
     local_args = [arg.to_local() for arg in args]
+    t1 = time.perf_counter()
 
     decomp_table = _get_inductor_decomp_table()
     # run with DTensor to apply the collectives given the graph
     interp = ApplyShardingInterpreter(gm, sharding_placement)
+    t2 = time.perf_counter()
 
     # TODO: make_fx here is suspicious in case of dynamic shapes
     # here we update sharding_placement if device order get muted
     with fx_traceback.preserve_node_meta():
         parallel_gm0 = make_fx(interp.run)(*local_args)
+    t3 = time.perf_counter()
 
     cleanup_graph(parallel_gm0)
+    t4 = time.perf_counter()
+
     interp2 = torch.fx.Interpreter(parallel_gm0)
     with fx_traceback.preserve_node_meta():
         parallel_gm = make_fx(interp2.run, decomposition_table=decomp_table)(
             *local_args
         )
+    t5 = time.perf_counter()
+
     cleanup_graph(parallel_gm)
+    t6 = time.perf_counter()
 
     # Copy descriptors over to new graph
     for n1, n2 in zip(
@@ -335,6 +348,7 @@ def apply_sharding_to_model(gm, sharding_placement, params_spec, buffers_spec):
             rename_placeholder_node(parallel_gm, n2, n1.name)
     # need to recompile after renaming nodes
     parallel_gm.recompile()
+    t7 = time.perf_counter()
 
     sharded_param_dict = {}
     sharded_buffer_dict = {}
@@ -359,5 +373,21 @@ def apply_sharding_to_model(gm, sharding_placement, params_spec, buffers_spec):
         sharded_buffer_dict[fqn] = shard_node_given_placements(
             n, sharding_placement, meta=True
         )
+    t8 = time.perf_counter()
+
+    logger.info(
+        "apply_sharding_to_model breakdown: "
+        "shard_inputs=%.3fs, interp_init=%.3fs, make_fx_1=%.3fs, "
+        "cleanup_1=%.3fs, make_fx_2=%.3fs, cleanup_2=%.3fs, "
+        "rename=%.3fs, shard_params=%.3fs",
+        t1 - t0,
+        t2 - t1,
+        t3 - t2,
+        t4 - t3,
+        t5 - t4,
+        t6 - t5,
+        t7 - t6,
+        t8 - t7,
+    )
 
     return parallel_gm, sharded_param_dict, sharded_buffer_dict
