@@ -234,6 +234,7 @@ def solve_ilp(problem: OverlapProblem) -> Schedule:
 def solve_greedy(
     problem: OverlapProblem,
     memory_budget_bytes: int | None = None,
+    max_comm_ahead: int | None = None,
 ) -> Schedule:
     """
     ASAP greedy scheduler with ALAP-priority tie-breaking.
@@ -241,6 +242,18 @@ def solve_greedy(
     Simulates concurrent stream execution.  At each step picks the op
     that can start earliest, breaking ties by urgency (lowest ALAP = most
     urgent).  Optionally respects a memory budget.
+
+    Among comm ops with the same start time, "completion" comms (reduce-
+    scatters — leaf comm ops with no consumers) are preferred over
+    "prefetch" comms (all-gathers — comm ops with downstream consumers).
+    This naturally interleaves AGs and RSs when they compete for the same
+    comm stream.
+
+    max_comm_ahead (optional) explicitly limits how many prefetch comms
+    can be scheduled ahead of completion comms.  When the limit is
+    reached, prefetch comms are blocked until a completion comm runs.
+    Only active when the problem contains both prefetch and completion
+    comms (e.g. backward pass); forward-only graphs are unaffected.
     """
     alap = compute_alap(problem)
     n = problem.n
@@ -258,9 +271,41 @@ def solve_greedy(
     current_memory = 0
     remaining_consumers = [len(problem.successors(i)) for i in range(n)]
 
+    def _net_memory_delta(op_id: int) -> int:
+        """Memory change from scheduling op: output allocated, consumed predecessors freed."""
+        delta = problem.ops[op_id].memory_bytes
+        for p in problem.predecessors(op_id):
+            if remaining_consumers[p] == 1:  # this op is the last consumer
+                delta -= problem.ops[p].memory_bytes
+        return delta
+
+    def _is_comm_prefetch(op_id: int) -> bool:
+        return (
+            problem.ops[op_id].stream != COMPUTE_STREAM
+            and remaining_consumers[op_id] > 0
+        )
+
+    def _is_comm_completion(op_id: int) -> bool:
+        return (
+            problem.ops[op_id].stream != COMPUTE_STREAM
+            and remaining_consumers[op_id] == 0
+        )
+
+    # Disable max_comm_ahead for graphs without completion comms (e.g.
+    # forward pass has all-gathers but no reduce-scatters).
+    if max_comm_ahead is not None:
+        has_any_completion_comm = any(
+            problem.ops[i].stream != COMPUTE_STREAM and len(problem.successors(i)) == 0
+            for i in range(n)
+        )
+        if not has_any_completion_comm:
+            max_comm_ahead = None
+
+    comm_balance = 0
+
     while ready:
         best_op: int | None = None
-        best_key = (float("inf"), float("inf"))
+        best_key = (float("inf"), True, True, float("inf"))
 
         for op_id in ready:
             op = problem.ops[op_id]
@@ -271,17 +316,35 @@ def solve_greedy(
             start = max(stream_avail[op.stream], pred_done)
 
             if memory_budget_bytes is not None:
-                if current_memory + op.memory_bytes > memory_budget_bytes:
+                delta = _net_memory_delta(op_id)
+                if delta > 0 and current_memory + delta > memory_budget_bytes:
                     continue
 
-            key = (start, alap[op_id])
+            # Block AG prefetches when too far ahead of RSs.
+            if (
+                max_comm_ahead is not None
+                and _is_comm_prefetch(op_id)
+                and comm_balance >= max_comm_ahead
+            ):
+                continue
+
+            # Sort key: earliest start, then comm before compute, then
+            # completion comms (RSs) before prefetch comms (AGs), then ALAP.
+            is_prefetch = _is_comm_prefetch(op_id)
+            key = (start, op.stream == COMPUTE_STREAM, is_prefetch, alap[op_id])
             if key < best_key:
                 best_key = key
                 best_op = op_id
 
-        # If everything exceeds memory, force the most urgent op
         if best_op is None:
-            best_op = min(ready, key=lambda i: alap[i])
+            # All ready ops blocked by budget or comm balance.  Prefer
+            # compute ops: they sit on the critical path and will eventually
+            # unlock reduce-scatters that free memory.
+            compute_ready = [
+                i for i in ready if problem.ops[i].stream == COMPUTE_STREAM
+            ]
+            pool = compute_ready or list(ready)
+            best_op = min(pool, key=lambda i: alap[i])
 
         op = problem.ops[best_op]
         pred_done = max(
@@ -294,6 +357,12 @@ def solve_greedy(
         completion[best_op] = end
         stream_avail[op.stream] = end
         ready.remove(best_op)
+
+        # Update comm balance
+        if _is_comm_prefetch(best_op):
+            comm_balance += 1
+        elif _is_comm_completion(best_op):
+            comm_balance -= 1
 
         current_memory += op.memory_bytes
         for p in problem.predecessors(best_op):
@@ -468,6 +537,7 @@ def reorder_for_overlap(
     classify: Callable[[fx.Node], NodeInfo],
     solver: str = "greedy",
     memory_budget_bytes: int | None = None,
+    max_comm_ahead: int | None = None,
 ) -> Schedule:
     """
     Full pipeline: build problem from FX graph, solve, and reorder in place.
@@ -478,6 +548,10 @@ def reorder_for_overlap(
     if solver == "ilp":
         schedule = solve_ilp(problem)
     else:
-        schedule = solve_greedy(problem, memory_budget_bytes=memory_budget_bytes)
+        schedule = solve_greedy(
+            problem,
+            memory_budget_bytes=memory_budget_bytes,
+            max_comm_ahead=max_comm_ahead,
+        )
     apply_schedule(graph, schedule, problem, op_to_node, node_to_op)
     return schedule

@@ -145,12 +145,17 @@ class overlap_scheduling_config:
     - solver: "greedy" (fast, memory-aware) or "ilp" (optimal via PuLP/CBC)
     - save_trace: write Perfetto-compatible before/after traces
     - custom_runtime_estimation: callable(node) -> cost in microseconds
+    - max_comm_ahead: max all-gathers that can be scheduled ahead of
+      reduce-scatters.  Controls interleaving of prefetches and reductions
+      on the comm stream.  AGs are only blocked when an RS is ready to
+      run, so the comm stream never goes idle unnecessarily.
     """
 
     solver = "greedy"
     save_trace = True
     custom_runtime_estimation = None
     memory_budget_bytes = None
+    max_comm_ahead = None
     _counter = 0
 
 
@@ -216,6 +221,7 @@ def overlap_scheduling_reordering_pass(
         classify,
         solver=configs.solver,
         memory_budget_bytes=configs.memory_budget_bytes,
+        max_comm_ahead=configs.max_comm_ahead,
     )
     print(f"Reordering took {time.time() - t:.2f} seconds")
     gm.recompile()

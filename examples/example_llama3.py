@@ -33,7 +33,7 @@ torch.distributed.init_process_group(
     "fake", store=fake_store, rank=0, world_size=world_size
 )
 
-use_1d_mesh = False
+use_1d_mesh = True  # False
 
 if use_1d_mesh:
     mesh = torch.distributed.device_mesh.init_device_mesh(
@@ -121,7 +121,7 @@ elif autobucketing_level == "overlap":
         make_custom_runtime_estimation(mesh)
     )
     overlap_scheduling_config.solver = "greedy"
-    overlap_scheduling_config.memory_budget_bytes = 2 * 1024**3  # 2 GB
+    overlap_scheduling_config.max_comm_ahead = 2
     torch._inductor.config.reorder_for_peak_memory = False
     torch._inductor.config.reorder_for_compute_comm_overlap = False
     overlap_pass = partial(
@@ -130,10 +130,12 @@ elif autobucketing_level == "overlap":
     )
 
     def post_grad_pass(graph):
+        metrics = estimate_graph_metrics(graph.owning_module, custom_runtime_estimation)
+        print("Before overlap", metrics)
         overlap_pass(graph)
         gm = graph.owning_module
         metrics = estimate_graph_metrics(gm, custom_runtime_estimation)
-        print(metrics)
+        print("After overlap", metrics)
         return gm
 
     torch._inductor.config.post_grad_custom_post_pass = post_grad_pass
