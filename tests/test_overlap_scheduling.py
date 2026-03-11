@@ -35,19 +35,35 @@ _WAIT = torch.ops._c10d_functional.wait_tensor.default
 def _validate_schedule(problem, schedule):
     """Check that start times respect all DAG and stream constraints."""
     st = schedule.start_times
-    # DAG precedence
+    ct = schedule.completion_times
+    # DAG precedence: successor can't start until predecessor completes
     for u in range(problem.n):
         for v in problem.successors(u):
-            assert st[v] >= st[u] + problem.ops[u].duration_ms - 1e-6, (
-                f"DAG violation: op {u} (end={st[u]+problem.ops[u].duration_ms}) "
+            assert ct[u] <= st[v] + 1e-6, (
+                f"DAG violation: op {u} (completion={ct[u]}) "
                 f"-> op {v} (start={st[v]})"
             )
-    # Stream serialization: no two ops on the same stream overlap
+    # Stream serialization: no two ops on the same stream overlap.
+    # For comm ops the execution interval on the comm stream is
+    # [completion - duration, completion], since the comm may be queued
+    # after dispatch.
     for stream in problem.streams():
         ids = problem.ops_on_stream(stream)
-        intervals = sorted(
-            [(st[i], st[i] + problem.ops[i].duration_ms, i) for i in ids]
-        )
+        if stream == COMPUTE_STREAM:
+            intervals = sorted(
+                [(st[i], st[i] + problem.ops[i].duration_ms, i) for i in ids]
+            )
+        else:
+            intervals = sorted(
+                [
+                    (
+                        ct[i] - problem.ops[i].duration_ms,
+                        ct[i],
+                        i,
+                    )
+                    for i in ids
+                ]
+            )
         for j in range(len(intervals) - 1):
             end_j = intervals[j][1]
             start_next = intervals[j + 1][0]
@@ -217,12 +233,12 @@ def test_greedy_memory_budget():
          \\-> ag2(3, mem=100) -> c3
          \\-> c1(2) -> c2(2) -> c3
 
-    Without memory limit: both ags launch at t=1, overlap with c1+c2.
-    ag1 and ag2 finish at t=4, c2 finishes at t=5, makespan = 6.
+    Without memory limit: both ags launch at t=1, serialize on pg0
+    (1-4, 4-7), compute c1+c2 runs 1-5, c3 waits for ag2 at t=7.
+    Makespan = 8.
 
     With memory budget = 150 (can only have one ag in flight):
-    must serialize the ags, total comm = 6ms on pg0.
-    c1+c2 = 4ms on compute. Makespan = 1 + max(6, 4) + 1 = 8.
+    ag2 is deferred until budget allows, makespan increases.
     """
     p = OverlapProblem()
     c0 = p.add_op("c0", COMPUTE_STREAM, 1.0)
@@ -240,7 +256,7 @@ def test_greedy_memory_budget():
     p.add_dep(ag2, c3)
     p.add_dep(c2, c3)
 
-    # No memory limit: both ags overlap with compute
+    # No memory limit (solve_greedy called directly): both ags overlap with compute
     sched = solve_greedy(p)
     _validate_schedule(p, sched)
     assert (

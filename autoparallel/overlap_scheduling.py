@@ -38,6 +38,7 @@ import torch.fx as fx
 # ---------------------------------------------------------------------------
 
 COMPUTE_STREAM = "compute"
+LAUNCH_OVERHEAD = 0.0
 
 
 @dataclass
@@ -98,6 +99,7 @@ class OverlapProblem:
 @dataclass
 class Schedule:
     start_times: dict[int, float]
+    completion_times: dict[int, float]
     makespan: float
 
     def order(self) -> list[int]:
@@ -157,6 +159,47 @@ def critical_path_length(problem: OverlapProblem) -> float:
     """Lower bound on makespan: longest weighted path through the DAG."""
     asap = compute_asap(problem)
     return max(asap[i] + problem.ops[i].duration_ms for i in range(problem.n))
+
+
+def topo_peak_memory(problem: OverlapProblem) -> int:
+    """Peak memory when ops run in topological order (no overlap).
+
+    Uses the same liveness model as solve_greedy: each op's output occupies
+    memory_bytes from when it runs until its last consumer runs.
+    """
+    order = topo_sort(problem)
+    remaining = [len(problem.successors(i)) for i in range(problem.n)]
+    current = 0
+    peak = 0
+    for i in order:
+        current += problem.ops[i].memory_bytes
+        peak = max(peak, current)
+        for p in problem.predecessors(i):
+            remaining[p] -= 1
+            if remaining[p] == 0:
+                current -= problem.ops[p].memory_bytes
+    return peak
+
+
+def graph_order_peak_memory(problem: OverlapProblem) -> int:
+    """Peak memory when ops run in their original graph order (by op id).
+
+    Since build_overlap_problem adds ops in FX graph node order, iterating
+    by op id reproduces the original (unoptimized) schedule's memory profile.
+    This gives a tighter bound than topo_peak_memory when many ops (e.g.
+    backward all-gathers) have no predecessors in the problem.
+    """
+    remaining = [len(problem.successors(i)) for i in range(problem.n)]
+    current = 0
+    peak = 0
+    for i in range(problem.n):
+        current += problem.ops[i].memory_bytes
+        peak = max(peak, current)
+        for p in problem.predecessors(i):
+            remaining[p] -= 1
+            if remaining[p] == 0:
+                current -= problem.ops[p].memory_bytes
+    return peak
 
 
 # ---------------------------------------------------------------------------
@@ -223,7 +266,14 @@ def solve_ilp(problem: OverlapProblem) -> Schedule:
     assert lp.status == pulp.constants.LpStatusOptimal
 
     start_times = {i: pulp.value(t[i]) for i in range(n)}
-    return Schedule(start_times=start_times, makespan=pulp.value(T))
+    completion_times = {
+        i: start_times[i] + problem.ops[i].duration_ms for i in range(n)
+    }
+    return Schedule(
+        start_times=start_times,
+        completion_times=completion_times,
+        makespan=pulp.value(T),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -234,26 +284,31 @@ def solve_ilp(problem: OverlapProblem) -> Schedule:
 def solve_greedy(
     problem: OverlapProblem,
     memory_budget_bytes: int | None = None,
-    max_comm_ahead: int | None = None,
+    max_in_flight: int | None = 2,
 ) -> Schedule:
     """
-    ASAP greedy scheduler with ALAP-priority tie-breaking.
+    ASAP greedy scheduler with dispatch-aware timing model.
 
-    Simulates concurrent stream execution.  At each step picks the op
-    that can start earliest, breaking ties by urgency (lowest ALAP = most
-    urgent).  Optionally respects a memory budget.
+    Models the FX execution model where the compute stream sequentially
+    dispatches every op:
+    - Compute ops block the compute stream for their full duration.
+    - Comm ops block the compute stream for only LAUNCH_OVERHEAD, then
+      run asynchronously on their comm stream.
+    - Predecessors are considered done at their completion time (which
+      for comm ops may be later than dispatch + LAUNCH_OVERHEAD).
 
-    Among comm ops with the same start time, "completion" comms (reduce-
-    scatters — leaf comm ops with no consumers) are preferred over
-    "prefetch" comms (all-gathers — comm ops with downstream consumers).
-    This naturally interleaves AGs and RSs when they compete for the same
-    comm stream.
+    The sort key picks the op with earliest dispatch time (ties broken by
+    comm-before-compute, then lowest ALAP).  start_times stores the actual
+    comm stream start for comm ops (not dispatch time), so apply_schedule
+    sees distinct timestamps that naturally interleave comms with compute.
 
-    max_comm_ahead (optional) explicitly limits how many prefetch comms
-    can be scheduled ahead of completion comms.  When the limit is
-    reached, prefetch comms are blocked until a completion comm runs.
-    Only active when the problem contains both prefetch and completion
-    comms (e.g. backward pass); forward-only graphs are unaffected.
+    max_in_flight limits, per comm stream, how many dispatched comms can
+    have unconsumed results (remaining_consumers > 0).  Leaf comms (e.g.
+    reduce-scatters with no downstream consumers) don't count toward this
+    limit.  This naturally interleaves prefetches with compute: when the
+    limit is reached, compute ops run first, consuming earlier comm results
+    and making room for new prefetches.  Default is 2 (one in progress +
+    one prefetched ahead).
     """
     alap = compute_alap(problem)
     n = problem.n
@@ -265,11 +320,16 @@ def solve_greedy(
 
     ready: set[int] = {i for i in range(n) if in_deg[i] == 0}
     completion: dict[int, float] = {}
-    stream_avail: dict[str, float] = defaultdict(float)
+    start_times: dict[int, float] = {}
+    compute_time: float = 0.0
+    comm_avail: dict[str, float] = defaultdict(float)
 
     # Memory tracking: each op's output is live until its last consumer runs
     current_memory = 0
     remaining_consumers = [len(problem.successors(i)) for i in range(n)]
+
+    # In-flight comm tracking: comms dispatched but not yet fully consumed
+    in_flight: dict[str, int] = defaultdict(int)
 
     def _net_memory_delta(op_id: int) -> int:
         """Memory change from scheduling op: output allocated, consumed predecessors freed."""
@@ -279,33 +339,9 @@ def solve_greedy(
                 delta -= problem.ops[p].memory_bytes
         return delta
 
-    def _is_comm_prefetch(op_id: int) -> bool:
-        return (
-            problem.ops[op_id].stream != COMPUTE_STREAM
-            and remaining_consumers[op_id] > 0
-        )
-
-    def _is_comm_completion(op_id: int) -> bool:
-        return (
-            problem.ops[op_id].stream != COMPUTE_STREAM
-            and remaining_consumers[op_id] == 0
-        )
-
-    # Disable max_comm_ahead for graphs without completion comms (e.g.
-    # forward pass has all-gathers but no reduce-scatters).
-    if max_comm_ahead is not None:
-        has_any_completion_comm = any(
-            problem.ops[i].stream != COMPUTE_STREAM and len(problem.successors(i)) == 0
-            for i in range(n)
-        )
-        if not has_any_completion_comm:
-            max_comm_ahead = None
-
-    comm_balance = 0
-
     while ready:
         best_op: int | None = None
-        best_key = (float("inf"), True, True, float("inf"))
+        best_key = (float("inf"), True, float("inf"))
 
         for op_id in ready:
             op = problem.ops[op_id]
@@ -313,33 +349,31 @@ def solve_greedy(
                 (completion[p] for p in problem.predecessors(op_id)),
                 default=0.0,
             )
-            start = max(stream_avail[op.stream], pred_done)
+            start = max(compute_time, pred_done)
 
             if memory_budget_bytes is not None:
                 delta = _net_memory_delta(op_id)
                 if delta > 0 and current_memory + delta > memory_budget_bytes:
                     continue
 
-            # Block AG prefetches when too far ahead of RSs.
+            # Block non-leaf comms when too many are in-flight on this stream
             if (
-                max_comm_ahead is not None
-                and _is_comm_prefetch(op_id)
-                and comm_balance >= max_comm_ahead
+                max_in_flight is not None
+                and op.stream != COMPUTE_STREAM
+                and remaining_consumers[op_id] > 0  # leaf comms always allowed
+                and in_flight[op.stream] >= max_in_flight
             ):
                 continue
 
-            # Sort key: earliest start, then comm before compute, then
-            # completion comms (RSs) before prefetch comms (AGs), then ALAP.
-            is_prefetch = _is_comm_prefetch(op_id)
-            key = (start, op.stream == COMPUTE_STREAM, is_prefetch, alap[op_id])
+            key = (start, op.stream == COMPUTE_STREAM, alap[op_id])
             if key < best_key:
                 best_key = key
                 best_op = op_id
 
         if best_op is None:
-            # All ready ops blocked by budget or comm balance.  Prefer
-            # compute ops: they sit on the critical path and will eventually
-            # unlock reduce-scatters that free memory.
+            # All ready ops blocked by budget or in-flight limit.  Prefer
+            # compute ops: they sit on the critical path and will consume
+            # in-flight comms, making room for new prefetches.
             compute_ready = [
                 i for i in ready if problem.ops[i].stream == COMPUTE_STREAM
             ]
@@ -351,32 +385,43 @@ def solve_greedy(
             (completion[p] for p in problem.predecessors(best_op)),
             default=0.0,
         )
-        start = max(stream_avail[op.stream], pred_done)
-        end = start + op.duration_ms
 
-        completion[best_op] = end
-        stream_avail[op.stream] = end
+        if op.stream == COMPUTE_STREAM:
+            start = max(compute_time, pred_done)
+            compute_time = start + op.duration_ms
+            start_times[best_op] = start
+            completion[best_op] = start + op.duration_ms
+        else:
+            dispatch = max(compute_time, pred_done)
+            comm_start = max(dispatch, comm_avail[op.stream])
+            comm_end = comm_start + op.duration_ms
+            compute_time = dispatch + LAUNCH_OVERHEAD
+            comm_avail[op.stream] = comm_end
+            start_times[best_op] = comm_start
+            completion[best_op] = comm_end
+            if remaining_consumers[best_op] > 0:
+                in_flight[op.stream] += 1
+
         ready.remove(best_op)
-
-        # Update comm balance
-        if _is_comm_prefetch(best_op):
-            comm_balance += 1
-        elif _is_comm_completion(best_op):
-            comm_balance -= 1
 
         current_memory += op.memory_bytes
         for p in problem.predecessors(best_op):
             remaining_consumers[p] -= 1
             if remaining_consumers[p] == 0:
                 current_memory -= problem.ops[p].memory_bytes
+                if problem.ops[p].stream != COMPUTE_STREAM:
+                    in_flight[problem.ops[p].stream] -= 1
 
         for s in problem.successors(best_op):
             in_deg[s] -= 1
             if in_deg[s] == 0:
                 ready.add(s)
 
-    start_times = {i: completion[i] - problem.ops[i].duration_ms for i in range(n)}
-    return Schedule(start_times=start_times, makespan=max(completion.values()))
+    return Schedule(
+        start_times=start_times,
+        completion_times=completion,
+        makespan=max(completion.values()),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -472,36 +517,72 @@ def apply_schedule(
 
     Uses priority-based topological sort to guarantee all FX edges are
     respected while matching schedule start times as closely as possible.
-    Comm start nodes are placed at the collective's start time; wait nodes
-    are placed at the collective's completion time (start + duration).
+
+    Sort key is a 4-tuple: (time, node_type, tiebreaker, original_order).
+    node_type separates comm starts (0) from compute (1) from waits (2)
+    so that at the same dispatch time, comms are launched before compute.
+    For comm starts, the tiebreaker is completion_times which reflects the
+    solver's intended comm stream order — crucial when multiple comms share
+    the same dispatch time (LAUNCH_OVERHEAD ≈ 0).
     """
     original_order = {node: i for i, node in enumerate(graph.nodes)}
 
-    sort_key: dict[fx.Node, tuple[float, int]] = {}
+    sort_key: dict[fx.Node, tuple[float, int, float, int]] = {}
     for node in graph.nodes:
         if node.op == "placeholder":
-            sort_key[node] = (float("-inf"), original_order[node])
+            sort_key[node] = (float("-inf"), 0, 0.0, original_order[node])
         elif node.op == "output":
-            sort_key[node] = (float("inf"), original_order[node])
+            sort_key[node] = (float("inf"), 0, 0.0, original_order[node])
         elif node in node_to_op:
             op_id = node_to_op[node]
             if op_to_node.get(op_id) is node:
-                # Canonical node (compute, comm start, other)
-                sort_key[node] = (
-                    schedule.start_times[op_id],
-                    original_order[node],
-                )
+                op = problem.ops[op_id]
+                if op.stream != COMPUTE_STREAM:
+                    # Comm start: dispatch time as primary, completion
+                    # as tiebreaker so same-dispatch-time comms appear
+                    # in the solver's intended comm stream order.
+                    sort_key[node] = (
+                        schedule.start_times[op_id],
+                        0,
+                        schedule.completion_times[op_id],
+                        original_order[node],
+                    )
+                else:
+                    sort_key[node] = (
+                        schedule.start_times[op_id],
+                        1,
+                        0.0,
+                        original_order[node],
+                    )
             else:
-                # Wait node: place at collective's completion time
-                completion = (
-                    schedule.start_times[op_id] + problem.ops[op_id].duration_ms
-                )
-                sort_key[node] = (completion, original_order[node])
+                # Wait node: defer after same-time ops so comm launches
+                # and compute run before waits block the compute stream.
+                if len(problem.successors(op_id)) == 0:
+                    # Leaf comm (e.g. reduce-scatter in backward): no
+                    # downstream compute needs this result.  Push to end.
+                    sort_key[node] = (
+                        schedule.makespan,
+                        2,
+                        0.0,
+                        original_order[node],
+                    )
+                else:
+                    sort_key[node] = (
+                        schedule.completion_times[op_id],
+                        2,
+                        0.0,
+                        original_order[node],
+                    )
         else:
             # Node not in the problem (SKIP'd get_attr, etc.): keep near
             # original position using a small scaled value so it sorts
             # early but after placeholders.
-            sort_key[node] = (original_order[node] * 1e-9, original_order[node])
+            sort_key[node] = (
+                original_order[node] * 1e-9,
+                0,
+                0.0,
+                original_order[node],
+            )
 
     # Priority-based Kahn's topological sort: respects all FX edges while
     # scheduling nodes in sort_key order when unconstrained.
@@ -509,7 +590,7 @@ def apply_schedule(
     for node in graph.nodes:
         in_degree[node] = len(node.all_input_nodes)
 
-    heap: list[tuple[tuple[float, int], int, fx.Node]] = []
+    heap: list[tuple[tuple[float, int, float, int], int, fx.Node]] = []
     for node in graph.nodes:
         if in_degree[node] == 0:
             heapq.heappush(heap, (sort_key[node], id(node), node))
@@ -537,7 +618,7 @@ def reorder_for_overlap(
     classify: Callable[[fx.Node], NodeInfo],
     solver: str = "greedy",
     memory_budget_bytes: int | None = None,
-    max_comm_ahead: int | None = None,
+    max_in_flight: int | None = 2,
 ) -> Schedule:
     """
     Full pipeline: build problem from FX graph, solve, and reorder in place.
@@ -551,7 +632,7 @@ def reorder_for_overlap(
         schedule = solve_greedy(
             problem,
             memory_budget_bytes=memory_budget_bytes,
-            max_comm_ahead=max_comm_ahead,
+            max_in_flight=max_in_flight,
         )
     apply_schedule(graph, schedule, problem, op_to_node, node_to_op)
     return schedule
