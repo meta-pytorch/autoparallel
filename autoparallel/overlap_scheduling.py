@@ -32,6 +32,7 @@ from typing import Callable
 
 import pulp
 import torch.fx as fx
+from torch._inductor.fx_passes.memory_estimator import MemoryTracker
 
 # ---------------------------------------------------------------------------
 # Problem formulation
@@ -152,6 +153,91 @@ def compute_alap(problem: OverlapProblem) -> dict[int, float]:
             default=horizon,
         )
         alap[u] = latest - problem.ops[u].duration_ms
+    return alap
+
+
+def _compute_contention_aware_alap(problem: OverlapProblem) -> dict[int, float]:
+    """ALAP with stream contention modeling.
+
+    Standard compute_alap ignores stream serialization, so all ops on a
+    comm stream get the same ALAP regardless of queuing.  This version:
+    1. Runs a contention-aware forward simulation (ASAP with per-stream
+       serialization) to determine realistic completion times and the
+       stream serialization order.
+    2. Propagates ALAP backward through both DAG edges and stream
+       serialization edges.
+
+    This gives leaf comms (reduce-scatters with no downstream compute)
+    realistic ALAP values based on their position in the comm stream
+    queue, rather than the artificially late `horizon` value.  Their
+    predecessors (gradient matmuls) inherit tighter deadlines.
+    """
+    n = problem.n
+
+    # Forward pass: ASAP with stream serialization
+    in_deg = [0] * n
+    for i in range(n):
+        for j in problem.successors(i):
+            in_deg[j] += 1
+
+    ready: set[int] = {i for i in range(n) if in_deg[i] == 0}
+    completion: dict[int, float] = {}
+    stream_avail: dict[str, float] = defaultdict(float)
+    stream_order: dict[str, list[int]] = defaultdict(list)
+    forward_order: list[int] = []
+
+    while ready:
+        best: int | None = None
+        best_key = (float("inf"), True, float("inf"))
+        for op_id in ready:
+            op = problem.ops[op_id]
+            pred_done = max(
+                (completion[p] for p in problem.predecessors(op_id)),
+                default=0.0,
+            )
+            start = max(pred_done, stream_avail[op.stream])
+            key = (start, op.stream == COMPUTE_STREAM, op_id)
+            if key < best_key:
+                best_key = key
+                best = op_id
+
+        assert best is not None
+        op = problem.ops[best]
+        start = best_key[0]
+        completion[best] = start + op.duration_ms
+        stream_avail[op.stream] = completion[best]
+        stream_order[op.stream].append(best)
+        forward_order.append(best)
+        ready.remove(best)
+
+        for v in problem.successors(best):
+            in_deg[v] -= 1
+            if in_deg[v] == 0:
+                ready.add(v)
+
+    horizon = max(completion.values()) if completion else 0.0
+
+    # Stream serialization: next op on the same stream
+    stream_next: dict[int, int] = {}
+    for order in stream_order.values():
+        for i in range(len(order) - 1):
+            stream_next[order[i]] = order[i + 1]
+
+    # Backward pass: ALAP with DAG + serialization edges.
+    # Process in reverse forward order so that both DAG successors and
+    # stream serialization successors have already been computed.
+    alap: dict[int, float] = {}
+    for u in reversed(forward_order):
+        dag_latest = min(
+            (alap[s] for s in problem.successors(u)),
+            default=horizon,
+        )
+        if u in stream_next:
+            latest = min(dag_latest, alap[stream_next[u]])
+        else:
+            latest = dag_latest
+        alap[u] = latest - problem.ops[u].duration_ms
+
     return alap
 
 
@@ -695,28 +781,34 @@ def apply_schedule(
     graph.lint()
 
 
-def _compute_fx_base_peak(
-    graph: fx.Graph,
-    node_info: dict[fx.Node, NodeInfo],
-) -> int:
-    """Peak memory when FX nodes run in their original graph order."""
-    fx_remaining = {node: len(node.users) for node in graph.nodes}
-    current = 0
-    peak = 0
-    for node in graph.nodes:
-        current += node_info[node].memory_bytes
-        peak = max(peak, current)
-        for inp in node.all_input_nodes:
-            fx_remaining[inp] -= 1
-            if fx_remaining[inp] == 0:
-                current -= node_info[inp].memory_bytes
-    return peak
+def _predict_mem_delta(node: fx.Node, tracker: MemoryTracker) -> int:
+    """Predict net memory change from scheduling node on tracker.
+
+    Computes fresh storage allocations minus storages freed (because all
+    their consumers would be scheduled after this node).  This gives the
+    actual storage-level delta that MemoryTracker.schedule_node would
+    apply, without mutating state.
+    """
+    alias = tracker.alias_tracker
+    delta = 0
+    for sk in alias.get_fresh_allocations(node):
+        if tracker.device_filter(sk.device) and sk not in tracker.current_live_storages:
+            delta += tracker._get_storage_size(sk)
+    for sk in alias.get_storage_uses(node):
+        if not tracker.device_filter(sk.device):
+            continue
+        if sk not in tracker.current_live_storages:
+            continue
+        if not tracker.is_releasable(alias.storage_to_allocator[sk]):
+            continue
+        if all(u in tracker.scheduled or u is node for u in alias.storage_to_uses[sk]):
+            delta -= tracker._get_storage_size(sk)
+    return delta
 
 
 def _greedy_reorder(
     graph: fx.Graph,
     classify: Callable[[fx.Node], NodeInfo],
-    max_in_flight: int | None = 2,
     memory_headroom_fraction: float = 0.0,
 ) -> Schedule:
     """Unified greedy scheduler that directly produces FX node order.
@@ -728,6 +820,13 @@ def _greedy_reorder(
     graph order, but allow an ALAP-preferred candidate when memory stays
     within a configurable headroom.  This naturally handles comm-prep/post
     ops (tiny memory, always pass the budget check).
+
+    Comm dispatches are gated by in-flight bytes: tracks the total bytes
+    of non-leaf comm outputs that have been dispatched but not yet fully
+    consumed (all wait consumers scheduled).  The budget is
+    memory_headroom_fraction * base_peak.  This provides back-pressure:
+    when the budget is exhausted, compute must consume pending comm
+    results before new comms can be dispatched.
     """
     # Classify all nodes upfront
     node_info: dict[fx.Node, NodeInfo] = {}
@@ -742,9 +841,9 @@ def _greedy_reorder(
 
     original_order: dict[fx.Node, int] = {node: i for i, node in enumerate(graph.nodes)}
 
-    # Compute ALAP on abstract problem for priority
+    # Compute contention-aware ALAP on abstract problem for priority
     problem, op_to_node, node_to_op = build_overlap_problem(graph, classify)
-    alap = compute_alap(problem)
+    alap = _compute_contention_aware_alap(problem)
     alap_priority: dict[fx.Node, float] = {}
     for node in graph.nodes:
         if node in node_to_op:
@@ -752,28 +851,54 @@ def _greedy_reorder(
         else:
             alap_priority[node] = float("inf")
 
-    # In-flight tracking: for each comm start, count non-output FX users
-    # of its wait node (abstract successors in the dissolved-wait model)
-    abstract_remaining: dict[fx.Node, int] = {}
+    # Leaf comm detection: comms whose wait has no non-output consumers.
+    # Their waits are deferred to the end since no downstream compute
+    # needs the result.
+    is_leaf_comm: dict[fx.Node, bool] = {}
     for wait, start in wait_to_start.items():
-        count = sum(1 for u in wait.users if u.op != "output")
-        abstract_remaining.setdefault(start, 0)
-        abstract_remaining[start] += count
+        has_consumers = any(u.op != "output" for u in wait.users)
+        is_leaf_comm[start] = not has_consumers
 
-    # Memory budget via dry-run in original order
-    base_peak = _compute_fx_base_peak(graph, node_info)
-    memory_budget = base_peak * (1.0 + memory_headroom_fraction)
+    # Memory budget via dry-run in original order using MemoryTracker,
+    # which handles views, in-place ops, and aliased storage correctly.
+    base_tracker = MemoryTracker(graph)
+    for node in graph.nodes:
+        base_tracker.schedule_node(node)
+    base_peak = base_tracker.peak_memory
+    if base_peak == 0:
+        # No FakeTensors in meta (e.g. unit tests) — disable gating
+        memory_budget = float("inf")
+        in_flight_budget: float = float("inf")
+    else:
+        memory_budget = base_peak * (1.0 + memory_headroom_fraction)
+        in_flight_budget = memory_headroom_fraction * base_peak
+
+    # In-flight comm tracking: bytes of non-leaf comm outputs that have
+    # been dispatched but not yet fully consumed.  Provides back-pressure:
+    # comms are blocked when in_flight_bytes would exceed in_flight_budget,
+    # forcing compute to consume pending comm results before new comms
+    # are dispatched.
+    in_flight_bytes: int = 0
+    comm_remaining: dict[fx.Node, int] = {}
+    comm_output_size: dict[fx.Node, int] = {}
+    consumer_to_comms: dict[fx.Node, list[fx.Node]] = defaultdict(list)
+    for wait, start in wait_to_start.items():
+        if is_leaf_comm.get(start, False):
+            continue
+        consumers = [u for u in wait.users if u.op != "output"]
+        comm_remaining[start] = len(consumers)
+        comm_output_size[start] = node_info[start].memory_bytes
+        for consumer in consumers:
+            consumer_to_comms[consumer].append(start)
 
     # Scheduling state
     compute_time: float = 0.0
     comm_avail: dict[str, float] = defaultdict(float)
-    in_flight: dict[str, int] = defaultdict(int)
-    current_memory: int = 0
     completion: dict[fx.Node, float] = {}
     start_times_fx: dict[fx.Node, float] = {}
 
-    # FX liveness tracking for memory
-    fx_remaining: dict[fx.Node, int] = {node: len(node.users) for node in graph.nodes}
+    # MemoryTracker for runtime scheduling
+    mem_tracker = MemoryTracker(graph)
 
     # Kahn's algorithm state
     in_degree: dict[fx.Node, int] = {
@@ -788,15 +913,8 @@ def _greedy_reorder(
             default=0.0,
         )
 
-    def _net_memory_delta(node: fx.Node) -> int:
-        delta = node_info[node].memory_bytes
-        for inp in node.all_input_nodes:
-            if fx_remaining[inp] == 1:
-                delta -= node_info[inp].memory_bytes
-        return delta
-
     def _emit(node: fx.Node) -> None:
-        nonlocal current_memory, compute_time
+        nonlocal compute_time, in_flight_bytes
         ordered.append(node)
         ready.discard(node)
         info = node_info[node]
@@ -812,8 +930,8 @@ def _greedy_reorder(
             comm_avail[info.stream] = comm_end
             start_times_fx[node] = dispatch
             completion[node] = comm_end
-            if abstract_remaining.get(node, 0) > 0:
-                in_flight[info.stream] += 1
+            if node in comm_output_size:
+                in_flight_bytes += comm_output_size[node]
         elif info.kind == NodeKind.COMM_WAIT:
             start = wait_to_start[node]
             comm_done = completion[start]
@@ -827,22 +945,13 @@ def _greedy_reorder(
             start_times_fx[node] = start
             completion[node] = start + info.duration_ms
 
-        # Memory tracking
-        current_memory += info.memory_bytes
-        for inp in node.all_input_nodes:
-            fx_remaining[inp] -= 1
-            if fx_remaining[inp] == 0:
-                current_memory -= node_info[inp].memory_bytes
+        mem_tracker.schedule_node(node)
 
-        # In-flight tracking: decrement when a consumer of a wait is emitted
-        if node.op != "output":
-            for inp in node.all_input_nodes:
-                if node_info[inp].kind == NodeKind.COMM_WAIT:
-                    start = wait_to_start[inp]
-                    if abstract_remaining.get(start, 0) > 0:
-                        abstract_remaining[start] -= 1
-                        if abstract_remaining[start] == 0:
-                            in_flight[node_info[start].stream] -= 1
+        # Update in-flight bytes when comm consumers complete
+        for s in consumer_to_comms.get(node, []):
+            comm_remaining[s] -= 1
+            if comm_remaining[s] == 0:
+                in_flight_bytes -= comm_output_size[s]
 
         # Update Kahn's in-degree
         for user in node.users:
@@ -865,17 +974,14 @@ def _greedy_reorder(
                         ((float("-inf"), -1, float(original_order[node])), node)
                     )
 
-        # Comm starts
+        # Comm starts: gate by in-flight bytes budget
         for node in ready:
             info = node_info[node]
             if info.kind != NodeKind.COMM_START:
                 continue
-            if (
-                max_in_flight is not None
-                and abstract_remaining.get(node, 0) > 0
-                and in_flight[info.stream] >= max_in_flight
-            ):
-                continue
+            if node in comm_output_size:
+                if in_flight_bytes + comm_output_size[node] > in_flight_budget:
+                    continue
             pred_done = _pred_done(node)
             dispatch = max(compute_time, pred_done)
             candidates.append(((dispatch, 0, alap_priority[node]), node))
@@ -886,7 +992,7 @@ def _greedy_reorder(
             if info.kind != NodeKind.COMM_WAIT:
                 continue
             start = wait_to_start[node]
-            if abstract_remaining.get(start, 0) == 0:
+            if is_leaf_comm.get(start, False):
                 key_time = float("inf")
             else:
                 key_time = completion[start]
@@ -903,8 +1009,8 @@ def _greedy_reorder(
                 key=lambda n: (alap_priority[n], original_order[n]),
             )
             if alap_best != default:
-                delta = _net_memory_delta(alap_best)
-                if current_memory + delta <= memory_budget:
+                delta = _predict_mem_delta(alap_best, mem_tracker)
+                if mem_tracker.get_current_memory_bytes() + delta <= memory_budget:
                     chosen = alap_best
                 else:
                     chosen = default
@@ -915,7 +1021,7 @@ def _greedy_reorder(
             candidates.append(((start, 1, alap_priority[chosen]), chosen))
 
         if not candidates:
-            # All comms blocked by in-flight limit, no compute/waits ready.
+            # All comms blocked by memory budget, no compute/waits ready.
             # Force any ready node (shouldn't normally happen).
             best = min(ready, key=lambda n: alap_priority.get(n, float("inf")))
         else:
@@ -951,7 +1057,6 @@ def reorder_for_overlap(
     classify: Callable[[fx.Node], NodeInfo],
     solver: str = "greedy",
     memory_budget_bytes: int | None = None,
-    max_in_flight: int | None = 2,
     memory_headroom_fraction: float = 0.0,
 ) -> Schedule:
     """
@@ -960,7 +1065,7 @@ def reorder_for_overlap(
     Returns the Schedule for inspection.
     """
     if solver == "greedy":
-        return _greedy_reorder(graph, classify, max_in_flight, memory_headroom_fraction)
+        return _greedy_reorder(graph, classify, memory_headroom_fraction)
     # ILP path: keep existing build_problem -> solve_ilp -> apply_schedule
     problem, op_to_node, node_to_op = build_overlap_problem(graph, classify)
     schedule = solve_ilp(problem)

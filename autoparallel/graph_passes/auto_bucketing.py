@@ -145,16 +145,15 @@ class overlap_scheduling_config:
     - solver: "greedy" (fast, memory-aware) or "ilp" (optimal via PuLP/CBC)
     - save_trace: write Perfetto-compatible before/after traces
     - custom_runtime_estimation: callable(node) -> cost in microseconds
-    - max_in_flight: per comm stream, max dispatched comms with unconsumed
-      results.  Leaf comms (no downstream consumers) don't count.
-      Controls the AG/compute interleaving depth.
+    - memory_headroom_fraction: fraction of base peak memory allowed as
+      extra headroom for reordering.  Comm dispatches are gated against
+      this budget (comms whose output would exceed the budget are deferred).
     """
 
     solver = "greedy"
     save_trace = True
     custom_runtime_estimation = None
     memory_budget_bytes = None
-    max_in_flight = 2
     memory_headroom_fraction = 0.0
     _counter = 0
 
@@ -221,7 +220,6 @@ def overlap_scheduling_reordering_pass(
         classify,
         solver=configs.solver,
         memory_budget_bytes=configs.memory_budget_bytes,
-        max_in_flight=configs.max_in_flight,
         memory_headroom_fraction=configs.memory_headroom_fraction,
     )
     print(
