@@ -164,6 +164,8 @@ class ShardingOptimizer:
         self.prob = pulp.LpProblem("AutoParallel", pulp.LpMinimize)
         self.add_default_constraints()
         t3 = time.perf_counter()
+        n_unique_vars = len(set(id(v) for v in self.pulp_variables.values()))
+        n_constraints = len(self.prob.constraints)
         logger.info(
             "ILP construction took %.3fs "
             "(decision_vars=%.3fs, validate=%.3fs, constraints=%.3fs)",
@@ -171,6 +173,12 @@ class ShardingOptimizer:
             t1 - t0,
             t2 - t1,
             t3 - t2,
+        )
+        logger.info(
+            "ILP problem size: %d unique vars, %d decision vars, %d constraints",
+            n_unique_vars,
+            len(self.decision_vars),
+            n_constraints,
         )
 
     def _get_next_name(self, prefix):
@@ -681,7 +689,10 @@ class ShardingOptimizer:
         t0 = time.perf_counter()
         self._set_objective()
         self._solve(verbose)
-        logger.info("ILP solve took %.3fs", time.perf_counter() - t0)
+        obj_value = pulp.value(self.prob.objective)
+        logger.info(
+            "ILP solve took %.3fs (objective=%.4f)", time.perf_counter() - t0, obj_value
+        )
         return self._extract_and_validate_solution()
 
     # ---- Logging ----
