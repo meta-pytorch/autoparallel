@@ -749,6 +749,71 @@ def test_fx_comm_prep_reorder():
             ), f"greedy: expected 27.1ms, got {schedule.makespan}"
 
 
+def _build_comm_post_graph() -> fx.Graph:
+    """
+    Graph where a "comm post" op (reshape) sits between an RS wait and
+    the graph output, with heavy compute before the RS.
+
+    mm1(x, w) -> mm2(mm1, w) -> rs(mm2) -> wait -> reshape(wait) -> output
+
+    Original order: mm1, mm2, rs, wait, reshape
+    reshape should stay near the RS wait (not block other compute).
+    This tests the symmetric case of comm_prep: ops that consume comm
+    results and flow directly to outputs.
+    """
+    graph = fx.Graph()
+    x = graph.placeholder("x")
+    w = graph.placeholder("w")
+
+    mm1 = graph.call_function(torch.ops.aten.mm.default, (x, w))
+    mm1.name = "mm1"
+    mm2 = graph.call_function(torch.ops.aten.mm.default, (mm1, w))
+    mm2.name = "mm2"
+    rs = graph.call_function(_RS, (mm2, "sum", 2, "0"))
+    rs.name = "rs"
+    wait = graph.call_function(_WAIT, (rs,))
+    wait.name = "wait"
+    reshape = graph.call_function(torch.ops.aten.reshape.default, (wait, [-1]))
+    reshape.name = "reshape"
+    graph.output(reshape)
+    return graph
+
+
+def test_fx_comm_post_reorder():
+    """
+    Comm post ops (reshape consuming an RS wait, flowing to output)
+    should be identified as comm-adjacent and move freely.
+
+    This graph is simple (no overlap opportunity), but verifies that
+    comm-post identification works and doesn't break topological order.
+    """
+    costs = {
+        "mm1": 5.0,
+        "mm2": 5.0,
+        "rs": 4.0,
+        "reshape": 0.1,
+    }
+    classify = _make_classify(costs)
+
+    graph = _build_comm_post_graph()
+    original_names = _get_call_function_names(graph)
+    assert original_names == ["mm1", "mm2", "rs", "wait", "reshape"]
+
+    reorder_for_overlap(graph, classify, solver="greedy")
+    names = _get_call_function_names(graph)
+    _check_fx_topo_order(graph)
+
+    # Order should be preserved (no reordering opportunity here),
+    # but the key thing is it doesn't crash and topo order is valid.
+    assert names == [
+        "mm1",
+        "mm2",
+        "rs",
+        "wait",
+        "reshape",
+    ], f"unexpected reorder: {names}"
+
+
 if __name__ == "__main__":
     test_basic_overlap()
     test_multi_pg_overlap()
@@ -764,4 +829,5 @@ if __name__ == "__main__":
     test_fx_no_reorder_needed()
     test_fx_duplicate_deps()
     test_fx_comm_prep_reorder()
+    test_fx_comm_post_reorder()
     print("All tests passed.")

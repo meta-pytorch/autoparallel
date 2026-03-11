@@ -537,32 +537,49 @@ def apply_schedule(
     # that sit between SKIP'd inputs (parameters) and comm starts, with no
     # real compute in their dependency chain.  These should move freely
     # with their comms rather than being pinned to original order.
-    comm_prep: set[int] = set()
+    #
+    # Symmetrically, "comm post" ops sit between comm results and graph
+    # outputs (e.g. reshape after a reduce-scatter wait).  They should
+    # also move freely so reduce-scatter waits can be pushed later.
+    comm_adjacent: set[int] = set()
     changed = True
     while changed:
         changed = False
         for op_id in range(problem.n):
-            if op_id in comm_prep or problem.ops[op_id].stream != COMPUTE_STREAM:
+            if op_id in comm_adjacent or problem.ops[op_id].stream != COMPUTE_STREAM:
                 continue
             succs = problem.successors(op_id)
-            if len(succs) == 0:
-                continue
-            all_succs_comm = all(
-                problem.ops[s].stream != COMPUTE_STREAM or s in comm_prep for s in succs
+            preds = problem.predecessors(op_id)
+            # Comm prep: all preds are SKIP'd or already adjacent,
+            # all succs are comms or already adjacent, must have succs.
+            is_prep = (
+                len(succs) > 0
+                and all(
+                    problem.ops[s].stream != COMPUTE_STREAM or s in comm_adjacent
+                    for s in succs
+                )
+                and all(p in comm_adjacent for p in preds)
             )
-            all_preds_skip_or_prep = all(
-                p in comm_prep for p in problem.predecessors(op_id)
+            # Comm post: all succs are SKIP'd/absent or already adjacent,
+            # all preds are comms or already adjacent, must have preds.
+            is_post = (
+                len(preds) > 0
+                and all(
+                    problem.ops[p].stream != COMPUTE_STREAM or p in comm_adjacent
+                    for p in preds
+                )
+                and all(s in comm_adjacent for s in succs)
             )
-            if all_succs_comm and all_preds_skip_or_prep:
-                comm_prep.add(op_id)
+            if is_prep or is_post:
+                comm_adjacent.add(op_id)
                 changed = True
 
     # Remap compute ops: assign solver time slots in original graph order.
     # Solver time slots are monotonically increasing (compute stream is
     # serial), so mapping them to original-order compute ops preserves
     # relative order while keeping the same time scale as comm/wait keys.
-    # Comm-prep ops are excluded: they use solver start_times directly so
-    # they can move with their associated comms.
+    # Comm-adjacent ops are excluded: they use solver start_times directly
+    # so they can move with their associated comms.
     compute_entries: list[tuple[fx.Node, int]] = []
     for node in graph.nodes:
         if node in node_to_op:
@@ -570,7 +587,7 @@ def apply_schedule(
             if (
                 op_to_node.get(op_id) is node
                 and problem.ops[op_id].stream == COMPUTE_STREAM
-                and op_id not in comm_prep
+                and op_id not in comm_adjacent
             ):
                 compute_entries.append((node, op_id))
 
@@ -601,8 +618,8 @@ def apply_schedule(
                         original_order[node],
                     )
                 else:
-                    if op_id in comm_prep:
-                        # Comm prep: use solver time so it moves with its comm
+                    if op_id in comm_adjacent:
+                        # Comm-adjacent: use solver time to move with its comm
                         sort_key[node] = (
                             schedule.start_times[op_id],
                             1,
