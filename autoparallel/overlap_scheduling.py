@@ -524,8 +524,61 @@ def apply_schedule(
     For comm starts, the tiebreaker is completion_times which reflects the
     solver's intended comm stream order — crucial when multiple comms share
     the same dispatch time (LAUNCH_OVERHEAD ≈ 0).
+
+    Compute ops preserve their original relative order: the solver decides
+    time slots (where comms are inserted), but compute ops fill those slots
+    in original graph order.  This prevents the solver's ALAP-based
+    tie-breaking from reordering independent compute ops within a layer,
+    which would change tensor lifetimes and blow up peak memory.
     """
     original_order = {node: i for i, node in enumerate(graph.nodes)}
+
+    # Identify "comm prep" compute ops: trivial ops (e.g. reshape, view)
+    # that sit between SKIP'd inputs (parameters) and comm starts, with no
+    # real compute in their dependency chain.  These should move freely
+    # with their comms rather than being pinned to original order.
+    comm_prep: set[int] = set()
+    changed = True
+    while changed:
+        changed = False
+        for op_id in range(problem.n):
+            if op_id in comm_prep or problem.ops[op_id].stream != COMPUTE_STREAM:
+                continue
+            succs = problem.successors(op_id)
+            if len(succs) == 0:
+                continue
+            all_succs_comm = all(
+                problem.ops[s].stream != COMPUTE_STREAM or s in comm_prep for s in succs
+            )
+            all_preds_skip_or_prep = all(
+                p in comm_prep for p in problem.predecessors(op_id)
+            )
+            if all_succs_comm and all_preds_skip_or_prep:
+                comm_prep.add(op_id)
+                changed = True
+
+    # Remap compute ops: assign solver time slots in original graph order.
+    # Solver time slots are monotonically increasing (compute stream is
+    # serial), so mapping them to original-order compute ops preserves
+    # relative order while keeping the same time scale as comm/wait keys.
+    # Comm-prep ops are excluded: they use solver start_times directly so
+    # they can move with their associated comms.
+    compute_entries: list[tuple[fx.Node, int]] = []
+    for node in graph.nodes:
+        if node in node_to_op:
+            op_id = node_to_op[node]
+            if (
+                op_to_node.get(op_id) is node
+                and problem.ops[op_id].stream == COMPUTE_STREAM
+                and op_id not in comm_prep
+            ):
+                compute_entries.append((node, op_id))
+
+    solver_slots = sorted(schedule.start_times[op_id] for _, op_id in compute_entries)
+    orig_sorted = sorted(compute_entries, key=lambda x: original_order[x[0]])
+    compute_mapped_time: dict[fx.Node, float] = {}
+    for i, (node, _) in enumerate(orig_sorted):
+        compute_mapped_time[node] = solver_slots[i]
 
     sort_key: dict[fx.Node, tuple[float, int, float, int]] = {}
     for node in graph.nodes:
@@ -548,12 +601,21 @@ def apply_schedule(
                         original_order[node],
                     )
                 else:
-                    sort_key[node] = (
-                        schedule.start_times[op_id],
-                        1,
-                        0.0,
-                        original_order[node],
-                    )
+                    if op_id in comm_prep:
+                        # Comm prep: use solver time so it moves with its comm
+                        sort_key[node] = (
+                            schedule.start_times[op_id],
+                            1,
+                            0.0,
+                            original_order[node],
+                        )
+                    else:
+                        sort_key[node] = (
+                            compute_mapped_time[node],
+                            1,
+                            0.0,
+                            original_order[node],
+                        )
             else:
                 # Wait node: defer after same-time ops so comm launches
                 # and compute run before waits block the compute stream.

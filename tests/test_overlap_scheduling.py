@@ -651,6 +651,104 @@ def test_fx_duplicate_deps():
     _check_fx_topo_order(graph)
 
 
+def _build_comm_prep_graph() -> fx.Graph:
+    """
+    Graph where a "comm prep" op (reshape) sits between a parameter and an AG,
+    with heavy compute ops on the main path.
+
+    heavy1(x, w) -> heavy2(heavy1, w) -> mm_final(heavy2, wait)
+    param -> reshape(param) -> ag(reshape) -> wait -/
+
+    Original order: heavy1, heavy2, reshape, ag, wait, mm_final
+    reshape should move before heavy1 to allow ag to overlap with heavy1+heavy2.
+    """
+    graph = fx.Graph()
+    x = graph.placeholder("x")
+    w = graph.placeholder("w")
+    param = graph.placeholder("param")
+
+    heavy1 = graph.call_function(torch.ops.aten.mm.default, (x, w))
+    heavy1.name = "heavy1"
+    heavy2 = graph.call_function(torch.ops.aten.mm.default, (heavy1, w))
+    heavy2.name = "heavy2"
+    # reshape is independent — depends only on param (placeholder)
+    reshape = graph.call_function(torch.ops.aten.reshape.default, (param, [-1]))
+    reshape.name = "reshape"
+    ag = graph.call_function(_AG, (reshape, 2, "0"))
+    ag.name = "ag"
+    wait = graph.call_function(_WAIT, (ag,))
+    wait.name = "wait"
+    mm_final = graph.call_function(torch.ops.aten.mm.default, (heavy2, wait))
+    mm_final.name = "mm_final"
+    graph.output(mm_final)
+    return graph
+
+
+def test_fx_comm_prep_reorder():
+    """
+    Comm prep ops (reshape feeding an AG, descending from placeholders)
+    should move freely with their comms, not be pinned to original order.
+
+    Original: heavy1, heavy2, reshape, ag, wait, mm_final
+
+    Without comm_prep awareness, order-preservation would keep reshape
+    after heavy2, preventing any overlap (37.1ms actual execution).
+
+    The ILP finds the optimal: reshape, ag, heavy1, heavy2, wait, mm_final
+    giving 22.1ms (ag fully hidden behind heavy1+heavy2).
+
+    The greedy solver picks heavy1 first (lower ALAP = more urgent), then
+    reshape, ag, heavy2: giving 27.1ms.  Both solvers benefit from comm_prep
+    awareness — reshape moves before heavy2, enabling ag overlap.
+    """
+    costs = {
+        "heavy1": 10.0,
+        "heavy2": 10.0,
+        "reshape": 0.1,
+        "ag": 15.0,
+        "mm_final": 2.0,
+    }
+    classify = _make_classify(costs)
+
+    for solver_name in ["ilp", "greedy"]:
+        graph = _build_comm_prep_graph()
+        assert _get_call_function_names(graph) == [
+            "heavy1",
+            "heavy2",
+            "reshape",
+            "ag",
+            "wait",
+            "mm_final",
+        ]
+
+        schedule = reorder_for_overlap(graph, classify, solver=solver_name)
+        names = _get_call_function_names(graph)
+        _check_fx_topo_order(graph)
+
+        # Both solvers: reshape and ag must move before heavy2 to enable overlap.
+        # Without comm_prep fix, reshape would stay after heavy2 (original order).
+        assert names.index("reshape") < names.index(
+            "heavy2"
+        ), f"{solver_name}: reshape should move before heavy2, got {names}"
+        assert names.index("ag") < names.index(
+            "heavy2"
+        ), f"{solver_name}: ag should move before heavy2, got {names}"
+
+        if solver_name == "ilp":
+            # ILP finds optimal: reshape before heavy1
+            assert names.index("reshape") < names.index(
+                "heavy1"
+            ), f"ilp: reshape should move before heavy1, got {names}"
+            assert (
+                abs(schedule.makespan - 22.1) < 1e-6
+            ), f"ilp: expected 22.1ms, got {schedule.makespan}"
+        else:
+            # Greedy picks heavy1 first (lower ALAP), then reshape
+            assert (
+                abs(schedule.makespan - 27.1) < 1e-6
+            ), f"greedy: expected 27.1ms, got {schedule.makespan}"
+
+
 if __name__ == "__main__":
     test_basic_overlap()
     test_multi_pg_overlap()
@@ -665,4 +763,5 @@ if __name__ == "__main__":
     test_fx_multi_pg_reorder()
     test_fx_no_reorder_needed()
     test_fx_duplicate_deps()
+    test_fx_comm_prep_reorder()
     print("All tests passed.")
