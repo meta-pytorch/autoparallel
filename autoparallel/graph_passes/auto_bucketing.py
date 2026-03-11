@@ -155,6 +155,7 @@ class overlap_scheduling_config:
     custom_runtime_estimation = None
     memory_budget_bytes = None
     max_in_flight = 2
+    memory_headroom_fraction = 0.0
     _counter = 0
 
 
@@ -221,6 +222,7 @@ def overlap_scheduling_reordering_pass(
         solver=configs.solver,
         memory_budget_bytes=configs.memory_budget_bytes,
         max_in_flight=configs.max_in_flight,
+        memory_headroom_fraction=configs.memory_headroom_fraction,
     )
     print(
         f"Reordering took {time.time() - t:.2f} seconds, "

@@ -298,9 +298,12 @@ def solve_greedy(
       for comm ops may be later than dispatch + LAUNCH_OVERHEAD).
 
     The sort key picks the op with earliest dispatch time (ties broken by
-    comm-before-compute, then lowest ALAP).  start_times stores the actual
-    comm stream start for comm ops (not dispatch time), so apply_schedule
-    sees distinct timestamps that naturally interleave comms with compute.
+    comm-before-compute, then lowest ALAP).  start_times stores the
+    dispatch time for comm ops (when the compute stream queues the comm),
+    while completion_times stores when the comm finishes on its stream.
+    This way apply_schedule places comm start nodes at their dispatch
+    position in the FX graph, not at the (potentially much later) time
+    the comm actually begins on a busy comm stream.
 
     max_in_flight limits, per comm stream, how many dispatched comms can
     have unconsumed results (remaining_consumers > 0).  Leaf comms (e.g.
@@ -397,7 +400,7 @@ def solve_greedy(
             comm_end = comm_start + op.duration_ms
             compute_time = dispatch + LAUNCH_OVERHEAD
             comm_avail[op.stream] = comm_end
-            start_times[best_op] = comm_start
+            start_times[best_op] = dispatch
             completion[best_op] = comm_end
             if remaining_consumers[best_op] > 0:
                 in_flight[op.stream] += 1
@@ -692,26 +695,274 @@ def apply_schedule(
     graph.lint()
 
 
+def _compute_fx_base_peak(
+    graph: fx.Graph,
+    node_info: dict[fx.Node, NodeInfo],
+) -> int:
+    """Peak memory when FX nodes run in their original graph order."""
+    fx_remaining = {node: len(node.users) for node in graph.nodes}
+    current = 0
+    peak = 0
+    for node in graph.nodes:
+        current += node_info[node].memory_bytes
+        peak = max(peak, current)
+        for inp in node.all_input_nodes:
+            fx_remaining[inp] -= 1
+            if fx_remaining[inp] == 0:
+                current -= node_info[inp].memory_bytes
+    return peak
+
+
+def _greedy_reorder(
+    graph: fx.Graph,
+    classify: Callable[[fx.Node], NodeInfo],
+    max_in_flight: int | None = 2,
+    memory_headroom_fraction: float = 0.0,
+) -> Schedule:
+    """Unified greedy scheduler that directly produces FX node order.
+
+    Unlike solve_greedy + apply_schedule, this operates on FX nodes
+    directly via Kahn's topological sort with the same dispatch-aware
+    timing model.  Memory-budgeted compute reordering replaces the
+    comm-adjacent fixpoint: among ready compute ops, default to original
+    graph order, but allow an ALAP-preferred candidate when memory stays
+    within a configurable headroom.  This naturally handles comm-prep/post
+    ops (tiny memory, always pass the budget check).
+    """
+    # Classify all nodes upfront
+    node_info: dict[fx.Node, NodeInfo] = {}
+    wait_to_start: dict[fx.Node, fx.Node] = {}
+    for node in graph.nodes:
+        info = classify(node)
+        node_info[node] = info
+        if info.kind == NodeKind.COMM_WAIT:
+            start_node = node.args[0]
+            assert isinstance(start_node, fx.Node)
+            wait_to_start[node] = start_node
+
+    original_order: dict[fx.Node, int] = {node: i for i, node in enumerate(graph.nodes)}
+
+    # Compute ALAP on abstract problem for priority
+    problem, op_to_node, node_to_op = build_overlap_problem(graph, classify)
+    alap = compute_alap(problem)
+    alap_priority: dict[fx.Node, float] = {}
+    for node in graph.nodes:
+        if node in node_to_op:
+            alap_priority[node] = alap[node_to_op[node]]
+        else:
+            alap_priority[node] = float("inf")
+
+    # In-flight tracking: for each comm start, count non-output FX users
+    # of its wait node (abstract successors in the dissolved-wait model)
+    abstract_remaining: dict[fx.Node, int] = {}
+    for wait, start in wait_to_start.items():
+        count = sum(1 for u in wait.users if u.op != "output")
+        abstract_remaining.setdefault(start, 0)
+        abstract_remaining[start] += count
+
+    # Memory budget via dry-run in original order
+    base_peak = _compute_fx_base_peak(graph, node_info)
+    memory_budget = base_peak * (1.0 + memory_headroom_fraction)
+
+    # Scheduling state
+    compute_time: float = 0.0
+    comm_avail: dict[str, float] = defaultdict(float)
+    in_flight: dict[str, int] = defaultdict(int)
+    current_memory: int = 0
+    completion: dict[fx.Node, float] = {}
+    start_times_fx: dict[fx.Node, float] = {}
+
+    # FX liveness tracking for memory
+    fx_remaining: dict[fx.Node, int] = {node: len(node.users) for node in graph.nodes}
+
+    # Kahn's algorithm state
+    in_degree: dict[fx.Node, int] = {
+        node: len(node.all_input_nodes) for node in graph.nodes
+    }
+    ready: set[fx.Node] = {node for node in graph.nodes if in_degree[node] == 0}
+    ordered: list[fx.Node] = []
+
+    def _pred_done(node: fx.Node) -> float:
+        return max(
+            (completion[inp] for inp in node.all_input_nodes if inp in completion),
+            default=0.0,
+        )
+
+    def _net_memory_delta(node: fx.Node) -> int:
+        delta = node_info[node].memory_bytes
+        for inp in node.all_input_nodes:
+            if fx_remaining[inp] == 1:
+                delta -= node_info[inp].memory_bytes
+        return delta
+
+    def _emit(node: fx.Node) -> None:
+        nonlocal current_memory, compute_time
+        ordered.append(node)
+        ready.discard(node)
+        info = node_info[node]
+
+        if info.kind == NodeKind.SKIP:
+            completion[node] = compute_time
+        elif info.kind == NodeKind.COMM_START:
+            pred_done = _pred_done(node)
+            dispatch = max(compute_time, pred_done)
+            comm_start = max(dispatch, comm_avail[info.stream])
+            comm_end = comm_start + info.duration_ms
+            compute_time = dispatch + LAUNCH_OVERHEAD
+            comm_avail[info.stream] = comm_end
+            start_times_fx[node] = dispatch
+            completion[node] = comm_end
+            if abstract_remaining.get(node, 0) > 0:
+                in_flight[info.stream] += 1
+        elif info.kind == NodeKind.COMM_WAIT:
+            start = wait_to_start[node]
+            comm_done = completion[start]
+            compute_time = max(compute_time, comm_done)
+            start_times_fx[node] = compute_time
+            completion[node] = compute_time
+        else:  # COMPUTE, OTHER
+            pred_done = _pred_done(node)
+            start = max(compute_time, pred_done)
+            compute_time = start + info.duration_ms
+            start_times_fx[node] = start
+            completion[node] = start + info.duration_ms
+
+        # Memory tracking
+        current_memory += info.memory_bytes
+        for inp in node.all_input_nodes:
+            fx_remaining[inp] -= 1
+            if fx_remaining[inp] == 0:
+                current_memory -= node_info[inp].memory_bytes
+
+        # In-flight tracking: decrement when a consumer of a wait is emitted
+        if node.op != "output":
+            for inp in node.all_input_nodes:
+                if node_info[inp].kind == NodeKind.COMM_WAIT:
+                    start = wait_to_start[inp]
+                    if abstract_remaining.get(start, 0) > 0:
+                        abstract_remaining[start] -= 1
+                        if abstract_remaining[start] == 0:
+                            in_flight[node_info[start].stream] -= 1
+
+        # Update Kahn's in-degree
+        for user in node.users:
+            in_degree[user] -= 1
+            if in_degree[user] == 0:
+                ready.add(user)
+
+    # Main scheduling loop
+    while ready:
+        candidates: list[tuple[tuple[float, int, float], fx.Node]] = []
+
+        # Skip nodes (placeholders, get_attr, etc.)
+        for node in ready:
+            info = node_info[node]
+            if info.kind == NodeKind.SKIP:
+                if node.op == "output":
+                    candidates.append(((float("inf"), 3, 0.0), node))
+                else:
+                    candidates.append(
+                        ((float("-inf"), -1, float(original_order[node])), node)
+                    )
+
+        # Comm starts
+        for node in ready:
+            info = node_info[node]
+            if info.kind != NodeKind.COMM_START:
+                continue
+            if (
+                max_in_flight is not None
+                and abstract_remaining.get(node, 0) > 0
+                and in_flight[info.stream] >= max_in_flight
+            ):
+                continue
+            pred_done = _pred_done(node)
+            dispatch = max(compute_time, pred_done)
+            candidates.append(((dispatch, 0, alap_priority[node]), node))
+
+        # Wait nodes
+        for node in ready:
+            info = node_info[node]
+            if info.kind != NodeKind.COMM_WAIT:
+                continue
+            start = wait_to_start[node]
+            if abstract_remaining.get(start, 0) == 0:
+                key_time = float("inf")
+            else:
+                key_time = completion[start]
+            candidates.append(((key_time, 2, 0.0), node))
+
+        # Compute nodes: pick one candidate via default/ALAP selection
+        compute_ready = [
+            n for n in ready if node_info[n].kind in (NodeKind.COMPUTE, NodeKind.OTHER)
+        ]
+        if compute_ready:
+            default = min(compute_ready, key=lambda n: original_order[n])
+            alap_best = min(
+                compute_ready,
+                key=lambda n: (alap_priority[n], original_order[n]),
+            )
+            if alap_best != default:
+                delta = _net_memory_delta(alap_best)
+                if current_memory + delta <= memory_budget:
+                    chosen = alap_best
+                else:
+                    chosen = default
+            else:
+                chosen = default
+            pred_done = _pred_done(chosen)
+            start = max(compute_time, pred_done)
+            candidates.append(((start, 1, alap_priority[chosen]), chosen))
+
+        if not candidates:
+            # All comms blocked by in-flight limit, no compute/waits ready.
+            # Force any ready node (shouldn't normally happen).
+            best = min(ready, key=lambda n: alap_priority.get(n, float("inf")))
+        else:
+            _, best = min(candidates)
+        _emit(best)
+
+    # Reorder the FX graph to match
+    output_node = next(n for n in graph.nodes if n.op == "output")
+    for node in ordered:
+        if node.op not in ("placeholder", "output"):
+            output_node.prepend(node)
+    graph.lint()
+
+    # Build Schedule for return
+    sched_start: dict[int, float] = {}
+    sched_completion: dict[int, float] = {}
+    for node in ordered:
+        if node in node_to_op:
+            op_id = node_to_op[node]
+            if op_to_node.get(op_id) is node:
+                sched_start[op_id] = start_times_fx.get(node, 0.0)
+                sched_completion[op_id] = completion.get(node, 0.0)
+    makespan = max(completion.values()) if completion else 0.0
+    return Schedule(
+        start_times=sched_start,
+        completion_times=sched_completion,
+        makespan=makespan,
+    )
+
+
 def reorder_for_overlap(
     graph: fx.Graph,
     classify: Callable[[fx.Node], NodeInfo],
     solver: str = "greedy",
     memory_budget_bytes: int | None = None,
     max_in_flight: int | None = 2,
+    memory_headroom_fraction: float = 0.0,
 ) -> Schedule:
     """
     Full pipeline: build problem from FX graph, solve, and reorder in place.
 
     Returns the Schedule for inspection.
     """
+    if solver == "greedy":
+        return _greedy_reorder(graph, classify, max_in_flight, memory_headroom_fraction)
+    # ILP path: keep existing build_problem -> solve_ilp -> apply_schedule
     problem, op_to_node, node_to_op = build_overlap_problem(graph, classify)
-    if solver == "ilp":
-        schedule = solve_ilp(problem)
-    else:
-        schedule = solve_greedy(
-            problem,
-            memory_budget_bytes=memory_budget_bytes,
-            max_in_flight=max_in_flight,
-        )
+    schedule = solve_ilp(problem)
     apply_schedule(graph, schedule, problem, op_to_node, node_to_op)
     return schedule
