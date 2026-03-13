@@ -509,11 +509,36 @@ def nccl_reduce_scatter_cost(
 def nccl_all_to_all_cost(
     n_bytes: int, topo: MeshDimTopo, config: NCCLTopoConfig
 ) -> float:
-    """Cost model for AllToAll based on NCCL's P2P ring decomposition.
+    """Cost model for AllToAll using Ring-style formulas with nsteps=nRanks.
 
-    NCCL decomposes AllToAll into nRanks P2P Send/Recv pairs, giving
-    nsteps = nRanks (vs nRanks-1 for AG/RS) and bus-to-algo ratio = 1.0
-    (no nRanks/(nRanks-1) boost).
+    NCCL has no collective-level cost model for AllToAll — it is excluded from
+    the tuning loop (NCCL_NUM_FUNCTIONS=5 covers only BR/RD/AG/RS/AR). At
+    runtime, AllToAll is either decomposed into nRanks P2P Send/Recv pairs or
+    dispatched to the Copy Engine (CE) path on Hopper+ with CUDA 12.5+.
+
+    This approximation reuses Ring latency/bandwidth constants with
+    nsteps=nRanks and bus-to-algo ratio=1.0 (matching tuning.cc's formula,
+    even though NCCL never evaluates it for AllToAll). It is likely optimistic
+    because:
+      - P2P AllToAll uses SLICESTEPS=1/CHUNKSTEPS=1 (vs NCCL_STEPS/4 and
+        NCCL_STEPS/2 for AG), reducing pipelining and effective bandwidth.
+      - All-to-all traffic creates contention on NVLink/network links that
+        unidirectional Ring collectives don't.
+      - The CE path (Hopper+) and LL AllToAll (small messages) have different
+        performance characteristics not captured here.
+
+    TODO: potential improvements, roughly in priority order:
+      1. Empirical bandwidth correction factor to account for worse pipelining
+         and link contention (similar to NCCL's treeCorrectionFactor). Profile
+         AllToAll vs AllGather across message sizes / rank counts on real HW
+         and fit a discount curve to bus_bw.
+      2. CE path model for Hopper+: branch on arch and estimate cost from CE
+         memcpy throughput instead of SM-driven channel bandwidth. Requires
+         per-arch CE BW numbers and knowledge of buffer registration state
+         (not available at cost-model time today).
+      3. LL AllToAll for small messages: separate latency-dominated model
+         below some size threshold. Unlikely to matter for sharding decisions
+         which typically involve large tensors.
     """
     n_ranks = topo.n_ranks
     n_nodes = topo.n_nodes
