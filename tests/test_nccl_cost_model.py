@@ -18,6 +18,7 @@ from autoparallel.cost_models.nccl_cost_model import (
     derive_mesh_dim_topo,
     detect_nccl_topo_config,
     h100_topo_config,
+    nccl_all_to_all_cost,
     nccl_allgather_cost,
     nccl_allreduce_cost,
     nccl_collective_time,
@@ -465,3 +466,34 @@ class TestDetectNCCLTopoConfig:
         ):
             config = detect_nccl_topo_config(mesh)
         assert config is None
+
+
+# ---- AllToAll cost model tests ----
+
+
+class TestAllToAllCost:
+    def test_positive_and_finite(self):
+        config = a100_topo_config()
+        topo = derive_mesh_dim_topo(config, (8,), 0)
+        cost = nccl_all_to_all_cost(1 << 20, topo, config)
+        assert cost > 0
+        assert cost < float("inf")
+
+    def test_monotonicity(self):
+        config = h100_topo_config()
+        topo = derive_mesh_dim_topo(config, (8,), 0)
+        sizes = [1 << k for k in range(6, 28, 2)]
+        times = [nccl_all_to_all_cost(s, topo, config) for s in sizes]
+        for i in range(1, len(times)):
+            assert times[i] >= times[i - 1], (
+                f"AllToAll cost decreased from {sizes[i-1]} to {sizes[i]}: "
+                f"{times[i-1]} > {times[i]}"
+            )
+
+    def test_more_expensive_than_allgather(self):
+        config = a100_topo_config()
+        topo = derive_mesh_dim_topo(config, (8,), 0)
+        n_bytes = 1 << 24
+        a2a = nccl_all_to_all_cost(n_bytes, topo, config)
+        ag = nccl_allgather_cost(n_bytes, topo, config)
+        assert a2a > ag

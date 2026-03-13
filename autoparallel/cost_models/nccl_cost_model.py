@@ -509,8 +509,41 @@ def nccl_reduce_scatter_cost(
 def nccl_all_to_all_cost(
     n_bytes: int, topo: MeshDimTopo, config: NCCLTopoConfig
 ) -> float:
-    # NCCL doesn't model all-to-all directly; approximate as allgather
-    return nccl_collective_time(NCCLFunc.ALLGATHER, n_bytes, topo, config)
+    """Cost model for AllToAll based on NCCL's P2P ring decomposition.
+
+    NCCL decomposes AllToAll into nRanks P2P Send/Recv pairs, giving
+    nsteps = nRanks (vs nRanks-1 for AG/RS) and bus-to-algo ratio = 1.0
+    (no nRanks/(nRanks-1) boost).
+    """
+    n_ranks = topo.n_ranks
+    n_nodes = topo.n_nodes
+
+    # Bandwidth: Ring-style, ratio = 1.0 (no bus-to-algo boost)
+    bw = topo.bw_intra if n_nodes <= 2 else topo.bw_inter
+    bus_bw = topo.n_channels * bw
+
+    if bus_bw <= 0:
+        return float("inf")
+
+    # Latency: Ring-style with nsteps = nRanks
+    nsteps = n_ranks
+    base_lat = _BASE_LATENCIES[NCCLAlgo.RING]
+    intra_lat = _HW_LAT_NVLINK[NCCLAlgo.RING]
+
+    if topo.ppn == 1:
+        inter_lat_base = _HW_LAT_NET[NCCLAlgo.TREE]
+    else:
+        inter_lat_base = _HW_LAT_NET[NCCLAlgo.RING]
+    inter_lat = inter_lat_base + config.net_latency
+    inter_lat += config.net_latency  # Simple protocol doubles net_latency
+
+    net_overhead = _NET_OVERHEAD_SIMPLE if n_nodes > 1 else 0.0
+    intra_lat = max(intra_lat, net_overhead)
+
+    n_inter_steps = 0 if n_nodes == 1 else n_nodes - 1
+    lat = base_lat + (nsteps - n_inter_steps) * intra_lat + n_inter_steps * inter_lat
+
+    return lat + n_bytes / (1000.0 * bus_bw)
 
 
 # ---------------------------------------------------------------------------
