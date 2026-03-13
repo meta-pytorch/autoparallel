@@ -16,6 +16,10 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from enum import Enum
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from torch.distributed.tensor import DeviceMesh
 
 
 class GpuArch(Enum):
@@ -512,6 +516,27 @@ def nccl_all_to_all_cost(
 # ---------------------------------------------------------------------------
 # Default configs for common GPU architectures
 # ---------------------------------------------------------------------------
+
+
+def detect_nccl_topo_config(mesh: "DeviceMesh") -> NCCLTopoConfig | None:
+    """Auto-detect GPU architecture and build an NCCLTopoConfig from the mesh.
+
+    Returns None if the GPU is unrecognized (caller falls back to PyTorch model).
+    """
+    import torch
+
+    device_name = torch.cuda.get_device_name(0)
+    total_gpus = mesh.size()
+    gpus_per_node = torch.cuda.device_count()
+    num_nodes = total_gpus // gpus_per_node
+
+    if "A100" in device_name:
+        return a100_topo_config(num_nodes=num_nodes, gpus_per_node=gpus_per_node)
+    elif "H100" in device_name or "H200" in device_name:
+        return h100_topo_config(num_nodes=num_nodes, gpus_per_node=gpus_per_node)
+    elif "B200" in device_name or "GB200" in device_name:
+        return gb200_topo_config(num_nodes=num_nodes, gpus_per_node=gpus_per_node)
+    return None
 
 
 def a100_topo_config(

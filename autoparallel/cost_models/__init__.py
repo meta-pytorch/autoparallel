@@ -6,6 +6,7 @@
 from .nccl_cost_model import (  # noqa: F401
     NCCLTopoConfig,
     a100_topo_config,
+    detect_nccl_topo_config,
     gb200_topo_config,
     h100_topo_config,
 )

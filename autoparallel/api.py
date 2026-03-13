@@ -309,6 +309,7 @@ class AutoParallel:
         if mp_policy is not None:
             mp_policy = canonicalize_mp(mp_policy)
         self.mp_policy = mp_policy
+        self.cost_model = kwargs.pop("cost_model", "nccl")
         self.kwargs = kwargs
         # copy user model to avoid modifying it in-place
         # in dtype casting and move_to_fake
@@ -360,6 +361,23 @@ class AutoParallel:
         # won't be called (Python only calls __exit__ if __enter__
         # succeeds), so we must unwind the stack ourselves.
         try:
+            from .cost_models.collective_runtime_estimation import (
+                get_nccl_topo_config,
+                set_nccl_topo_config,
+            )
+            from .cost_models.nccl_cost_model import (
+                NCCLTopoConfig,
+                detect_nccl_topo_config,
+            )
+
+            self._prev_nccl_config = get_nccl_topo_config()
+            if isinstance(self.cost_model, NCCLTopoConfig):
+                set_nccl_topo_config(self.cost_model)
+            elif self.cost_model == "nccl":
+                set_nccl_topo_config(detect_nccl_topo_config(self.mesh))
+            else:
+                set_nccl_topo_config(None)
+
             self.build_model_graph()
             self.old_inductor_comprehensive_padding = (
                 torch._inductor.config.comprehensive_padding
@@ -397,6 +415,9 @@ class AutoParallel:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        from .cost_models.collective_runtime_estimation import set_nccl_topo_config
+
+        set_nccl_topo_config(self._prev_nccl_config)
         torch._inductor.config.comprehensive_padding = (
             self.old_inductor_comprehensive_padding
         )

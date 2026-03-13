@@ -16,6 +16,7 @@ from autoparallel.cost_models.nccl_cost_model import (
     _nccl_algo_time,
     a100_topo_config,
     derive_mesh_dim_topo,
+    detect_nccl_topo_config,
     h100_topo_config,
     nccl_allgather_cost,
     nccl_allreduce_cost,
@@ -374,3 +375,93 @@ class TestPublicAPI:
         ar = nccl_allreduce_cost(n_bytes, topo, config)
         rs = nccl_reduce_scatter_cost(n_bytes, topo, config)
         assert ar > rs
+
+
+# ---- detect_nccl_topo_config tests ----
+
+
+class TestDetectNCCLTopoConfig:
+    def _make_mock_mesh(self, total_gpus):
+        from unittest.mock import MagicMock
+
+        mesh = MagicMock()
+        mesh.size.return_value = total_gpus
+        return mesh
+
+    def test_a100_detected(self):
+        from unittest.mock import patch
+
+        mesh = self._make_mock_mesh(16)
+        with (
+            patch("torch.cuda.get_device_name", return_value="NVIDIA A100-SXM4-80GB"),
+            patch("torch.cuda.device_count", return_value=8),
+        ):
+            config = detect_nccl_topo_config(mesh)
+        assert config is not None
+        assert config.arch == GpuArch.AMPERE
+        assert config.num_nodes == 2
+        assert config.gpus_per_node == 8
+
+    def test_h100_detected(self):
+        from unittest.mock import patch
+
+        mesh = self._make_mock_mesh(8)
+        with (
+            patch("torch.cuda.get_device_name", return_value="NVIDIA H100 80GB HBM3"),
+            patch("torch.cuda.device_count", return_value=8),
+        ):
+            config = detect_nccl_topo_config(mesh)
+        assert config is not None
+        assert config.arch == GpuArch.HOPPER
+        assert config.num_nodes == 1
+        assert config.gpus_per_node == 8
+
+    def test_h200_detected(self):
+        from unittest.mock import patch
+
+        mesh = self._make_mock_mesh(8)
+        with (
+            patch("torch.cuda.get_device_name", return_value="NVIDIA H200"),
+            patch("torch.cuda.device_count", return_value=8),
+        ):
+            config = detect_nccl_topo_config(mesh)
+        assert config is not None
+        assert config.arch == GpuArch.HOPPER
+
+    def test_b200_detected(self):
+        from unittest.mock import patch
+
+        mesh = self._make_mock_mesh(72)
+        with (
+            patch("torch.cuda.get_device_name", return_value="NVIDIA B200"),
+            patch("torch.cuda.device_count", return_value=72),
+        ):
+            config = detect_nccl_topo_config(mesh)
+        assert config is not None
+        assert config.arch == GpuArch.BLACKWELL
+        assert config.num_nodes == 1
+        assert config.gpus_per_node == 72
+
+    def test_gb200_detected(self):
+        from unittest.mock import patch
+
+        mesh = self._make_mock_mesh(144)
+        with (
+            patch("torch.cuda.get_device_name", return_value="NVIDIA GB200"),
+            patch("torch.cuda.device_count", return_value=72),
+        ):
+            config = detect_nccl_topo_config(mesh)
+        assert config is not None
+        assert config.arch == GpuArch.BLACKWELL
+        assert config.num_nodes == 2
+
+    def test_unknown_gpu_returns_none(self):
+        from unittest.mock import patch
+
+        mesh = self._make_mock_mesh(8)
+        with (
+            patch("torch.cuda.get_device_name", return_value="NVIDIA RTX 4090"),
+            patch("torch.cuda.device_count", return_value=8),
+        ):
+            config = detect_nccl_topo_config(mesh)
+        assert config is None
