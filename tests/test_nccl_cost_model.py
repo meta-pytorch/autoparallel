@@ -14,55 +14,21 @@ from autoparallel.cost_models.nccl_cost_model import (
     _compute_algo_latency,
     _eligible_algos,
     _nccl_algo_time,
+    a100_topo_config,
     derive_mesh_dim_topo,
+    h100_topo_config,
     nccl_allgather_cost,
     nccl_allreduce_cost,
     nccl_collective_time,
     nccl_reduce_scatter_cost,
 )
 
-# ---- Helpers ----
-
-
-def _a100_config(num_nodes=1, gpus_per_node=8, **kwargs):
-    return NCCLTopoConfig(
-        arch=GpuArch.AMPERE,
-        num_nodes=num_nodes,
-        gpus_per_node=gpus_per_node,
-        bw_intra=87.7,
-        bw_inter=25.0,
-        **kwargs,
-    )
-
-
-def _h100_config(num_nodes=1, gpus_per_node=8, **kwargs):
-    return NCCLTopoConfig(
-        arch=GpuArch.HOPPER,
-        num_nodes=num_nodes,
-        gpus_per_node=gpus_per_node,
-        bw_intra=225.0,
-        bw_inter=50.0,
-        **kwargs,
-    )
-
-
-def _b200_config(num_nodes=1, gpus_per_node=8, **kwargs):
-    return NCCLTopoConfig(
-        arch=GpuArch.BLACKWELL,
-        num_nodes=num_nodes,
-        gpus_per_node=gpus_per_node,
-        bw_intra=400.0,
-        bw_inter=50.0,
-        **kwargs,
-    )
-
-
 # ---- derive_mesh_dim_topo tests ----
 
 
 class TestDeriveMeshDimTopo:
     def test_single_dim_single_node(self):
-        config = _a100_config()
+        config = a100_topo_config()
         topo = derive_mesh_dim_topo(config, (8,), 0)
         assert topo.n_ranks == 8
         assert topo.n_nodes == 1
@@ -70,7 +36,7 @@ class TestDeriveMeshDimTopo:
         assert topo.n_channels == 12
 
     def test_two_dim_mesh_inner(self):
-        config = _a100_config(num_nodes=2)
+        config = a100_topo_config(num_nodes=2)
         # mesh (2, 8): dim 1 is inner, inner_product = 1
         topo = derive_mesh_dim_topo(config, (2, 8), 1)
         assert topo.n_ranks == 8
@@ -78,7 +44,7 @@ class TestDeriveMeshDimTopo:
         assert topo.n_nodes == 1
 
     def test_two_dim_mesh_outer(self):
-        config = _a100_config(num_nodes=2)
+        config = a100_topo_config(num_nodes=2)
         # mesh (2, 8): dim 0 is outer, inner_product = 8
         topo = derive_mesh_dim_topo(config, (2, 8), 0)
         assert topo.n_ranks == 2
@@ -86,13 +52,13 @@ class TestDeriveMeshDimTopo:
         assert topo.n_nodes == 2
 
     def test_bw_per_channel(self):
-        config = _h100_config(num_channels=16)
+        config = h100_topo_config(num_channels=16)
         topo = derive_mesh_dim_topo(config, (8,), 0)
         assert topo.bw_intra == pytest.approx(225.0 / 16)
         assert topo.bw_inter == pytest.approx(50.0 / 16)
 
     def test_custom_channels(self):
-        config = _a100_config(num_channels=8)
+        config = a100_topo_config(num_channels=8)
         topo = derive_mesh_dim_topo(config, (8,), 0)
         assert topo.n_channels == 8
 
@@ -126,7 +92,7 @@ class TestDeriveMeshDimTopo:
 
 class TestAlgoBwLatency:
     def test_ring_bw_single_node(self):
-        config = _a100_config()
+        config = a100_topo_config()
         topo = derive_mesh_dim_topo(config, (8,), 0)
         bw = _compute_algo_bw(NCCLFunc.ALLREDUCE, NCCLAlgo.RING, topo, config)
         # Ring AR: busBw = nCh * bw * nRanks / (2*(nRanks-1))
@@ -134,7 +100,7 @@ class TestAlgoBwLatency:
         assert bw == pytest.approx(expected)
 
     def test_ring_bw_allgather(self):
-        config = _a100_config()
+        config = a100_topo_config()
         topo = derive_mesh_dim_topo(config, (8,), 0)
         bw = _compute_algo_bw(NCCLFunc.ALLGATHER, NCCLAlgo.RING, topo, config)
         # Ring AG: busBw = nCh * bw * nRanks / (nRanks-1)
@@ -142,7 +108,7 @@ class TestAlgoBwLatency:
         assert bw == pytest.approx(expected)
 
     def test_tree_bw_allreduce(self):
-        config = _a100_config()
+        config = a100_topo_config()
         topo = derive_mesh_dim_topo(config, (8,), 0)
         bw = _compute_algo_bw(NCCLFunc.ALLREDUCE, NCCLAlgo.TREE, topo, config)
         # Tree AR: busBw = min(nCh*bw*0.92, nCh*perChMax) * 0.5
@@ -153,26 +119,26 @@ class TestAlgoBwLatency:
         assert bw == pytest.approx(expected)
 
     def test_tree_not_available_for_ag(self):
-        config = _a100_config()
+        config = a100_topo_config()
         topo = derive_mesh_dim_topo(config, (8,), 0)
         bw = _compute_algo_bw(NCCLFunc.ALLGATHER, NCCLAlgo.TREE, topo, config)
         assert bw == 0.0
 
     def test_nvls_bw_hopper(self):
-        config = _h100_config(has_nvswitch=True)
+        config = h100_topo_config()
         topo = derive_mesh_dim_topo(config, (8,), 0)
         bw = _compute_algo_bw(NCCLFunc.ALLREDUCE, NCCLAlgo.NVLS, topo, config)
         assert bw > 0
 
     def test_nvls_bw_ampere_zero(self):
-        config = _a100_config(has_nvswitch=True)
+        config = a100_topo_config(has_nvswitch=True)
         topo = derive_mesh_dim_topo(config, (8,), 0)
         # Ampere nvlsEfficiency = 0.0, so intraBw should be 0
         bw = _compute_algo_bw(NCCLFunc.ALLREDUCE, NCCLAlgo.NVLS, topo, config)
         assert bw == 0.0
 
     def test_ring_latency_single_node(self):
-        config = _a100_config()
+        config = a100_topo_config()
         topo = derive_mesh_dim_topo(config, (8,), 0)
         lat = _compute_algo_latency(NCCLFunc.ALLREDUCE, NCCLAlgo.RING, topo, config)
         # nNodes=1: nInterSteps=0, lat = baseLat + nsteps*intraLat
@@ -181,7 +147,7 @@ class TestAlgoBwLatency:
         assert lat == pytest.approx(expected)
 
     def test_ring_latency_multi_node(self):
-        config = _a100_config(num_nodes=2, gpus_per_node=1)
+        config = a100_topo_config(num_nodes=2, gpus_per_node=1)
         topo = derive_mesh_dim_topo(config, (2,), 0)
         lat = _compute_algo_latency(NCCLFunc.ALLREDUCE, NCCLAlgo.RING, topo, config)
         # gpus_per_node=1 => ppn=1, n_nodes=2, nRanks=2, nsteps=2, nInterSteps=2
@@ -191,7 +157,7 @@ class TestAlgoBwLatency:
         assert lat == pytest.approx(8.4 + 2 * 14.0)
 
     def test_tree_latency_single_node(self):
-        config = _a100_config()
+        config = a100_topo_config()
         topo = derive_mesh_dim_topo(config, (8,), 0)
         lat = _compute_algo_latency(NCCLFunc.ALLREDUCE, NCCLAlgo.TREE, topo, config)
         # nNodes=1: lat = baseLat + 2*((ppn-1)*intraLat + log2(1)*interLat)
@@ -204,7 +170,7 @@ class TestAlgoBwLatency:
 
 class TestAlgorithmSelection:
     def test_nvls_wins_intra_node_hopper(self):
-        config = _h100_config(has_nvswitch=True)
+        config = h100_topo_config()
         topo = derive_mesh_dim_topo(config, (8,), 0)
         n_bytes = 1 << 20  # 1MB
         ring_time = _nccl_algo_time(
@@ -217,7 +183,7 @@ class TestAlgorithmSelection:
         assert nvls_time < ring_time * 2  # At least in the same ballpark
 
     def test_tree_competes_multi_node_ar(self):
-        config = _a100_config(num_nodes=4)
+        config = a100_topo_config(num_nodes=4)
         topo = derive_mesh_dim_topo(config, (4,), 0)
         n_bytes = 1 << 20
         ring_time = _nccl_algo_time(
@@ -236,42 +202,42 @@ class TestAlgorithmSelection:
 
 class TestFeatureFlags:
     def test_nvls_disabled_without_nvswitch(self):
-        config = _h100_config(has_nvswitch=False)
+        config = h100_topo_config(has_nvswitch=False)
         algos = _eligible_algos(NCCLFunc.ALLREDUCE, config, 1)
         assert NCCLAlgo.NVLS not in algos
         assert NCCLAlgo.NVLS_TREE not in algos
 
     def test_nvls_enabled_with_nvswitch_hopper(self):
-        config = _h100_config(has_nvswitch=True)
+        config = h100_topo_config()
         algos = _eligible_algos(NCCLFunc.ALLREDUCE, config, 1)
         assert NCCLAlgo.NVLS in algos
 
     def test_nvls_tree_requires_multi_node(self):
-        config = _h100_config(has_nvswitch=True)
+        config = h100_topo_config()
         algos_1n = _eligible_algos(NCCLFunc.ALLREDUCE, config, 1)
         algos_2n = _eligible_algos(NCCLFunc.ALLREDUCE, config, 2)
         assert NCCLAlgo.NVLS_TREE not in algos_1n
         assert NCCLAlgo.NVLS_TREE in algos_2n
 
     def test_collnet_disabled_without_flag(self):
-        config = _a100_config(has_collnet=False)
+        config = a100_topo_config(has_collnet=False)
         algos = _eligible_algos(NCCLFunc.ALLREDUCE, config, 1)
         assert NCCLAlgo.COLLNET_DIRECT not in algos
         assert NCCLAlgo.COLLNET_CHAIN not in algos
 
     def test_collnet_enabled_with_flag(self):
-        config = _a100_config(has_collnet=True)
+        config = a100_topo_config(has_collnet=True)
         algos = _eligible_algos(NCCLFunc.ALLREDUCE, config, 2)
         assert NCCLAlgo.COLLNET_DIRECT in algos
         assert NCCLAlgo.COLLNET_CHAIN in algos
 
     def test_nvls_not_eligible_ampere(self):
-        config = _a100_config(has_nvswitch=True)
+        config = a100_topo_config(has_nvswitch=True)
         algos = _eligible_algos(NCCLFunc.ALLREDUCE, config, 1)
         assert NCCLAlgo.NVLS not in algos
 
     def test_ag_rs_eligible_algos(self):
-        config = _h100_config(has_nvswitch=True, has_collnet=True)
+        config = h100_topo_config(has_collnet=True)
         algos = _eligible_algos(NCCLFunc.ALLGATHER, config, 2)
         assert NCCLAlgo.RING in algos
         assert NCCLAlgo.NVLS in algos
@@ -286,7 +252,7 @@ class TestFeatureFlags:
 
 class TestTreeCorrection:
     def test_tree_correction_applied(self):
-        config = _a100_config(num_nodes=2)
+        config = a100_topo_config(num_nodes=2)
         topo = derive_mesh_dim_topo(config, (2,), 0)
         # Small message: correction factor < 1 for some sizes
         small = 1 << 10  # 1KB, log2(1024/64) = 4 -> factor = 0.9
@@ -316,7 +282,7 @@ class TestTreeCorrection:
 
 class TestRingPlateau:
     def test_ring_plateau_multi_node(self):
-        config = _a100_config(num_nodes=4, gpus_per_node=1)
+        config = a100_topo_config(num_nodes=4, gpus_per_node=1)
         topo = derive_mesh_dim_topo(config, (4,), 0)
         n_ch = topo.n_channels
         n_ranks = topo.n_ranks
@@ -355,7 +321,7 @@ class TestMonotonicity:
         "func", [NCCLFunc.ALLGATHER, NCCLFunc.ALLREDUCE, NCCLFunc.REDUCESCATTER]
     )
     def test_cost_increases_with_size(self, func):
-        config = _h100_config()
+        config = h100_topo_config()
         topo = derive_mesh_dim_topo(config, (8,), 0)
         sizes = [1 << k for k in range(6, 28, 2)]
         times = [nccl_collective_time(func, s, topo, config) for s in sizes]
@@ -369,7 +335,7 @@ class TestMonotonicity:
         "func", [NCCLFunc.ALLGATHER, NCCLFunc.ALLREDUCE, NCCLFunc.REDUCESCATTER]
     )
     def test_cost_positive(self, func):
-        config = _a100_config()
+        config = a100_topo_config()
         topo = derive_mesh_dim_topo(config, (8,), 0)
         t = nccl_collective_time(func, 1 << 20, topo, config)
         assert t > 0
@@ -381,28 +347,28 @@ class TestMonotonicity:
 
 class TestPublicAPI:
     def test_allgather_cost(self):
-        config = _a100_config()
+        config = a100_topo_config()
         topo = derive_mesh_dim_topo(config, (8,), 0)
         cost = nccl_allgather_cost(1 << 20, topo, config)
         assert cost > 0
         assert cost < float("inf")
 
     def test_allreduce_cost(self):
-        config = _a100_config()
+        config = a100_topo_config()
         topo = derive_mesh_dim_topo(config, (8,), 0)
         cost = nccl_allreduce_cost(1 << 20, topo, config)
         assert cost > 0
         assert cost < float("inf")
 
     def test_reduce_scatter_cost(self):
-        config = _a100_config()
+        config = a100_topo_config()
         topo = derive_mesh_dim_topo(config, (8,), 0)
         cost = nccl_reduce_scatter_cost(1 << 20, topo, config)
         assert cost > 0
         assert cost < float("inf")
 
     def test_allreduce_more_expensive_than_reduce_scatter(self):
-        config = _a100_config()
+        config = a100_topo_config()
         topo = derive_mesh_dim_topo(config, (8,), 0)
         n_bytes = 1 << 24
         ar = nccl_allreduce_cost(n_bytes, topo, config)

@@ -507,3 +507,63 @@ def nccl_all_to_all_cost(
 ) -> float:
     # NCCL doesn't model all-to-all directly; approximate as allgather
     return nccl_collective_time(NCCLFunc.ALLGATHER, n_bytes, topo, config)
+
+
+# ---------------------------------------------------------------------------
+# Default configs for common GPU architectures
+# ---------------------------------------------------------------------------
+
+
+def a100_topo_config(
+    num_nodes: int = 1,
+    gpus_per_node: int = 8,
+    bw_inter: float = 25.0,
+    **kwargs,
+) -> NCCLTopoConfig:
+    """DGX A100: 8x A100 per node, NVLink 87.7 GB/s intra-node."""
+    return NCCLTopoConfig(
+        arch=GpuArch.AMPERE,
+        num_nodes=num_nodes,
+        gpus_per_node=gpus_per_node,
+        bw_intra=87.7,
+        bw_inter=bw_inter,
+        **kwargs,
+    )
+
+
+def h100_topo_config(
+    num_nodes: int = 1,
+    gpus_per_node: int = 8,
+    bw_inter: float = 50.0,
+    has_nvswitch: bool = True,
+    **kwargs,
+) -> NCCLTopoConfig:
+    """DGX H100: 8x H100 per node, NVSwitch 225 GB/s intra-node."""
+    return NCCLTopoConfig(
+        arch=GpuArch.HOPPER,
+        num_nodes=num_nodes,
+        gpus_per_node=gpus_per_node,
+        bw_intra=225.0,
+        bw_inter=bw_inter,
+        has_nvswitch=has_nvswitch,
+        **kwargs,
+    )
+
+
+def gb200_topo_config(
+    num_nodes: int = 1,
+    gpus_per_node: int = 72,
+    bw_inter: float = 50.0,
+    has_nvswitch: bool = True,
+    **kwargs,
+) -> NCCLTopoConfig:
+    """GB200 NVL72: 72x B200 per rack, NVSwitch 400 GB/s intra-node."""
+    return NCCLTopoConfig(
+        arch=GpuArch.BLACKWELL,
+        num_nodes=num_nodes,
+        gpus_per_node=gpus_per_node,
+        bw_intra=400.0,
+        bw_inter=bw_inter,
+        has_nvswitch=has_nvswitch,
+        **kwargs,
+    )
