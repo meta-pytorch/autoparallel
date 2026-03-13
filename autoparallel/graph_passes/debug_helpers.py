@@ -129,10 +129,20 @@ def make_custom_runtime_estimation(mesh):
             target = node.target
             if target == torch.ops._c10d_functional.wait_tensor.default:
                 return 0
-            mesh_topo = MeshTopoInfo.build_from_mesh(mesh)
-            groups_name = tuple(g.group_name for g in mesh.get_all_groups())
+            # Resolve group_name to a mesh and dimension. Collectives may
+            # use per-dimension groups or the flattened mesh group created
+            # by mesh._flatten() in _apply_placement_common.
             group_name = get_group_name(node)
-            mesh_dim = groups_name.index(group_name)
+            groups_name = tuple(g.group_name for g in mesh.get_all_groups())
+            if group_name in groups_name:
+                cost_mesh = mesh
+                mesh_dim = groups_name.index(group_name)
+            elif mesh.ndim > 1:
+                cost_mesh = mesh._flatten()
+                mesh_dim = 0
+            else:
+                return 0
+            mesh_topo = MeshTopoInfo.build_from_mesh(cost_mesh)
             t = node.args[0].meta["val"]  # type: ignore[union-attr]
             comm_bytes_gb = t.numel() * t.itemsize / 2**30
             if override_size is not None:
@@ -145,14 +155,14 @@ def make_custom_runtime_estimation(mesh):
                     nccl_reduce_scatter_cost,
                 )
 
-                mesh_shape = tuple(mesh.shape)
+                mesh_shape = tuple(cost_mesh.shape)
                 topo = derive_mesh_dim_topo(nccl_config, mesh_shape, mesh_dim)
 
                 if target in {
                     torch.ops._c10d_functional.all_gather_into_tensor.default,
                     torch.ops._c10d_functional.all_gather_into_tensor_out.default,
                 }:
-                    n_bytes = int(comm_bytes_gb * mesh.shape[mesh_dim] * 1024**3)
+                    n_bytes = int(comm_bytes_gb * cost_mesh.shape[mesh_dim] * 1024**3)
                     return nccl_allgather_cost(n_bytes, topo, nccl_config)
                 elif target == torch.ops._c10d_functional.reduce_scatter_tensor.default:
                     n_bytes = int(comm_bytes_gb * 1024**3)
@@ -167,7 +177,7 @@ def make_custom_runtime_estimation(mesh):
                 torch.ops._c10d_functional.all_gather_into_tensor.default,
                 torch.ops._c10d_functional.all_gather_into_tensor_out.default,
             }:
-                comm_bytes_gb *= mesh.shape[mesh_dim]
+                comm_bytes_gb *= cost_mesh.shape[mesh_dim]
                 return allgather_cost(comm_bytes_gb, mesh_topo, mesh_dim)
             elif target == torch.ops._c10d_functional.reduce_scatter_tensor.default:
                 return reduce_scatter_cost(comm_bytes_gb, mesh_topo, mesh_dim)
