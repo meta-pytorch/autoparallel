@@ -497,3 +497,110 @@ class TestAllToAllCost:
         a2a = nccl_all_to_all_cost(n_bytes, topo, config)
         ag = nccl_allgather_cost(n_bytes, topo, config)
         assert a2a > ag
+
+
+# ---- NVSwitch empirical path tests ----
+
+
+class TestNVSwitchEmpiricalPath:
+    def test_allreduce_more_expensive_than_allgather_h100_nvswitch(self):
+        """AllReduce should be more expensive than AllGather on H100 NVSwitch.
+
+        Benchmarks show AllReduce is 47-84% more expensive than AllGather at
+        large message sizes on 8xH100 NVSwitch. The formula-based model gets
+        this ranking inverted; the empirical path fixes it.
+        """
+        config = h100_topo_config()
+        topo = derive_mesh_dim_topo(config, (8,), 0)
+        n_bytes = 1 << 24  # 16MB
+        ar = nccl_allreduce_cost(n_bytes, topo, config)
+        ag = nccl_allgather_cost(n_bytes, topo, config)
+        assert ar > ag
+
+    def test_allgather_equals_reduce_scatter_h100_nvswitch(self):
+        """AG and RS should have the same cost on NVSwitch (symmetric BW)."""
+        config = h100_topo_config()
+        topo = derive_mesh_dim_topo(config, (8,), 0)
+        n_bytes = 1 << 24
+        ag = nccl_allgather_cost(n_bytes, topo, config)
+        rs = nccl_reduce_scatter_cost(n_bytes, topo, config)
+        assert ag == pytest.approx(rs)
+
+    def test_not_used_for_multi_node(self):
+        """Multi-node should fall through to the algo selection loop."""
+        config = h100_topo_config(num_nodes=2)
+        topo = derive_mesh_dim_topo(config, (2, 8), 0)
+        # Multi-node dim: n_nodes=2, should NOT use empirical path.
+        # Just verify it returns a finite positive value (algo loop works).
+        cost = nccl_allgather_cost(1 << 20, topo, config)
+        assert cost > 0
+        assert cost < float("inf")
+
+    def test_not_used_for_ampere(self):
+        """Ampere should not use the NVSwitch empirical path."""
+        config = a100_topo_config(has_nvswitch=True)
+        topo = derive_mesh_dim_topo(config, (8,), 0)
+        cost = nccl_allgather_cost(1 << 20, topo, config)
+        assert cost > 0
+        assert cost < float("inf")
+
+    def test_ag_faster_with_fewer_gpus(self):
+        """AllGather is cheaper with fewer GPUs (higher per-GPU algo_bw)."""
+        config = h100_topo_config()
+        n_bytes = 1 << 24  # 16MB
+        cost_2 = nccl_allgather_cost(
+            n_bytes, derive_mesh_dim_topo(config, (2,), 0), config
+        )
+        cost_4 = nccl_allgather_cost(
+            n_bytes, derive_mesh_dim_topo(config, (4,), 0), config
+        )
+        cost_8 = nccl_allgather_cost(
+            n_bytes, derive_mesh_dim_topo(config, (8,), 0), config
+        )
+        assert cost_2 < cost_4 < cost_8
+
+    def test_rs_faster_with_fewer_gpus(self):
+        """ReduceScatter is cheaper with fewer GPUs."""
+        config = h100_topo_config()
+        n_bytes = 1 << 24
+        cost_2 = nccl_reduce_scatter_cost(
+            n_bytes, derive_mesh_dim_topo(config, (2,), 0), config
+        )
+        cost_4 = nccl_reduce_scatter_cost(
+            n_bytes, derive_mesh_dim_topo(config, (4,), 0), config
+        )
+        cost_8 = nccl_reduce_scatter_cost(
+            n_bytes, derive_mesh_dim_topo(config, (8,), 0), config
+        )
+        assert cost_2 < cost_4 < cost_8
+
+    def test_ar_4gpu_slower_than_8gpu(self):
+        """AllReduce at 4 GPUs is empirically slower than at 8 on NVSwitch.
+
+        The lower BW at 4 GPUs (236 vs 267 GB/s) only dominates at large
+        message sizes where the latency term becomes negligible.
+        """
+        config = h100_topo_config()
+        n_bytes = 1 << 26  # 64MB — well above the crossover point
+        cost_4 = nccl_allreduce_cost(
+            n_bytes, derive_mesh_dim_topo(config, (4,), 0), config
+        )
+        cost_8 = nccl_allreduce_cost(
+            n_bytes, derive_mesh_dim_topo(config, (8,), 0), config
+        )
+        assert cost_4 > cost_8
+
+    def test_interpolation_between_measured_points(self):
+        """GPU count between measured points should give intermediate cost."""
+        config = h100_topo_config()
+        n_bytes = 1 << 24
+        cost_2 = nccl_allgather_cost(
+            n_bytes, derive_mesh_dim_topo(config, (2,), 0), config
+        )
+        cost_3 = nccl_allgather_cost(
+            n_bytes, derive_mesh_dim_topo(config, (3,), 0), config
+        )
+        cost_4 = nccl_allgather_cost(
+            n_bytes, derive_mesh_dim_topo(config, (4,), 0), config
+        )
+        assert cost_2 < cost_3 < cost_4

@@ -332,6 +332,40 @@ _A2A_CE_BW = {
 }
 _A2A_CE_LATENCY = 50.0  # us, measured from 0-byte AllToAll on H100
 
+# NVSwitch empirical bandwidth (GB/s, algo_bw) and latency (us) for
+# AG/RS/AR on Hopper+, measured from nccl-tests on H100 NVSwitch at
+# 2/4/8 GPUs (1GB messages, out-of-place). AG and RS values are averaged
+# since they are symmetric on NVSwitch. For intermediate GPU counts,
+# linearly interpolated; clamped at the boundary measurements.
+# Blackwell: scaled from Hopper by bw_intra ratio; needs profiling.
+_NVSWITCH_BW_POINTS: dict[NCCLFunc, tuple[tuple[int, float], ...]] = {
+    NCCLFunc.ALLGATHER: ((2, 537.0), (4, 434.0), (8, 394.0)),
+    NCCLFunc.REDUCESCATTER: ((2, 537.0), (4, 434.0), (8, 394.0)),
+    NCCLFunc.ALLREDUCE: ((2, 324.0), (4, 236.0), (8, 267.0)),
+}
+_NVSWITCH_LAT_POINTS: dict[NCCLFunc, tuple[tuple[int, float], ...]] = {
+    NCCLFunc.ALLGATHER: ((2, 8.0), (4, 17.0), (8, 30.0)),
+    NCCLFunc.REDUCESCATTER: ((2, 8.0), (4, 17.0), (8, 30.0)),
+    NCCLFunc.ALLREDUCE: ((2, 10.0), (4, 15.0), (8, 31.0)),
+}
+_BLACKWELL_BW_SCALE = 400.0 / 225.0  # Blackwell/Hopper bw_intra ratio
+
+
+def _interp_clamped(points: tuple[tuple[int, float], ...], x: int) -> float:
+    """Linearly interpolate between data points, clamping at boundaries."""
+    if x <= points[0][0]:
+        return points[0][1]
+    if x >= points[-1][0]:
+        return points[-1][1]
+    for i in range(len(points) - 1):
+        x0, y0 = points[i]
+        x1, y1 = points[i + 1]
+        if x <= x1:
+            t = (x - x0) / (x1 - x0)
+            return y0 + t * (y1 - y0)
+    return points[-1][1]
+
+
 # SM-driven AllToAll bandwidth correction for non-CE-path cases (older arch,
 # no NVSwitch, or multi-node). P2P decomposition has worse pipelining
 # (SLICESTEPS=1/CHUNKSTEPS=1) and more link contention than Ring collectives.
@@ -490,7 +524,26 @@ def nccl_collective_time(
     topo: MeshDimTopo,
     config: NCCLTopoConfig,
 ) -> float:
-    """Pick the best algorithm and return estimated time in microseconds."""
+    """Pick the best algorithm and return estimated time in microseconds.
+
+    For Hopper+ with NVSwitch on a single node, uses empirical bandwidth
+    and latency fitted from nccl-tests at 2/4/8 GPUs, with linear
+    interpolation for intermediate counts. Blackwell values are scaled
+    from Hopper by the bw_intra ratio. The algo selection loop below is
+    only used for non-NVSwitch or multi-node cases.
+    """
+    # NVSwitch empirical path for Hopper+ intra-node
+    if (
+        config.arch in (GpuArch.HOPPER, GpuArch.BLACKWELL)
+        and config.has_nvswitch
+        and topo.n_nodes == 1
+    ):
+        bw = _interp_clamped(_NVSWITCH_BW_POINTS[func], topo.n_ranks)
+        if config.arch == GpuArch.BLACKWELL:
+            bw *= _BLACKWELL_BW_SCALE
+        lat = _interp_clamped(_NVSWITCH_LAT_POINTS[func], topo.n_ranks)
+        return lat + n_bytes / (1000.0 * bw)
+
     algos = _eligible_algos(func, config, topo.n_nodes)
     best = float("inf")
     for algo in algos:
