@@ -56,7 +56,7 @@ class TestDeriveMeshDimTopo:
     def test_bw_per_channel(self):
         config = h100_topo_config(num_channels=16)
         topo = derive_mesh_dim_topo(config, (8,), 0)
-        assert topo.bw_intra == pytest.approx(225.0 / 16)
+        assert topo.bw_intra == pytest.approx(320.0 / 16)
         assert topo.bw_inter == pytest.approx(50.0 / 16)
 
     def test_custom_channels(self):
@@ -70,7 +70,7 @@ class TestDeriveMeshDimTopo:
             arch=GpuArch.HOPPER,
             num_nodes=4,
             gpus_per_node=8,
-            bw_intra=225.0,
+            bw_intra=320.0,
             bw_inter=50.0,
         )
         # dim 2: inner_product=1, ppn=min(8//1,4)=4, n_nodes=1

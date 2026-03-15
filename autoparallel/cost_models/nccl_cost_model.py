@@ -55,7 +55,8 @@ class NCCLTopoConfig:
     arch: GpuArch
     num_nodes: int
     gpus_per_node: int
-    # Total per-GPU intra-node BW in GB/s (e.g. A100=87.7, H100=225, B200=400)
+    # Total per-GPU intra-node BW in GB/s, derived from NCCL's per-link NVLink
+    # constants × default channel count (A100=87.7, H100=320, B200=640).
     bw_intra: float
     # Total per-GPU inter-node BW in GB/s (e.g. 25 for 200Gbps, 50 for 400Gbps)
     bw_inter: float
@@ -355,7 +356,7 @@ _NVSWITCH_LAT_POINTS: dict[NCCLFunc, tuple[tuple[int, float], ...]] = {
     NCCLFunc.REDUCESCATTER: ((2, 8.0), (4, 17.0), (8, 30.0)),
     NCCLFunc.ALLREDUCE: ((2, 10.0), (4, 15.0), (8, 31.0)),
 }
-_BLACKWELL_BW_SCALE = 400.0 / 225.0  # Blackwell/Hopper bw_intra ratio
+_BLACKWELL_BW_SCALE = 640.0 / 320.0  # Blackwell/Hopper bw_intra ratio
 
 
 def _interp_clamped(points: tuple[tuple[int, float], ...], x: int) -> float:
@@ -704,12 +705,16 @@ def h100_topo_config(
     has_nvswitch: bool = True,
     **kwargs,
 ) -> NCCLTopoConfig:
-    """DGX H100: 8x H100 per node, NVSwitch 225 GB/s intra-node."""
+    """DGX H100: 8x H100 per node, NVSwitch 320 GB/s intra-node.
+
+    bw_intra derived from NCCL's SM90 NVLink BW (20.0 GB/s per channel from
+    the graph search speed array) × 16 default channels.
+    """
     return NCCLTopoConfig(
         arch=GpuArch.HOPPER,
         num_nodes=num_nodes,
         gpus_per_node=gpus_per_node,
-        bw_intra=225.0,
+        bw_intra=320.0,
         bw_inter=bw_inter,
         has_nvswitch=has_nvswitch,
         **kwargs,
@@ -723,12 +728,16 @@ def gb200_topo_config(
     has_nvswitch: bool = True,
     **kwargs,
 ) -> NCCLTopoConfig:
-    """GB200 NVL72: 72x B200 per rack, NVSwitch 400 GB/s intra-node."""
+    """GB200 NVL72: 72x B200 per rack, NVSwitch 640 GB/s intra-node.
+
+    bw_intra derived from NCCL's SM100 NVLink BW (40.0 GB/s per channel from
+    the graph search speed array) × 16 default channels.
+    """
     return NCCLTopoConfig(
         arch=GpuArch.BLACKWELL,
         num_nodes=num_nodes,
         gpus_per_node=gpus_per_node,
-        bw_intra=400.0,
+        bw_intra=640.0,
         bw_inter=bw_inter,
         has_nvswitch=has_nvswitch,
         **kwargs,
