@@ -604,3 +604,57 @@ class TestNVSwitchEmpiricalPath:
             n_bytes, derive_mesh_dim_topo(config, (4,), 0), config
         )
         assert cost_2 < cost_3 < cost_4
+
+
+# ---- NIC aggregation for NVSwitch multi-node ----
+
+
+class TestNICAggregation:
+    def test_ring_bw_increases_with_nvswitch_multi_node(self):
+        """Ring BW should increase when NVSwitch aggregates NICs at 4+ nodes."""
+        config_nvs = h100_topo_config(num_nodes=4)
+        config_no_nvs = h100_topo_config(num_nodes=4, has_nvswitch=False)
+        # Flat mesh: all 32 GPUs in one communicator, ppn=8
+        topo_nvs = derive_mesh_dim_topo(config_nvs, (32,), 0)
+        topo_no_nvs = derive_mesh_dim_topo(config_no_nvs, (32,), 0)
+        bw_nvs = _compute_algo_bw(
+            NCCLFunc.ALLGATHER, NCCLAlgo.RING, topo_nvs, config_nvs
+        )
+        bw_no_nvs = _compute_algo_bw(
+            NCCLFunc.ALLGATHER, NCCLAlgo.RING, topo_no_nvs, config_no_nvs
+        )
+        assert bw_nvs > bw_no_nvs
+
+    def test_ag_cost_scales_sublinearly_with_nodes(self):
+        """AG cost at 4 nodes should be less than 2x AG cost at 2 nodes."""
+        config_2n = h100_topo_config(num_nodes=2)
+        config_4n = h100_topo_config(num_nodes=4)
+        n_bytes = 1 << 30  # 1GB
+        topo_2n = derive_mesh_dim_topo(config_2n, (16,), 0)
+        topo_4n = derive_mesh_dim_topo(config_4n, (32,), 0)
+        cost_2n = nccl_allgather_cost(n_bytes, topo_2n, config_2n)
+        cost_4n = nccl_allgather_cost(n_bytes, topo_4n, config_4n)
+        assert cost_4n < 2 * cost_2n
+
+    def test_nvls_tree_wins_over_nvls_multi_node_ar(self):
+        """NVLS_TREE should beat NVLS for multi-node AR on H100 NVSwitch."""
+        config = h100_topo_config(num_nodes=4)
+        topo = derive_mesh_dim_topo(config, (32,), 0)
+        n_bytes = 1 << 30
+        nvls_time = _nccl_algo_time(
+            NCCLFunc.ALLREDUCE, NCCLAlgo.NVLS, n_bytes, topo, config
+        )
+        nvls_tree_time = _nccl_algo_time(
+            NCCLFunc.ALLREDUCE, NCCLAlgo.NVLS_TREE, n_bytes, topo, config
+        )
+        assert nvls_tree_time < nvls_time
+
+    def test_a100_no_nvswitch_unaffected(self):
+        """A100 (no NVSwitch) Ring BW should be unchanged by aggregation."""
+        config = a100_topo_config(num_nodes=4, gpus_per_node=8)
+        topo = derive_mesh_dim_topo(config, (32,), 0)
+        bw = _compute_algo_bw(NCCLFunc.ALLGATHER, NCCLAlgo.RING, topo, config)
+        # Without NVSwitch: bw_inter used directly, no aggregation
+        bw_inter_per_ch = 25.0 / 12
+        expected = 12 * bw_inter_per_ch * 32 / 31
+        assert bw == pytest.approx(expected)

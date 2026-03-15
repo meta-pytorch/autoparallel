@@ -226,6 +226,13 @@ def _compute_algo_bw(
     bw_inter = topo.bw_inter
     arch = config.arch
 
+    # NVSwitch aggregates all ppn NICs for inter-node Ring/Tree traffic.
+    # The effective per-channel bandwidth is capped by NVSwitch throughput.
+    if config.has_nvswitch and n_nodes > 1:
+        bw_inter_agg = min(bw_intra, bw_inter * ppn)
+    else:
+        bw_inter_agg = bw_inter
+
     if func == NCCLFunc.ALLREDUCE:
         nsteps = 2 * (n_ranks - 1)
     else:
@@ -234,7 +241,7 @@ def _compute_algo_bw(
     node_bucket = _node_bucket(n_nodes)
 
     if algo == NCCLAlgo.RING:
-        bw = bw_intra if n_nodes <= 2 else bw_inter
+        bw = bw_intra if n_nodes <= 2 else bw_inter_agg
         bus_bw = n_ch * bw
         # Bus-to-algo conversion
         bus_bw *= n_ranks / nsteps
@@ -243,7 +250,7 @@ def _compute_algo_bw(
         # Tree is only used for AllReduce
         if func != NCCLFunc.ALLREDUCE:
             return 0.0
-        bw = bw_intra if n_nodes <= 2 else bw_inter
+        bw = bw_intra if n_nodes <= 2 else bw_inter_agg
         bus_bw = n_ch * bw
         per_ch_max = _PER_CH_MAX_TREE_BWS[arch][node_bucket]
         bus_bw = min(bus_bw * 0.92, n_ch * per_ch_max)
@@ -276,14 +283,14 @@ def _compute_algo_bw(
             return 0.0
         intra_bw = bw_intra * eff * (n_ch - 1) / n_ch
         intra_bw *= 2.0  # AllReduce pipelines two operations
-        inter_bw = bw_inter * (2 if n_nodes <= 2 else 1)
+        inter_bw = bw_inter_agg * (2 if n_nodes <= 2 else 1)
         per_ch_max = _PER_CH_MAX_NVLS_TREE_BWS[arch][node_bucket]
         bw = min(intra_bw, inter_bw, per_ch_max)
         bus_bw = n_ch * bw
         bus_bw *= 0.5
 
     elif algo == NCCLAlgo.COLLNET_DIRECT:
-        bw = bw_intra if n_nodes <= 2 else bw_inter
+        bw = bw_intra if n_nodes <= 2 else bw_inter_agg
         if func in (NCCLFunc.ALLGATHER, NCCLFunc.REDUCESCATTER):
             # AG/RS: ppn * min(bwIntra, bwInter * 0.9), no bus-to-algo conversion
             bus_bw = ppn * min(bw_intra * n_ch, bw_inter * n_ch * 0.9)
@@ -302,7 +309,7 @@ def _compute_algo_bw(
         # Only Simple protocol, only for AllReduce
         if func != NCCLFunc.ALLREDUCE:
             return 0.0
-        bw = bw_intra if n_nodes <= 2 else bw_inter
+        bw = bw_intra if n_nodes <= 2 else bw_inter_agg
         bus_bw = n_ch * bw
         bus_bw *= 0.5
 
