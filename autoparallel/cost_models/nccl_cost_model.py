@@ -321,6 +321,13 @@ def _compute_algo_bw(
 _NET_OVERHEAD_SIMPLE = 1.0 * 3
 
 
+# AllToAll bandwidth correction: P2P decomposition has worse pipelining
+# (SLICESTEPS=1/CHUNKSTEPS=1) and creates more link contention than
+# unidirectional Ring collectives. 0.7 is a conservative estimate pending
+# empirical profiling.
+_A2A_BW_CORRECTION = 0.7
+
+
 def _compute_algo_latency(
     func: NCCLFunc,
     algo: NCCLAlgo,
@@ -527,11 +534,13 @@ def nccl_all_to_all_cost(
       - The CE path (Hopper+) and LL AllToAll (small messages) have different
         performance characteristics not captured here.
 
+    We apply a bandwidth correction factor (_A2A_BW_CORRECTION) to discount
+    effective bandwidth, accounting for worse pipelining and link contention.
+
     TODO: potential improvements, roughly in priority order:
-      1. Empirical bandwidth correction factor to account for worse pipelining
-         and link contention (similar to NCCL's treeCorrectionFactor). Profile
-         AllToAll vs AllGather across message sizes / rank counts on real HW
-         and fit a discount curve to bus_bw.
+      1. Profile AllToAll vs AllGather across message sizes / rank counts on
+         real HW and fit a proper discount curve to bus_bw (similar to NCCL's
+         treeCorrectionFactor).
       2. CE path model for Hopper+: branch on arch and estimate cost from CE
          memcpy throughput instead of SM-driven channel bandwidth. Requires
          per-arch CE BW numbers and knowledge of buffer registration state
@@ -543,9 +552,10 @@ def nccl_all_to_all_cost(
     n_ranks = topo.n_ranks
     n_nodes = topo.n_nodes
 
-    # Bandwidth: Ring-style, ratio = 1.0 (no bus-to-algo boost)
+    # Bandwidth: Ring-style, ratio = 1.0 (no bus-to-algo boost),
+    # discounted by correction factor for pipelining / contention.
     bw = topo.bw_intra if n_nodes <= 2 else topo.bw_inter
-    bus_bw = topo.n_channels * bw
+    bus_bw = topo.n_channels * bw * _A2A_BW_CORRECTION
 
     if bus_bw <= 0:
         return float("inf")
