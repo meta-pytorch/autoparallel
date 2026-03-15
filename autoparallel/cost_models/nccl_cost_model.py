@@ -321,10 +321,20 @@ def _compute_algo_bw(
 _NET_OVERHEAD_SIMPLE = 1.0 * 3
 
 
-# AllToAll bandwidth correction: P2P decomposition has worse pipelining
-# (SLICESTEPS=1/CHUNKSTEPS=1) and creates more link contention than
-# unidirectional Ring collectives. 0.7 is a conservative estimate pending
-# empirical profiling.
+# CE-path AllToAll bandwidth for NVSwitch-connected Hopper+ GPUs (GB/s).
+# On these architectures, NCCL dispatches AllToAll to Copy Engines, achieving
+# much higher throughput than SM-driven channels.
+# H100: fitted from nccl-tests alltoall_perf on 8xH100 NVSwitch (>=32MB msgs).
+# Blackwell: estimated proportionally from bw_intra ratio; needs profiling.
+_A2A_CE_BW = {
+    GpuArch.HOPPER: 380.0,
+    GpuArch.BLACKWELL: 675.0,
+}
+_A2A_CE_LATENCY = 50.0  # us, measured from 0-byte AllToAll on H100
+
+# SM-driven AllToAll bandwidth correction for non-CE-path cases (older arch,
+# no NVSwitch, or multi-node). P2P decomposition has worse pipelining
+# (SLICESTEPS=1/CHUNKSTEPS=1) and more link contention than Ring collectives.
 _A2A_BW_CORRECTION = 0.7
 
 
@@ -516,43 +526,46 @@ def nccl_reduce_scatter_cost(
 def nccl_all_to_all_cost(
     n_bytes: int, topo: MeshDimTopo, config: NCCLTopoConfig
 ) -> float:
-    """Cost model for AllToAll using Ring-style formulas with nsteps=nRanks.
+    """Cost model for AllToAll using architecture-aware bandwidth estimation.
 
     NCCL has no collective-level cost model for AllToAll — it is excluded from
     the tuning loop (NCCL_NUM_FUNCTIONS=5 covers only BR/RD/AG/RS/AR). At
     runtime, AllToAll is either decomposed into nRanks P2P Send/Recv pairs or
     dispatched to the Copy Engine (CE) path on Hopper+ with CUDA 12.5+.
 
-    This approximation reuses Ring latency/bandwidth constants with
-    nsteps=nRanks and bus-to-algo ratio=1.0 (matching tuning.cc's formula,
-    even though NCCL never evaluates it for AllToAll). It is likely optimistic
-    because:
-      - P2P AllToAll uses SLICESTEPS=1/CHUNKSTEPS=1 (vs NCCL_STEPS/4 and
-        NCCL_STEPS/2 for AG), reducing pipelining and effective bandwidth.
-      - All-to-all traffic creates contention on NVLink/network links that
-        unidirectional Ring collectives don't.
-      - The CE path (Hopper+) and LL AllToAll (small messages) have different
-        performance characteristics not captured here.
-
-    We apply a bandwidth correction factor (_A2A_BW_CORRECTION) to discount
-    effective bandwidth, accounting for worse pipelining and link contention.
+    Two paths:
+      - CE path (Hopper+ with NVSwitch, intra-node): uses empirical per-arch
+        bandwidth fitted from nccl-tests alltoall_perf. CE bypasses SM-driven
+        channels and achieves much higher throughput (~380 GB/s on H100 vs.
+        225 GB/s SM-driven).
+      - SM-driven fallback (older arch, no NVSwitch, or multi-node): reuses
+        Ring latency/bandwidth constants with nsteps=nRanks and bus-to-algo
+        ratio=1.0, discounted by _A2A_BW_CORRECTION for worse pipelining and
+        link contention.
 
     TODO: potential improvements, roughly in priority order:
-      1. Profile AllToAll vs AllGather across message sizes / rank counts on
-         real HW and fit a proper discount curve to bus_bw (similar to NCCL's
-         treeCorrectionFactor).
-      2. CE path model for Hopper+: branch on arch and estimate cost from CE
-         memcpy throughput instead of SM-driven channel bandwidth. Requires
-         per-arch CE BW numbers and knowledge of buffer registration state
-         (not available at cost-model time today).
-      3. LL AllToAll for small messages: separate latency-dominated model
+      1. Profile AllToAll on Blackwell NVSwitch hardware to replace the
+         estimated _A2A_CE_BW[BLACKWELL] with a measured value.
+      2. Profile multi-node AllToAll to validate or replace _A2A_BW_CORRECTION.
+      3. Fit a size-dependent discount curve to bus_bw for the SM-driven path
+         (similar to NCCL's treeCorrectionFactor).
+      4. LL AllToAll for small messages: separate latency-dominated model
          below some size threshold. Unlikely to matter for sharding decisions
          which typically involve large tensors.
     """
     n_ranks = topo.n_ranks
     n_nodes = topo.n_nodes
 
-    # Bandwidth: Ring-style, ratio = 1.0 (no bus-to-algo boost),
+    # CE path: Hopper+ with NVSwitch, intra-node AllToAll
+    if (
+        config.arch in (GpuArch.HOPPER, GpuArch.BLACKWELL)
+        and config.has_nvswitch
+        and n_nodes == 1
+    ):
+        bus_bw = _A2A_CE_BW[config.arch]
+        return _A2A_CE_LATENCY + n_bytes / (1000.0 * bus_bw)
+
+    # SM-driven fallback: Ring-style, ratio = 1.0 (no bus-to-algo boost),
     # discounted by correction factor for pipelining / contention.
     bw = topo.bw_intra if n_nodes <= 2 else topo.bw_inter
     bus_bw = topo.n_channels * bw * _A2A_BW_CORRECTION
