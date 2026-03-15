@@ -6,9 +6,10 @@
 """
 NCCL-based communication cost model for AutoParallel.
 
-Ports the Simple-protocol cost model from NCCL's tuning.cc to Python,
-covering 6 algorithms (Ring, Tree, CollNet Direct/Chain, NVLS, NVLS Tree)
-with per-architecture tuning constants and empirical correction factors.
+Ports the cost model from NCCL's tuning.cc to Python, covering 3 protocols
+(LL, LL128, Simple), 6 algorithms (Ring, Tree, CollNet Direct/Chain, NVLS,
+NVLS Tree) with per-architecture tuning constants and empirical correction
+factors.
 """
 
 from __future__ import annotations
@@ -41,6 +42,12 @@ class NCCLAlgo(Enum):
     COLLNET_CHAIN = 3
     NVLS = 4
     NVLS_TREE = 5
+
+
+class NCCLProto(Enum):
+    LL = 0
+    LL128 = 1
+    SIMPLE = 2
 
 
 _DEFAULT_CHANNELS = {
@@ -79,44 +86,44 @@ class MeshDimTopo:
 
 
 # ---------------------------------------------------------------------------
-# Tuning constants ported from NCCL tuning.cc (Simple protocol column only)
+# Tuning constants ported from NCCL tuning.cc
+# All per-protocol tuples are ordered (LL, LL128, SIMPLE).
 # ---------------------------------------------------------------------------
 
-# baseLatencies[algo][SIMPLE] (lines 143-148)
+# baseLatencies[algo][proto] (lines 143-148)
 _BASE_LATENCIES = {
-    NCCLAlgo.TREE: 8.4,
-    NCCLAlgo.RING: 8.4,
-    NCCLAlgo.COLLNET_DIRECT: 0.0,
-    NCCLAlgo.COLLNET_CHAIN: 0.0,
-    NCCLAlgo.NVLS: 0.0,
-    NCCLAlgo.NVLS_TREE: 0.0,
+    NCCLAlgo.TREE: (6.8, 14.0, 8.4),
+    NCCLAlgo.RING: (6.6, 14.0, 8.4),
+    NCCLAlgo.COLLNET_DIRECT: (0.0, 0.0, 0.0),
+    NCCLAlgo.COLLNET_CHAIN: (0.0, 0.0, 0.0),
+    NCCLAlgo.NVLS: (0.0, 0.0, 0.0),
+    NCCLAlgo.NVLS_TREE: (0.0, 0.0, 0.0),
 }
 
-# hwLatencies[hw][algo][SIMPLE] (lines 151-168)
-# hw: NVLINK, PCI, NET
+# hwLatencies[hw][algo][proto] (lines 151-168)
 _HW_LAT_NVLINK = {
-    NCCLAlgo.TREE: 4.0,
-    NCCLAlgo.RING: 3.4,
-    NCCLAlgo.COLLNET_DIRECT: 3.7,
-    NCCLAlgo.COLLNET_CHAIN: 2.8,
-    NCCLAlgo.NVLS: 25.0,
-    NCCLAlgo.NVLS_TREE: 25.0,
+    NCCLAlgo.TREE: (0.6, 1.25, 4.0),
+    NCCLAlgo.RING: (0.6, 1.9, 3.4),
+    NCCLAlgo.COLLNET_DIRECT: (0.0, 0.0, 3.7),
+    NCCLAlgo.COLLNET_CHAIN: (0.0, 0.0, 2.8),
+    NCCLAlgo.NVLS: (0.0, 0.0, 25.0),
+    NCCLAlgo.NVLS_TREE: (0.0, 0.0, 25.0),
 }
 _HW_LAT_PCI = {
-    NCCLAlgo.TREE: 4.0,
-    NCCLAlgo.RING: 5.7,
-    NCCLAlgo.COLLNET_DIRECT: 3.7,
-    NCCLAlgo.COLLNET_CHAIN: 2.8,
-    NCCLAlgo.NVLS: 0.0,
-    NCCLAlgo.NVLS_TREE: 0.0,
+    NCCLAlgo.TREE: (1.0, 1.9, 4.0),
+    NCCLAlgo.RING: (1.0, 2.5, 5.7),
+    NCCLAlgo.COLLNET_DIRECT: (0.0, 0.0, 3.7),
+    NCCLAlgo.COLLNET_CHAIN: (0.0, 0.0, 2.8),
+    NCCLAlgo.NVLS: (0.0, 0.0, 0.0),
+    NCCLAlgo.NVLS_TREE: (0.0, 0.0, 0.0),
 }
 _HW_LAT_NET = {
-    NCCLAlgo.TREE: 14.0,
-    NCCLAlgo.RING: 14.0,
-    NCCLAlgo.COLLNET_DIRECT: 31.0,
-    NCCLAlgo.COLLNET_CHAIN: 30.0,
-    NCCLAlgo.NVLS: 18.0,
-    NCCLAlgo.NVLS_TREE: 20.9,
+    NCCLAlgo.TREE: (5.0, 8.5, 14.0),
+    NCCLAlgo.RING: (2.7, 4.0, 14.0),
+    NCCLAlgo.COLLNET_DIRECT: (0.0, 0.0, 31.0),
+    NCCLAlgo.COLLNET_CHAIN: (0.0, 0.0, 30.0),
+    NCCLAlgo.NVLS: (0.0, 0.0, 18.0),
+    NCCLAlgo.NVLS_TREE: (0.0, 0.0, 20.9),
 }
 
 # perChMaxTreeBws[arch][nodeBucket] (lines 188-193), nodeBucket: N1/N2/N4+
@@ -133,6 +140,29 @@ _PER_CH_MAX_NVLS_TREE_BWS = {
     GpuArch.BLACKWELL: (0.0, 96.0, 43.8),
 }
 
+# llMaxBws[index1][nodeBucket] (lines 170-175)
+# Single-node: indexed by GPU arch. Multi-node: NCCL switches to CPU vendor
+# (Intel=row 0, AMD=row 1). We default to Intel for multi-node.
+_LL_MAX_BWS = {
+    GpuArch.AMPERE: (87.7, 39.0, 20.4),
+    GpuArch.HOPPER: (141.0, 39.0, 20.4),
+    GpuArch.BLACKWELL: (282.0, 39.0, 20.4),
+}
+
+# perChMaxRingLL128Bws[arch][nodeBucket] (lines 176-181)
+_PER_CH_MAX_RING_LL128_BWS = {
+    GpuArch.AMPERE: (20.0, 20.0, 20.0),
+    GpuArch.HOPPER: (36.7, 36.7, 36.7),
+    GpuArch.BLACKWELL: (40.0, 40.0, 40.0),
+}
+
+# perChMaxTreeLL128Bws[arch][nodeBucket] (lines 182-187)
+_PER_CH_MAX_TREE_LL128_BWS = {
+    GpuArch.AMPERE: (20.0, 20.0, 20.0),
+    GpuArch.HOPPER: (36.7, 36.7, 29.0),
+    GpuArch.BLACKWELL: (55.6, 31.67, 20.0),
+}
+
 # nvlsEfficiency[arch] (lines 135-140)
 _NVLS_EFFICIENCY = {
     GpuArch.AMPERE: 0.0,
@@ -140,33 +170,87 @@ _NVLS_EFFICIENCY = {
     GpuArch.BLACKWELL: 0.74,
 }
 
-# treeCorrectionFactor[SIMPLE][24] (line 584)
-_TREE_CORRECTION_FACTOR_SIMPLE = (
-    0.9,
-    0.9,
-    0.9,
-    0.9,
-    0.9,
-    0.9,
-    0.9,
-    0.8,
-    0.7,
-    0.6,
-    0.6,
-    0.5,
-    0.5,
-    0.5,
-    0.5,
-    0.6,
-    0.7,
-    0.8,
-    0.7,
-    0.7,
-    0.8,
-    0.9,
-    0.9,
-    0.9,
-)
+# treeCorrectionFactor[proto][24] (lines 581-585)
+_TREE_CORRECTION_FACTOR = {
+    NCCLProto.LL: (
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        0.9,
+        0.8,
+        0.7,
+        0.7,
+        0.7,
+        0.7,
+        0.6,
+        0.5,
+        0.4,
+        0.4,
+        0.5,
+        0.6,
+        0.7,
+        0.8,
+        0.9,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+    ),
+    NCCLProto.LL128: (
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        0.9,
+        0.8,
+        0.8,
+        0.8,
+        0.7,
+        0.6,
+        0.6,
+        0.6,
+        0.6,
+        0.6,
+        0.6,
+        0.8,
+        0.9,
+        0.9,
+        0.9,
+        0.9,
+        1.0,
+        1.0,
+        1.0,
+    ),
+    NCCLProto.SIMPLE: (
+        0.9,
+        0.9,
+        0.9,
+        0.9,
+        0.9,
+        0.9,
+        0.9,
+        0.8,
+        0.7,
+        0.6,
+        0.6,
+        0.5,
+        0.5,
+        0.5,
+        0.5,
+        0.6,
+        0.7,
+        0.8,
+        0.7,
+        0.7,
+        0.8,
+        0.9,
+        0.9,
+        0.9,
+    ),
+}
 
 
 def _node_bucket(n_nodes: int) -> int:
@@ -215,10 +299,11 @@ def derive_mesh_dim_topo(
 def _compute_algo_bw(
     func: NCCLFunc,
     algo: NCCLAlgo,
+    proto: NCCLProto,
     topo: MeshDimTopo,
     config: NCCLTopoConfig,
 ) -> float:
-    """Compute effective algorithm bandwidth in GB/s for a given algo."""
+    """Compute effective algorithm bandwidth in GB/s for a given algo+proto."""
     n_ranks = topo.n_ranks
     n_nodes = topo.n_nodes
     ppn = topo.ppn
@@ -227,13 +312,6 @@ def _compute_algo_bw(
     bw_inter = topo.bw_inter
     arch = config.arch
 
-    # NVSwitch aggregates all ppn NICs for inter-node Ring/Tree traffic.
-    # The effective per-channel bandwidth is capped by NVSwitch throughput.
-    if config.has_nvswitch and n_nodes > 1:
-        bw_inter_agg = min(bw_intra, bw_inter * ppn)
-    else:
-        bw_inter_agg = bw_inter
-
     if func == NCCLFunc.ALLREDUCE:
         nsteps = 2 * (n_ranks - 1)
     else:
@@ -241,25 +319,44 @@ def _compute_algo_bw(
 
     node_bucket = _node_bucket(n_nodes)
 
+    # NVLS/NVLS_TREE/CollNet only support Simple protocol
+    if proto != NCCLProto.SIMPLE:
+        if algo in (
+            NCCLAlgo.NVLS,
+            NCCLAlgo.NVLS_TREE,
+            NCCLAlgo.COLLNET_DIRECT,
+            NCCLAlgo.COLLNET_CHAIN,
+        ):
+            return 0.0
+
+    # NVSwitch aggregates all ppn NICs for inter-node Ring/Tree traffic.
+    if config.has_nvswitch and n_nodes > 1:
+        bw_inter_agg = min(bw_intra, bw_inter * ppn)
+    else:
+        bw_inter_agg = bw_inter
+
+    # --- Phase 1: compute raw bus BW per algorithm ---
+
     if algo == NCCLAlgo.RING:
         bw = bw_intra if n_nodes <= 2 else bw_inter_agg
         bus_bw = n_ch * bw
-        # Bus-to-algo conversion
-        bus_bw *= n_ranks / nsteps
 
     elif algo == NCCLAlgo.TREE:
-        # Tree is only used for AllReduce
         if func != NCCLFunc.ALLREDUCE:
             return 0.0
         bw = bw_intra if n_nodes <= 2 else bw_inter_agg
         bus_bw = n_ch * bw
-        per_ch_max = _PER_CH_MAX_TREE_BWS[arch][node_bucket]
-        bus_bw = min(bus_bw * 0.92, n_ch * per_ch_max)
-        bus_bw *= 0.5
 
     elif algo == NCCLAlgo.NVLS:
         eff = _NVLS_EFFICIENCY[arch]
         if n_ch < 2:
+            return 0.0
+        # NVLS multi-node AG/RS requires collnet (NCCL lines 327-334)
+        if (
+            func in (NCCLFunc.ALLGATHER, NCCLFunc.REDUCESCATTER)
+            and n_nodes > 1
+            and not config.has_collnet
+        ):
             return 0.0
         intra_bw = bw_intra * eff * (n_ch - 1) / n_ch
         if func == NCCLFunc.ALLREDUCE:
@@ -271,12 +368,8 @@ def _compute_algo_bw(
         else:
             bw = intra_bw
         bus_bw = n_ch * bw
-        # Bus-to-algo conversion for AG/RS
-        if func != NCCLFunc.ALLREDUCE:
-            bus_bw *= n_ranks / nsteps
 
     elif algo == NCCLAlgo.NVLS_TREE:
-        # Only for AllReduce
         if func != NCCLFunc.ALLREDUCE:
             return 0.0
         eff = _NVLS_EFFICIENCY[arch]
@@ -288,34 +381,61 @@ def _compute_algo_bw(
         per_ch_max = _PER_CH_MAX_NVLS_TREE_BWS[arch][node_bucket]
         bw = min(intra_bw, inter_bw, per_ch_max)
         bus_bw = n_ch * bw
-        bus_bw *= 0.5
 
     elif algo == NCCLAlgo.COLLNET_DIRECT:
         bw = bw_intra if n_nodes <= 2 else bw_inter_agg
         if func in (NCCLFunc.ALLGATHER, NCCLFunc.REDUCESCATTER):
-            # AG/RS: ppn * min(bwIntra, bwInter * 0.9), no bus-to-algo conversion
+            # AG/RS: no bus-to-algo conversion (NCCL line 347 skips it)
             bus_bw = ppn * min(bw_intra * n_ch, bw_inter * n_ch * 0.9)
             return bus_bw
         else:
-            # AllReduce
             bus_bw = n_ch * bw
             factor = ppn / n_ch
             factor -= (factor - 1) / 2
             bus_bw /= factor
             if arch in (GpuArch.HOPPER, GpuArch.BLACKWELL):
                 bus_bw *= 0.85
-            bus_bw *= 0.5
 
     elif algo == NCCLAlgo.COLLNET_CHAIN:
-        # Only Simple protocol, only for AllReduce
         if func != NCCLFunc.ALLREDUCE:
             return 0.0
         bw = bw_intra if n_nodes <= 2 else bw_inter_agg
         bus_bw = n_ch * bw
-        bus_bw *= 0.5
 
     else:
         return 0.0
+
+    # --- Phase 2: protocol-specific BW adjustments (NCCL lines 305-313) ---
+
+    ll_max_bw = _LL_MAX_BWS[arch][node_bucket]
+
+    if algo == NCCLAlgo.RING and proto == NCCLProto.LL:
+        bus_bw = min(ll_max_bw, bus_bw * 0.5)
+    if algo == NCCLAlgo.RING and proto == NCCLProto.LL128:
+        per_ch_max = _PER_CH_MAX_RING_LL128_BWS[arch][node_bucket]
+        bus_bw = min(bus_bw * 0.92, n_ch * per_ch_max)
+    if algo == NCCLAlgo.TREE and func == NCCLFunc.ALLREDUCE:
+        per_ch_max_tree = _PER_CH_MAX_TREE_BWS[arch][node_bucket]
+        bus_bw = min(bus_bw * 0.92, n_ch * per_ch_max_tree)
+    if algo == NCCLAlgo.TREE and proto == NCCLProto.LL:
+        bus_bw = min(bus_bw / 3.8, ll_max_bw)
+    if algo == NCCLAlgo.TREE and proto == NCCLProto.LL128:
+        per_ch_max_tree_ll128 = _PER_CH_MAX_TREE_LL128_BWS[arch][node_bucket]
+        bus_bw = min(
+            bus_bw * (7.0 / 9.0 if n_nodes == 1 else 120.0 / 128.0),
+            n_ch * per_ch_max_tree_ll128,
+        )
+
+    # --- Phase 3: bus-to-algo conversion (NCCL lines 346-352) ---
+    # For non-Ring AG/RS, no ratio applied (bus_bw IS algo_bw).
+    if algo == NCCLAlgo.RING or func not in (
+        NCCLFunc.ALLGATHER,
+        NCCLFunc.REDUCESCATTER,
+    ):
+        if algo in (NCCLAlgo.RING, NCCLAlgo.NVLS, NCCLAlgo.NVLS_TREE):
+            bus_bw *= n_ranks / nsteps
+        else:
+            bus_bw *= 0.5
 
     return bus_bw
 
@@ -324,9 +444,8 @@ def _compute_algo_bw(
 # Latency computation — port of tuning.cc lines 354-402
 # ---------------------------------------------------------------------------
 
-# getNetOverhead() * 3 for Simple protocol when nNodes > 1
-# We use 1.0 us base (Intel default)
-_NET_OVERHEAD_SIMPLE = 1.0 * 3
+# getNetOverhead() base value (1.0 us for Intel, the common default)
+_NET_OVERHEAD_BASE = 1.0
 
 
 # CE-path AllToAll bandwidth for NVSwitch-connected Hopper+ GPUs (GB/s).
@@ -383,26 +502,29 @@ _A2A_BW_CORRECTION = 0.7
 def _compute_algo_latency(
     func: NCCLFunc,
     algo: NCCLAlgo,
+    proto: NCCLProto,
     topo: MeshDimTopo,
     config: NCCLTopoConfig,
 ) -> float:
-    """Compute latency in microseconds for a given algo."""
+    """Compute latency in microseconds for a given algo+proto."""
     n_ranks = topo.n_ranks
     n_nodes = topo.n_nodes
     ppn = topo.ppn
+    p = proto.value
 
-    base_lat = _BASE_LATENCIES[algo]
+    base_lat = _BASE_LATENCIES[algo][p]
     # We assume NVLink intra-node
-    intra_lat = _HW_LAT_NVLINK[algo]
+    intra_lat = _HW_LAT_NVLINK[algo][p]
 
     # ppn==1 case: use Tree NET latency for inter
     if ppn == 1:
-        inter_lat_base = _HW_LAT_NET[NCCLAlgo.TREE]
+        inter_lat_base = _HW_LAT_NET[NCCLAlgo.TREE][p]
     else:
-        inter_lat_base = _HW_LAT_NET[algo]
+        inter_lat_base = _HW_LAT_NET[algo][p]
     inter_lat = inter_lat_base + config.net_latency
     # Simple protocol doubles net_latency (flush extra latency, line 360)
-    inter_lat += config.net_latency
+    if proto == NCCLProto.SIMPLE:
+        inter_lat += config.net_latency
 
     if func == NCCLFunc.ALLREDUCE:
         nsteps = 2 * (n_ranks - 1)
@@ -410,7 +532,12 @@ def _compute_algo_latency(
         nsteps = n_ranks - 1
 
     if algo == NCCLAlgo.RING:
-        net_overhead = _NET_OVERHEAD_SIMPLE if n_nodes > 1 else 0.0
+        if n_nodes > 1:
+            net_overhead = _NET_OVERHEAD_BASE
+            if proto == NCCLProto.SIMPLE:
+                net_overhead *= 3
+        else:
+            net_overhead = 0.0
         intra_lat = max(intra_lat, net_overhead)
         if n_nodes == 1:
             n_inter_steps = 0
@@ -423,7 +550,6 @@ def _compute_algo_latency(
         )
 
     elif algo == NCCLAlgo.TREE:
-        # Tree only for AllReduce
         lat = base_lat + 2 * (
             (n_ranks // n_nodes - 1) * intra_lat + _log2i(n_nodes) * inter_lat
         )
@@ -462,37 +588,39 @@ def _log2i(n: int) -> int:
 def _nccl_algo_time(
     func: NCCLFunc,
     algo: NCCLAlgo,
+    proto: NCCLProto,
     n_bytes: int,
     topo: MeshDimTopo,
     config: NCCLTopoConfig,
 ) -> float:
-    """Compute estimated time in microseconds for one algorithm.
+    """Compute estimated time in microseconds for one algorithm+protocol.
 
     Returns float('inf') if the algorithm is disabled (zero bandwidth).
     """
-    bw = _compute_algo_bw(func, algo, topo, config)
-    lat = _compute_algo_latency(func, algo, topo, config)
+    bw = _compute_algo_bw(func, algo, proto, topo, config)
+    lat = _compute_algo_latency(func, algo, proto, topo, config)
 
     if bw <= 0:
         return float("inf")
 
-    # Tree correction factor (line 595)
+    # Tree correction factor (NCCL line 595: logSize < 23 for Tree)
     log_size = _log2i(n_bytes >> 6)
-    if algo == NCCLAlgo.TREE and func == NCCLFunc.ALLREDUCE and 0 <= log_size < 24:
-        bw *= _TREE_CORRECTION_FACTOR_SIMPLE[log_size]
+    if algo == NCCLAlgo.TREE and func == NCCLFunc.ALLREDUCE and 0 <= log_size < 23:
+        bw *= _TREE_CORRECTION_FACTOR[proto][log_size]
 
-    # NVLS_Tree correction for Blackwell (line 596)
+    # NVLS_Tree correction for Blackwell (line 596: logSize < 24)
     if (
         algo == NCCLAlgo.NVLS_TREE
         and func == NCCLFunc.ALLREDUCE
         and config.arch == GpuArch.BLACKWELL
         and 0 <= log_size < 24
     ):
-        bw *= _TREE_CORRECTION_FACTOR_SIMPLE[log_size]
+        bw *= _TREE_CORRECTION_FACTOR[proto][log_size]
 
     # Ring plateau effect for multi-node Simple allreduce (lines 597-599)
     if (
         algo == NCCLAlgo.RING
+        and proto == NCCLProto.SIMPLE
         and topo.n_nodes > 1
         and func == NCCLFunc.ALLREDUCE
         and n_bytes / (topo.n_channels * topo.n_ranks) >= 64
@@ -526,13 +654,25 @@ def _eligible_algos(
     return algos
 
 
+def _eligible_protos(algo: NCCLAlgo) -> list[NCCLProto]:
+    """Return protocols eligible for a given algorithm."""
+    if algo in (
+        NCCLAlgo.NVLS,
+        NCCLAlgo.NVLS_TREE,
+        NCCLAlgo.COLLNET_DIRECT,
+        NCCLAlgo.COLLNET_CHAIN,
+    ):
+        return [NCCLProto.SIMPLE]
+    return [NCCLProto.LL, NCCLProto.LL128, NCCLProto.SIMPLE]
+
+
 def nccl_collective_time(
     func: NCCLFunc,
     n_bytes: int,
     topo: MeshDimTopo,
     config: NCCLTopoConfig,
 ) -> float:
-    """Pick the best algorithm and return estimated time in microseconds.
+    """Pick the best algorithm+protocol and return estimated time in microseconds.
 
     For Hopper+ with NVSwitch on a single node, uses empirical bandwidth
     and latency fitted from nccl-tests at 2/4/8 GPUs, with linear
@@ -555,9 +695,10 @@ def nccl_collective_time(
     algos = _eligible_algos(func, config, topo.n_nodes)
     best = float("inf")
     for algo in algos:
-        t = _nccl_algo_time(func, algo, n_bytes, topo, config)
-        if t < best:
-            best = t
+        for proto in _eligible_protos(algo):
+            t = _nccl_algo_time(func, algo, proto, n_bytes, topo, config)
+            if t < best:
+                best = t
     return best
 
 
@@ -616,6 +757,7 @@ def nccl_all_to_all_cost(
     """
     n_ranks = topo.n_ranks
     n_nodes = topo.n_nodes
+    _s = NCCLProto.SIMPLE.value
 
     # CE path: Hopper+ with NVSwitch, intra-node AllToAll
     if (
@@ -634,19 +776,19 @@ def nccl_all_to_all_cost(
     if bus_bw <= 0:
         return float("inf")
 
-    # Latency: Ring-style with nsteps = nRanks
+    # Latency: Ring-style with nsteps = nRanks, Simple protocol
     nsteps = n_ranks
-    base_lat = _BASE_LATENCIES[NCCLAlgo.RING]
-    intra_lat = _HW_LAT_NVLINK[NCCLAlgo.RING]
+    base_lat = _BASE_LATENCIES[NCCLAlgo.RING][_s]
+    intra_lat = _HW_LAT_NVLINK[NCCLAlgo.RING][_s]
 
     if topo.ppn == 1:
-        inter_lat_base = _HW_LAT_NET[NCCLAlgo.TREE]
+        inter_lat_base = _HW_LAT_NET[NCCLAlgo.TREE][_s]
     else:
-        inter_lat_base = _HW_LAT_NET[NCCLAlgo.RING]
+        inter_lat_base = _HW_LAT_NET[NCCLAlgo.RING][_s]
     inter_lat = inter_lat_base + config.net_latency
     inter_lat += config.net_latency  # Simple protocol doubles net_latency
 
-    net_overhead = _NET_OVERHEAD_SIMPLE if n_nodes > 1 else 0.0
+    net_overhead = _NET_OVERHEAD_BASE * 3 if n_nodes > 1 else 0.0
     intra_lat = max(intra_lat, net_overhead)
 
     n_inter_steps = 0 if n_nodes == 1 else n_nodes - 1

@@ -9,10 +9,12 @@ from autoparallel.cost_models.nccl_cost_model import (
     GpuArch,
     NCCLAlgo,
     NCCLFunc,
+    NCCLProto,
     NCCLTopoConfig,
     _compute_algo_bw,
     _compute_algo_latency,
     _eligible_algos,
+    _eligible_protos,
     _nccl_algo_time,
     a100_topo_config,
     derive_mesh_dim_topo,
@@ -96,7 +98,9 @@ class TestAlgoBwLatency:
     def test_ring_bw_single_node(self):
         config = a100_topo_config()
         topo = derive_mesh_dim_topo(config, (8,), 0)
-        bw = _compute_algo_bw(NCCLFunc.ALLREDUCE, NCCLAlgo.RING, topo, config)
+        bw = _compute_algo_bw(
+            NCCLFunc.ALLREDUCE, NCCLAlgo.RING, NCCLProto.SIMPLE, topo, config
+        )
         # Ring AR: busBw = nCh * bw * nRanks / (2*(nRanks-1))
         expected = 12 * (87.7 / 12) * 8 / (2 * 7)
         assert bw == pytest.approx(expected)
@@ -104,7 +108,9 @@ class TestAlgoBwLatency:
     def test_ring_bw_allgather(self):
         config = a100_topo_config()
         topo = derive_mesh_dim_topo(config, (8,), 0)
-        bw = _compute_algo_bw(NCCLFunc.ALLGATHER, NCCLAlgo.RING, topo, config)
+        bw = _compute_algo_bw(
+            NCCLFunc.ALLGATHER, NCCLAlgo.RING, NCCLProto.SIMPLE, topo, config
+        )
         # Ring AG: busBw = nCh * bw * nRanks / (nRanks-1)
         expected = 12 * (87.7 / 12) * 8 / 7
         assert bw == pytest.approx(expected)
@@ -112,7 +118,9 @@ class TestAlgoBwLatency:
     def test_tree_bw_allreduce(self):
         config = a100_topo_config()
         topo = derive_mesh_dim_topo(config, (8,), 0)
-        bw = _compute_algo_bw(NCCLFunc.ALLREDUCE, NCCLAlgo.TREE, topo, config)
+        bw = _compute_algo_bw(
+            NCCLFunc.ALLREDUCE, NCCLAlgo.TREE, NCCLProto.SIMPLE, topo, config
+        )
         # Tree AR: busBw = min(nCh*bw*0.92, nCh*perChMax) * 0.5
         per_ch_max = 24.0  # Ampere, N1
         raw = 12 * (87.7 / 12)
@@ -123,26 +131,34 @@ class TestAlgoBwLatency:
     def test_tree_not_available_for_ag(self):
         config = a100_topo_config()
         topo = derive_mesh_dim_topo(config, (8,), 0)
-        bw = _compute_algo_bw(NCCLFunc.ALLGATHER, NCCLAlgo.TREE, topo, config)
+        bw = _compute_algo_bw(
+            NCCLFunc.ALLGATHER, NCCLAlgo.TREE, NCCLProto.SIMPLE, topo, config
+        )
         assert bw == 0.0
 
     def test_nvls_bw_hopper(self):
         config = h100_topo_config()
         topo = derive_mesh_dim_topo(config, (8,), 0)
-        bw = _compute_algo_bw(NCCLFunc.ALLREDUCE, NCCLAlgo.NVLS, topo, config)
+        bw = _compute_algo_bw(
+            NCCLFunc.ALLREDUCE, NCCLAlgo.NVLS, NCCLProto.SIMPLE, topo, config
+        )
         assert bw > 0
 
     def test_nvls_bw_ampere_zero(self):
         config = a100_topo_config(has_nvswitch=True)
         topo = derive_mesh_dim_topo(config, (8,), 0)
         # Ampere nvlsEfficiency = 0.0, so intraBw should be 0
-        bw = _compute_algo_bw(NCCLFunc.ALLREDUCE, NCCLAlgo.NVLS, topo, config)
+        bw = _compute_algo_bw(
+            NCCLFunc.ALLREDUCE, NCCLAlgo.NVLS, NCCLProto.SIMPLE, topo, config
+        )
         assert bw == 0.0
 
     def test_ring_latency_single_node(self):
         config = a100_topo_config()
         topo = derive_mesh_dim_topo(config, (8,), 0)
-        lat = _compute_algo_latency(NCCLFunc.ALLREDUCE, NCCLAlgo.RING, topo, config)
+        lat = _compute_algo_latency(
+            NCCLFunc.ALLREDUCE, NCCLAlgo.RING, NCCLProto.SIMPLE, topo, config
+        )
         # nNodes=1: nInterSteps=0, lat = baseLat + nsteps*intraLat
         nsteps = 2 * 7
         expected = 8.4 + nsteps * 3.4  # NVLink ring lat = 3.4
@@ -151,7 +167,9 @@ class TestAlgoBwLatency:
     def test_ring_latency_multi_node(self):
         config = a100_topo_config(num_nodes=2, gpus_per_node=1)
         topo = derive_mesh_dim_topo(config, (2,), 0)
-        lat = _compute_algo_latency(NCCLFunc.ALLREDUCE, NCCLAlgo.RING, topo, config)
+        lat = _compute_algo_latency(
+            NCCLFunc.ALLREDUCE, NCCLAlgo.RING, NCCLProto.SIMPLE, topo, config
+        )
         # gpus_per_node=1 => ppn=1, n_nodes=2, nRanks=2, nsteps=2, nInterSteps=2
         # netOverhead = 1.0*3 = 3.0, intraLat = max(3.4, 3.0) = 3.4
         # ppn=1 => interLat base = hwLat[NET][TREE] = 14.0
@@ -161,7 +179,9 @@ class TestAlgoBwLatency:
     def test_tree_latency_single_node(self):
         config = a100_topo_config()
         topo = derive_mesh_dim_topo(config, (8,), 0)
-        lat = _compute_algo_latency(NCCLFunc.ALLREDUCE, NCCLAlgo.TREE, topo, config)
+        lat = _compute_algo_latency(
+            NCCLFunc.ALLREDUCE, NCCLAlgo.TREE, NCCLProto.SIMPLE, topo, config
+        )
         # nNodes=1: lat = baseLat + 2*((ppn-1)*intraLat + log2(1)*interLat)
         # = 8.4 + 2*(7*4.0 + 0) = 8.4 + 56 = 64.4
         assert lat == pytest.approx(8.4 + 2 * 7 * 4.0)
@@ -176,10 +196,10 @@ class TestAlgorithmSelection:
         topo = derive_mesh_dim_topo(config, (8,), 0)
         n_bytes = 1 << 20  # 1MB
         ring_time = _nccl_algo_time(
-            NCCLFunc.ALLREDUCE, NCCLAlgo.RING, n_bytes, topo, config
+            NCCLFunc.ALLREDUCE, NCCLAlgo.RING, NCCLProto.SIMPLE, n_bytes, topo, config
         )
         nvls_time = _nccl_algo_time(
-            NCCLFunc.ALLREDUCE, NCCLAlgo.NVLS, n_bytes, topo, config
+            NCCLFunc.ALLREDUCE, NCCLAlgo.NVLS, NCCLProto.SIMPLE, n_bytes, topo, config
         )
         # NVLS should be competitive or better for large-ish messages on Hopper
         assert nvls_time < ring_time * 2  # At least in the same ballpark
@@ -189,10 +209,10 @@ class TestAlgorithmSelection:
         topo = derive_mesh_dim_topo(config, (4,), 0)
         n_bytes = 1 << 20
         ring_time = _nccl_algo_time(
-            NCCLFunc.ALLREDUCE, NCCLAlgo.RING, n_bytes, topo, config
+            NCCLFunc.ALLREDUCE, NCCLAlgo.RING, NCCLProto.SIMPLE, n_bytes, topo, config
         )
         tree_time = _nccl_algo_time(
-            NCCLFunc.ALLREDUCE, NCCLAlgo.TREE, n_bytes, topo, config
+            NCCLFunc.ALLREDUCE, NCCLAlgo.TREE, NCCLProto.SIMPLE, n_bytes, topo, config
         )
         # Tree should be competitive for multi-node AllReduce
         assert tree_time < float("inf")
@@ -249,6 +269,137 @@ class TestFeatureFlags:
         assert NCCLAlgo.COLLNET_CHAIN not in algos
 
 
+# ---- Protocol eligibility ----
+
+
+class TestProtocolEligibility:
+    def test_ring_all_protos(self):
+        protos = _eligible_protos(NCCLAlgo.RING)
+        assert NCCLProto.LL in protos
+        assert NCCLProto.LL128 in protos
+        assert NCCLProto.SIMPLE in protos
+
+    def test_tree_all_protos(self):
+        protos = _eligible_protos(NCCLAlgo.TREE)
+        assert NCCLProto.LL in protos
+        assert NCCLProto.LL128 in protos
+        assert NCCLProto.SIMPLE in protos
+
+    def test_nvls_simple_only(self):
+        assert _eligible_protos(NCCLAlgo.NVLS) == [NCCLProto.SIMPLE]
+
+    def test_nvls_tree_simple_only(self):
+        assert _eligible_protos(NCCLAlgo.NVLS_TREE) == [NCCLProto.SIMPLE]
+
+    def test_collnet_simple_only(self):
+        assert _eligible_protos(NCCLAlgo.COLLNET_DIRECT) == [NCCLProto.SIMPLE]
+        assert _eligible_protos(NCCLAlgo.COLLNET_CHAIN) == [NCCLProto.SIMPLE]
+
+
+# ---- LL/LL128 bandwidth tests ----
+
+
+class TestLLBandwidth:
+    def test_ring_ll_capped_by_ll_max(self):
+        """Ring+LL bandwidth should be capped by llMaxBws."""
+        config = a100_topo_config()
+        topo = derive_mesh_dim_topo(config, (8,), 0)
+        bw_ll = _compute_algo_bw(
+            NCCLFunc.ALLGATHER, NCCLAlgo.RING, NCCLProto.LL, topo, config
+        )
+        bw_simple = _compute_algo_bw(
+            NCCLFunc.ALLGATHER, NCCLAlgo.RING, NCCLProto.SIMPLE, topo, config
+        )
+        # LL: min(llMaxBw, busBw * 0.5) then bus-to-algo
+        # Simple: busBw then bus-to-algo
+        assert bw_ll < bw_simple
+        assert bw_ll > 0
+
+    def test_ring_ll128_capped(self):
+        """Ring+LL128 bandwidth should be capped by perChMaxRingLL128Bw."""
+        config = a100_topo_config()
+        topo = derive_mesh_dim_topo(config, (8,), 0)
+        bw_ll128 = _compute_algo_bw(
+            NCCLFunc.ALLGATHER, NCCLAlgo.RING, NCCLProto.LL128, topo, config
+        )
+        bw_simple = _compute_algo_bw(
+            NCCLFunc.ALLGATHER, NCCLAlgo.RING, NCCLProto.SIMPLE, topo, config
+        )
+        # LL128: min(busBw * 0.92, nCh * perChMax) then bus-to-algo
+        assert bw_ll128 <= bw_simple
+        assert bw_ll128 > 0
+
+    def test_tree_ll_much_lower_than_simple(self):
+        """Tree+LL should have much lower BW than Tree+Simple."""
+        config = a100_topo_config()
+        topo = derive_mesh_dim_topo(config, (8,), 0)
+        bw_ll = _compute_algo_bw(
+            NCCLFunc.ALLREDUCE, NCCLAlgo.TREE, NCCLProto.LL, topo, config
+        )
+        bw_simple = _compute_algo_bw(
+            NCCLFunc.ALLREDUCE, NCCLAlgo.TREE, NCCLProto.SIMPLE, topo, config
+        )
+        # Tree+LL: min(busBw/3.8, llMaxBw) * 0.5
+        assert bw_ll < bw_simple
+        assert bw_ll > 0
+
+    def test_nvls_ll_returns_zero(self):
+        """NVLS + non-Simple protocol should return 0."""
+        config = h100_topo_config()
+        topo = derive_mesh_dim_topo(config, (8,), 0)
+        bw_ll = _compute_algo_bw(
+            NCCLFunc.ALLREDUCE, NCCLAlgo.NVLS, NCCLProto.LL, topo, config
+        )
+        bw_ll128 = _compute_algo_bw(
+            NCCLFunc.ALLREDUCE, NCCLAlgo.NVLS, NCCLProto.LL128, topo, config
+        )
+        assert bw_ll == 0.0
+        assert bw_ll128 == 0.0
+
+
+# ---- LL latency tests ----
+
+
+class TestLLLatency:
+    def test_ring_ll_lower_latency_than_simple(self):
+        """Ring+LL should have lower latency than Ring+Simple."""
+        config = a100_topo_config()
+        topo = derive_mesh_dim_topo(config, (8,), 0)
+        lat_ll = _compute_algo_latency(
+            NCCLFunc.ALLREDUCE, NCCLAlgo.RING, NCCLProto.LL, topo, config
+        )
+        lat_simple = _compute_algo_latency(
+            NCCLFunc.ALLREDUCE, NCCLAlgo.RING, NCCLProto.SIMPLE, topo, config
+        )
+        # LL base latency (6.6) + intra (0.6) vs Simple base (8.4) + intra (3.4)
+        assert lat_ll < lat_simple
+
+    def test_ring_ll_multi_node_net_overhead_lower(self):
+        """Ring+LL multi-node: net overhead is not multiplied by 3."""
+        config = a100_topo_config(num_nodes=4, gpus_per_node=1)
+        topo = derive_mesh_dim_topo(config, (4,), 0)
+        lat_ll = _compute_algo_latency(
+            NCCLFunc.ALLREDUCE, NCCLAlgo.RING, NCCLProto.LL, topo, config
+        )
+        lat_simple = _compute_algo_latency(
+            NCCLFunc.ALLREDUCE, NCCLAlgo.RING, NCCLProto.SIMPLE, topo, config
+        )
+        assert lat_ll < lat_simple
+
+    def test_inter_lat_no_double_for_ll(self):
+        """LL protocol should not double the net_latency (no flush overhead)."""
+        config = a100_topo_config(num_nodes=2, gpus_per_node=1, net_latency=5.0)
+        topo = derive_mesh_dim_topo(config, (2,), 0)
+        lat_ll = _compute_algo_latency(
+            NCCLFunc.ALLREDUCE, NCCLAlgo.RING, NCCLProto.LL, topo, config
+        )
+        lat_simple = _compute_algo_latency(
+            NCCLFunc.ALLREDUCE, NCCLAlgo.RING, NCCLProto.SIMPLE, topo, config
+        )
+        # Simple doubles net_latency (adds 5.0 extra), LL doesn't
+        assert lat_simple > lat_ll
+
+
 # ---- Tree correction factor ----
 
 
@@ -261,10 +412,10 @@ class TestTreeCorrection:
         large = 1 << 18  # 256KB, log2(256K/64) = 12 -> factor = 0.5
 
         time_small = _nccl_algo_time(
-            NCCLFunc.ALLREDUCE, NCCLAlgo.TREE, small, topo, config
+            NCCLFunc.ALLREDUCE, NCCLAlgo.TREE, NCCLProto.SIMPLE, small, topo, config
         )
         time_large = _nccl_algo_time(
-            NCCLFunc.ALLREDUCE, NCCLAlgo.TREE, large, topo, config
+            NCCLFunc.ALLREDUCE, NCCLAlgo.TREE, NCCLProto.SIMPLE, large, topo, config
         )
 
         # Both should be finite
@@ -272,8 +423,12 @@ class TestTreeCorrection:
         assert time_large < float("inf")
 
         # Verify correction is actually applied by comparing with uncorrected
-        bw_raw = _compute_algo_bw(NCCLFunc.ALLREDUCE, NCCLAlgo.TREE, topo, config)
-        lat = _compute_algo_latency(NCCLFunc.ALLREDUCE, NCCLAlgo.TREE, topo, config)
+        bw_raw = _compute_algo_bw(
+            NCCLFunc.ALLREDUCE, NCCLAlgo.TREE, NCCLProto.SIMPLE, topo, config
+        )
+        lat = _compute_algo_latency(
+            NCCLFunc.ALLREDUCE, NCCLAlgo.TREE, NCCLProto.SIMPLE, topo, config
+        )
         time_uncorrected = lat + large / (1000.0 * bw_raw)
         # With correction factor of 0.5, bw is halved => comm time doubles
         assert time_large > time_uncorrected
@@ -295,16 +450,18 @@ class TestRingPlateau:
         above = threshold
 
         time_below = _nccl_algo_time(
-            NCCLFunc.ALLREDUCE, NCCLAlgo.RING, below, topo, config
+            NCCLFunc.ALLREDUCE, NCCLAlgo.RING, NCCLProto.SIMPLE, below, topo, config
         )
         time_above = _nccl_algo_time(
-            NCCLFunc.ALLREDUCE, NCCLAlgo.RING, above, topo, config
+            NCCLFunc.ALLREDUCE, NCCLAlgo.RING, NCCLProto.SIMPLE, above, topo, config
         )
 
         # The latency inflation of 1.4x should cause a jump at the threshold
-        bw = _compute_algo_bw(NCCLFunc.ALLREDUCE, NCCLAlgo.RING, topo, config)
+        bw = _compute_algo_bw(
+            NCCLFunc.ALLREDUCE, NCCLAlgo.RING, NCCLProto.SIMPLE, topo, config
+        )
         lat_base = _compute_algo_latency(
-            NCCLFunc.ALLREDUCE, NCCLAlgo.RING, topo, config
+            NCCLFunc.ALLREDUCE, NCCLAlgo.RING, NCCLProto.SIMPLE, topo, config
         )
         # Below: no inflation
         expected_below = lat_base + below / (1000.0 * bw)
@@ -313,6 +470,26 @@ class TestRingPlateau:
 
         assert time_below == pytest.approx(expected_below)
         assert time_above == pytest.approx(expected_above)
+
+    def test_ring_plateau_only_simple(self):
+        """Ring plateau should only apply to Simple protocol."""
+        config = a100_topo_config(num_nodes=4, gpus_per_node=1)
+        topo = derive_mesh_dim_topo(config, (4,), 0)
+        n_bytes = 1 << 20  # well above threshold
+
+        bw_ll = _compute_algo_bw(
+            NCCLFunc.ALLREDUCE, NCCLAlgo.RING, NCCLProto.LL, topo, config
+        )
+        lat_ll = _compute_algo_latency(
+            NCCLFunc.ALLREDUCE, NCCLAlgo.RING, NCCLProto.LL, topo, config
+        )
+        time_ll = _nccl_algo_time(
+            NCCLFunc.ALLREDUCE, NCCLAlgo.RING, NCCLProto.LL, n_bytes, topo, config
+        )
+        if bw_ll > 0:
+            # LL should NOT have plateau inflation
+            expected_ll = lat_ll + n_bytes / (1000.0 * bw_ll)
+            assert time_ll == pytest.approx(expected_ll)
 
 
 # ---- Monotonicity ----
@@ -618,10 +795,14 @@ class TestNICAggregation:
         topo_nvs = derive_mesh_dim_topo(config_nvs, (32,), 0)
         topo_no_nvs = derive_mesh_dim_topo(config_no_nvs, (32,), 0)
         bw_nvs = _compute_algo_bw(
-            NCCLFunc.ALLGATHER, NCCLAlgo.RING, topo_nvs, config_nvs
+            NCCLFunc.ALLGATHER, NCCLAlgo.RING, NCCLProto.SIMPLE, topo_nvs, config_nvs
         )
         bw_no_nvs = _compute_algo_bw(
-            NCCLFunc.ALLGATHER, NCCLAlgo.RING, topo_no_nvs, config_no_nvs
+            NCCLFunc.ALLGATHER,
+            NCCLAlgo.RING,
+            NCCLProto.SIMPLE,
+            topo_no_nvs,
+            config_no_nvs,
         )
         assert bw_nvs > bw_no_nvs
 
@@ -642,10 +823,15 @@ class TestNICAggregation:
         topo = derive_mesh_dim_topo(config, (32,), 0)
         n_bytes = 1 << 30
         nvls_time = _nccl_algo_time(
-            NCCLFunc.ALLREDUCE, NCCLAlgo.NVLS, n_bytes, topo, config
+            NCCLFunc.ALLREDUCE, NCCLAlgo.NVLS, NCCLProto.SIMPLE, n_bytes, topo, config
         )
         nvls_tree_time = _nccl_algo_time(
-            NCCLFunc.ALLREDUCE, NCCLAlgo.NVLS_TREE, n_bytes, topo, config
+            NCCLFunc.ALLREDUCE,
+            NCCLAlgo.NVLS_TREE,
+            NCCLProto.SIMPLE,
+            n_bytes,
+            topo,
+            config,
         )
         assert nvls_tree_time < nvls_time
 
@@ -653,8 +839,54 @@ class TestNICAggregation:
         """A100 (no NVSwitch) Ring BW should be unchanged by aggregation."""
         config = a100_topo_config(num_nodes=4, gpus_per_node=8)
         topo = derive_mesh_dim_topo(config, (32,), 0)
-        bw = _compute_algo_bw(NCCLFunc.ALLGATHER, NCCLAlgo.RING, topo, config)
+        bw = _compute_algo_bw(
+            NCCLFunc.ALLGATHER, NCCLAlgo.RING, NCCLProto.SIMPLE, topo, config
+        )
         # Without NVSwitch: bw_inter used directly, no aggregation
         bw_inter_per_ch = 25.0 / 12
         expected = 12 * bw_inter_per_ch * 32 / 31
         assert bw == pytest.approx(expected)
+
+
+# ---- LL wins for small messages at multi-node ----
+
+
+class TestLLWinsSmallMessages:
+    def test_ll_wins_small_multi_node_ag(self):
+        """For small multi-node AG, LL or LL128 should beat Simple."""
+        config = a100_topo_config(num_nodes=4, gpus_per_node=1)
+        topo = derive_mesh_dim_topo(config, (4,), 0)
+        n_bytes = 1 << 10  # 1KB
+        time_simple = _nccl_algo_time(
+            NCCLFunc.ALLGATHER, NCCLAlgo.RING, NCCLProto.SIMPLE, n_bytes, topo, config
+        )
+        time_ll = _nccl_algo_time(
+            NCCLFunc.ALLGATHER, NCCLAlgo.RING, NCCLProto.LL, n_bytes, topo, config
+        )
+        # LL should have lower latency, winning for small messages
+        assert time_ll < time_simple
+
+    def test_simple_wins_large_message(self):
+        """For large messages, Simple should beat LL (higher BW)."""
+        config = a100_topo_config()
+        topo = derive_mesh_dim_topo(config, (8,), 0)
+        n_bytes = 1 << 24  # 16MB
+        time_simple = _nccl_algo_time(
+            NCCLFunc.ALLGATHER, NCCLAlgo.RING, NCCLProto.SIMPLE, n_bytes, topo, config
+        )
+        time_ll = _nccl_algo_time(
+            NCCLFunc.ALLGATHER, NCCLAlgo.RING, NCCLProto.LL, n_bytes, topo, config
+        )
+        assert time_simple < time_ll
+
+    def test_collective_time_picks_best_proto(self):
+        """nccl_collective_time should pick the best protocol automatically."""
+        config = a100_topo_config(num_nodes=4, gpus_per_node=1)
+        topo = derive_mesh_dim_topo(config, (4,), 0)
+        n_bytes = 1 << 10
+        best = nccl_collective_time(NCCLFunc.ALLGATHER, n_bytes, topo, config)
+        # Should be at most the Simple time
+        time_simple = _nccl_algo_time(
+            NCCLFunc.ALLGATHER, NCCLAlgo.RING, NCCLProto.SIMPLE, n_bytes, topo, config
+        )
+        assert best <= time_simple
