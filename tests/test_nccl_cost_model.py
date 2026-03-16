@@ -6,6 +6,9 @@
 import pytest
 
 from autoparallel.cost_models.nccl_cost_model import (
+    _A2A_MULTI_NODE_LAT_POINTS,
+    _A2A_NIC_OVERHEAD,
+    _A2A_NIC_RAMP_FACTOR,
     _RING_CORRECTION_FACTOR,
     GpuArch,
     NCCLAlgo,
@@ -16,6 +19,7 @@ from autoparallel.cost_models.nccl_cost_model import (
     _compute_algo_latency,
     _eligible_algos,
     _eligible_protos,
+    _interp_clamped,
     _log2i,
     _nccl_algo_time,
     a100_topo_config,
@@ -806,6 +810,111 @@ class TestAllToAllCost:
         a2a = nccl_all_to_all_cost(n_bytes, topo, config)
         ag = nccl_allgather_cost(n_bytes, topo, config)
         assert a2a > ag
+
+    def test_multi_node_latency_sublinear(self):
+        """Multi-node AllToAll latency should grow sublinearly with nodes."""
+        lat_2n = _interp_clamped(_A2A_MULTI_NODE_LAT_POINTS, 2)
+        lat_4n = _interp_clamped(_A2A_MULTI_NODE_LAT_POINTS, 4)
+        lat_8n = _interp_clamped(_A2A_MULTI_NODE_LAT_POINTS, 8)
+        assert lat_2n < lat_4n < lat_8n
+        # Sublinear: 4x nodes should give less than 4x latency
+        assert lat_8n < 4 * lat_2n
+
+    def test_multi_node_bw_scales_with_bw_inter(self):
+        """Multi-node NVSwitch AllToAll BW should scale with bw_inter, not bw_intra."""
+        config_50 = h100_topo_config(num_nodes=2, bw_inter=50.0)
+        config_25 = h100_topo_config(num_nodes=2, bw_inter=25.0)
+        topo_50 = derive_mesh_dim_topo(config_50, (16,), 0)
+        topo_25 = derive_mesh_dim_topo(config_25, (16,), 0)
+        n_bytes = 1 << 30  # 1GB — BW-dominated
+        cost_50 = nccl_all_to_all_cost(n_bytes, topo_50, config_50)
+        cost_25 = nccl_all_to_all_cost(n_bytes, topo_25, config_25)
+        # Doubling NIC BW should roughly halve the BW term
+        ratio = cost_25 / cost_50
+        assert ratio > 1.5
+
+    def test_nic_bottleneck_path_for_nvswitch_multi_node(self):
+        """NVSwitch multi-node should use the NIC-bottleneck path."""
+        config = h100_topo_config(num_nodes=2)
+        topo = derive_mesh_dim_topo(config, (16,), 0)
+        n_bytes = 1 << 30
+        cost = nccl_all_to_all_cost(n_bytes, topo, config)
+        # Verify against expected NIC-bottleneck formula
+        lat = _interp_clamped(_A2A_MULTI_NODE_LAT_POINTS, 2)
+        remote_fraction = (16 - 8) / 16
+        nic_bw = 50.0 * (1.0 - _A2A_NIC_OVERHEAD / 2)
+        expected = lat + n_bytes * remote_fraction / (1000.0 * nic_bw)
+        assert cost == pytest.approx(expected)
+
+    def test_sm_fallback_for_no_nvswitch(self):
+        """Without NVSwitch, multi-node should use SM-driven fallback."""
+        config = h100_topo_config(num_nodes=2, has_nvswitch=False)
+        topo = derive_mesh_dim_topo(config, (16,), 0)
+        n_bytes = 1 << 20
+        cost = nccl_all_to_all_cost(n_bytes, topo, config)
+        # SM-driven fallback uses Ring-style latency + channel-based BW;
+        # NIC-bottleneck path would give a very different value.
+        # Just verify it's finite and positive.
+        assert cost > 0
+        assert cost < float("inf")
+        # SM-driven uses bw_intra for <=2 nodes, which is much higher than
+        # NIC-bottleneck's bw_inter, so cost should be lower.
+        config_nvs = h100_topo_config(num_nodes=2, has_nvswitch=True)
+        topo_nvs = derive_mesh_dim_topo(config_nvs, (16,), 0)
+        cost_nvs = nccl_all_to_all_cost(n_bytes, topo_nvs, config_nvs)
+        # The two paths model different things so costs differ
+        assert cost != pytest.approx(cost_nvs)
+
+    def test_nic_ramp_slows_mid_range(self):
+        """Mid-range AllToAll should be slower than uncorrected NIC model."""
+        config = h100_topo_config(num_nodes=2)
+        topo = derive_mesh_dim_topo(config, (16,), 0)
+        # 2M total, per_gpu = 128K, logSize = 11, ramp factor = 0.43
+        n_bytes = 2 * (1 << 20)
+        cost = nccl_all_to_all_cost(n_bytes, topo, config)
+        # Uncorrected NIC model (no ramp)
+        lat = _interp_clamped(_A2A_MULTI_NODE_LAT_POINTS, 2)
+        remote_fraction = (16 - 8) / 16
+        nic_bw = 50.0 * (1.0 - _A2A_NIC_OVERHEAD / 2)
+        uncorrected = lat + n_bytes * remote_fraction / (1000.0 * nic_bw)
+        assert cost > uncorrected
+
+    def test_nic_ramp_factor_table_shape(self):
+        """Ramp factor table should have expected shape and bounds."""
+        assert len(_A2A_NIC_RAMP_FACTOR) == 24
+        assert _A2A_NIC_RAMP_FACTOR[0] == 1.0
+        assert _A2A_NIC_RAMP_FACTOR[23] == 1.0
+        for f in _A2A_NIC_RAMP_FACTOR:
+            assert 0.0 < f <= 1.0
+
+    def test_nic_ramp_weaker_at_more_nodes(self):
+        """More nodes should weaken the ramp correction (NIC saturates sooner)."""
+        # 4M total: per_gpu is 256K at 2n (idx 12, factor 0.62) and
+        # 128K at 4n (idx 11, factor 0.43). But 4n applies linear deficit
+        # dampening: 1-(1-0.43)/2 = 0.715 — weaker than 0.62.
+        # Both are slower than uncorrected, but 4n should have a milder
+        # correction relative to its uncorrected BW term.
+        n_bytes = 4 * (1 << 20)
+        config_2n = h100_topo_config(num_nodes=2)
+        config_4n = h100_topo_config(num_nodes=4)
+        topo_2n = derive_mesh_dim_topo(config_2n, (16,), 0)
+        topo_4n = derive_mesh_dim_topo(config_4n, (32,), 0)
+        cost_2n = nccl_all_to_all_cost(n_bytes, topo_2n, config_2n)
+        cost_4n = nccl_all_to_all_cost(n_bytes, topo_4n, config_4n)
+        # Compute uncorrected BW times for each
+        lat_2n = _interp_clamped(_A2A_MULTI_NODE_LAT_POINTS, 2)
+        lat_4n = _interp_clamped(_A2A_MULTI_NODE_LAT_POINTS, 4)
+        rf_2n = (16 - 8) / 16
+        rf_4n = (32 - 8) / 32
+        nic_2n = 50.0 * (1.0 - _A2A_NIC_OVERHEAD / 2)
+        nic_4n = 50.0 * (1.0 - _A2A_NIC_OVERHEAD / 4)
+        uncorr_bw_2n = n_bytes * rf_2n / (1000.0 * nic_2n)
+        uncorr_bw_4n = n_bytes * rf_4n / (1000.0 * nic_4n)
+        # Effective correction = (cost - lat) / uncorrected_bw_time
+        # Larger value = weaker correction (closer to 1.0)
+        eff_corr_2n = uncorr_bw_2n / (cost_2n - lat_2n)
+        eff_corr_4n = uncorr_bw_4n / (cost_4n - lat_4n)
+        assert eff_corr_4n > eff_corr_2n
 
 
 # ---- NVSwitch empirical path tests ----

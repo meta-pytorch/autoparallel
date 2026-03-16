@@ -531,9 +531,58 @@ def _interp_clamped(points: tuple[tuple[int, float], ...], x: int) -> float:
 
 
 # SM-driven AllToAll bandwidth correction for non-CE-path cases (older arch,
-# no NVSwitch, or multi-node). P2P decomposition has worse pipelining
-# (SLICESTEPS=1/CHUNKSTEPS=1) and more link contention than Ring collectives.
+# no NVSwitch, or multi-node without NVSwitch). P2P decomposition has worse
+# pipelining (SLICESTEPS=1/CHUNKSTEPS=1) and more link contention than Ring.
 _A2A_BW_CORRECTION = 0.7
+
+# Multi-node AllToAll on NVSwitch Hopper+: empirical latency (us) fitted from
+# nccl-tests alltoall_perf on H100 at 2/4/8 nodes (0-byte messages). AllToAll
+# decomposes into concurrent P2P transfers so latency grows much slower than
+# Ring-style sequential steps.
+_A2A_MULTI_NODE_LAT_POINTS = ((2, 37.0), (4, 42.0), (8, 60.0))
+
+# NIC efficiency overhead for multi-node AllToAll P2P. At low node counts,
+# fewer remote destinations reduce NIC pipeline utilization. Fitted from H100
+# benchmarks: nic_eff = 1 - _A2A_NIC_OVERHEAD / n_nodes.
+# (2-node: 78%, 4-node: 89%, 8-node: 95% of raw NIC BW)
+_A2A_NIC_OVERHEAD = 0.44
+
+# NIC bandwidth ramp-up correction for multi-node AllToAll. At mid-range
+# message sizes, per-P2P-pair transfers are too small to saturate the NIC,
+# reducing effective bandwidth. Indexed by log2(per_gpu_bytes >> 6), same
+# scheme as _RING_CORRECTION_FACTOR. Base values fitted from 2-node H100
+# benchmarks; scaled to other node counts via linear deficit dampening
+# (1 - (1-corr)/log2(n_nodes)) since more concurrent NIC streams at higher
+# node counts help saturate the NIC sooner.
+_A2A_NIC_RAMP_FACTOR = (
+    # logSize: 0     1     2     3     4     5     6     7
+    1.00,
+    1.00,
+    1.00,
+    1.00,
+    1.00,
+    1.00,
+    1.00,
+    1.00,
+    # logSize: 8     9    10    11    12    13    14    15
+    0.28,
+    0.28,
+    0.35,
+    0.43,
+    0.62,
+    0.71,
+    0.82,
+    0.89,
+    # logSize: 16   17    18    19    20    21    22    23
+    0.92,
+    0.95,
+    1.00,
+    1.00,
+    1.00,
+    1.00,
+    1.00,
+    1.00,
+)
 
 # Per-node synchronization overhead (us) for multi-node Ring.
 # NCCL's Ring latency model (nsteps * per_step_lat) assumes each step has
@@ -800,23 +849,22 @@ def nccl_all_to_all_cost(
     runtime, AllToAll is either decomposed into nRanks P2P Send/Recv pairs or
     dispatched to the Copy Engine (CE) path on Hopper+ with CUDA 12.5+.
 
-    Two paths:
+    Three paths:
       - CE path (Hopper+ with NVSwitch, intra-node): uses empirical per-arch
-        bandwidth fitted from nccl-tests alltoall_perf. CE bypasses SM-driven
-        channels and achieves much higher throughput (~380 GB/s on H100 vs.
-        225 GB/s SM-driven).
-      - SM-driven fallback (older arch, no NVSwitch, or multi-node): reuses
-        Ring latency/bandwidth constants with nsteps=nRanks and bus-to-algo
-        ratio=1.0, discounted by _A2A_BW_CORRECTION for worse pipelining and
-        link contention.
+        bandwidth fitted from nccl-tests alltoall_perf.
+      - NIC-bottleneck path (Hopper+ with NVSwitch, multi-node): models
+        AllToAll as concurrent P2P transfers bottlenecked by NIC bandwidth.
+        Uses empirical latency and per-GPU NIC BW with efficiency correction.
+      - SM-driven fallback (older arch, no NVSwitch): reuses Ring
+        latency/bandwidth constants with nsteps=nRanks and bus-to-algo
+        ratio=1.0, discounted by _A2A_BW_CORRECTION.
 
     TODO: potential improvements, roughly in priority order:
       1. Profile AllToAll on Blackwell NVSwitch hardware to replace the
          estimated _A2A_CE_BW[BLACKWELL] with a measured value.
-      2. Profile multi-node AllToAll to validate or replace _A2A_BW_CORRECTION.
-      3. Fit a size-dependent discount curve to bus_bw for the SM-driven path
+      2. Fit a size-dependent discount curve to bus_bw for the SM-driven path
          (similar to NCCL's treeCorrectionFactor).
-      4. LL AllToAll for small messages: separate latency-dominated model
+      3. LL AllToAll for small messages: separate latency-dominated model
          below some size threshold. Unlikely to matter for sharding decisions
          which typically involve large tensors.
     """
@@ -832,6 +880,36 @@ def nccl_all_to_all_cost(
     ):
         bus_bw = _A2A_CE_BW[config.arch]
         return _A2A_CE_LATENCY + n_bytes / (1000.0 * bus_bw)
+
+    # NIC-bottleneck path: Hopper+ NVSwitch multi-node. AllToAll decomposes
+    # into concurrent P2P transfers; the bottleneck is per-GPU NIC bandwidth,
+    # not Ring-style sequential steps.
+    if n_nodes > 1 and config.has_nvswitch:
+        lat = _interp_clamped(_A2A_MULTI_NODE_LAT_POINTS, n_nodes)
+        remote_fraction = (n_ranks - topo.ppn) / n_ranks
+        nic_bw = config.bw_inter * (1.0 - _A2A_NIC_OVERHEAD / n_nodes)
+        if nic_bw <= 0:
+            return float("inf")
+        # Size-dependent NIC ramp correction: at mid-range per-GPU sizes the
+        # NIC isn't fully saturated. More nodes = more concurrent streams =
+        # faster saturation, so the correction weakens with node count.
+        # Linear deficit scaling (1-(1-corr)/log_nodes) rather than power law
+        # (corr^(1/log_nodes)) because it dampens extreme base values more
+        # aggressively at high node counts, avoiding overcorrection when the
+        # BW term is small relative to latency.
+        log_per_gpu = _log2i((n_bytes // n_ranks) >> 6)
+        if 0 <= log_per_gpu < 24:
+            corr = _A2A_NIC_RAMP_FACTOR[log_per_gpu]
+        elif log_per_gpu < 0:
+            corr = _A2A_NIC_RAMP_FACTOR[0]
+        else:
+            corr = 1.0
+        log_nodes = _log2i(n_nodes)
+        if log_nodes > 1 and corr < 1.0:
+            corr = 1.0 - (1.0 - corr) / log_nodes
+        if corr <= 0:
+            return float("inf")
+        return lat + n_bytes * remote_fraction / (1000.0 * nic_bw * corr)
 
     # SM-driven fallback: Ring-style, ratio = 1.0 (no bus-to-algo boost),
     # discounted by correction factor for pipelining / contention.
