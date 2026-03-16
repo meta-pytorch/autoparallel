@@ -192,14 +192,14 @@ _RING_CORRECTION_FACTOR = (
     1.00,
     1.00,
     0.10,
-    0.15,
-    0.25,
-    0.40,
-    0.60,
+    0.18,
+    0.30,
+    0.43,
+    0.63,
     # logSize: 16   17    18    19    20    21    22    23
-    0.50,
-    0.75,
-    0.90,
+    0.55,
+    0.78,
+    0.93,
     1.00,
     1.00,
     1.00,
@@ -535,6 +535,13 @@ def _interp_clamped(points: tuple[tuple[int, float], ...], x: int) -> float:
 # (SLICESTEPS=1/CHUNKSTEPS=1) and more link contention than Ring collectives.
 _A2A_BW_CORRECTION = 0.7
 
+# Per-node synchronization overhead (us) for multi-node Ring.
+# NCCL's Ring latency model (nsteps * per_step_lat) assumes each step has
+# constant cost, but in practice there is additional per-node coordination
+# overhead (barrier sync, NIC arbitration) not captured by per-step constants.
+# Fitted from H100 AG small-message benchmarks at 2/4/8 nodes.
+_RING_SYNC_OVERHEAD_PER_NODE = 4.7
+
 
 def _compute_algo_latency(
     func: NCCLFunc,
@@ -585,6 +592,11 @@ def _compute_algo_latency(
         lat = (
             base_lat + (nsteps - n_inter_steps) * intra_lat + n_inter_steps * inter_lat
         )
+        if n_nodes > 1:
+            sync_overhead = _RING_SYNC_OVERHEAD_PER_NODE * n_nodes
+            if n_nodes > 4:
+                sync_overhead *= (n_nodes / 4) ** 0.65
+            lat += sync_overhead
 
     elif algo == NCCLAlgo.TREE:
         lat = base_lat + 2 * (

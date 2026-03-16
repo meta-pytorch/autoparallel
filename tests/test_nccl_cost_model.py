@@ -175,8 +175,8 @@ class TestAlgoBwLatency:
         # gpus_per_node=1 => ppn=1, n_nodes=2, nRanks=2, nsteps=2, nInterSteps=2
         # netOverhead = 1.0*3 = 3.0, intraLat = max(3.4, 3.0) = 3.4
         # ppn=1 => interLat base = hwLat[NET][TREE] = 14.0
-        # lat = 8.4 + (2-2)*3.4 + 2*14.0 = 36.4
-        assert lat == pytest.approx(8.4 + 2 * 14.0)
+        # lat = 8.4 + (2-2)*3.4 + 2*14.0 + 4.7*2 = 45.8
+        assert lat == pytest.approx(8.4 + 2 * 14.0 + 4.7 * 2)
 
     def test_tree_latency_single_node(self):
         config = a100_topo_config()
