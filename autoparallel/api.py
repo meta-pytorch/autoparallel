@@ -309,7 +309,7 @@ class AutoParallel:
         if mp_policy is not None:
             mp_policy = canonicalize_mp(mp_policy)
         self.mp_policy = mp_policy
-        self.cost_model = kwargs.pop("cost_model", "nccl")
+        self.cost_model = kwargs.pop("cost_model", None)
         self.kwargs = kwargs
         # copy user model to avoid modifying it in-place
         # in dtype casting and move_to_fake
