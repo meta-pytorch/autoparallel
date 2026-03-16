@@ -93,10 +93,10 @@ def input_fn():
     return x
 
 
-from autoparallel.cost_models.collective_runtime_estimation import set_nccl_topo_config
-from autoparallel.cost_models.nccl_cost_model import detect_nccl_topo_config
+# from autoparallel.cost_models.collective_runtime_estimation import set_nccl_topo_config
+# from autoparallel.cost_models.nccl_cost_model import detect_nccl_topo_config
 
-set_nccl_topo_config(detect_nccl_topo_config(mesh))
+# set_nccl_topo_config(detect_nccl_topo_config(mesh))
 
 autobucketing_level = "aten"
 
