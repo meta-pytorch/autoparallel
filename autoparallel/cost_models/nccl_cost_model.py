@@ -514,6 +514,82 @@ _NVSWITCH_LAT_POINTS: dict[NCCLFunc, tuple[tuple[int, float], ...]] = {
 }
 _BLACKWELL_BW_SCALE = 640.0 / 320.0  # Blackwell/Hopper bw_intra ratio
 
+# Multi-node AllReduce empirical constants for Hopper+ NVSwitch.
+# The algo selection loop (Ring/Tree/NVLS/NVLS_TREE) works well for AG/RS but
+# systematically underestimates AR due to latency, BW-ramp, and peak-BW gaps.
+# Fitted from nccl-tests allreduce_perf on H100 NVSwitch at 2/4/8 nodes.
+
+# Latency (us) from 1K-message benchmarks (latency-dominated regime).
+_AR_MULTI_NODE_LAT_POINTS = ((2, 29.5), (4, 41.5), (8, 58.7))
+
+# Peak algo BW (GB/s) from 4G/8G benchmarks (BW-dominated regime).
+_AR_MULTI_NODE_BW_POINTS = ((2, 248.6), (4, 166.0), (8, 157.4))
+
+# BW ramp tables: fraction of peak BW achieved at each per-GPU size bucket.
+# Indexed by log2(per_gpu_bytes >> 6), same scheme as _RING_CORRECTION_FACTOR.
+# Two tables: 2-node has fewer pipeline stages to fill so ramps more slowly.
+# Values at tiny indices (where BW term < 0.1us) are set to 1.0 since the
+# ramp value doesn't affect total time there.
+_AR_MULTI_NODE_RAMP_N2 = (
+    # idx: 0     1     2     3     4     5     6     7
+    1.00,
+    1.00,
+    1.00,
+    1.00,
+    0.01,
+    0.02,
+    0.04,
+    0.05,
+    # idx: 8     9    10    11    12    13    14    15
+    0.05,
+    0.08,
+    0.11,
+    0.16,
+    0.24,
+    0.29,
+    0.41,
+    0.56,
+    # idx:16    17    18    19    20    21    22    23
+    0.59,
+    0.75,
+    0.85,
+    0.91,
+    0.96,
+    0.98,
+    1.00,
+    1.00,
+)
+
+_AR_MULTI_NODE_RAMP_N4P = (
+    # idx: 0     1     2     3     4     5     6     7
+    1.00,
+    1.00,
+    0.01,
+    0.02,
+    0.03,
+    0.04,
+    0.05,
+    0.06,
+    # idx: 8     9    10    11    12    13    14    15
+    0.09,
+    0.12,
+    0.15,
+    0.21,
+    0.32,
+    0.49,
+    0.66,
+    0.83,
+    # idx:16    17    18    19    20    21    22    23
+    0.95,
+    0.95,
+    0.97,
+    0.99,
+    1.00,
+    1.00,
+    1.00,
+    1.00,
+)
+
 
 def _interp_clamped(points: tuple[tuple[int, float], ...], x: int) -> float:
     """Linearly interpolate between data points, clamping at boundaries."""
@@ -790,9 +866,10 @@ def nccl_collective_time(
 
     For Hopper+ with NVSwitch on a single node, uses empirical bandwidth
     and latency fitted from nccl-tests at 2/4/8 GPUs, with linear
-    interpolation for intermediate counts. Blackwell values are scaled
-    from Hopper by the bw_intra ratio. The algo selection loop below is
-    only used for non-NVSwitch or multi-node cases.
+    interpolation for intermediate counts. Multi-node AllReduce on
+    Hopper+ NVSwitch also uses an empirical path with size-dependent BW
+    ramp tables. Blackwell values are scaled from Hopper by the bw_intra
+    ratio. The algo selection loop below is used for all other cases.
     """
     # NVSwitch empirical path for Hopper+ intra-node
     if (
@@ -805,6 +882,31 @@ def nccl_collective_time(
             bw *= _BLACKWELL_BW_SCALE
         lat = _interp_clamped(_NVSWITCH_LAT_POINTS[func], topo.n_ranks)
         return lat + n_bytes / (1000.0 * bw)
+
+    # Empirical path for multi-node AllReduce on Hopper+ NVSwitch
+    if (
+        func == NCCLFunc.ALLREDUCE
+        and config.arch in (GpuArch.HOPPER, GpuArch.BLACKWELL)
+        and config.has_nvswitch
+        and topo.n_nodes > 1
+    ):
+        bw = _interp_clamped(_AR_MULTI_NODE_BW_POINTS, topo.n_nodes)
+        if config.arch == GpuArch.BLACKWELL:
+            bw *= _BLACKWELL_BW_SCALE
+        lat = _interp_clamped(_AR_MULTI_NODE_LAT_POINTS, topo.n_nodes)
+        ramp_table = (
+            _AR_MULTI_NODE_RAMP_N2 if topo.n_nodes <= 2 else _AR_MULTI_NODE_RAMP_N4P
+        )
+        log_per_gpu = _log2i((n_bytes // topo.n_ranks) >> 6)
+        if 0 <= log_per_gpu < 24:
+            ramp = ramp_table[log_per_gpu]
+        elif log_per_gpu < 0:
+            ramp = ramp_table[0]
+        else:
+            ramp = 1.0
+        if ramp <= 0:
+            return float("inf")
+        return lat + n_bytes / (1000.0 * bw * ramp)
 
     algos = _eligible_algos(func, config, topo.n_nodes)
     best = float("inf")
