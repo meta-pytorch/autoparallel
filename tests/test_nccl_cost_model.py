@@ -6,6 +6,7 @@
 import pytest
 
 from autoparallel.cost_models.nccl_cost_model import (
+    _RING_CORRECTION_FACTOR,
     GpuArch,
     NCCLAlgo,
     NCCLFunc,
@@ -15,6 +16,7 @@ from autoparallel.cost_models.nccl_cost_model import (
     _compute_algo_latency,
     _eligible_algos,
     _eligible_protos,
+    _log2i,
     _nccl_algo_time,
     a100_topo_config,
     derive_mesh_dim_topo,
@@ -434,7 +436,125 @@ class TestTreeCorrection:
         assert time_large > time_uncorrected
 
 
-# ---- Ring plateau ----
+# ---- Ring correction factor ----
+
+
+class TestRingCorrection:
+    def test_multi_node_ring_has_correction(self):
+        """Multi-node Ring AG at 2M should be slower than uncorrected."""
+        config = h100_topo_config(num_nodes=2, gpus_per_node=8)
+        topo = derive_mesh_dim_topo(config, (16,), 0)
+        n_bytes = 2 * (1 << 20)  # 2MB total => 128KB per GPU => logSize=11 => 0.05
+
+        bw_raw = _compute_algo_bw(
+            NCCLFunc.ALLGATHER, NCCLAlgo.RING, NCCLProto.SIMPLE, topo, config
+        )
+        lat = _compute_algo_latency(
+            NCCLFunc.ALLGATHER, NCCLAlgo.RING, NCCLProto.SIMPLE, topo, config
+        )
+        time_uncorrected = lat + n_bytes / (1000.0 * bw_raw)
+
+        time_corrected = _nccl_algo_time(
+            NCCLFunc.ALLGATHER, NCCLAlgo.RING, NCCLProto.SIMPLE, n_bytes, topo, config
+        )
+        assert time_corrected > time_uncorrected
+
+    def test_single_node_ring_unaffected(self):
+        """Single-node Ring should not have any Ring correction applied."""
+        config = h100_topo_config()
+        topo = derive_mesh_dim_topo(config, (8,), 0)
+        n_bytes = 2 * (1 << 20)
+
+        bw_raw = _compute_algo_bw(
+            NCCLFunc.ALLGATHER, NCCLAlgo.RING, NCCLProto.SIMPLE, topo, config
+        )
+        lat = _compute_algo_latency(
+            NCCLFunc.ALLGATHER, NCCLAlgo.RING, NCCLProto.SIMPLE, topo, config
+        )
+        time_uncorrected = lat + n_bytes / (1000.0 * bw_raw)
+
+        time_actual = _nccl_algo_time(
+            NCCLFunc.ALLGATHER, NCCLAlgo.RING, NCCLProto.SIMPLE, n_bytes, topo, config
+        )
+        assert time_actual == pytest.approx(time_uncorrected)
+
+    def test_large_messages_no_effect(self):
+        """Large messages (>=1G per GPU) should have correction ~1.0."""
+        config = h100_topo_config(num_nodes=2, gpus_per_node=8)
+        topo = derive_mesh_dim_topo(config, (16,), 0)
+        n_bytes = 16 * (1 << 30)  # 16GB total => 1GB per GPU => logSize=24
+
+        bw_raw = _compute_algo_bw(
+            NCCLFunc.ALLGATHER, NCCLAlgo.RING, NCCLProto.SIMPLE, topo, config
+        )
+        lat = _compute_algo_latency(
+            NCCLFunc.ALLGATHER, NCCLAlgo.RING, NCCLProto.SIMPLE, topo, config
+        )
+        time_uncorrected = lat + n_bytes / (1000.0 * bw_raw)
+
+        time_actual = _nccl_algo_time(
+            NCCLFunc.ALLGATHER, NCCLAlgo.RING, NCCLProto.SIMPLE, n_bytes, topo, config
+        )
+        # logSize >= 24 means no correction applied (factor stays 1.0)
+        assert time_actual == pytest.approx(time_uncorrected)
+
+    def test_correction_factor_values(self):
+        """Verify the correction table has expected shape and bounds."""
+        assert len(_RING_CORRECTION_FACTOR) == 24
+        assert _RING_CORRECTION_FACTOR[0] == 1.00
+        assert _RING_CORRECTION_FACTOR[23] == 1.00
+        for f in _RING_CORRECTION_FACTOR:
+            assert 0.0 < f <= 1.0
+
+    def test_depth_scaling_8_node(self):
+        """8-node Ring should be slower than 4-node at the same per-GPU size."""
+        n_bytes = 64 * (1 << 20)  # 64M total
+        # 4-node: 32 GPUs, per_gpu = 2M, logSize=15
+        config_4n = h100_topo_config(num_nodes=4)
+        topo_4n = derive_mesh_dim_topo(config_4n, (32,), 0)
+        # 8-node: 64 GPUs, per_gpu = 1M, logSize=14
+        config_8n = h100_topo_config(num_nodes=8)
+        topo_8n = derive_mesh_dim_topo(config_8n, (64,), 0)
+
+        time_4n = _nccl_algo_time(
+            NCCLFunc.ALLGATHER,
+            NCCLAlgo.RING,
+            NCCLProto.SIMPLE,
+            n_bytes,
+            topo_4n,
+            config_4n,
+        )
+        time_8n = _nccl_algo_time(
+            NCCLFunc.ALLGATHER,
+            NCCLAlgo.RING,
+            NCCLProto.SIMPLE,
+            n_bytes,
+            topo_8n,
+            config_8n,
+        )
+        # 8-node should be slower (more pipeline stages, depth-adjusted correction)
+        assert time_8n > time_4n
+
+    def test_depth_scaling_amplifies_correction(self):
+        """At 8 nodes, the effective correction should be stronger than table value."""
+        config = h100_topo_config(num_nodes=8)
+        topo = derive_mesh_dim_topo(config, (64,), 0)
+        n_bytes = 8 * (1 << 20)  # 8M total => 128K/GPU, logSize=11, table f=0.10
+
+        bw_raw = _compute_algo_bw(
+            NCCLFunc.ALLGATHER, NCCLAlgo.RING, NCCLProto.SIMPLE, topo, config
+        )
+        lat = _compute_algo_latency(
+            NCCLFunc.ALLGATHER, NCCLAlgo.RING, NCCLProto.SIMPLE, topo, config
+        )
+        # Time with table correction only (f=0.10)
+        time_table_only = lat + n_bytes / (1000.0 * bw_raw * 0.10)
+        # Time with depth-amplified correction (f=0.10^1.2=0.063)
+        time_actual = _nccl_algo_time(
+            NCCLFunc.ALLGATHER, NCCLAlgo.RING, NCCLProto.SIMPLE, n_bytes, topo, config
+        )
+        # Depth scaling makes it slower than table-only
+        assert time_actual > time_table_only
 
 
 class TestRingPlateau:
@@ -463,10 +583,20 @@ class TestRingPlateau:
         lat_base = _compute_algo_latency(
             NCCLFunc.ALLREDUCE, NCCLAlgo.RING, NCCLProto.SIMPLE, topo, config
         )
-        # Below: no inflation
-        expected_below = lat_base + below / (1000.0 * bw)
+
+        # Account for Ring correction factor (multi-node)
+        def _ring_corrected_bw(n_bytes_val):
+            log_pg = _log2i((n_bytes_val // n_ranks) >> 6)
+            if 0 <= log_pg < 24:
+                return bw * _RING_CORRECTION_FACTOR[log_pg]
+            elif log_pg < 0:
+                return bw * _RING_CORRECTION_FACTOR[0]
+            return bw
+
+        # Below: no plateau inflation
+        expected_below = lat_base + below / (1000.0 * _ring_corrected_bw(below))
         # Above: lat *= 1.4
-        expected_above = lat_base * 1.4 + above / (1000.0 * bw)
+        expected_above = lat_base * 1.4 + above / (1000.0 * _ring_corrected_bw(above))
 
         assert time_below == pytest.approx(expected_below)
         assert time_above == pytest.approx(expected_above)
@@ -487,8 +617,10 @@ class TestRingPlateau:
             NCCLFunc.ALLREDUCE, NCCLAlgo.RING, NCCLProto.LL, n_bytes, topo, config
         )
         if bw_ll > 0:
-            # LL should NOT have plateau inflation
-            expected_ll = lat_ll + n_bytes / (1000.0 * bw_ll)
+            # LL should NOT have plateau inflation, but Ring correction applies
+            log_pg = _log2i((n_bytes // topo.n_ranks) >> 6)
+            corr = _RING_CORRECTION_FACTOR[log_pg] if 0 <= log_pg < 24 else 1.0
+            expected_ll = lat_ll + n_bytes / (1000.0 * bw_ll * corr)
             assert time_ll == pytest.approx(expected_ll)
 
 

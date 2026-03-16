@@ -170,6 +170,43 @@ _NVLS_EFFICIENCY = {
     GpuArch.BLACKWELL: 0.74,
 }
 
+# Ring correction factor for multi-node pipelining ramp.
+# NCCL has treeCorrectionFactor but no equivalent for Ring. Ring pipelining
+# efficiency ramps with per-GPU data size — the pipeline isn't full at small
+# sizes, yielding much lower effective BW. Fitted from H100 AG benchmarks
+# at 2/4/8 nodes (ratio of measured BW to model BW, averaged across node
+# counts). Indexed by log2i(per_gpu_bytes >> 6), same range as
+# treeCorrectionFactor (64B–256MB).
+_RING_CORRECTION_FACTOR = (
+    # logSize: 0     1     2     3     4     5     6     7
+    1.00,
+    1.00,
+    1.00,
+    1.00,
+    1.00,
+    1.00,
+    1.00,
+    1.00,
+    # logSize: 8     9    10    11    12    13    14    15
+    1.00,
+    1.00,
+    1.00,
+    0.10,
+    0.15,
+    0.25,
+    0.40,
+    0.60,
+    # logSize: 16   17    18    19    20    21    22    23
+    0.50,
+    0.75,
+    0.90,
+    1.00,
+    1.00,
+    1.00,
+    1.00,
+    1.00,
+)
+
 # treeCorrectionFactor[proto][24] (lines 581-585)
 _TREE_CORRECTION_FACTOR = {
     NCCLProto.LL: (
@@ -616,6 +653,22 @@ def _nccl_algo_time(
         and 0 <= log_size < 24
     ):
         bw *= _TREE_CORRECTION_FACTOR[proto][log_size]
+
+    # Ring correction factor for multi-node pipelining ramp
+    if algo == NCCLAlgo.RING and topo.n_nodes > 1:
+        log_per_gpu = _log2i((n_bytes // topo.n_ranks) >> 6)
+        if 0 <= log_per_gpu < 24:
+            corr = _RING_CORRECTION_FACTOR[log_per_gpu]
+        elif log_per_gpu < 0:
+            corr = _RING_CORRECTION_FACTOR[0]
+        else:
+            corr = 1.0
+        # Deeper pipelines (8+ nodes) ramp more slowly; amplify correction.
+        # Exponent fitted from 8-node H100 AG benchmarks: factor^1.2 matches
+        # the measured BW deficit at 8 nodes across logSize 11-18.
+        if topo.n_nodes > 4 and corr < 1.0:
+            corr **= 1.0 + 0.2 * (_log2i(topo.n_nodes) - 2)
+        bw *= corr
 
     # Ring plateau effect for multi-node Simple allreduce (lines 597-599)
     if (
