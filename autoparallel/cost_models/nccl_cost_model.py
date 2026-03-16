@@ -703,21 +703,34 @@ _BLACKWELL_BW_SCALE = 640.0 / 320.0  # Blackwell/Hopper bw_intra ratio
 
 # --- Multi-node AllReduce bypass -------------------------------------------
 
-# The algo selection loop (Ring/Tree/NVLS/NVLS_TREE) works well for AG/RS but
-# systematically underestimates AR due to latency, BW-ramp, and peak-BW gaps.
-# Fitted from nccl-tests allreduce_perf on H100 NVSwitch at 2/4/8 nodes.
+# The algo selection loop (Ring/Tree/NVLS/NVLS_TREE) systematically
+# underestimates AR due to latency, BW-ramp, and peak-BW gaps.
+# Fitted from nccl-tests allreduce_perf on H100 NVSwitch at 2/4/8/16/32 nodes.
 
 # Latency (us) from 1K-message benchmarks (latency-dominated regime).
-_AR_MULTI_NODE_LAT_POINTS = ((2, 29.5), (4, 41.5), (8, 58.7))
+_AR_MULTI_NODE_LAT_POINTS = (
+    (2, 29.5),
+    (4, 41.5),
+    (8, 58.7),
+    (16, 67.2),
+    (32, 91.4),
+)
 
-# Peak algo BW (GB/s) from 4G/8G benchmarks (BW-dominated regime).
-_AR_MULTI_NODE_BW_POINTS = ((2, 248.6), (4, 166.0), (8, 157.4))
+# Peak algo BW (GB/s) from 8G benchmarks (BW-dominated regime).
+_AR_MULTI_NODE_BW_POINTS = (
+    (2, 248.6),
+    (4, 166.0),
+    (8, 157.4),
+    (16, 158.9),
+    (32, 151.2),
+)
 
 # BW ramp tables: fraction of peak BW achieved at each per-GPU size bucket.
 # Indexed by log2(per_gpu_bytes >> 6), same scheme as _RING_CORRECTION_FACTOR.
-# Two tables: 2-node has fewer pipeline stages to fill so ramps more slowly.
-# Values at tiny indices (where BW term < 0.1us) are set to 1.0 since the
-# ramp value doesn't affect total time there.
+# Three tables by node count: 2-node has fewer pipeline stages; 4-8 node is
+# intermediate; 16+ node has a different ramp profile because NVLS_TREE
+# dominates the mid-range. Values at tiny indices (where BW term < 0.1us)
+# are set to 1.0 since the ramp value doesn't affect total time there.
 _AR_MULTI_NODE_RAMP_N2 = (
     # idx: 0     1     2     3     4     5     6     7
     1.00,
@@ -748,7 +761,7 @@ _AR_MULTI_NODE_RAMP_N2 = (
     1.00,
 )
 
-_AR_MULTI_NODE_RAMP_N4P = (
+_AR_MULTI_NODE_RAMP_N4 = (
     # idx: 0     1     2     3     4     5     6     7
     1.00,
     1.00,
@@ -778,6 +791,80 @@ _AR_MULTI_NODE_RAMP_N4P = (
     1.00,
 )
 
+# Averaged from 16-node and 32-node H100 NVSwitch benchmarks.
+_AR_MULTI_NODE_RAMP_N16 = (
+    # idx: 0     1     2     3     4     5     6     7
+    1.00,
+    1.00,
+    0.02,
+    0.03,
+    0.03,
+    0.05,
+    0.07,
+    0.10,
+    # idx: 8     9    10    11    12    13    14    15
+    0.13,
+    0.19,
+    0.19,
+    0.33,
+    0.54,
+    0.71,
+    0.89,
+    0.98,
+    # idx:16    17    18    19    20    21    22    23
+    1.00,
+    1.00,
+    1.00,
+    1.00,
+    1.00,
+    1.00,
+    1.00,
+    1.00,
+)
+
+# --- Multi-node AG/RS bypass (>8 nodes) ------------------------------------
+
+# At ≤8 nodes, the NCCL Ring model (algo selection loop) is accurate for
+# AG/RS. At 16+ nodes, Ring latency (O(nRanks) steps) overestimates by
+# 50-130%. Fitted from nccl-tests allgather/reduce_scatter on H100 NVSwitch.
+# AG and RS are symmetric on NVSwitch so they share constants.
+
+_AGRS_MULTI_NODE_LAT_POINTS = ((16, 219.0), (32, 548.0))
+_AGRS_MULTI_NODE_BW_POINTS = ((16, 320.0), (32, 310.0))
+
+# Ramp table averaged from AG and RS at 16/32 nodes. Protocol transitions
+# (LL→LL128→Simple) cause dips at certain per-GPU sizes; the ramp values
+# smooth over these while preserving the overall BW efficiency curve.
+_AGRS_MULTI_NODE_RAMP = (
+    # idx: 0     1     2     3     4     5     6     7
+    1.00,
+    1.00,
+    1.00,
+    1.00,
+    0.04,
+    0.05,
+    0.04,
+    0.06,
+    # idx: 8     9    10    11    12    13    14    15
+    0.11,
+    0.08,
+    0.16,
+    0.07,
+    0.12,
+    0.22,
+    0.34,
+    0.51,
+    # idx:16    17    18    19    20    21    22    23
+    0.50,
+    0.72,
+    0.86,
+    1.00,
+    1.00,
+    1.00,
+    1.00,
+    1.00,
+)
+
 # --- AllToAll (entirely empirical, no NCCL equivalent) ---------------------
 
 # CE-path AllToAll bandwidth for NVSwitch-connected Hopper+ GPUs (GB/s).
@@ -800,7 +887,7 @@ _A2A_BW_CORRECTION = 0.7
 # nccl-tests alltoall_perf on H100 at 2/4/8 nodes (0-byte messages). AllToAll
 # decomposes into concurrent P2P transfers so latency grows much slower than
 # Ring-style sequential steps.
-_A2A_MULTI_NODE_LAT_POINTS = ((2, 37.0), (4, 42.0), (8, 60.0))
+_A2A_MULTI_NODE_LAT_POINTS = ((2, 37.0), (4, 42.0), (8, 60.0), (16, 98.0), (32, 290.0))
 
 # NIC efficiency overhead for multi-node AllToAll P2P. At low node counts,
 # fewer remote destinations reduce NIC pipeline utilization. Fitted from H100
@@ -901,11 +988,11 @@ def nccl_collective_time(
     """Pick the best algorithm+protocol and return estimated time in microseconds.
 
     For Hopper+ with NVSwitch on a single node, uses empirical bandwidth
-    and latency fitted from nccl-tests at 2/4/8 GPUs, with linear
-    interpolation for intermediate counts. Multi-node AllReduce on
-    Hopper+ NVSwitch also uses an empirical path with size-dependent BW
-    ramp tables. Blackwell values are scaled from Hopper by the bw_intra
-    ratio. The algo selection loop below is used for all other cases.
+    and latency fitted from nccl-tests at 2/4/8 GPUs. Multi-node AllReduce
+    and high-node-count AG/RS on Hopper+ NVSwitch also use empirical paths
+    with size-dependent BW ramp tables. Blackwell values are scaled from
+    Hopper by the bw_intra ratio. The algo selection loop is used for all
+    other cases.
     """
     # NVSwitch empirical path for Hopper+ intra-node
     if (
@@ -930,14 +1017,41 @@ def nccl_collective_time(
         if config.arch == GpuArch.BLACKWELL:
             bw *= _BLACKWELL_BW_SCALE
         lat = _interp_clamped(_AR_MULTI_NODE_LAT_POINTS, topo.n_nodes)
-        ramp_table = (
-            _AR_MULTI_NODE_RAMP_N2 if topo.n_nodes <= 2 else _AR_MULTI_NODE_RAMP_N4P
-        )
+        if topo.n_nodes <= 2:
+            ramp_table = _AR_MULTI_NODE_RAMP_N2
+        elif topo.n_nodes <= 8:
+            ramp_table = _AR_MULTI_NODE_RAMP_N4
+        else:
+            ramp_table = _AR_MULTI_NODE_RAMP_N16
         log_per_gpu = _log2i((n_bytes // topo.n_ranks) >> 6)
         if 0 <= log_per_gpu < 24:
             ramp = ramp_table[log_per_gpu]
         elif log_per_gpu < 0:
             ramp = ramp_table[0]
+        else:
+            ramp = 1.0
+        if ramp <= 0:
+            return float("inf")
+        return lat + n_bytes / (1000.0 * bw * ramp)
+
+    # Empirical path for multi-node AG/RS on Hopper+ NVSwitch (>8 nodes).
+    # At ≤8 nodes the Ring model in the algo loop below is accurate; at 16+
+    # nodes Ring latency scales as O(nRanks) which overestimates by 50-130%.
+    if (
+        func in (NCCLFunc.ALLGATHER, NCCLFunc.REDUCESCATTER)
+        and config.arch in (GpuArch.HOPPER, GpuArch.BLACKWELL)
+        and config.has_nvswitch
+        and topo.n_nodes > 8
+    ):
+        bw = _interp_clamped(_AGRS_MULTI_NODE_BW_POINTS, topo.n_nodes)
+        if config.arch == GpuArch.BLACKWELL:
+            bw *= _BLACKWELL_BW_SCALE
+        lat = _interp_clamped(_AGRS_MULTI_NODE_LAT_POINTS, topo.n_nodes)
+        log_per_gpu = _log2i((n_bytes // topo.n_ranks) >> 6)
+        if 0 <= log_per_gpu < 24:
+            ramp = _AGRS_MULTI_NODE_RAMP[log_per_gpu]
+        elif log_per_gpu < 0:
+            ramp = _AGRS_MULTI_NODE_RAMP[0]
         else:
             ramp = 1.0
         if ramp <= 0:
