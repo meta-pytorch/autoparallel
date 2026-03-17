@@ -4,8 +4,10 @@
 # LICENSE file in the root directory of this source tree.
 
 import functools
+import multiprocessing
 
 import numpy as np
+import pytest
 import torch
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor, Replicate, Shard, distribute_tensor
@@ -26,6 +28,7 @@ from torch.testing._internal.distributed._tensor.common_dtensor import (
     with_comms,
 )
 
+import autoparallel.shardings.dtensor_sharding_helpers as dtensor_sharding_helpers
 from autoparallel.shardings.dtensor_sharding_helpers import (
     batch_shard_strategy,
     get_op_strategy,
@@ -346,9 +349,27 @@ class CustomShardingPropagator(
             return output_sharding
 
 
-dispatcher = DTensor._op_dispatcher
-# change to the customized sharding_propagator for testing implicit fallback
-dispatcher.sharding_propagator = CustomShardingPropagator()
+# Install the custom propagator so that subprocesses spawned by
+# MultiProcessTestCase (which use ``spawn`` and re-import this module) see it.
+# In the main pytest process we use a module-scoped fixture to install/restore
+# it only while this module's tests run, preventing leaks into other modules.
+_custom_propagator = CustomShardingPropagator()
+_orig_dispatcher_propagator = DTensor._op_dispatcher.sharding_propagator
+_orig_helpers_propagator = dtensor_sharding_helpers.propagator
+
+if multiprocessing.current_process().name != "MainProcess":
+    # Subprocess worker (spawned by MultiProcessTestCase): install immediately.
+    DTensor._op_dispatcher.sharding_propagator = _custom_propagator
+    dtensor_sharding_helpers.propagator = _custom_propagator
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _install_custom_propagator():
+    DTensor._op_dispatcher.sharding_propagator = _custom_propagator
+    dtensor_sharding_helpers.propagator = _custom_propagator
+    yield
+    DTensor._op_dispatcher.sharding_propagator = _orig_dispatcher_propagator
+    dtensor_sharding_helpers.propagator = _orig_helpers_propagator
 
 
 class ImplicitRegistrationTest(DTensorTestBase):
