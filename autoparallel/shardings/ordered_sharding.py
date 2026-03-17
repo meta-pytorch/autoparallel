@@ -172,6 +172,9 @@ def build_param_grad_linear_chains(
     source_to_chain: dict[torch.fx.Node, list[torch.fx.Node]] = {}
 
     for param, grad in param_and_grad_nodes:
+        # Skip unused parameters — no chain to build
+        if not param.users:
+            continue
         # Build forward chain of users for the parameter
         last_p = list(param.users)[0]
         p_chain: list[torch.fx.Node] = [param]
