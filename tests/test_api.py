@@ -1117,3 +1117,45 @@ def test_enter_failure_cleans_up_fake_mode(device_mesh_1d):
     with torch.device("meta"):
         model2 = Model(dim)
     AutoParallel(model2, input_fn, device_mesh_1d)
+
+
+def test_unused_parameters_captured(device_mesh_1d):
+    """Unused parameters should appear on the parallel model."""
+    dim = 128
+
+    class Model(nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            self.used_linear = nn.Linear(dim, dim)
+            self.unused_linear = nn.Linear(dim, dim)
+
+        def forward(self, x):
+            return self.used_linear(x)
+
+    with torch.device("meta"):
+        model = Model(dim)
+
+    batch_size = 512
+    local_batch_size = batch_size // device_mesh_1d.size()
+    x = DTensor.from_local(
+        torch.rand(local_batch_size, dim, device="cuda"),
+        device_mesh_1d,
+        [Shard(0)],
+    )
+    parallel_mod = auto_parallel(
+        model,
+        device_mesh_1d,
+        sample_inputs=(x,),
+        out_shardings=(Shard(0),),
+        compile=False,
+    )
+
+    param_names = {name for name, _ in parallel_mod.named_parameters()}
+    assert "used_linear.weight" in param_names
+    assert "used_linear.bias" in param_names
+    assert (
+        "unused_linear.weight" in param_names
+    ), f"unused_linear.weight not found in parallel model params: {param_names}"
+    assert (
+        "unused_linear.bias" in param_names
+    ), f"unused_linear.bias not found in parallel model params: {param_names}"
