@@ -1117,3 +1117,69 @@ def test_enter_failure_cleans_up_fake_mode(device_mesh_1d):
     with torch.device("meta"):
         model2 = Model(dim)
     AutoParallel(model2, input_fn, device_mesh_1d)
+
+
+def test_aliased_submodule(device_mesh_1d):
+    """Test that aliased submodules (two module attrs pointing to the same object) work.
+
+    This mirrors the DINOVid pattern where model.model_ema = model.teacher,
+    causing named_parameters(remove_duplicate=False) to yield the same tensor
+    under two FQNs. move_to_fake must not assert on the second occurrence
+    because the tensor was already replaced with a fake on the first pass.
+    The module alias must also be re-established on the parallel model so that
+    model_ema and teacher remain the same object.
+    """
+    dim = 128
+
+    class Model(nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            self.student = nn.Linear(dim, dim)
+            self.teacher = nn.Linear(dim, dim)
+            # Alias: model_ema IS teacher (same object, two registered names)
+            self.model_ema = self.teacher
+
+        def forward(self, x):
+            return self.student(x) + self.teacher(x)
+
+        def init_weights(self):
+            nn.init.ones_(self.student.weight)
+            nn.init.zeros_(self.student.bias)
+            nn.init.ones_(self.teacher.weight)
+            nn.init.zeros_(self.teacher.bias)
+
+    with torch.device("meta"):
+        model = Model(dim)
+
+    assert model.model_ema is model.teacher
+
+    batch_size = 512
+    local_batch_size = batch_size // device_mesh_1d.size()
+    x = DTensor.from_local(
+        torch.rand(local_batch_size, dim, device="cuda"),
+        device_mesh_1d,
+        [Shard(0)],
+    )
+    # The key assertion is that auto_parallel succeeds without crashing
+    # on the aliased submodule in move_to_fake.
+    parallel_mod = auto_parallel(
+        model,
+        device_mesh_1d,
+        sample_inputs=(x,),
+        out_shardings=(Shard(0),),
+        compile=False,
+    )
+
+    # Module alias should be re-established on the parallel model
+    assert parallel_mod.model_ema is parallel_mod.teacher
+
+    parallel_mod.to_empty(device="cuda")
+    parallel_mod.init_weights()
+
+    expected = torch.ones(dim, dim, device="cuda")
+    assert torch.equal(
+        parallel_mod.get_parameter("student.weight").full_tensor(), expected
+    )
+    assert torch.equal(
+        parallel_mod.get_parameter("teacher.weight").full_tensor(), expected
+    )
