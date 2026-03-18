@@ -306,6 +306,47 @@ def _check_forward_args(args, expected_inputs):
                 )
 
 
+def _add_unused_params_and_buffers(model, graph_module):
+    """Register parameters/buffers from model that are missing from graph_module.
+
+    Dynamo only captures parameters/buffers actually used in forward(). This
+    adds unused ones as get_attr nodes so aot_export_joint_with_descriptors
+    lifts them into the joint graph and they appear in params_spec/buffers_spec.
+    """
+    from torch.fx.graph_module import _assign_attr
+
+    existing_params = set(dict(graph_module.named_parameters()))
+    existing_buffers = set(dict(graph_module.named_buffers()))
+
+    graph = graph_module.graph
+    # Insert after all existing placeholder/get_attr nodes, before computation.
+    insert_before = None
+    for node in graph.nodes:
+        if node.op not in ("placeholder", "get_attr"):
+            insert_before = node
+            break
+
+    added = False
+    for fqn, param in model.named_parameters():
+        if fqn not in existing_params:
+            _assign_attr(param, graph_module, fqn)
+            with graph.inserting_before(insert_before):
+                n = graph.create_node("get_attr", target=fqn)
+                n.meta["val"] = param
+            added = True
+
+    for fqn, buf in model.named_buffers():
+        if fqn not in existing_buffers:
+            _assign_attr(buf, graph_module, fqn)
+            with graph.inserting_before(insert_before):
+                n = graph.create_node("get_attr", target=fqn)
+                n.meta["val"] = buf
+            added = True
+
+    if added:
+        graph_module.recompile()
+
+
 class AutoParallel:
     """
     Args:
@@ -484,6 +525,7 @@ class AutoParallel:
                 *formatted_inputs
             )
             _restore_state_dict(self.model, torch_ir_with_fqn)
+            _add_unused_params_and_buffers(self.model, torch_ir_with_fqn)
             # TODO Can't use fake mode here because it clashes with the user level
             # fake mode. Ideally dynamo should reuse the user level fake mode.
             self.joint_with_descriptors = aot_export_joint_with_descriptors(
