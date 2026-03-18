@@ -72,6 +72,29 @@ def _build_alias_map(
     return alias_map
 
 
+def _build_module_alias_map(model: torch.nn.Module) -> dict[str, str]:
+    """Build a mapping from alias module FQNs to canonical module FQNs.
+
+    When a model registers the same module under multiple names (e.g.
+    self.model_ema = self.teacher), named_modules() deduplicates by default.
+    This detects such aliases so they can be re-established on the parallel model.
+    """
+    canonical_by_id: dict[int, str] = {}
+    canonical_fqns: set[str] = set()
+    for fqn, mod in model.named_modules():
+        if fqn == "":
+            continue
+        canonical_by_id[id(mod)] = fqn
+        canonical_fqns.add(fqn)
+    alias_map: dict[str, str] = {}
+    for fqn, mod in model.named_modules(remove_duplicate=False):
+        if fqn == "":
+            continue
+        if fqn not in canonical_fqns and id(mod) in canonical_by_id:
+            alias_map[fqn] = canonical_by_id[id(mod)]
+    return alias_map
+
+
 def _assign_attr(
     attr: Any,
     target_module: torch.nn.Module,
@@ -190,14 +213,19 @@ def move_to_fake(model: torch.nn.Module, mode: FakeTensorMode, device: torch.dev
                     fake_tensor, requires_grad=fake_tensor.requires_grad
                 )
             fake_memo[id(orig)] = fake_tensor
+            # Also map the fake tensor's id so aliased submodules
+            # (where setattr already replaced the original) are recognized.
+            fake_memo[id(fake_tensor)] = fake_tensor
         setattr(submod, k, fake_tensor)
 
     with mode:
         for k, p in model.named_parameters(remove_duplicate=False):
-            assert_is_meta_tensor(k, p)
+            if id(p) not in fake_memo:
+                assert_is_meta_tensor(k, p)
             _move_to_fake(model, k, device, parameter=True)
         for k, b in model.named_buffers(remove_duplicate=False):
-            assert_is_meta_tensor(k, b)
+            if id(b) not in fake_memo:
+                assert_is_meta_tensor(k, b)
             _move_to_fake(model, k, device, parameter=False)
 
     return model
@@ -362,6 +390,7 @@ class AutoParallel:
         # can re-register them later.
         self._param_alias_map = _build_alias_map(model.named_parameters)
         self._buffer_alias_map = _build_alias_map(model.named_buffers)
+        self._module_alias_map = _build_module_alias_map(model)
 
         # keep a separate copy of the fake orig model to customize for supporting init_weights
         self.init_weights_model = move_to_fake(
@@ -746,6 +775,27 @@ class AutoParallel:
                     canonical_fqn,
                     attr_kind=_AttrKind.BUFFER,
                 )
+
+        # Re-establish module aliases (e.g. model_ema -> teacher) so that
+        # both FQNs point to the same submodule on the parallel model.
+        for alias_fqn, canonical_fqn in self._module_alias_map.items():
+            # Find the canonical module on the parallel model
+            canonical_mod = self.parallel_model
+            for attr in canonical_fqn.split("."):
+                canonical_mod = getattr(canonical_mod, attr, None)
+                if canonical_mod is None:
+                    break
+            if canonical_mod is None:
+                continue
+            # Navigate to the alias's parent and re-establish the alias
+            *alias_prefix, alias_field = alias_fqn.split(".")
+            alias_parent = self.parallel_model
+            for attr in alias_prefix:
+                alias_parent = getattr(alias_parent, attr, None)
+                if alias_parent is None:
+                    break
+            if alias_parent is not None:
+                setattr(alias_parent, alias_field, canonical_mod)
 
         # Right now we require a convention that the user model provides an init_weights method,
         # although we could snoop for other methods too.
