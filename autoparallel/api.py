@@ -29,7 +29,12 @@ from torch.export.unflatten import _AttrKind
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
 from .apply_sharding import apply_sharding_to_model
-from .cast_parametrization import apply_dtype_cast, canonicalize_mp, set_dtype_cast
+from .cast_parametrization import (
+    DTypeCastModule,
+    apply_dtype_cast,
+    canonicalize_mp,
+    set_dtype_cast,
+)
 from .graph_passes.activation_checkpointing import ac_joint_pass
 from .graph_passes.graph_utils import (
     _add_alias,
@@ -789,7 +794,14 @@ class AutoParallel:
             self._traced_inputs, self.input_constraints, self.mesh
         )
 
+        # apply_dtype_cast swaps self.model.__class__ to a dynamic subclass
+        # with property descriptors for each parameter (e.g. 'weight'). We need
+        # the original user class so those properties don't conflict with
+        # register_parameter in _register_params_and_init_weights.
         UserModelClass = type(self.model)
+        if issubclass(UserModelClass, DTypeCastModule):
+            # DTypeCast bases are (DTypeCastModule, OriginalClass)
+            UserModelClass = UserModelClass.__bases__[1]
 
         class AutoParallelModule(UserModelClass):
             def __init__(self):
