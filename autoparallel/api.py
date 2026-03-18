@@ -50,6 +50,8 @@ _APPLY_VIEW_MM_VIEW_PATTERN = False
 
 logger = logging.getLogger(__name__)
 
+_NN_MODULE_KEYS = set(torch.nn.Module().__dict__.keys())
+
 
 def _build_alias_map(
     named_iter_fn: Callable[..., Any],
@@ -787,7 +789,12 @@ class AutoParallel:
             self._traced_inputs, self.input_constraints, self.mesh
         )
 
-        class AutoParallelModule(torch.nn.Module):
+        UserModelClass = type(self.model)
+
+        class AutoParallelModule(UserModelClass):
+            def __init__(self):
+                torch.nn.Module.__init__(self)
+
             def forward(self, *args):
                 _check_forward_args(args, expected_inputs)
                 # NB: don't close over the parameters/buffers, as the user may
@@ -804,6 +811,12 @@ class AutoParallel:
                 return out
 
         self.parallel_model = AutoParallelModule()
+        # Copy user-defined instance attributes (e.g. self.dim, self.config)
+        # from the original model. Uses __dict__ directly to avoid triggering
+        # nn.Module.__setattr__ which intercepts nn.Parameter/nn.Module assignments.
+        for k, v in self.model.__dict__.items():
+            if k not in _NN_MODULE_KEYS:
+                self.parallel_model.__dict__[k] = v
         self._register_params_and_init_weights(sharded_param_dict, sharded_buffer_dict)
         return self.parallel_model
 

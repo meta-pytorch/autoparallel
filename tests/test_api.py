@@ -1159,3 +1159,263 @@ def test_unused_parameters_captured(device_mesh_1d):
     assert (
         "unused_linear.bias" in param_names
     ), f"unused_linear.bias not found in parallel model params: {param_names}"
+
+
+def test_parallel_model_isinstance(device_mesh_1d):
+    """AutoParallelModule should be an instance of the user's model class."""
+    dim = 128
+
+    class Model(nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            self.linear = nn.Linear(dim, dim)
+
+        def forward(self, x):
+            return self.linear(x)
+
+    with torch.device("meta"):
+        model = Model(dim)
+
+    batch_size = 512
+    local_batch_size = batch_size // device_mesh_1d.size()
+    x = DTensor.from_local(
+        torch.rand(local_batch_size, dim, device="cuda"),
+        device_mesh_1d,
+        [Shard(0)],
+    )
+    parallel_mod = auto_parallel(
+        model,
+        device_mesh_1d,
+        sample_inputs=(x,),
+        out_shardings=(Shard(0),),
+        compile=False,
+    )
+    assert isinstance(parallel_mod, Model)
+
+
+def test_user_method_accessible(device_mesh_1d):
+    """User-defined methods and instance attributes should be available on parallel model."""
+    dim = 128
+
+    class Model(nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            self.linear = nn.Linear(dim, dim)
+            self.dim = dim
+            self.model_name = "test_model"
+
+        def forward(self, x):
+            return self.linear(x)
+
+        def get_num_params(self):
+            return sum(p.numel() for p in self.parameters())
+
+    with torch.device("meta"):
+        model = Model(dim)
+
+    batch_size = 512
+    local_batch_size = batch_size // device_mesh_1d.size()
+    x = DTensor.from_local(
+        torch.rand(local_batch_size, dim, device="cuda"),
+        device_mesh_1d,
+        [Shard(0)],
+    )
+    parallel_mod = auto_parallel(
+        model,
+        device_mesh_1d,
+        sample_inputs=(x,),
+        out_shardings=(Shard(0),),
+        compile=False,
+    )
+    assert hasattr(parallel_mod, "get_num_params")
+    assert parallel_mod.get_num_params() > 0
+    assert parallel_mod.dim == dim
+    assert parallel_mod.model_name == "test_model"
+
+
+def test_user_ema_update(device_mesh_1d):
+    """User-defined EMA update method should work on the parallel model."""
+    dim = 128
+
+    class Model(nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            self.linear = nn.Linear(dim, dim, bias=False)
+            self.ema_linear = nn.Linear(dim, dim, bias=False)
+
+        def forward(self, x):
+            return self.linear(x)
+
+        def init_weights(self):
+            with torch.no_grad():
+                self.linear.weight.fill_(2.0)
+                self.ema_linear.weight.fill_(0.0)
+
+        @torch.no_grad()
+        def update_ema(self, decay=0.9):
+            for p, ema_p in zip(self.linear.parameters(), self.ema_linear.parameters()):
+                ema_p.lerp_(p, 1 - decay)
+
+    with torch.device("meta"):
+        model = Model(dim)
+
+    batch_size = 512
+    local_batch_size = batch_size // device_mesh_1d.size()
+    x = DTensor.from_local(
+        torch.rand(local_batch_size, dim, device="cuda"),
+        device_mesh_1d,
+        [Shard(0)],
+    )
+    parallel_mod = auto_parallel(
+        model,
+        device_mesh_1d,
+        sample_inputs=(x,),
+        out_shardings=(Shard(0),),
+        compile=False,
+    )
+    parallel_mod.to_empty(device="cuda")
+    parallel_mod.init_weights()
+
+    assert torch.equal(
+        parallel_mod.get_parameter("ema_linear.weight").full_tensor(),
+        torch.zeros(dim, dim, device="cuda"),
+    )
+
+    parallel_mod.update_ema(decay=0.9)
+
+    # EMA should have moved 10% toward the main weight (2.0)
+    expected = torch.full((dim, dim), 0.2, device="cuda")
+    assert torch.allclose(
+        parallel_mod.get_parameter("ema_linear.weight").full_tensor(),
+        expected,
+    )
+
+
+def test_user_reset_buffers(device_mesh_1d):
+    """User-defined method that resets buffers should work on the parallel model."""
+    dim = 128
+
+    class Model(nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            self.linear = nn.Linear(dim, dim)
+            self.register_buffer("step_count", torch.zeros(1))
+
+        def forward(self, x):
+            return self.linear(x) + self.step_count
+
+        def init_weights(self):
+            with torch.no_grad():
+                self.linear.weight.fill_(1.0)
+                self.linear.bias.fill_(0.0)
+                self.step_count.fill_(42.0)
+
+        def reset_step_count(self):
+            self.step_count.zero_()
+
+    with torch.device("meta"):
+        model = Model(dim)
+
+    batch_size = 512
+    local_batch_size = batch_size // device_mesh_1d.size()
+    x = DTensor.from_local(
+        torch.rand(local_batch_size, dim, device="cuda"),
+        device_mesh_1d,
+        [Shard(0)],
+    )
+    parallel_mod = auto_parallel(
+        model,
+        device_mesh_1d,
+        sample_inputs=(x,),
+        out_shardings=(Shard(0),),
+        compile=False,
+    )
+    parallel_mod.to_empty(device="cuda")
+    parallel_mod.init_weights()
+
+    assert parallel_mod.get_buffer("step_count").full_tensor().item() == 42.0
+    parallel_mod.reset_step_count()
+    assert parallel_mod.get_buffer("step_count").full_tensor().item() == 0.0
+
+
+def test_user_classmethod_and_property(device_mesh_1d):
+    """Classmethods and properties defined on the user model should be accessible."""
+    dim = 128
+
+    class Model(nn.Module):
+        _registry = []
+
+        def __init__(self, dim):
+            super().__init__()
+            self.linear = nn.Linear(dim, dim)
+            self._hidden_dim = dim * 4
+
+        def forward(self, x):
+            return self.linear(x)
+
+        @classmethod
+        def from_config(cls, config_dim):
+            return cls(config_dim)
+
+        @property
+        def hidden_dim(self):
+            return self._hidden_dim
+
+    with torch.device("meta"):
+        model = Model(dim)
+
+    batch_size = 512
+    local_batch_size = batch_size // device_mesh_1d.size()
+    x = DTensor.from_local(
+        torch.rand(local_batch_size, dim, device="cuda"),
+        device_mesh_1d,
+        [Shard(0)],
+    )
+    parallel_mod = auto_parallel(
+        model,
+        device_mesh_1d,
+        sample_inputs=(x,),
+        out_shardings=(Shard(0),),
+        compile=False,
+    )
+    assert parallel_mod.hidden_dim == dim * 4
+    assert hasattr(type(parallel_mod), "from_config")
+    assert type(parallel_mod)._registry is Model._registry
+
+
+def test_inherited_user_model(device_mesh_1d):
+    """AutoParallelModule should inherit from the leaf class, getting the full MRO."""
+    dim = 128
+
+    class BaseModel(nn.Module):
+        def get_num_params(self):
+            return sum(p.numel() for p in self.parameters())
+
+    class Model(BaseModel):
+        def __init__(self, dim):
+            super().__init__()
+            self.linear = nn.Linear(dim, dim)
+
+        def forward(self, x):
+            return self.linear(x)
+
+    with torch.device("meta"):
+        model = Model(dim)
+
+    batch_size = 512
+    local_batch_size = batch_size // device_mesh_1d.size()
+    x = DTensor.from_local(
+        torch.rand(local_batch_size, dim, device="cuda"),
+        device_mesh_1d,
+        [Shard(0)],
+    )
+    parallel_mod = auto_parallel(
+        model,
+        device_mesh_1d,
+        sample_inputs=(x,),
+        out_shardings=(Shard(0),),
+        compile=False,
+    )
+    assert isinstance(parallel_mod, Model)
+    assert isinstance(parallel_mod, BaseModel)
+    assert parallel_mod.get_num_params() > 0
