@@ -37,7 +37,12 @@ from torch.distributed.tensor._ops.utils import (
     generate_redistribute_costs,
     is_tensor_shardable,
 )
-from torch.distributed.tensor.placement_types import Replicate, Shard
+from torch.distributed.tensor.placement_types import (
+    Partial,
+    Placement,
+    Replicate,
+    Shard,
+)
 
 # need to import this to have the dtype_cast registered
 from ..cast_parametrization import dtype_cast  # noqa
@@ -886,3 +891,213 @@ def stack_strategy(mesh, op_schema: OpSchema):
         mesh, op_schema, single_mesh_dim_strategies, input_index=1
     )
     return s
+
+
+# ======================================
+# Convolution ops
+
+
+@register_opschema_rule(torch.ops.aten.convolution.default)
+def convolution_strategy(mesh, op_schema: OpSchema):
+    from torch.distributed.tensor._ops.utils import expand_to_full_mesh_op_strategy
+
+    bias_strategy = op_schema.args_schema[2]
+    has_bias = isinstance(bias_strategy, OpStrategy)
+
+    # Placement list: [output, input, weight, (bias)]
+    single_mesh_dim_strategies: list[list[Placement | None]] = []
+
+    n = 4 if has_bias else 3
+    single_mesh_dim_strategies.append([Replicate()] * n)
+
+    # Batch shard: input/output on dim 0, weight/bias replicated
+    batch_shard: list[Placement | None] = [Shard(0), Shard(0), Replicate()]
+    if has_bias:
+        batch_shard.append(Replicate())
+    single_mesh_dim_strategies.append(batch_shard)
+
+    return expand_to_full_mesh_op_strategy(
+        mesh, op_schema, single_mesh_dim_strategies, input_index=1
+    )
+
+
+@register_opschema_rule(torch.ops.aten.convolution_backward.default)
+def convolution_backward_strategy(mesh, op_schema: OpSchema):
+    from torch.distributed.tensor._ops.utils import expand_to_full_mesh_op_strategy
+
+    bias_shape_opt = op_schema.args_schema[3]
+    has_bias = bias_shape_opt is not None
+
+    # Outputs: grad_input, grad_weight, grad_bias (3)
+    # Inputs (tensor): grad_output, input, weight (3)
+    # Placement list: [grad_input, grad_weight, grad_bias, grad_output, input, weight]
+    single_mesh_dim_strategies: list[list[Placement | None]] = []
+
+    if has_bias:
+        single_mesh_dim_strategies.append([Replicate()] * 6)
+        single_mesh_dim_strategies.append(
+            [Shard(0), Partial(), Partial(), Shard(0), Shard(0), Replicate()]
+        )
+    else:
+        single_mesh_dim_strategies.append(
+            [Replicate(), Replicate(), None, Replicate(), Replicate(), Replicate()]
+        )
+        single_mesh_dim_strategies.append(
+            [Shard(0), Partial(), None, Shard(0), Shard(0), Replicate()]
+        )
+
+    return expand_to_full_mesh_op_strategy(
+        mesh, op_schema, single_mesh_dim_strategies, input_index=3
+    )
+
+
+# ======================================
+# Random ops
+
+
+@register_opschema_rule(torch.ops.aten.uniform.default)
+def uniform_strategy(mesh, op_schema: OpSchema):
+    from torch.distributed.tensor._ops.utils import expand_to_full_mesh_op_strategy
+
+    input_strategy = op_schema.args_schema[0]
+    assert isinstance(input_strategy, OpStrategy)
+    ndim = input_strategy.ndim
+
+    # [output, input] — any shard of input maps to same shard of output
+    single_mesh_dim_strategies: list[list[Placement | None]] = [
+        [Replicate(), Replicate()]
+    ]
+    for d in range(ndim):
+        single_mesh_dim_strategies.append([Shard(d), Shard(d)])
+
+    return expand_to_full_mesh_op_strategy(
+        mesh, op_schema, single_mesh_dim_strategies, input_index=1
+    )
+
+
+# ======================================
+# Scatter ops
+
+
+@register_opschema_rule(torch.ops.aten.diagonal_scatter.default)
+def diagonal_scatter_strategy(mesh, op_schema: OpSchema):
+    from torch.distributed.tensor._ops.utils import (
+        expand_to_full_mesh_op_strategy,
+        normalize_dim,
+    )
+
+    input_strategy = op_schema.args_schema[0]
+    assert isinstance(input_strategy, OpStrategy)
+    ndim = input_strategy.ndim
+
+    dim1 = op_schema.args_schema[3] if len(op_schema.args_schema) > 3 else 0
+    dim2 = op_schema.args_schema[4] if len(op_schema.args_schema) > 4 else 1
+    assert isinstance(dim1, int)
+    assert isinstance(dim2, int)
+    dim1 = normalize_dim(dim1, ndim)
+    dim2 = normalize_dim(dim2, ndim)
+    min_d, max_d = min(dim1, dim2), max(dim1, dim2)
+
+    # [output, input, src]
+    single_mesh_dim_strategies: list[list[Placement | None]] = [[Replicate()] * 3]
+    for d in range(ndim):
+        if d == dim1 or d == dim2:
+            continue
+        # src shape has dim1/dim2 removed, diagonal appended
+        removed = (1 if d > min_d else 0) + (1 if d > max_d else 0)
+        single_mesh_dim_strategies.append([Shard(d), Shard(d), Shard(d - removed)])
+
+    return expand_to_full_mesh_op_strategy(
+        mesh, op_schema, single_mesh_dim_strategies, input_index=1
+    )
+
+
+@register_opschema_rule(torch.ops.aten.select_scatter.default)
+def select_scatter_strategy(mesh, op_schema: OpSchema):
+    from torch.distributed.tensor._ops.utils import (
+        expand_to_full_mesh_op_strategy,
+        normalize_dim,
+    )
+
+    input_strategy = op_schema.args_schema[0]
+    assert isinstance(input_strategy, OpStrategy)
+    ndim = input_strategy.ndim
+    dim = op_schema.args_schema[2]
+    assert isinstance(dim, int)
+    dim = normalize_dim(dim, ndim)
+
+    # [output, input, src]
+    single_mesh_dim_strategies: list[list[Placement | None]] = [[Replicate()] * 3]
+    for d in range(ndim):
+        if d == dim:
+            continue
+        # src has the select dim removed
+        single_mesh_dim_strategies.append(
+            [Shard(d), Shard(d), Shard(d if d < dim else d - 1)]
+        )
+
+    return expand_to_full_mesh_op_strategy(
+        mesh, op_schema, single_mesh_dim_strategies, input_index=1
+    )
+
+
+# ======================================
+# Indexing ops
+
+
+@register_opschema_rule(torch.ops.aten.index.Tensor)
+def index_strategy(mesh, op_schema: OpSchema):
+    from torch.distributed.tensor._op_schema import TupleStrategy
+    from torch.distributed.tensor._ops.utils import expand_to_full_mesh_op_strategy
+
+    self_strategy = op_schema.args_schema[0]
+    indices_schema = op_schema.args_schema[1]
+    assert isinstance(self_strategy, OpStrategy)
+    ndim = self_strategy.ndim
+
+    if not isinstance(indices_schema, TupleStrategy):
+        n_inputs = len(op_schema.args_strategy)
+        strats: list[list[Placement | None]] = [[Replicate()] * (1 + n_inputs)]
+        return expand_to_full_mesh_op_strategy(mesh, op_schema, strats, input_index=1)
+
+    indexed_dims = []
+    index_strategies = []
+    for i, child in enumerate(indices_schema.children):
+        if isinstance(child, OpStrategy):
+            indexed_dims.append(i)
+            index_strategies.append(child)
+
+    n_idx = len(index_strategies)
+    consecutive = len(indexed_dims) <= 1 or all(
+        indexed_dims[i + 1] - indexed_dims[i] == 1 for i in range(len(indexed_dims) - 1)
+    )
+    broadcast_ndim = max(s.ndim for s in index_strategies)
+    insert_at = indexed_dims[0] if consecutive else 0
+
+    # [output, self, idx1, idx2, ...]
+    n_entries = 2 + n_idx
+    single_mesh_dim_strategies: list[list[Placement | None]] = [
+        [Replicate()] * n_entries
+    ]
+
+    for d in range(ndim):
+        if d in indexed_dims:
+            continue
+
+        # Map self dim d to output dim
+        if consecutive:
+            if d < insert_at:
+                out_d = d
+            else:
+                out_d = d - len(indexed_dims) + broadcast_ndim
+        else:
+            shift = sum(1 for idx_d in indexed_dims if idx_d < d)
+            out_d = broadcast_ndim + d - shift
+
+        single_mesh_dim_strategies.append(
+            [Shard(out_d), Shard(d)] + [Replicate()] * n_idx
+        )
+
+    return expand_to_full_mesh_op_strategy(
+        mesh, op_schema, single_mesh_dim_strategies, input_index=1
+    )
