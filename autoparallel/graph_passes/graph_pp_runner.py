@@ -844,6 +844,7 @@ def overlap_fw_bw(
     multiplexed_graph_callables: dict[tuple[int, int], fx.GraphModule],
     action: _Action,
     ctx: _PipelineContext,
+    inductor: bool = False,
 ) -> None:
     assert action.sub_actions is not None, "Expected sub actions for overlap callback"
     fw_action = action.sub_actions[0]
@@ -896,7 +897,11 @@ def overlap_fw_bw(
         output,
         saved_intermediates,
     ) = _run_multiplexed_fw_bw_module(
-        multiplexed_fw_bw_module, fw_stage.graph_meta, bw_stage.graph_meta, bw_fw_args
+        multiplexed_fw_bw_module,
+        fw_stage.graph_meta,
+        bw_stage.graph_meta,
+        bw_fw_args,
+        inductor=inductor,
     )
 
     bw_stage._accumulate_stage_unsharded_grads(param_buffer_grads)
