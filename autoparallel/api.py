@@ -29,7 +29,12 @@ from torch.export.unflatten import _AttrKind
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
 from .apply_sharding import apply_sharding_to_model
-from .cast_parametrization import apply_dtype_cast, canonicalize_mp, set_dtype_cast
+from .cast_parametrization import (
+    DTypeCastModule,
+    apply_dtype_cast,
+    canonicalize_mp,
+    set_dtype_cast,
+)
 from .graph_passes.activation_checkpointing import ac_joint_pass
 from .graph_passes.graph_utils import (
     _add_alias,
@@ -49,6 +54,8 @@ from .shardings.placement_options import (
 _APPLY_VIEW_MM_VIEW_PATTERN = False
 
 logger = logging.getLogger(__name__)
+
+_NN_MODULE_KEYS = set(torch.nn.Module().__dict__.keys())
 
 
 def _build_alias_map(
@@ -837,7 +844,19 @@ class AutoParallel:
             self._traced_inputs, self.input_constraints, self.mesh
         )
 
-        class AutoParallelModule(torch.nn.Module):
+        # apply_dtype_cast swaps self.model.__class__ to a dynamic subclass
+        # with property descriptors for each parameter (e.g. 'weight'). We need
+        # the original user class so those properties don't conflict with
+        # register_parameter in _register_params_and_init_weights.
+        UserModelClass = type(self.model)
+        if issubclass(UserModelClass, DTypeCastModule):
+            # DTypeCast bases are (DTypeCastModule, OriginalClass)
+            UserModelClass = UserModelClass.__bases__[1]
+
+        class AutoParallelModule(UserModelClass):
+            def __init__(self):
+                torch.nn.Module.__init__(self)
+
             def forward(self, *args):
                 _check_forward_args(args, expected_inputs)
                 # NB: don't close over the parameters/buffers, as the user may
@@ -854,6 +873,12 @@ class AutoParallel:
                 return out
 
         self.parallel_model = AutoParallelModule()
+        # Copy user-defined instance attributes (e.g. self.dim, self.config)
+        # from the original model. Uses __dict__ directly to avoid triggering
+        # nn.Module.__setattr__ which intercepts nn.Parameter/nn.Module assignments.
+        for k, v in self.model.__dict__.items():
+            if k not in _NN_MODULE_KEYS:
+                self.parallel_model.__dict__[k] = v
         self._register_params_and_init_weights(sharded_param_dict, sharded_buffer_dict)
         return self.parallel_model
 
