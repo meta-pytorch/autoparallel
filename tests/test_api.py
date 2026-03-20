@@ -1485,3 +1485,325 @@ def test_inherited_user_model(device_mesh_1d):
     assert isinstance(parallel_mod, Model)
     assert isinstance(parallel_mod, BaseModel)
     assert parallel_mod.get_num_params() > 0
+
+
+def test_init_load_state_dict(device_mesh_1d):
+    """Test that init_weights can use load_state_dict to initialize parameters."""
+    dim = 128
+
+    class Model(nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            self.linear = nn.Linear(dim, dim)
+            self.register_buffer("buf", torch.empty(dim))
+
+        def forward(self, x):
+            return self.linear(x) + self.buf
+
+        def init_weights(self):
+            state = {
+                "linear.weight": torch.ones(dim, dim) * 3.0,
+                "linear.bias": torch.full((dim,), 7.0),
+                "buf": torch.arange(dim, dtype=torch.float32),
+            }
+            self.load_state_dict(state)
+
+    with torch.device("meta"):
+        model = Model(dim)
+
+    batch_size = 512
+    local_batch_size = batch_size // device_mesh_1d.size()
+    x = DTensor.from_local(
+        torch.rand(local_batch_size, dim, device="cuda"),
+        device_mesh_1d,
+        [Shard(0)],
+    )
+    parallel_mod = auto_parallel(
+        model,
+        device_mesh_1d,
+        sample_inputs=(x,),
+        out_shardings=(Shard(0),),
+        compile=False,
+    )
+    parallel_mod.to_empty(device="cuda")
+    parallel_mod.init_weights()
+    assert torch.equal(
+        parallel_mod.get_parameter("linear.weight").full_tensor(),
+        torch.full((dim, dim), 3.0, device="cuda"),
+    )
+    assert torch.equal(
+        parallel_mod.get_parameter("linear.bias").full_tensor(),
+        torch.full((dim,), 7.0, device="cuda"),
+    )
+    assert torch.equal(
+        parallel_mod.get_buffer("buf").full_tensor(),
+        torch.arange(dim, dtype=torch.float32, device="cuda"),
+    )
+
+
+def test_init_submodule_init_weights(device_mesh_1d):
+    """Test that init_weights can call submodule init_weights methods."""
+    dim = 128
+
+    class MLP(nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            self.fc1 = nn.Linear(dim, dim)
+            self.fc2 = nn.Linear(dim, dim)
+
+        def forward(self, x):
+            return self.fc2(self.fc1(x))
+
+        def init_weights(self):
+            with torch.no_grad():
+                self.fc1.weight.fill_(1.0)
+                self.fc1.bias.fill_(0.0)
+                self.fc2.weight.fill_(2.0)
+                self.fc2.bias.fill_(0.5)
+
+    class Attention(nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            self.qkv = nn.Linear(dim, dim * 3, bias=False)
+            self.proj = nn.Linear(dim, dim, bias=False)
+
+        def forward(self, x):
+            return self.proj(self.qkv(x)[:, :dim])
+
+        def init_weights(self):
+            nn.init.ones_(self.qkv.weight)
+            nn.init.ones_(self.proj.weight)
+
+    class Model(nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            self.mlp = MLP(dim)
+            self.attn = Attention(dim)
+
+        def forward(self, x):
+            return self.mlp(x) + self.attn(x)
+
+        def init_weights(self):
+            self.mlp.init_weights()
+            self.attn.init_weights()
+
+    with torch.device("meta"):
+        model = Model(dim)
+
+    batch_size = 512
+    local_batch_size = batch_size // device_mesh_1d.size()
+    x = DTensor.from_local(
+        torch.rand(local_batch_size, dim, device="cuda"),
+        device_mesh_1d,
+        [Shard(0)],
+    )
+    parallel_mod = auto_parallel(
+        model,
+        device_mesh_1d,
+        sample_inputs=(x,),
+        out_shardings=(Shard(0),),
+        compile=False,
+    )
+    parallel_mod.to_empty(device="cuda")
+    parallel_mod.init_weights()
+    assert torch.equal(
+        parallel_mod.get_parameter("mlp.fc1.weight").full_tensor(),
+        torch.ones(dim, dim, device="cuda"),
+    )
+    assert torch.equal(
+        parallel_mod.get_parameter("mlp.fc2.bias").full_tensor(),
+        torch.full((dim,), 0.5, device="cuda"),
+    )
+    assert torch.equal(
+        parallel_mod.get_parameter("attn.qkv.weight").full_tensor(),
+        torch.ones(dim * 3, dim, device="cuda"),
+    )
+    assert torch.equal(
+        parallel_mod.get_parameter("attn.proj.weight").full_tensor(),
+        torch.ones(dim, dim, device="cuda"),
+    )
+
+
+def test_init_access_submodule_params(device_mesh_1d):
+    """Test that init_weights can iterate over submodule parameters."""
+    dim = 128
+
+    class Model(nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            self.linear1 = nn.Linear(dim, dim)
+            self.linear2 = nn.Linear(dim, dim)
+
+        def forward(self, x):
+            return self.linear2(self.linear1(x))
+
+        def init_weights(self):
+            for name, param in self.named_parameters():
+                if "weight" in name:
+                    with torch.no_grad():
+                        param.fill_(1.0)
+                elif "bias" in name:
+                    with torch.no_grad():
+                        param.fill_(0.0)
+
+    with torch.device("meta"):
+        model = Model(dim)
+
+    batch_size = 512
+    local_batch_size = batch_size // device_mesh_1d.size()
+    x = DTensor.from_local(
+        torch.rand(local_batch_size, dim, device="cuda"),
+        device_mesh_1d,
+        [Shard(0)],
+    )
+    parallel_mod = auto_parallel(
+        model,
+        device_mesh_1d,
+        sample_inputs=(x,),
+        out_shardings=(Shard(0),),
+        compile=False,
+    )
+    parallel_mod.to_empty(device="cuda")
+    parallel_mod.init_weights()
+    assert torch.equal(
+        parallel_mod.get_parameter("linear1.weight").full_tensor(),
+        torch.ones(dim, dim, device="cuda"),
+    )
+    assert torch.equal(
+        parallel_mod.get_parameter("linear2.weight").full_tensor(),
+        torch.ones(dim, dim, device="cuda"),
+    )
+    assert torch.equal(
+        parallel_mod.get_parameter("linear1.bias").full_tensor(),
+        torch.zeros(dim, device="cuda"),
+    )
+    assert torch.equal(
+        parallel_mod.get_parameter("linear2.bias").full_tensor(),
+        torch.zeros(dim, device="cuda"),
+    )
+
+
+def test_init_submodule_load_state_dict(device_mesh_1d):
+    """Test that init_weights can call load_state_dict on a submodule."""
+    dim = 128
+
+    class SubModule(nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            self.linear = nn.Linear(dim, dim)
+            self.register_buffer("scale", torch.empty(dim))
+
+        def forward(self, x):
+            return self.linear(x) * self.scale
+
+        def init_weights(self):
+            state = {
+                "linear.weight": torch.eye(dim),
+                "linear.bias": torch.zeros(dim),
+                "scale": torch.ones(dim) * 5.0,
+            }
+            self.load_state_dict(state)
+
+    class Model(nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            self.sub = SubModule(dim)
+            self.out = nn.Linear(dim, dim)
+
+        def forward(self, x):
+            return self.out(self.sub(x))
+
+        def init_weights(self):
+            self.sub.init_weights()
+            with torch.no_grad():
+                self.out.weight.fill_(1.0)
+                self.out.bias.fill_(0.0)
+
+    with torch.device("meta"):
+        model = Model(dim)
+
+    batch_size = 512
+    local_batch_size = batch_size // device_mesh_1d.size()
+    x = DTensor.from_local(
+        torch.rand(local_batch_size, dim, device="cuda"),
+        device_mesh_1d,
+        [Shard(0)],
+    )
+    parallel_mod = auto_parallel(
+        model,
+        device_mesh_1d,
+        sample_inputs=(x,),
+        out_shardings=(Shard(0),),
+        compile=False,
+    )
+    parallel_mod.to_empty(device="cuda")
+    parallel_mod.init_weights()
+    assert torch.equal(
+        parallel_mod.get_parameter("sub.linear.weight").full_tensor(),
+        torch.eye(dim, device="cuda"),
+    )
+    assert torch.equal(
+        parallel_mod.get_parameter("sub.linear.bias").full_tensor(),
+        torch.zeros(dim, device="cuda"),
+    )
+    assert torch.equal(
+        parallel_mod.get_buffer("sub.scale").full_tensor(),
+        torch.full((dim,), 5.0, device="cuda"),
+    )
+    assert torch.equal(
+        parallel_mod.get_parameter("out.weight").full_tensor(),
+        torch.ones(dim, dim, device="cuda"),
+    )
+
+
+def test_init_optional_submodule(device_mesh_1d):
+    """Test that init_weights can check for optional (None) submodules.
+
+    Mirrors the torchtitan Decoder pattern where rope may or may not be present.
+    When rope is None, the parallel model must still have the attribute so the
+    None check doesn't raise AttributeError.
+    """
+    dim = 128
+
+    class Model(nn.Module):
+        def __init__(self, dim, use_rope=False):
+            super().__init__()
+            self.linear = nn.Linear(dim, dim)
+            self.rope = nn.Linear(dim, dim) if use_rope else None
+
+        def forward(self, x):
+            return self.linear(x)
+
+        def init_weights(self):
+            with torch.no_grad():
+                self.linear.weight.fill_(1.0)
+                self.linear.bias.fill_(0.0)
+            if self.rope is not None:
+                with torch.no_grad():
+                    self.rope.weight.fill_(2.0)
+
+    with torch.device("meta"):
+        model = Model(dim, use_rope=False)
+
+    batch_size = 512
+    local_batch_size = batch_size // device_mesh_1d.size()
+    x = DTensor.from_local(
+        torch.rand(local_batch_size, dim, device="cuda"),
+        device_mesh_1d,
+        [Shard(0)],
+    )
+    parallel_mod = auto_parallel(
+        model,
+        device_mesh_1d,
+        sample_inputs=(x,),
+        out_shardings=(Shard(0),),
+        compile=False,
+    )
+    parallel_mod.to_empty(device="cuda")
+    parallel_mod.init_weights()
+
+    assert parallel_mod.rope is None
+    assert torch.equal(
+        parallel_mod.get_parameter("linear.weight").full_tensor(),
+        torch.ones(dim, dim, device="cuda"),
+    )
