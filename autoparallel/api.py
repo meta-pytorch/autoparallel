@@ -863,6 +863,12 @@ class AutoParallel:
             if k not in _NN_MODULE_KEYS:
                 self.parallel_model.__dict__[k] = v
         self._register_params_and_init_weights(sharded_param_dict, sharded_buffer_dict)
+        # Copy submodules that don't appear in any parameter/buffer FQN path
+        # (e.g. self.rope when it has no traced params/buffers). These aren't
+        # created by _assign_attr, but init_weights may need to access them.
+        for k, v in self.model._modules.items():
+            if k not in self.parallel_model._modules:
+                self.parallel_model._modules[k] = v
         return self.parallel_model
 
 

@@ -1754,3 +1754,56 @@ def test_init_submodule_load_state_dict(device_mesh_1d):
         parallel_mod.get_parameter("out.weight").full_tensor(),
         torch.ones(dim, dim, device="cuda"),
     )
+
+
+def test_init_optional_submodule(device_mesh_1d):
+    """Test that init_weights can check for optional (None) submodules.
+
+    Mirrors the torchtitan Decoder pattern where rope may or may not be present.
+    When rope is None, the parallel model must still have the attribute so the
+    None check doesn't raise AttributeError.
+    """
+    dim = 128
+
+    class Model(nn.Module):
+        def __init__(self, dim, use_rope=False):
+            super().__init__()
+            self.linear = nn.Linear(dim, dim)
+            self.rope = nn.Linear(dim, dim) if use_rope else None
+
+        def forward(self, x):
+            return self.linear(x)
+
+        def init_weights(self):
+            with torch.no_grad():
+                self.linear.weight.fill_(1.0)
+                self.linear.bias.fill_(0.0)
+            if self.rope is not None:
+                with torch.no_grad():
+                    self.rope.weight.fill_(2.0)
+
+    with torch.device("meta"):
+        model = Model(dim, use_rope=False)
+
+    batch_size = 512
+    local_batch_size = batch_size // device_mesh_1d.size()
+    x = DTensor.from_local(
+        torch.rand(local_batch_size, dim, device="cuda"),
+        device_mesh_1d,
+        [Shard(0)],
+    )
+    parallel_mod = auto_parallel(
+        model,
+        device_mesh_1d,
+        sample_inputs=(x,),
+        out_shardings=(Shard(0),),
+        compile=False,
+    )
+    parallel_mod.to_empty(device="cuda")
+    parallel_mod.init_weights()
+
+    assert parallel_mod.rope is None
+    assert torch.equal(
+        parallel_mod.get_parameter("linear.weight").full_tensor(),
+        torch.ones(dim, dim, device="cuda"),
+    )

@@ -9,7 +9,7 @@ from torch import nn
 from torch.distributed.tensor import DTensor
 from torch.testing._internal.distributed.fake_pg import FakeStore
 
-from autoparallel.api_pp import _make_pp_module
+from autoparallel.api_pp import make_pp_module
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -70,7 +70,7 @@ def test_pp_init_weights_basic(device_mesh_1d):
         model = Model(dim)
 
     param_dict, buffer_dict = _make_sharded_dicts(model, device_mesh_1d)
-    pp_mod = _make_pp_module(param_dict, buffer_dict, model)
+    pp_mod = make_pp_module(param_dict, buffer_dict, model)
     pp_mod.init_weights()
 
     assert torch.equal(
@@ -108,7 +108,7 @@ def test_pp_init_weights_setattr(device_mesh_1d):
         model = Model(dim)
 
     param_dict, buffer_dict = _make_sharded_dicts(model, device_mesh_1d)
-    pp_mod = _make_pp_module(param_dict, buffer_dict, model)
+    pp_mod = make_pp_module(param_dict, buffer_dict, model)
     pp_mod.init_weights()
 
     assert torch.equal(
@@ -156,7 +156,7 @@ def test_pp_init_weights_submodule(device_mesh_1d):
         model = Model(dim)
 
     param_dict, buffer_dict = _make_sharded_dicts(model, device_mesh_1d)
-    pp_mod = _make_pp_module(param_dict, buffer_dict, model)
+    pp_mod = make_pp_module(param_dict, buffer_dict, model)
     pp_mod.init_weights()
 
     assert torch.equal(
@@ -196,7 +196,7 @@ def test_pp_init_weights_load_state_dict(device_mesh_1d):
         model = Model(dim)
 
     param_dict, buffer_dict = _make_sharded_dicts(model, device_mesh_1d)
-    pp_mod = _make_pp_module(param_dict, buffer_dict, model)
+    pp_mod = make_pp_module(param_dict, buffer_dict, model)
     pp_mod.init_weights()
 
     assert torch.equal(
@@ -233,7 +233,7 @@ def test_pp_init_weights_user_helper_method(device_mesh_1d):
         model = Model(dim)
 
     param_dict, buffer_dict = _make_sharded_dicts(model, device_mesh_1d)
-    pp_mod = _make_pp_module(param_dict, buffer_dict, model)
+    pp_mod = make_pp_module(param_dict, buffer_dict, model)
 
     assert isinstance(pp_mod, Model)
     pp_mod.init_weights()
@@ -273,7 +273,7 @@ def test_pp_init_weights_named_parameters(device_mesh_1d):
         model = Model(dim)
 
     param_dict, buffer_dict = _make_sharded_dicts(model, device_mesh_1d)
-    pp_mod = _make_pp_module(param_dict, buffer_dict, model)
+    pp_mod = make_pp_module(param_dict, buffer_dict, model)
     pp_mod.init_weights()
 
     assert torch.equal(
@@ -283,4 +283,44 @@ def test_pp_init_weights_named_parameters(device_mesh_1d):
     assert torch.equal(
         pp_mod.get_parameter("linear2.bias").full_tensor(),
         torch.zeros(dim, device="cuda"),
+    )
+
+
+def test_pp_init_weights_optional_submodule(device_mesh_1d):
+    """init_weights that checks for an optional submodule (self.rope is not None).
+
+    Mirrors the torchtitan Decoder pattern where rope may or may not be present.
+    When rope is None, the parallel model must still have the attribute so the
+    None check doesn't raise AttributeError.
+    """
+    dim = 128
+
+    class Model(nn.Module):
+        def __init__(self, dim, use_rope=False):
+            super().__init__()
+            self.linear = nn.Linear(dim, dim)
+            self.rope = nn.Linear(dim, dim) if use_rope else None
+
+        def forward(self, x):
+            return self.linear(x)
+
+        def init_weights(self):
+            with torch.no_grad():
+                self.linear.weight.fill_(1.0)
+                self.linear.bias.fill_(0.0)
+            if self.rope is not None:
+                with torch.no_grad():
+                    self.rope.weight.fill_(2.0)
+
+    with torch.device("meta"):
+        model = Model(dim, use_rope=False)
+
+    param_dict, buffer_dict = _make_sharded_dicts(model, device_mesh_1d)
+    pp_mod = make_pp_module(param_dict, buffer_dict, model)
+    pp_mod.init_weights()
+
+    assert pp_mod.rope is None
+    assert torch.equal(
+        pp_mod.get_parameter("linear.weight").full_tensor(),
+        torch.ones(dim, dim, device="cuda"),
     )
