@@ -43,6 +43,7 @@ from .graph_passes.graph_utils import (
     cleanup_graph,
     update_joint_with_descriptors,
 )
+from .graph_passes.make_collectives_contiguous import make_collectives_contiguous
 from .init_weights import hook_params_setters
 from .optimize_sharding import ShardingOptimizer
 from .shardings.placement_options import (
@@ -657,6 +658,7 @@ class AutoParallel:
         # clean it up by removing the added aliases from previous pass
         # as well as redundant views
         cleanup_graph(parallel_gm, aggressive=True)
+        make_collectives_contiguous(parallel_gm)
         t_cleanup = time.perf_counter()
 
         trace_structured(
