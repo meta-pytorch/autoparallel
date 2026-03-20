@@ -3,7 +3,6 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
-from types import MethodType
 from typing import Any, Optional
 
 import torch
@@ -13,48 +12,37 @@ from torch.export.unflatten import _AttrKind
 from autoparallel.graph_passes.graph_partition import partition_joint_with_descriptors
 
 from .api import AutoParallel, _assign_attr
-from .init_weights import _init_weights_context
+from .cast_parametrization import DTypeCastModule
+from .init_weights import wrap_init_weights
 
 
-class AutoParallelPPModule(torch.nn.Module):
-    def __init__(
-        self,
-        sharded_param_dict: dict[str, torch.nn.Parameter],
-        sharded_buffer_dict: dict[str, torch.Tensor],
-        ref_model: torch.nn.Module,
-    ):
-        super().__init__()
-        self._register_params_and_buffers(
-            sharded_param_dict, sharded_buffer_dict, ref_model
-        )
+def _make_pp_module(
+    sharded_param_dict: dict[str, torch.nn.Parameter],
+    sharded_buffer_dict: dict[str, torch.Tensor],
+    ref_model: torch.nn.Module,
+):
+    """Create an AutoParallelPPModule that inherits from the user's model class."""
+    UserModelClass = type(ref_model)
+    if issubclass(UserModelClass, DTypeCastModule):
+        UserModelClass = UserModelClass.__bases__[1]
 
-        # If the user model has init_weights, bind it to this parallel model
-        # with DTensor-aware interception for parameter/buffer assignments.
-        if hasattr(ref_model, "init_weights"):
-            user_init_weights_fn = getattr(type(ref_model), "init_weights")
+    class AutoParallelPPModule(UserModelClass):  # type: ignore[misc,valid-type]
+        def __init__(self):
+            torch.nn.Module.__init__(self)
 
-            def init_weights(_self, *args, **kwargs):
-                with _init_weights_context(_self):
-                    return user_init_weights_fn(_self, *args, **kwargs)
+        def forward(self, *args):
+            raise NotImplementedError("This is a placeholder for the pipeline model")
 
-            self.init_weights = MethodType(init_weights, self)
+    mod = AutoParallelPPModule()
 
-    def _register_params_and_buffers(
-        self, sharded_param_dict, sharded_buffer_dict, ref_model
-    ):
+    # Register params and buffers, preserving original module structure.
+    for k, v in sharded_param_dict.items():
+        _assign_attr(v, mod, ref_model, k, attr_kind=_AttrKind.PARAMETER)
+    for k, buf in sharded_buffer_dict.items():
+        _assign_attr(buf, mod, ref_model, k, attr_kind=_AttrKind.BUFFER)
 
-        # We construct an unflattened structure on parallel_mod,
-        # e.g. _assign_attr(v, parallel_model, k="layers.0.weight") will literally
-        # create empty nn.Modules recursively and then stash 'v' so it shows up in the right spot
-        # We pass ref_model to preserve the original module structure (e.g., nn.ModuleDict)
-        for k, v in sharded_param_dict.items():
-            _assign_attr(v, self, ref_model, k, attr_kind=_AttrKind.PARAMETER)
-
-        for k, v in sharded_buffer_dict.items():
-            _assign_attr(v, self, ref_model, k, attr_kind=_AttrKind.BUFFER)
-
-    def forward(self, *args):
-        raise NotImplementedError("This is a placeholder for the pipeline model")
+    wrap_init_weights(mod)
+    return mod
 
 
 class AutoParallelPP(AutoParallel):
@@ -228,7 +216,7 @@ class AutoParallelPP(AutoParallel):
             "unshard": unshard_module,
             "reduce_grad": reduce_grad_module,
         }
-        self.parallel_model = AutoParallelPPModule(
+        self.parallel_model = _make_pp_module(
             sharded_param_dict,
             sharded_buffer_dict,
             self.model,
