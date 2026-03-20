@@ -286,6 +286,36 @@ class TestBuildParamGradLinearChains:
             assert param in source_to_chain
             assert param in node_to_source
 
+    def test_dead_end_node_in_chain(self):
+        """Test that a chain node with no users doesn't crash the traversal.
+
+        When a node in the chain has exactly one input (so the while loop
+        enters) but zero users, list(last_p.users.keys())[0] would raise
+        an IndexError without the len(last_p.users) > 0 guard.
+        """
+        # Build a minimal graph where param's sole user is a dead-end node
+        # (single input, no users of its own).
+        graph = torch.fx.Graph()
+        other = graph.placeholder("other")
+        param = graph.placeholder("param")
+        dead_end = graph.call_function(torch.ops.aten.t.default, (param,))
+        graph.output(other)  # neither param nor dead_end is used by output
+
+        assert len(param.users) == 1
+        assert len(dead_end.all_input_nodes) == 1
+        assert len(dead_end.users) == 0
+
+        # Should not raise an IndexError
+        node_to_source, source_to_chain = build_param_grad_linear_chains(
+            [(param, None)]
+        )
+
+        # The chain should contain only param — the dead-end node is excluded
+        # because the loop stops before appending a node with no users.
+        assert param in source_to_chain
+        chain = source_to_chain[param]
+        assert chain == [param]
+
     def test_chains_contain_only_single_input_nodes(self):
         """Test that chains only include nodes with single inputs (linear dependency)."""
         dim = 64
