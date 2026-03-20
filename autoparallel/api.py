@@ -8,7 +8,6 @@ import functools
 import logging
 import time
 from contextlib import ExitStack, contextmanager
-from types import MethodType
 from typing import Any, Callable, Optional, Union
 
 import torch
@@ -43,7 +42,7 @@ from .graph_passes.graph_utils import (
     cleanup_graph,
     update_joint_with_descriptors,
 )
-from .init_weights import hook_params_setters
+from .init_weights import wrap_init_weights
 from .optimize_sharding import ShardingOptimizer
 from .shardings.placement_options import (
     NumericsLogger,
@@ -398,11 +397,6 @@ class AutoParallel:
         self._param_alias_map = _build_alias_map(model.named_parameters)
         self._buffer_alias_map = _build_alias_map(model.named_buffers)
         self._module_alias_map = _build_module_alias_map(model)
-
-        # keep a separate copy of the fake orig model to customize for supporting init_weights
-        self.init_weights_model = move_to_fake(
-            copy.deepcopy(model), self.fake_mode, device
-        )
 
         if self.mp_policy is not None:
             apply_dtype_cast(model, self.mp_policy)
@@ -804,21 +798,10 @@ class AutoParallel:
             if alias_parent is not None:
                 setattr(alias_parent, alias_field, canonical_mod)
 
-        # Right now we require a convention that the user model provides an init_weights method,
-        # although we could snoop for other methods too.
-        hook_params_setters(self.init_weights_model, self.parallel_model)
-        if hasattr(self.model, "init_weights"):
-
-            def init_weights(_self, *args, **kwargs):
-                # this is now a deep-fake-copy of orig mod, so we don't have to use reparametrize
-                return self.init_weights_model.init_weights(*args, **kwargs)
-
-            # assign an init_weights method onto the output mod.
-            # all it does is sneakily run the original user mod's init_weights method,
-            # but with our new DTensor sharded params attached to the user module.
-            self.parallel_model.init_weights = MethodType(
-                init_weights, self.parallel_model
-            )
+        # Wrap init_weights (inherited from UserModelClass) so that parameter/buffer
+        # assignments and in-place data operations are intercepted and correctly
+        # applied to the sharded DTensor parameters.
+        wrap_init_weights(self.parallel_model)
 
     def apply_placement(self, sharding_placement=None):
 

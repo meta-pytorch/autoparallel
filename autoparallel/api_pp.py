@@ -13,7 +13,7 @@ from torch.export.unflatten import _AttrKind
 from autoparallel.graph_passes.graph_partition import partition_joint_with_descriptors
 
 from .api import AutoParallel, _assign_attr
-from .init_weights import hook_params_setters
+from .init_weights import _init_weights_context
 
 
 class AutoParallelPPModule(torch.nn.Module):
@@ -21,7 +21,6 @@ class AutoParallelPPModule(torch.nn.Module):
         self,
         sharded_param_dict: dict[str, torch.nn.Parameter],
         sharded_buffer_dict: dict[str, torch.Tensor],
-        init_weights_model: torch.nn.Module,
         ref_model: torch.nn.Module,
     ):
         super().__init__()
@@ -29,18 +28,15 @@ class AutoParallelPPModule(torch.nn.Module):
             sharded_param_dict, sharded_buffer_dict, ref_model
         )
 
-        # Right now we require a convention that the user model provides an init_weights method,
-        # although we could snoop for other methods too.
-        if hasattr(init_weights_model, "init_weights"):
-            hook_params_setters(init_weights_model, self)
+        # If the user model has init_weights, bind it to this parallel model
+        # with DTensor-aware interception for parameter/buffer assignments.
+        if hasattr(ref_model, "init_weights"):
+            user_init_weights_fn = getattr(type(ref_model), "init_weights")
 
             def init_weights(_self, *args, **kwargs):
-                # this is now a deep-fake-copy of orig mod, so we don't have to use reparametrize
-                return init_weights_model.init_weights(*args, **kwargs)
+                with _init_weights_context(_self):
+                    return user_init_weights_fn(_self, *args, **kwargs)
 
-            # assign an init_weights method onto the output mod.
-            # all it does is sneakily run the original user mod's init_weights method,
-            # but with our new DTensor sharded params attached to the user module.
             self.init_weights = MethodType(init_weights, self)
 
     def _register_params_and_buffers(
@@ -235,7 +231,6 @@ class AutoParallelPP(AutoParallel):
         self.parallel_model = AutoParallelPPModule(
             sharded_param_dict,
             sharded_buffer_dict,
-            self.init_weights_model,
             self.model,
         )
         return {
