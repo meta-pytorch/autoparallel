@@ -3,7 +3,6 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
-import copy
 import logging
 import os
 from contextlib import nullcontext
@@ -45,7 +44,7 @@ from autoparallel._testing.models.dsv3 import (
     dsv3_loss_fn,
 )
 from autoparallel.api import move_to_fake
-from autoparallel.api_pp import AutoParallelPP, AutoParallelPPModule
+from autoparallel.api_pp import AutoParallelPP, make_pp_module
 from autoparallel.graph_passes.graph_pp_runner import (
     GraphCallables,
     GraphMeta,
@@ -459,14 +458,10 @@ def run_test(
                 for k, v in cache["sharded_param_dict"].items()
             }
             fake_mode = FakeTensorMode()
-            init_weights_model = move_to_fake(
-                copy.deepcopy(stage_mod), fake_mode, device
-            )
             stage_mod = move_to_fake(stage_mod, fake_mode, device)
-            pp_mod = AutoParallelPPModule(
+            pp_mod = make_pp_module(
                 cache["sharded_param_dict"],
                 cache["sharded_buffer_dict"],
-                init_weights_model,
                 stage_mod,
             )
         else:

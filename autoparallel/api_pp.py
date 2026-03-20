@@ -11,12 +11,12 @@ from torch.export.unflatten import _AttrKind
 
 from autoparallel.graph_passes.graph_partition import partition_joint_with_descriptors
 
-from .api import AutoParallel, _assign_attr
+from .api import _NN_MODULE_KEYS, AutoParallel, _assign_attr
 from .cast_parametrization import DTypeCastModule
 from .init_weights import wrap_init_weights
 
 
-def _make_pp_module(
+def make_pp_module(
     sharded_param_dict: dict[str, torch.nn.Parameter],
     sharded_buffer_dict: dict[str, torch.Tensor],
     ref_model: torch.nn.Module,
@@ -35,11 +35,21 @@ def _make_pp_module(
 
     mod = AutoParallelPPModule()
 
+    # Copy user-defined instance attributes (e.g. self.dim, self.config).
+    for k, v in ref_model.__dict__.items():
+        if k not in _NN_MODULE_KEYS:
+            mod.__dict__[k] = v
+
     # Register params and buffers, preserving original module structure.
     for k, v in sharded_param_dict.items():
         _assign_attr(v, mod, ref_model, k, attr_kind=_AttrKind.PARAMETER)
     for k, buf in sharded_buffer_dict.items():
         _assign_attr(buf, mod, ref_model, k, attr_kind=_AttrKind.BUFFER)
+
+    # Copy submodules that don't appear in any parameter/buffer FQN path.
+    for k, v in ref_model._modules.items():
+        if k not in mod._modules:
+            mod._modules[k] = v
 
     wrap_init_weights(mod)
     return mod
@@ -216,7 +226,7 @@ class AutoParallelPP(AutoParallel):
             "unshard": unshard_module,
             "reduce_grad": reduce_grad_module,
         }
-        self.parallel_model = _make_pp_module(
+        self.parallel_model = make_pp_module(
             sharded_param_dict,
             sharded_buffer_dict,
             self.model,
