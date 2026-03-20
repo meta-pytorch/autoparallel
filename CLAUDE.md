@@ -102,4 +102,4 @@ Follow these rules for all code changes in this repository:
   on the code that is being read, but they should have some experience in the
   area.
 
-If uncertain, choose the simpler, more concise implementation.
+If uncertain, choose the simpler, more concise implementation. Testing CI
