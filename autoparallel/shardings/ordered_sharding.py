@@ -179,7 +179,7 @@ def build_param_grad_linear_chains(
         last_p = list(param.users)[0]
         p_chain: list[torch.fx.Node] = [param]
         # get all linear chain of users of the parameter
-        while len(last_p.all_input_nodes) == 1:
+        while len(last_p.all_input_nodes) == 1 and len(last_p.users) > 0:
             p_chain.append(last_p)
             # TODO: we need to handle the case where there are multiple users
             # maybe?
