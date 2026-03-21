@@ -42,11 +42,7 @@ from .input_validation import (
     _flatten_out_shardings,
     _make_input_fn,
 )
-from .module_construction import (
-    _build_alias_map,
-    _build_module_alias_map,
-    make_parallel_module,
-)
+from .module_construction import make_parallel_module
 from .optimize_sharding import ShardingOptimizer
 from .shardings.placement_options import (
     NumericsLogger,
@@ -101,14 +97,6 @@ class AutoParallel:
         # copy user model to avoid modifying it in-place
         # in dtype casting and move_to_fake
         model = copy.deepcopy(model)
-
-        # Capture parameter and buffer alias info before move_to_fake breaks
-        # aliasing. named_parameters()/named_buffers() deduplicate by default,
-        # so aliases are dropped. We record alias_fqn -> canonical_fqn so we
-        # can re-register them later.
-        self._param_alias_map = _build_alias_map(model.named_parameters)
-        self._buffer_alias_map = _build_alias_map(model.named_buffers)
-        self._module_alias_map = _build_module_alias_map(model)
 
         if self.mp_policy is not None:
             apply_dtype_cast(model, self.mp_policy)
@@ -466,9 +454,6 @@ class AutoParallel:
             sharded_param_dict,
             sharded_buffer_dict,
             forward_fn=forward,
-            param_alias_map=self._param_alias_map,
-            buffer_alias_map=self._buffer_alias_map,
-            module_alias_map=self._module_alias_map,
         )
         return self.parallel_model
 

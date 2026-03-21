@@ -125,9 +125,6 @@ def make_parallel_module(
     sharded_param_dict: dict[str, torch.nn.Parameter],
     sharded_buffer_dict: dict[str, torch.Tensor],
     forward_fn: Callable | None = None,
-    param_alias_map: dict[str, str] | None = None,
-    buffer_alias_map: dict[str, str] | None = None,
-    module_alias_map: dict[str, str] | None = None,
 ) -> torch.nn.Module:
     """Create a parallel module populated with sharded params/buffers.
 
@@ -135,15 +132,18 @@ def make_parallel_module(
     copying, param/buffer registration, alias re-establishment, orphan submodule
     copying, and init_weights wrapping.
 
+    Alias detection (param, buffer, and module aliases) is performed automatically
+    from ref_model, which must preserve aliasing (e.g. move_to_fake does this).
+
     Args:
         ref_model: The original (possibly fake) model to mirror structure from.
         sharded_param_dict: FQN -> sharded Parameter mapping.
         sharded_buffer_dict: FQN -> sharded buffer mapping.
         forward_fn: If provided, used as the forward method on the new module.
-        param_alias_map: alias_fqn -> canonical_fqn for deduplicated parameters.
-        buffer_alias_map: alias_fqn -> canonical_fqn for deduplicated buffers.
-        module_alias_map: alias_fqn -> canonical_fqn for aliased submodules.
     """
+    param_alias_map = _build_alias_map(ref_model.named_parameters)
+    buffer_alias_map = _build_alias_map(ref_model.named_buffers)
+    module_alias_map = _build_module_alias_map(ref_model)
     UserModelClass = type(ref_model)
     if issubclass(UserModelClass, DTypeCastModule):
         UserModelClass = UserModelClass.__bases__[1]
@@ -174,7 +174,7 @@ def make_parallel_module(
     # Re-establish aliased params/buffers that were deduplicated during tracing.
     # The alias map's "canonical" may not match which FQN the tracer kept,
     # so we check both directions.
-    for alias_fqn, canonical_fqn in (param_alias_map or {}).items():
+    for alias_fqn, canonical_fqn in param_alias_map.items():
         if canonical_fqn in sharded_param_dict:
             _assign_attr(
                 mod.get_parameter(canonical_fqn),
@@ -191,7 +191,7 @@ def make_parallel_module(
                 canonical_fqn,
                 attr_kind=_AttrKind.PARAMETER,
             )
-    for alias_fqn, canonical_fqn in (buffer_alias_map or {}).items():
+    for alias_fqn, canonical_fqn in buffer_alias_map.items():
         if canonical_fqn in sharded_buffer_dict:
             _assign_attr(
                 mod.get_buffer(canonical_fqn),
@@ -211,7 +211,7 @@ def make_parallel_module(
 
     # Re-establish module aliases (e.g. model_ema -> teacher) so that
     # both FQNs point to the same submodule on the parallel model.
-    for alias_fqn, canonical_fqn in (module_alias_map or {}).items():
+    for alias_fqn, canonical_fqn in module_alias_map.items():
         canonical_mod: Any = mod
         for attr in canonical_fqn.split("."):
             canonical_mod = getattr(canonical_mod, attr, None)
