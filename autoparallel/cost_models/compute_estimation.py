@@ -214,9 +214,23 @@ DEVICE_LIMITS: Tuple[DeviceLimit, ...] = (
         gemm_tflops={
             torch.float64: 72.1,
             torch.float32: 144.2,
-            torch.float16: 2300,
-            torch.bfloat16: 2300,
-            torch.int8: 4600,
+            torch.float16: 2309.6,
+            torch.bfloat16: 2309.6,
+            torch.int8: 4614.0,
+        },
+    ),
+    # AMD MI355X
+    DeviceLimit(
+        "AMD Instinct MI355X",
+        "https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/product-briefs/amd-instinct-mi355x-gpu-brochure.pdf",
+        sm=(-1, -1),  # sm not defined for AMD GPUs
+        gmem_bandwidth=8.0 * (1024**4),
+        gemm_tflops={
+            torch.float64: 78.6,
+            torch.float32: 157.3,
+            torch.float16: 2516.6,
+            torch.bfloat16: 2516.6,
+            torch.int8: 5033.2,
         },
     ),
 )
