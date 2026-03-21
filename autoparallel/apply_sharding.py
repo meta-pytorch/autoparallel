@@ -3,12 +3,10 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
-import contextlib
 import copy
 import logging
 import operator
 import time
-from typing import Any
 
 import torch
 import torch.fx.traceback as fx_traceback
@@ -41,6 +39,40 @@ _VIEW_OPS = {
 }
 
 
+def _compute_shard_order(shard_order, reverse: bool):
+    result = []
+    for tensor_dim, mesh_dims in shard_order:
+        default_order = sorted(mesh_dims)
+        if reverse:
+            default_order = default_order[::-1]
+        result.append(
+            ShardOrderEntry(tensor_dim=tensor_dim, mesh_dims=tuple(default_order))
+        )
+    return tuple(result)
+
+
+def _filter_specs_for_local_map(flat_args, curr_specs, tgt_specs):
+    """Filter curr/tgt specs to tensor-only entries for local_map HOPs.
+
+    Other ops filter out non-tensor/symint args from their specs already,
+    but local_map keeps them, so we need to strip them here.
+    """
+    curr_specs_t = []
+    tgt_specs_t = []
+    for i, arg in enumerate(flat_args):
+        if isinstance(arg, torch.Tensor):
+            curr_specs_t.append(curr_specs[i])
+            tgt_specs_t.append(tgt_specs[i])
+        elif isinstance(arg, torch.SymInt):
+            assert curr_specs[i] is None
+            assert tgt_specs[i] is None
+        else:
+            raise ValueError("Unexpected local_map HOP argument")
+
+    assert len(curr_specs_t) == len(tgt_specs_t)
+    return curr_specs_t, tgt_specs_t
+
+
 class ApplyShardingInterpreter(torch.fx.Interpreter):
     def __init__(
         self,
@@ -61,47 +93,30 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
         self._curr_node = n
         return super().run_node(n)
 
+    def _get_input_nodes(self):
+        # node.all_input_nodes deduplicates, but we need repeated nodes preserved
+        return [
+            x
+            for x in tree_flatten(self._curr_node.args)[0]
+            if isinstance(x, torch.fx.Node)
+        ]
+
     def _set_origin_and_target_device_order(self, node, curr_spec, tgt_spec):
         # shard_order should be automatically assigned once `placements` is set
         assert curr_spec.shard_order is not None
         assert tgt_spec.shard_order is not None
         if node in self.param_placement_order:
             is_target_reversed_order, need_reorder = self.param_placement_order[node]
-            curr_shard_order = []
-            tgt_shard_order = []
-            for tensor_dim, mesh_dims in curr_spec.shard_order:
-                default_order = sorted(mesh_dims)
-                if is_target_reversed_order and need_reorder:
-                    curr_shard_order.append(
-                        ShardOrderEntry(
-                            tensor_dim=tensor_dim, mesh_dims=tuple(default_order)
-                        )
-                    )
-                else:
-                    curr_shard_order.append(
-                        ShardOrderEntry(
-                            tensor_dim=tensor_dim, mesh_dims=tuple(default_order[::-1])
-                        )
-                    )
+            curr_spec.shard_order = _compute_shard_order(
+                curr_spec.shard_order,
+                reverse=not (is_target_reversed_order and need_reorder),
+            )
+            tgt_spec.shard_order = _compute_shard_order(
+                tgt_spec.shard_order,
+                reverse=is_target_reversed_order,
+            )
 
-            for tensor_dim, mesh_dims in tgt_spec.shard_order:
-                default_order = sorted(mesh_dims)
-                if is_target_reversed_order:
-                    tgt_shard_order.append(
-                        ShardOrderEntry(
-                            tensor_dim=tensor_dim, mesh_dims=tuple(default_order[::-1])
-                        )
-                    )
-                else:
-                    tgt_shard_order.append(
-                        ShardOrderEntry(
-                            tensor_dim=tensor_dim, mesh_dims=tuple(default_order)
-                        )
-                    )
-            curr_spec.shard_order = tuple(curr_shard_order)
-            tgt_spec.shard_order = tuple(tgt_shard_order)
-
-    def redistribute_tensor(self, arg, curr_spec, tgt_spec, node=None):
+    def redistribute_tensor(self, arg, curr_spec, tgt_spec, node):
         tgt_placements = tuple(
             p if not p.is_partial() else Replicate() for p in tgt_spec.placements
         )
@@ -134,24 +149,18 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
 
         new_args_0 = list(args[0])
         if isinstance(arg, torch.Tensor):
-            # use this instead of node.all_input_nodes as it handles repeated nodes
-            all_input_nodes = [
-                x for x in tree_flatten(node.args)[0] if isinstance(x, torch.fx.Node)
-            ]
+            all_input_nodes = self._get_input_nodes()
             curr_spec = self.sharding_placement[all_input_nodes[0]].output_specs[idx]
             tgt_spec = self.sharding_placement[node].input_specs[0]
-            new_args_0[idx] = self.redistribute_tensor(arg, curr_spec, tgt_spec)
+            new_args_0[idx] = self.redistribute_tensor(arg, curr_spec, tgt_spec, node)
         else:
             tgt_spec = None
 
         return [tuple(new_args_0), idx], tgt_spec
 
-    def _call_regular_function(self, target, args):
+    def _redistribute_and_adjust_args(self, target, args):
         node = self._curr_node
-        # use this instead of node.all_input_nodes as it handles repeated nodes
-        all_input_nodes = [
-            x for x in tree_flatten(node.args)[0] if isinstance(x, torch.fx.Node)
-        ]
+        all_input_nodes = self._get_input_nodes()
         num_input_nodes = len(all_input_nodes)
         curr_specs = [
             self.sharding_placement[n].output_specs for n in all_input_nodes
@@ -162,26 +171,10 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
 
         flat_args, treespec = tree_flatten(args)
         flat_args_t = [x for x in flat_args if isinstance(x, torch.Tensor)]
-        # TODO: flat_args_t is only for tensors here, but we should support other types as well
         if len(flat_args_t) < len(flat_args) and "local_map" in node.name:
-            # The only reason this block is only for local_map is that
-            # other ops seem to have filtered out non-symint/tensors from their specs
-            curr_specs_t = []
-            tgt_specs_t = []
-            for i, arg in enumerate(flat_args):
-                if isinstance(arg, torch.Tensor):
-                    curr_specs_t.append(curr_specs[i])
-                    tgt_specs_t.append(tgt_specs[i])
-                    continue
-                elif node.name and isinstance(arg, torch.SymInt):
-                    assert curr_specs[i] is None
-                    assert tgt_specs[i] is None
-                else:
-                    raise ValueError("Unexpected local_map HOP argument")
-
-            assert len(flat_args_t) == len(curr_specs_t) == len(tgt_specs_t)
-            curr_specs = curr_specs_t
-            tgt_specs = tgt_specs_t
+            curr_specs, tgt_specs = _filter_specs_for_local_map(
+                flat_args, curr_specs, tgt_specs
+            )
 
         assert len(flat_args_t) == len(curr_specs) == len(tgt_specs)
         last_tgt_spec = None
@@ -221,7 +214,7 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
         if self._curr_node.target == operator.getitem:
             new_args, tgt_spec = self._call_getitem(args)
         else:
-            new_args, tgt_spec = self._call_regular_function(target, args)
+            new_args, tgt_spec = self._redistribute_and_adjust_args(target, args)
 
         # use DTensor machinery to ensure the view ops are valid
         # otherwise we would end-up forcing global shapes on local tensors
@@ -250,18 +243,16 @@ def shard_node_given_placements(node, sharding_placement, *, meta: bool):
     curr_placement = (Replicate(),) * mesh.ndim
     tensor = node.meta["val"]
 
-    ctx: Any
     if meta:
         assert isinstance(
             tensor, FakeTensor
         ), f"only FakeTensor params supported for now, got {type(tensor)}"
-        ctx = unset_fake_temporarily
-        with ctx():
+        with unset_fake_temporarily():
             tensor = torch.randn(tensor.shape, dtype=tensor.dtype, device="meta")
+            sharded_tensor = DTensor.from_local(
+                tensor, mesh, curr_placement
+            ).redistribute(mesh, tgt_spec.placements)
     else:
-        ctx = contextlib.nullcontext
-
-    with ctx():
         sharded_tensor = DTensor.from_local(tensor, mesh, curr_placement).redistribute(
             mesh, tgt_spec.placements
         )
