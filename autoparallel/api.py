@@ -23,16 +23,10 @@ from torch._subclasses import FakeTensorMode
 from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor import DeviceMesh
 from torch.export._trace import _restore_state_dict
-from torch.export.unflatten import _AttrKind
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
 from .apply_sharding import apply_sharding_to_model
-from .cast_parametrization import (
-    DTypeCastModule,
-    apply_dtype_cast,
-    canonicalize_mp,
-    set_dtype_cast,
-)
+from .cast_parametrization import apply_dtype_cast, canonicalize_mp, set_dtype_cast
 from .graph_passes.activation_checkpointing import ac_joint_pass
 from .graph_passes.graph_utils import (
     _add_alias,
@@ -41,7 +35,6 @@ from .graph_passes.graph_utils import (
     cleanup_graph,
     update_joint_with_descriptors,
 )
-from .init_weights import wrap_init_weights
 from .input_validation import (
     _check_forward_args,
     _compute_expected_inputs,
@@ -50,10 +43,9 @@ from .input_validation import (
     _make_input_fn,
 )
 from .module_construction import (
-    _NN_MODULE_KEYS,
-    _assign_attr,
     _build_alias_map,
     _build_module_alias_map,
+    make_parallel_module,
 )
 from .optimize_sharding import ShardingOptimizer
 from .shardings.placement_options import (
@@ -430,99 +422,6 @@ class AutoParallel:
             sharded_buffer_dict,
         )
 
-    def _register_params_and_init_weights(
-        self, sharded_param_dict, sharded_buffer_dict
-    ):
-
-        # We construct an unflattened structure on parallel_mod,
-        # e.g. _assign_attr(v, parallel_model, k="layers.0.weight") will literally
-        # create empty nn.Modules recursively and then stash 'v' so it shows up in the right spot
-        # We pass self.model as reference to preserve the original module structure (e.g., nn.ModuleDict)
-        for k, v in sharded_param_dict.items():
-            _assign_attr(
-                v,
-                self.parallel_model,
-                self.model,
-                k,
-                attr_kind=_AttrKind.PARAMETER,
-            )
-
-        for k, v in sharded_buffer_dict.items():
-            _assign_attr(
-                v,
-                self.parallel_model,
-                self.model,
-                k,
-                attr_kind=_AttrKind.BUFFER,
-            )
-
-        # Register aliased params/buffers that were deduplicated during tracing.
-        # e.g. if the original model has rope.cache and freqs_cis pointing to
-        # the same tensor, only one survives in the sharded dict. We register
-        # the missing alias so the parallel model mirrors the original structure.
-        # Note: the alias map's "canonical" may not match which FQN the tracer
-        # kept, so we check both directions.
-        for alias_fqn, canonical_fqn in self._param_alias_map.items():
-            if canonical_fqn in sharded_param_dict:
-                _assign_attr(
-                    self.parallel_model.get_parameter(canonical_fqn),
-                    self.parallel_model,
-                    self.model,
-                    alias_fqn,
-                    attr_kind=_AttrKind.PARAMETER,
-                )
-            elif alias_fqn in sharded_param_dict:
-                _assign_attr(
-                    self.parallel_model.get_parameter(alias_fqn),
-                    self.parallel_model,
-                    self.model,
-                    canonical_fqn,
-                    attr_kind=_AttrKind.PARAMETER,
-                )
-        for alias_fqn, canonical_fqn in self._buffer_alias_map.items():
-            if canonical_fqn in sharded_buffer_dict:
-                _assign_attr(
-                    self.parallel_model.get_buffer(canonical_fqn),
-                    self.parallel_model,
-                    self.model,
-                    alias_fqn,
-                    attr_kind=_AttrKind.BUFFER,
-                )
-            elif alias_fqn in sharded_buffer_dict:
-                _assign_attr(
-                    self.parallel_model.get_buffer(alias_fqn),
-                    self.parallel_model,
-                    self.model,
-                    canonical_fqn,
-                    attr_kind=_AttrKind.BUFFER,
-                )
-
-        # Re-establish module aliases (e.g. model_ema -> teacher) so that
-        # both FQNs point to the same submodule on the parallel model.
-        for alias_fqn, canonical_fqn in self._module_alias_map.items():
-            # Find the canonical module on the parallel model
-            canonical_mod = self.parallel_model
-            for attr in canonical_fqn.split("."):
-                canonical_mod = getattr(canonical_mod, attr, None)
-                if canonical_mod is None:
-                    break
-            if canonical_mod is None:
-                continue
-            # Navigate to the alias's parent and re-establish the alias
-            *alias_prefix, alias_field = alias_fqn.split(".")
-            alias_parent = self.parallel_model
-            for attr in alias_prefix:
-                alias_parent = getattr(alias_parent, attr, None)
-                if alias_parent is None:
-                    break
-            if alias_parent is not None:
-                setattr(alias_parent, alias_field, canonical_mod)
-
-        # Wrap init_weights (inherited from UserModelClass) so that parameter/buffer
-        # assignments and in-place data operations are intercepted and correctly
-        # applied to the sharded DTensor parameters.
-        wrap_init_weights(self.parallel_model)
-
     def apply_placement(self, sharding_placement=None):
 
         sharded_param_dict, sharded_buffer_dict = self._apply_placement_common(
@@ -547,48 +446,30 @@ class AutoParallel:
             self._traced_inputs, self.input_constraints, self.mesh
         )
 
-        # apply_dtype_cast swaps self.model.__class__ to a dynamic subclass
-        # with property descriptors for each parameter (e.g. 'weight'). We need
-        # the original user class so those properties don't conflict with
-        # register_parameter in _register_params_and_init_weights.
-        UserModelClass = type(self.model)
-        if issubclass(UserModelClass, DTypeCastModule):
-            # DTypeCast bases are (DTypeCastModule, OriginalClass)
-            UserModelClass = UserModelClass.__bases__[1]
+        def forward(self, *args):
+            _check_forward_args(args, expected_inputs)
+            # NB: don't close over the parameters/buffers, as the user may
+            # reassign the module!
+            # Use the exact param/buffer FQNs that the compiled graph
+            # expects, matching the primals order from tracing.
+            params = [
+                self.get_parameter(fqn).to_local() for fqn in graph_param_fqns
+            ] + [self.get_buffer(fqn).to_local() for fqn in graph_buffer_fqns]
+            boxed_args = [*params, *args]
+            del params
+            # NB: don't do self.parallel_model_fn work around Dynamo bug
+            out = parallel_model_fn(boxed_args)
+            return out
 
-        class AutoParallelModule(UserModelClass):
-            def __init__(self):
-                torch.nn.Module.__init__(self)
-
-            def forward(self, *args):
-                _check_forward_args(args, expected_inputs)
-                # NB: don't close over the parameters/buffers, as the user may
-                # reassign the module!
-                # Use the exact param/buffer FQNs that the compiled graph
-                # expects, matching the primals order from tracing.
-                params = [
-                    self.get_parameter(fqn).to_local() for fqn in graph_param_fqns
-                ] + [self.get_buffer(fqn).to_local() for fqn in graph_buffer_fqns]
-                boxed_args = [*params, *args]
-                del params
-                # NB: don't do self.parallel_model_fn work around Dynamo bug
-                out = parallel_model_fn(boxed_args)
-                return out
-
-        self.parallel_model = AutoParallelModule()
-        # Copy user-defined instance attributes (e.g. self.dim, self.config)
-        # from the original model. Uses __dict__ directly to avoid triggering
-        # nn.Module.__setattr__ which intercepts nn.Parameter/nn.Module assignments.
-        for k, v in self.model.__dict__.items():
-            if k not in _NN_MODULE_KEYS:
-                self.parallel_model.__dict__[k] = v
-        self._register_params_and_init_weights(sharded_param_dict, sharded_buffer_dict)
-        # Copy submodules that don't appear in any parameter/buffer FQN path
-        # (e.g. self.rope when it has no traced params/buffers). These aren't
-        # created by _assign_attr, but init_weights may need to access them.
-        for k, v in self.model._modules.items():
-            if k not in self.parallel_model._modules:
-                self.parallel_model._modules[k] = v
+        self.parallel_model = make_parallel_module(
+            self.model,
+            sharded_param_dict,
+            sharded_buffer_dict,
+            forward_fn=forward,
+            param_alias_map=self._param_alias_map,
+            buffer_alias_map=self._buffer_alias_map,
+            module_alias_map=self._module_alias_map,
+        )
         return self.parallel_model
 
 

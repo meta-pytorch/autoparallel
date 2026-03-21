@@ -8,6 +8,9 @@ from typing import Any, Callable
 import torch
 from torch.export.unflatten import _AttrKind
 
+from .cast_parametrization import DTypeCastModule
+from .init_weights import wrap_init_weights
+
 _NN_MODULE_KEYS = set(torch.nn.Module().__dict__.keys())
 
 
@@ -115,3 +118,122 @@ def _assign_attr(
         curr_mod.register_buffer(field, attr)
     else:
         setattr(curr_mod, field, attr)
+
+
+def make_parallel_module(
+    ref_model: torch.nn.Module,
+    sharded_param_dict: dict[str, torch.nn.Parameter],
+    sharded_buffer_dict: dict[str, torch.Tensor],
+    forward_fn: Callable | None = None,
+    param_alias_map: dict[str, str] | None = None,
+    buffer_alias_map: dict[str, str] | None = None,
+    module_alias_map: dict[str, str] | None = None,
+) -> torch.nn.Module:
+    """Create a parallel module populated with sharded params/buffers.
+
+    Handles UserModelClass resolution (stripping DTypeCastModule), user attribute
+    copying, param/buffer registration, alias re-establishment, orphan submodule
+    copying, and init_weights wrapping.
+
+    Args:
+        ref_model: The original (possibly fake) model to mirror structure from.
+        sharded_param_dict: FQN -> sharded Parameter mapping.
+        sharded_buffer_dict: FQN -> sharded buffer mapping.
+        forward_fn: If provided, used as the forward method on the new module.
+        param_alias_map: alias_fqn -> canonical_fqn for deduplicated parameters.
+        buffer_alias_map: alias_fqn -> canonical_fqn for deduplicated buffers.
+        module_alias_map: alias_fqn -> canonical_fqn for aliased submodules.
+    """
+    UserModelClass = type(ref_model)
+    if issubclass(UserModelClass, DTypeCastModule):
+        UserModelClass = UserModelClass.__bases__[1]
+
+    class ParallelModule(UserModelClass):  # type: ignore[valid-type,misc]
+        def __init__(self):
+            torch.nn.Module.__init__(self)
+
+    if forward_fn is not None:
+        ParallelModule.forward = forward_fn
+
+    mod = ParallelModule()
+
+    # Copy user-defined instance attributes (e.g. self.dim, self.config).
+    # Uses __dict__ directly to avoid triggering nn.Module.__setattr__
+    # which intercepts nn.Parameter/nn.Module assignments.
+    for k, v in ref_model.__dict__.items():
+        if k not in _NN_MODULE_KEYS:
+            mod.__dict__[k] = v
+
+    # Register sharded params and buffers, preserving original module
+    # structure (e.g. nn.ModuleDict) from ref_model.
+    for k, v in sharded_param_dict.items():
+        _assign_attr(v, mod, ref_model, k, attr_kind=_AttrKind.PARAMETER)
+    for k, v in sharded_buffer_dict.items():
+        _assign_attr(v, mod, ref_model, k, attr_kind=_AttrKind.BUFFER)
+
+    # Re-establish aliased params/buffers that were deduplicated during tracing.
+    # The alias map's "canonical" may not match which FQN the tracer kept,
+    # so we check both directions.
+    for alias_fqn, canonical_fqn in (param_alias_map or {}).items():
+        if canonical_fqn in sharded_param_dict:
+            _assign_attr(
+                mod.get_parameter(canonical_fqn),
+                mod,
+                ref_model,
+                alias_fqn,
+                attr_kind=_AttrKind.PARAMETER,
+            )
+        elif alias_fqn in sharded_param_dict:
+            _assign_attr(
+                mod.get_parameter(alias_fqn),
+                mod,
+                ref_model,
+                canonical_fqn,
+                attr_kind=_AttrKind.PARAMETER,
+            )
+    for alias_fqn, canonical_fqn in (buffer_alias_map or {}).items():
+        if canonical_fqn in sharded_buffer_dict:
+            _assign_attr(
+                mod.get_buffer(canonical_fqn),
+                mod,
+                ref_model,
+                alias_fqn,
+                attr_kind=_AttrKind.BUFFER,
+            )
+        elif alias_fqn in sharded_buffer_dict:
+            _assign_attr(
+                mod.get_buffer(alias_fqn),
+                mod,
+                ref_model,
+                canonical_fqn,
+                attr_kind=_AttrKind.BUFFER,
+            )
+
+    # Re-establish module aliases (e.g. model_ema -> teacher) so that
+    # both FQNs point to the same submodule on the parallel model.
+    for alias_fqn, canonical_fqn in (module_alias_map or {}).items():
+        canonical_mod: Any = mod
+        for attr in canonical_fqn.split("."):
+            canonical_mod = getattr(canonical_mod, attr, None)
+            if canonical_mod is None:
+                break
+        if canonical_mod is None:
+            continue
+        *alias_prefix, alias_field = alias_fqn.split(".")
+        alias_parent: Any = mod
+        for attr in alias_prefix:
+            alias_parent = getattr(alias_parent, attr, None)
+            if alias_parent is None:
+                break
+        if alias_parent is not None:
+            setattr(alias_parent, alias_field, canonical_mod)
+
+    # Copy submodules that don't appear in any parameter/buffer FQN path
+    # (e.g. self.rope when it has no traced params/buffers). These aren't
+    # created by _assign_attr, but init_weights may need to access them.
+    for k, v in ref_model._modules.items():
+        if k not in mod._modules:
+            mod._modules[k] = v
+
+    wrap_init_weights(mod)
+    return mod
