@@ -7,7 +7,7 @@ import copy
 import functools
 import logging
 import time
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack
 from typing import Any, Callable, Optional, Union
 
 import torch
@@ -18,7 +18,6 @@ from torch._functorch.aot_autograd import (
     boxed_nop_preserve_node_meta,
 )
 from torch._inductor.compile_fx import compile_fx_inner
-from torch._inductor.decomposition import select_decomp_table
 from torch._logging import trace_structured
 from torch._subclasses import FakeTensorMode
 from torch.distributed.fsdp import MixedPrecisionPolicy
@@ -43,314 +42,35 @@ from .graph_passes.graph_utils import (
     update_joint_with_descriptors,
 )
 from .init_weights import wrap_init_weights
+from .input_validation import (
+    _check_forward_args,
+    _compute_expected_inputs,
+    _extract_input_info,
+    _flatten_out_shardings,
+    _make_input_fn,
+)
+from .module_construction import (
+    _NN_MODULE_KEYS,
+    _assign_attr,
+    _build_alias_map,
+    _build_module_alias_map,
+)
 from .optimize_sharding import ShardingOptimizer
 from .shardings.placement_options import (
     NumericsLogger,
     _get_device_from_mesh,
     debug_boxed_nop_preserve_node_meta,
 )
+from .tracing import (
+    _add_unused_params_and_buffers,
+    _get_decomp_table,
+    enable_local_map_wrapping,
+    move_to_fake,
+)
 
 _APPLY_VIEW_MM_VIEW_PATTERN = False
 
 logger = logging.getLogger(__name__)
-
-_NN_MODULE_KEYS = set(torch.nn.Module().__dict__.keys())
-
-
-def _build_alias_map(
-    named_iter_fn: Callable[..., Any],
-) -> dict[str, str]:
-    """Build a mapping from alias FQNs to canonical FQNs.
-
-    named_parameters()/named_buffers() deduplicate by default, so when a model
-    registers the same tensor under multiple FQNs only one survives. This
-    function detects the aliases so they can be re-registered later.
-    """
-    canonical_by_id: dict[int, str] = {}
-    canonical_fqns: set[str] = set()
-    for fqn, tensor in named_iter_fn():
-        canonical_by_id[id(tensor)] = fqn
-        canonical_fqns.add(fqn)
-    alias_map: dict[str, str] = {}
-    for fqn, tensor in named_iter_fn(remove_duplicate=False):
-        if fqn not in canonical_fqns and id(tensor) in canonical_by_id:
-            alias_map[fqn] = canonical_by_id[id(tensor)]
-    return alias_map
-
-
-def _build_module_alias_map(model: torch.nn.Module) -> dict[str, str]:
-    """Build a mapping from alias module FQNs to canonical module FQNs.
-
-    When a model registers the same module under multiple names (e.g.
-    self.model_ema = self.teacher), named_modules() deduplicates by default.
-    This detects such aliases so they can be re-established on the parallel model.
-    """
-    canonical_by_id: dict[int, str] = {}
-    canonical_fqns: set[str] = set()
-    for fqn, mod in model.named_modules():
-        if fqn == "":
-            continue
-        canonical_by_id[id(mod)] = fqn
-        canonical_fqns.add(fqn)
-    alias_map: dict[str, str] = {}
-    for fqn, mod in model.named_modules(remove_duplicate=False):
-        if fqn == "":
-            continue
-        if fqn not in canonical_fqns and id(mod) in canonical_by_id:
-            alias_map[fqn] = canonical_by_id[id(mod)]
-    return alias_map
-
-
-def _assign_attr(
-    attr: Any,
-    target_module: torch.nn.Module,
-    ref_module: torch.nn.Module,
-    fqn: str,
-    attr_kind: _AttrKind,
-):
-    """
-    Custom version of torch.export._unlift._assign_attr that preserves the original
-    module structure (e.g., nn.ModuleDict) from ref_module.
-
-    Args:
-        attr: The attribute to assign (parameter/buffer/module)
-        target_module: The module to assign the attribute to
-        ref_module: Reference module to check for original structure
-        fqn: Fully qualified name of the attribute (e.g., "layers.0.weight")
-        attr_kind: Type of attribute (PARAMETER, BUFFER, etc.)
-    """
-    *prefix, field = fqn.split(".")
-
-    # Navigate to the parent module, creating submodules as needed
-    curr_mod = target_module
-    for i, attr_name in enumerate(prefix):
-        if not hasattr(curr_mod, attr_name):
-            # Check if we should create a module matching the ref_module type
-            # Navigate to the same location in ref_module
-            ref_curr_mod = ref_module
-            for ref_attr_name in prefix[:i]:
-                if hasattr(ref_curr_mod, ref_attr_name):
-                    ref_curr_mod = getattr(ref_curr_mod, ref_attr_name)
-                else:
-                    ref_curr_mod = None  # type: ignore[assignment]
-                    break
-
-            # Create an instance of the same type as in ref_module
-            if ref_curr_mod is not None and hasattr(ref_curr_mod, attr_name):
-                ref_submod = getattr(ref_curr_mod, attr_name)
-                cls = type(ref_submod)
-                try:
-                    cls = type(ref_submod)
-                    new_inst = ref_submod.__new__(cls)
-                    new_inst.__dict__ = ref_submod.__dict__.copy()
-                    setattr(curr_mod, attr_name, new_inst)
-                except Exception:
-                    # Fall back to regular Module if instantiation fails
-                    setattr(curr_mod, attr_name, torch.nn.Module())
-            else:
-                setattr(curr_mod, attr_name, torch.nn.Module())
-
-        curr_mod = getattr(curr_mod, attr_name)
-
-    # Set the final attribute
-    if attr_kind == _AttrKind.PARAMETER:
-        assert isinstance(attr, torch.nn.Parameter)
-        curr_mod.register_parameter(field, attr)
-    elif attr_kind == _AttrKind.BUFFER:
-        assert isinstance(attr, torch.Tensor)
-        curr_mod.register_buffer(field, attr)
-    else:
-        setattr(curr_mod, field, attr)
-
-
-def _get_decomp_table():
-    decomp_table = copy.copy(select_decomp_table())
-    # TODO: removing those as they cause missing DTensor propagation rules
-    decomp_table.pop(torch.ops.aten.full_like.default)
-    decomp_table.pop(torch.ops.aten.empty_like.default)
-    decomp_table.pop(torch.ops.aten.threshold_backward.default)
-    decomp_table.pop(torch.ops.aten.native_layer_norm.default)
-    decomp_table.pop(torch.ops.aten.embedding_dense_backward.default)
-    decomp_table.pop(torch.ops.aten.native_layer_norm_backward.default)
-    decomp_table.pop(torch.ops.aten._softmax_backward_data.default)
-    decomp_table.pop(torch.ops.aten._softmax.default)
-    decomp_table.pop(torch.ops.aten.stack.default)
-
-    # decompose addmm to allow for TP on mm
-    decomp_table.pop(torch.ops.aten.addmm.default)
-
-    def addmm_decomp(self, mat1, mat2, beta=1, alpha=1):
-        return self + mat1 @ mat2
-
-    decomp_table[torch.ops.aten.addmm.default] = addmm_decomp
-    # decomp_table = None
-
-    return decomp_table
-
-
-def move_to_fake(model: torch.nn.Module, mode: FakeTensorMode, device: torch.device):
-    """
-    Move the model to the fake mode and move the weights to the fake device
-    """
-
-    def assert_is_meta_tensor(name, t):
-        assert isinstance(t, torch.Tensor) and t.device == torch.device(
-            "meta"
-        ), f"tensor {name} must be on meta device, not {t.device}"
-
-    # Use remove_duplicate=False so aliased params/buffers (e.g. rope.cache
-    # and freqs_cis pointing to the same tensor) get the same fake tensor,
-    # preserving aliasing through tracing.
-    fake_memo: dict[int, torch.Tensor] = {}
-
-    def _move_to_fake(module, k, device, parameter=True):
-        submod = module
-        while len(k.split(".")) > 1:
-            submod_name, k = k.split(".", 1)
-            submod = getattr(submod, submod_name)
-
-        orig = getattr(submod, k)
-        if id(orig) in fake_memo:
-            fake_tensor = fake_memo[id(orig)]
-        else:
-            fake_tensor = mode.from_tensor(orig).to(device)
-            if parameter:
-                fake_tensor = torch.nn.Parameter(
-                    fake_tensor, requires_grad=fake_tensor.requires_grad
-                )
-            fake_memo[id(orig)] = fake_tensor
-            # Also map the fake tensor's id so aliased submodules
-            # (where setattr already replaced the original) are recognized.
-            fake_memo[id(fake_tensor)] = fake_tensor
-        setattr(submod, k, fake_tensor)
-
-    with mode:
-        for k, p in model.named_parameters(remove_duplicate=False):
-            if id(p) not in fake_memo:
-                assert_is_meta_tensor(k, p)
-            _move_to_fake(model, k, device, parameter=True)
-        for k, b in model.named_buffers(remove_duplicate=False):
-            if id(b) not in fake_memo:
-                assert_is_meta_tensor(k, b)
-            _move_to_fake(model, k, device, parameter=False)
-
-    return model
-
-
-@contextmanager
-def enable_local_map_wrapping():
-    from torch._dynamo.variables.higher_order_ops import (
-        LocalMapWrappedHigherOrderVariable as vt_cls,
-    )
-    from torch._higher_order_ops import local_map as local_map_module
-
-    with vt_cls.enable(), local_map_module.defer_inlining():
-        yield
-
-
-def _compute_expected_inputs(traced_inputs, input_constraints, mesh):
-    """Compute expected runtime inputs by applying sharding to traced global shapes.
-
-    Returns a list of meta tensors (for tensor inputs) or raw values (for non-tensor inputs).
-    """
-    from torch.distributed.tensor.placement_types import Replicate, Shard
-
-    default_placement = (Shard(0),) + (Replicate(),) * (mesh.ndim - 1)
-
-    result = []
-    tensor_idx = 0
-    for inp in traced_inputs:
-        if isinstance(inp, torch.Tensor):
-            if input_constraints is None:
-                placements = default_placement
-            else:
-                placements = input_constraints[tensor_idx]
-                if placements is None:
-                    placements = default_placement
-
-            local_shape = list(inp.shape)
-            for mesh_dim, placement in enumerate(placements):
-                if isinstance(placement, Shard):
-                    local_shape[placement.dim] //= mesh.size(mesh_dim)
-            result.append(torch.empty(local_shape, dtype=inp.dtype, device="meta"))
-            tensor_idx += 1
-        else:
-            result.append(inp)
-
-    return result
-
-
-def _check_forward_args(args, expected_inputs):
-    """Validate that forward() args match the shapes/dtypes used during tracing."""
-    if len(args) != len(expected_inputs):
-        raise ValueError(
-            f"AutoParallel: expected {len(expected_inputs)} arguments "
-            f"but got {len(args)}"
-        )
-    for i, (arg, expected) in enumerate(zip(args, expected_inputs)):
-        if isinstance(expected, torch.Tensor):
-            if not isinstance(arg, torch.Tensor):
-                raise TypeError(
-                    f"AutoParallel: argument {i} should be a Tensor "
-                    f"but got {type(arg).__name__}"
-                )
-            if arg.shape != expected.shape:
-                raise ValueError(
-                    f"AutoParallel: argument {i} has shape {tuple(arg.shape)} "
-                    f"but expected {tuple(expected.shape)}"
-                )
-            if arg.dtype != expected.dtype:
-                raise ValueError(
-                    f"AutoParallel: argument {i} has dtype {arg.dtype} "
-                    f"but expected {expected.dtype}"
-                )
-        else:
-            if arg != expected:
-                raise ValueError(
-                    f"AutoParallel: argument {i} has value {arg!r} "
-                    f"but was traced with {expected!r}"
-                )
-
-
-def _add_unused_params_and_buffers(model, graph_module):
-    """Register parameters/buffers from model that are missing from graph_module.
-
-    Dynamo only captures parameters/buffers actually used in forward(). This
-    adds unused ones as get_attr nodes so aot_export_joint_with_descriptors
-    lifts them into the joint graph and they appear in params_spec/buffers_spec.
-    """
-    from torch.fx.graph_module import _assign_attr
-
-    existing_params = set(dict(graph_module.named_parameters()))
-    existing_buffers = set(dict(graph_module.named_buffers()))
-
-    graph = graph_module.graph
-    # Insert after all existing placeholder/get_attr nodes, before computation.
-    insert_before = None
-    for node in graph.nodes:
-        if node.op not in ("placeholder", "get_attr"):
-            insert_before = node
-            break
-
-    added = False
-    for fqn, param in model.named_parameters():
-        if fqn not in existing_params:
-            _assign_attr(param, graph_module, fqn)
-            with graph.inserting_before(insert_before):
-                n = graph.create_node("get_attr", target=fqn)
-                n.meta["val"] = param
-            added = True
-
-    for fqn, buf in model.named_buffers():
-        if fqn not in existing_buffers:
-            _assign_attr(buf, graph_module, fqn)
-            with graph.inserting_before(insert_before):
-                n = graph.create_node("get_attr", target=fqn)
-                n.meta["val"] = buf
-            added = True
-
-    if added:
-        graph_module.recompile()
 
 
 class AutoParallel:
@@ -875,129 +595,6 @@ class AutoParallel:
 ####################
 # Simple API start #
 ####################
-
-
-def _extract_input_info(
-    sample_inputs: Any, mesh: DeviceMesh
-) -> tuple[list[tuple[int, ...]], list[torch.dtype], list[tuple[Any, ...]], Any]:
-    """
-    Extract tensor metadata and placements from sample inputs (supports pytrees).
-
-    For DTensor inputs, extracts global shape, dtype, and placements.
-    For regular Tensor inputs, uses shape/dtype and assumes Replicate.
-
-    Does NOT materialize tensors - just extracts metadata.
-
-    Returns:
-        - List of shapes (global shapes for DTensors)
-        - List of dtypes
-        - List of placement tuples for each tensor leaf
-        - TreeSpec for reconstructing the pytree structure
-    """
-    import torch.utils._pytree as pytree
-    from torch.distributed.tensor import DTensor
-    from torch.distributed.tensor.placement_types import Replicate
-
-    flat_inputs, treespec = pytree.tree_flatten(sample_inputs)
-
-    shapes = []
-    dtypes = []
-    input_placements = []
-
-    for inp in flat_inputs:
-        if isinstance(inp, DTensor):
-            # DTensor.shape returns the global shape
-            shapes.append(tuple(inp.shape))
-            dtypes.append(inp.dtype)
-            input_placements.append(tuple(inp.placements))
-        elif isinstance(inp, torch.Tensor):
-            shapes.append(tuple(inp.shape))
-            dtypes.append(inp.dtype)
-            input_placements.append(tuple(Replicate() for _ in range(mesh.ndim)))
-        else:
-            raise TypeError(
-                f"sample_inputs leaves must be Tensor or DTensor, got {type(inp)}"
-            )
-
-    return shapes, dtypes, input_placements, treespec
-
-
-def _make_input_fn(
-    shapes: list[tuple[int, ...]],
-    dtypes: list[torch.dtype],
-    treespec: Any,
-) -> Callable[[], tuple[Any, ...]]:
-    """
-    Create an input_fn that creates tensors with the given shapes/dtypes.
-
-    The returned function should be called inside FakeTensorMode.
-    It creates new tensors (which will be fake tensors when called in FakeTensorMode).
-
-    Returns:
-        Callable that returns inputs as a tuple.
-    """
-    import torch.utils._pytree as pytree
-
-    def input_fn() -> tuple[Any, ...]:
-        # Create tensors inside FakeTensorMode - they'll be fake tensors
-        tensors = [
-            torch.empty(shape, dtype=dtype, device="cuda")
-            for shape, dtype in zip(shapes, dtypes)
-        ]
-        result = pytree.tree_unflatten(tensors, treespec)
-
-        # AutoParallel expects input_fn to return a tuple
-        if isinstance(result, tuple):
-            return result
-        else:
-            return (result,)
-
-    return input_fn
-
-
-def _flatten_out_shardings(
-    out_shardings: Any,
-) -> list[tuple[Any, ...]]:
-    """
-    Flatten out_shardings to a list of placement tuples.
-
-    The out_shardings should match the structure of the model output.
-    Each leaf should be a tuple of Placements.
-
-    Handles nested structures by recursively walking until we find placement tuples.
-    """
-    from torch.distributed.tensor.placement_types import Placement
-
-    def is_placement_tuple(obj: Any) -> bool:
-        if not isinstance(obj, tuple):
-            return False
-        if len(obj) == 0:
-            return False
-        return all(isinstance(p, Placement) for p in obj)
-
-    def collect_placement_tuples(obj: Any, result: list) -> None:
-        """Recursively collect placement tuples from a nested structure."""
-        if is_placement_tuple(obj):
-            result.append(obj)
-        elif isinstance(obj, (list, tuple)):
-            for item in obj:
-                collect_placement_tuples(item, result)
-        elif isinstance(obj, dict):
-            for item in obj.values():
-                collect_placement_tuples(item, result)
-        else:
-            raise TypeError(
-                f"out_shardings must contain tuples of Placements, "
-                f"got {type(obj)}: {obj}"
-            )
-
-    result: list[tuple[Any, ...]] = []
-    collect_placement_tuples(out_shardings, result)
-
-    if not result:
-        raise ValueError("out_shardings must contain at least one placement tuple")
-
-    return result
 
 
 def auto_parallel(
