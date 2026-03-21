@@ -7,7 +7,8 @@ import copy
 import functools
 import logging
 import time
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass
 from typing import Any, Callable, Optional, Union
 
 import torch
@@ -61,6 +62,93 @@ _APPLY_VIEW_MM_VIEW_PATTERN = False
 logger = logging.getLogger(__name__)
 
 
+@contextmanager
+def _suppress_wait_tensor_side_effect():
+    """Temporarily remove wait_tensor from the side-effectful set.
+
+    This allows DCE to clean up unused wait_tensor nodes in the backward graph,
+    which is important for memory. The entries are restored on exit.
+    """
+    ops = torch.fx.node._side_effectful_functions
+    removed = set()
+    for op in (
+        torch.ops._c10d_functional.wait_tensor,
+        torch.ops._c10d_functional.wait_tensor.default,
+    ):
+        if op in ops:
+            ops.remove(op)
+            removed.add(op)
+    try:
+        yield
+    finally:
+        ops.update(removed)
+
+
+@dataclass
+class JointGraphResult:
+    gm: torch.fx.GraphModule
+    joint_with_descriptors: Any
+    traced_inputs: list[Any]
+
+
+def build_joint_graph(
+    model: torch.nn.Module,
+    input_fn: Callable,
+    fake_mode: FakeTensorMode,
+    stack: ExitStack,
+) -> JointGraphResult:
+    t0 = time.perf_counter()
+    decomp_table = _get_decomp_table()
+
+    with fake_mode:
+        raw_inputs = input_fn()
+
+    formatted_inputs = raw_inputs if isinstance(raw_inputs, tuple) else (raw_inputs,)
+
+    traced_inputs = list(formatted_inputs)
+
+    with set_dtype_cast(
+        True
+    ), enable_local_map_wrapping(), torch._dynamo.utils._disable_saved_tensors_hooks_during_tracing():
+        torch_ir_with_fqn = _dynamo_graph_capture_for_export(model)(*formatted_inputs)
+        _restore_state_dict(model, torch_ir_with_fqn)
+        _add_unused_params_and_buffers(model, torch_ir_with_fqn)
+        # TODO Can't use fake mode here because it clashes with the user level
+        # fake mode. Ideally dynamo should reuse the user level fake mode.
+        joint_with_descriptors = aot_export_joint_with_descriptors(
+            stack,
+            torch_ir_with_fqn,
+            formatted_inputs,
+            decompositions=decomp_table,
+        )
+    gm = joint_with_descriptors.graph_module
+    assert_has_no_collectives(gm)
+
+    cleanup_graph(gm)
+    if _APPLY_VIEW_MM_VIEW_PATTERN:
+        _replace_view_mm_view_with_einsum(gm)
+    # now add aliases nodes to the graph to
+    # give more room for optimizations
+    _add_alias(gm, version="v2")
+    trace_structured(
+        "artifact",
+        metadata_fn=lambda: {
+            "name": "autoparallel_joint_graph",
+            "encoding": "string",
+        },
+        payload_fn=lambda: gm.print_readable(
+            print_output=False, include_stride=True, include_device=True
+        ),
+    )
+
+    logger.info("Graph tracing took %.3fs", time.perf_counter() - t0)
+    return JointGraphResult(
+        gm=gm,
+        joint_with_descriptors=joint_with_descriptors,
+        traced_inputs=traced_inputs,
+    )
+
+
 class AutoParallel:
     """
     Args:
@@ -81,7 +169,8 @@ class AutoParallel:
         reshard_after_forward: bool = True,
         dynamic: bool = False,
         numerics_logger: NumericsLogger | None = None,
-        **kwargs,
+        cost_model: Any = None,
+        repeated_subgraphs: bool = False,
     ):
         self.stack = ExitStack()
         self.fake_mode = (
@@ -92,8 +181,8 @@ class AutoParallel:
         if mp_policy is not None:
             mp_policy = canonicalize_mp(mp_policy)
         self.mp_policy = mp_policy
-        self.cost_model = kwargs.pop("cost_model", None)
-        self.kwargs = kwargs
+        self.cost_model = cost_model
+        self.repeated_subgraphs = repeated_subgraphs
         # copy user model to avoid modifying it in-place
         # in dtype casting and move_to_fake
         model = copy.deepcopy(model)
@@ -168,7 +257,7 @@ class AutoParallel:
                 self.gm,
                 self.mesh,
                 rescale_grad_comm_cost_for_mp,
-                repeated_subgraphs=self.kwargs.get("repeated_subgraphs", False),
+                repeated_subgraphs=self.repeated_subgraphs,
             )
 
             self.sharding_optimizer = sharding_optimizer
@@ -206,57 +295,12 @@ class AutoParallel:
             )
 
     def build_model_graph(self):
-        t0 = time.perf_counter()
-        decomp_table = _get_decomp_table()
-
-        with self.fake_mode:
-            raw_inputs = self.input_fn()
-
-        formatted_inputs = (
-            raw_inputs if isinstance(raw_inputs, tuple) else (raw_inputs,)
+        result = build_joint_graph(
+            self.model, self.input_fn, self.fake_mode, self.stack
         )
-
-        # Capture traced inputs for runtime validation in forward().
-        self._traced_inputs = list(formatted_inputs)
-
-        with set_dtype_cast(
-            True
-        ), enable_local_map_wrapping(), torch._dynamo.utils._disable_saved_tensors_hooks_during_tracing():
-            torch_ir_with_fqn = _dynamo_graph_capture_for_export(self.model)(
-                *formatted_inputs
-            )
-            _restore_state_dict(self.model, torch_ir_with_fqn)
-            _add_unused_params_and_buffers(self.model, torch_ir_with_fqn)
-            # TODO Can't use fake mode here because it clashes with the user level
-            # fake mode. Ideally dynamo should reuse the user level fake mode.
-            self.joint_with_descriptors = aot_export_joint_with_descriptors(
-                self.stack,
-                torch_ir_with_fqn,
-                formatted_inputs,
-                decompositions=decomp_table,
-            )
-        gm = self.joint_with_descriptors.graph_module
-        assert_has_no_collectives(gm)
-
-        cleanup_graph(gm)
-        if _APPLY_VIEW_MM_VIEW_PATTERN:
-            _replace_view_mm_view_with_einsum(gm)
-        # now add aliases nodes to the graph to
-        # give more room for optimizations
-        _add_alias(gm, version="v2")
-        trace_structured(
-            "artifact",
-            metadata_fn=lambda: {
-                "name": "autoparallel_joint_graph",
-                "encoding": "string",
-            },
-            payload_fn=lambda: gm.print_readable(
-                print_output=False, include_stride=True, include_device=True
-            ),
-        )
-
-        self.gm = gm
-        logger.info("Graph tracing took %.3fs", time.perf_counter() - t0)
+        self.gm = result.gm
+        self.joint_with_descriptors = result.joint_with_descriptors
+        self._traced_inputs = result.traced_inputs
 
     # TODO: Specify what the low/high meaning is (percentage?)
     def add_parameter_memory_constraint(self, low=None, high=None):
@@ -377,25 +421,9 @@ class AutoParallel:
         # )
         self.parallel_gm = parallel_gm
         update_joint_with_descriptors(self.joint_with_descriptors, parallel_gm)
-        # NB: so this function takes in the parameters at the beginning
-
-        # let's remove those otherwise we can't clean the backward graph properly
-        # NB: This is VERY important for good memory use!
-        # TODO: This is VERY VERY NAUGHTY, need to do this in a scoped way
-        if (
-            torch.ops._c10d_functional.wait_tensor
-            in torch.fx.node._side_effectful_functions
-        ):
-            torch.fx.node._side_effectful_functions.remove(
-                torch.ops._c10d_functional.wait_tensor
-            )
-        if (
-            torch.ops._c10d_functional.wait_tensor.default
-            in torch.fx.node._side_effectful_functions
-        ):
-            torch.fx.node._side_effectful_functions.remove(
-                torch.ops._c10d_functional.wait_tensor.default
-            )
+        # Allow DCE to remove unused wait_tensor nodes in the backward graph.
+        # Pushed onto self.stack so it's restored in AutoParallel.__exit__.
+        self.stack.enter_context(_suppress_wait_tensor_side_effect())
         logger.info(
             "Apply placements took %.3fs "
             "(apply_sharding=%.3fs, cleanup=%.3fs, trace=%.3fs, ac=%.3fs)",
