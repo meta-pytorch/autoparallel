@@ -32,17 +32,26 @@ from .shardings.ordered_sharding import (
 )
 from .shardings.propagation_rules import TENSOR_FACTORY_OPS
 
-_ENABLE_ORDERED_SHARDING_OPTIMIZATION = True
-
 logger = logging.getLogger(__name__)
+
+_VIEW_OPS = {
+    torch.ops.aten._unsafe_view.default,
+    torch.ops.aten.view.default,
+    torch.ops.aten.expand.default,
+}
 
 
 class ApplyShardingInterpreter(torch.fx.Interpreter):
-    def __init__(self, module, sharding_placement):
+    def __init__(
+        self,
+        module,
+        sharding_placement,
+        enable_ordered_sharding_optimization: bool = True,
+    ):
         super().__init__(module, garbage_collect_values=True, graph=None)
         self.sharding_placement = sharding_placement
         param_placement_order = {}
-        if _ENABLE_ORDERED_SHARDING_OPTIMIZATION:
+        if enable_ordered_sharding_optimization:
             param_placement_order = compute_optimal_placement_order_for_parameters(
                 module, sharding_placement
             )
@@ -117,24 +126,27 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
             )
         return x
 
-    def redistribute_getitem_arg(self, arg, idx):
+    def _call_getitem(self, args):
         node = self._curr_node
         assert node.target == operator.getitem, f"Got {node.target}"
-        if not isinstance(arg, torch.Tensor):
-            return arg
+        idx = args[1]
+        arg = args[0][idx]
 
-        # use this instead of node.all_input_nodes as it handles repeated nodes
-        all_input_nodes = [
-            x for x in tree_flatten(node.args)[0] if isinstance(x, torch.fx.Node)
-        ]
-        curr_spec = self.sharding_placement[all_input_nodes[0]].output_specs[idx]
-        tgt_spec = self.sharding_placement[node].input_specs[0]
+        new_args_0 = list(args[0])
+        if isinstance(arg, torch.Tensor):
+            # use this instead of node.all_input_nodes as it handles repeated nodes
+            all_input_nodes = [
+                x for x in tree_flatten(node.args)[0] if isinstance(x, torch.fx.Node)
+            ]
+            curr_spec = self.sharding_placement[all_input_nodes[0]].output_specs[idx]
+            tgt_spec = self.sharding_placement[node].input_specs[0]
+            new_args_0[idx] = self.redistribute_tensor(arg, curr_spec, tgt_spec)
+        else:
+            tgt_spec = None
 
-        x = self.redistribute_tensor(arg, curr_spec, tgt_spec)
-        self.tgt_spec = tgt_spec
-        return x
+        return [tuple(new_args_0), idx], tgt_spec
 
-    def redistribute_args(self, args):
+    def _call_regular_function(self, target, args):
         node = self._curr_node
         # use this instead of node.all_input_nodes as it handles repeated nodes
         all_input_nodes = [
@@ -172,14 +184,14 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
             tgt_specs = tgt_specs_t
 
         assert len(flat_args_t) == len(curr_specs) == len(tgt_specs)
+        last_tgt_spec = None
         new_flat_args_t = []
         for n, arg, curr_spec, tgt_spec in zip(
             all_input_nodes, flat_args_t, curr_specs, tgt_specs
         ):
             x = self.redistribute_tensor(arg, curr_spec, tgt_spec, node)
-            self._set_origin_and_target_device_order(node, curr_spec, tgt_spec)
             new_flat_args_t.append(x)
-            self.tgt_spec = tgt_spec
+            last_tgt_spec = tgt_spec
 
         new_flat_args = []
         counter = 0
@@ -189,34 +201,12 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
                 counter += 1
             new_flat_args.append(x)
 
-        new_args = treespec.unflatten(new_flat_args)
-        return list(new_args)
-
-    def call_function(self, target, args, kwargs):
-        new_args = []
-        node = self._curr_node
-
-        # TODO: fix getitem propagation to have as input all the tensors
-        # this will require fixing other things down the line
-        # and might require removing the workaround None -> Replicate from
-        # DTensor sharding ops
-        if node.target == operator.getitem:
-            new_args.append(list(args[0]))
-            new_args[0][args[1]] = self.redistribute_getitem_arg(
-                new_args[0][args[1]], args[1]
-            )
-            new_args[0] = tuple(new_args[0])
-            new_args.append(args[1])
-        else:
-            new_args = self.redistribute_args(args)
+        new_args = list(treespec.unflatten(new_flat_args))
 
         # apply sharding to constructor functions as well
         if target in TENSOR_FACTORY_OPS:
             # scalar_tensor has a scalar as first arg, not a shape
-            if target == torch.ops.aten.scalar_tensor.default:
-                # scalar tensors can't be sharded, so no transformation needed
-                pass
-            else:
+            if target != torch.ops.aten.scalar_tensor.default:
                 val = list(new_args[0])
                 spec = self.sharding_placement[node].output_specs
                 for mesh_size, placement in zip(spec.mesh.shape, spec.placements):
@@ -225,19 +215,23 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
                         val[placement.dim] //= mesh_size
                 new_args[0] = tuple(val)
 
+        return new_args, last_tgt_spec
+
+    def call_function(self, target, args, kwargs):
+        if self._curr_node.target == operator.getitem:
+            new_args, tgt_spec = self._call_getitem(args)
+        else:
+            new_args, tgt_spec = self._call_regular_function(target, args)
+
         # use DTensor machinery to ensure the view ops are valid
         # otherwise we would end-up forcing global shapes on local tensors
         # which would yield errors
-        if target in {
-            torch.ops.aten._unsafe_view.default,
-            torch.ops.aten.view.default,
-            torch.ops.aten.expand.default,
-        }:
+        if target in _VIEW_OPS and tgt_spec is not None:
             new_args[0] = DTensor.from_local(
-                new_args[0], self.tgt_spec.mesh, self.tgt_spec.placements
+                new_args[0], tgt_spec.mesh, tgt_spec.placements
             )
             # TODO: once `from_local` accept device order arg, we can remove the following
-            new_args[0]._spec.shard_order = self.tgt_spec.shard_order
+            new_args[0]._spec.shard_order = tgt_spec.shard_order
 
             # TODO: see if we can remove this contiguous properly
             new_args[0] = new_args[0].contiguous()
@@ -305,89 +299,95 @@ def _get_inductor_decomp_table():
     return decomp_table
 
 
-def apply_sharding_to_model(gm, sharding_placement, params_spec, buffers_spec):
-    t0 = time.perf_counter()
-    args = shard_nodes_given_placements(gm, sharding_placement)
-    local_args = [arg.to_local() for arg in args]
-    t1 = time.perf_counter()
-
+def _lower_to_parallel_graph(gm, sharding_placement, local_args):
+    """Two-pass lowering: interpret with sharding collectives, then decompose."""
     decomp_table = _get_inductor_decomp_table()
-    # run with DTensor to apply the collectives given the graph
+
     interp = ApplyShardingInterpreter(gm, sharding_placement)
-    t2 = time.perf_counter()
 
     # TODO: make_fx here is suspicious in case of dynamic shapes
     # here we update sharding_placement if device order get muted
     with fx_traceback.preserve_node_meta():
         parallel_gm0 = make_fx(interp.run)(*local_args)
-    t3 = time.perf_counter()
-
     cleanup_graph(parallel_gm0)
-    t4 = time.perf_counter()
 
     interp2 = torch.fx.Interpreter(parallel_gm0)
     with fx_traceback.preserve_node_meta():
         parallel_gm = make_fx(interp2.run, decomposition_table=decomp_table)(
             *local_args
         )
-    t5 = time.perf_counter()
-
     cleanup_graph(parallel_gm)
-    t6 = time.perf_counter()
 
-    # Copy descriptors over to new graph
+    return parallel_gm
+
+
+def _copy_descriptors_and_rename_placeholders(source_gm, target_gm):
+    """Copy node descriptors from source graph and rename placeholders to match."""
     for n1, n2 in zip(
-        (n for n in gm.graph.nodes if n.op in ("placeholder", "output")),
-        (n for n in parallel_gm.graph.nodes if n.op in ("placeholder", "output")),
+        (n for n in source_gm.graph.nodes if n.op in ("placeholder", "output")),
+        (n for n in target_gm.graph.nodes if n.op in ("placeholder", "output")),
     ):
         n2.meta["desc"] = n1.meta["desc"]
         if n2.op == "placeholder":
             n2.target = n1.target
-            # node renaming is needed for partitioner as it searchs for tangents
+            # node renaming is needed for partitioner as it searches for tangent
             # nodes. See https://fburl.com/kc4jtc3t for one case where it's used
-            rename_placeholder_node(parallel_gm, n2, n1.name)
-    # need to recompile after renaming nodes
-    parallel_gm.recompile()
-    t7 = time.perf_counter()
+            rename_placeholder_node(target_gm, n2, n1.name)
+    target_gm.recompile()
 
-    sharded_param_dict = {}
-    sharded_buffer_dict = {}
 
+def _shard_params_and_buffers(gm, sharding_placement, params_spec, buffers_spec):
+    """Shard parameters and buffers according to the sharding placement."""
     # NB: ok to NOT use the parallel_gm here because we will just reapply the
     # correct sharding placement via sharding_placement
     fqn_to_param = get_named_param_nodes(gm.graph)
     fqn_to_buffer = get_named_buffer_nodes(gm.graph)
 
+    sharded_param_dict = {}
     for fqn in params_spec:
         n = fqn_to_param[fqn]
         with unset_fake_temporarily():
             sharded_param_dict[fqn] = nn.Parameter(
                 shard_node_given_placements(n, sharding_placement, meta=True)
             )
-            # assign device order info to fqn model parameter
             tgt_spec = sharding_placement[n].input_specs[0]
             sharded_param_dict[fqn]._spec.shard_order = tgt_spec.shard_order
 
+    sharded_buffer_dict = {}
     for fqn in buffers_spec:
         n = fqn_to_buffer[fqn]
         sharded_buffer_dict[fqn] = shard_node_given_placements(
             n, sharding_placement, meta=True
         )
-    t8 = time.perf_counter()
+
+    return sharded_param_dict, sharded_buffer_dict
+
+
+def apply_sharding_to_model(gm, sharding_placement, params_spec, buffers_spec):
+    t0 = time.perf_counter()
+    args = shard_nodes_given_placements(gm, sharding_placement)
+    local_args = [arg.to_local() for arg in args]
+    t1 = time.perf_counter()
+
+    parallel_gm = _lower_to_parallel_graph(gm, sharding_placement, local_args)
+    t2 = time.perf_counter()
+
+    _copy_descriptors_and_rename_placeholders(gm, parallel_gm)
+    t3 = time.perf_counter()
+
+    sharded_param_dict, sharded_buffer_dict = _shard_params_and_buffers(
+        gm, sharding_placement, params_spec, buffers_spec
+    )
+    t4 = time.perf_counter()
 
     logger.info(
         "apply_sharding_to_model breakdown: "
-        "shard_inputs=%.3fs, interp_init=%.3fs, make_fx_1=%.3fs, "
-        "cleanup_1=%.3fs, make_fx_2=%.3fs, cleanup_2=%.3fs, "
+        "shard_inputs=%.3fs, lower_graph=%.3fs, "
         "rename=%.3fs, shard_params=%.3fs",
         t1 - t0,
         t2 - t1,
         t3 - t2,
         t4 - t3,
-        t5 - t4,
-        t6 - t5,
-        t7 - t6,
-        t8 - t7,
     )
 
     return parallel_gm, sharded_param_dict, sharded_buffer_dict
