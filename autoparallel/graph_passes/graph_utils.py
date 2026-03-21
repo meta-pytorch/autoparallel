@@ -6,6 +6,7 @@
 from typing import Union
 
 import torch
+from torch._functorch._aot_autograd.subclass_utils import create_subclass_meta
 from torch._functorch.aot_autograd import JointWithDescriptors
 from torch._inductor.fx_passes.joint_graph import patterns
 from torch._inductor.fx_passes.post_grad import remove_assert_ops, remove_noop_ops
@@ -78,6 +79,16 @@ def update_joint_with_descriptors(
 
     joint_with_descriptors._aot_state.flat_args = new_flat_args  # type: ignore[assignment]
     joint_with_descriptors._aot_state.fw_metadata.traced_tangents = new_local_tangents
+    # Regenerate subclass_tangent_meta from the updated local tangents so that
+    # MemoryFormatMeta records the correct (local) sizes and strides.
+    # Without this, the stale global-shaped metadata causes
+    # coerce_to_expected_memory_format to broadcast the tangent back to global
+    # shape, which then fails the inductor backward's assert_size_stride.
+    joint_with_descriptors._aot_state.fw_metadata.subclass_tangent_meta = (
+        create_subclass_meta(
+            new_local_tangents, count_symints=False, with_memory_format=True
+        )
+    )
 
 
 def _add_alias(gm, version="v1"):
