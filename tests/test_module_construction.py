@@ -6,11 +6,7 @@
 import torch
 from torch import nn
 
-from autoparallel.module_construction import (
-    _build_alias_map,
-    _build_module_alias_map,
-    make_parallel_module,
-)
+from autoparallel.module_construction import make_parallel_module
 
 
 def _make_param_and_buffer_dicts(model):
@@ -201,16 +197,11 @@ def test_param_alias_reregistered():
     with torch.device("meta"):
         model = Model()
 
-    param_alias_map = _build_alias_map(model.named_parameters)
-    assert len(param_alias_map) == 1
-
     # Only the canonical FQN ends up in the dict (tracer deduplicates)
     param_dict = {"embed.weight": nn.Parameter(torch.randn(dim, dim))}
     buffer_dict = {}
 
-    mod = make_parallel_module(
-        model, param_dict, buffer_dict, param_alias_map=param_alias_map
-    )
+    mod = make_parallel_module(model, param_dict, buffer_dict)
 
     assert hasattr(mod, "lm_head")
     assert mod.get_parameter("lm_head.weight") is mod.get_parameter("embed.weight")
@@ -241,19 +232,27 @@ def test_buffer_alias_reregistered():
     with torch.device("meta"):
         model = Model()
 
-    buffer_alias_map = _build_alias_map(model.named_buffers)
-    assert len(buffer_alias_map) == 1
-
     param_dict, _ = _make_param_and_buffer_dicts(model)
-    # Only the canonical buffer survives deduplication
-    canonical_fqn = list(buffer_alias_map.values())[0]
+    # Only the canonical buffer survives deduplication; figure out which one.
+    seen: dict[int, str] = {}
+    for fqn, buf in model.named_buffers():
+        seen[id(buf)] = fqn
+    canonical_fqn: str | None = None
+    for fqn, buf in model.named_buffers(remove_duplicate=False):
+        if fqn not in seen.values():
+            canonical_fqn = seen[id(buf)]
+            break
+    assert canonical_fqn is not None
     buffer_dict = {canonical_fqn: torch.randn(dim)}
 
-    mod = make_parallel_module(
-        model, param_dict, buffer_dict, buffer_alias_map=buffer_alias_map
-    )
+    mod = make_parallel_module(model, param_dict, buffer_dict)
 
-    alias_fqn = list(buffer_alias_map.keys())[0]
+    # The alias is whichever FQN wasn't canonical
+    alias_fqn = next(
+        fqn
+        for fqn, buf in model.named_buffers(remove_duplicate=False)
+        if fqn not in seen.values()
+    )
     assert mod.get_buffer(alias_fqn) is mod.get_buffer(canonical_fqn)
 
 
@@ -276,13 +275,8 @@ def test_module_alias_reestablished():
 
     assert model.model_ema is model.teacher
 
-    module_alias_map = _build_module_alias_map(model)
-    assert len(module_alias_map) == 1
-
     param_dict, buffer_dict = _make_param_and_buffer_dicts(model)
-    mod = make_parallel_module(
-        model, param_dict, buffer_dict, module_alias_map=module_alias_map
-    )
+    mod = make_parallel_module(model, param_dict, buffer_dict)
 
     assert mod.model_ema is mod.teacher
 
