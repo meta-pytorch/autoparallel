@@ -7,13 +7,11 @@ from typing import Any, Optional
 
 import torch
 from torch._logging import trace_structured
-from torch.export.unflatten import _AttrKind
 
 from autoparallel.graph_passes.graph_partition import partition_joint_with_descriptors
 
-from .api import _NN_MODULE_KEYS, AutoParallel, _assign_attr
-from .cast_parametrization import DTypeCastModule
-from .init_weights import wrap_init_weights
+from .api import AutoParallel
+from .module_construction import make_parallel_module
 
 
 def make_pp_module(
@@ -22,37 +20,7 @@ def make_pp_module(
     ref_model: torch.nn.Module,
 ):
     """Create an AutoParallelPPModule that inherits from the user's model class."""
-    UserModelClass = type(ref_model)
-    if issubclass(UserModelClass, DTypeCastModule):
-        UserModelClass = UserModelClass.__bases__[1]
-
-    class AutoParallelPPModule(UserModelClass):  # type: ignore[misc,valid-type]
-        def __init__(self):
-            torch.nn.Module.__init__(self)
-
-        def forward(self, *args):
-            raise NotImplementedError("This is a placeholder for the pipeline model")
-
-    mod = AutoParallelPPModule()
-
-    # Copy user-defined instance attributes (e.g. self.dim, self.config).
-    for k, v in ref_model.__dict__.items():
-        if k not in _NN_MODULE_KEYS:
-            mod.__dict__[k] = v
-
-    # Register params and buffers, preserving original module structure.
-    for k, v in sharded_param_dict.items():
-        _assign_attr(v, mod, ref_model, k, attr_kind=_AttrKind.PARAMETER)
-    for k, buf in sharded_buffer_dict.items():
-        _assign_attr(buf, mod, ref_model, k, attr_kind=_AttrKind.BUFFER)
-
-    # Copy submodules that don't appear in any parameter/buffer FQN path.
-    for k, v in ref_model._modules.items():
-        if k not in mod._modules:
-            mod._modules[k] = v
-
-    wrap_init_weights(mod)
-    return mod
+    return make_parallel_module(ref_model, sharded_param_dict, sharded_buffer_dict)
 
 
 class AutoParallelPP(AutoParallel):
