@@ -5,6 +5,7 @@
 
 import collections
 import logging
+import operator
 import time
 from pathlib import Path
 from typing import Any, Iterable
@@ -55,33 +56,12 @@ def _get_meta_tensors_for_op(op, user_args, user_kwargs):
     return out_tensor_meta, input_tensor_metas
 
 
-def _spec_has_tensor_meta(spec):
-    if spec is None:
-        return True
-    if isinstance(spec, DTensorSpec):
-        return spec.tensor_meta is not None
-    return all(s.tensor_meta is not None for s in spec if s is not None)
-
-
-def _has_tensor_meta(out_strat):
-    """Check if all specs (input and output) already have tensor_meta set."""
-    if len(out_strat.strategies) == 0:
-        return False
-    first = out_strat.strategies[0]
-    if not _spec_has_tensor_meta(first.output_specs):
-        return False
-    if first.input_specs is None:
-        return False
-    return all(_spec_has_tensor_meta(s) for s in first.input_specs)
-
-
 def propagate_tensor_meta(op, user_args, user_kwargs, out_strat):
-    if _has_tensor_meta(out_strat):
-        return
-
     new_tensor_meta, tensor_metas = _get_meta_tensors_for_op(op, user_args, user_kwargs)
 
     for strat in out_strat.strategies:
+        if strat.output_specs is None:
+            continue
         if isinstance(new_tensor_meta, TensorMeta):
             strat.output_spec.tensor_meta = new_tensor_meta
         else:
@@ -346,7 +326,11 @@ def get_placement_options(mesh, op, specs, user_args, user_kwargs):
             out_strat = get_op_strategy(op, op_schema)
     t1 = time.perf_counter()
 
-    propagate_tensor_meta(op, user_args, user_kwargs, out_strat)
+    # operator.getitem is self-contained: its input is a tuple of tensors
+    # but input_specs tracks only the selected element, so
+    # propagate_tensor_meta's input count assertion would fail.
+    if op is not operator.getitem:
+        propagate_tensor_meta(op, user_args, user_kwargs, out_strat)
     t2 = time.perf_counter()
 
     fill_missing_redistribute_cost(op, specs, out_strat)

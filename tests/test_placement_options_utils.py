@@ -10,7 +10,6 @@ from torch.distributed.tensor._op_schema import OpSpec, OpStrategy
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
 from autoparallel.shardings.placement_options import (
-    _has_tensor_meta,
     fill_missing_redistribute_cost,
     keep_unique_configs,
     propagate_tensor_meta,
@@ -29,73 +28,6 @@ def device_mesh_2d():
 def _make_tensor_meta(shape, dtype=torch.float32):
     t = torch.empty(shape, dtype=dtype, device="meta")
     return TensorMeta(t.shape, t.stride(), t.dtype)
-
-
-# ===== _has_tensor_meta =====
-
-
-class TestHasTensorMeta:
-    def test_both_input_and_output_have_meta(self, device_mesh_1d):
-        tm = _make_tensor_meta((4, 8))
-        spec = DTensorSpec(device_mesh_1d, (Replicate(),), tensor_meta=tm)
-        strat = OpStrategy(
-            [OpSpec(spec, input_specs=[spec], redistribute_cost=[[0.0]])]
-        )
-        assert _has_tensor_meta(strat) is True
-
-    def test_output_has_meta_input_missing(self, device_mesh_1d):
-        """This is the bug we hit: output has tensor_meta but input doesn't."""
-        tm = _make_tensor_meta((4, 8))
-        out_spec = DTensorSpec(device_mesh_1d, (Replicate(),), tensor_meta=tm)
-        in_spec = DTensorSpec(device_mesh_1d, (Replicate(),))
-        strat = OpStrategy(
-            [OpSpec(out_spec, input_specs=[in_spec], redistribute_cost=[[0.0]])]
-        )
-        assert _has_tensor_meta(strat) is False
-
-    def test_output_missing_meta(self, device_mesh_1d):
-        spec = DTensorSpec(device_mesh_1d, (Replicate(),))
-        strat = OpStrategy(
-            [OpSpec(spec, input_specs=[spec], redistribute_cost=[[0.0]])]
-        )
-        assert _has_tensor_meta(strat) is False
-
-    def test_input_specs_none(self, device_mesh_1d):
-        tm = _make_tensor_meta((4, 8))
-        spec = DTensorSpec(device_mesh_1d, (Replicate(),), tensor_meta=tm)
-        strat = OpStrategy([OpSpec(spec)])
-        assert _has_tensor_meta(strat) is False
-
-    def test_output_specs_none(self, device_mesh_1d):
-        """Non-tensor getitem output with input_specs also None → False
-        because propagate_tensor_meta needs to fill input_specs."""
-        strat = OpStrategy([OpSpec(None, input_specs=None)])
-        assert _has_tensor_meta(strat) is False
-
-    def test_output_specs_none_with_input(self, device_mesh_1d):
-        """Non-tensor getitem output but input_specs set → True."""
-        tm = _make_tensor_meta((4, 8))
-        in_spec = DTensorSpec(device_mesh_1d, (Replicate(),), tensor_meta=tm)
-        strat = OpStrategy([OpSpec(None, input_specs=[in_spec])])
-        assert _has_tensor_meta(strat) is True
-
-    def test_multi_output_all_have_meta(self, device_mesh_1d):
-        tm = _make_tensor_meta((4, 8))
-        spec = DTensorSpec(device_mesh_1d, (Replicate(),), tensor_meta=tm)
-        out = (spec, spec)
-        strat = OpStrategy([OpSpec(out, input_specs=[spec], redistribute_cost=[[0.0]])])
-        assert _has_tensor_meta(strat) is True
-
-    def test_multi_output_with_none_specs(self, device_mesh_1d):
-        tm = _make_tensor_meta((4, 8))
-        spec = DTensorSpec(device_mesh_1d, (Replicate(),), tensor_meta=tm)
-        out = (spec, None, spec)
-        strat = OpStrategy([OpSpec(out, input_specs=[spec], redistribute_cost=[[0.0]])])
-        assert _has_tensor_meta(strat) is True
-
-    def test_empty_strategy_list(self):
-        strat = OpStrategy([])
-        assert _has_tensor_meta(strat) is False
 
 
 # ===== remove_invalid_configs =====
@@ -237,20 +169,22 @@ class TestFillMissingRedistributeCost:
 
 
 class TestPropagateTensorMeta:
-    def test_skips_when_meta_already_set(self, device_mesh_1d):
+    def test_overwrites_existing_meta(self, device_mesh_1d):
         tm = _make_tensor_meta((4, 8))
         spec = DTensorSpec(device_mesh_1d, (Replicate(),), tensor_meta=tm)
         strat = OpStrategy(
             [OpSpec(spec, input_specs=[spec], redistribute_cost=[[0.0]])]
         )
-        # Should be a no-op — tensor_meta stays the same
         propagate_tensor_meta(
             torch.ops.aten.neg.default,
             (torch.empty(4, 8, device="meta"),),
             {},
             strat,
         )
-        assert strat.strategies[0].output_spec.tensor_meta is tm
+        # tensor_meta is overwritten (not the same object) but has the same shape
+        result_tm = strat.strategies[0].output_spec.tensor_meta
+        assert result_tm is not tm
+        assert result_tm.shape == torch.Size([4, 8])
 
     def test_fills_when_meta_missing(self, device_mesh_1d):
         spec = DTensorSpec(device_mesh_1d, (Replicate(),))
@@ -265,3 +199,19 @@ class TestPropagateTensorMeta:
         )
         assert strat.strategies[0].output_spec.tensor_meta is not None
         assert strat.strategies[0].output_spec.tensor_meta.shape == torch.Size([4, 8])
+
+    def test_skips_none_output_specs(self, device_mesh_1d):
+        """Strategies with output_specs=None (non-tensor getitem) are skipped."""
+        tm = _make_tensor_meta((4, 8))
+        in_spec = DTensorSpec(device_mesh_1d, (Replicate(),), tensor_meta=tm)
+        strat = OpStrategy(
+            [OpSpec(None, input_specs=[in_spec], redistribute_cost=[[0.0]])]
+        )
+        # Should not crash even though output_specs is None
+        propagate_tensor_meta(
+            torch.ops.aten.neg.default,
+            (torch.empty(4, 8, device="meta"),),
+            {},
+            strat,
+        )
+        assert strat.strategies[0].output_specs is None
