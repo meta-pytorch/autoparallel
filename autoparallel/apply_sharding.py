@@ -93,13 +93,9 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
         self._curr_node = n
         return super().run_node(n)
 
-    def _get_input_nodes(self):
+    def _get_input_nodes(self, node):
         # node.all_input_nodes deduplicates, but we need repeated nodes preserved
-        return [
-            x
-            for x in tree_flatten(self._curr_node.args)[0]
-            if isinstance(x, torch.fx.Node)
-        ]
+        return [x for x in tree_flatten(node.args)[0] if isinstance(x, torch.fx.Node)]
 
     def _set_origin_and_target_device_order(self, node, curr_spec, tgt_spec):
         # shard_order should be automatically assigned once `placements` is set
@@ -149,7 +145,7 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
 
         new_args_0 = list(args[0])
         if isinstance(arg, torch.Tensor):
-            all_input_nodes = self._get_input_nodes()
+            all_input_nodes = self._get_input_nodes(node)
             curr_spec = self.sharding_placement[all_input_nodes[0]].output_specs[idx]
             tgt_spec = self.sharding_placement[node].input_specs[0]
             new_args_0[idx] = self.redistribute_tensor(arg, curr_spec, tgt_spec, node)
@@ -160,7 +156,7 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
 
     def _redistribute_and_adjust_args(self, target, args):
         node = self._curr_node
-        all_input_nodes = self._get_input_nodes()
+        all_input_nodes = self._get_input_nodes(node)
         num_input_nodes = len(all_input_nodes)
         curr_specs = [
             self.sharding_placement[n].output_specs for n in all_input_nodes
@@ -260,7 +256,7 @@ def shard_node_given_placements(node, sharding_placement, *, meta: bool):
     return sharded_tensor
 
 
-def shard_nodes_given_placements(gm, sharding_placement):
+def shard_placeholder_inputs(gm, sharding_placement):
     nodes = [x for x in gm.graph.find_nodes(op="placeholder")]
     sharded_tensors = []
     for node in nodes:
@@ -356,7 +352,7 @@ def _shard_params_and_buffers(gm, sharding_placement, params_spec, buffers_spec)
 
 def apply_sharding_to_model(gm, sharding_placement, params_spec, buffers_spec):
     t0 = time.perf_counter()
-    args = shard_nodes_given_placements(gm, sharding_placement)
+    args = shard_placeholder_inputs(gm, sharding_placement)
     local_args = [arg.to_local() for arg in args]
     t1 = time.perf_counter()
 
