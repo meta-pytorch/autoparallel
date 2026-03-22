@@ -28,7 +28,7 @@ from torch.utils._pytree import tree_flatten, tree_map_only
 from autoparallel.shardings.propagation_rules import generate_dummy_redistribute_costs
 
 from .dtensor_sharding_helpers import get_op_strategy, with_implicit_strategies
-from .propagation_rules import _op_partial_rules, _op_rules, remove_invalid_configs
+from .propagation_rules import _op_rules, remove_invalid_configs
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +55,30 @@ def _get_meta_tensors_for_op(op, user_args, user_kwargs):
     return out_tensor_meta, input_tensor_metas
 
 
+def _spec_has_tensor_meta(spec):
+    if spec is None:
+        return True
+    if isinstance(spec, DTensorSpec):
+        return spec.tensor_meta is not None
+    return all(s.tensor_meta is not None for s in spec if s is not None)
+
+
+def _has_tensor_meta(out_strat):
+    """Check if all specs (input and output) already have tensor_meta set."""
+    if len(out_strat.strategies) == 0:
+        return False
+    first = out_strat.strategies[0]
+    if not _spec_has_tensor_meta(first.output_specs):
+        return False
+    if first.input_specs is None:
+        return False
+    return all(_spec_has_tensor_meta(s) for s in first.input_specs)
+
+
 def propagate_tensor_meta(op, user_args, user_kwargs, out_strat):
+    if _has_tensor_meta(out_strat):
+        return
+
     new_tensor_meta, tensor_metas = _get_meta_tensors_for_op(op, user_args, user_kwargs)
 
     for strat in out_strat.strategies:
@@ -297,22 +320,6 @@ def get_placement_options(mesh, op, specs, user_args, user_kwargs):
         timer.record_op(op, time.perf_counter() - t_start)
         return out_strat
 
-    if op in _op_rules:
-        t0 = time.perf_counter()
-        out_strat = _op_rules[op](mesh, specs)
-        t1 = time.perf_counter()
-        out_strat = remove_invalid_configs(out_strat, mesh)
-        out_strat = keep_unique_configs(out_strat)
-        t2 = time.perf_counter()
-        timer.strategy_gen += t1 - t0
-        timer.filter_dedup += t2 - t1
-        timer.call_count += 1
-        timer.cache_misses += 1
-        timer.record_op(op, t2 - t_start)
-        if cache_key is not None:
-            _placement_options_cache[cache_key] = out_strat
-        return out_strat
-
     strat = []
     needs_pytree = False
     for spec in specs:
@@ -332,8 +339,8 @@ def get_placement_options(mesh, op, specs, user_args, user_kwargs):
     op_schema = OpSchema(op, strat, {}, RuntimeSchemaInfo(needs_pytree=needs_pytree))
 
     t0 = time.perf_counter()
-    if op in _op_partial_rules:
-        out_strat = _op_partial_rules[op](mesh, op_schema)
+    if op in _op_rules:
+        out_strat = _op_rules[op](mesh, op_schema)
     else:
         with with_implicit_strategies():
             out_strat = get_op_strategy(op, op_schema)
