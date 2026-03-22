@@ -13,7 +13,7 @@ from torch.distributed.tensor._op_schema import OpSchema, OpStrategy
 from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
 from torch.utils.flop_counter import register_flop_formula
 
-from autoparallel.shardings.propagation_rules import register_opschema_rule
+from autoparallel.shardings.propagation_rules import register_rule
 
 from .moe_placements import PartitionedShard
 from .moe_utils import (
@@ -200,7 +200,7 @@ def grouped_mm_flop_count(
     return total_flops
 
 
-@register_opschema_rule(torch.ops.autoparallel.batched_grouped_mm.default)
+@register_rule(torch.ops.autoparallel.batched_grouped_mm.default)
 def batched_grouped_mm_strategy(mesh: DeviceMesh, op_schema: OpSchema):
     from torch.distributed.tensor._op_schema import PlacementList
     from torch.distributed.tensor._ops.utils import expand_to_full_mesh_op_strategy
@@ -398,7 +398,7 @@ def batched_histc_meta(
     return out
 
 
-@register_opschema_rule(torch.ops.autoparallel.batched_histc.default)
+@register_rule(torch.ops.autoparallel.batched_histc.default)
 def batched_histc_strategy(mesh: DeviceMesh, op_schema: OpSchema):
     from torch.distributed.tensor._op_schema import PlacementList
     from torch.distributed.tensor._ops.utils import expand_to_full_mesh_op_strategy
@@ -1102,7 +1102,7 @@ def token_combine_meta(
     return torch.empty_like(base_output)
 
 
-@register_opschema_rule(torch.ops.autoparallel.token_dispatch.default)
+@register_rule(torch.ops.autoparallel.token_dispatch.default)
 def _token_dispatch_strategy(mesh: DeviceMesh, op_schema: OpSchema):
     from torch.distributed.tensor._op_schema import PlacementList
     from torch.distributed.tensor._ops.utils import expand_to_full_mesh_op_strategy
@@ -1137,7 +1137,7 @@ def _token_dispatch_strategy(mesh: DeviceMesh, op_schema: OpSchema):
     )
 
 
-@register_opschema_rule(torch.ops.autoparallel.token_combine.default)
+@register_rule(torch.ops.autoparallel.token_combine.default)
 def _token_combine_strategy(mesh: DeviceMesh, op_schema: OpSchema):
     from torch.distributed.tensor._op_schema import PlacementList
     from torch.distributed.tensor._ops.utils import expand_to_full_mesh_op_strategy

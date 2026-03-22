@@ -59,28 +59,15 @@ register_op_strategy_map(
 _op_rules = {}
 
 
-def register_rule(op):
+def register_rule(ops):
     global _op_rules
-
-    def wrapper(impl):
-        _op_rules[op] = impl
-        return impl
-
-    return wrapper
-
-
-_op_partial_rules = {}
-
-
-def register_opschema_rule(ops):
-    global _op_partial_rules
 
     def wrapper(impl):
         if isinstance(ops, list):
             for op in ops:
-                _op_partial_rules[op] = impl
+                _op_rules[op] = impl
         else:
-            _op_partial_rules[ops] = impl
+            _op_rules[ops] = impl
         return impl
 
     return wrapper
@@ -189,9 +176,9 @@ def generate_dummy_redistribute_costs(src_strategy: OpStrategy) -> list[float]:
 
 
 @register_rule(operator.getitem)
-def getitem_rule(mesh, specs):
-    op_spec = specs[0]
-    index = specs[1]
+def getitem_rule(mesh, op_schema):
+    op_spec = op_schema.args_schema[0]
+    index = op_schema.args_schema[1]
     strats = []
     new_inp = OpStrategy(
         [
@@ -219,11 +206,9 @@ def getitem_rule(mesh, specs):
 
 
 @register_rule(torch.ops.aten.view.default)
-def view_rule(mesh, specs):
-    # reverting https://github.com/pytorch/pytorch/pull/149764
-    # as it would raise errors on some cases
-    op_spec = specs[0]
-    shape = specs[1]
+def view_rule(mesh, op_schema):
+    op_spec = op_schema.args_schema[0]
+    shape = op_schema.args_schema[1]
     strats = []
     dim_map = dim_maps[torch.Tensor.view]
     rules = dim_map(op_spec, shape)
@@ -259,8 +244,8 @@ def view_rule(mesh, specs):
 
 
 @register_rule(torch.ops.aten.alias.default)
-def alias_rule(mesh, specs):
-    op_spec = specs[0]
+def alias_rule(mesh, op_schema):
+    op_spec = op_schema.args_schema[0]
     strats = []
     tensor_meta = op_spec.strategies[0].output_specs.tensor_meta
     all_ops = _create_all_options(mesh, tensor_meta.shape, tensor_meta)
@@ -276,13 +261,12 @@ def alias_rule(mesh, specs):
 
 
 @register_rule(torch.ops.aten.split_with_sizes.default)
-def split_with_sizes_rule(mesh, specs):
-    op_spec = specs[0]
-    sizes = specs[1]
+def split_with_sizes_rule(mesh, op_schema):
+    op_spec = op_schema.args_schema[0]
+    sizes = op_schema.args_schema[1]
     dim = 0
-    if len(specs) > 2:
-        # TODO: kwargs!!!!
-        dim = specs[2]
+    if len(op_schema.args_schema) > 2:
+        dim = op_schema.args_schema[2]
     strats = []
 
     banned_idxs = set()
@@ -314,11 +298,11 @@ def split_with_sizes_rule(mesh, specs):
 
 
 @register_rule(torch.ops.prims.iota.default)
-def iota_rule(mesh, specs):
+def iota_rule(mesh, op_schema):
     # Replicate-only: iota's output values are position-dependent
     # ([0, 1, ..., length-1]), so Shard would require adjusting `start`
     # per rank. Replicate is correct and cheap (small index tensors).
-    shape = [specs[0]]
+    shape = [op_schema.args_schema[0]]
     tensor_meta = _gen_tensor_meta(shape, dtype=torch.int64)
     placement = (Replicate(),) * mesh.ndim
     spec = DTensorSpec(mesh, placement, tensor_meta=tensor_meta)
@@ -326,9 +310,9 @@ def iota_rule(mesh, specs):
 
 
 @register_rule(torch.ops.aten.randperm.default)
-def randperm_rule(mesh, specs):
+def randperm_rule(mesh, op_schema):
     raise NotImplementedError("Needs hardening, only tested on a few cases")
-    shape = [specs[0]]
+    shape = [op_schema.args_schema[0]]
     tensor_meta = _gen_tensor_meta(shape, dtype=torch.int64)
     placement = (Replicate(),) * mesh.ndim
     spec = DTensorSpec(mesh, placement, tensor_meta=tensor_meta)
@@ -354,7 +338,7 @@ TENSOR_FACTORY_OPS = _SHAPE_FACTORY_OPS + [
 ]
 
 
-@register_opschema_rule(torch.ops.aten.scalar_tensor.default)
+@register_rule(torch.ops.aten.scalar_tensor.default)
 def scalar_tensor_rule(mesh, op_schema: OpSchema) -> OpStrategy:
     """
     Rule for aten.scalar_tensor which creates a scalar (0-dimensional) tensor.
@@ -387,7 +371,7 @@ def scalar_tensor_rule(mesh, op_schema: OpSchema) -> OpStrategy:
     return OpStrategy([strategy])
 
 
-@register_opschema_rule(_SHAPE_FACTORY_OPS)
+@register_rule(_SHAPE_FACTORY_OPS)
 def factory_rule(mesh, op_schema: OpSchema) -> OpStrategy:
     """
     This is an auto-parallel specific util that won't be upstreamed becuase of a UX mismatch.
@@ -462,7 +446,7 @@ def factory_rule(mesh, op_schema: OpSchema) -> OpStrategy:
 # the following ops require meta_tensor fix
 
 
-@register_opschema_rule(torch.ops.aten.native_layer_norm.default)
+@register_rule(torch.ops.aten.native_layer_norm.default)
 def native_layer_norm_rule(mesh, op_schema):
     from torch.distributed.tensor._ops._math_ops import (
         Sequence,
@@ -540,7 +524,7 @@ def native_layer_norm_rule(mesh, op_schema):
     return OpStrategy(kept)
 
 
-@register_opschema_rule(torch.ops.aten.native_layer_norm_backward.default)
+@register_rule(torch.ops.aten.native_layer_norm_backward.default)
 def native_layer_norm_backward_rule(mesh, op_schema):
     from torch.distributed.tensor._ops._math_ops import (
         Sequence,
@@ -617,7 +601,7 @@ def native_layer_norm_backward_rule(mesh, op_schema):
     return OpStrategy(kept)
 
 
-@register_opschema_rule(
+@register_rule(
     [
         torch.ops.prims.convert_element_type.default,
         torch.ops.autoparallel.dtype_cast.default,
@@ -632,7 +616,7 @@ def convert_element_type_rule(mesh, op_schema):
     return out_strat
 
 
-@register_opschema_rule(torch.ops.aten.constant_pad_nd.default)
+@register_rule(torch.ops.aten.constant_pad_nd.default)
 def constant_pad_nd_rule(mesh, op_schema):
     from torch.distributed.tensor._ops._tensor_ops import (
         propagate_single_input_strategy,
@@ -666,7 +650,7 @@ def constant_pad_nd_rule(mesh, op_schema):
     return OpStrategy(filtered_strats)
 
 
-@register_opschema_rule(torch.ops.aten.split.Tensor)
+@register_rule(torch.ops.aten.split.Tensor)
 def split_rule(mesh, op_schema):
     strat = op_schema.args_schema
     op = torch.ops.aten.split.Tensor
@@ -687,7 +671,7 @@ def split_rule(mesh, op_schema):
     return out_strat
 
 
-@register_opschema_rule(torch.ops.aten._unsafe_index.Tensor)
+@register_rule(torch.ops.aten._unsafe_index.Tensor)
 def _unsafe_index_rule(mesh, op_schema):
     raise NotImplementedError()
 
@@ -707,35 +691,31 @@ def sdpa_rule(op, mesh, op_schema):
     return out_strat
 
 
-@register_opschema_rule(torch.ops.aten._scaled_dot_product_efficient_attention.default)
+@register_rule(torch.ops.aten._scaled_dot_product_efficient_attention.default)
 def _(mesh, op_schema):
     op = torch.ops.aten._scaled_dot_product_efficient_attention.default
     return sdpa_rule(op, mesh, op_schema)
 
 
-@register_opschema_rule(torch.ops.aten._scaled_dot_product_flash_attention.default)
+@register_rule(torch.ops.aten._scaled_dot_product_flash_attention.default)
 def _(mesh, op_schema):
     op = torch.ops.aten._scaled_dot_product_flash_attention.default
     return sdpa_rule(op, mesh, op_schema)
 
 
-@register_opschema_rule(
-    torch.ops.aten._scaled_dot_product_flash_attention_backward.default
-)
+@register_rule(torch.ops.aten._scaled_dot_product_flash_attention_backward.default)
 def _(mesh, op_schema):
     op = torch.ops.aten._scaled_dot_product_flash_attention_backward.default
     return sdpa_rule(op, mesh, op_schema)
 
 
-@register_opschema_rule(
-    torch.ops.aten._scaled_dot_product_efficient_attention_backward.default
-)
+@register_rule(torch.ops.aten._scaled_dot_product_efficient_attention_backward.default)
 def _(mesh, op_schema):
     op = torch.ops.aten._scaled_dot_product_efficient_attention_backward.default
     return sdpa_rule(op, mesh, op_schema)
 
 
-@register_opschema_rule(torch.ops.aten.reshape.default)
+@register_rule(torch.ops.aten.reshape.default)
 def reshape_rule(mesh, op_schema):
     op = torch.ops.aten.reshape.default
     out_strat = get_op_strategy(op, op_schema)
@@ -750,7 +730,7 @@ def reshape_rule(mesh, op_schema):
     return out_strat
 
 
-@register_opschema_rule(torch.ops.aten.expand.default)
+@register_rule(torch.ops.aten.expand.default)
 def expand_rule(mesh, op_schema_):
     op = torch.ops.aten.expand.default
     from torch._subclasses.fake_tensor import unset_fake_temporarily
@@ -786,7 +766,7 @@ def expand_rule(mesh, op_schema_):
     return out_strat
 
 
-@register_opschema_rule(torch.ops.aten.einsum.default)
+@register_rule(torch.ops.aten.einsum.default)
 def einsum_rule(mesh, op_schema):
     from torch.distributed.tensor._op_schema import TupleStrategy
     from torch.distributed.tensor._ops._matrix_ops import _mm_like_strategy
@@ -808,7 +788,7 @@ def einsum_rule(mesh, op_schema):
     return _mm_like_strategy(mm_equation, mesh, new_op_schema)
 
 
-@register_opschema_rule(torch.ops.aten.scatter.src)
+@register_rule(torch.ops.aten.scatter.src)
 def scatter_strategy(mesh, op_schema: OpSchema):
     # taken from scatter_add strategy from PyTorch
     from torch.distributed.tensor._ops._tensor_ops import (
@@ -847,7 +827,7 @@ def scatter_strategy(mesh, op_schema: OpSchema):
     )
 
 
-@register_opschema_rule(torch.ops.aten.stack.default)
+@register_rule(torch.ops.aten.stack.default)
 def stack_strategy(mesh, op_schema: OpSchema):
     from torch.distributed.tensor._ops._tensor_ops import (
         PlacementList,
@@ -897,7 +877,7 @@ def stack_strategy(mesh, op_schema: OpSchema):
 # Convolution ops
 
 
-@register_opschema_rule(torch.ops.aten.convolution.default)
+@register_rule(torch.ops.aten.convolution.default)
 def convolution_strategy(mesh, op_schema: OpSchema):
     from torch.distributed.tensor._ops.utils import expand_to_full_mesh_op_strategy
 
@@ -921,7 +901,7 @@ def convolution_strategy(mesh, op_schema: OpSchema):
     )
 
 
-@register_opschema_rule(torch.ops.aten.convolution_backward.default)
+@register_rule(torch.ops.aten.convolution_backward.default)
 def convolution_backward_strategy(mesh, op_schema: OpSchema):
     from torch.distributed.tensor._ops.utils import expand_to_full_mesh_op_strategy
 
@@ -955,7 +935,7 @@ def convolution_backward_strategy(mesh, op_schema: OpSchema):
 # Random ops
 
 
-@register_opschema_rule(torch.ops.aten.uniform.default)
+@register_rule(torch.ops.aten.uniform.default)
 def uniform_strategy(mesh, op_schema: OpSchema):
     from torch.distributed.tensor._ops.utils import expand_to_full_mesh_op_strategy
 
@@ -979,7 +959,7 @@ def uniform_strategy(mesh, op_schema: OpSchema):
 # Scatter ops
 
 
-@register_opschema_rule(torch.ops.aten.diagonal_scatter.default)
+@register_rule(torch.ops.aten.diagonal_scatter.default)
 def diagonal_scatter_strategy(mesh, op_schema: OpSchema):
     from torch.distributed.tensor._ops.utils import (
         expand_to_full_mesh_op_strategy,
@@ -1012,7 +992,7 @@ def diagonal_scatter_strategy(mesh, op_schema: OpSchema):
     )
 
 
-@register_opschema_rule(torch.ops.aten.select_scatter.default)
+@register_rule(torch.ops.aten.select_scatter.default)
 def select_scatter_strategy(mesh, op_schema: OpSchema):
     from torch.distributed.tensor._ops.utils import (
         expand_to_full_mesh_op_strategy,
@@ -1045,7 +1025,7 @@ def select_scatter_strategy(mesh, op_schema: OpSchema):
 # Indexing ops
 
 
-@register_opschema_rule(torch.ops.aten.index.Tensor)
+@register_rule(torch.ops.aten.index.Tensor)
 def index_strategy(mesh, op_schema: OpSchema):
     from torch.distributed.tensor._op_schema import TupleStrategy
     from torch.distributed.tensor._ops.utils import expand_to_full_mesh_op_strategy
