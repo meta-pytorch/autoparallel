@@ -106,12 +106,35 @@ def _init_weights_context(parallel_model):
             return
         original_setattr(self, name, value)
 
+    # Guard against `dtensor.data = value` which silently fails (the C++ storage
+    # swap bypasses __torch_dispatch__ entirely, so the assignment is lost).
+    # We shadow the inherited C++ `.data` descriptor with a Python property on
+    # DTensor that raises a clear error on `__set__`.
+    _original_data_descriptor = DTensor.__dict__.get("data", None)
+
+    @property  # type: ignore[misc]
+    def _guarded_data(self: DTensor) -> torch.Tensor:
+        return torch.Tensor.data.__get__(self)  # type: ignore[attr-defined]
+
+    @_guarded_data.setter
+    def _guarded_data(self: DTensor, value: torch.Tensor) -> None:
+        raise RuntimeError(
+            "Cannot use `.data = ...` on a DTensor during init_weights — "
+            "the assignment is silently lost because it bypasses DTensor dispatch. "
+            "Use `self.<name> = value` or `self.<name>.data[:] = value` instead."
+        )
+
     torch.nn.Module.__setattr__ = _patched_setattr  # type: ignore[assignment]
+    DTensor.data = _guarded_data  # type: ignore[assignment]
     try:
         with _InitWeightsDispatchMode():
             yield
     finally:
         torch.nn.Module.__setattr__ = original_setattr  # type: ignore[assignment]
+        if _original_data_descriptor is not None:
+            DTensor.data = _original_data_descriptor  # type: ignore[assignment]
+        else:
+            del DTensor.data  # restore inheritance from torch.Tensor
 
 
 def wrap_init_weights(parallel_model):
