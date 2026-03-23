@@ -825,15 +825,12 @@ class ShardingOptimizer:
         """
         param_nodes: list[torch.fx.Node] = get_param_nodes(self.graph)
         elms: list[pulp.LpAffineExpression] = []
-        num_params_to_consider: int = 0
-        world_size: int = math.prod(self.mesh.shape)
+        budget_low: float = 0.0
+        budget_high: float = 0.0
         for node in param_nodes:
             node_idx = self.node_map[node]
-            can_be_fully_sharded: bool = node.meta["val"].numel() >= world_size
-            num_params_to_consider += int(can_be_fully_sharded)
-            if not can_be_fully_sharded:
-                continue
             num_out_strat = len(self.strats[node].strategies)
+            ratios: list[float] = []
             for out_idx in range(num_out_strat):
                 dv = self._resolve_decision_var((node_idx, 0, out_idx, 0))
                 spec: DTensorSpec = dv.input_spec
@@ -842,12 +839,15 @@ class ShardingOptimizer:
                 new_tensor_shape, _ = _get_sharded_shape_stride(spec)
                 new_size: int = math.prod(new_tensor_shape)
                 old_size: int = math.prod(tensor_shape)
-                elms.append(dv.var * new_size / old_size)
+                ratio = new_size / old_size
+                ratios.append(ratio)
+                elms.append(dv.var * ratio)
+            best_ratio: float = min(ratios)
+            budget_low += max(best_ratio, memory_factor_low)
+            budget_high += max(best_ratio, memory_factor_high)
 
-        memory_factor_low *= num_params_to_consider
-        memory_factor_high *= num_params_to_consider
-        self.prob += (pulp.lpSum(elms) <= memory_factor_high, "memory_constraint_high")
-        self.prob += (pulp.lpSum(elms) >= memory_factor_low, "memory_constraint_low")
+        self.prob += (pulp.lpSum(elms) <= budget_high, "memory_constraint_high")
+        self.prob += (pulp.lpSum(elms) >= budget_low, "memory_constraint_low")
 
     def add_node_constraint(self, node, placement=None, constraint_name=None):
         """USER (Category 5d): Force a specific placement for a node."""
