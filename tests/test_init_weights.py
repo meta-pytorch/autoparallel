@@ -3,6 +3,7 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+import pytest
 import torch
 from torch import nn
 from torch.distributed.tensor import DTensor
@@ -671,3 +672,47 @@ def test_init_optional_submodule(device_mesh_1d):
         parallel_mod.get_parameter("linear.weight").full_tensor(),
         torch.ones(dim, dim, device="cuda"),
     )
+
+
+def test_init_data_assign_raises(device_mesh_1d):
+    """Test that `buf.data = value` raises an error during init_weights.
+
+    `tensor.data = value` is a C++ storage swap that bypasses __torch_dispatch__,
+    so DTensor silently loses the assignment. The init_weights context must detect
+    this and raise a clear error directing users to use `self.<name> = value` or
+    `self.<name>.data[:] = value` instead.
+    """
+    dim = 128
+
+    class Model(nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            self.linear = nn.Linear(dim, dim)
+            self.register_buffer("buf", torch.empty(dim))
+
+        def forward(self, x):
+            return self.linear(x) + self.buf
+
+        def init_weights(self):
+            self.buf.data = torch.arange(dim, dtype=torch.float32)
+
+    with torch.device("meta"):
+        model = Model(dim)
+
+    batch_size = 512
+    local_batch_size = batch_size // device_mesh_1d.size()
+    x = DTensor.from_local(
+        torch.rand(local_batch_size, dim, device="cuda"),
+        device_mesh_1d,
+        [Shard(0)],
+    )
+    parallel_mod = auto_parallel(
+        model,
+        device_mesh_1d,
+        sample_inputs=(x,),
+        out_shardings=(Shard(0),),
+        compile=False,
+    )
+    parallel_mod.to_empty(device="cuda")
+    with pytest.raises(RuntimeError, match=r"Cannot use `.data = ...` on a DTensor"):
+        parallel_mod.init_weights()
