@@ -4,6 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import functools
+import logging
 
 # mypy: ignore-errors
 from collections import defaultdict
@@ -23,6 +24,8 @@ from .bucket_utils import (
     get_snode_tensor_info,
 )
 from .estimation import benchmark_and_sync_runtime
+
+logger = logging.getLogger(__name__)
 
 
 def get_dynamic_memory_threshold(
@@ -215,26 +218,27 @@ def get_simplefsdp_auto_plan(
                     ] = defaultdict(list)
 
                 if verbose:
-                    print(
-                        "break_overlap_criteria",
+                    logger.debug(
+                        "break_overlap_criteria %s",
                         break_overlap_criteria,
                     )
-                    print("Current comm time", comm_time, "comp time", comp_time)
-                    print(
-                        "break_memory_criteria",
+                    logger.debug(
+                        "Current comm time %s comp time %s", comm_time, comp_time
+                    )
+                    logger.debug(
+                        "break_memory_criteria %s",
                         break_memory_criteria,
                     )
-                    print(
-                        "memory_threshold",
+                    logger.debug(
+                        "memory_threshold %s total memory %s",
                         memory_threshold,
-                        "total memory",
                         heuristic_info["next_step_memory"] + bucketed_comm_memory,
                     )
-                    print(
-                        "break_comm_size_criteria",
+                    logger.debug(
+                        "break_comm_size_criteria %s",
                         break_comm_size_criteria,
                     )
-                    print("current_ag_bucket", all_gather_plan[-1])
+                    logger.debug("current_ag_bucket %s", all_gather_plan[-1])
 
                 # bucket reduce scatters if there are any
                 if len(current_rs_bucket) > 0:

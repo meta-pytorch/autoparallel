@@ -4,6 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 
 # mypy: ignore-errors
+import logging
 import os
 import pickle
 from collections import defaultdict
@@ -27,6 +28,8 @@ from .estimation_utils import (
     benchmark_and_cache_comm_dicts,
     estimate_comp_time,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def sync_dict_across_ranks(runtime_dict, world_size, group=None):
@@ -164,8 +167,8 @@ def benchmark_and_sync_runtime(
                     memories_at_nodes[idx + 1], peak_memory_per_step_dict[fsdp_ag_idx]
                 )
             else:
-                print(
-                    "[Relaxed Setting] untracked communication",
+                logger.debug(
+                    "[Relaxed Setting] untracked communication %s",
                     snode.node.python_kernel_name,
                 )
 

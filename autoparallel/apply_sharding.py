@@ -367,7 +367,7 @@ def apply_sharding_to_model(gm, sharding_placement, params_spec, buffers_spec):
     )
     t4 = time.perf_counter()
 
-    logger.info(
+    logger.debug(
         "apply_sharding_to_model breakdown: "
         "shard_inputs=%.3fs, lower_graph=%.3fs, "
         "rename=%.3fs, shard_params=%.3fs",

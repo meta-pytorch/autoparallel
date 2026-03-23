@@ -32,7 +32,7 @@ from transformers import AutoConfig, AutoModelForCausalLM
 
 from autoparallel.api import AutoParallel
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG)
 
 
 def parse_args():

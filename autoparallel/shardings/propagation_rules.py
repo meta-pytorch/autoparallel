@@ -20,6 +20,7 @@ Based on PyTorch DTensor implementation:
 import collections
 import copy
 import itertools
+import logging
 import math
 import operator
 
@@ -47,6 +48,8 @@ from torch.distributed.tensor.placement_types import (
 # need to import this to have the dtype_cast registered
 from ..cast_parametrization import dtype_cast  # noqa
 from .dtensor_sharding_helpers import get_op_strategy
+
+logger = logging.getLogger(__name__)
 
 # TODO: move this to PyTorch
 dim_maps[torch.t] = lambda input: dim_transpose(input.ndim, -2, -1)
@@ -725,7 +728,7 @@ def reshape_rule(mesh, op_schema):
         if len(out_strat.strategies) > 2 and str(out_strat.strategies[2]) == str(
             out_strat.strategies[0]
         ):
-            print("removing")
+            logger.debug("removing")
             out_strat.strategies.pop(2)
     return out_strat
 
