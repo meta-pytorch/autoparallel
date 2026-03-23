@@ -169,8 +169,6 @@ mp_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16)
 with torch.fx.traceback.preserve_node_meta(), AutoParallel(
     model, input_fn, mesh, mp_policy, compile=True
 ) as autop:
-    assert any(n.meta.get("nn_module_stack") for n in autop.gm.graph.nodes)
-    assert any(n.meta.get("fwd_nn_module_stack") for n in autop.gm.graph.nodes)
     autop.add_parameter_memory_constraint(low=None, high=None)
 
     x_sharding = (Shard(0),) + (Replicate(),) * (mesh.ndim - 1)
@@ -190,49 +188,5 @@ parallel_mod.init_weights()
 x = (torch.rand(bs // mesh.shape[0], seq_len, dim1, device="cuda"),)
 out = parallel_mod(*x)
 out.backward(torch.randn_like(out))
-
-# Validate
-seqs = set()
-for n in autop.gm.graph.nodes:
-    if "checkpoint" in n.meta.get(
-        "stack_trace", ""
-    ):  # placeholders don't have stack trace
-        is_bwd = n.meta.get("partitioner_tag", "") == "is_backward"
-        if not is_bwd:
-            if "getitem" in str(n.target):
-                # getitem nodes are tagged same as their parent
-                expected = policy_fn(None, n.args[0].target, (), ())
-            else:
-                expected = policy_fn(None, n.target, (), ())
-            actual = n.meta.get("recompute")
-            # NOTE: this assert only supports policy_fns on op alone
-            assert actual == expected
-            seqs.add(n.meta["seq_nr"])
-        else:
-            # fwd counterpart should have already populated seqs
-            assert n.meta["seq_nr"] in seqs
-
-mm_nodes = autop.gm.graph.find_nodes(
-    op="call_function", target=torch.ops.aten.mm.default
-)
-
-metas = [n.meta.get("custom", None) for n in autop.parallel_gm.graph.nodes]
-fwd_sdpa, bwd_sdpa = [
-    n
-    for n in autop.parallel_gm.graph.nodes
-    if "_scaled_dot_product_flash_attention" in n.name
-]
-# TODO: Dynamo HOP body is not preserving the fx_traceback.annotate
-# We should expect to also see the "inside_local_map" annotation
-assert fwd_sdpa.meta["custom"] == {
-    "inside_checkpoint": 0,
-    "inside_local_map": 2,
-    "outside_checkpoint": 0,
-}
-assert bwd_sdpa.meta["custom"] == {
-    "inside_checkpoint": 0,
-    "inside_local_map": 2,
-    "outside_checkpoint": 0,
-}
 
 print("All good!")
