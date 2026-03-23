@@ -3,6 +3,7 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+import logging
 from typing import Any, Optional
 
 import torch
@@ -12,6 +13,8 @@ from autoparallel.graph_passes.graph_partition import partition_joint_with_descr
 
 from .api import AutoParallel
 from .module_construction import make_parallel_module
+
+logger = logging.getLogger(__name__)
 
 
 def make_pp_module(
@@ -53,7 +56,7 @@ class AutoParallelPP(AutoParallel):
         num_input_grads = (
             len(bw_module.graph.find_nodes(op="output")[0].args[0]) - num_params_buffers
         )
-        print(
+        logger.info(
             f"num_params_buffers: {num_params_buffers}\n"
             f"num_user_outputs: {num_user_outputs}\n"
             f"num_mutate_inputs: {num_mutate_inputs}\n"

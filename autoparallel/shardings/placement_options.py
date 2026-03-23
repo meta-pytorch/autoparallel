@@ -164,7 +164,7 @@ def keep_unique_configs(op_strat: OpStrategy) -> OpStrategy:
 
             added.add(key)
         except TypeError:
-            print("Failed to hash, skipping dedup")
+            logger.debug("Failed to hash, skipping dedup")
         filtered_strats.append(strat)
     return OpStrategy(filtered_strats)
 
@@ -244,7 +244,7 @@ class PlacementOptionsTimer:
             + self.fill_redist_cost
             + self.filter_dedup
         )
-        logger.info(
+        logger.debug(
             "placement_options breakdown (%d calls, %.3fs total): "
             "strategy_gen=%.3fs, propagate_meta=%.3fs, "
             "fill_redist_cost=%.3fs, filter_dedup=%.3fs, "
@@ -260,7 +260,7 @@ class PlacementOptionsTimer:
         )
         top_ops = sorted(self.per_op.items(), key=lambda kv: -kv[1][0])[:10]
         for op_name, (op_time, op_count) in top_ops:
-            logger.info("  %-60s %.3fs (%d calls)", op_name, op_time, op_count)
+            logger.debug("  %-60s %.3fs (%d calls)", op_name, op_time, op_count)
 
 
 _placement_options_timer = PlacementOptionsTimer()
@@ -557,9 +557,9 @@ def print_rank_by_rank(msg: Any):
     torch.distributed.barrier()
     for i in range(world_size):
         if rank == i:
-            print(f"{rank=} start")
-            print(msg)
-            print(f"{rank=} done")
+            logger.debug(f"{rank=} start")
+            logger.debug(msg)
+            logger.debug(f"{rank=} done")
         torch.distributed.barrier()
 
 
@@ -610,7 +610,7 @@ class NumericsLogger:
             with open(path, "a") as f:
                 f.write("\n".join(logs) + "\n")
 
-            print(f"Weight hashes written to {path}")
+            logger.info(f"Weight hashes written to {path}")
 
     def log_fw_intermediates(self, logs):
         rank = torch.distributed.get_rank()
@@ -659,7 +659,7 @@ class NumericsLogger:
             torch.distributed.barrier()
 
         if self.rank == 0:
-            print(f"Weight hashes written to {path}")
+            logger.info(f"Weight hashes written to {path}")
 
     def log_pp_grads(self, orig_mod, stage_mods, num_world_stages, should_log):
         path = self.dir / "diff.log"

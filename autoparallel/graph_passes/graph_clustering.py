@@ -118,7 +118,7 @@ def get_identical_regions(
     # needed to detect if replacing a region will create cycles
     t = time.time()
     node_to_recursive_ancestors = _populate_recursive_ancestor_map(graph)
-    logger.info(f"Populated recursive ancestors in {time.time() - t} s")
+    logger.debug(f"Populated recursive ancestors in {time.time() - t} s")
 
     input_pickler = InputPickler()
     hash_to_duplicates: dict[str, IdenticalNodes] = defaultdict(list)
@@ -131,7 +131,7 @@ def get_identical_regions(
         duplicates = hash_to_duplicates[_hash_node(node, strategies, input_pickler)]
         duplicates.append(node)
         node_to_duplicates[node] = duplicates
-    logger.info(f"Hashed nodes in {time.time() - t} s")
+    logger.debug(f"Hashed nodes in {time.time() - t} s")
 
     def _is_identical(n0: Node, n1: Node) -> bool:
         return (
@@ -193,7 +193,7 @@ def get_identical_regions(
     for region_group in region_groups:
         region_group.sort(key=lambda rg: topological_ranking[rg[0]])
     region_groups.sort(key=lambda rg: topological_ranking[rg[0][0]])
-    logger.info(f"Expanded regions in {time.time() - t} s")
+    logger.debug(f"Expanded regions in {time.time() - t} s")
 
     # sanity check that we don't have duplicate nodes
     seen_nodes.clear()

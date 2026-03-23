@@ -144,7 +144,7 @@ class ShardingOptimizer:
         self._name_counters: dict[str, int] = {}
         t0 = time.perf_counter()
         self.strats = self.build_sharding_metadata()
-        logger.info("Placement options took %.3fs", time.perf_counter() - t0)
+        logger.debug("Placement options took %.3fs", time.perf_counter() - t0)
         from autoparallel.shardings.placement_options import get_placement_options_timer
 
         get_placement_options_timer().report()
@@ -153,7 +153,7 @@ class ShardingOptimizer:
         if repeated_subgraphs:
             t = time.time()
             clusters = get_identical_regions(self.gm.graph, self.strats)
-            print(f"Found {len(clusters)} clusters in {time.time() - t:.2f}s")
+            logger.debug(f"Found {len(clusters)} clusters in {time.time() - t:.2f}s")
             self.create_cluster_links(clusters)
 
         t0 = time.perf_counter()
@@ -166,7 +166,7 @@ class ShardingOptimizer:
         t3 = time.perf_counter()
         n_unique_vars = len(set(id(v) for v in self.pulp_variables.values()))
         n_constraints = len(self.prob.constraints)
-        logger.info(
+        logger.debug(
             "ILP construction took %.3fs "
             "(decision_vars=%.3fs, validate=%.3fs, constraints=%.3fs)",
             t3 - t0,
@@ -174,7 +174,7 @@ class ShardingOptimizer:
             t2 - t1,
             t3 - t2,
         )
-        logger.info(
+        logger.debug(
             "ILP problem size: %d unique vars, %d decision vars, %d constraints",
             n_unique_vars,
             len(self.decision_vars),
@@ -420,7 +420,7 @@ class ShardingOptimizer:
         for linked_key, root_key in self.cluster_links.items():
             self._root_to_linked[root_key].append(linked_key)
 
-        logger.info(
+        logger.debug(
             "_build_decision_vars breakdown (%d vars, %d cluster-copied): "
             "pulp_vars=%.3fs, compute_cost=%.3fs, edge_cost=%.3fs",
             n_vars,
@@ -653,7 +653,7 @@ class ShardingOptimizer:
             self.selected_keys.extend(self._root_to_linked.get(root_key, []))
 
         if self.prob.status == -1:
-            print(self.get_violated_constraints_log())
+            logger.warning(self.get_violated_constraints_log())
             raise RuntimeError("Unsolvable problem")
 
     def _extract_and_validate_solution(self):
@@ -690,7 +690,7 @@ class ShardingOptimizer:
         self._set_objective()
         self._solve(verbose)
         obj_value = pulp.value(self.prob.objective)
-        logger.info(
+        logger.debug(
             "ILP solve took %.3fs (objective=%.4f)", time.perf_counter() - t0, obj_value
         )
         return self._extract_and_validate_solution()

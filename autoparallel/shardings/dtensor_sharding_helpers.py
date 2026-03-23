@@ -230,7 +230,7 @@ def _try_decomp_sharding(
     decomp_strategy.ensure_schema_info(op)
     result = decomp_strategy.propagate_strategy(op_schema)
     if result is not None:
-        logger.info(f"derived sharding strategy for `{op}` via decomposition")
+        logger.debug(f"derived sharding strategy for `{op}` via decomposition")
     return result
 
 

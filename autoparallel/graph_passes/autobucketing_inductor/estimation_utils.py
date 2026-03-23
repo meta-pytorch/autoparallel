@@ -4,6 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 
 # mypy: ignore-errors
+import logging
 import time
 from collections.abc import Sequence
 from typing import Any, Callable, Union, cast
@@ -22,6 +23,8 @@ from torch._inductor.scheduler import (
 from torch.utils._mode_utils import no_dispatch
 
 from .bucket_utils import get_data_size
+
+logger = logging.getLogger(__name__)
 
 kernel_name_to_comm_op: dict[str, Callable[..., Any]] = {
     "torch.ops._c10d_functional.all_gather_into_tensor.default": c10d.all_gather_into_tensor,
@@ -268,7 +271,7 @@ def estimate_comp_time(
     elif isinstance(snode, ExternKernelSchedulerNode):
         time = benchmark_extern_node(snode.node, comp_cache)
         if verbose and time != 0:
-            print("[COMP Node] EXTERN", "time", time)
+            logger.debug("[COMP Node] EXTERN time %s", time)
         return time
     elif isinstance(snode, BaseSchedulerNode):
         node_list = [snode]
@@ -289,7 +292,7 @@ def estimate_comp_time(
     if comp_cache is not None:
         comp_cache.add_triton_runtime(src_code, time)
     if verbose and time != 0:
-        print("[COMP Node] BASE/FUSE", "time", time)
+        logger.debug("[COMP Node] BASE/FUSE time %s", time)
     return time
 
 
@@ -448,7 +451,9 @@ def _benchmark_and_cache_comm(
             process_group,
             estimate=False,
         )
-        print(comm_func_name, "inp", inp.size(), "out", out.size(), "time", time)
+        logger.debug(
+            "%s inp %s out %s time %s", comm_func_name, inp.size(), out.size(), time
+        )
         inp.cpu()
         out.cpu()
         del inp, out

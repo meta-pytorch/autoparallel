@@ -22,7 +22,7 @@ from autoparallel.graph_passes.auto_bucketing import (
 from autoparallel.graph_passes.debug_helpers import make_custom_runtime_estimation
 from autoparallel.graph_passes.estimate_graph_metrics import estimate_graph_metrics
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG)
 
 world_size = 64
 

@@ -3,6 +3,7 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+import logging
 import operator
 from collections import namedtuple
 from typing import Optional, Union
@@ -19,6 +20,8 @@ from torch.distributed.tensor.placement_types import (  # noqa
     Shard,
 )
 from torch.utils._pytree import tree_flatten
+
+logger = logging.getLogger(__name__)
 
 # Supported placement patterns for the ordered sharding optimization
 _PARAM_PLACEMENT = (Shard(0), Shard(0))
@@ -49,10 +52,10 @@ def _optimize_same_nd_sharding_as_1d(
     # TODO: make this more general, I'm playing safe for now
     allowed_placements = [(Shard(0), Replicate()), (Partial(), Shard(0))]
     if (curr_spec_first, tgt_spec_first) not in allowed_placements:
-        print(f"NOT doing optimization for {str(curr_spec)} -> {str(tgt_spec)}")
+        logger.debug(f"NOT doing optimization for {str(curr_spec)} -> {str(tgt_spec)}")
         return redistribute_local_tensor(arg, curr_spec, tgt_spec)
 
-    print(f"Doing optimization for {str(curr_spec)} -> {str(tgt_spec)}")
+    logger.debug(f"Doing optimization for {str(curr_spec)} -> {str(tgt_spec)}")
     mesh = curr_spec.device_mesh
     # TODO: remove ndim == 1 special case once
     # DeviceMesh._flatten is fixed
