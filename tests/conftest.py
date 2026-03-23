@@ -26,3 +26,14 @@ def device_mesh_1d():
         "cuda", (world_size,), mesh_dim_names=("dp",)
     )
     return mesh
+
+
+@pytest.fixture(scope="module")
+def device_mesh_3d():
+    world_size = torch.distributed.get_world_size()
+    mesh = torch.distributed.device_mesh.init_device_mesh(
+        "cuda",
+        (world_size // 32, 8, 4),
+        mesh_dim_names=("dp", "tp", "cp"),
+    )
+    return mesh
