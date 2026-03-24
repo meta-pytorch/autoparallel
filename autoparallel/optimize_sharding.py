@@ -599,7 +599,7 @@ class ShardingOptimizer:
                 terms.append(num_args * dv.compute_cost * dv.var)
         return pulp.lpSum(terms)
 
-    def _run_budget_chain(self, nodes, should_create_savings, prefix):
+    def _run_budget_chain(self, nodes, should_create_savings, prefix, compute_fn=None):
         """Run a cumulative budget chain over nodes, creating savings variables.
 
         The budget is a continuous LP variable that grows with compute and
@@ -616,13 +616,18 @@ class ShardingOptimizer:
             should_create_savings: Function(node) -> list of arg indices that
                 need savings variables, or empty list if none.
             prefix: Name prefix for LP variables ("fwd" or "bwd").
+            compute_fn: Optional function(node) -> LP expression for the
+                compute contribution. Defaults to _compute_cost_expr_for_node.
         """
+        if compute_fn is None:
+            compute_fn = self._compute_cost_expr_for_node
+
         budget_prev = None
         for node in nodes:
             if node.op == "output":
                 continue
 
-            compute_expr = self._compute_cost_expr_for_node(node)
+            compute_expr = compute_fn(node)
             savings_args = should_create_savings(node)
 
             node_savings = []
@@ -666,16 +671,42 @@ class ShardingOptimizer:
         non-negativity of the budget variable naturally prevents savings
         from exceeding available compute, and leftover compute carries
         forward across multiple windows.
+
+        Each node's compute is split between forward and backward chains
+        via a continuous LP variable, so the solver decides the optimal
+        allocation and no compute is double-counted.
         """
         param_derived = self._build_param_derived_set()
         terminal_derived = self._build_terminal_derived_set()
+
+        # Split each node's compute between forward and backward chains.
+        # fwd_share is the portion allocated to the forward chain; the
+        # remainder goes to the backward chain.
+        fwd_share: dict[torch.fx.Node, pulp.LpVariable] = {}
+        for node in self.graph.nodes:
+            if node.op == "output" or node not in self.strats:
+                continue
+            compute_expr = self._compute_cost_expr_for_node(node)
+            share = pulp.LpVariable(
+                self._get_next_name("compute_share"),
+                lowBound=0,
+                cat=pulp.LpContinuous,
+            )
+            self.prob += (
+                share <= compute_expr,
+                self._get_next_name("compute_share_ub"),
+            )
+            fwd_share[node] = share
 
         # --- Forward scan: prefetch overlap for parameter-derived inputs ---
         def fwd_savings(node):
             all_inputs = self._all_input_nodes(node)
             return [argi for argi, inp in enumerate(all_inputs) if inp in param_derived]
 
-        self._run_budget_chain(self.graph.nodes, fwd_savings, "fwd")
+        def fwd_compute(node):
+            return fwd_share.get(node, pulp.lpSum([]))
+
+        self._run_budget_chain(self.graph.nodes, fwd_savings, "fwd", fwd_compute)
 
         # --- Backward scan: post-compute overlap for terminal-derived nodes ---
         def bwd_savings(node):
@@ -683,7 +714,14 @@ class ShardingOptimizer:
                 return []
             return list(range(len(self._all_input_nodes(node))))
 
-        self._run_budget_chain(reversed(list(self.graph.nodes)), bwd_savings, "bwd")
+        def bwd_compute(node):
+            if node in fwd_share:
+                return self._compute_cost_expr_for_node(node) - fwd_share[node]
+            return self._compute_cost_expr_for_node(node)
+
+        self._run_budget_chain(
+            reversed(list(self.graph.nodes)), bwd_savings, "bwd", bwd_compute
+        )
 
     # ---- Solution ----
 
