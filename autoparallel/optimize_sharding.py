@@ -133,7 +133,12 @@ def _assert_has_tensor_meta(spec_or_specs, node, label):
 
 class ShardingOptimizer:
     def __init__(
-        self, gm, mesh, rescale_grad_comm_cost_for_mp=1.0, repeated_subgraphs=False
+        self,
+        gm,
+        mesh,
+        rescale_grad_comm_cost_for_mp=1.0,
+        repeated_subgraphs=False,
+        enable_prefetch_overlap=False,
     ):
         self.gm = gm
         self.graph = gm.graph
@@ -162,7 +167,10 @@ class ShardingOptimizer:
         self.validate()
         t2 = time.perf_counter()
         self.prob = pulp.LpProblem("AutoParallel", pulp.LpMinimize)
+        self.savings_vars: list[pulp.LpVariable] = []
         self.add_default_constraints()
+        if enable_prefetch_overlap:
+            self.add_prefetch_overlap_constraints()
         t3 = time.perf_counter()
         n_unique_vars = len(set(id(v) for v in self.pulp_variables.values()))
         n_constraints = len(self.prob.constraints)
@@ -632,6 +640,196 @@ class ShardingOptimizer:
         self.add_inf_cost_constraint()
         self.add_forward_backward_consistency_constraints()
 
+    # ---- Prefetch overlap ----
+
+    def _build_param_derived_set(self):
+        """Compute the set of nodes whose inputs are ALL parameter-derived.
+
+        A node is parameter-derived if every one of its inputs is either a
+        parameter placeholder or itself parameter-derived. This propagates
+        through dtype_cast, views, aliases, etc.
+        """
+        param_derived = set(get_param_nodes(self.graph))
+        for node in self.graph.nodes:
+            all_inputs = self._all_input_nodes(node)
+            if all_inputs and all(inp in param_derived for inp in all_inputs):
+                param_derived.add(node)
+        return param_derived
+
+    def _build_terminal_derived_set(self):
+        """Compute the set of nodes where all downstream paths lead to output.
+
+        A node is terminal-derived if every user is either the output node or
+        itself terminal-derived. This propagates backward through alias chains,
+        dtype_cast_bwd nodes, etc.
+        """
+        terminal_derived: set[torch.fx.Node] = set()
+        for node in reversed(list(self.graph.nodes)):
+            if node.op == "output":
+                continue
+            if node.users and all(
+                u.op == "output" or u in terminal_derived for u in node.users
+            ):
+                terminal_derived.add(node)
+        return terminal_derived
+
+    def _comm_cost_expr_for_edge(self, node, argi):
+        """Build an LP expression for the selected comm cost on a given edge.
+
+        Returns Σ_{o,j} dv[node, argi, o, j].comm_cost * x[node, argi, o, j].
+        Skips infinite-cost entries (already forced to x=0 by add_inf_cost_constraint).
+        """
+        node_idx = self.node_map[node]
+        terms = []
+        for _, out_idx, inp_idx in self.walk_over_options(node, constrain_arg=argi):
+            key = (node_idx, argi, out_idx, inp_idx)
+            dv = self.decision_vars[key]
+            if dv.comm_cost != 0 and math.isfinite(dv.comm_cost):
+                terms.append(dv.comm_cost * dv.var)
+        return pulp.lpSum(terms)
+
+    def _compute_cost_expr_for_node(self, node):
+        """Build an LP expression for the selected full compute cost of a node.
+
+        Uses arg 0 per_arg_compute * num_args to recover the full compute cost,
+        since all args agree on the output strategy.
+        """
+        node_idx = self.node_map[node]
+        if node.op == "output" or node not in self.strats:
+            return pulp.lpSum([])
+        num_args = len(self.strats[node].strategies[0].input_specs)
+        terms = []
+        for _, out_idx, inp_idx in self.walk_over_options(node, constrain_arg=0):
+            key = (node_idx, 0, out_idx, inp_idx)
+            dv = self.decision_vars[key]
+            if dv.compute_cost != 0:
+                terms.append(num_args * dv.compute_cost * dv.var)
+        return pulp.lpSum(terms)
+
+    def _run_budget_chain(self, nodes, should_create_savings, prefix, compute_fn=None):
+        """Run a cumulative budget chain over nodes, creating savings variables.
+
+        The budget is a continuous LP variable that grows with compute and
+        shrinks with savings as we scan:
+            B_0 = 0
+            B_i = B_{i-1} + compute(i) - savings(i)
+            B_i >= 0
+
+        The non-negativity constraint on B_i implicitly enforces that total
+        savings never exceed total accumulated compute.
+
+        Args:
+            nodes: Ordered sequence of nodes to scan.
+            should_create_savings: Function(node) -> list of arg indices that
+                need savings variables, or empty list if none.
+            prefix: Name prefix for LP variables ("fwd" or "bwd").
+            compute_fn: Optional function(node) -> LP expression for the
+                compute contribution. Defaults to _compute_cost_expr_for_node.
+        """
+        if compute_fn is None:
+            compute_fn = self._compute_cost_expr_for_node
+
+        budget_prev = None
+        for node in nodes:
+            if node.op == "output":
+                continue
+
+            compute_expr = compute_fn(node)
+            savings_args = should_create_savings(node)
+
+            node_savings = []
+            for argi in savings_args:
+                comm_expr = self._comm_cost_expr_for_edge(node, argi)
+                savings = pulp.LpVariable(
+                    self._get_next_name(f"{prefix}_savings"),
+                    lowBound=0,
+                    cat=pulp.LpContinuous,
+                )
+                self.prob += (
+                    savings <= comm_expr,
+                    self._get_next_name(f"{prefix}_savings_le_comm"),
+                )
+                node_savings.append(savings)
+                self.savings_vars.append(savings)
+
+            has_compute = node in self.strats and node.op != "output"
+            if not has_compute and not node_savings:
+                continue
+
+            budget = pulp.LpVariable(
+                self._get_next_name(f"{prefix}_budget"),
+                lowBound=0,
+                cat=pulp.LpContinuous,
+            )
+            rhs = compute_expr - pulp.lpSum(node_savings)
+            if budget_prev is not None:
+                rhs += budget_prev
+            self.prob += (
+                budget == rhs,
+                self._get_next_name(f"{prefix}_budget_eq"),
+            )
+            budget_prev = budget
+
+    def add_prefetch_overlap_constraints(self):
+        """Model communication-computation overlap within the ILP.
+
+        Uses cumulative budget chains: a continuous LP variable that grows
+        with compute and shrinks with savings as we scan the graph. The
+        non-negativity of the budget variable naturally prevents savings
+        from exceeding available compute, and leftover compute carries
+        forward across multiple windows.
+
+        Each node's compute is split between forward and backward chains
+        via a continuous LP variable, so the solver decides the optimal
+        allocation and no compute is double-counted.
+        """
+        param_derived = self._build_param_derived_set()
+        terminal_derived = self._build_terminal_derived_set()
+
+        # Split each node's compute between forward and backward chains.
+        # fwd_share is the portion allocated to the forward chain; the
+        # remainder goes to the backward chain.
+        fwd_share: dict[torch.fx.Node, pulp.LpVariable] = {}
+        for node in self.graph.nodes:
+            if node.op == "output" or node not in self.strats:
+                continue
+            compute_expr = self._compute_cost_expr_for_node(node)
+            share = pulp.LpVariable(
+                self._get_next_name("compute_share"),
+                lowBound=0,
+                cat=pulp.LpContinuous,
+            )
+            self.prob += (
+                share <= compute_expr,
+                self._get_next_name("compute_share_ub"),
+            )
+            fwd_share[node] = share
+
+        # --- Forward scan: prefetch overlap for parameter-derived inputs ---
+        def fwd_savings(node):
+            all_inputs = self._all_input_nodes(node)
+            return [argi for argi, inp in enumerate(all_inputs) if inp in param_derived]
+
+        def fwd_compute(node):
+            return fwd_share.get(node, pulp.lpSum([]))
+
+        self._run_budget_chain(self.graph.nodes, fwd_savings, "fwd", fwd_compute)
+
+        # --- Backward scan: post-compute overlap for terminal-derived nodes ---
+        def bwd_savings(node):
+            if node not in terminal_derived:
+                return []
+            return list(range(len(self._all_input_nodes(node))))
+
+        def bwd_compute(node):
+            if node in fwd_share:
+                return self._compute_cost_expr_for_node(node) - fwd_share[node]
+            return self._compute_cost_expr_for_node(node)
+
+        self._run_budget_chain(
+            reversed(list(self.graph.nodes)), bwd_savings, "bwd", bwd_compute
+        )
+
     # ---- Solution ----
 
     def _set_objective(self):
@@ -640,7 +838,8 @@ class ShardingOptimizer:
         for key, dv in self.decision_vars.items():
             multiplier = 1 + len(self._root_to_linked.get(key, []))
             terms.append(dv.var * dv.cost * multiplier)
-        self.prob += pulp.lpSum(terms)
+        savings_sum = pulp.lpSum(self.savings_vars) if self.savings_vars else 0
+        self.prob += pulp.lpSum(terms) - savings_sum
 
     def _solve(self, verbose=False):
         solver = pulp.PULP_CBC_CMD(msg=verbose)
@@ -697,9 +896,9 @@ class ShardingOptimizer:
 
     # ---- Logging ----
 
-    def get_violated_constraints_log(self):
+    def get_violated_constraints_log(self, eps=1e-4):
         violated_constraints = [
-            (k, c) for k, c in self.prob.constraints.items() if not c.valid()
+            (k, c) for k, c in self.prob.constraints.items() if not c.valid(eps)
         ]
         log_str = f"Violated constraints: {[x[0] for x in violated_constraints]}"
         for cname, c in violated_constraints:
@@ -724,6 +923,7 @@ class ShardingOptimizer:
             colored=colored,
             verbose=verbose,
             violated_constraints_log=self.get_violated_constraints_log(),
+            savings_vars=self.savings_vars,
         )
 
     def print_costs_for_node(self, node, arg=0, **kwargs):

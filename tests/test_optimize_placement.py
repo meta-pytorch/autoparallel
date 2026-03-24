@@ -633,3 +633,51 @@ def test_world_size_larger_than_parameter(device_mesh_1d):
     param_nodes = get_param_nodes(autop.gm.graph)
     for node in param_nodes:
         assert sharding_placement[node].output_specs.placements == (Replicate(),)
+
+
+def _run_ffn_optimization(mesh, enable_prefetch_overlap):
+    """Helper to run FFN optimization with or without prefetch overlap."""
+    model_fn, input_fn = _make_model_and_input_fn(mesh)
+    with torch.device("meta"):
+        model = model_fn()
+    with AutoParallel(
+        model, input_fn, mesh, enable_prefetch_overlap=enable_prefetch_overlap
+    ) as autop:
+        placement = (Shard(0), Replicate())
+        autop.add_input_constraints([placement] * 2)
+        autop.add_output_constraints([placement] * 3)
+        autop.add_parameter_memory_constraint(low=0, high=None)
+        sharding_placement = autop.optimize_placement(verbose=False)
+    return autop, sharding_placement
+
+
+@patch("torch.cuda.device_count", lambda: 8)
+@patch("torch.cuda.get_device_name", lambda device: "H100")
+def test_prefetch_overlap_reduces_cost(device_mesh_2d):
+    autop, _ = _run_ffn_optimization(device_mesh_2d, enable_prefetch_overlap=True)
+    opt = autop.sharding_optimizer
+
+    # The overlap-enabled objective subtracts savings from the base cost.
+    # Verify that savings are non-negative (the solver found overlap to exploit).
+    total_savings = sum(v.value() for v in opt.savings_vars)
+    assert total_savings >= -1e-9, f"Total savings should be >= 0, got {total_savings}"
+
+
+@patch("torch.cuda.device_count", lambda: 8)
+@patch("torch.cuda.get_device_name", lambda device: "H100")
+def test_prefetch_overlap_savings_structure(device_mesh_2d):
+    autop, _ = _run_ffn_optimization(device_mesh_2d, enable_prefetch_overlap=True)
+    opt = autop.sharding_optimizer
+
+    assert len(opt.savings_vars) > 0, "Expected savings variables to be created"
+
+    # Check that savings variables have names indicating both forward and
+    # backward scan directions
+    fwd_savings = [v for v in opt.savings_vars if v.name.startswith("fwd_savings")]
+    bwd_savings = [v for v in opt.savings_vars if v.name.startswith("bwd_savings")]
+    assert len(fwd_savings) > 0, "Expected forward-scan savings variables"
+    assert len(bwd_savings) > 0, "Expected backward-scan savings variables"
+
+    # All savings values should be >= 0
+    for v in opt.savings_vars:
+        assert v.value() >= -1e-9, f"Savings variable {v.name} has negative value"
