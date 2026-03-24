@@ -554,6 +554,48 @@ def test_get_attr_nodes(device_mesh_1d):
 
 @patch("torch.cuda.device_count", lambda: 8)
 @patch("torch.cuda.get_device_name", lambda device: "H100")
+def test_parameter_memory_constraint_indivisible_param(device_mesh_2d):
+    """Parameter whose size is >= world_size but not divisible by it
+    should not make the memory constraint infeasible."""
+    # world_size = 32*8 = 256. A bias of size 280 is >= 256 but 280 % 256 != 0,
+    # so it can't be fully sharded across all devices.
+    dim1 = 1024
+    dim2 = 280
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear1 = nn.Linear(dim1, dim2, bias=True)
+            self.linear2 = nn.Linear(dim2, dim1, bias=True)
+
+        def forward(self, x):
+            return self.linear2(F.relu(self.linear1(x)))
+
+    bs = 8 * device_mesh_2d.shape[0]
+
+    def input_fn():
+        return torch.rand(bs, dim1, device="cuda", requires_grad=True)
+
+    with torch.device("meta"):
+        model = Model()
+
+    with AutoParallel(model, input_fn, device_mesh_2d) as autop:
+        x_sharding = (Shard(0), Replicate())
+        autop.add_input_constraints([x_sharding])
+        autop.add_output_constraints([x_sharding])
+        autop.add_parameter_memory_constraint(low=None, high=None)
+
+        sharding_placement = autop.optimize_placement()
+
+    # Should solve without error. Verify params got some placement.
+    param_nodes = get_param_nodes(autop.gm.graph)
+    assert len(param_nodes) > 0
+    for node in param_nodes:
+        assert node in sharding_placement
+
+
+@patch("torch.cuda.device_count", lambda: 8)
+@patch("torch.cuda.get_device_name", lambda device: "H100")
 def test_world_size_larger_than_parameter(device_mesh_1d):
     # make a parameter which is smaller than the world size
     dim: int = device_mesh_1d.shape[0] // 2

@@ -22,9 +22,11 @@ from autoparallel.cost_models.collective_runtime_estimation import (
     MeshTopoInfo,
     allgather_cost,
     allreduce_cost,
+    get_nccl_topo_config,
     reduce_scatter_cost,
 )
 from autoparallel.cost_models.compute_estimation import estimate_strategy_runtime_cost
+from autoparallel.cost_models.nccl_cost_model import derive_mesh_dim_topo
 
 
 def parse_tensor_annotation(annotation: str) -> torch.Tensor:
@@ -115,6 +117,8 @@ def _is_communication_node(node):
 
 
 def make_custom_runtime_estimation(mesh):
+    nccl_config = get_nccl_topo_config()
+
     def custom_runtime_estimation(node: torch.fx.Node, override_size=None):
         if not node.op == "call_function":
             return 0
@@ -125,27 +129,61 @@ def make_custom_runtime_estimation(mesh):
             target = node.target
             if target == torch.ops._c10d_functional.wait_tensor.default:
                 return 0
-            # TODO: figure out mesh without reading from global scope
-            mesh_topo = MeshTopoInfo.build_from_mesh(mesh)
-            groups_name = tuple(g.group_name for g in mesh.get_all_groups())
+            # Resolve group_name to a mesh and dimension. Collectives may
+            # use per-dimension groups or the flattened mesh group created
+            # by mesh._flatten() in _apply_placement_common.
             group_name = get_group_name(node)
-            mesh_dim = groups_name.index(group_name)
+            groups_name = tuple(g.group_name for g in mesh.get_all_groups())
+            if group_name in groups_name:
+                cost_mesh = mesh
+                mesh_dim = groups_name.index(group_name)
+            elif mesh.ndim > 1:
+                cost_mesh = mesh._flatten()
+                mesh_dim = 0
+            else:
+                return 0
+            mesh_topo = MeshTopoInfo.build_from_mesh(cost_mesh)
             t = node.args[0].meta["val"]  # type: ignore[union-attr]
             comm_bytes_gb = t.numel() * t.itemsize / 2**30
             if override_size is not None:
                 comm_bytes_gb = override_size
+
+            if nccl_config is not None:
+                from autoparallel.cost_models.nccl_cost_model import (
+                    nccl_allgather_cost,
+                    nccl_allreduce_cost,
+                    nccl_reduce_scatter_cost,
+                )
+
+                mesh_shape = tuple(cost_mesh.shape)
+                topo = derive_mesh_dim_topo(nccl_config, mesh_shape, mesh_dim)
+
+                if target in {
+                    torch.ops._c10d_functional.all_gather_into_tensor.default,
+                    torch.ops._c10d_functional.all_gather_into_tensor_out.default,
+                }:
+                    n_bytes = int(comm_bytes_gb * cost_mesh.shape[mesh_dim] * 1024**3)
+                    return nccl_allgather_cost(n_bytes, topo, nccl_config)
+                elif target == torch.ops._c10d_functional.reduce_scatter_tensor.default:
+                    n_bytes = int(comm_bytes_gb * 1024**3)
+                    return nccl_reduce_scatter_cost(n_bytes, topo, nccl_config)
+                elif target == torch.ops._c10d_functional.all_reduce.default:
+                    n_bytes = int(comm_bytes_gb * 1024**3)
+                    return nccl_allreduce_cost(n_bytes, topo, nccl_config)
+                else:
+                    return 0
+
             if target in {
                 torch.ops._c10d_functional.all_gather_into_tensor.default,
                 torch.ops._c10d_functional.all_gather_into_tensor_out.default,
             }:
-                comm_bytes_gb *= mesh.shape[mesh_dim]
+                comm_bytes_gb *= cost_mesh.shape[mesh_dim]
                 return allgather_cost(comm_bytes_gb, mesh_topo, mesh_dim)
             elif target == torch.ops._c10d_functional.reduce_scatter_tensor.default:
                 return reduce_scatter_cost(comm_bytes_gb, mesh_topo, mesh_dim)
             elif target == torch.ops._c10d_functional.all_reduce.default:
                 return allreduce_cost(comm_bytes_gb, mesh_topo, mesh_dim)
             else:
-                # TODO: add all_to_all cost
                 return 0
         return estimate_strategy_runtime_cost(node, None)
 
@@ -179,8 +217,37 @@ def _get_tid(node):
     if _is_communication_node(node):
         if node.target == torch.ops._c10d_functional.wait_tensor.default:
             return 0
-        return node.args[-1]
+        return f"group-{node.args[-1]}"
     return 0
+
+
+def _get_category(node):
+    """Get trace category for node."""
+    if _is_communication_node(node):
+        return "nccl"
+    if node.op == "call_function":
+        target_str = str(node.target)
+        if any(x in target_str.lower() for x in ["mm", "bmm", "matmul", "addmm"]):
+            return "gemm"
+        if any(x in target_str.lower() for x in ["flash", "attention", "sdpa"]):
+            return "attention"
+    return "kernel"
+
+
+def _get_collective_type(node):
+    """Get the type of collective operation."""
+    if not _is_communication_node(node):
+        return None
+    target_str = str(node.target)
+    if "all_gather" in target_str:
+        return "AllGather"
+    elif "reduce_scatter" in target_str:
+        return "ReduceScatter"
+    elif "all_reduce" in target_str:
+        return "AllReduce"
+    elif "wait_tensor" in target_str:
+        return "Wait"
+    return "Unknown"
 
 
 def get_repr(arg, mode="full"):
@@ -221,51 +288,70 @@ def get_repr(arg, mode="full"):
 def create_execution_trace(
     gm: torch.fx.GraphModule,
     runtime_estimator: Callable[[torch.fx.Node], float],
-    file_path: str = "fake_trace.json",
-):
+    name: str = "fake_trace",
+    file_path: str | None = None,
+) -> dict[str, Any]:
     """
     Create a perfetto trace from a GraphModule representing its execution
     trace. This is useful for inspecting communication-computation overlapping
     for different reordering strategies.
     """
-    trace: dict[str, Any] = {}
+    launch_overhead = 1  # 1us
+    ms_to_us = 1000
+
     trace_events = []
-    curr_time = {0: 0}
-    global_time: dict[torch.fx.Node, int] = {}
+    curr_time: dict[int | str, float] = {0: 0}
+    global_time: dict[torch.fx.Node, float] = {}
+
     for node_idx, node in enumerate(gm.graph.nodes):
-        dur = int(runtime_estimator(node))
+        dur = runtime_estimator(node) * ms_to_us
         tid = _get_tid(node)
         if tid not in curr_time:
             curr_time[tid] = curr_time[0]
-        event = {"ph": "X", "cat": "kernel", "name": str(node), "pid": 0, "tid": tid}
+
+        cat = _get_category(node)
+        coll_type = _get_collective_type(node)
+        node_name = f"nccl:{coll_type}:{node.name}" if coll_type else str(node)
+
+        event = {"ph": "X", "cat": cat, "name": node_name, "pid": 0, "tid": tid}
+
         if _is_communication_node(node):
             if tid == 0 and is_wait_tensor(node) and node.args[0].op != "placeholder":
-                # if it's wait tensor, let's sync with compute stream
-                comm_end_time = global_time.pop(node.args[0])
+                # if it's wait tensor, walk up chained waits to find the collective
+                # Now this may happen for all_to_all in dsv3 (wait(wait(all_to_all)))
+                comm_node = node.args[0]
+                while is_wait_tensor(comm_node):
+                    comm_node = comm_node.args[0]
+                comm_end_time = global_time[comm_node]
                 curr_time[tid] = max(curr_time[tid], comm_end_time)
             else:
                 curr_time[tid] = max(curr_time[0], curr_time[tid])
 
         event["ts"] = curr_time[tid]
         event["dur"] = dur
-        launch_overhead = 1  # 1us
         curr_time[tid] += dur + launch_overhead
         if tid != 0:
             curr_time[0] += launch_overhead
             # keep track of when a given collective will finish
             global_time[node] = curr_time[tid]
 
-        args: dict[str, Any] = {}
-        args["order"] = node_idx
+        event["args"] = {
+            "order": node_idx,
+            "output": get_repr(node, mode="content_only"),
+            "inputs": [get_repr(arg) for arg in node.args],
+        }
 
-        args["output"] = get_repr(node, mode="content_only")
-        node_args = []
-        for arg in node.args:
-            node_args.append(get_repr(arg))
-        args["inputs"] = node_args
-        event["args"] = args
-        trace_events.append(event)
-    trace["traceEvents"] = trace_events
-    trace["traceName"] = "fake_trace.json"
-    with open(file_path, "w") as fp:
-        json.dump(trace, fp)
+        if dur > 0.0:
+            trace_events.append(event)
+
+    trace = {
+        "traceEvents": trace_events,
+        "traceName": f"{name}_trace.json",
+        "displayTimeUnit": "us",
+    }
+
+    if file_path is not None:
+        with open(file_path, "w") as fp:
+            json.dump(trace, fp, indent=2)
+
+    return trace

@@ -2,18 +2,12 @@
 #
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
-from typing import Any, Union
+from contextlib import contextmanager
 
 import torch
 from torch._dynamo.utils import warn_once
 from torch.distributed.tensor import DTensor
 from torch.utils._python_dispatch import TorchDispatchMode
-
-
-def _submod_setattr(model: torch.nn.Module, fqn: str, value: Any):
-    module_path, _, buffer_name = fqn.rpartition(".")
-    submod: torch.nn.Module = model.get_submodule(module_path)
-    setattr(submod, buffer_name, value)
 
 
 def _copy_set_value_to_dtensor(
@@ -46,35 +40,6 @@ def _copy_set_value_to_dtensor(
         parallel_value.copy_(new_parallel_value)
 
 
-def _build_param_property(parallel_model: torch.nn.Module, fqn: str):
-    def getter(self) -> torch.nn.Parameter:
-        param = parallel_model.get_parameter(fqn)
-        return param
-
-    def setter(self, value: Union[torch.Tensor, torch.nn.Parameter]) -> None:
-        parallel_value = parallel_model.get_parameter(fqn)
-        assert isinstance(
-            parallel_value, DTensor
-        ), "Expected parallel_module params to be DTensors"
-        _copy_set_value_to_dtensor(fqn, parallel_value, value)
-
-    return property(getter, setter)
-
-
-def _build_buffer_property(parallel_model: torch.nn.Module, fqn: str):
-    def getter(self) -> torch.Tensor:
-        return parallel_model.get_buffer(fqn)
-
-    def setter(self, value: torch.Tensor) -> None:
-        parallel_value = parallel_model.get_buffer(fqn)
-        assert isinstance(
-            parallel_value, DTensor
-        ), "Expected parallel_module params to be DTensors"
-        _copy_set_value_to_dtensor(fqn, parallel_value, value)
-
-    return property(getter, setter)
-
-
 class _InitWeightsDispatchMode(TorchDispatchMode):
     """Intercepts in-place copy operations on DTensors during init_weights.
 
@@ -101,62 +66,91 @@ class _InitWeightsDispatchMode(TorchDispatchMode):
         return func(*args, **(kwargs or {}))
 
 
-def hook_params_setters(
-    init_weights_model: torch.nn.Module, parallel_model: torch.nn.Module
-) -> None:
+@contextmanager
+def _init_weights_context(parallel_model):
+    """Context manager that intercepts parameter/buffer assignments during init_weights.
+
+    Temporarily overrides ``nn.Module.__setattr__`` so that assignments like
+    ``self.weight = nn.Parameter(torch.ones(...))`` copy the new value into the
+    existing DTensor (preserving its placement) rather than replacing it.
+
+    Also activates ``_InitWeightsDispatchMode`` to handle in-place data
+    operations like ``self.weight.data[:] = value``.
     """
-    Replaces init_weights_model's parameters with hooked properties that let us
-     (a) return a new parameter (from our parallel_mod) instead of the one on the original model,
-         similar to using stateless.reparametrize
-     (b) also, detect if anyone tries to assign a new value to the parameter, e.g.
-         self.layer.weight = nn.Parameter(torch.randn(10, 10))
-         would not be properly captured if relying on parametrization alone
+    # Build map of (module_id, attr_name) -> (fqn, dtensor) for all DTensor
+    # params and buffers. We iterate per-module with recurse=False to capture
+    # aliased params/buffers that named_parameters() would deduplicate.
+    dtensor_map: dict[tuple[int, str], tuple[str, DTensor]] = {}
+    for mod_name, mod in parallel_model.named_modules():
+        for p_name, param in mod.named_parameters(recurse=False):
+            if isinstance(param, DTensor):
+                fqn = f"{mod_name}.{p_name}" if mod_name else p_name
+                dtensor_map[(id(mod), p_name)] = (fqn, param)
+        for b_name, buf in mod.named_buffers(recurse=False):
+            if isinstance(buf, DTensor):
+                fqn = f"{mod_name}.{b_name}" if mod_name else b_name
+                dtensor_map[(id(mod), b_name)] = (fqn, buf)
 
-    Assumes init_weights_model is a deepcopy of the user's original model, with all fake params. This way we can
-    modify the model to enable init_weights to work, without affecting the user's original model.
+    original_setattr = torch.nn.Module.__setattr__
 
-    Adds one 'property' (e.g. getter+setter) obj for each parameter name at the right spot in
-    the module hierarchy.  For self.layer.weight, this would install a 'weight' property on the self.layer
-    submodule.
+    def _patched_setattr(self, name, value):  # type: ignore[no-untyped-def]
+        key = (id(self), name)
+        if key in dtensor_map:
+            if isinstance(value, DTensor):
+                # Already a DTensor (e.g. aliased buffer re-assignment).
+                original_setattr(self, name, value)
+                return
+            set_value = value.data if isinstance(value, torch.nn.Parameter) else value
+            fqn, existing_dtensor = dtensor_map[key]
+            _copy_set_value_to_dtensor(fqn, existing_dtensor, set_value)
+            return
+        original_setattr(self, name, value)
 
-    Also wraps init_weights_model.init_weights (if present) with a TorchDispatchMode
-    to handle in-place data operations like ``self.weight.data[:] = value``.
+    # Guard against `dtensor.data = value` which silently fails (the C++ storage
+    # swap bypasses __torch_dispatch__ entirely, so the assignment is lost).
+    # We shadow the inherited C++ `.data` descriptor with a Python property on
+    # DTensor that raises a clear error on `__set__`.
+    _original_data_descriptor = DTensor.__dict__.get("data", None)
+
+    @property  # type: ignore[misc]
+    def _guarded_data(self: DTensor) -> torch.Tensor:
+        return torch.Tensor.data.__get__(self)  # type: ignore[attr-defined]
+
+    @_guarded_data.setter
+    def _guarded_data(self: DTensor, value: torch.Tensor) -> None:
+        raise RuntimeError(
+            "Cannot use `.data = ...` on a DTensor during init_weights — "
+            "the assignment is silently lost because it bypasses DTensor dispatch. "
+            "Use `self.<name> = value` or `self.<name>.data[:] = value` instead."
+        )
+
+    torch.nn.Module.__setattr__ = _patched_setattr  # type: ignore[assignment]
+    DTensor.data = _guarded_data  # type: ignore[assignment]
+    try:
+        with _InitWeightsDispatchMode():
+            yield
+    finally:
+        torch.nn.Module.__setattr__ = original_setattr  # type: ignore[assignment]
+        if _original_data_descriptor is not None:
+            DTensor.data = _original_data_descriptor  # type: ignore[assignment]
+        else:
+            del DTensor.data  # restore inheritance from torch.Tensor
+
+
+def wrap_init_weights(parallel_model):
+    """Wraps ``parallel_model.init_weights`` with DTensor-aware interception.
+
+    After calling this, ``parallel_model.init_weights()`` will automatically
+    handle parameter/buffer assignments and in-place data operations so that
+    the user's single-GPU init_weights code works on the sharded parallel model.
     """
-    parallel_param_fqns = set(n for n, _ in parallel_model.named_parameters())
-    parallel_buffer_fqns = set(n for n, _ in parallel_model.named_buffers())
+    if not hasattr(parallel_model, "init_weights"):
+        return
 
-    for mod_name, mod in sorted(init_weights_model.named_modules()):
-        params_dict = dict(mod.named_parameters(recurse=False))
-        buffers_dict = dict(mod.named_buffers(recurse=False))
+    original_init_weights = parallel_model.init_weights
 
-        namespace = {}
-        for p_name in params_dict:
-            fqn = f"{mod_name}.{p_name}" if mod_name else p_name
-            # Skip aliased parameters not present on the parallel model.
-            if fqn not in parallel_param_fqns:
-                continue
-            namespace[p_name] = _build_param_property(parallel_model, fqn)
+    def wrapped_init_weights(*args, **kwargs):  # type: ignore[no-untyped-def]
+        with _init_weights_context(parallel_model):
+            return original_init_weights(*args, **kwargs)
 
-        for b_name in buffers_dict:
-            fqn = f"{mod_name}.{b_name}" if mod_name else b_name
-            # Skip aliased buffers not present on the parallel model.
-            if fqn not in parallel_buffer_fqns:
-                continue
-            namespace[b_name] = _build_buffer_property(parallel_model, fqn)
-
-        cls = mod.__class__
-        # nn.Module.__setattr__ gets in the way
-        namespace["__setattr__"] = object.__setattr__
-        mod.__class__ = type(f"HookedInit{cls.__name__}", (cls,), namespace)
-
-    # Wrap init_weights to activate a dispatch mode that intercepts in-place
-    # copy operations (e.g. self.weight.data[:] = value) on DTensor local tensors.
-    if hasattr(init_weights_model, "init_weights"):
-        mode = _InitWeightsDispatchMode()
-        original_init_weights = init_weights_model.init_weights
-
-        def wrapped_init_weights(*args, **kwargs):  # type: ignore[no-untyped-def]
-            with mode:
-                return original_init_weights(*args, **kwargs)
-
-        init_weights_model.init_weights = wrapped_init_weights  # type: ignore[assignment]
+    parallel_model.init_weights = wrapped_init_weights  # type: ignore[assignment]

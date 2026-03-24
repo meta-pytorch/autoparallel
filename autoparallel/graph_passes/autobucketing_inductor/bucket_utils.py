@@ -4,6 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 
 # mypy: ignore-errors
+import logging
 import math
 from functools import reduce
 from typing import Any, Callable, Dict, Union, cast
@@ -18,6 +19,8 @@ from torch._inductor.virtualized import V
 from torch.distributed import ProcessGroup
 from torch.distributed.distributed_c10d import _resolve_process_group
 from torch.utils._ordered_set import OrderedSet
+
+logger = logging.getLogger(__name__)
 
 
 def get_data_size(size):
@@ -176,12 +179,10 @@ def _get_fx_node(
         )
     origins_with_expected_op = [o for o in origins if o.target == expected_op]
     if len(origins_with_expected_op) != 1:
-        print(
-            "[Get FX exception] origins_with_expected_op",
+        logger.debug(
+            "[Get FX exception] origins_with_expected_op %s expected_op %s snode_or_ir_node %s",
             origins_with_expected_op,
-            "expected_op",
             expected_op,
-            "snode_or_ir_node",
             snode_or_ir_node,
         )
         return None

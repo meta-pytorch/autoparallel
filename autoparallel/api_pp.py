@@ -3,62 +3,27 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
-from types import MethodType
+import logging
 from typing import Any, Optional
 
 import torch
 from torch._logging import trace_structured
-from torch.export.unflatten import _AttrKind
 
 from autoparallel.graph_passes.graph_partition import partition_joint_with_descriptors
 
-from .api import AutoParallel, _assign_attr
-from .init_weights import hook_params_setters
+from .api import AutoParallel
+from .module_construction import make_parallel_module
+
+logger = logging.getLogger(__name__)
 
 
-class AutoParallelPPModule(torch.nn.Module):
-    def __init__(
-        self,
-        sharded_param_dict: dict[str, torch.nn.Parameter],
-        sharded_buffer_dict: dict[str, torch.Tensor],
-        init_weights_model: torch.nn.Module,
-        ref_model: torch.nn.Module,
-    ):
-        super().__init__()
-        self._register_params_and_buffers(
-            sharded_param_dict, sharded_buffer_dict, ref_model
-        )
-
-        # Right now we require a convention that the user model provides an init_weights method,
-        # although we could snoop for other methods too.
-        if hasattr(init_weights_model, "init_weights"):
-            hook_params_setters(init_weights_model, self)
-
-            def init_weights(_self, *args, **kwargs):
-                # this is now a deep-fake-copy of orig mod, so we don't have to use reparametrize
-                return init_weights_model.init_weights(*args, **kwargs)
-
-            # assign an init_weights method onto the output mod.
-            # all it does is sneakily run the original user mod's init_weights method,
-            # but with our new DTensor sharded params attached to the user module.
-            self.init_weights = MethodType(init_weights, self)
-
-    def _register_params_and_buffers(
-        self, sharded_param_dict, sharded_buffer_dict, ref_model
-    ):
-
-        # We construct an unflattened structure on parallel_mod,
-        # e.g. _assign_attr(v, parallel_model, k="layers.0.weight") will literally
-        # create empty nn.Modules recursively and then stash 'v' so it shows up in the right spot
-        # We pass ref_model to preserve the original module structure (e.g., nn.ModuleDict)
-        for k, v in sharded_param_dict.items():
-            _assign_attr(v, self, ref_model, k, attr_kind=_AttrKind.PARAMETER)
-
-        for k, v in sharded_buffer_dict.items():
-            _assign_attr(v, self, ref_model, k, attr_kind=_AttrKind.BUFFER)
-
-    def forward(self, *args):
-        raise NotImplementedError("This is a placeholder for the pipeline model")
+def make_pp_module(
+    sharded_param_dict: dict[str, torch.nn.Parameter],
+    sharded_buffer_dict: dict[str, torch.Tensor],
+    ref_model: torch.nn.Module,
+):
+    """Create an AutoParallelPPModule that inherits from the user's model class."""
+    return make_parallel_module(ref_model, sharded_param_dict, sharded_buffer_dict)
 
 
 class AutoParallelPP(AutoParallel):
@@ -91,7 +56,7 @@ class AutoParallelPP(AutoParallel):
         num_input_grads = (
             len(bw_module.graph.find_nodes(op="output")[0].args[0]) - num_params_buffers
         )
-        print(
+        logger.info(
             f"num_params_buffers: {num_params_buffers}\n"
             f"num_user_outputs: {num_user_outputs}\n"
             f"num_mutate_inputs: {num_mutate_inputs}\n"
@@ -232,10 +197,9 @@ class AutoParallelPP(AutoParallel):
             "unshard": unshard_module,
             "reduce_grad": reduce_grad_module,
         }
-        self.parallel_model = AutoParallelPPModule(
+        self.parallel_model = make_pp_module(
             sharded_param_dict,
             sharded_buffer_dict,
-            self.init_weights_model,
             self.model,
         )
         return {

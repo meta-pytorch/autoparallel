@@ -250,6 +250,72 @@ class TestBuildParamGradLinearChains:
         chain2_nodes = set(source_to_chain[param2])
         assert chain1_nodes.isdisjoint(chain2_nodes), "Param chains should be disjoint"
 
+    def test_unused_parameter_skipped(self):
+        """Test that parameters with no users are skipped without raising an error.
+
+        This can happen when a parameter exists in the graph as a placeholder
+        but is not used by any operation in the forward pass.
+        """
+        dim = 64
+        model = SimpleLinearModel(dim)
+        sample_input = torch.randn(8, dim, requires_grad=True)
+
+        gm, param_grad_nodes = _get_joint_graph(model, sample_input)
+
+        # Insert an unused placeholder node into the graph to simulate
+        # an unused parameter
+        graph = gm.graph
+        first_node = next(iter(graph.nodes))
+        with graph.inserting_before(first_node):
+            unused_param = graph.placeholder("unused_param")
+
+        # Prepend the unused parameter (with no grad) to the list
+        param_grad_nodes_with_unused = [(unused_param, None)] + param_grad_nodes
+
+        # This should not raise an IndexError
+        node_to_source, source_to_chain = build_param_grad_linear_chains(
+            param_grad_nodes_with_unused
+        )
+
+        # The unused parameter should not appear in either dict
+        assert unused_param not in node_to_source
+        assert unused_param not in source_to_chain
+
+        # The other (used) parameters should still have their chains
+        for param, grad in param_grad_nodes:
+            assert param in source_to_chain
+            assert param in node_to_source
+
+    def test_dead_end_node_in_chain(self):
+        """Test that a chain node with no users doesn't crash the traversal.
+
+        When a node in the chain has exactly one input (so the while loop
+        enters) but zero users, list(last_p.users.keys())[0] would raise
+        an IndexError without the len(last_p.users) > 0 guard.
+        """
+        # Build a minimal graph where param's sole user is a dead-end node
+        # (single input, no users of its own).
+        graph = torch.fx.Graph()
+        other = graph.placeholder("other")
+        param = graph.placeholder("param")
+        dead_end = graph.call_function(torch.ops.aten.t.default, (param,))
+        graph.output(other)  # neither param nor dead_end is used by output
+
+        assert len(param.users) == 1
+        assert len(dead_end.all_input_nodes) == 1
+        assert len(dead_end.users) == 0
+
+        # Should not raise an IndexError
+        node_to_source, source_to_chain = build_param_grad_linear_chains(
+            [(param, None)]
+        )
+
+        # The chain should contain only param — the dead-end node is excluded
+        # because the loop stops before appending a node with no users.
+        assert param in source_to_chain
+        chain = source_to_chain[param]
+        assert chain == [param]
+
     def test_chains_contain_only_single_input_nodes(self):
         """Test that chains only include nodes with single inputs (linear dependency)."""
         dim = 64

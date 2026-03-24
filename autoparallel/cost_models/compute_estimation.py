@@ -214,9 +214,23 @@ DEVICE_LIMITS: Tuple[DeviceLimit, ...] = (
         gemm_tflops={
             torch.float64: 72.1,
             torch.float32: 144.2,
-            torch.float16: 2300,
-            torch.bfloat16: 2300,
-            torch.int8: 4600,
+            torch.float16: 2309.6,
+            torch.bfloat16: 2309.6,
+            torch.int8: 4614.0,
+        },
+    ),
+    # AMD MI355X
+    DeviceLimit(
+        "AMD Instinct MI355X",
+        "https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/product-briefs/amd-instinct-mi355x-gpu-brochure.pdf",
+        sm=(-1, -1),  # sm not defined for AMD GPUs
+        gmem_bandwidth=8.0 * (1024**4),
+        gemm_tflops={
+            torch.float64: 78.6,
+            torch.float32: 157.3,
+            torch.float16: 2516.6,
+            torch.bfloat16: 2516.6,
+            torch.int8: 5033.2,
         },
     ),
 )
@@ -387,6 +401,21 @@ def _get_dtype_from_args(args):
     return dtype
 
 
+_compute_cost_cache: dict[tuple, float] = {}
+
+
+def reset_compute_cost_cache():
+    _compute_cost_cache.clear()
+
+
+def _make_hashable(x):
+    if isinstance(x, (list, tuple)):
+        return tuple(_make_hashable(a) for a in x)
+    if isinstance(x, torch.Tensor):
+        return (x.shape, x.stride(), x.dtype)
+    return x
+
+
 def estimate_strategy_runtime_cost(node, strategy):
     """
     This function estimates the runtime cost of a given strategy
@@ -398,6 +427,26 @@ def estimate_strategy_runtime_cost(node, strategy):
     if _has_zero_cost(node):
         return 0
 
+    cache_key = None
+    if strategy is not None:
+        input_specs_key = tuple(
+            (s.placements, s.tensor_meta) for s in strategy.input_specs
+        )
+        try:
+            non_tensor_args = tuple(
+                _make_hashable(a)
+                for a in tree_flatten(node.args)[0]
+                if not isinstance(a, torch.fx.Node)
+            )
+            cache_key = (node.target, input_specs_key, non_tensor_args)
+        except TypeError:
+            pass
+
+        if cache_key is not None:
+            cached = _compute_cost_cache.get(cache_key)
+            if cached is not None:
+                return cached
+
     args, kwargs = _shard_args_for_node(node, strategy)
 
     flops, out = _compute_flops(node.target, *args, **kwargs)
@@ -406,19 +455,23 @@ def estimate_strategy_runtime_cost(node, strategy):
     read_write_time = compute_read_write_time(read_write_bytes)
 
     if flops == 0:
-        return read_write_time
+        result = read_write_time
+    else:
+        dtype = _get_dtype_from_args(args)
 
-    dtype = _get_dtype_from_args(args)
+        # TODO: use PyTorch's version once it's giving correct results
+        gpu_flops = _get_device_tflops(dtype) * 10**12
 
-    # TODO: use PyTorch's version once it's giving correct results
-    gpu_flops = _get_device_tflops(dtype) * 10**12
+        # suppose 70% efficiency for the operator
+        compute_efficiency = 0.70
+        compute_time = flops / gpu_flops * 1e6  # us
+        compute_time = compute_time / compute_efficiency
 
-    # suppose 70% efficiency for the operator
-    compute_efficiency = 0.70
-    compute_time = flops / gpu_flops * 1e6  # us
-    compute_time = compute_time / compute_efficiency
+        result = max(compute_time, read_write_time)
 
-    return max(compute_time, read_write_time)
+    if cache_key is not None:
+        _compute_cost_cache[cache_key] = result
+    return result
 
 
 def benchmark_strategy_runtime_cost(node, strategy):

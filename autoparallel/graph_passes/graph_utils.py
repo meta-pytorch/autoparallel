@@ -6,6 +6,7 @@
 from typing import Union
 
 import torch
+from torch._functorch._aot_autograd.subclass_utils import create_subclass_meta
 from torch._functorch.aot_autograd import JointWithDescriptors
 from torch._inductor.fx_passes.joint_graph import patterns
 from torch._inductor.fx_passes.post_grad import remove_assert_ops, remove_noop_ops
@@ -78,6 +79,16 @@ def update_joint_with_descriptors(
 
     joint_with_descriptors._aot_state.flat_args = new_flat_args  # type: ignore[assignment]
     joint_with_descriptors._aot_state.fw_metadata.traced_tangents = new_local_tangents
+    # Regenerate subclass_tangent_meta from the updated local tangents so that
+    # MemoryFormatMeta records the correct (local) sizes and strides.
+    # Without this, the stale global-shaped metadata causes
+    # coerce_to_expected_memory_format to broadcast the tangent back to global
+    # shape, which then fails the inductor backward's assert_size_stride.
+    joint_with_descriptors._aot_state.fw_metadata.subclass_tangent_meta = (
+        create_subclass_meta(
+            new_local_tangents, count_symints=False, with_memory_format=True
+        )
+    )
 
 
 def _add_alias(gm, version="v1"):
@@ -202,67 +213,78 @@ def assert_has_no_collectives(gm: torch.fx.GraphModule):
 # We perform this pattern-matching replacement for both the forward as well as
 # the backward pass.
 # TODO: use graph_patterns to simplify writing this
+def _batch_dims(n: int) -> str:
+    """Return a string of `n` batch-dimension letters starting from 'a'."""
+    assert 0 < n <= 25
+    return "".join(chr(97 + i) for i in range(n))
+
+
+def _match_forward_linear(mm_node):
+    """Match the forward pattern: view -> mm -> view.
+
+    Returns (inputs, replaced_node, equation) or None.
+    """
+    first_input, second_input = mm_node.all_input_nodes
+    if first_input.target != torch.ops.aten.view.default:
+        return None
+    view_input = first_input.all_input_nodes[0]
+    users = list(mm_node.users)
+    if not (
+        len(users) == 1
+        and users[0].target == torch.ops.aten.view.default
+        and view_input.meta["val"].shape[:-1] == users[0].meta["val"].shape[:-1]
+        and second_input.meta["val"].ndim == 2
+    ):
+        return None
+    ndim = view_input.meta["val"].ndim
+    assert 1 < ndim <= 26, "Only support up to 26D for now"
+    dims = _batch_dims(ndim - 1)
+    equation = f"{dims}k,kn->{dims}n"
+    return [view_input, second_input], users[0], equation
+
+
+def _match_backward_linear(mm_node):
+    """Match the backward pattern: view -> permute -> mm -> permute.
+
+    Returns (inputs, replaced_node, equation) or None.
+    """
+    first_input, second_input = mm_node.all_input_nodes
+    if second_input.target != torch.ops.aten.view.default:
+        return None
+    if first_input.target != torch.ops.aten.permute.default:
+        return None
+    if first_input.all_input_nodes[0].target != torch.ops.aten.view.default:
+        return None
+    orig_first = first_input.all_input_nodes[0].all_input_nodes[0]
+    orig_second = second_input.all_input_nodes[0]
+    users = list(mm_node.users)
+    if not (
+        len(users) == 1
+        and users[0].target == torch.ops.aten.permute.default
+        and orig_first.meta["val"].shape[:-1] == orig_second.meta["val"].shape[:-1]
+        and mm_node.meta["val"].ndim == 2
+    ):
+        return None
+    ndim = orig_first.meta["val"].ndim
+    assert 1 < ndim <= 26, "Only support up to 26D for now"
+    dims = _batch_dims(ndim - 1)
+    equation = f"{dims}n,{dims}k->kn"
+    return [orig_first, orig_second], users[0], equation
+
+
 def _replace_view_mm_view_with_einsum(gm):
     mm_nodes = gm.graph.find_nodes(op="call_function", target=torch.ops.aten.mm.default)
     for node in mm_nodes:
-        first_input, second_input = node.all_input_nodes
-        if first_input.target == torch.ops.aten.view.default:
-            view_input = first_input.all_input_nodes[0]
-            users = list(node.users)
-            if (
-                len(users) == 1
-                and users[0].target == torch.ops.aten.view.default
-                and view_input.meta["val"].shape[:-1] == users[0].meta["val"].shape[:-1]
-                and second_input.meta["val"].ndim == 2
-            ):
-                print(
-                    f"Found matmul node {node}, {view_input.meta['val'].shape, second_input.meta['val'].shape}"
-                )
-                ndim = view_input.meta["val"].ndim
-                assert 1 < ndim <= 10, "Only support up to 10D for now"
-
-                # generate the leading dimensions as a, b, c, etc
-                dims = "".join([chr(97 + i) for i in range(ndim - 1)])
-                mm_equation = f"{dims}k,kn->{dims}n"
-                with gm.graph.inserting_before(node):
-                    new_node = gm.graph.call_function(
-                        torch.ops.aten.einsum.default,
-                        args=(mm_equation, [view_input, second_input]),
-                    )
-                    new_node.meta.update(users[0].meta)
-                    users[0].replace_all_uses_with(new_node)
-
-        elif second_input.target == torch.ops.aten.view.default:
-            if first_input.target != torch.ops.aten.permute.default:
-                continue
-            if first_input.all_input_nodes[0].target != torch.ops.aten.view.default:
-                continue
-            orig_first = first_input.all_input_nodes[0].all_input_nodes[0]
-            orig_second = second_input.all_input_nodes[0]
-            users = list(node.users)
-            if (
-                len(users) == 1
-                and users[0].target == torch.ops.aten.permute.default
-                and orig_first.meta["val"].shape[:-1]
-                == orig_second.meta["val"].shape[:-1]
-                and node.meta["val"].ndim == 2
-            ):
-                print(
-                    f"Found matmul node {node} {orig_first.meta['val'].shape, orig_second.meta['val'].shape}"
-                )
-
-                ndim = orig_first.meta["val"].ndim
-                assert 1 < ndim <= 10, "Only support up to 10D for now"
-
-                # generate the leading dimensions as a, b, c, etc
-                dims = "".join([chr(97 + i) for i in range(ndim - 1)])
-                mm_equation = f"{dims}n,{dims}k->kn"
-                with gm.graph.inserting_before(node):
-                    new_node = gm.graph.call_function(
-                        torch.ops.aten.einsum.default,
-                        args=(mm_equation, [orig_first, orig_second]),
-                    )
-                    new_node.meta.update(users[0].meta)
-                    users[0].replace_all_uses_with(new_node)
+        match = _match_forward_linear(node) or _match_backward_linear(node)
+        if match is None:
+            continue
+        inputs, replaced_node, equation = match
+        with gm.graph.inserting_before(node):
+            new_node = gm.graph.call_function(
+                torch.ops.aten.einsum.default,
+                args=(equation, inputs),
+            )
+            new_node.meta.update(replaced_node.meta)
+            replaced_node.replace_all_uses_with(new_node)
     gm.graph.eliminate_dead_code()
     gm.recompile()
