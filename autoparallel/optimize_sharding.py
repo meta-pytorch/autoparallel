@@ -632,6 +632,95 @@ class ShardingOptimizer:
         self.add_inf_cost_constraint()
         self.add_forward_backward_consistency_constraints()
 
+    # ---- Prefetch overlap ----
+
+    def _build_param_derived_set(self):
+        """Compute the set of nodes whose inputs are ALL parameter-derived.
+
+        A node is parameter-derived if every one of its inputs is either a
+        parameter placeholder or itself parameter-derived. This propagates
+        through dtype_cast, views, aliases, etc.
+        """
+        param_derived = set(get_param_nodes(self.graph))
+        for node in self.graph.nodes:
+            all_inputs = self._all_input_nodes(node)
+            if all_inputs and all(inp in param_derived for inp in all_inputs):
+                param_derived.add(node)
+        return param_derived
+
+    def _build_terminal_derived_set(self):
+        """Compute the set of nodes in the parameter gradient reduce-scatter chain.
+
+        A node is in this set if every one of its users is either a parameter
+        gradient node or itself in this set. This captures only the tail end
+        of the gradient chain (alias/view nodes right before the output), not
+        the backward matmuls that compute the gradients.
+        """
+        param_nodes = get_param_nodes(self.graph)
+        grad_nodes = set()
+        for param, grad in get_param_and_grad_nodes(self.graph).values():
+            if grad is not None:
+                grad_nodes.add(grad)
+
+        logger.debug(
+            "terminal_derived: %d param nodes, %d grad nodes",
+            len(param_nodes),
+            len(grad_nodes),
+        )
+
+        terminal_derived: set[torch.fx.Node] = set()
+        for node in reversed(list(self.graph.nodes)):
+            if node.op == "output":
+                continue
+            if node.users and all(
+                u in grad_nodes or u in terminal_derived for u in node.users
+            ):
+                terminal_derived.add(node)
+        return terminal_derived
+
+    def apply_prefetch_discount(self, scale=0.0):
+        """Discount communication costs for prefetchable edges.
+
+        Scales down comm costs for:
+        - Forward: edges where the producer is parameter-derived (FSDP
+          all-gathers that can be prefetched ahead of compute)
+        - Backward: edges into terminal-derived nodes (gradient
+          reduce-scatters that can overlap with earlier backward compute)
+
+        Must be called before get_solution(). A scale of 0.0 means fully
+        overlapped (free); 1.0 means no discount.
+
+        Returns the number of decision vars modified.
+        """
+        param_derived = self._build_param_derived_set()
+        terminal_derived = self._build_terminal_derived_set()
+
+        n_modified = 0
+        for key, dv in self.decision_vars.items():
+            node_idx, argi, out_idx, inp_idx = key
+            node = self.nodes[node_idx]
+
+            input_nodes = self._all_input_nodes(node)
+            if not input_nodes:
+                continue
+            producer = input_nodes[argi]
+
+            is_prefetchable = producer in param_derived or node in terminal_derived
+            if is_prefetchable and dv.comm_cost > 0 and math.isfinite(dv.comm_cost):
+                dv.comm_cost *= scale
+                dv.cost = dv.comm_cost + dv.compute_cost + dv.sharding_transition_cost
+                n_modified += 1
+
+        logger.debug(
+            "apply_prefetch_discount(scale=%.2f): modified %d decision vars "
+            "(%d param-derived nodes, %d terminal-derived nodes)",
+            scale,
+            n_modified,
+            len(param_derived),
+            len(terminal_derived),
+        )
+        return n_modified
+
     # ---- Solution ----
 
     def _set_objective(self):
