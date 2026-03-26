@@ -70,7 +70,6 @@ def _pointwise_strategy(mesh, op_schema):
     )
     from torch.distributed.tensor._ops.single_dim_strategy import (
         _fill_single_dim_strategy_placeholders,
-        _get_unique_placements,
         _insert_single_dim_replication_strategy,
     )
     from torch.distributed.tensor._ops.utils import expand_to_full_mesh_op_strategy
@@ -87,7 +86,16 @@ def _pointwise_strategy(mesh, op_schema):
     strategies_with_placeholders = _insert_single_dim_replication_strategy(
         strategies_with_placeholders, num_outputs, num_inputs
     )
-    unique_placements = _get_unique_placements(op_schema)
+
+    # _get_unique_placements assumes each OpStrategy has exactly one strategy
+    # (the single-dim path). In autoparallel, inputs have multiple strategies,
+    # so we collect unique placements from all of them.
+    unique_placements = set()
+    for arg in op_schema.args_schema:
+        if isinstance(arg, OpStrategy):
+            for strat in arg.strategies:
+                unique_placements.update(strat.output_spec.placements)
+
     single_dim_strategies = _fill_single_dim_strategy_placeholders(
         unique_placements, strategies_with_placeholders
     )
