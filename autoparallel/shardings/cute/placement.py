@@ -20,7 +20,7 @@ Examples:
         (device d holds a strided pattern in the flat dim)
 """
 
-from ._pycute import Layout, coalesce, flatten, is_tuple, product
+from torch.distributed._pycute import Layout, coalesce, flatten, is_tuple, product
 
 
 class CutePlacement:
@@ -87,34 +87,14 @@ class CutePlacement:
         The layout maps device_idx -> starting offset, with stride = chunk_size.
         This is Layout(D, chunk_size) where chunk_size > 0.
 
-        We also recognize layouts that coalesce to this form, e.g.,
-        (2, 8):(8, 1) from a flatten of (B, S) sharded on B means
-        each device holds B/D * S contiguous elements — this is still
-        a simple shard with chunk_size = B/D * S.
+        With lexicographic coalesce, layouts like (2, 8):(8, 1) correctly
+        coalesce to 16:1, so a simple rank-1 check suffices.
         """
         if self.dim is None:
             return False
         c = coalesce(self.layout)
-        # Simple case: rank-1 layout with positive stride
         if not is_tuple(c.shape) and not is_tuple(c.stride):
             return c.stride > 0
-        # Check if the layout describes contiguous elements per device.
-        # A layout is "contiguous per device" if its right_inverse has size
-        # equal to the layout's cosize, i.e., it covers all elements in [0, cosize).
-        # Simpler check: the layout, when treated as a function, maps
-        # range(size) to a contiguous range. We check this by verifying
-        # that the coalesced layout of the "local" part is just N:1.
-        # For (2,8):(8,1) -> coalesced is (2,8):(8,1) which is NOT N:1.
-        # But (8,2):(1,8) -> coalesced is 16:1 which IS N:1.
-        # The issue is ordering — we need to check if the image is contiguous
-        # regardless of order.
-        # Practical check: is the layout a permutation of N:1?
-        # i.e., does it produce all values 0..N-1 for inputs 0..N-1?
-        sz = c.size()
-        if sz <= 64:  # Only check for small layouts
-            vals = sorted(c(i) for i in range(sz))
-            if vals == list(range(sz)):
-                return True
         return False
 
     def to_placement(self):

@@ -11,7 +11,7 @@ They determine how placements transform through tensor operations:
 
 import re
 
-from ._pycute import Layout, coalesce, flatten, is_tuple, prefix_product, product
+from torch.distributed._pycute import Layout, coalesce, flatten, is_tuple, product, suffix_product
 from .placement import CutePlacement
 
 

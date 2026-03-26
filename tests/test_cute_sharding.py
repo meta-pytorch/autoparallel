@@ -4,7 +4,7 @@ Tests for CuTe-based sharding placement and propagation.
 
 import unittest
 
-from autoparallel.shardings.cute._pycute import Layout, coalesce, flatten, product
+from torch.distributed._pycute import Layout, coalesce, flatten, product
 from autoparallel.shardings.cute.placement import CutePlacement
 from autoparallel.shardings.cute.propagation import (
     propagate_einsum,
@@ -32,7 +32,7 @@ class TestPycuteBasics(unittest.TestCase):
         self.assertEqual(L(0, 1), 4)
 
     def test_coalesce(self):
-        L = Layout((2, 6), (1, 2))  # contiguous 12 elements
+        L = Layout((2, 6), (6, 1))  # row-major contiguous 12 elements
         c = coalesce(L)
         self.assertEqual(c.shape, 12)
         self.assertEqual(c.stride, 1)
