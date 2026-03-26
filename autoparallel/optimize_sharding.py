@@ -88,7 +88,7 @@ from torch._functorch._aot_autograd.fx_utils import (
 )
 from torch.distributed.tensor._dtensor_spec import DTensorSpec
 from torch.distributed.tensor.placement_types import Placement, Replicate, Shard
-from torch.utils._pytree import tree_flatten, tree_map_only
+from torch.utils._pytree import tree_map_only
 
 from .cost_models.collective_runtime_estimation import estimate_strategy_comms_cost
 from .cost_models.compute_estimation import (
@@ -96,6 +96,11 @@ from .cost_models.compute_estimation import (
     estimate_strategy_runtime_cost,
 )
 from .graph_passes.graph_clustering import get_identical_regions
+from .graph_passes.graph_utils import (
+    all_input_nodes,
+    build_param_derived_set,
+    build_terminal_derived_set,
+)
 from .shardings.placement_options import get_placement_options_for_node
 from .shardings.propagation_rules import _create_all_options
 
@@ -243,7 +248,7 @@ class ShardingOptimizer:
     def _all_input_nodes(self, node):
         """Variant of node.all_input_nodes that preserves duplicate nodes."""
         # TODO: add kwargs?
-        return [x for x in tree_flatten(node.args)[0] if isinstance(x, torch.fx.Node)]
+        return all_input_nodes(node)
 
     def walk_over_options(self, node, constrain_arg=None):
         """Yield (argi, out_idx, inp_idx) for all valid strategy combinations."""
@@ -634,50 +639,6 @@ class ShardingOptimizer:
 
     # ---- Prefetch overlap ----
 
-    def _build_param_derived_set(self):
-        """Compute the set of nodes whose inputs are ALL parameter-derived.
-
-        A node is parameter-derived if every one of its inputs is either a
-        parameter placeholder or itself parameter-derived. This propagates
-        through dtype_cast, views, aliases, etc.
-        """
-        param_derived = set(get_param_nodes(self.graph))
-        for node in self.graph.nodes:
-            all_inputs = self._all_input_nodes(node)
-            if all_inputs and all(inp in param_derived for inp in all_inputs):
-                param_derived.add(node)
-        return param_derived
-
-    def _build_terminal_derived_set(self):
-        """Compute the set of nodes in the parameter gradient reduce-scatter chain.
-
-        A node is in this set if every one of its users is either a parameter
-        gradient node or itself in this set. This captures only the tail end
-        of the gradient chain (alias/view nodes right before the output), not
-        the backward matmuls that compute the gradients.
-        """
-        param_nodes = get_param_nodes(self.graph)
-        grad_nodes = set()
-        for param, grad in get_param_and_grad_nodes(self.graph).values():
-            if grad is not None:
-                grad_nodes.add(grad)
-
-        logger.debug(
-            "terminal_derived: %d param nodes, %d grad nodes",
-            len(param_nodes),
-            len(grad_nodes),
-        )
-
-        terminal_derived: set[torch.fx.Node] = set()
-        for node in reversed(list(self.graph.nodes)):
-            if node.op == "output":
-                continue
-            if node.users and all(
-                u in grad_nodes or u in terminal_derived for u in node.users
-            ):
-                terminal_derived.add(node)
-        return terminal_derived
-
     def apply_prefetch_discount(self, scale=0.0):
         """Discount communication costs for prefetchable edges.
 
@@ -692,8 +653,18 @@ class ShardingOptimizer:
 
         Returns the number of decision vars modified.
         """
-        param_derived = self._build_param_derived_set()
-        terminal_derived = self._build_terminal_derived_set()
+        param_derived = build_param_derived_set(self.graph)
+        terminal_derived = build_terminal_derived_set(self.graph)
+
+        logger.debug(
+            "terminal_derived: %d param nodes, %d grad nodes",
+            len(get_param_nodes(self.graph)),
+            sum(
+                1
+                for _, grad in get_param_and_grad_nodes(self.graph).values()
+                if grad is not None
+            ),
+        )
 
         n_modified = 0
         for key, dv in self.decision_vars.items():
