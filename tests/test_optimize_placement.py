@@ -347,11 +347,11 @@ class LocalMapTransformerBlock(nn.Module):
 
     def forward(self, x):
         @local_map(
-            out_placements=((Shard(0), Shard(1), Shard(2)),),
+            out_placements=((Shard(0), Shard(2)),),
             in_placements=(
-                (Shard(0), Shard(1), Shard(2)),  # query
-                (Shard(0), Shard(1), Replicate()),  # key
-                (Shard(0), Shard(1), Replicate()),  # value
+                (Shard(0), Shard(2)),  # query
+                (Shard(0), Replicate()),  # key
+                (Shard(0), Replicate()),  # value
             ),
             redistribute_inputs=True,
             in_grad_placements=None,
@@ -388,16 +388,15 @@ class LocalMapTransformerBlock(nn.Module):
 
 @patch("torch.cuda.device_count", lambda: 8)
 @patch("torch.cuda.get_device_name", lambda device: "H100")
-def test_local_map_placement_respected(device_mesh_3d, device="cuda"):
-    # Setup per example_local_map.py
-    bs = 8 * device_mesh_3d.shape[0]
+def test_local_map_placement_respected(device_mesh_2d, device="cuda"):
+    bs = 8 * device_mesh_2d.shape[0]
     dim1 = 6144
     dim2 = dim1 * 4
     nheads = 48
     seq_len = 256
 
     def model_fn():
-        return LocalMapTransformerBlock(nheads, dim1, dim2, device_mesh_3d)
+        return LocalMapTransformerBlock(nheads, dim1, dim2, device_mesh_2d)
 
     def input_fn():
         return torch.randn(bs, seq_len, dim1, device=device, requires_grad=True)
@@ -405,10 +404,10 @@ def test_local_map_placement_respected(device_mesh_3d, device="cuda"):
     with torch.device("meta"):
         model = model_fn()
 
-    with AutoParallel(model, input_fn, device_mesh_3d) as autop:
+    with AutoParallel(model, input_fn, device_mesh_2d) as autop:
         autop.add_parameter_memory_constraint(low=None, high=None)
 
-        x_sharding = (Shard(0), Replicate(), Shard(1))
+        x_sharding = (Shard(0), Shard(1))
         autop.add_input_constraints([x_sharding])
         autop.add_output_constraints([x_sharding])
 
@@ -429,32 +428,28 @@ def test_local_map_placement_respected(device_mesh_3d, device="cuda"):
     # Check fw inputs
     assert len(fw_spec.input_specs) == 3  # query, key, value
     q_spec, k_spec, v_spec = fw_spec.input_specs
-    assert q_spec.placements == (Shard(dim=0), Shard(dim=1), Shard(dim=2))
-    assert k_spec.placements == v_spec.placements == (Shard(0), Shard(1), Replicate())
+    assert q_spec.placements == (Shard(dim=0), Shard(dim=2))
+    assert k_spec.placements == v_spec.placements == (Shard(0), Replicate())
 
     # Check fw outputs incl saved activations
     assert len(fw_spec.output_specs) == 8
     fw_out_spec, *act_specs = fw_spec.output_specs
-    assert fw_out_spec.placements == (Shard(0), Shard(1), Shard(2))
+    assert fw_out_spec.placements == (Shard(0), Shard(2))
     for act_spec in act_specs:
-        assert act_spec.placements == (Replicate(), Replicate(), Replicate())
+        assert act_spec.placements == (Replicate(), Replicate())
 
     # Check bw inputs incl saved activations
     assert len(bw_spec.input_specs) == 8
     *act_specs, bw_in_spec = bw_spec.input_specs
-    assert bw_in_spec.placements == (Shard(0), Shard(1), Shard(2))
+    assert bw_in_spec.placements == (Shard(0), Shard(2))
     for act_spec in act_specs:
-        assert act_spec.placements == (Replicate(), Replicate(), Replicate())
+        assert act_spec.placements == (Replicate(), Replicate())
 
     # Check bw outputs
     assert len(bw_spec.output_specs) == 3  # query, key, value
     grad_q_spec, grad_k_spec, grad_v_spec = bw_spec.output_specs
-    assert grad_q_spec.placements == (Shard(dim=0), Shard(dim=1), Shard(dim=2))
-    assert (
-        grad_k_spec.placements
-        == grad_v_spec.placements
-        == (Shard(0), Shard(1), Replicate())
-    )
+    assert grad_q_spec.placements == (Shard(dim=0), Shard(dim=2))
+    assert grad_k_spec.placements == grad_v_spec.placements == (Shard(0), Replicate())
 
 
 @patch("torch.cuda.device_count", lambda: 8)
