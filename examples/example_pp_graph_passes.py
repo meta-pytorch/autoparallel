@@ -290,9 +290,10 @@ def run_all_graph_pass_tests(
             graph_passes=[],
         )
         pp_mod = autop.parallel_model
-        pp_mod.to_empty(device="cuda")
-        pp_mod.init_weights(buffer_device="cuda")
-        sharded_params, buffers, x = _get_fw_inputs(pp_mod, eval_input_fn)
+        with unset_fake_temporarily():
+            pp_mod.to_empty(device="cuda")
+            pp_mod.init_weights(buffer_device="cuda")
+            sharded_params, buffers, x = _get_fw_inputs(pp_mod, eval_input_fn)
 
         for name, graph_passes, use_fsdp, use_split in test_configs:
             if graph_passes:
