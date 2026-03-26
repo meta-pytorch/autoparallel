@@ -654,7 +654,14 @@ class ShardingOptimizer:
 
         if self.prob.status == -1:
             logger.warning(self.get_violated_constraints_log())
-            raise RuntimeError("Unsolvable problem")
+            raise RuntimeError(
+                "The sharding optimizer could not find a feasible solution. "
+                "This typically means the user-specified constraints are "
+                "contradictory or the device mesh is too small for the requested "
+                "sharding. Check the WARNING log above for the list of violated "
+                "constraints, and consider relaxing input/output constraints or "
+                "using a larger mesh."
+            )
 
     def _extract_and_validate_solution(self):
         """Validate the ILP solution and return the optimal strategy per node."""
