@@ -384,8 +384,13 @@ def propagate_pointwise(all_placements, shapes, mesh_sizes):
     Propagate CutePlacements through a pointwise (element-wise) operation.
 
     Given the input placements, computes output placements assuming no
-    redistribution. All non-replicate inputs must agree on placement per
-    mesh dim. Broadcasting: size-1 dims are treated as replicate.
+    redistribution. All inputs must have compatible placements per mesh dim:
+    - All sharded inputs must agree on the same placement.
+    - A replicate input is only compatible with a sharded input if the
+      replicate tensor has size 1 (or is scalar) on the sharded dim,
+      so that broadcasting handles it correctly with no conversion.
+      Otherwise, the replicate tensor would need to be sliced to match
+      the shard — that's a placement conversion, not redistribution-free.
 
     Returns:
         output_placements tuple, or None if incompatible.
@@ -401,19 +406,34 @@ def propagate_pointwise(all_placements, shapes, mesh_sizes):
             p = inp_placements[mesh_dim]
 
             if p.is_replicate():
+                # Will check compatibility with candidate after the loop
                 continue
 
-            # Broadcasting: size-1 on sharded dim -> effectively replicate
+            # Sharded input — check if it's broadcasting (size 1 on sharded dim)
             if p.dim is not None and p.dim < len(shapes[inp_idx]):
                 if shapes[inp_idx][p.dim] == 1:
+                    # Size-1 shard is effectively replicate
                     continue
 
             if candidate is None:
                 candidate = p
             elif candidate != p:
-                return None  # conflicting placements
+                return None  # conflicting sharded placements
 
         if candidate is not None:
+            # We have a sharded candidate. Verify all replicate inputs
+            # are compatible: they must have size 1 (or be scalar) on
+            # the sharded dim so broadcasting works without conversion.
+            for inp_idx, inp_placements in enumerate(all_placements):
+                p = inp_placements[mesh_dim]
+                if not p.is_replicate():
+                    continue
+                # Replicate input: check if it has size > 1 on the sharded dim
+                if candidate.dim is not None and candidate.dim < len(shapes[inp_idx]):
+                    if shapes[inp_idx][candidate.dim] > 1:
+                        # Replicate tensor has full size on the sharded dim —
+                        # local op would see shape mismatch without slicing
+                        return None
             output_placements.append(candidate)
         else:
             output_placements.append(CutePlacement.replicate(mesh_size))

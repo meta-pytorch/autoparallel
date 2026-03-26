@@ -400,17 +400,23 @@ class TestPointwisePropagation(unittest.TestCase):
         out = propagate_pointwise([(p1,), (p2,)], [(8, 16), (8, 16)], (D,))
         self.assertIsNone(out)
 
-    def test_shard_with_replicate(self):
-        """One sharded, one replicate -> output gets shard."""
+    def test_shard_with_replicate_incompatible(self):
+        """One sharded, one replicate with full size -> incompatible.
+
+        Replicate tensor has full size on the sharded dim, so the local
+        op would see a shape mismatch without slicing the replicate first.
+        """
         D = 2
         p1 = CutePlacement.shard(0, 8, D)
         p2 = CutePlacement.replicate(D)
         out = propagate_pointwise([(p1,), (p2,)], [(8, 16), (8, 16)], (D,))
-        self.assertIsNotNone(out)
-        self.assertEqual(out[0], p1)
+        self.assertIsNone(out)
 
-    def test_broadcast_size1(self):
-        """Input with size-1 on sharded dim -> treated as replicate."""
+    def test_shard_with_replicate_broadcast(self):
+        """One sharded, one replicate with size-1 on sharded dim -> OK.
+
+        Size-1 broadcasts correctly with no conversion needed.
+        """
         D = 2
         p1 = CutePlacement.shard(0, 8, D)
         p2 = CutePlacement.replicate(D)
