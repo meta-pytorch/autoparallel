@@ -351,7 +351,14 @@ class AutoParallel:
         )
 
         if self.sharding_optimizer.prob.status == -1:
-            raise RuntimeError("Didn't find solution")
+            raise RuntimeError(
+                "The sharding optimizer could not find a feasible solution. "
+                "This typically means the user-specified constraints are "
+                "contradictory or the device mesh is too small for the requested "
+                "sharding. Check the WARNING log for the list of violated "
+                "constraints, and consider relaxing input/output constraints or "
+                "using a larger mesh."
+            )
 
         return self.sharding_placement
 
