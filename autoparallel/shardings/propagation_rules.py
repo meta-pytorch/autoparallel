@@ -63,7 +63,10 @@ def _pointwise_strategy(mesh, op_schema):
     """Generate pointwise sharding strategies for an op.
 
     Replacement for the removed torch.distributed.tensor._ops._pointwise_ops.pointwise_strategy,
-    reimplemented using the new single-dim strategy primitives.
+    reimplemented using the new single-dim strategy primitives. Always produces a single
+    output spec per strategy (matching the old pointwise_strategy behavior), even for
+    multi-output ops like native_layer_norm — callers are expected to construct the
+    per-output specs themselves.
     """
     from torch.distributed.tensor._ops._pointwise_ops import (
         _common_pointwise_single_dim_strategy,
@@ -83,8 +86,17 @@ def _pointwise_strategy(mesh, op_schema):
     strategies_with_placeholders = strategy_fn(
         op_schema.op, op_schema.args_meta, op_schema.kwargs_meta
     )
+
+    # _common_pointwise_single_dim_strategy produces num_outputs output entries
+    # per row. Collapse to a single output entry so expand_to_full_mesh_op_strategy
+    # returns a single DTensorSpec in output_specs, matching the old behavior.
+    if num_outputs > 1:
+        strategies_with_placeholders = [
+            row[:1] + row[num_outputs:] for row in strategies_with_placeholders
+        ]
+
     strategies_with_placeholders = _insert_single_dim_replication_strategy(
-        strategies_with_placeholders, num_outputs, num_inputs
+        strategies_with_placeholders, 1, num_inputs
     )
 
     # _get_unique_placements assumes each OpStrategy has exactly one strategy
@@ -100,7 +112,7 @@ def _pointwise_strategy(mesh, op_schema):
         unique_placements, strategies_with_placeholders
     )
     return expand_to_full_mesh_op_strategy(
-        mesh, op_schema, single_dim_strategies, input_index=num_outputs
+        mesh, op_schema, single_dim_strategies, input_index=1
     )
 
 
