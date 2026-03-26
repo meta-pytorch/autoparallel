@@ -221,9 +221,21 @@ def view_rule(mesh, op_schema):
     out_tensor_meta = _gen_tensor_meta(out_tensor)
     for strat in op_spec.strategies:
         input_specs = strat.output_specs
-        input_tgt_placements, output_placements = propagate_shape_and_sharding(
-            input_specs.placements, global_shape, rules, mesh.shape, strict_view=False
-        )
+        try:
+            input_tgt_placements, output_placements = propagate_shape_and_sharding(
+                input_specs.placements,
+                global_shape,
+                rules,
+                mesh.shape,
+                strict_view=False,
+            )
+        except AssertionError:
+            # PyTorch may raise when a sharded dim is not divisible by the
+            # mesh size (e.g. unflatten nheads=48 on mesh dim size=32).
+            # With strict_view=False this should demote to Replicate, but
+            # upstream validation is overly strict.  Skip this strategy;
+            # the replicated variant is already covered by another iteration.
+            continue
 
         input_tgt_spec = DTensorSpec(
             placements=tuple(input_tgt_placements),
