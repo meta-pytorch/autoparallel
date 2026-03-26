@@ -13,54 +13,8 @@ from torch._functorch._aot_autograd.fx_utils import get_param_nodes
 from torch.distributed._tensor.experimental import local_map
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
-from torch.testing._internal.distributed.fake_pg import FakeStore
 
 from autoparallel.api import AutoParallel, auto_parallel
-
-
-@pytest.fixture(scope="module", autouse=True)
-def init_pg():
-    world_size = 256
-    fake_store = FakeStore()
-    if torch.distributed.is_initialized():
-        return
-    torch.distributed.init_process_group(
-        "fake", store=fake_store, rank=0, world_size=world_size
-    )
-
-
-@pytest.fixture(scope="module")
-def device_mesh_1d():
-    world_size = torch.distributed.get_world_size()
-    mesh = torch.distributed.device_mesh.init_device_mesh(
-        "cuda", (world_size,), mesh_dim_names=("dp",)
-    )
-    return mesh
-
-
-@pytest.fixture(scope="module")
-def device_mesh_2d():
-    world_size = torch.distributed.get_world_size()
-    mesh = torch.distributed.device_mesh.init_device_mesh(
-        "cuda",
-        (world_size // 8, 8),
-        mesh_dim_names=(
-            "dp",
-            "tp",
-        ),
-    )
-    return mesh
-
-
-@pytest.fixture(scope="module")
-def device_mesh_local_map():
-    world_size = torch.distributed.get_world_size()
-    mesh = torch.distributed.device_mesh.init_device_mesh(
-        "cuda",
-        (world_size // 32, 8, 4),  # dp=8, tp=8, cp=4
-        mesh_dim_names=("dp", "tp", "cp"),
-    )
-    return mesh
 
 
 class FFN(nn.Module):
@@ -434,16 +388,16 @@ class LocalMapTransformerBlock(nn.Module):
 
 @patch("torch.cuda.device_count", lambda: 8)
 @patch("torch.cuda.get_device_name", lambda device: "H100")
-def test_local_map_placement_respected(device_mesh_local_map, device="cuda"):
+def test_local_map_placement_respected(device_mesh_3d, device="cuda"):
     # Setup per example_local_map.py
-    bs = 8 * device_mesh_local_map.shape[0]
+    bs = 8 * device_mesh_3d.shape[0]
     dim1 = 6144
     dim2 = dim1 * 4
     nheads = 48
     seq_len = 256
 
     def model_fn():
-        return LocalMapTransformerBlock(nheads, dim1, dim2, device_mesh_local_map)
+        return LocalMapTransformerBlock(nheads, dim1, dim2, device_mesh_3d)
 
     def input_fn():
         return torch.randn(bs, seq_len, dim1, device=device, requires_grad=True)
@@ -451,7 +405,7 @@ def test_local_map_placement_respected(device_mesh_local_map, device="cuda"):
     with torch.device("meta"):
         model = model_fn()
 
-    with AutoParallel(model, input_fn, device_mesh_local_map) as autop:
+    with AutoParallel(model, input_fn, device_mesh_3d) as autop:
         autop.add_parameter_memory_constraint(low=None, high=None)
 
         x_sharding = (Shard(0), Replicate(), Shard(1))

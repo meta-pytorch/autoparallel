@@ -16,7 +16,6 @@ from torch._functorch._aot_autograd.descriptors import (
     PlainAOTInput,
     PlainAOTOutput,
 )
-from torch.testing._internal.distributed.fake_pg import FakeStore
 
 from autoparallel.graph_passes.graph_utils import (
     build_param_derived_set,
@@ -248,26 +247,6 @@ class TestBuildTerminalDerivedSet:
 # ---------------------------------------------------------------------------
 # Integration test: apply_prefetch_discount on a real traced graph
 # ---------------------------------------------------------------------------
-
-
-@pytest.fixture(scope="module", autouse=True)
-def init_pg():
-    if torch.distributed.is_initialized():
-        return
-    fake_store = FakeStore()
-    torch.distributed.init_process_group(
-        "fake", store=fake_store, rank=0, world_size=256
-    )
-
-
-@pytest.fixture(scope="module")
-def device_mesh_2d():
-    world_size = torch.distributed.get_world_size()
-    return torch.distributed.device_mesh.init_device_mesh(
-        "cuda",
-        (world_size // 8, 8),
-        mesh_dim_names=("dp", "tp"),
-    )
 
 
 class FFN(torch.nn.Module):
