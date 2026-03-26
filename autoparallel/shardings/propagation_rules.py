@@ -59,6 +59,43 @@ register_op_strategy_map(
 )
 
 
+def _pointwise_strategy(mesh, op_schema):
+    """Generate pointwise sharding strategies for an op.
+
+    Replacement for the removed torch.distributed.tensor._ops._pointwise_ops.pointwise_strategy,
+    reimplemented using the new single-dim strategy primitives.
+    """
+    from torch.distributed.tensor._ops._pointwise_ops import (
+        _common_pointwise_single_dim_strategy,
+    )
+    from torch.distributed.tensor._ops.single_dim_strategy import (
+        _fill_single_dim_strategy_placeholders,
+        _get_unique_placements,
+        _insert_single_dim_replication_strategy,
+    )
+    from torch.distributed.tensor._ops.utils import expand_to_full_mesh_op_strategy
+
+    num_outputs = sum(
+        1 for r in op_schema.op._schema.returns if "Tensor" in str(r.type)
+    )
+    num_inputs = sum(1 for arg in op_schema.args_schema if isinstance(arg, OpStrategy))
+
+    strategy_fn = _common_pointwise_single_dim_strategy()
+    strategies_with_placeholders = strategy_fn(
+        op_schema.op, op_schema.args_meta, op_schema.kwargs_meta
+    )
+    strategies_with_placeholders = _insert_single_dim_replication_strategy(
+        strategies_with_placeholders, num_outputs, num_inputs
+    )
+    unique_placements = _get_unique_placements(op_schema)
+    single_dim_strategies = _fill_single_dim_strategy_placeholders(
+        unique_placements, strategies_with_placeholders
+    )
+    return expand_to_full_mesh_op_strategy(
+        mesh, op_schema, single_dim_strategies, input_index=num_outputs
+    )
+
+
 _op_rules = {}
 
 
@@ -467,13 +504,7 @@ def native_layer_norm_rule(mesh, op_schema):
         Sequence,
         normalize_to_torch_size,
     )
-    from torch.distributed.tensor._ops._pointwise_ops import pointwise_strategy
 
-    # mesh = op_schema.get_mesh_from_args()
-    # args must be: input, normalized_shape, weight, bias, eps
-    # for None weight and bias, their corresponding objects will
-    # be None as well. layer_norm_strategy returns one OpStrategy
-    # for the triple return values (out, mean, rstd).
     assert len(op_schema.args_schema) == 5
     (
         input_strategy,
@@ -483,8 +514,6 @@ def native_layer_norm_rule(mesh, op_schema):
         _,
     ) = op_schema.args_schema
 
-    # the current layer norm implementation requires that all
-    # input DTensor's sharding must be in form of OpStrategy
     assert isinstance(input_strategy, OpStrategy)
     assert isinstance(normalized_shape, (int, Sequence, torch.Size))
     normalized_size = normalize_to_torch_size(normalized_shape)
@@ -492,7 +521,7 @@ def native_layer_norm_rule(mesh, op_schema):
     input_ndim = input_strategy.ndim
     axis = input_ndim - len(normalized_size)
 
-    output_strategy = pointwise_strategy(op_schema, linearity=False)
+    output_strategy = _pointwise_strategy(mesh, op_schema)
 
     # now let's remove the cases that are invalid, as they require
     # reduction on a sharded dimension
@@ -545,7 +574,6 @@ def native_layer_norm_backward_rule(mesh, op_schema):
         Sequence,
         normalize_to_torch_size,
     )
-    from torch.distributed.tensor._ops._pointwise_ops import pointwise_strategy
 
     assert len(op_schema.args_schema) == 8
     (
@@ -566,7 +594,7 @@ def native_layer_norm_backward_rule(mesh, op_schema):
     input_ndim = input_strategy.ndim
     axis = input_ndim - len(normalized_size)
 
-    output_strategy = pointwise_strategy(op_schema, linearity=False)
+    output_strategy = _pointwise_strategy(mesh, op_schema)
 
     # now let's remove the cases that are invalid, as they require
     # reduction on a sharded dimension
