@@ -23,7 +23,7 @@ from torch.distributed.tensor.placement_types import Partial, Replicate, Shard  
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.utils._pytree import tree_flatten, tree_map_only
 
-from .graph_passes.graph_utils import cleanup_graph
+from .graph_passes.graph_utils import all_input_nodes, cleanup_graph
 from .shardings.ordered_sharding import (
     compute_optimal_placement_order_for_parameters,
     ordered_redistribute_local_tensor,
@@ -95,7 +95,7 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
 
     def _get_input_nodes(self, node):
         # node.all_input_nodes deduplicates, but we need repeated nodes preserved
-        return [x for x in tree_flatten(node.args)[0] if isinstance(x, torch.fx.Node)]
+        return all_input_nodes(node)
 
     def _set_origin_and_target_device_order(self, node, curr_spec, tgt_spec):
         # shard_order should be automatically assigned once `placements` is set

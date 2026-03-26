@@ -88,7 +88,7 @@ from torch._functorch._aot_autograd.fx_utils import (
 )
 from torch.distributed.tensor._dtensor_spec import DTensorSpec
 from torch.distributed.tensor.placement_types import Placement, Replicate, Shard
-from torch.utils._pytree import tree_flatten, tree_map_only
+from torch.utils._pytree import tree_map_only
 
 from .cost_models.collective_runtime_estimation import estimate_strategy_comms_cost
 from .cost_models.compute_estimation import (
@@ -96,6 +96,11 @@ from .cost_models.compute_estimation import (
     estimate_strategy_runtime_cost,
 )
 from .graph_passes.graph_clustering import get_identical_regions
+from .graph_passes.graph_utils import (
+    all_input_nodes,
+    build_param_derived_set,
+    build_terminal_derived_set,
+)
 from .shardings.placement_options import get_placement_options_for_node
 from .shardings.propagation_rules import _create_all_options
 
@@ -243,7 +248,7 @@ class ShardingOptimizer:
     def _all_input_nodes(self, node):
         """Variant of node.all_input_nodes that preserves duplicate nodes."""
         # TODO: add kwargs?
-        return [x for x in tree_flatten(node.args)[0] if isinstance(x, torch.fx.Node)]
+        return all_input_nodes(node)
 
     def walk_over_options(self, node, constrain_arg=None):
         """Yield (argi, out_idx, inp_idx) for all valid strategy combinations."""
@@ -631,6 +636,61 @@ class ShardingOptimizer:
         self.add_output_input_consistent_constraint()
         self.add_inf_cost_constraint()
         self.add_forward_backward_consistency_constraints()
+
+    # ---- Prefetch overlap ----
+
+    def apply_prefetch_discount(self, scale=0.0):
+        """Discount communication costs for prefetchable edges.
+
+        Scales down comm costs for:
+        - Forward: edges where the producer is parameter-derived (FSDP
+          all-gathers that can be prefetched ahead of compute)
+        - Backward: edges into terminal-derived nodes (gradient
+          reduce-scatters that can overlap with earlier backward compute)
+
+        Must be called before get_solution(). A scale of 0.0 means fully
+        overlapped (free); 1.0 means no discount.
+
+        Returns the number of decision vars modified.
+        """
+        param_derived = build_param_derived_set(self.graph)
+        terminal_derived = build_terminal_derived_set(self.graph)
+
+        logger.debug(
+            "terminal_derived: %d param nodes, %d grad nodes",
+            len(get_param_nodes(self.graph)),
+            sum(
+                1
+                for _, grad in get_param_and_grad_nodes(self.graph).values()
+                if grad is not None
+            ),
+        )
+
+        n_modified = 0
+        for key, dv in self.decision_vars.items():
+            node_idx, argi, out_idx, inp_idx = key
+            node = self.nodes[node_idx]
+
+            input_nodes = self._all_input_nodes(node)
+            if not input_nodes:
+                continue
+            producer = input_nodes[argi]
+
+            is_prefetchable = producer in param_derived or node in terminal_derived
+            if is_prefetchable and dv.comm_cost > 0 and math.isfinite(dv.comm_cost):
+                dv.comm_cost *= scale
+                dv.cost = dv.comm_cost + dv.compute_cost + dv.sharding_transition_cost
+                n_modified += 1
+
+        logger.debug(
+            "apply_prefetch_discount(scale=%.2f): modified %d decision vars "
+            "(%d param-derived nodes, %d terminal-derived nodes)",
+            scale,
+            n_modified,
+            len(param_derived),
+            len(terminal_derived),
+        )
+        return n_modified
 
     # ---- Solution ----
 

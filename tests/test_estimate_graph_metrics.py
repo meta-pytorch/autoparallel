@@ -3,12 +3,10 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
-import pytest
 import torch
 from torch import nn
 from torch.distributed.tensor.placement_types import Replicate, Shard
 from torch.fx.experimental.proxy_tensor import make_fx
-from torch.testing._internal.distributed.fake_pg import FakeStore
 
 from autoparallel.api import AutoParallel
 from autoparallel.graph_passes.debug_helpers import (
@@ -16,32 +14,6 @@ from autoparallel.graph_passes.debug_helpers import (
     make_custom_runtime_estimation,
 )
 from autoparallel.graph_passes.estimate_graph_metrics import estimate_graph_metrics
-
-
-@pytest.fixture(scope="module", autouse=True)
-def init_pg():
-    if torch.distributed.is_initialized():
-        return
-    fake_store = FakeStore()
-    torch.distributed.init_process_group(
-        "fake", store=fake_store, rank=0, world_size=256
-    )
-
-
-@pytest.fixture(scope="module")
-def device_mesh():
-    world_size = torch.distributed.get_world_size()
-    return torch.distributed.device_mesh.init_device_mesh(
-        "cuda", (world_size,), mesh_dim_names=("dp",)
-    )
-
-
-@pytest.fixture(scope="module")
-def device_mesh_2d():
-    world_size = torch.distributed.get_world_size()
-    return torch.distributed.device_mesh.init_device_mesh(
-        "cuda", (world_size // 8, 8), mesh_dim_names=("dp", "tp")
-    )
 
 
 def _constant_estimator(dur):
@@ -96,7 +68,7 @@ def test_deterministic():
     assert m1 == m2
 
 
-def test_with_autoparallel(device_mesh):
+def test_with_autoparallel(device_mesh_1d):
     dim = 128
 
     class Model(nn.Module):
@@ -113,13 +85,13 @@ def test_with_autoparallel(device_mesh):
     with torch.device("meta"):
         model = Model()
 
-    with AutoParallel(model, input_fn, device_mesh) as autop:
+    with AutoParallel(model, input_fn, device_mesh_1d) as autop:
         autop.add_input_constraints([(Shard(0),)])
         autop.add_output_constraints([(Shard(0),)])
         sharding_placement = autop.optimize_placement()
         _ = autop.apply_placement(sharding_placement)
 
-    estimator = make_custom_runtime_estimation(device_mesh)
+    estimator = make_custom_runtime_estimation(device_mesh_1d)
     metrics = estimate_graph_metrics(autop.parallel_gm, estimator)
 
     assert metrics.total_time > 0
@@ -133,7 +105,7 @@ def test_with_autoparallel(device_mesh):
         assert metrics.communication_time > 0
 
 
-def _run_autoparallel(dim, device_mesh, *, model_cls, requires_grad=True):
+def _run_autoparallel(dim, device_mesh_1d, *, model_cls, requires_grad=True):
     """Run AutoParallel on a model and return the graph metrics."""
     with torch.device("meta"):
         model = model_cls()
@@ -145,17 +117,17 @@ def _run_autoparallel(dim, device_mesh, *, model_cls, requires_grad=True):
     def input_fn():
         return torch.rand(512, dim, device="cuda")
 
-    with AutoParallel(model, input_fn, device_mesh) as autop:
+    with AutoParallel(model, input_fn, device_mesh_1d) as autop:
         autop.add_input_constraints([(Shard(0),)])
         autop.add_output_constraints([(Shard(0),)])
         sharding_placement = autop.optimize_placement()
         _ = autop.apply_placement(sharding_placement)
 
-    estimator = make_custom_runtime_estimation(device_mesh)
+    estimator = make_custom_runtime_estimation(device_mesh_1d)
     return estimate_graph_metrics(autop.parallel_gm, estimator), autop.parallel_gm
 
 
-def test_training_vs_inference_metrics(device_mesh):
+def test_training_vs_inference_metrics(device_mesh_1d):
     """Training mode (with backward) should produce higher metrics than inference."""
     dim = 128
 
@@ -168,17 +140,17 @@ def test_training_vs_inference_metrics(device_mesh):
             return self.linear(x)
 
     train_metrics, _ = _run_autoparallel(
-        dim, device_mesh, model_cls=Model, requires_grad=True
+        dim, device_mesh_1d, model_cls=Model, requires_grad=True
     )
     infer_metrics, _ = _run_autoparallel(
-        dim, device_mesh, model_cls=Model, requires_grad=False
+        dim, device_mesh_1d, model_cls=Model, requires_grad=False
     )
 
     assert train_metrics.total_time > infer_metrics.total_time
     assert train_metrics.compute_time > infer_metrics.compute_time
 
 
-def test_multi_layer_model(device_mesh):
+def test_multi_layer_model(device_mesh_1d):
     """A deeper model should have more compute and communication than a single layer."""
     dim = 128
 
@@ -202,9 +174,9 @@ def test_multi_layer_model(device_mesh):
             x = self.linear2(x)
             return self.linear3(x)
 
-    single_metrics, _ = _run_autoparallel(dim, device_mesh, model_cls=SingleLayer)
+    single_metrics, _ = _run_autoparallel(dim, device_mesh_1d, model_cls=SingleLayer)
     triple_metrics, triple_gm = _run_autoparallel(
-        dim, device_mesh, model_cls=ThreeLayer
+        dim, device_mesh_1d, model_cls=ThreeLayer
     )
 
     assert triple_metrics.compute_time > single_metrics.compute_time
@@ -215,7 +187,7 @@ def test_multi_layer_model(device_mesh):
     assert triple_metrics.communication_time > 0
 
 
-def test_inference_mode(device_mesh):
+def test_inference_mode(device_mesh_1d):
     """Forward-only graph should have no tangent placeholders and valid metrics."""
     dim = 128
 
@@ -228,7 +200,7 @@ def test_inference_mode(device_mesh):
             return self.linear(x)
 
     metrics, gm = _run_autoparallel(
-        dim, device_mesh, model_cls=Model, requires_grad=False
+        dim, device_mesh_1d, model_cls=Model, requires_grad=False
     )
 
     assert metrics.total_time > 0
@@ -240,7 +212,7 @@ def test_inference_mode(device_mesh):
     assert len(placeholders) == 2
 
 
-def test_guaranteed_communication(device_mesh):
+def test_guaranteed_communication(device_mesh_1d):
     """Training mode with sharded data must produce gradient collectives."""
     dim = 128
 
@@ -252,7 +224,7 @@ def test_guaranteed_communication(device_mesh):
         def forward(self, x):
             return self.linear(x)
 
-    metrics, gm = _run_autoparallel(dim, device_mesh, model_cls=Model)
+    metrics, gm = _run_autoparallel(dim, device_mesh_1d, model_cls=Model)
 
     num_comm = sum(1 for n in gm.graph.nodes if _is_communication_node(n))
     assert num_comm > 0, "Training with sharded data should require collectives"
