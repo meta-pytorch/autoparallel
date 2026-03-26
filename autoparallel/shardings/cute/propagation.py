@@ -274,15 +274,20 @@ def propagate_einsum(
     placements are already in place (no redistribution).
 
     For each mesh dimension, determines the output placement based on
-    how A and B are sharded:
+    how A and B are sharded. The only redistribution-free strategies are:
 
-    - A sharded on batch dim, B replicate: output sharded on batch (each
-      device computes its batch slice using B's full data). No communication.
-    - A sharded on M dim, B replicate: output sharded on M. No communication.
-    - B sharded on N dim, A replicate: output sharded on N. No communication.
-    - Both sharded on same contraction dim: output is partial (needs all-reduce
-      AFTER the op — this is inherent to the algorithm, not redistribution).
-    - Conflicting shardings (e.g. A on M, B on N same mesh dim): incompatible.
+    For mk,kn->mn:
+      (R, R) -> R
+      (S(m), R) -> S(m)       — A sharded on M, B replicate
+      (R, S(n)) -> S(n)       — A replicate, B sharded on N
+      (S(k), S(k)) -> P       — both sharded on contraction dim
+
+    For batch dims (appear in both inputs and output):
+      (S(b), S(b)) -> S(b)    — both sharded on same batch dim
+
+    Batch dims require BOTH inputs to be sharded identically because
+    the local matmul needs matching batch sizes. (S(b), R) is NOT free —
+    B has all batches locally but the matmul kernel sees mismatched shapes.
 
     Returns:
         output_placements tuple, or None if incompatible.
@@ -307,8 +312,7 @@ def propagate_einsum(
             continue
 
         if not pa.is_replicate() and not pb.is_replicate():
-            # Both sharded — must be on the same contraction dim for this
-            # to work without redistribution
+            # Both sharded — must be on the same dim label
             a_dim = pa.dim
             b_dim = pb.dim
             if (
@@ -319,72 +323,52 @@ def propagate_einsum(
             ):
                 a_label = inputs[0][a_dim]
                 b_label = inputs[1][b_dim]
-                if a_label == b_label and categories.get(a_label) == "contract":
-                    # Both on same contraction dim: partial output
-                    p = CutePlacement.replicate(mesh_size)
-                    p._is_partial = True
-                    output_placements.append(p)
-                    continue
-                elif a_label == b_label and categories.get(a_label) == "batch":
-                    # Both on same batch dim: output sharded on batch
-                    out_dim = out_label_to_dim[a_label]
-                    output_placements.append(
-                        CutePlacement(dim=out_dim, layout=pa.layout)
-                    )
-                    continue
+                if a_label == b_label:
+                    cat = categories.get(a_label, "other")
+                    if cat == "contract":
+                        p = CutePlacement.replicate(mesh_size)
+                        p._is_partial = True
+                        output_placements.append(p)
+                        continue
+                    elif cat == "batch":
+                        out_dim = out_label_to_dim[a_label]
+                        output_placements.append(
+                            CutePlacement(dim=out_dim, layout=pa.layout)
+                        )
+                        continue
 
-            # Conflicting shardings on this mesh dim — incompatible
             return None
 
         # Exactly one is sharded
         if not pa.is_replicate():
-            # A is sharded, B is replicate
             a_dim = pa.dim
             if a_dim is None or a_dim >= len(inputs[0]):
                 return None
             label = inputs[0][a_dim]
             cat = categories.get(label, "other")
 
-            if cat == "batch":
-                # A sharded on batch, B replicate: each device picks its
-                # batch slice from replicated B. No communication.
+            if cat == "m":
                 out_dim = out_label_to_dim[label]
                 output_placements.append(
                     CutePlacement(dim=out_dim, layout=pa.layout)
                 )
-            elif cat == "m":
-                # A sharded on M, B replicate: output sharded on M
-                out_dim = out_label_to_dim[label]
-                output_placements.append(
-                    CutePlacement(dim=out_dim, layout=pa.layout)
-                )
-            elif cat == "contract":
-                # A sharded on K, B replicate: incompatible
-                # (B must also be sharded on K for partial output)
-                return None
             else:
+                # batch, contract, n, other — all incompatible when only A is sharded
                 return None
         else:
-            # B is sharded, A is replicate
             b_dim = pb.dim
             if b_dim is None or b_dim >= len(inputs[1]):
                 return None
             label = inputs[1][b_dim]
             cat = categories.get(label, "other")
 
-            if cat == "batch":
+            if cat == "n":
                 out_dim = out_label_to_dim[label]
                 output_placements.append(
                     CutePlacement(dim=out_dim, layout=pb.layout)
                 )
-            elif cat == "n":
-                out_dim = out_label_to_dim[label]
-                output_placements.append(
-                    CutePlacement(dim=out_dim, layout=pb.layout)
-                )
-            elif cat == "contract":
-                return None
             else:
+                # batch, contract, m, other — all incompatible when only B is sharded
                 return None
 
     return tuple(output_placements)

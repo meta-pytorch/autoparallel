@@ -250,13 +250,83 @@ class TestViewPropagation(unittest.TestCase):
 
 
 class TestEinsumPropagation(unittest.TestCase):
-    """Test einsum/matmul propagation — all redistribution-free."""
+    """Test einsum/matmul propagation — all redistribution-free.
 
-    def test_mm_a_batch_shard_b_replicate(self):
-        """bmk,bkn->bmn: A=Shard(batch), B=Replicate.
+    For mk,kn->mn, the only valid strategies are:
+      (R, R) -> R
+      (S(m), R) -> S(m)
+      (R, S(n)) -> S(n)
+      (S(k), S(k)) -> P
 
-        Each device has its batch slice of A and full B.
-        Computes C[d] = A[d] @ B[d] locally. No communication.
+    For batch dims: both inputs must be sharded identically.
+    """
+
+    def test_both_replicate(self):
+        D = 2
+        pa = (CutePlacement.replicate(D),)
+        pb = (CutePlacement.replicate(D),)
+        out = propagate_einsum("mk,kn->mn", pa, pb, (16, 8), (8, 32), (D,))
+        self.assertIsNotNone(out)
+        self.assertTrue(out[0].is_replicate())
+
+    def test_mm_m_shard(self):
+        """mk,kn->mn: A=Shard(m), B=Replicate -> S(m)."""
+        D = 2
+        pa = (CutePlacement.shard(0, 16, D),)
+        pb = (CutePlacement.replicate(D),)
+        out = propagate_einsum("mk,kn->mn", pa, pb, (16, 8), (8, 32), (D,))
+        self.assertIsNotNone(out)
+        self.assertEqual(out[0].dim, 0)
+
+    def test_mm_n_shard(self):
+        """mk,kn->mn: A=Replicate, B=Shard(n) -> S(n)."""
+        D = 2
+        pa = (CutePlacement.replicate(D),)
+        pb = (CutePlacement.shard(1, 32, D),)
+        out = propagate_einsum("mk,kn->mn", pa, pb, (16, 8), (8, 32), (D,))
+        self.assertIsNotNone(out)
+        self.assertEqual(out[0].dim, 1)
+
+    def test_mm_k_shard_both(self):
+        """mk,kn->mn: Both Shard(k) -> Partial."""
+        D = 2
+        pa = (CutePlacement.shard(1, 8, D),)
+        pb = (CutePlacement.shard(0, 8, D),)
+        out = propagate_einsum("mk,kn->mn", pa, pb, (16, 8), (8, 32), (D,))
+        self.assertIsNotNone(out)
+        self.assertTrue(hasattr(out[0], "_is_partial") and out[0]._is_partial)
+
+    def test_mm_k_shard_only_a_incompatible(self):
+        """mk,kn->mn: A=Shard(k), B=Replicate -> incompatible."""
+        D = 2
+        pa = (CutePlacement.shard(1, 8, D),)
+        pb = (CutePlacement.replicate(D),)
+        out = propagate_einsum("mk,kn->mn", pa, pb, (16, 8), (8, 32), (D,))
+        self.assertIsNone(out)
+
+    def test_mm_conflicting_shardings_incompatible(self):
+        """mk,kn->mn: A=Shard(m), B=Shard(n) on same mesh dim -> incompatible."""
+        D = 2
+        pa = (CutePlacement.shard(0, 16, D),)
+        pb = (CutePlacement.shard(1, 32, D),)
+        out = propagate_einsum("mk,kn->mn", pa, pb, (16, 8), (8, 32), (D,))
+        self.assertIsNone(out)
+
+    def test_batch_both_sharded(self):
+        """bmk,bkn->bmn: Both Shard(batch) -> S(batch)."""
+        D = 2
+        pa = (CutePlacement.shard(0, 4, D),)
+        pb = (CutePlacement.shard(0, 4, D),)
+        out = propagate_einsum(
+            "bmk,bkn->bmn", pa, pb, (4, 8, 16), (4, 16, 32), (D,)
+        )
+        self.assertIsNotNone(out)
+        self.assertEqual(out[0].dim, 0)
+
+    def test_batch_a_only_incompatible(self):
+        """bmk,bkn->bmn: A=Shard(batch), B=Replicate -> incompatible.
+
+        Local matmul would see (B/D, M, K) @ (B, K, N) — batch mismatch.
         """
         D = 2
         pa = (CutePlacement.shard(0, 4, D),)
@@ -264,44 +334,20 @@ class TestEinsumPropagation(unittest.TestCase):
         out = propagate_einsum(
             "bmk,bkn->bmn", pa, pb, (4, 8, 16), (4, 16, 32), (D,)
         )
-        self.assertIsNotNone(out)
-        self.assertEqual(out[0].dim, 0)
-        self.assertFalse(out[0].is_replicate())
+        self.assertIsNone(out)
 
-    def test_mm_a_replicate_b_batch_shard(self):
-        """bmk,bkn->bmn: A=Replicate, B=Shard(batch).
-
-        Symmetric to above. No communication.
-        """
+    def test_batch_b_only_incompatible(self):
+        """bmk,bkn->bmn: A=Replicate, B=Shard(batch) -> incompatible."""
         D = 2
         pa = (CutePlacement.replicate(D),)
         pb = (CutePlacement.shard(0, 4, D),)
         out = propagate_einsum(
             "bmk,bkn->bmn", pa, pb, (4, 8, 16), (4, 16, 32), (D,)
         )
-        self.assertIsNotNone(out)
-        self.assertEqual(out[0].dim, 0)
+        self.assertIsNone(out)
 
-    def test_mm_both_batch_shard(self):
-        """bmk,bkn->bmn: Both sharded on batch.
-
-        Each device has matching batch slices. No communication.
-        """
-        D = 2
-        pa = (CutePlacement.shard(0, 4, D),)
-        pb = (CutePlacement.shard(0, 4, D),)
-        out = propagate_einsum(
-            "bmk,bkn->bmn", pa, pb, (4, 8, 16), (4, 16, 32), (D,)
-        )
-        self.assertIsNotNone(out)
-        self.assertEqual(out[0].dim, 0)
-
-    def test_mm_m_shard(self):
-        """bmk,bkn->bmn: A=Shard(m), B=Replicate.
-
-        Each device has its M slice of A. Computes its M slice of output.
-        B is fully available. No communication.
-        """
+    def test_batch_m_shard(self):
+        """bmk,bkn->bmn: A=Shard(m), B=Replicate -> S(m)."""
         D = 2
         pa = (CutePlacement.shard(1, 8, D),)
         pb = (CutePlacement.replicate(D),)
@@ -309,67 +355,15 @@ class TestEinsumPropagation(unittest.TestCase):
             "bmk,bkn->bmn", pa, pb, (4, 8, 16), (4, 16, 32), (D,)
         )
         self.assertIsNotNone(out)
-        self.assertEqual(out[0].dim, 1)  # m dim in output
+        self.assertEqual(out[0].dim, 1)
 
-    def test_mm_n_shard(self):
-        """bmk,bkn->bmn: A=Replicate, B=Shard(n).
-
-        Each device has its N slice of B. Computes its N slice of output.
-        A is fully available. No communication.
-        """
-        D = 2
-        pa = (CutePlacement.replicate(D),)
-        pb = (CutePlacement.shard(2, 32, D),)
-        out = propagate_einsum(
-            "bmk,bkn->bmn", pa, pb, (4, 8, 16), (4, 16, 32), (D,)
-        )
-        self.assertIsNotNone(out)
-        self.assertEqual(out[0].dim, 2)  # n dim in output
-
-    def test_mm_k_shard_both(self):
-        """bmk,bkn->bmn: Both sharded on K (contraction).
-
-        Each device computes partial result. Needs all-reduce AFTER
-        (inherent to algorithm, not redistribution).
-        """
-        D = 2
-        pa = (CutePlacement.shard(2, 16, D),)
-        pb = (CutePlacement.shard(1, 16, D),)
-        out = propagate_einsum(
-            "bmk,bkn->bmn", pa, pb, (4, 8, 16), (4, 16, 32), (D,)
-        )
-        self.assertIsNotNone(out)
-        self.assertTrue(hasattr(out[0], "_is_partial") and out[0]._is_partial)
-
-    def test_mm_k_shard_only_a_incompatible(self):
-        """bmk,bkn->bmn: A=Shard(k), B=Replicate -> incompatible.
-
-        Can't compute partial mm if only one input is sharded on K.
-        """
-        D = 2
-        pa = (CutePlacement.shard(2, 16, D),)
-        pb = (CutePlacement.replicate(D),)
-        out = propagate_einsum(
-            "bmk,bkn->bmn", pa, pb, (4, 8, 16), (4, 16, 32), (D,)
-        )
-        self.assertIsNone(out)
-
-    def test_mm_conflicting_shardings_incompatible(self):
-        """bmk,bkn->bmn: A=Shard(m), B=Shard(n) on same mesh dim -> incompatible."""
-        D = 2
-        pa = (CutePlacement.shard(1, 8, D),)  # m
-        pb = (CutePlacement.shard(2, 32, D),)  # n
-        out = propagate_einsum(
-            "bmk,bkn->bmn", pa, pb, (4, 8, 16), (4, 16, 32), (D,)
-        )
-        self.assertIsNone(out)
-
-    def test_mm_cute_batch_shard(self):
-        """bmk,bkn->bmn: CuTe hierarchical shard on batch passes through."""
-        D = 2
+    def test_cute_batch_shard(self):
+        """bmk,bkn->bmn: CuTe hierarchical shard on batch passes through
+        when both inputs have it."""
+        D = 4
         cute_layout = Layout((2, 2), (4, 1))
         pa = (CutePlacement(dim=0, layout=cute_layout),)
-        pb = (CutePlacement.replicate(D),)
+        pb = (CutePlacement(dim=0, layout=cute_layout),)
         out = propagate_einsum(
             "bmk,bkn->bmn", pa, pb, (4, 8, 16), (4, 16, 32), (D,)
         )
@@ -382,22 +376,9 @@ class TestEinsumPropagation(unittest.TestCase):
         D = 4
         pa = (CutePlacement.shard(0, 16, D),)
         pb = (CutePlacement.replicate(D),)
-        out = propagate_einsum(
-            "mk,kn->mn", pa, pb, (16, 8), (8, 32), (D,)
-        )
+        out = propagate_einsum("mk,kn->mn", pa, pb, (16, 8), (8, 32), (D,))
         self.assertIsNotNone(out)
         self.assertEqual(out[0].dim, 0)
-
-    def test_both_replicate(self):
-        """Both replicate -> output replicate."""
-        D = 2
-        pa = (CutePlacement.replicate(D),)
-        pb = (CutePlacement.replicate(D),)
-        out = propagate_einsum(
-            "mk,kn->mn", pa, pb, (16, 8), (8, 32), (D,)
-        )
-        self.assertIsNotNone(out)
-        self.assertTrue(out[0].is_replicate())
 
 
 class TestPointwisePropagation(unittest.TestCase):
