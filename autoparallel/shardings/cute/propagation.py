@@ -13,14 +13,15 @@ All view cases (identity, flatten, split) use composition(R, tiler).
 
 from ._pycute import (
     Layout,
-    codomain_divide,
+    ScaledBasis,
+    coalesce,
     composition,
+    flatten,
     is_tuple,
     make_basis_like,
     make_layout,
     product,
 )
-from ._pycute.codomain_divide import _has_coord_strides
 from .placement import CutePlacement
 
 
@@ -107,6 +108,12 @@ def _build_inverse_mapping(dim_mapping):
                 ("split", out_dim, mapping[2], mapping[3])
             )
     return inv
+
+
+def _has_coord_strides(layout):
+    """Check if a layout has ScaledBasis (coordinate) strides."""
+    strides = flatten(layout.stride) if is_tuple(layout.stride) else (layout.stride,)
+    return any(isinstance(s, ScaledBasis) for s in strides)
 
 
 def _build_reshape_composition(entries, placement, input_shape):
@@ -198,23 +205,28 @@ def propagate_view(placements, input_shape, output_shape, mesh_sizes):
         result = composition(R, tiler)
 
         if _has_coord_strides(result):
-            # Split case: result already has E(k) coordinate strides.
-            # codomain_divide reads coverage directly — no re-composition.
+            # Split case: result has E(k) strides tagging each mode with
+            # its piece index. Coalesce merges modes within the same piece,
+            # then find the sharded piece by comparing size vs group_shape[k].
             group_shape = entries[0][2]
-            coverage = codomain_divide(result, group_shape)
+            result = coalesce(result)
 
-            sharded_pieces = [
-                k
-                for k in range(len(group_shape))
-                if coverage[k] < group_shape[k] and group_shape[k] > 1
-            ]
+            strides = flatten(result.stride) if is_tuple(result.stride) else (result.stride,)
+            shapes = flatten(result.shape) if is_tuple(result.shape) else (result.shape,)
 
-            if len(sharded_pieces) != 1:
-                return None
+            shard_piece = None
+            for stride, size in zip(strides, shapes):
+                if isinstance(stride, ScaledBasis):
+                    k = stride.index
+                    if size < group_shape[k]:
+                        if shard_piece is not None:
+                            return None  # multiple sharded pieces
+                        shard_piece = k
 
-            shard_piece = sharded_pieces[0]
+            if shard_piece is None:
+                return None  # all pieces full — shouldn't happen for a sharded input
+
             piece_size = group_shape[shard_piece]
-
             if piece_size % mesh_size != 0:
                 return None
 
