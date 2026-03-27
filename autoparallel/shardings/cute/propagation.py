@@ -7,17 +7,19 @@ All rules operate on CutePlacement with rank-2 layouts:
 Rules are strictly redistribution-free: they return output placements
 assuming the given inputs are already in place, or None if incompatible.
 
-View propagation follows: S_C = S_A . R where R is the reshape bijection.
-Flatten uses composition(R, tiler), split uses codomain_divide.
+View propagation follows S_C = S_A . R where R is the reshape bijection.
+All view cases (identity, flatten, split) use composition(R, tiler).
 """
 
 from ._pycute import (
     Layout,
+    ScaledBasis,
     coalesce,
     codomain_divide,
     composition,
     flatten,
     is_tuple,
+    make_basis_like,
     make_layout,
     product,
 )
@@ -109,12 +111,71 @@ def _build_inverse_mapping(dim_mapping):
     return inv
 
 
+def _has_coord_strides(layout):
+    """Check if a layout has ScaledBasis (coordinate) strides."""
+    for s in flatten(layout.stride) if is_tuple(layout.stride) else (layout.stride,):
+        if isinstance(s, ScaledBasis):
+            return True
+    return False
+
+
+def _build_reshape_composition(entries, placement, input_shape):
+    """
+    Build the reshape bijection R and tiler for S_C = composition(R, tiler).
+
+    Returns (R, tiler, device_stride, out_dim) or None if incompatible.
+    For split entries, out_dim is determined after inspecting the result.
+    """
+    shard_dim = placement.dim
+    mesh_size = placement.mesh_dim_size
+    entry = entries[0]
+
+    if entry[0] == "identity":
+        dim_size = input_shape[shard_dim]
+        if dim_size % mesh_size != 0:
+            return None
+        local_shard = dim_size // mesh_size
+        R = Layout(dim_size)
+        tiler = Layout(local_shard)
+        device_stride = local_shard
+        return R, tiler, device_stride, entry[1]
+
+    elif entry[0] == "flatten":
+        in_dims = entry[2]
+        pos = in_dims.index(shard_dim)
+        dim_sizes = tuple(input_shape[d] for d in in_dims)
+        shard_dim_size = dim_sizes[pos]
+
+        if shard_dim_size % mesh_size != 0:
+            return None
+        local_shard = shard_dim_size // mesh_size
+
+        R = Layout(dim_sizes)
+        tiler = tuple(
+            Layout(local_shard) if k == pos else Layout(dim_sizes[k])
+            for k in range(len(dim_sizes))
+        )
+        R_stride_at_pos = R.stride[pos] if is_tuple(R.stride) else R.stride
+        device_stride = R_stride_at_pos * local_shard
+        return R, tiler, device_stride, entry[1]
+
+    elif entries[0][0] == "split":
+        group_shape = entries[0][2]
+        # Use coordinate strides so composition tags per-piece coverage
+        R = Layout(group_shape, make_basis_like(group_shape))
+        local_layout = Layout(placement.local_shape, placement.local_stride)
+        tiler = local_layout
+        return R, tiler, None, None  # out_dim determined from result
+
+    return None
+
+
 def propagate_view(placements, input_shape, output_shape, mesh_sizes):
     """
     Propagate CutePlacements through a view/reshape operation.
 
     Each device performs a local view — no communication involved.
-    Follows S_C = S_A . R where R is the reshape bijection.
+    All cases follow S_C = S_A . R via composition(R, tiler).
 
     Returns:
         tuple of CutePlacement, or None if incompatible.
@@ -137,13 +198,23 @@ def propagate_view(placements, input_shape, output_shape, mesh_sizes):
 
         entries = inv_mapping[shard_dim]
 
-        # --- Split: input dim maps to multiple output dims ---
-        if entries[0][0] == "split":
-            group_shape = entries[0][2]
+        # Build R and tiler for this reshape
+        args = _build_reshape_composition(entries, placement, input_shape)
+        if args is None:
+            return None
+        R, tiler, device_stride, out_dim = args
 
-            # codomain_divide: composition with coordinate strides
-            local_layout = Layout(placement.local_shape, placement.local_stride)
-            coverage = codomain_divide(local_layout, group_shape)
+        # S_C_local = composition(R, tiler)
+        result = composition(R, tiler)
+
+        if _has_coord_strides(result):
+            # Split case: coordinate strides tag per-piece coverage.
+            # Find the sharded piece and create a simple Shard on it.
+            group_shape = entries[0][2]
+            coverage = codomain_divide(
+                Layout(placement.local_shape, placement.local_stride),
+                group_shape,
+            )
 
             sharded_pieces = [
                 k
@@ -164,50 +235,14 @@ def propagate_view(placements, input_shape, output_shape, mesh_sizes):
             if target_entry is None:
                 return None
 
-            out_dim = target_entry[1]
-            output_places.append(CutePlacement.shard(out_dim, piece_size, mesh_size))
-            continue
-
-        entry = entries[0]
-
-        # --- Identity: dim maps 1:1 ---
-        if entry[0] == "identity":
-            out_dim = entry[1]
-            output_places.append(CutePlacement(dim=out_dim, layout=placement.layout))
-
-        # --- Flatten: multiple input dims collapse into one ---
-        elif entry[0] == "flatten":
-            out_dim = entry[1]
-            in_dims = entry[2]
-            pos = in_dims.index(shard_dim)
-            dim_sizes = tuple(input_shape[d] for d in in_dims)
-            shard_dim_size = dim_sizes[pos]
-
-            if shard_dim_size % mesh_size != 0:
-                return None
-
-            local_shard = shard_dim_size // mesh_size
-
-            # S_C = composition(R, tiler) where:
-            # R = Layout(dim_sizes) — the reshape bijection for the flatten group
-            # tiler = identity on non-sharded dims, local shard on sharded dim
-            R = Layout(dim_sizes)
-            tiler = tuple(
-                Layout(local_shard) if k == pos else Layout(dim_sizes[k])
-                for k in range(len(dim_sizes))
+            output_places.append(
+                CutePlacement.shard(target_entry[1], piece_size, mesh_size)
             )
-            S_C_local = composition(R, tiler)
-
-            # Re-add device mode: stride = distance between consecutive devices
-            device_stride = (
-                R.stride[pos] if is_tuple(R.stride) else R.stride
-            ) * local_shard
-
-            out_layout = make_layout(Layout(mesh_size, device_stride), S_C_local)
-            output_places.append(CutePlacement(dim=out_dim, layout=out_layout))
-
         else:
-            return None
+            # Identity/Flatten case: result IS the local output layout.
+            # Re-add device mode.
+            out_layout = make_layout(Layout(mesh_size, device_stride), result)
+            output_places.append(CutePlacement(dim=out_dim, layout=out_layout))
 
     return tuple(output_places)
 
