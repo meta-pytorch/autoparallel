@@ -57,11 +57,33 @@ class TestTiledLayout(unittest.TestCase):
         self.assertEqual(t1, t2)
 
     def test_shard_layout_derived(self):
-        """shard_layout is derived from logical_divide."""
+        """shard_layout is derived from sequential logical_divide."""
         t = TiledLayout.shard((4, 8, 16), shard_dim=1, mesh_dim_size=2)
         sl = t.shard_layout
-        # Should have tile (local) and rest (mesh)
         self.assertEqual(sl.size(), 512)
+
+    def test_shard_multi_s0s0(self):
+        """S(0),S(0) on (8, 16) with mesh (2, 4)."""
+        t = TiledLayout.shard_multi((8, 16), [(0, 2), (0, 4)])
+        self.assertFalse(t.is_replicate())
+        self.assertEqual(len(t.mesh_tilers), 2)
+        placements = t.get_placements()
+        self.assertEqual(placements[0], ("shard", 0, 2))
+        self.assertEqual(placements[1], ("shard", 0, 4))
+
+    def test_shard_multi_s0s1(self):
+        """S(0),S(1) on (4, 8, 16) with mesh (2, 4)."""
+        t = TiledLayout.shard_multi((4, 8, 16), [(0, 2), (1, 4)])
+        placements = t.get_placements()
+        self.assertEqual(placements[0], ("shard", 0, 2))
+        self.assertEqual(placements[1], ("shard", 1, 4))
+
+    def test_shard_multi_view_invariant(self):
+        """S(0),S(1) through view: tilers invariant."""
+        t = TiledLayout.shard_multi((4, 8, 16), [(0, 2), (1, 4)])
+        v = propagate_view(t, (32, 16))
+        self.assertIsNotNone(v)
+        self.assertEqual(v.mesh_tilers, t.mesh_tilers)
 
 
 class TestViewPropagation(unittest.TestCase):
@@ -72,14 +94,14 @@ class TestViewPropagation(unittest.TestCase):
         self.assertIsNotNone(out)
         self.assertEqual(out.tensor_shape, (32, 16))
         # mesh_tiler invariant
-        self.assertEqual(out.mesh_tiler, t.mesh_tiler)
+        self.assertEqual(out.mesh_tilers, t.mesh_tilers)
 
     def test_unflatten(self):
         t = TiledLayout.shard((32, 16), shard_dim=0, mesh_dim_size=2)
         out = propagate_view(t, (4, 8, 16))
         self.assertIsNotNone(out)
         self.assertEqual(out.tensor_shape, (4, 8, 16))
-        self.assertEqual(out.mesh_tiler, t.mesh_tiler)
+        self.assertEqual(out.mesh_tilers, t.mesh_tilers)
 
     def test_replicate_through_view(self):
         t = TiledLayout.replicate((4, 8, 16))
@@ -91,7 +113,7 @@ class TestViewPropagation(unittest.TestCase):
         original = TiledLayout.shard((4, 8, 16), shard_dim=1, mesh_dim_size=2)
         after_flat = propagate_view(original, (32, 16))
         after_unflat = propagate_view(after_flat, (4, 8, 16))
-        self.assertEqual(after_unflat.mesh_tiler, original.mesh_tiler)
+        self.assertEqual(after_unflat.mesh_tilers, original.mesh_tilers)
 
     def test_incompatible(self):
         t = TiledLayout.shard((4, 8, 16), shard_dim=0, mesh_dim_size=2)
@@ -103,9 +125,9 @@ class TestViewPropagation(unittest.TestCase):
         v1 = propagate_view(t, (32, 16))
         v2 = propagate_view(v1, (2, 16, 16))
         v3 = propagate_view(v2, (4, 8, 16))
-        self.assertEqual(t.mesh_tiler, v1.mesh_tiler)
-        self.assertEqual(t.mesh_tiler, v2.mesh_tiler)
-        self.assertEqual(t.mesh_tiler, v3.mesh_tiler)
+        self.assertEqual(t.mesh_tilers, v1.mesh_tilers)
+        self.assertEqual(t.mesh_tilers, v2.mesh_tilers)
+        self.assertEqual(t.mesh_tilers, v3.mesh_tilers)
 
 
 class TestTransposePropagation(unittest.TestCase):
@@ -115,7 +137,7 @@ class TestTransposePropagation(unittest.TestCase):
         out = propagate_transpose(t, 0, 1)
         self.assertEqual(out.tensor_shape, (8, 4, 16))
         # tiler modes also swapped
-        self.assertNotEqual(out.mesh_tiler, t.mesh_tiler)
+        self.assertNotEqual(out.mesh_tilers, t.mesh_tilers)
 
     def test_transpose_replicate(self):
         t = TiledLayout.replicate((4, 8))
@@ -247,7 +269,7 @@ class TestPointwisePropagation(unittest.TestCase):
         b = TiledLayout.shard((8, 16), shard_dim=0, mesh_dim_size=2)
         out = propagate_pointwise([a, b], (8, 16))
         self.assertIsNotNone(out)
-        self.assertEqual(out.mesh_tiler, a.mesh_tiler)
+        self.assertEqual(out.mesh_tilers, a.mesh_tilers)
 
     def test_mismatch(self):
         a = TiledLayout.shard((8, 16), shard_dim=0, mesh_dim_size=2)
@@ -296,7 +318,7 @@ class TestEndToEnd(unittest.TestCase):
 
         after_v1 = propagate_view(input_t, (B * S, H))
         self.assertIsNotNone(after_v1)
-        self.assertEqual(after_v1.mesh_tiler, input_t.mesh_tiler)
+        self.assertEqual(after_v1.mesh_tilers, input_t.mesh_tilers)
 
         weight = TiledLayout.replicate((H, O))
         after_mm = propagate_einsum("mk,kn->mn", after_v1, weight, (B * S, O))
