@@ -94,99 +94,31 @@ def propagate_slice(tiled, dim, index):
     """
     Propagate TiledLayout through a slice (select a single index along dim).
 
-    C[...] = A[..., index, ...] where dim is fixed to index.
+    Uses CuTe's partial evaluation on tensor_layout.
 
-    If dim is sharded, this requires redistribution (not all devices have
-    the requested index) — returns None.
-
-    If dim is not sharded, each device has all values along dim, so
-    selecting index is a local operation. The shard_layout is composed
-    with a layout that maps the reduced element space to the original.
+    If dim is sharded, returns None (requires redistribution).
+    If dim is not sharded, rebuild shard for the output shape with
+    adjusted dim indices.
     """
     # Check if the sliced dim is sharded
     placements = tiled.get_placements()
     for p_type, p_dim in placements:
         if p_type == "shard" and p_dim == dim:
-            return None  # slicing a sharded dim requires redistribution
+            return None
 
-    # Build output tensor shape (remove the sliced dim)
+    # Slice tensor_layout using CuTe slicing
     t_shape = (
         tiled.tensor_layout.shape
         if is_tuple(tiled.tensor_layout.shape)
         else (tiled.tensor_layout.shape,)
     )
-    t_stride = (
-        tiled.tensor_layout.stride
-        if is_tuple(tiled.tensor_layout.stride)
-        else (tiled.tensor_layout.stride,)
+    slice_coord = tuple(index if k == dim else None for k in range(len(t_shape)))
+    new_tensor = tiled.tensor_layout(*slice_coord)
+    output_shape = (
+        new_tensor.shape if is_tuple(new_tensor.shape) else (new_tensor.shape,)
     )
-    output_shape = t_shape[:dim] + t_shape[dim + 1 :]
-    output_stride = t_stride[:dim] + t_stride[dim + 1 :]
 
-    if len(output_shape) == 0:
-        return None  # scalar output
-    if len(output_shape) == 1:
-        new_tensor = Layout(output_shape[0], output_stride[0])
-    else:
-        new_tensor = Layout(output_shape, output_stride)
-
-    # The slice selects elements at offset = index * stride[dim].
-    # Build a layout that maps output element indices to input element indices:
-    # output_elem_idx -> output_elem_idx + index * stride[dim]
-    # This is: composition(shard_layout, offset_layout)
-    # where offset_layout(i) = i + offset.
-    #
-    # CuTe doesn't have an "offset" operation in composition, but we can
-    # construct the mapping: the output elements are a subset of input
-    # elements. For row-major strides, the output element index i maps to
-    # input element index:
-    #   input_idx = (coords before dim) * strides + index * stride[dim] + (coords after dim) * strides
-    #
-    # Since element indices are row-major, the output element i corresponds
-    # to input element: i_before * (dim_size * stride_after) + index * stride_after + i_after
-    # where i = i_before * stride_after_without_dim + i_after.
-    #
-    # Simpler: input_elem = output_elem_expanded + index * elements_per_slice
-    # where we insert the fixed index at the right position.
-    #
-    # For row-major element indexing:
-    # input_element_idx(out_coords) = sum(c_k * input_elem_stride_k) where
-    # c_dim = index (fixed), others from output coords.
-
-    # Compute input element strides (row-major)
-    input_elem_strides = [1] * len(t_shape)
-    for k in range(len(t_shape) - 2, -1, -1):
-        input_elem_strides[k] = input_elem_strides[k + 1] * t_shape[k + 1]
-
-    # The offset from fixing dim to index
-    offset = index * input_elem_strides[dim]
-
-    # Output element strides (row-major over output shape)
-    out_elem_strides = [1] * len(output_shape)
-    for k in range(len(output_shape) - 2, -1, -1):
-        out_elem_strides[k] = out_elem_strides[k + 1] * output_shape[k + 1]
-
-    # Build a layout mapping output_elem_idx -> input_elem_idx
-    # output coords (c0, ..., c_{dim-1}, c_{dim+1}, ...) map to input elem:
-    # sum(c_k * input_elem_stride_k) + index * input_elem_stride_dim
-    # = sum(c_k * input_elem_stride_k_adjusted) + offset
-    slice_shape = list(output_shape)
-    slice_stride = list(input_elem_strides[:dim] + input_elem_strides[dim + 1 :])
-
-    if len(slice_shape) == 1:
-        slice_layout = Layout(slice_shape[0], slice_stride[0])
-    else:
-        slice_layout = Layout(tuple(slice_shape), tuple(slice_stride))
-
-    # New shard_layout: compose original shard with the slice mapping.
-    # shard maps (mesh, local) -> input_elem_idx
-    # We need: (mesh, local') -> output_elem_idx such that
-    # slice(output_elem_idx) + offset = input_elem_idx
-    #
-    # This is NOT a simple composition because of the offset.
-    # Instead, rebuild shard for the output shape based on placements.
-    # The shard pattern is the same — just on fewer dims.
-
+    # Rebuild shard for output shape with adjusted dim indices
     for p_type, p_dim in placements:
         if p_type == "shard":
             new_dim = p_dim if p_dim < dim else p_dim - 1
