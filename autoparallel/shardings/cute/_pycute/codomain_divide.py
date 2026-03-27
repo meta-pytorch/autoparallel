@@ -5,26 +5,27 @@ This is the dual of logical_divide:
   logical_divide(L, tiler)       -> reshape DOMAIN into (tile, rest)
   codomain_divide(L, group_shape) -> reshape CODOMAIN into per-piece coverage
 
-Given a layout L mapping local_idx -> flat_offset, and a group_shape (G0, G1, ...)
-that describes how to reshape the flat codomain, determine how many unique
-coordinates each piece covers.
-
-The flat codomain has row-major strides: S_k = product(group_shape[k+1:]).
-Each mode of L (with stride d and size s) falls into the piece k where
-S_k <= d < S_k * G_k. It contributes min(s, S_k * G_k / d) to piece k's
-coverage, with overflow becoming a virtual mode at stride S_k * G_k that
-is processed by outer pieces.
-
-This operation answers: "If I reshape the flat offsets this layout produces
-into (G0, G1, ...), how many unique values does each piece get?"
+Implemented as composition with a coordinate-producing split layout:
+  composition(Layout(group_shape, (E(0), E(1), ...)), layout)
+The result has E(k) strides tagging each mode with its piece index.
+Per-piece coverage is read from the mode sizes grouped by E(k).
 """
 
-from torch.distributed._pycute import flatten, is_tuple
+# Import composition from torch — we need it here but avoid circular imports
+# by importing at function level if needed
+from torch.distributed._pycute import composition, flatten, is_tuple
+
+from .scaled_basis import E, ScaledBasis, make_basis_like
 
 
 def codomain_divide(layout, group_shape):
     """
     Determine per-piece coverage when reshaping a layout's codomain.
+
+    Uses CuTe composition with coordinate-producing strides:
+    composition(Layout(group_shape, (E(0), E(1), ...)), layout)
+    decomposes the layout's modes through the split shape, tagging each
+    resulting mode with an E(k) stride indicating which piece it belongs to.
 
     Args:
         layout: A CuTe Layout mapping indices -> flat offsets.
@@ -37,49 +38,27 @@ def codomain_divide(layout, group_shape):
         If coverage[k] == group_shape[k], piece k is fully covered.
         If coverage[k] < group_shape[k], piece k is partially covered (sharded).
 
-    Complexity: O(modes × pieces) — no element enumeration.
+    Complexity: O(1) — structural composition on shape/stride, no enumeration.
     """
-    n_pieces = len(group_shape)
+    # Avoid circular: Layout is used by composition, import here
+    from torch.distributed._pycute import Layout as _Layout
 
-    # Row-major strides for the codomain shape
-    split_strides = [1] * n_pieces
-    for k in range(n_pieces - 2, -1, -1):
-        split_strides[k] = split_strides[k + 1] * group_shape[k + 1]
+    from .scaled_basis import make_basis_like
 
-    # Extract layout modes as (stride, size) pairs
-    if is_tuple(layout.shape):
-        modes = list(zip(flatten(layout.stride), flatten(layout.shape)))
+    coord_split = _Layout(group_shape, make_basis_like(group_shape))
+    result = composition(coord_split, layout)
+
+    # Extract modes and group by piece (E(k) stride)
+    if is_tuple(result.shape):
+        modes = list(zip(flatten(result.stride), flatten(result.shape)))
     else:
-        modes = [(layout.stride, layout.shape)]
+        modes = [(result.stride, result.shape)]
 
+    n_pieces = len(group_shape)
     coverage = {k: 1 for k in range(n_pieces)}
 
-    for mode_stride, mode_size in modes:
-        if mode_size <= 1:
-            continue
-
-        # Process this mode through pieces from innermost to outermost.
-        # A mode at stride d with size s falls into piece k where S_k <= d < S_k*G_k.
-        # It contributes steps_in_piece = min(s, S_k*G_k / d) to piece k.
-        # If s > steps_in_piece, the overflow has effective stride S_k*G_k
-        # and size s // steps_in_piece, processed by outer pieces.
-        current_stride = mode_stride
-        remaining = mode_size
-
-        for k in range(n_pieces - 1, -1, -1):
-            if remaining <= 1:
-                break
-            piece_stride = split_strides[k]
-            piece_end = piece_stride * group_shape[k]
-
-            if current_stride >= piece_stride and current_stride < piece_end:
-                steps_in_piece = piece_end // current_stride
-                contrib = min(remaining, steps_in_piece)
-                coverage[k] *= contrib
-                if remaining > steps_in_piece:
-                    remaining = remaining // steps_in_piece
-                    current_stride = piece_end  # overflow stride
-                else:
-                    remaining = 0
+    for stride, size in modes:
+        if isinstance(stride, ScaledBasis):
+            coverage[stride.index] *= size
 
     return coverage
