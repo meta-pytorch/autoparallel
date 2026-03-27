@@ -17,14 +17,6 @@ from autoparallel.shardings.placement_options import (
 from autoparallel.shardings.propagation_rules import remove_invalid_configs
 
 
-@pytest.fixture(scope="module")
-def device_mesh_2d():
-    world_size = torch.distributed.get_world_size()
-    return torch.distributed.device_mesh.init_device_mesh(
-        "cuda", (world_size // 8, 8), mesh_dim_names=("dp", "tp")
-    )
-
-
 def _make_tensor_meta(shape, dtype=torch.float32):
     t = torch.empty(shape, dtype=dtype, device="meta")
     return TensorMeta(t.shape, t.stride(), t.dtype)

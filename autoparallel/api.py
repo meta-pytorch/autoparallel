@@ -347,7 +347,9 @@ class AutoParallel:
                 "name": "autoparallel_sharding_optimizer_log",
                 "encoding": "string",
             },
-            payload_fn=lambda: self.sharding_optimizer.get_log(colored=False),
+            payload_fn=lambda: self.sharding_optimizer.get_log(
+                verbose=True, colored=False
+            ),
         )
 
         if self.sharding_optimizer.prob.status == -1:

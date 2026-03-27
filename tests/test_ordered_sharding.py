@@ -6,7 +6,6 @@
 from contextlib import ExitStack
 from unittest.mock import patch
 
-import pytest
 import torch
 from torch import nn
 from torch._functorch._aot_autograd.fx_utils import get_param_and_grad_nodes
@@ -14,7 +13,6 @@ from torch._functorch.aot_autograd import aot_export_joint_with_descriptors
 from torch.distributed._tensor.placement_types import DTensorSpec
 from torch.distributed.tensor._op_schema import OpSpec
 from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
-from torch.testing._internal.distributed.fake_pg import FakeStore
 
 from autoparallel.api import AutoParallel
 from autoparallel.shardings.ordered_sharding import (
@@ -349,31 +347,6 @@ class TestBuildParamGradLinearChains:
                 f"Node {node.name} in chain has {len(node.all_input_nodes)} inputs, "
                 f"expected 1"
             )
-
-
-@pytest.fixture(scope="module", autouse=True)
-def init_pg():
-    world_size = 256
-    fake_store = FakeStore()
-    if torch.distributed.is_initialized():
-        return
-    torch.distributed.init_process_group(
-        "fake", store=fake_store, rank=0, world_size=world_size
-    )
-
-
-@pytest.fixture(scope="module")
-def device_mesh_2d():
-    world_size = torch.distributed.get_world_size()
-    mesh = torch.distributed.device_mesh.init_device_mesh(
-        "cuda",
-        (world_size // 8, 8),
-        mesh_dim_names=(
-            "dp",
-            "tp",
-        ),
-    )
-    return mesh
 
 
 class ModelWithNonTrainableParams(nn.Module):

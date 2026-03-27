@@ -6,6 +6,10 @@
 from typing import Union
 
 import torch
+from torch._functorch._aot_autograd.fx_utils import (
+    get_param_and_grad_nodes,
+    get_param_nodes,
+)
 from torch._functorch._aot_autograd.subclass_utils import create_subclass_meta
 from torch._functorch.aot_autograd import JointWithDescriptors
 from torch._inductor.fx_passes.joint_graph import patterns
@@ -13,6 +17,7 @@ from torch._inductor.fx_passes.post_grad import remove_assert_ops, remove_noop_o
 from torch._inductor.pattern_matcher import stable_topological_sort
 from torch.fx import GraphModule
 from torch.fx.experimental._backward_state import BackwardState
+from torch.utils._pytree import tree_flatten
 
 
 def cleanup_graph(gm: torch.fx.GraphModule, aggressive: bool = False) -> None:
@@ -288,3 +293,48 @@ def _replace_view_mm_view_with_einsum(gm):
             replaced_node.replace_all_uses_with(new_node)
     gm.graph.eliminate_dead_code()
     gm.recompile()
+
+
+def all_input_nodes(node: torch.fx.Node) -> list[torch.fx.Node]:
+    """Variant of node.all_input_nodes that preserves duplicate nodes."""
+    return [x for x in tree_flatten(node.args)[0] if isinstance(x, torch.fx.Node)]
+
+
+def build_param_derived_set(graph: torch.fx.Graph) -> set[torch.fx.Node]:
+    """Compute the set of nodes whose inputs are ALL parameter-derived.
+
+    A node is parameter-derived if every one of its inputs is either a
+    parameter placeholder or itself parameter-derived. This propagates
+    through dtype_cast, views, aliases, etc.
+    """
+    param_derived = set(get_param_nodes(graph))
+    for node in graph.nodes:
+        inputs = all_input_nodes(node)
+        if inputs and all(inp in param_derived for inp in inputs):
+            param_derived.add(node)
+    return param_derived
+
+
+def build_terminal_derived_set(graph: torch.fx.Graph) -> set[torch.fx.Node]:
+    """Compute the set of nodes in the parameter gradient reduce-scatter chain.
+
+    A node is in this set if every one of its users is either a parameter
+    gradient node or itself in this set. This captures only the tail end
+    of the gradient chain (alias/view nodes right before the output), not
+    the backward matmuls that compute the gradients.
+    """
+    # Seed with the grad nodes themselves — these are the terminal outputs
+    # for parameter gradients and their only user is the output node.
+    terminal_derived: set[torch.fx.Node] = set()
+    for param, grad in get_param_and_grad_nodes(graph).values():
+        if grad is not None:
+            terminal_derived.add(grad)
+
+    # Walk backward: a node is terminal-derived if ALL its users are
+    # already in the terminal_derived set.
+    for node in reversed(list(graph.nodes)):
+        if node.op == "output":
+            continue
+        if node.users and all(u in terminal_derived for u in node.users):
+            terminal_derived.add(node)
+    return terminal_derived
