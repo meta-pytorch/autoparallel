@@ -227,7 +227,10 @@ def propagate_einsum(equation, tiled_a, tiled_b, output_shape):
 
 
 def propagate_pointwise(all_tileds, output_shape):
-    """Pointwise: all inputs must have compatible mesh_tilers."""
+    """Pointwise: all inputs must have compatible mesh_tilers.
+
+    Pointwise is identity on coordinates — same shard pattern passes through.
+    """
     if not all_tileds:
         return None
 
@@ -249,23 +252,54 @@ def propagate_pointwise(all_tileds, output_shape):
 # =============================================================================
 
 
+def _make_reduce_layout(layout, reduce_dim):
+    """Build projection layout that removes reduce_dim using E(k) strides."""
+    shape = layout.shape if is_tuple(layout.shape) else (layout.shape,)
+    ndim = len(shape)
+    out_shape = []
+    out_stride = []
+    for k in range(ndim):
+        if k != reduce_dim:
+            out_shape.append(shape[k])
+            out_stride.append(E(k))
+    if len(out_shape) == 1:
+        return Layout(out_shape[0], out_stride[0])
+    return Layout(tuple(out_shape), tuple(out_stride))
+
+
 def propagate_reduction(tiled, reduce_dim, keepdim, output_shape):
-    """Reduction: sharded dim reduced -> Partial. Otherwise adjust."""
+    """Reduction = composition with projection that removes reduce_dim.
+
+    If sharded dim reduced -> Partial (tiler becomes replicate after projection).
+    """
+    # Check if reduce_dim is sharded
     placements = tiled.get_placements()
+    is_sharded_reduce = any(
+        e[0] == "shard" and e[1] == reduce_dim for e in placements
+    )
 
-    for entry in placements:
-        if entry[0] == "shard" and entry[1] == reduce_dim:
-            result = TiledLayout.replicate(output_shape)
-            result._is_partial = True
-            return result
+    if keepdim:
+        # keepdim: output has same rank, reduced dim size 1
+        # Use slice at index 0 on the reduced dim (size 1 = same as any index)
+        new_tensor = Layout(output_shape)
+        # Tilers: reduce_dim becomes size 1
+        new_tilers = []
+        for tiler in tiled.mesh_tilers:
+            t_shape = tiler.shape if is_tuple(tiler.shape) else (tiler.shape,)
+            new_shape = tuple(1 if k == reduce_dim else t_shape[k] for k in range(len(t_shape)))
+            t_stride = tiler.stride if is_tuple(tiler.stride) else (tiler.stride,)
+            new_tilers.append(Layout(new_shape, t_stride))
+        result = TiledLayout(new_tensor, tuple(new_tilers))
+    else:
+        # Project out reduce_dim via composition with E(k) projection
+        new_tensor = composition(tiled.tensor_layout, _make_reduce_layout(tiled.tensor_layout, reduce_dim))
+        new_tilers = tuple(
+            composition(t, _make_reduce_layout(t, reduce_dim))
+            for t in tiled.mesh_tilers
+        )
+        result = TiledLayout(new_tensor, new_tilers)
 
-    # Rebuild for output shape
-    shard_specs = []
-    for entry in placements:
-        if entry[0] == "shard":
-            new_dim = entry[1] if entry[1] < reduce_dim or keepdim else entry[1] - 1
-            shard_specs.append((new_dim, entry[2]))
+    if is_sharded_reduce:
+        result._is_partial = True
 
-    if shard_specs:
-        return TiledLayout.shard_multi(output_shape, shard_specs)
-    return TiledLayout.replicate(output_shape)
+    return result
