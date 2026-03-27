@@ -194,20 +194,35 @@ def multiple_process_run(rank, world_size, tmp_dir, model, sharding_map):
             # reconstruct sharding_placement based on sharding_map instead
             # sharding_placement = autop.optimize_placement()
             sharding_placement = {}
+            new_strats = autop.sharding_optimizer.strats
             for node in autop.gm.graph.nodes:
                 fqn = node.name
                 if fqn in sharding_map:
-                    # Adjust sharding_map[fqn] to use a (2,2) mesh configuration
                     adjusted_value = sharding_map[fqn]
-                    for input_spec in adjusted_value.input_specs:
+
+                    # Update mesh and tensor_meta on all specs. The serialized
+                    # specs carry stale tensor_meta from the original mesh/batch
+                    # configuration; pull correct metadata from the new graph's
+                    # sharding strategies.
+                    new_node_strat = new_strats[node]
+                    ref_spec = new_node_strat.strategies[0]
+
+                    for i, input_spec in enumerate(adjusted_value.input_specs):
                         input_spec.mesh = mesh
+                        input_spec.tensor_meta = ref_spec.input_specs[i].tensor_meta
+
                     if isinstance(adjusted_value.output_specs, tuple):
-                        for output_spec in adjusted_value.output_specs:
+                        ref_out = ref_spec.output_specs
+                        for j, output_spec in enumerate(adjusted_value.output_specs):
                             if output_spec is None:
                                 continue
                             output_spec.mesh = mesh
+                            output_spec.tensor_meta = ref_out[j].tensor_meta
                     else:
                         adjusted_value.output_specs.mesh = mesh
+                        adjusted_value.output_specs.tensor_meta = (
+                            ref_spec.output_spec.tensor_meta
+                        )
                     sharding_placement[node] = adjusted_value
 
             parallel_mod = autop.apply_placement(sharding_placement)
