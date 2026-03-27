@@ -201,15 +201,13 @@ def propagate_view(placements, input_shape, output_shape, mesh_sizes):
             return None
         R, tiler, device_stride, out_dim = args
 
-        # S_C_local = composition(R, tiler)
-        result = composition(R, tiler)
+        # S_C = composition(R, tiler), then coalesce
+        result = coalesce(composition(R, tiler))
 
         if _has_coord_strides(result):
             # Split case: result has E(k) strides tagging each mode with
-            # its piece index. Coalesce merges modes within the same piece,
-            # then find the sharded piece by comparing size vs group_shape[k].
+            # its piece index. Find the sharded piece (size < group_shape[k]).
             group_shape = entries[0][2]
-            result = coalesce(result)
 
             strides = flatten(result.stride) if is_tuple(result.stride) else (result.stride,)
             shapes = flatten(result.shape) if is_tuple(result.shape) else (result.shape,)
@@ -224,7 +222,7 @@ def propagate_view(placements, input_shape, output_shape, mesh_sizes):
                         shard_piece = k
 
             if shard_piece is None:
-                return None  # all pieces full — shouldn't happen for a sharded input
+                return None
 
             piece_size = group_shape[shard_piece]
             if piece_size % mesh_size != 0:
@@ -234,14 +232,15 @@ def propagate_view(placements, input_shape, output_shape, mesh_sizes):
             if target_entry is None:
                 return None
 
-            output_places.append(
-                CutePlacement.shard(target_entry[1], piece_size, mesh_size)
-            )
-        else:
-            # Identity/Flatten case: result IS the local output layout.
-            # Re-add device mode.
-            out_layout = make_layout(Layout(mesh_size, device_stride), result)
-            output_places.append(CutePlacement(dim=out_dim, layout=out_layout))
+            # Local layout for the sharded piece: coverage contiguous elements
+            coverage = piece_size // mesh_size
+            out_dim = target_entry[1]
+            device_stride = coverage
+            result = Layout(coverage)
+
+        # Build output CutePlacement: (device_mode, local_layout)
+        out_layout = make_layout(Layout(mesh_size, device_stride), result)
+        output_places.append(CutePlacement(dim=out_dim, layout=out_layout))
 
     return tuple(output_places)
 
