@@ -1,8 +1,9 @@
 """
-Extended pycute with coordinate-producing strides (ScaledBasis).
+Extended pycute with coordinate-producing strides and codomain_divide.
 
-Re-exports everything from torch.distributed._pycute and adds
-ScaledBasis/ArithmeticTuple for coordinate layouts.
+Re-exports everything from torch.distributed._pycute and adds:
+- ScaledBasis/ArithmeticTuple for coordinate layouts
+- codomain_divide for codomain decomposition (dual of logical_divide)
 """
 
 from torch.distributed._pycute import *  # noqa: F401,F403
@@ -33,6 +34,7 @@ from torch.distributed._pycute import (
     suffix_product,
 )
 
+from .codomain_divide import codomain_divide
 from .scaled_basis import (
     ArithmeticTuple,
     E,

@@ -8,16 +8,7 @@ Rules are strictly redistribution-free: they return output placements
 assuming the given inputs are already in place, or None if incompatible.
 """
 
-from ._pycute import (
-    ArithmeticTuple,
-    E,
-    Layout,
-    coalesce,
-    flatten,
-    is_tuple,
-    make_basis_like,
-    product,
-)
+from ._pycute import Layout, coalesce, codomain_divide, flatten, is_tuple, product
 from .placement import CutePlacement
 
 # =============================================================================
@@ -105,38 +96,6 @@ def _build_inverse_mapping(dim_mapping):
     return inv
 
 
-def _analyze_split_coverage(placement, group_shape):
-    """
-    Determine which split pieces are sharded using coordinate-producing strides.
-
-    Creates a coordinate layout Layout(group_shape, (E(0), E(1), ...)) that maps
-    flat_offset -> (g0, g1, ...) coordinates. Evaluates the shard layout through
-    this coordinate layout to find which pieces each device fully covers.
-
-    Returns: dict mapping piece_idx -> local coverage count.
-    """
-    coord_strides = make_basis_like(group_shape)
-    coord_split = Layout(group_shape, coord_strides)
-
-    n_pieces = len(group_shape)
-    n_local = placement.local_size
-    mesh_size = placement.mesh_dim_size
-
-    # Evaluate for device 0: for each local element, get its split coordinates
-    coverage = {k: set() for k in range(n_pieces)}
-    for i in range(n_local):
-        flat = placement.layout(0, i)  # device 0, local index i
-        coords = coord_split(flat)
-        if isinstance(coords, ArithmeticTuple):
-            for k in range(n_pieces):
-                coverage[k].add(coords[k])
-        else:
-            # Single piece (rank-1 split) — coords is just an int
-            coverage[0].add(coords)
-
-    return {k: len(v) for k, v in coverage.items()}
-
-
 def propagate_view(placements, input_shape, output_shape, mesh_sizes):
     """
     Propagate CutePlacements through a view/reshape operation.
@@ -168,8 +127,11 @@ def propagate_view(placements, input_shape, output_shape, mesh_sizes):
         if entries[0][0] == "split":
             group_shape = entries[0][2]
 
-            # Use coordinate-producing strides to find which piece is sharded
-            coverage = _analyze_split_coverage(placement, group_shape)
+            # Use codomain_divide to determine which piece is sharded.
+            # The local layout's codomain (flat offsets) is reshaped into
+            # group_shape, and per-piece coverage reveals partial pieces.
+            local_layout = Layout(placement.local_shape, placement.local_stride)
+            coverage = codomain_divide(local_layout, group_shape)
 
             sharded_pieces = [
                 k

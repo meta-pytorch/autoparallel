@@ -15,6 +15,7 @@ from autoparallel.shardings.cute._pycute import (
     Layout,
     ScaledBasis,
     coalesce,
+    codomain_divide,
     make_basis_like,
 )
 from autoparallel.shardings.cute.placement import CutePlacement
@@ -533,6 +534,45 @@ class TestScaledBasis(unittest.TestCase):
             self.assertEqual(len(g0_vals), 4)
             # Each device covers half of g1 (S dim) -> piece 1 sharded
             self.assertEqual(len(g1_vals), 4)  # 4 out of 8
+
+
+class TestCodomainDivide(unittest.TestCase):
+    """Test codomain_divide — dual of logical_divide."""
+
+    def test_cute_layout_split(self):
+        """CuTe (4, 4):(8, 1) through split (4, 8):
+        piece 0 (B, stride 8) fully covered, piece 1 (S, stride 1) sharded."""
+        cov = codomain_divide(Layout((4, 4), (8, 1)), (4, 8))
+        self.assertEqual(cov[0], 4)  # full
+        self.assertEqual(cov[1], 4)  # 4 out of 8 = sharded
+
+    def test_contiguous_split(self):
+        """Contiguous 16:1 through split (4, 8):
+        innermost fills piece 1 (8), overflow fills piece 0 (2)."""
+        cov = codomain_divide(Layout(16, 1), (4, 8))
+        self.assertEqual(cov[0], 2)  # 2 out of 4
+        self.assertEqual(cov[1], 8)  # full
+
+    def test_unsqueeze(self):
+        """2:1 through split (1, 4): piece 0 full (size 1), piece 1 sharded."""
+        cov = codomain_divide(Layout(2, 1), (1, 4))
+        self.assertEqual(cov[0], 1)  # full (size 1)
+        self.assertEqual(cov[1], 2)  # 2 out of 4
+
+    def test_full_coverage(self):
+        """24:1 through split (2, 3, 4): all pieces fully covered."""
+        cov = codomain_divide(Layout(24, 1), (2, 3, 4))
+        self.assertEqual(cov[0], 2)
+        self.assertEqual(cov[1], 3)
+        self.assertEqual(cov[2], 4)
+
+    def test_partial_3_piece(self):
+        """6:1 through split (2, 3, 4): piece 2 full, overflow to piece 1."""
+        cov = codomain_divide(Layout(6, 1), (2, 3, 4))
+        self.assertEqual(cov[2], 4)  # full
+        # 6 / 4 = 1 remainder for piece 1, then piece 0
+        self.assertLessEqual(cov[1], 3)
+        self.assertLessEqual(cov[0], 2)
 
 
 if __name__ == "__main__":
