@@ -10,7 +10,7 @@ Propagation:
 - Slice: CuTe slice tensor_layout and all tilers
 """
 
-from ._pycute import Layout, is_tuple, product
+from ._pycute import E, Layout, composition, is_tuple, product
 from .placement import TiledLayout
 
 
@@ -31,31 +31,30 @@ def propagate_view(tiled, new_shape):
 # =============================================================================
 
 
-def _swap_layout(layout, d0, d1):
-    shape = list(layout.shape if is_tuple(layout.shape) else (layout.shape,))
-    stride = list(layout.stride if is_tuple(layout.stride) else (layout.stride,))
-    shape[d0], shape[d1] = shape[d1], shape[d0]
-    stride[d0], stride[d1] = stride[d1], stride[d0]
-    return Layout(tuple(shape), tuple(stride))
-
-
-def _permute_layout(layout, dims):
+def _make_perm_layout(layout, dims):
+    """Build a permutation layout for the given layout and dim ordering."""
     shape = layout.shape if is_tuple(layout.shape) else (layout.shape,)
-    stride = layout.stride if is_tuple(layout.stride) else (layout.stride,)
-    return Layout(tuple(shape[d] for d in dims), tuple(stride[d] for d in dims))
+    perm_shape = tuple(shape[d] for d in dims)
+    perm_stride = tuple(E(d) for d in dims)
+    return Layout(perm_shape, perm_stride)
 
 
 def propagate_transpose(tiled, dim0, dim1):
-    """Transpose: swap modes in tensor_layout and all tilers."""
-    new_tensor = _swap_layout(tiled.tensor_layout, dim0, dim1)
-    new_tilers = tuple(_swap_layout(t, dim0, dim1) for t in tiled.mesh_tilers)
+    """Transpose: composition with permutation layout using ScaledBasis."""
+    t_shape = tiled.tensor_layout.shape if is_tuple(tiled.tensor_layout.shape) else (tiled.tensor_layout.shape,)
+    ndim = len(t_shape)
+    dims = list(range(ndim))
+    dims[dim0], dims[dim1] = dims[dim1], dims[dim0]
+
+    new_tensor = composition(tiled.tensor_layout, _make_perm_layout(tiled.tensor_layout, dims))
+    new_tilers = tuple(composition(t, _make_perm_layout(t, dims)) for t in tiled.mesh_tilers)
     return TiledLayout(new_tensor, new_tilers)
 
 
 def propagate_permute(tiled, dims):
-    """Permute: reorder modes in tensor_layout and all tilers."""
-    new_tensor = _permute_layout(tiled.tensor_layout, dims)
-    new_tilers = tuple(_permute_layout(t, dims) for t in tiled.mesh_tilers)
+    """Permute: composition with permutation layout using ScaledBasis."""
+    new_tensor = composition(tiled.tensor_layout, _make_perm_layout(tiled.tensor_layout, dims))
+    new_tilers = tuple(composition(t, _make_perm_layout(t, dims)) for t in tiled.mesh_tilers)
     return TiledLayout(new_tensor, new_tilers)
 
 
