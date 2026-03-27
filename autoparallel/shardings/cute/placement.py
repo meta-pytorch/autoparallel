@@ -1,162 +1,205 @@
 """
-CutePlacement: A unified sharding placement using CuTe layouts.
+TiledLayout: Sharding as composition of tensor layout and shard layout.
 
-Convention:
-    The layout is a rank-2 CuTe Layout mapping (device_idx, local_idx...) -> flat_offset
-    within the tensor dimension. Mode 0 is the device mode (size = mesh_dim_size),
-    remaining modes describe the local element pattern per device.
+This mirrors CuTe's tensor definition T = accessor ∘ layout:
+- tensor_layout: tensor_coords -> flat_memory_offset (how tensor is stored)
+- shard_layout: (mesh_coords, local_coords) -> element_index (how devices partition)
 
-    This is analogous to CuTe's thread-value (TV) layouts, where device = thread
-    and local elements = values.
+The full mapping: composition(tensor_layout, shard_layout) gives
+(mesh, local) -> memory_offset.
 
-Examples:
-    Replicate on mesh dim of size 4:
-        Layout((4, 16), (0, 1))
-        All 4 devices hold the same 16 contiguous elements (stride-0 device mode).
-
-    Shard(dim=1) for tensor dim size 16, mesh dim size 4:
-        Layout((4, 4), (4, 1))
-        Device d starts at offset d*4, holding 4 contiguous elements.
-
-    After flatten (B=4, S=8) -> (B*S=32), Shard(1) on S by D=2 devices:
-        Layout((2, 4, 4), (4, 8, 1))
-        Device d holds 16 elements in a strided pattern:
-        4 batches (stride 8) x 4 seq elements (stride 1), offset by d*4.
+Separation of concerns:
+- Reshape/view/transpose change tensor_layout, leave shard_layout unchanged
+- Shard/redistribute change shard_layout, leave tensor_layout unchanged
 """
 
-from ._pycute import Layout, coalesce, flatten, is_tuple, make_layout, product
+from ._pycute import Layout, coalesce, codomain_divide, flatten, is_tuple, make_layout, product
 
 
-class CutePlacement:
+class TiledLayout:
     """
-    Unified sharding placement using a rank-2 CuTe Layout.
+    Sharding described by two CuTe Layouts.
 
     Attributes:
-        dim: Tensor dimension being sharded, or None for replicate.
-        layout: CuTe Layout mapping (device_idx, local_idx...) -> flat_offset.
-            Mode 0 = device mode (size = mesh_dim_size).
-            Remaining modes = local element pattern.
+        tensor_layout: Layout mapping tensor_coords -> flat_memory_offset.
+            Shape = global tensor shape, strides = memory strides.
+        shard_layout: Layout mapping (mesh_coords..., local_coords...) -> element_index.
+            First modes = mesh shape, remaining = per-device element pattern.
+            element_index is a flat index in [0, num_elements).
+        mesh_ndim: Number of leading modes that are mesh dimensions.
     """
 
-    def __init__(self, dim, layout):
-        self.dim = dim
-        self.layout = layout
-
-    @staticmethod
-    def replicate(mesh_dim_size, tensor_dim_size=1):
-        """Create a replicate placement (stride-0 device mode)."""
-        return CutePlacement(
-            dim=None,
-            layout=Layout((mesh_dim_size, tensor_dim_size), (0, 1)),
-        )
-
-    @staticmethod
-    def shard(dim, tensor_dim_size, mesh_dim_size):
-        """Create a standard shard placement (contiguous chunks)."""
-        assert tensor_dim_size % mesh_dim_size == 0, (
-            f"Tensor dim size {tensor_dim_size} must be divisible by "
-            f"mesh dim size {mesh_dim_size}"
-        )
-        chunk_size = tensor_dim_size // mesh_dim_size
-        return CutePlacement(
-            dim=dim,
-            layout=Layout((mesh_dim_size, chunk_size), (chunk_size, 1)),
-        )
-
-    @staticmethod
-    def from_placement(placement, tensor_dim_size, mesh_dim_size):
-        """Convert a DTensor Placement to CutePlacement."""
-        if hasattr(placement, "dim") and hasattr(placement, "is_shard"):
-            if placement.is_shard():
-                return CutePlacement.shard(
-                    placement.dim, tensor_dim_size, mesh_dim_size
-                )
-        return CutePlacement.replicate(mesh_dim_size, tensor_dim_size)
+    def __init__(self, tensor_layout, shard_layout, mesh_ndim):
+        self.tensor_layout = tensor_layout
+        self.shard_layout = shard_layout
+        self.mesh_ndim = mesh_ndim
 
     @property
-    def mesh_dim_size(self):
-        """Number of devices along this mesh dimension."""
-        if is_tuple(self.layout.shape):
-            return self.layout.shape[0]
-        return self.layout.shape
+    def tensor_shape(self):
+        """Global tensor shape."""
+        return self.tensor_layout.shape
+
+    @property
+    def num_elements(self):
+        """Total number of elements in the tensor."""
+        return product(self.tensor_shape)
+
+    @property
+    def mesh_shape(self):
+        """Shape of the mesh (first mesh_ndim modes of shard_layout)."""
+        if is_tuple(self.shard_layout.shape):
+            return self.shard_layout.shape[: self.mesh_ndim]
+        return (self.shard_layout.shape,)
 
     @property
     def local_shape(self):
-        """Shape of the local modes (excluding device mode)."""
-        if is_tuple(self.layout.shape):
-            return self.layout.shape[1:]
-        return ()
-
-    @property
-    def local_stride(self):
-        """Stride of the local modes (excluding device mode)."""
-        if is_tuple(self.layout.stride):
-            return self.layout.stride[1:]
+        """Shape of local modes (after mesh modes in shard_layout)."""
+        if is_tuple(self.shard_layout.shape):
+            return self.shard_layout.shape[self.mesh_ndim :]
         return ()
 
     @property
     def local_size(self):
-        """Number of elements each device holds."""
-        return product(self.local_shape) if self.local_shape else 1
+        """Number of elements per device."""
+        ls = self.local_shape
+        return product(ls) if ls else 1
 
-    @property
-    def device_stride(self):
-        """Stride of the device mode."""
-        if is_tuple(self.layout.stride):
-            return self.layout.stride[0]
-        return self.layout.stride
+    @staticmethod
+    def replicate(tensor_shape, mesh_shape):
+        """All devices hold all elements."""
+        n = product(tensor_shape) if is_tuple(tensor_shape) else tensor_shape
+        tensor_layout = Layout(tensor_shape)
+        # Mesh modes with stride 0, local mode covers all elements
+        mesh_ndim = len(mesh_shape) if is_tuple(mesh_shape) else 1
+        shape = mesh_shape + (n,) if is_tuple(mesh_shape) else (mesh_shape, n)
+        stride = (0,) * mesh_ndim + (1,)
+        shard_layout = Layout(shape, stride)
+        return TiledLayout(tensor_layout, shard_layout, mesh_ndim)
+
+    @staticmethod
+    def shard(tensor_shape, mesh_shape, shard_dim, mesh_dim=0):
+        """Shard tensor_shape[shard_dim] across mesh_shape[mesh_dim]."""
+        tensor_layout = Layout(tensor_shape)
+        n = product(tensor_shape) if is_tuple(tensor_shape) else tensor_shape
+        mesh_ndim = len(mesh_shape) if is_tuple(mesh_shape) else 1
+        mesh_shape_t = mesh_shape if is_tuple(mesh_shape) else (mesh_shape,)
+
+        # Compute tensor strides (row-major)
+        t_shape = tensor_shape if is_tuple(tensor_shape) else (tensor_shape,)
+        t_strides = [1] * len(t_shape)
+        for k in range(len(t_shape) - 2, -1, -1):
+            t_strides[k] = t_strides[k + 1] * t_shape[k + 1]
+
+        D = mesh_shape_t[mesh_dim]
+        dim_size = t_shape[shard_dim]
+        assert dim_size % D == 0
+        chunk = dim_size // D
+
+        # Build shard layout:
+        # Mesh modes: stride 0 for all except mesh_dim, which gets chunk * t_strides[shard_dim]
+        mesh_strides = [0] * mesh_ndim
+        mesh_strides[mesh_dim] = chunk * t_strides[shard_dim]
+
+        # Local modes: same as tensor dims, but shard_dim has size chunk instead of dim_size
+        local_shape = []
+        local_strides = []
+        for k in range(len(t_shape)):
+            sz = chunk if k == shard_dim else t_shape[k]
+            local_shape.append(sz)
+            local_strides.append(t_strides[k])
+
+        shape = tuple(mesh_shape_t) + tuple(local_shape)
+        stride = tuple(mesh_strides) + tuple(local_strides)
+        shard_layout = Layout(shape, stride)
+
+        return TiledLayout(tensor_layout, shard_layout, mesh_ndim)
 
     def is_replicate(self):
-        """True if all devices hold the same data (stride-0 device mode)."""
-        if self.dim is None:
-            return True
-        return self.device_stride == 0
+        """True if all mesh modes have stride 0."""
+        if is_tuple(self.shard_layout.stride):
+            mesh_strides = self.shard_layout.stride[: self.mesh_ndim]
+            if is_tuple(mesh_strides):
+                return all(s == 0 for s in mesh_strides)
+            return mesh_strides == 0
+        return self.shard_layout.stride == 0
 
-    def is_shard(self):
-        """True if this is equivalent to a simple Shard(dim).
-
-        A simple shard has a contiguous local layout (coalesces to N:1)
-        and device stride = chunk size.
+    def get_placements(self):
         """
-        if self.dim is None:
-            return False
-        if self.device_stride == 0:
-            return False
-        # Check that local modes are contiguous (coalesce to N:1)
-        local = Layout(self.local_shape, self.local_stride)
-        c = coalesce(local)
-        if is_tuple(c.shape) or is_tuple(c.stride):
-            return False
-        return c.stride == 1
+        Extract per-mesh-dim DTensor-style placements.
 
-    def to_placement(self):
-        """Convert back to a DTensor Placement if possible."""
-        from torch.distributed.tensor.placement_types import Replicate, Shard
-
+        Returns list of (placement_type, dim_or_none) tuples:
+            ("replicate", None) or ("shard", dim_index)
+        """
         if self.is_replicate():
-            return Replicate()
-        if self.is_shard():
-            return Shard(self.dim)
-        return None
+            mesh_shape_t = self.mesh_shape if is_tuple(self.mesh_shape) else (self.mesh_shape,)
+            return [("replicate", None)] * len(mesh_shape_t)
+
+        # Use codomain_divide on local layout vs tensor shape to find
+        # which tensor dims are sharded
+        t_shape = self.tensor_shape if is_tuple(self.tensor_shape) else (self.tensor_shape,)
+        local_layout = Layout(self.local_shape, self.local_stride)
+        coverage = codomain_divide(local_layout, t_shape)
+
+        # For each mesh dim, determine which tensor dim it shards
+        mesh_shape_t = self.mesh_shape if is_tuple(self.mesh_shape) else (self.mesh_shape,)
+        shard_strides = self.shard_layout.stride if is_tuple(self.shard_layout.stride) else (self.shard_layout.stride,)
+        mesh_strides = shard_strides[: self.mesh_ndim]
+
+        # Compute tensor row-major strides for comparison
+        t_strides = [1] * len(t_shape)
+        for k in range(len(t_shape) - 2, -1, -1):
+            t_strides[k] = t_strides[k + 1] * t_shape[k + 1]
+
+        placements = []
+        for md in range(len(mesh_shape_t)):
+            ms = mesh_strides[md] if is_tuple(mesh_strides) else mesh_strides
+            if ms == 0:
+                placements.append(("replicate", None))
+            else:
+                # Find which tensor dim this mesh dim shards by matching stride
+                shard_dim = None
+                for k in range(len(t_shape)):
+                    # mesh stride should be chunk * tensor_stride[k]
+                    # where chunk = dim_size / mesh_dim_size
+                    if t_strides[k] > 0 and ms % t_strides[k] == 0:
+                        chunk = ms // t_strides[k]
+                        if chunk * mesh_shape_t[md] == t_shape[k]:
+                            shard_dim = k
+                            break
+                placements.append(("shard", shard_dim))
+
+        return placements
+
+    @property
+    def local_stride(self):
+        if is_tuple(self.shard_layout.stride):
+            return self.shard_layout.stride[self.mesh_ndim :]
+        return ()
 
     def __eq__(self, other):
-        if not isinstance(other, CutePlacement):
+        if not isinstance(other, TiledLayout):
             return NotImplemented
-        return self.dim == other.dim and self.layout == other.layout
-
-    def __hash__(self):
-        return hash((self.dim, self.layout))
+        return (
+            self.tensor_layout == other.tensor_layout
+            and self.shard_layout == other.shard_layout
+            and self.mesh_ndim == other.mesh_ndim
+        )
 
     def __repr__(self):
-        if self.is_replicate():
-            return f"CutePlacement.replicate({self.mesh_dim_size})"
-        if self.is_shard():
-            return f"CutePlacement.shard(dim={self.dim}, chunk={self.local_size})"
-        return f"CutePlacement(dim={self.dim}, layout={self.layout})"
+        return (
+            f"TiledLayout(\n"
+            f"  tensor={self.tensor_layout},\n"
+            f"  shard={self.shard_layout},\n"
+            f"  mesh_ndim={self.mesh_ndim}\n"
+            f")"
+        )
 
     def __str__(self):
-        if self.is_replicate():
-            return "R"
-        if self.is_shard():
-            return f"S({self.dim})"
-        return f"CS({self.dim}, {self.layout})"
+        placements = self.get_placements()
+        parts = []
+        for p_type, p_dim in placements:
+            if p_type == "replicate":
+                parts.append("R")
+            else:
+                parts.append(f"S({p_dim})")
+        return f"[{', '.join(parts)}] on {self.tensor_shape}"

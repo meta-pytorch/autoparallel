@@ -67,6 +67,36 @@ class ScaledBasis:
     def __eq__(self, other: object) -> bool:
         if isinstance(other, ScaledBasis):
             return self.value == other.value and self.index == other.index
+        if isinstance(other, int):
+            return False
+        return NotImplemented
+
+    def __lt__(self, other: object) -> bool:
+        if isinstance(other, ScaledBasis):
+            return (self.index, self.value) < (other.index, other.value)
+        if isinstance(other, int):
+            return False  # ScaledBasis sorts after integers
+        return NotImplemented
+
+    def __le__(self, other: object) -> bool:
+        if isinstance(other, ScaledBasis):
+            return (self.index, self.value) <= (other.index, other.value)
+        if isinstance(other, int):
+            return False
+        return NotImplemented
+
+    def __gt__(self, other: object) -> bool:
+        if isinstance(other, ScaledBasis):
+            return (self.index, self.value) > (other.index, other.value)
+        if isinstance(other, int):
+            return True  # ScaledBasis sorts after integers
+        return NotImplemented
+
+    def __ge__(self, other: object) -> bool:
+        if isinstance(other, ScaledBasis):
+            return (self.index, self.value) >= (other.index, other.value)
+        if isinstance(other, int):
+            return True
         return NotImplemented
 
     def __hash__(self) -> int:
