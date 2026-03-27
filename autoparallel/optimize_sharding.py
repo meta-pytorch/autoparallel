@@ -762,6 +762,143 @@ class ShardingOptimizer:
         )
         return self._extract_and_validate_solution()
 
+    def resolve(self, verbose=False):
+        """Re-solve the ILP after adding or removing constraints.
+
+        Unlike get_solution(), this does not re-set the objective, so it can
+        be called multiple times after modifying constraints.
+        """
+        t0 = time.perf_counter()
+        self._solve(verbose)
+        obj_value = pulp.value(self.prob.objective)
+        logger.debug(
+            "ILP re-solve took %.3fs (objective=%.4f)",
+            time.perf_counter() - t0,
+            obj_value,
+        )
+        return self._extract_and_validate_solution()
+
+    def remove_constraints(self, names):
+        """Remove constraints by name, allowing re-solve to revert to the
+        unconstrained optimum."""
+        for name in names:
+            del self.prob.constraints[name]
+
+    def diff_solutions(self, solution_a, solution_b):
+        """Compare two solutions and report placement changes and cost diffs.
+
+        Args:
+            solution_a: baseline solution dict (node → OpSpec), e.g. from get_solution()
+            solution_b: counterfactual solution dict, e.g. from resolve()
+        """
+        from torch.distributed.tensor._op_schema import _pretty_print_spec
+
+        changes = defaultdict(list)
+        unchanged = 0
+
+        for node in solution_a:
+            if node not in solution_b:
+                continue
+            spec_a = solution_a[node].output_specs
+            spec_b = solution_b[node].output_specs
+            if not isinstance(spec_a, DTensorSpec) or not isinstance(
+                spec_b, DTensorSpec
+            ):
+                continue
+            if spec_a.placements == spec_b.placements:
+                unchanged += 1
+            else:
+                key = (
+                    _pretty_print_spec(spec_a),
+                    _pretty_print_spec(spec_b),
+                )
+                changes[key].append(node)
+
+        # Compute objective values from selected_keys for current solution
+        # (solution_b is the current state after last solve)
+        cost_a = self._compute_solution_cost(solution_a)
+        cost_b = self._compute_solution_cost(solution_b)
+
+        lines = []
+        lines.append(
+            f"Objective: {cost_a['total']:.1f} -> {cost_b['total']:.1f} "
+            f"({cost_b['total'] - cost_a['total']:+.1f})"
+        )
+        lines.append(
+            f"  compute: {cost_a['compute']:.1f} -> {cost_b['compute']:.1f} "
+            f"({cost_b['compute'] - cost_a['compute']:+.1f})"
+        )
+        lines.append(
+            f"  comm:    {cost_a['comm']:.1f} -> {cost_b['comm']:.1f} "
+            f"({cost_b['comm'] - cost_a['comm']:+.1f})"
+        )
+        lines.append(
+            f"  trans:   {cost_a['transition']:.1f} -> {cost_b['transition']:.1f} "
+            f"({cost_b['transition'] - cost_a['transition']:+.1f})"
+        )
+        lines.append("")
+        lines.append(
+            f"Placement changes ({sum(len(v) for v in changes.values())} nodes "
+            f"changed, {unchanged} unchanged):"
+        )
+        for (old, new), nodes in sorted(changes.items(), key=lambda x: -len(x[1])):
+            lines.append(f"  {old} -> {new}: {len(nodes)} nodes")
+
+        result = "\n".join(lines)
+        print(result)
+        return result
+
+    def _compute_solution_cost(self, solution):
+        """Compute the total cost breakdown for a given solution."""
+        total_compute = 0.0
+        total_comm = 0.0
+        total_transition = 0.0
+
+        for node, strategy in solution.items():
+            out_idx = None
+            for i, s in enumerate(self.strats[node].strategies):
+                if s is strategy:
+                    out_idx = i
+                    break
+            if out_idx is None:
+                continue
+
+            compute_cost = estimate_strategy_runtime_cost(node, strategy)
+            total_compute += compute_cost
+
+            input_nodes = self._all_input_nodes(node)
+            for argi, pred in enumerate(input_nodes):
+                pred_strategy = solution.get(pred)
+                if pred_strategy is None:
+                    continue
+                pred_out_idx = None
+                for i, s in enumerate(self.strats[pred].strategies):
+                    if s is pred_strategy:
+                        pred_out_idx = i
+                        break
+                if pred_out_idx is None:
+                    continue
+                comm = strategy.redistribute_cost[argi][pred_out_idx]
+                if math.isfinite(comm):
+                    total_comm += comm
+
+                # Transition cost
+                pred_spec = pred_strategy.output_specs
+                input_spec = strategy.input_specs[argi]
+                if (
+                    isinstance(pred_spec, DTensorSpec)
+                    and isinstance(input_spec, DTensorSpec)
+                    and pred_spec.placements != input_spec.placements
+                ):
+                    total_transition += 1
+
+        return {
+            "total": total_compute + total_comm + total_transition,
+            "compute": total_compute,
+            "comm": total_comm,
+            "transition": total_transition,
+        }
+
     # ---- Logging ----
 
     def get_violated_constraints_log(self):
@@ -805,6 +942,176 @@ class ShardingOptimizer:
         costs = [[str(x)] + x.redistribute_cost[arg] for x in tgt_strat.strategies]
         print(tabulate(costs, headers=src_placements, **kwargs))
 
+    def explain_placement(self, target_placement, start_node=None, max_nodes=None):
+        """Diagnose why the optimizer didn't choose a specific placement.
+
+        Walks the graph in topological order and, for each node, reports whether
+        target_placement is available, what its compute cost would be compared
+        to the chosen placement, and flags the first node where the target
+        becomes unavailable.
+
+        Shows both compute and communication costs. Communication cost for the
+        target assumes all predecessors also use target_placement (i.e., "what
+        if the entire graph used this placement?").
+
+        Must be called after get_solution().
+
+        Args:
+            target_placement: tuple of Placement objects, e.g. (Shard(0), Replicate())
+            start_node: optional node to begin from (default: first graph node)
+            max_nodes: optional limit on number of nodes to report
+        """
+        from tabulate import tabulate  # type: ignore
+        from torch.distributed.tensor._op_schema import _pretty_print_spec
+
+        # Build chosen out_idx per node from the solution
+        chosen_out_idx = {}
+        for key in self.selected_keys:
+            node_idx, argi, out_idx, inp_idx = key
+            if argi == 0:
+                chosen_out_idx[node_idx] = out_idx
+
+        target_placement = tuple(target_placement)
+        target_str = _pretty_print_spec(DTensorSpec(self.mesh, target_placement))
+
+        # Build target_out_idx per node: which strategy index produces
+        # target_placement, if any.
+        target_out_idx_map = {}
+        for ni, node in enumerate(self.nodes):
+            if node.op == "output":
+                continue
+            op_strategy = self.strats.get(node)
+            if op_strategy is None:
+                continue
+            for i, strategy in enumerate(op_strategy.strategies):
+                spec = strategy.output_specs
+                if (
+                    isinstance(spec, DTensorSpec)
+                    and spec.placements == target_placement
+                ):
+                    target_out_idx_map[ni] = i
+                    break
+
+        started = start_node is None
+        rows = []
+        count = 0
+
+        for node_idx, node in enumerate(self.nodes):
+            if node.op == "output":
+                continue
+
+            if not started:
+                if node is start_node:
+                    started = True
+                else:
+                    continue
+
+            if max_nodes is not None and count >= max_nodes:
+                break
+
+            op_strategy = self.strats[node]
+            out_idx = chosen_out_idx.get(node_idx)
+            if out_idx is None:
+                continue
+
+            chosen_strategy = op_strategy.strategies[out_idx]
+            chosen_spec = chosen_strategy.output_specs
+
+            # Skip multi-output nodes (tuples)
+            if not isinstance(chosen_spec, DTensorSpec):
+                continue
+
+            chosen_placement_str = _pretty_print_spec(chosen_spec)
+            chosen_compute = estimate_strategy_runtime_cost(node, chosen_strategy)
+
+            # Compute communication cost for the chosen strategy: sum
+            # redistribute_cost across all args using predecessors' chosen
+            # out_idx.
+            input_nodes = self._all_input_nodes(node)
+            chosen_comm = 0.0
+            for argi, pred in enumerate(input_nodes):
+                pred_idx = self.node_map[pred]
+                pred_out = chosen_out_idx.get(pred_idx, 0)
+                chosen_comm += chosen_strategy.redistribute_cost[argi][pred_out]
+
+            # Get output shape for display
+            shape = chosen_spec.tensor_meta.shape if chosen_spec.tensor_meta else "?"
+            shape_str = str(list(shape)) if shape != "?" else "?"
+
+            # Search for target placement among available strategies
+            target_out_idx = target_out_idx_map.get(node_idx)
+
+            if target_out_idx is not None:
+                target_strategy = op_strategy.strategies[target_out_idx]
+                target_compute = estimate_strategy_runtime_cost(node, target_strategy)
+
+                # Compute communication cost for the target strategy:
+                # assume each predecessor also uses target_placement. If a
+                # predecessor doesn't have it, fall back to its chosen placement.
+                target_comm = 0.0
+                for argi, pred in enumerate(input_nodes):
+                    pred_idx = self.node_map[pred]
+                    pred_tgt_out = target_out_idx_map.get(
+                        pred_idx, chosen_out_idx.get(pred_idx, 0)
+                    )
+                    target_comm += target_strategy.redistribute_cost[argi][pred_tgt_out]
+
+                chosen_total = chosen_compute + chosen_comm
+                target_total = target_compute + target_comm
+
+                # Determine status based on total cost
+                if chosen_spec.placements == target_placement:
+                    status = "CHOSEN"
+                elif abs(chosen_total - target_total) < 0.01:
+                    status = "TIE"
+                elif target_total < chosen_total:
+                    status = "TARGET CHEAPER"
+                else:
+                    status = "CHOSEN CHEAPER"
+
+                # Flag kernel launch floor on compute
+                if (
+                    abs(target_compute - 7.0) < 0.01
+                    and abs(chosen_compute - 7.0) < 0.01
+                ):
+                    status += " [floor]"
+
+                target_compute_str = f"{target_compute:.1f}"
+                target_comm_str = f"{target_comm:.1f}"
+            else:
+                target_compute_str = "N/A"
+                target_comm_str = "N/A"
+                status = "UNAVAILABLE"
+
+            rows.append(
+                [
+                    str(node),
+                    shape_str,
+                    chosen_placement_str,
+                    f"{chosen_compute:.1f}",
+                    f"{chosen_comm:.1f}",
+                    target_compute_str,
+                    target_comm_str,
+                    status,
+                ]
+            )
+            count += 1
+
+        headers = [
+            "Node",
+            "Shape",
+            "Chosen",
+            "Ch.Comp",
+            "Ch.Comm",
+            "Tgt.Comp",
+            "Tgt.Comm",
+            "Status",
+        ]
+        result = f"explain_placement: target={target_str}\n\n"
+        result += tabulate(rows, headers=headers)
+        print(result)
+        return result
+
     # ---- User constraints ----
 
     def _add_node_constraint(
@@ -818,11 +1125,12 @@ class ShardingOptimizer:
             if out_idx in output_constraint_indices:
                 var = self.pulp_variables[(node_idx, argi, out_idx, inp_idx)]
                 vars_per_arg.setdefault(argi, []).append(var)
+        names = []
         for eqs in vars_per_arg.values():
-            self.prob += (
-                pulp.lpSum(eqs) == 1,
-                self._get_next_name(constraint_name),
-            )
+            name = self._get_next_name(constraint_name)
+            self.prob += (pulp.lpSum(eqs) == 1, name)
+            names.append(name)
+        return names
 
     def _add_paired_output_constraint(self, node_a, node_b, constraint_name):
         """Constrains two nodes to have matching output placements.
@@ -917,22 +1225,33 @@ class ShardingOptimizer:
         self.prob += (pulp.lpSum(elms) >= budget_low, "memory_constraint_low")
 
     def add_node_constraint(self, node, placement=None, constraint_name=None):
-        """USER (Category 5d): Force a specific placement for a node."""
+        """USER (Category 5d): Force a specific placement for a node.
+
+        For nodes with tuple output_specs (e.g. SDPA), the placement is matched
+        against the first DTensorSpec element in the tuple.
+        """
         assert node in self.strats, (node, self.strats.keys())
         strat = self.strats[node]
         if placement is None:
             # default is Shard(0) to parallelize on the batch
             placement = (Shard(0),) + (Replicate(),) * (self.mesh.ndim - 1)
-        output_constraint_indices = [
-            i
-            for i, s in enumerate(strat.strategies)
-            if s.output_specs.placements == placement
-        ]
+        output_constraint_indices = []
+        for i, s in enumerate(strat.strategies):
+            specs = s.output_specs
+            if isinstance(specs, DTensorSpec):
+                if specs.placements == placement:
+                    output_constraint_indices.append(i)
+            elif isinstance(specs, (list, tuple)):
+                for spec in specs:
+                    if isinstance(spec, DTensorSpec):
+                        if spec.placements == placement:
+                            output_constraint_indices.append(i)
+                        break
         if len(output_constraint_indices) == 0:
             raise RuntimeError(
                 f"Couldn't find appropriate constraint {node} {constraint_name} {placement}"
             )
-        self._add_node_constraint(
+        return self._add_node_constraint(
             node,
             output_constraint_indices=output_constraint_indices,
             constraint_name=constraint_name,
