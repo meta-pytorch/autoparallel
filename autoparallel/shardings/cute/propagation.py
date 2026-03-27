@@ -13,16 +13,14 @@ All view cases (identity, flatten, split) use composition(R, tiler).
 
 from ._pycute import (
     Layout,
-    ScaledBasis,
-    coalesce,
     codomain_divide,
     composition,
-    flatten,
     is_tuple,
     make_basis_like,
     make_layout,
     product,
 )
+from ._pycute.codomain_divide import _has_coord_strides
 from .placement import CutePlacement
 
 
@@ -109,14 +107,6 @@ def _build_inverse_mapping(dim_mapping):
                 ("split", out_dim, mapping[2], mapping[3])
             )
     return inv
-
-
-def _has_coord_strides(layout):
-    """Check if a layout has ScaledBasis (coordinate) strides."""
-    for s in flatten(layout.stride) if is_tuple(layout.stride) else (layout.stride,):
-        if isinstance(s, ScaledBasis):
-            return True
-    return False
 
 
 def _build_reshape_composition(entries, placement, input_shape):
@@ -208,13 +198,10 @@ def propagate_view(placements, input_shape, output_shape, mesh_sizes):
         result = composition(R, tiler)
 
         if _has_coord_strides(result):
-            # Split case: coordinate strides tag per-piece coverage.
-            # Find the sharded piece and create a simple Shard on it.
+            # Split case: result already has E(k) coordinate strides.
+            # codomain_divide reads coverage directly — no re-composition.
             group_shape = entries[0][2]
-            coverage = codomain_divide(
-                Layout(placement.local_shape, placement.local_stride),
-                group_shape,
-            )
+            coverage = codomain_divide(result, group_shape)
 
             sharded_pieces = [
                 k
