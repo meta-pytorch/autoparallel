@@ -1,19 +1,11 @@
 """
 CuTe-based sharding propagation rules.
 
-All rules operate purely on CutePlacement (one per mesh dimension).
-They determine how placements transform through tensor operations,
-assuming the given input placements are already in place (no redistribution).
+All rules operate on CutePlacement with rank-2 layouts:
+    (device_idx, local_idx...) -> flat_offset
 
-Each rule returns output placements, or None for incompatible inputs.
-The caller is responsible for enumerating input placement strategies
-and computing redistribution costs.
-
-Supported operations:
-- view/reshape: flatten, split, permute
-- einsum/matmul: batch, M, N, K dimension handling
-- pointwise: element-wise ops with broadcasting
-- reduction: sum, mean, etc. along a dimension
+Rules are strictly redistribution-free: they return output placements
+assuming the given inputs are already in place, or None if incompatible.
 """
 
 from torch.distributed._pycute import Layout, coalesce, flatten, is_tuple, product
@@ -80,7 +72,7 @@ def _compute_view_dim_mapping(input_shape, output_shape):
         elif len(in_group) == 0 and len(out_group) == 1:
             result[out_group[0]] = ("new",)
         elif len(in_group) == 1 and len(out_group) == 0:
-            pass  # removed size-1 dim
+            pass
         else:
             group_shape = tuple(output_shape[d] for d in out_group)
             for idx, out_dim in enumerate(out_group):
@@ -90,41 +82,65 @@ def _compute_view_dim_mapping(input_shape, output_shape):
 
 
 def _build_inverse_mapping(dim_mapping):
-    """
-    Build inverse mapping: input_dim -> list of (mapping_type, out_dim, ...) entries.
-    """
+    """input_dim -> list of (mapping_type, out_dim, ...) entries."""
     inv = {}
     for out_dim, mapping in dim_mapping.items():
         if mapping[0] == "identity":
-            in_dim = mapping[1]
-            inv.setdefault(in_dim, []).append(("identity", out_dim))
+            inv.setdefault(mapping[1], []).append(("identity", out_dim))
         elif mapping[0] == "flatten":
             for in_dim in mapping[1]:
                 inv.setdefault(in_dim, []).append(("flatten", out_dim, mapping[1]))
         elif mapping[0] == "split":
-            in_dim = mapping[1]
-            inv.setdefault(in_dim, []).append(
+            inv.setdefault(mapping[1], []).append(
                 ("split", out_dim, mapping[2], mapping[3])
             )
     return inv
+
+
+def _analyze_split_coverage(local_shape, local_stride, group_shape):
+    """
+    Determine which split pieces are sharded by matching shard modes
+    against split pieces via stride ranges.
+
+    The local modes of the shard layout have strides from the original
+    tensor dims. Each split piece k covers stride range [S_k, S_k * G_k).
+    A shard mode with stride in that range contributes to piece k's coverage.
+
+    Returns: dict mapping piece_idx -> local coverage count.
+    """
+    # Flatten local modes
+    if is_tuple(local_shape):
+        local_modes = list(zip(flatten(local_stride), flatten(local_shape)))
+    else:
+        local_modes = [(local_stride, local_shape)]
+
+    # Compute split strides (row-major)
+    n = len(group_shape)
+    split_strides = [1] * n
+    for k in range(n - 2, -1, -1):
+        split_strides[k] = split_strides[k + 1] * group_shape[k + 1]
+
+    coverage = {}
+    for k in range(n):
+        piece_stride = split_strides[k]
+        piece_end = piece_stride * group_shape[k]
+        piece_coverage = 1
+        for mode_stride, mode_size in local_modes:
+            if piece_stride <= mode_stride < piece_end:
+                piece_coverage *= mode_size
+        coverage[k] = piece_coverage
+
+    return coverage
 
 
 def propagate_view(placements, input_shape, output_shape, mesh_sizes):
     """
     Propagate CutePlacements through a view/reshape operation.
 
-    Given the input placements, computes the output placements that result
-    from each device performing a local view — NO communication involved.
-
-    Args:
-        placements: tuple of CutePlacement, one per mesh dimension
-        input_shape: tuple of ints, global input tensor shape
-        output_shape: tuple of ints, global output tensor shape
-        mesh_sizes: tuple of ints, size of each mesh dimension
+    Each device performs a local view — no communication involved.
 
     Returns:
-        output_placements: tuple of CutePlacement, or None if the view is
-        incompatible with the given placements (would require redistribution).
+        tuple of CutePlacement, or None if incompatible.
     """
     dim_mapping = _compute_view_dim_mapping(input_shape, output_shape)
     inv_mapping = _build_inverse_mapping(dim_mapping)
@@ -140,10 +156,47 @@ def propagate_view(placements, input_shape, output_shape, mesh_sizes):
 
         shard_dim = placement.dim
         if shard_dim not in inv_mapping:
-            # Sharded dim was removed (size-1 dim squeezed out) — incompatible
             return None
 
         entries = inv_mapping[shard_dim]
+
+        # --- Split: input dim maps to multiple output dims ---
+        if entries[0][0] == "split":
+            group_shape = entries[0][2]
+
+            # Use mode-stride matching to find which piece is sharded
+            coverage = _analyze_split_coverage(
+                placement.local_shape, placement.local_stride, group_shape
+            )
+
+            sharded_pieces = [
+                k for k in range(len(group_shape))
+                if coverage[k] < group_shape[k] and group_shape[k] > 1
+            ]
+
+            if len(sharded_pieces) != 1:
+                return None  # 0 or multiple sharded pieces
+
+            shard_piece = sharded_pieces[0]
+            piece_size = group_shape[shard_piece]
+
+            if piece_size % mesh_size != 0:
+                return None
+
+            # Find the output dim for this piece
+            target_entry = next(
+                (e for e in entries if e[3] == shard_piece), None
+            )
+            if target_entry is None:
+                return None
+
+            out_dim = target_entry[1]
+            output_places.append(
+                CutePlacement.shard(out_dim, piece_size, mesh_size)
+            )
+            continue
+
+        # --- Identity or Flatten: single entry ---
         entry = entries[0]
 
         if entry[0] == "identity":
@@ -161,66 +214,49 @@ def propagate_view(placements, input_shape, output_shape, mesh_sizes):
             shard_dim_size = dim_sizes[pos]
 
             if shard_dim_size % mesh_size != 0:
-                return None  # incompatible
+                return None
 
             local_shard = shard_dim_size // mesh_size
 
-            # Each device does a local view. In the flattened output dim,
-            # the device's elements form a pattern determined by:
-            # - which input dims are in the flatten group
-            # - which one is sharded and at what position
-            #
-            # Row-major strides: stride[k] = product(dim_sizes[k+1:])
+            # Build row-major strides for the flatten group
             n = len(dim_sizes)
             strides = [1] * n
             for k in range(n - 2, -1, -1):
                 strides[k] = strides[k + 1] * dim_sizes[k + 1]
 
-            shape_parts = []
-            stride_parts = []
+            # Device mode: stride = strides[pos] * local_shard
+            # (offset between consecutive devices in the flat space)
+            device_stride = strides[pos] * local_shard
 
-            for k in range(pos):
-                if dim_sizes[k] > 1:
-                    shape_parts.append(dim_sizes[k])
-                    stride_parts.append(strides[k])
+            # Local modes: all dims in the flatten group, with the
+            # sharded dim replaced by its local portion
+            local_shape_parts = []
+            local_stride_parts = []
 
-            shape_parts.append(local_shard)
-            stride_parts.append(strides[pos])
+            for k in range(n):
+                sz = local_shard if k == pos else dim_sizes[k]
+                if sz > 1:
+                    local_shape_parts.append(sz)
+                    local_stride_parts.append(strides[k])
 
-            for k in range(pos + 1, n):
-                if dim_sizes[k] > 1:
-                    shape_parts.append(dim_sizes[k])
-                    stride_parts.append(strides[k])
-
-            if len(shape_parts) == 1:
-                out_layout = Layout(shape_parts[0], stride_parts[0])
+            if len(local_shape_parts) == 0:
+                local_s = 1
+                local_d = 0
+            elif len(local_shape_parts) == 1:
+                local_s = local_shape_parts[0]
+                local_d = local_stride_parts[0]
             else:
-                out_layout = Layout(tuple(shape_parts), tuple(stride_parts))
+                local_s = tuple(local_shape_parts)
+                local_d = tuple(local_stride_parts)
 
+            out_layout = Layout(
+                (mesh_size, local_s),
+                (device_stride, local_d),
+            )
             output_places.append(CutePlacement(dim=out_dim, layout=out_layout))
 
-        elif entry[0] == "split":
-            out_dim = entry[1]
-            group_shape = entry[2]
-            split_id = entry[3]
-
-            shard_dim_size = input_shape[shard_dim]
-            if shard_dim_size % mesh_size != 0:
-                return None
-
-            if split_id == 0:
-                piece_size = group_shape[0]
-                if piece_size % mesh_size == 0:
-                    output_places.append(
-                        CutePlacement.shard(out_dim, piece_size, mesh_size)
-                    )
-                else:
-                    return None  # can't shard this split piece
-            else:
-                return None  # non-first split piece incompatible
-
         else:
-            return None  # unknown mapping
+            return None
 
     return tuple(output_places)
 
@@ -231,7 +267,6 @@ def propagate_view(placements, input_shape, output_shape, mesh_sizes):
 
 
 def _parse_einsum(equation):
-    """Parse einsum equation into (input_subscripts, output_subscript)."""
     if "->" not in equation:
         raise ValueError(f"Einsum equation must contain '->': {equation}")
     inputs_str, output = equation.split("->")
@@ -239,19 +274,13 @@ def _parse_einsum(equation):
 
 
 def _classify_einsum_dims(inputs, output):
-    """
-    Classify each dimension label into: batch, contract, m, n, or other.
-    """
-    assert len(inputs) == 2, "Only 2-operand einsum supported"
+    assert len(inputs) == 2
     a_dims, b_dims = set(inputs[0]), set(inputs[1])
     out_dims = set(output)
 
     categories = {}
     for d in a_dims | b_dims | out_dims:
-        in_a = d in a_dims
-        in_b = d in b_dims
-        in_out = d in out_dims
-
+        in_a, in_b, in_out = d in a_dims, d in b_dims, d in out_dims
         if in_a and in_b and in_out:
             categories[d] = "batch"
         elif in_a and in_b and not in_out:
@@ -270,34 +299,17 @@ def propagate_einsum(
     equation, placements_a, placements_b, shape_a, shape_b, mesh_sizes
 ):
     """
-    Propagate CutePlacements through an einsum, assuming the given input
-    placements are already in place (no redistribution).
+    Propagate CutePlacements through an einsum (redistribution-free).
 
-    For each mesh dimension, determines the output placement based on
-    how A and B are sharded. The only redistribution-free strategies are:
-
-    For mk,kn->mn:
+    Valid strategies per mesh dim:
       (R, R) -> R
-      (S(m), R) -> S(m)       — A sharded on M, B replicate
-      (R, S(n)) -> S(n)       — A replicate, B sharded on N
-      (S(k), S(k)) -> P       — both sharded on contraction dim
-
-    For batch dims (appear in both inputs and output):
-      (S(b), S(b)) -> S(b)    — both sharded on same batch dim
-
-    Batch dims require BOTH inputs to be sharded identically because
-    the local matmul needs matching batch sizes. (S(b), R) is NOT free —
-    B has all batches locally but the matmul kernel sees mismatched shapes.
-
-    Returns:
-        output_placements tuple, or None if incompatible.
-        Partial outputs have _is_partial=True attribute.
+      (S(m), R) -> S(m)
+      (R, S(n)) -> S(n)
+      (S(k), S(k)) -> Partial
+      (S(b), S(b)) -> S(b)  [batch dims only]
     """
     inputs, output = _parse_einsum(equation)
     categories = _classify_einsum_dims(inputs, output)
-
-    a_label_to_dim = {label: i for i, label in enumerate(inputs[0])}
-    b_label_to_dim = {label: i for i, label in enumerate(inputs[1])}
     out_label_to_dim = {label: i for i, label in enumerate(output)}
 
     output_placements = []
@@ -312,14 +324,10 @@ def propagate_einsum(
             continue
 
         if not pa.is_replicate() and not pb.is_replicate():
-            # Both sharded — must be on the same dim label
-            a_dim = pa.dim
-            b_dim = pb.dim
+            a_dim, b_dim = pa.dim, pb.dim
             if (
-                a_dim is not None
-                and b_dim is not None
-                and a_dim < len(inputs[0])
-                and b_dim < len(inputs[1])
+                a_dim is not None and b_dim is not None
+                and a_dim < len(inputs[0]) and b_dim < len(inputs[1])
             ):
                 a_label = inputs[0][a_dim]
                 b_label = inputs[1][b_dim]
@@ -336,39 +344,32 @@ def propagate_einsum(
                             CutePlacement(dim=out_dim, layout=pa.layout)
                         )
                         continue
-
             return None
 
-        # Exactly one is sharded
+        # Exactly one sharded
         if not pa.is_replicate():
             a_dim = pa.dim
             if a_dim is None or a_dim >= len(inputs[0]):
                 return None
             label = inputs[0][a_dim]
-            cat = categories.get(label, "other")
-
-            if cat == "m":
+            if categories.get(label) == "m":
                 out_dim = out_label_to_dim[label]
                 output_placements.append(
                     CutePlacement(dim=out_dim, layout=pa.layout)
                 )
             else:
-                # batch, contract, n, other — all incompatible when only A is sharded
                 return None
         else:
             b_dim = pb.dim
             if b_dim is None or b_dim >= len(inputs[1]):
                 return None
             label = inputs[1][b_dim]
-            cat = categories.get(label, "other")
-
-            if cat == "n":
+            if categories.get(label) == "n":
                 out_dim = out_label_to_dim[label]
                 output_placements.append(
                     CutePlacement(dim=out_dim, layout=pb.layout)
                 )
             else:
-                # batch, contract, m, other — all incompatible when only B is sharded
                 return None
 
     return tuple(output_placements)
@@ -381,58 +382,36 @@ def propagate_einsum(
 
 def propagate_pointwise(all_placements, shapes, mesh_sizes):
     """
-    Propagate CutePlacements through a pointwise (element-wise) operation.
+    Propagate CutePlacements through a pointwise op (redistribution-free).
 
-    Given the input placements, computes output placements assuming no
-    redistribution. All inputs must have compatible placements per mesh dim:
-    - All sharded inputs must agree on the same placement.
-    - A replicate input is only compatible with a sharded input if the
-      replicate tensor has size 1 (or is scalar) on the sharded dim,
-      so that broadcasting handles it correctly with no conversion.
-      Otherwise, the replicate tensor would need to be sliced to match
-      the shard — that's a placement conversion, not redistribution-free.
-
-    Returns:
-        output_placements tuple, or None if incompatible.
+    All sharded inputs must agree. Replicate inputs must have size 1 on
+    the sharded dim (broadcasting) — otherwise they'd need slicing.
     """
-    num_mesh_dims = len(mesh_sizes)
     output_placements = []
 
-    for mesh_dim in range(num_mesh_dims):
+    for mesh_dim in range(len(mesh_sizes)):
         mesh_size = mesh_sizes[mesh_dim]
         candidate = None
 
         for inp_idx, inp_placements in enumerate(all_placements):
             p = inp_placements[mesh_dim]
-
             if p.is_replicate():
-                # Will check compatibility with candidate after the loop
                 continue
-
-            # Sharded input — check if it's broadcasting (size 1 on sharded dim)
             if p.dim is not None and p.dim < len(shapes[inp_idx]):
                 if shapes[inp_idx][p.dim] == 1:
-                    # Size-1 shard is effectively replicate
                     continue
-
             if candidate is None:
                 candidate = p
             elif candidate != p:
-                return None  # conflicting sharded placements
+                return None
 
         if candidate is not None:
-            # We have a sharded candidate. Verify all replicate inputs
-            # are compatible: they must have size 1 (or be scalar) on
-            # the sharded dim so broadcasting works without conversion.
             for inp_idx, inp_placements in enumerate(all_placements):
                 p = inp_placements[mesh_dim]
                 if not p.is_replicate():
                     continue
-                # Replicate input: check if it has size > 1 on the sharded dim
                 if candidate.dim is not None and candidate.dim < len(shapes[inp_idx]):
                     if shapes[inp_idx][candidate.dim] > 1:
-                        # Replicate tensor has full size on the sharded dim —
-                        # local op would see shape mismatch without slicing
                         return None
             output_placements.append(candidate)
         else:
@@ -448,17 +427,10 @@ def propagate_pointwise(all_placements, shapes, mesh_sizes):
 
 def propagate_reduction(placements, reduce_dim, keepdim, mesh_sizes):
     """
-    Propagate CutePlacements through a reduction operation.
+    Propagate CutePlacements through a reduction (redistribution-free).
 
-    Given the input placements, computes output placements assuming no
-    redistribution during the reduction itself.
-
-    If the input is sharded on the reduce_dim, the output is partial
-    (each device holds a partial result that needs an all-reduce — this
-    is inherent to the algorithm, not a redistribution).
-
-    Returns:
-        output_placements tuple. Partial outputs have _is_partial=True.
+    Shard on reduce_dim -> Partial (needs all-reduce, inherent to algorithm).
+    Shard on other dim -> dim adjustment if not keepdim.
     """
     output_placements = []
 
@@ -467,9 +439,7 @@ def propagate_reduction(placements, reduce_dim, keepdim, mesh_sizes):
 
         if placement.is_replicate():
             output_placements.append(CutePlacement.replicate(mesh_size))
-            continue
-
-        if placement.dim == reduce_dim:
+        elif placement.dim == reduce_dim:
             p = CutePlacement.replicate(mesh_size)
             p._is_partial = True
             output_placements.append(p)
