@@ -1,208 +1,127 @@
 """
 CuTe-based sharding propagation rules.
 
-All rules operate on TiledLayout = (tensor_layout, shard_layout).
-Reshape/view/transpose/permute change tensor_layout; shard_layout is invariant.
-Slice and gather modify the element space, changing shard_layout via composition.
+All rules operate on TiledLayout = (tensor_layout, mesh_tiler).
+shard_layout = logical_divide(tensor_layout, mesh_tiler) is derived.
 
-Rules are strictly redistribution-free: they return output placements
-assuming the given inputs are already in place, or None if incompatible.
+Both tensor_layout and mesh_tiler transform under CuTe operations:
+- View: tensor_layout changes, mesh_tiler invariant
+- Transpose/Permute: reorder modes in both
+- Slice: CuTe slice both with same coordinate
+
+Rules are strictly redistribution-free.
 """
 
-from ._pycute import Layout, codomain_divide, composition, is_tuple, product
+from ._pycute import Layout, is_tuple, product
 from .placement import TiledLayout
 
 
 # =============================================================================
-# View / Reshape propagation
+# View / Reshape
 # =============================================================================
 
 
 def propagate_view(tiled, new_shape):
-    """
-    Propagate TiledLayout through a view/reshape.
-
-    Reshape changes the tensor_layout (how coords map to memory).
-    The shard_layout (which device holds which elements) is invariant.
-    """
+    """View: tensor_layout changes, mesh_tiler invariant."""
     if product(tiled.tensor_shape) != product(new_shape):
         return None
-    return TiledLayout(Layout(new_shape), tiled.shard_layout, tiled.mesh_ndim)
+    return TiledLayout(Layout(new_shape), tiled.mesh_tiler)
 
 
 # =============================================================================
-# Transpose / Permute propagation
+# Transpose / Permute
 # =============================================================================
 
 
 def propagate_transpose(tiled, dim0, dim1):
-    """
-    Propagate TiledLayout through a transpose.
+    """Transpose: swap modes in both tensor_layout and mesh_tiler."""
+    def _swap(layout, d0, d1):
+        shape = list(layout.shape if is_tuple(layout.shape) else (layout.shape,))
+        stride = list(layout.stride if is_tuple(layout.stride) else (layout.stride,))
+        shape[d0], shape[d1] = shape[d1], shape[d0]
+        stride[d0], stride[d1] = stride[d1], stride[d0]
+        return Layout(tuple(shape), tuple(stride))
 
-    Transpose reorders tensor_layout modes. shard_layout unchanged.
-    """
-    shape = list(
-        tiled.tensor_layout.shape
-        if is_tuple(tiled.tensor_layout.shape)
-        else (tiled.tensor_layout.shape,)
-    )
-    stride = list(
-        tiled.tensor_layout.stride
-        if is_tuple(tiled.tensor_layout.stride)
-        else (tiled.tensor_layout.stride,)
-    )
-    shape[dim0], shape[dim1] = shape[dim1], shape[dim0]
-    stride[dim0], stride[dim1] = stride[dim1], stride[dim0]
-    new_tensor = Layout(tuple(shape), tuple(stride))
-    return TiledLayout(new_tensor, tiled.shard_layout, tiled.mesh_ndim)
-
-
-# =============================================================================
-# Permute propagation
-# =============================================================================
+    return TiledLayout(_swap(tiled.tensor_layout, dim0, dim1),
+                       _swap(tiled.mesh_tiler, dim0, dim1))
 
 
 def propagate_permute(tiled, dims):
-    """
-    Propagate TiledLayout through a permute.
+    """Permute: reorder modes in both tensor_layout and mesh_tiler."""
+    def _permute(layout, dims):
+        shape = layout.shape if is_tuple(layout.shape) else (layout.shape,)
+        stride = layout.stride if is_tuple(layout.stride) else (layout.stride,)
+        return Layout(tuple(shape[d] for d in dims), tuple(stride[d] for d in dims))
 
-    Reorders tensor_layout modes according to dims. shard_layout unchanged.
-    permute(dims) means output[i] = input[dims[i]].
-    """
-    shape = (
-        tiled.tensor_layout.shape
-        if is_tuple(tiled.tensor_layout.shape)
-        else (tiled.tensor_layout.shape,)
-    )
-    stride = (
-        tiled.tensor_layout.stride
-        if is_tuple(tiled.tensor_layout.stride)
-        else (tiled.tensor_layout.stride,)
-    )
-    new_shape = tuple(shape[d] for d in dims)
-    new_stride = tuple(stride[d] for d in dims)
-    new_tensor = Layout(new_shape, new_stride)
-    return TiledLayout(new_tensor, tiled.shard_layout, tiled.mesh_ndim)
+    return TiledLayout(_permute(tiled.tensor_layout, dims),
+                       _permute(tiled.mesh_tiler, dims))
 
 
 # =============================================================================
-# Slice propagation
+# Slice
 # =============================================================================
 
 
 def propagate_slice(tiled, dim, index):
+    """Slice: CuTe slice both tensor_layout and mesh_tiler.
+
+    If dim is sharded (tiler size < tensor size), returns None.
     """
-    Propagate TiledLayout through a slice (select a single index along dim).
+    t_shape = tiled.tensor_layout.shape if is_tuple(tiled.tensor_layout.shape) else (tiled.tensor_layout.shape,)
+    m_shape = tiled.mesh_tiler.shape if is_tuple(tiled.mesh_tiler.shape) else (tiled.mesh_tiler.shape,)
 
-    Uses CuTe's partial evaluation on tensor_layout.
+    if m_shape[dim] < t_shape[dim]:
+        return None  # slicing a sharded dim requires redistribution
 
-    If dim is sharded, returns None (requires redistribution).
-    If dim is not sharded, rebuild shard for the output shape with
-    adjusted dim indices.
-    """
-    # Check if the sliced dim is sharded
-    placements = tiled.get_placements()
-    for p_type, p_dim in placements:
-        if p_type == "shard" and p_dim == dim:
-            return None
+    ndim = len(t_shape)
+    coord = tuple(index if k == dim else None for k in range(ndim))
 
-    # Slice tensor_layout using CuTe slicing
-    t_shape = (
-        tiled.tensor_layout.shape
-        if is_tuple(tiled.tensor_layout.shape)
-        else (tiled.tensor_layout.shape,)
-    )
-    slice_coord = tuple(index if k == dim else None for k in range(len(t_shape)))
-    new_tensor = tiled.tensor_layout(*slice_coord)
-    output_shape = (
-        new_tensor.shape if is_tuple(new_tensor.shape) else (new_tensor.shape,)
-    )
+    new_tensor = tiled.tensor_layout(*coord)
+    new_tiler = tiled.mesh_tiler(*coord)
 
-    # Rebuild shard for output shape with adjusted dim indices
-    for p_type, p_dim in placements:
-        if p_type == "shard":
-            new_dim = p_dim if p_dim < dim else p_dim - 1
-            mesh_dim = placements.index((p_type, p_dim))
-            return TiledLayout.shard(
-                output_shape, tiled.mesh_shape, new_dim, mesh_dim
-            )
-
-    return TiledLayout.replicate(output_shape, tiled.mesh_shape)
+    return TiledLayout(new_tensor, new_tiler)
 
 
 # =============================================================================
-# Gather propagation
+# Gather
 # =============================================================================
 
 
 def propagate_gather(tiled, dim, index_layout):
+    """Gather with CuTe-expressible index pattern along dim.
+
+    If dim is sharded, returns None.
     """
-    Propagate TiledLayout through a structured gather along dim.
+    t_shape = tiled.tensor_layout.shape if is_tuple(tiled.tensor_layout.shape) else (tiled.tensor_layout.shape,)
+    m_shape = tiled.mesh_tiler.shape if is_tuple(tiled.mesh_tiler.shape) else (tiled.mesh_tiler.shape,)
 
-    C[..., i, ...] = A[..., index_layout(i), ...] where index_layout
-    is a CuTe Layout mapping output indices to input indices along dim.
+    if m_shape[dim] < t_shape[dim]:
+        return None
 
-    Only works for CuTe-expressible index patterns (contiguous, strided, tiled).
-    Arbitrary index tensors cannot be represented as Layouts.
-
-    If dim is sharded, returns None (would need redistribution).
-    If dim is not sharded, the gather is local — compose the index mapping
-    into the tensor layout.
-    """
-    # Check if the gathered dim is sharded
-    placements = tiled.get_placements()
-    for p_type, p_dim in placements:
-        if p_type == "shard" and p_dim == dim:
-            return None  # gathering on a sharded dim requires redistribution
-
-    # Build output tensor shape: replace dim's size with index_layout's size
-    t_shape = (
-        tiled.tensor_layout.shape
-        if is_tuple(tiled.tensor_layout.shape)
-        else (tiled.tensor_layout.shape,)
-    )
-    t_stride = (
-        tiled.tensor_layout.stride
-        if is_tuple(tiled.tensor_layout.stride)
-        else (tiled.tensor_layout.stride,)
-    )
-
-    gather_size = index_layout.size()
-    output_shape = t_shape[:dim] + (gather_size,) + t_shape[dim + 1 :]
-
-    # The tensor_layout's dim mode gets composed with index_layout:
-    # original: tensor_coord[dim] -> memory offset contribution = coord * stride[dim]
-    # after gather: output_idx -> index_layout(output_idx) -> memory offset
-    # = index_layout(output_idx) * stride[dim]
-    # This is composition of stride[dim] * identity with index_layout,
-    # which is just Layout(index_layout.shape, index_layout.stride * stride[dim])
-
+    # Replace dim in tensor_layout with gathered strides
+    t_stride = tiled.tensor_layout.stride if is_tuple(tiled.tensor_layout.stride) else (tiled.tensor_layout.stride,)
     dim_stride = t_stride[dim]
+
     if is_tuple(index_layout.stride):
         new_dim_stride = tuple(s * dim_stride for s in index_layout.stride)
     else:
         new_dim_stride = index_layout.stride * dim_stride
 
-    new_dim_shape = index_layout.shape
+    new_shape = t_shape[:dim] + (index_layout.shape,) + t_shape[dim + 1:]
+    new_stride = t_stride[:dim] + (new_dim_stride,) + t_stride[dim + 1:]
+    new_tensor = Layout(new_shape, new_stride)
 
-    output_stride = t_stride[:dim] + (new_dim_stride,) + t_stride[dim + 1 :]
-    output_shape_full = t_shape[:dim] + (new_dim_shape,) + t_shape[dim + 1 :]
-    new_tensor = Layout(output_shape_full, output_stride)
+    # Tiler: dim was replicate (full size), replace with gathered size
+    m_stride = tiled.mesh_tiler.stride if is_tuple(tiled.mesh_tiler.stride) else (tiled.mesh_tiler.stride,)
+    new_m_shape = m_shape[:dim] + (index_layout.shape,) + m_shape[dim + 1:]
+    new_m_stride = m_stride[:dim] + (new_dim_stride,) + m_stride[dim + 1:]
+    new_tiler = Layout(new_m_shape, new_m_stride)
 
-    # shard_layout: element-index based. Rebuild for output shape.
-    for p_type, p_dim in placements:
-        if p_type == "shard":
-            new_dim = p_dim  # gather doesn't change dim indices (replaces in-place)
-            mesh_dim = placements.index((p_type, p_dim))
-            return TiledLayout.shard(
-                output_shape, tiled.mesh_shape, new_dim, mesh_dim
-            )
-
-    return TiledLayout.replicate(output_shape, tiled.mesh_shape)
+    return TiledLayout(new_tensor, new_tiler)
 
 
 # =============================================================================
-# Einsum / Matmul propagation
+# Einsum / Matmul
 # =============================================================================
 
 
@@ -235,118 +154,91 @@ def _classify_einsum_dims(inputs, output):
     return categories
 
 
-def _get_shard_dim(tiled, mesh_dim):
-    """Get which tensor dim a specific mesh dim shards, or None for replicate."""
+def _get_shard_info(tiled):
+    """Get list of (dim, mesh_size) for sharded dims."""
     placements = tiled.get_placements()
-    if mesh_dim < len(placements):
-        p_type, p_dim = placements[mesh_dim]
-        if p_type == "shard":
-            return p_dim
-    return None
+    return [(entry[1], entry[2]) for entry in placements if entry[0] == "shard"]
 
 
 def propagate_einsum(equation, tiled_a, tiled_b, output_shape):
-    """
-    Propagate TiledLayout through an einsum (redistribution-free).
-
-    Valid strategies:
-      Both replicate on a mesh dim -> output replicate
-      Both shard on same batch/contract dim -> batch passes through, contract -> Partial
-      One shards M (or N), other replicate -> output shards M (or N)
-    """
+    """Einsum: redistribution-free strategies."""
     inputs, output = _parse_einsum(equation)
     categories = _classify_einsum_dims(inputs, output)
 
-    assert tiled_a.mesh_ndim == tiled_b.mesh_ndim
-    mesh_ndim = tiled_a.mesh_ndim
-    mesh_shape = tiled_a.mesh_shape
+    a_shards = _get_shard_info(tiled_a)
+    b_shards = _get_shard_info(tiled_b)
 
-    # Build output tensor layout
-    out_tensor_layout = Layout(output_shape)
+    if not a_shards and not b_shards:
+        return TiledLayout.replicate(output_shape)
 
-    # For each mesh dim, determine output shard
-    # Start from replicate and modify
-    out_tiled = TiledLayout.replicate(output_shape, mesh_shape)
+    # Build output from each shard
+    out = TiledLayout.replicate(output_shape)
     is_partial = False
 
-    for md in range(mesh_ndim):
-        a_shard = _get_shard_dim(tiled_a, md)
-        b_shard = _get_shard_dim(tiled_b, md)
+    # Check each sharded dim
+    for a_dim, a_mesh in a_shards:
+        if a_dim >= len(inputs[0]):
+            return None
+        a_label = inputs[0][a_dim]
+        cat = categories.get(a_label, "other")
 
-        if a_shard is None and b_shard is None:
-            continue  # both replicate
+        # Find matching shard in b
+        b_match = None
+        for b_dim, b_mesh in b_shards:
+            if b_dim < len(inputs[1]) and inputs[1][b_dim] == a_label:
+                b_match = (b_dim, b_mesh)
+                break
 
-        if a_shard is not None and b_shard is not None:
-            # Both sharded — must be on same label
-            if a_shard >= len(inputs[0]) or b_shard >= len(inputs[1]):
-                return None
-            a_label = inputs[0][a_shard]
-            b_label = inputs[1][b_shard]
-            if a_label != b_label:
-                return None
-
-            cat = categories.get(a_label, "other")
-            if cat == "batch":
-                out_dim = output.index(a_label)
-                out_tiled = TiledLayout.shard(
-                    output_shape, mesh_shape, out_dim, md
-                )
-            elif cat == "contract":
-                is_partial = True
-            else:
-                return None
-            continue
-
-        # Exactly one sharded
-        if a_shard is not None:
-            if a_shard >= len(inputs[0]):
-                return None
-            label = inputs[0][a_shard]
-            cat = categories.get(label, "other")
-            if cat == "m":
-                out_dim = output.index(label)
-                out_tiled = TiledLayout.shard(
-                    output_shape, mesh_shape, out_dim, md
-                )
-            else:
-                return None
+        if cat == "m":
+            if b_match:
+                return None  # can't have both sharded on M dim
+            out_dim = output.index(a_label)
+            out = TiledLayout.shard(output_shape, out_dim, a_mesh)
+        elif cat == "batch":
+            if not b_match:
+                return None  # batch must be sharded on both
+            out_dim = output.index(a_label)
+            out = TiledLayout.shard(output_shape, out_dim, a_mesh)
+        elif cat == "contract":
+            if not b_match:
+                return None  # K shard needs both
+            is_partial = True
         else:
-            if b_shard >= len(inputs[1]):
-                return None
-            label = inputs[1][b_shard]
-            cat = categories.get(label, "other")
-            if cat == "n":
-                out_dim = output.index(label)
-                out_tiled = TiledLayout.shard(
-                    output_shape, mesh_shape, out_dim, md
-                )
-            else:
-                return None
+            return None
+
+    for b_dim, b_mesh in b_shards:
+        if b_dim >= len(inputs[1]):
+            return None
+        b_label = inputs[1][b_dim]
+        cat = categories.get(b_label, "other")
+        # Skip if already handled as batch/contract
+        if any(a_dim < len(inputs[0]) and inputs[0][a_dim] == b_label for a_dim, _ in a_shards):
+            continue
+        if cat == "n":
+            out_dim = output.index(b_label)
+            out = TiledLayout.shard(output_shape, out_dim, b_mesh)
+        else:
+            return None
 
     if is_partial:
-        out_tiled._is_partial = True
+        out._is_partial = True
 
-    return out_tiled
+    return out
 
 
 # =============================================================================
-# Pointwise propagation
+# Pointwise
 # =============================================================================
 
 
 def propagate_pointwise(all_tileds, output_shape):
-    """
-    Propagate TiledLayout through a pointwise op (redistribution-free).
-
-    All inputs must have compatible shard_layouts.
-    """
+    """Pointwise: all inputs must have compatible mesh_tilers."""
     if not all_tileds:
         return None
 
     ref = all_tileds[0]
     for tiled in all_tileds[1:]:
-        if tiled.shard_layout != ref.shard_layout:
-            # Check if one is replicate (broadcasting from size-1 dim)
+        if tiled.mesh_tiler != ref.mesh_tiler:
             if tiled.is_replicate():
                 continue
             if ref.is_replicate():
@@ -354,46 +246,27 @@ def propagate_pointwise(all_tileds, output_shape):
                 continue
             return None
 
-    # Output has same shard layout, new tensor shape
-    return TiledLayout(Layout(output_shape), ref.shard_layout, ref.mesh_ndim)
+    return TiledLayout(Layout(output_shape), ref.mesh_tiler)
 
 
 # =============================================================================
-# Reduction propagation
+# Reduction
 # =============================================================================
 
 
 def propagate_reduction(tiled, reduce_dim, keepdim, output_shape):
-    """
-    Propagate TiledLayout through a reduction (redistribution-free).
-
-    If the reduced dim is sharded -> Partial.
-    Otherwise -> adjust tensor_layout, shard_layout unchanged.
-    """
-    # Check if reduce_dim is sharded
+    """Reduction: if sharded dim reduced -> Partial. Otherwise adjust."""
     placements = tiled.get_placements()
-    for p_type, p_dim in placements:
-        if p_type == "shard" and p_dim == reduce_dim:
-            # Reducing a sharded dim -> Partial
-            result = TiledLayout.replicate(output_shape, tiled.mesh_shape)
+
+    for entry in placements:
+        if entry[0] == "shard" and entry[1] == reduce_dim:
+            result = TiledLayout.replicate(output_shape)
             result._is_partial = True
             return result
 
-    # Reducing a non-sharded dim: shard_layout is still valid
-    # (element indices don't change for the remaining elements,
-    # but we need to account for the collapsed dim)
-    # For now, find which dim is sharded and rebuild
-    for p_type, p_dim in placements:
-        if p_type == "shard":
-            # Adjust dim index if needed
-            new_dim = p_dim
-            if not keepdim and p_dim > reduce_dim:
-                new_dim = p_dim - 1
-            # Find mesh_dim for this placement
-            mesh_dim = placements.index((p_type, p_dim))
-            return TiledLayout.shard(
-                output_shape, tiled.mesh_shape, new_dim, mesh_dim
-            )
+    for entry in placements:
+        if entry[0] == "shard":
+            new_dim = entry[1] if entry[1] < reduce_dim or keepdim else entry[1] - 1
+            return TiledLayout.shard(output_shape, new_dim, entry[2])
 
-    # All replicate
-    return TiledLayout.replicate(output_shape, tiled.mesh_shape)
+    return TiledLayout.replicate(output_shape)

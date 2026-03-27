@@ -1,9 +1,8 @@
 """
 CuTe-based sharding placement and propagation.
 
-This package provides:
-- TiledLayout: Sharding as composition of tensor layout and shard layout
-- Propagation rules for view, transpose, einsum, pointwise, and reduction ops
+TiledLayout = tensor_layout + mesh_tiler.
+shard_layout = logical_divide(tensor_layout, mesh_tiler) — derived, not stored.
 """
 
 from .placement import TiledLayout

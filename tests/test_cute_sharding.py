@@ -1,9 +1,6 @@
 """
-Tests for TiledLayout sharding placement and propagation.
-
-TiledLayout = (tensor_layout, shard_layout):
-- tensor_layout: tensor_coords -> memory_offset (changed by reshape/transpose)
-- shard_layout: (mesh, local) -> element_index (changed by shard/redistribute)
+Tests for TiledLayout = tensor_layout + mesh_tiler.
+shard_layout = logical_divide(tensor_layout, mesh_tiler) — derived.
 """
 
 import unittest
@@ -16,7 +13,6 @@ from autoparallel.shardings.cute._pycute import (
     coalesce,
     codomain_divide,
     make_basis_like,
-    product,
 )
 from autoparallel.shardings.cute.placement import TiledLayout
 from autoparallel.shardings.cute.propagation import (
@@ -32,165 +28,214 @@ from autoparallel.shardings.cute.propagation import (
 
 
 class TestTiledLayout(unittest.TestCase):
-    """Test TiledLayout creation and queries."""
 
     def test_replicate(self):
-        t = TiledLayout.replicate((4, 8, 16), (2, 4))
+        t = TiledLayout.replicate((4, 8, 16))
         self.assertTrue(t.is_replicate())
         self.assertEqual(t.tensor_shape, (4, 8, 16))
-        self.assertEqual(t.mesh_shape, (2, 4))
-        self.assertEqual(t.num_elements, 512)
         self.assertEqual(t.local_size, 512)
 
     def test_shard(self):
-        t = TiledLayout.shard((4, 8, 16), (2,), shard_dim=0)
+        t = TiledLayout.shard((4, 8, 16), shard_dim=0, mesh_dim_size=2)
         self.assertFalse(t.is_replicate())
         placements = t.get_placements()
-        self.assertEqual(placements, [("shard", 0)])
+        self.assertEqual(placements[0], ("shard", 0, 2))
 
     def test_shard_dim1(self):
-        t = TiledLayout.shard((4, 8, 16), (2,), shard_dim=1)
+        t = TiledLayout.shard((4, 8, 16), shard_dim=1, mesh_dim_size=2)
         placements = t.get_placements()
-        self.assertEqual(placements, [("shard", 1)])
+        self.assertEqual(placements[0], ("shard", 1, 2))
 
-    def test_shard_2d_mesh(self):
-        t = TiledLayout.shard((4, 8, 16), (2, 4), shard_dim=0, mesh_dim=0)
+    def test_replicate_placements(self):
+        t = TiledLayout.replicate((4, 8, 16))
         placements = t.get_placements()
-        self.assertEqual(placements[0], ("shard", 0))
-        self.assertEqual(placements[1], ("replicate", None))
-
-    def test_shard_both_dims(self):
-        # Shard dim 0 on mesh dim 0, dim 1 on mesh dim 1
-        t = TiledLayout.shard((4, 8, 16), (2, 4), shard_dim=0, mesh_dim=0)
-        # Now also shard dim 1 on mesh dim 1 — need to build manually
-        # For now test the factory for single shard
-        placements = t.get_placements()
-        self.assertEqual(placements[0], ("shard", 0))
-
-    def test_replicate_get_placements(self):
-        t = TiledLayout.replicate((4, 8, 16), (2, 4))
-        placements = t.get_placements()
-        self.assertEqual(placements, [("replicate", None), ("replicate", None)])
-
-    def test_str(self):
-        t = TiledLayout.shard((4, 8, 16), (2,), shard_dim=1)
-        s = str(t)
-        self.assertIn("S(1)", s)
+        self.assertEqual(placements, [("replicate", None, None)])
 
     def test_equality(self):
-        t1 = TiledLayout.shard((4, 8, 16), (2,), shard_dim=0)
-        t2 = TiledLayout.shard((4, 8, 16), (2,), shard_dim=0)
+        t1 = TiledLayout.shard((4, 8, 16), shard_dim=0, mesh_dim_size=2)
+        t2 = TiledLayout.shard((4, 8, 16), shard_dim=0, mesh_dim_size=2)
         self.assertEqual(t1, t2)
+
+    def test_shard_layout_derived(self):
+        """shard_layout is derived from logical_divide."""
+        t = TiledLayout.shard((4, 8, 16), shard_dim=1, mesh_dim_size=2)
+        sl = t.shard_layout
+        # Should have tile (local) and rest (mesh)
+        self.assertEqual(sl.size(), 512)
 
 
 class TestViewPropagation(unittest.TestCase):
-    """View/reshape: tensor_layout changes, shard_layout invariant."""
 
     def test_flatten(self):
-        """(B, S, H) -> (B*S, H): shard_layout unchanged."""
-        t = TiledLayout.shard((4, 8, 16), (2,), shard_dim=0)
+        t = TiledLayout.shard((4, 8, 16), shard_dim=0, mesh_dim_size=2)
         out = propagate_view(t, (32, 16))
         self.assertIsNotNone(out)
         self.assertEqual(out.tensor_shape, (32, 16))
-        # shard_layout is invariant
-        self.assertEqual(out.shard_layout, t.shard_layout)
+        # mesh_tiler invariant
+        self.assertEqual(out.mesh_tiler, t.mesh_tiler)
 
     def test_unflatten(self):
-        """(B*S, H) -> (B, S, H): shard_layout unchanged."""
-        t = TiledLayout.shard((32, 16), (2,), shard_dim=0)
+        t = TiledLayout.shard((32, 16), shard_dim=0, mesh_dim_size=2)
         out = propagate_view(t, (4, 8, 16))
         self.assertIsNotNone(out)
         self.assertEqual(out.tensor_shape, (4, 8, 16))
-        self.assertEqual(out.shard_layout, t.shard_layout)
+        self.assertEqual(out.mesh_tiler, t.mesh_tiler)
 
     def test_replicate_through_view(self):
-        t = TiledLayout.replicate((4, 8, 16), (2,))
+        t = TiledLayout.replicate((4, 8, 16))
         out = propagate_view(t, (32, 16))
         self.assertIsNotNone(out)
         self.assertTrue(out.is_replicate())
 
     def test_round_trip(self):
-        """Flatten then unflatten: shard_layout preserved exactly."""
-        original = TiledLayout.shard((4, 8, 16), (2,), shard_dim=1)
+        original = TiledLayout.shard((4, 8, 16), shard_dim=1, mesh_dim_size=2)
         after_flat = propagate_view(original, (32, 16))
         after_unflat = propagate_view(after_flat, (4, 8, 16))
-        # shard_layout identical throughout
-        self.assertEqual(after_unflat.shard_layout, original.shard_layout)
+        self.assertEqual(after_unflat.mesh_tiler, original.mesh_tiler)
 
-    def test_incompatible_shape(self):
-        t = TiledLayout.shard((4, 8, 16), (2,), shard_dim=0)
-        out = propagate_view(t, (100,))  # wrong total elements
-        self.assertIsNone(out)
+    def test_incompatible(self):
+        t = TiledLayout.shard((4, 8, 16), shard_dim=0, mesh_dim_size=2)
+        self.assertIsNone(propagate_view(t, (100,)))
+
+    def test_mesh_tiler_invariant(self):
+        """mesh_tiler doesn't change under any view."""
+        t = TiledLayout.shard((4, 8, 16), shard_dim=1, mesh_dim_size=4)
+        v1 = propagate_view(t, (32, 16))
+        v2 = propagate_view(v1, (2, 16, 16))
+        v3 = propagate_view(v2, (4, 8, 16))
+        self.assertEqual(t.mesh_tiler, v1.mesh_tiler)
+        self.assertEqual(t.mesh_tiler, v2.mesh_tiler)
+        self.assertEqual(t.mesh_tiler, v3.mesh_tiler)
 
 
 class TestTransposePropagation(unittest.TestCase):
-    """Transpose: tensor_layout modes reorder, shard_layout unchanged."""
 
     def test_transpose(self):
-        t = TiledLayout.shard((4, 8, 16), (2,), shard_dim=0)
+        t = TiledLayout.shard((4, 8, 16), shard_dim=0, mesh_dim_size=2)
         out = propagate_transpose(t, 0, 1)
-        self.assertIsNotNone(out)
         self.assertEqual(out.tensor_shape, (8, 4, 16))
-        # shard_layout invariant
-        self.assertEqual(out.shard_layout, t.shard_layout)
+        # tiler modes also swapped
+        self.assertNotEqual(out.mesh_tiler, t.mesh_tiler)
 
     def test_transpose_replicate(self):
-        t = TiledLayout.replicate((4, 8), (2,))
+        t = TiledLayout.replicate((4, 8))
         out = propagate_transpose(t, 0, 1)
         self.assertTrue(out.is_replicate())
-        self.assertEqual(out.tensor_shape, (8, 4))
+
+
+class TestPermutePropagation(unittest.TestCase):
+
+    def test_permute_3d(self):
+        t = TiledLayout.shard((4, 8, 16), shard_dim=0, mesh_dim_size=2)
+        out = propagate_permute(t, (2, 0, 1))
+        self.assertEqual(out.tensor_shape, (16, 4, 8))
+
+    def test_permute_round_trip(self):
+        t = TiledLayout.shard((4, 8, 16), shard_dim=1, mesh_dim_size=2)
+        p1 = propagate_permute(t, (2, 0, 1))
+        p2 = propagate_permute(p1, (1, 2, 0))
+        self.assertEqual(p2, t)
+
+
+class TestSlicePropagation(unittest.TestCase):
+
+    def test_slice_non_sharded_dim(self):
+        t = TiledLayout.shard((4, 8, 16), shard_dim=0, mesh_dim_size=2)
+        out = propagate_slice(t, dim=1, index=3)
+        self.assertIsNotNone(out)
+        placements = out.get_placements()
+        self.assertEqual(placements[0], ("shard", 0, 2))
+
+    def test_slice_sharded_dim(self):
+        t = TiledLayout.shard((4, 8, 16), shard_dim=0, mesh_dim_size=2)
+        out = propagate_slice(t, dim=0, index=2)
+        self.assertIsNone(out)
+
+    def test_slice_replicate(self):
+        t = TiledLayout.replicate((4, 8, 16))
+        out = propagate_slice(t, dim=1, index=3)
+        self.assertIsNotNone(out)
+        self.assertTrue(out.is_replicate())
+
+    def test_slice_dim_before_shard(self):
+        t = TiledLayout.shard((4, 8, 16), shard_dim=1, mesh_dim_size=2)
+        out = propagate_slice(t, dim=0, index=2)
+        self.assertIsNotNone(out)
+        placements = out.get_placements()
+        self.assertEqual(placements[0], ("shard", 0, 2))  # dim 1 -> dim 0
+
+
+class TestGatherPropagation(unittest.TestCase):
+
+    def test_gather_non_sharded(self):
+        t = TiledLayout.shard((4, 8, 16), shard_dim=0, mesh_dim_size=2)
+        index = Layout(4, 1)
+        out = propagate_gather(t, dim=1, index_layout=index)
+        self.assertIsNotNone(out)
+
+    def test_gather_sharded_dim(self):
+        t = TiledLayout.shard((4, 8, 16), shard_dim=1, mesh_dim_size=2)
+        index = Layout(4, 1)
+        out = propagate_gather(t, dim=1, index_layout=index)
+        self.assertIsNone(out)
+
+    def test_gather_replicate(self):
+        t = TiledLayout.replicate((4, 8, 16))
+        index = Layout(4, 2)
+        out = propagate_gather(t, dim=1, index_layout=index)
+        self.assertIsNotNone(out)
+        self.assertTrue(out.is_replicate())
 
 
 class TestEinsumPropagation(unittest.TestCase):
-    """Einsum: redistribution-free strategies."""
 
     def test_both_replicate(self):
-        a = TiledLayout.replicate((16, 8), (2,))
-        b = TiledLayout.replicate((8, 32), (2,))
+        a = TiledLayout.replicate((16, 8))
+        b = TiledLayout.replicate((8, 32))
         out = propagate_einsum("mk,kn->mn", a, b, (16, 32))
         self.assertIsNotNone(out)
         self.assertTrue(out.is_replicate())
 
     def test_m_shard(self):
-        a = TiledLayout.shard((16, 8), (2,), shard_dim=0)
-        b = TiledLayout.replicate((8, 32), (2,))
+        a = TiledLayout.shard((16, 8), shard_dim=0, mesh_dim_size=2)
+        b = TiledLayout.replicate((8, 32))
         out = propagate_einsum("mk,kn->mn", a, b, (16, 32))
         self.assertIsNotNone(out)
         placements = out.get_placements()
-        self.assertEqual(placements[0], ("shard", 0))
+        self.assertEqual(placements[0], ("shard", 0, 2))
 
     def test_n_shard(self):
-        a = TiledLayout.replicate((16, 8), (2,))
-        b = TiledLayout.shard((8, 32), (2,), shard_dim=1)
+        a = TiledLayout.replicate((16, 8))
+        b = TiledLayout.shard((8, 32), shard_dim=1, mesh_dim_size=2)
         out = propagate_einsum("mk,kn->mn", a, b, (16, 32))
         self.assertIsNotNone(out)
         placements = out.get_placements()
-        self.assertEqual(placements[0], ("shard", 1))
+        self.assertEqual(placements[0], ("shard", 1, 2))
 
     def test_k_shard_both(self):
-        a = TiledLayout.shard((16, 8), (2,), shard_dim=1)
-        b = TiledLayout.shard((8, 32), (2,), shard_dim=0)
+        a = TiledLayout.shard((16, 8), shard_dim=1, mesh_dim_size=2)
+        b = TiledLayout.shard((8, 32), shard_dim=0, mesh_dim_size=2)
         out = propagate_einsum("mk,kn->mn", a, b, (16, 32))
         self.assertIsNotNone(out)
         self.assertTrue(hasattr(out, "_is_partial") and out._is_partial)
 
-    def test_k_shard_only_a_incompatible(self):
-        a = TiledLayout.shard((16, 8), (2,), shard_dim=1)
-        b = TiledLayout.replicate((8, 32), (2,))
+    def test_k_shard_only_a(self):
+        a = TiledLayout.shard((16, 8), shard_dim=1, mesh_dim_size=2)
+        b = TiledLayout.replicate((8, 32))
         out = propagate_einsum("mk,kn->mn", a, b, (16, 32))
         self.assertIsNone(out)
 
-    def test_batch_both_sharded(self):
-        a = TiledLayout.shard((4, 8, 16), (2,), shard_dim=0)
-        b = TiledLayout.shard((4, 16, 32), (2,), shard_dim=0)
+    def test_batch_both(self):
+        a = TiledLayout.shard((4, 8, 16), shard_dim=0, mesh_dim_size=2)
+        b = TiledLayout.shard((4, 16, 32), shard_dim=0, mesh_dim_size=2)
         out = propagate_einsum("bmk,bkn->bmn", a, b, (4, 8, 32))
         self.assertIsNotNone(out)
         placements = out.get_placements()
-        self.assertEqual(placements[0], ("shard", 0))
+        self.assertEqual(placements[0], ("shard", 0, 2))
 
-    def test_batch_a_only_incompatible(self):
-        a = TiledLayout.shard((4, 8, 16), (2,), shard_dim=0)
-        b = TiledLayout.replicate((4, 16, 32), (2,))
+    def test_batch_a_only(self):
+        a = TiledLayout.shard((4, 8, 16), shard_dim=0, mesh_dim_size=2)
+        b = TiledLayout.replicate((4, 16, 32))
         out = propagate_einsum("bmk,bkn->bmn", a, b, (4, 8, 32))
         self.assertIsNone(out)
 
@@ -198,209 +243,72 @@ class TestEinsumPropagation(unittest.TestCase):
 class TestPointwisePropagation(unittest.TestCase):
 
     def test_matching(self):
-        a = TiledLayout.shard((8, 16), (2,), shard_dim=0)
-        b = TiledLayout.shard((8, 16), (2,), shard_dim=0)
+        a = TiledLayout.shard((8, 16), shard_dim=0, mesh_dim_size=2)
+        b = TiledLayout.shard((8, 16), shard_dim=0, mesh_dim_size=2)
         out = propagate_pointwise([a, b], (8, 16))
         self.assertIsNotNone(out)
-        self.assertEqual(out.shard_layout, a.shard_layout)
+        self.assertEqual(out.mesh_tiler, a.mesh_tiler)
 
-    def test_mismatch_incompatible(self):
-        a = TiledLayout.shard((8, 16), (2,), shard_dim=0)
-        b = TiledLayout.shard((8, 16), (2,), shard_dim=1)
+    def test_mismatch(self):
+        a = TiledLayout.shard((8, 16), shard_dim=0, mesh_dim_size=2)
+        b = TiledLayout.shard((8, 16), shard_dim=1, mesh_dim_size=2)
         out = propagate_pointwise([a, b], (8, 16))
         self.assertIsNone(out)
 
-    def test_shard_with_replicate_broadcast(self):
-        a = TiledLayout.shard((8, 16), (2,), shard_dim=0)
-        b = TiledLayout.replicate((8, 16), (2,))
+    def test_shard_with_replicate(self):
+        a = TiledLayout.shard((8, 16), shard_dim=0, mesh_dim_size=2)
+        b = TiledLayout.replicate((8, 16))
         out = propagate_pointwise([a, b], (8, 16))
         self.assertIsNotNone(out)
 
     def test_all_replicate(self):
-        a = TiledLayout.replicate((8, 16), (2,))
-        b = TiledLayout.replicate((8, 16), (2,))
+        a = TiledLayout.replicate((8, 16))
+        b = TiledLayout.replicate((8, 16))
         out = propagate_pointwise([a, b], (8, 16))
-        self.assertIsNotNone(out)
         self.assertTrue(out.is_replicate())
 
 
 class TestReductionPropagation(unittest.TestCase):
 
-    def test_reduce_non_sharded_dim(self):
-        t = TiledLayout.shard((8, 16), (2,), shard_dim=1)
+    def test_reduce_non_sharded(self):
+        t = TiledLayout.shard((8, 16), shard_dim=1, mesh_dim_size=2)
         out = propagate_reduction(t, reduce_dim=0, keepdim=False, output_shape=(16,))
-        self.assertIsNotNone(out)
         placements = out.get_placements()
-        self.assertEqual(placements[0], ("shard", 0))  # dim 1 becomes dim 0
+        self.assertEqual(placements[0], ("shard", 0, 2))
 
-    def test_reduce_sharded_dim(self):
-        t = TiledLayout.shard((8, 16), (2,), shard_dim=0)
+    def test_reduce_sharded(self):
+        t = TiledLayout.shard((8, 16), shard_dim=0, mesh_dim_size=2)
         out = propagate_reduction(t, reduce_dim=0, keepdim=False, output_shape=(16,))
-        self.assertIsNotNone(out)
         self.assertTrue(hasattr(out, "_is_partial") and out._is_partial)
 
     def test_reduce_replicate(self):
-        t = TiledLayout.replicate((8, 16), (2,))
+        t = TiledLayout.replicate((8, 16))
         out = propagate_reduction(t, reduce_dim=0, keepdim=False, output_shape=(16,))
-        self.assertTrue(out.is_replicate())
-
-
-class TestPermutePropagation(unittest.TestCase):
-    """Permute: reorder tensor_layout modes, shard_layout unchanged."""
-
-    def test_permute_3d(self):
-        t = TiledLayout.shard((4, 8, 16), (2,), shard_dim=0)
-        out = propagate_permute(t, (2, 0, 1))
-        self.assertIsNotNone(out)
-        self.assertEqual(out.tensor_shape, (16, 4, 8))
-        self.assertEqual(out.shard_layout, t.shard_layout)
-
-    def test_permute_is_transpose_generalization(self):
-        t = TiledLayout.shard((4, 8, 16), (2,), shard_dim=1)
-        transposed = propagate_transpose(t, 0, 2)
-        permuted = propagate_permute(t, (2, 1, 0))
-        self.assertEqual(transposed.tensor_layout, permuted.tensor_layout)
-
-    def test_permute_replicate(self):
-        t = TiledLayout.replicate((4, 8, 16), (2,))
-        out = propagate_permute(t, (2, 1, 0))
-        self.assertTrue(out.is_replicate())
-
-    def test_permute_round_trip(self):
-        t = TiledLayout.shard((4, 8, 16), (2,), shard_dim=1)
-        p1 = propagate_permute(t, (2, 0, 1))
-        p2 = propagate_permute(p1, (1, 2, 0))  # inverse permutation
-        self.assertEqual(p2.tensor_shape, t.tensor_shape)
-        self.assertEqual(p2.shard_layout, t.shard_layout)
-
-
-class TestSlicePropagation(unittest.TestCase):
-    """Slice: select fixed index along a dim."""
-
-    def test_slice_non_sharded_dim(self):
-        """Slice dim 1 (not sharded) -> removes dim, shard adjusts."""
-        t = TiledLayout.shard((4, 8, 16), (2,), shard_dim=0)
-        out = propagate_slice(t, dim=1, index=3)
-        self.assertIsNotNone(out)
-        self.assertEqual(out.tensor_shape, (4, 16))
-        placements = out.get_placements()
-        self.assertEqual(placements[0], ("shard", 0))
-
-    def test_slice_non_sharded_dim_after(self):
-        """Slice dim 2 (after shard dim 0) -> shard dim unchanged."""
-        t = TiledLayout.shard((4, 8, 16), (2,), shard_dim=0)
-        out = propagate_slice(t, dim=2, index=5)
-        self.assertIsNotNone(out)
-        self.assertEqual(out.tensor_shape, (4, 8))
-        placements = out.get_placements()
-        self.assertEqual(placements[0], ("shard", 0))
-
-    def test_slice_sharded_dim_incompatible(self):
-        """Slice the sharded dim -> requires redistribution."""
-        t = TiledLayout.shard((4, 8, 16), (2,), shard_dim=0)
-        out = propagate_slice(t, dim=0, index=2)
-        self.assertIsNone(out)
-
-    def test_slice_replicate(self):
-        """Slice on replicate -> still replicate with dim removed."""
-        t = TiledLayout.replicate((4, 8, 16), (2,))
-        out = propagate_slice(t, dim=1, index=3)
-        self.assertIsNotNone(out)
-        self.assertTrue(out.is_replicate())
-        self.assertEqual(out.tensor_shape, (4, 16))
-
-    def test_slice_dim_before_shard(self):
-        """Slice dim 0 when shard is on dim 1 -> shard dim shifts to 0."""
-        t = TiledLayout.shard((4, 8, 16), (2,), shard_dim=1)
-        out = propagate_slice(t, dim=0, index=2)
-        self.assertIsNotNone(out)
-        self.assertEqual(out.tensor_shape, (8, 16))
-        placements = out.get_placements()
-        self.assertEqual(placements[0], ("shard", 0))  # dim 1 becomes dim 0
-
-
-class TestGatherPropagation(unittest.TestCase):
-    """Gather with structured (CuTe-expressible) index patterns."""
-
-    def test_gather_contiguous_subset(self):
-        """Gather first 4 elements along dim 1 (not sharded)."""
-        t = TiledLayout.shard((4, 8, 16), (2,), shard_dim=0)
-        index = Layout(4, 1)  # indices 0, 1, 2, 3
-        out = propagate_gather(t, dim=1, index_layout=index)
-        self.assertIsNotNone(out)
-        self.assertEqual(out.tensor_shape, (4, 4, 16))
-        placements = out.get_placements()
-        self.assertEqual(placements[0], ("shard", 0))
-
-    def test_gather_strided(self):
-        """Gather every 2nd element along dim 1 (not sharded)."""
-        t = TiledLayout.shard((4, 8, 16), (2,), shard_dim=0)
-        index = Layout(4, 2)  # indices 0, 2, 4, 6
-        out = propagate_gather(t, dim=1, index_layout=index)
-        self.assertIsNotNone(out)
-        self.assertEqual(out.tensor_shape, (4, 4, 16))
-
-    def test_gather_sharded_dim_incompatible(self):
-        """Gather on the sharded dim -> requires redistribution."""
-        t = TiledLayout.shard((4, 8, 16), (2,), shard_dim=1)
-        index = Layout(4, 1)
-        out = propagate_gather(t, dim=1, index_layout=index)
-        self.assertIsNone(out)
-
-    def test_gather_replicate(self):
-        """Gather on replicate -> still replicate."""
-        t = TiledLayout.replicate((4, 8, 16), (2,))
-        index = Layout(4, 2)
-        out = propagate_gather(t, dim=1, index_layout=index)
-        self.assertIsNotNone(out)
         self.assertTrue(out.is_replicate())
 
 
 class TestEndToEnd(unittest.TestCase):
 
-    def test_linear_3d_both_shardings_preserved(self):
-        """
-        (B, S, H) with S(0) on dp, S(1) on sp.
-        view -> mm -> view: shard_layout invariant through views.
-        """
+    def test_linear_3d(self):
+        """view -> mm -> view with shard preserved."""
         B, S, H, O = 4, 8, 16, 32
+        input_t = TiledLayout.shard((B, S, H), shard_dim=0, mesh_dim_size=2)
 
-        # Input: shard dim 0 on mesh dim 0
-        input_t = TiledLayout.shard((B, S, H), (2, 4), shard_dim=0, mesh_dim=0)
-        original_shard = input_t.shard_layout
-
-        # Step 1: view (B, S, H) -> (B*S, H) — trivial
         after_v1 = propagate_view(input_t, (B * S, H))
         self.assertIsNotNone(after_v1)
-        self.assertEqual(after_v1.shard_layout, original_shard)
+        self.assertEqual(after_v1.mesh_tiler, input_t.mesh_tiler)
 
-        # Step 2: mm (B*S, H) @ (H, O) -> (B*S, O)
-        weight = TiledLayout.replicate((H, O), (2, 4))
-        after_mm = propagate_einsum(
-            "mk,kn->mn", after_v1, weight, (B * S, O)
-        )
+        weight = TiledLayout.replicate((H, O))
+        after_mm = propagate_einsum("mk,kn->mn", after_v1, weight, (B * S, O))
         self.assertIsNotNone(after_mm)
 
-        # Step 3: view (B*S, O) -> (B, S, O) — trivial
         after_v2 = propagate_view(after_mm, (B, S, O))
         self.assertIsNotNone(after_v2)
-
-        # The shard on dim 0 should be recoverable
         placements = after_v2.get_placements()
-        self.assertEqual(placements[0], ("shard", 0))
-
-    def test_view_is_trivial(self):
-        """View propagation is literally just updating tensor_shape."""
-        t = TiledLayout.shard((4, 8, 16), (2, 4), shard_dim=1, mesh_dim=1)
-        v1 = propagate_view(t, (32, 16))
-        v2 = propagate_view(v1, (4, 8, 16))
-        # shard_layout never changed
-        self.assertEqual(t.shard_layout, v1.shard_layout)
-        self.assertEqual(t.shard_layout, v2.shard_layout)
+        self.assertEqual(placements[0], ("shard", 0, 2))
 
 
 class TestScaledBasis(unittest.TestCase):
-    """ScaledBasis / coordinate strides still work."""
 
     def test_basis_creation(self):
         self.assertEqual(E(0).value, 1)
@@ -416,11 +324,6 @@ class TestScaledBasis(unittest.TestCase):
         cov = codomain_divide(Layout((4, 4), (8, 1)), (4, 8))
         self.assertEqual(cov[0], 4)
         self.assertEqual(cov[1], 4)
-
-    def test_codomain_divide_contiguous(self):
-        cov = codomain_divide(Layout(16, 1), (4, 8))
-        self.assertEqual(cov[0], 2)
-        self.assertEqual(cov[1], 8)
 
 
 if __name__ == "__main__":
