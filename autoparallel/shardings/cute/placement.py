@@ -24,14 +24,7 @@ Examples:
         4 batches (stride 8) x 4 seq elements (stride 1), offset by d*4.
 """
 
-from torch.distributed._pycute import (
-    Layout,
-    coalesce,
-    flatten,
-    is_tuple,
-    make_layout,
-    product,
-)
+from ._pycute import Layout, coalesce, flatten, is_tuple, make_layout, product
 
 
 class CutePlacement:

@@ -9,7 +9,14 @@ Layout convention: rank-2 (device, local...) -> flat_offset.
 
 import unittest
 
-from torch.distributed._pycute import Layout, coalesce
+from autoparallel.shardings.cute._pycute import (
+    ArithmeticTuple,
+    E,
+    Layout,
+    ScaledBasis,
+    coalesce,
+    make_basis_like,
+)
 from autoparallel.shardings.cute.placement import CutePlacement
 from autoparallel.shardings.cute.propagation import (
     propagate_einsum,
@@ -96,12 +103,14 @@ class TestCutePlacement(unittest.TestCase):
 
     def test_from_placement_shard(self):
         from torch.distributed.tensor.placement_types import Shard
+
         p = CutePlacement.from_placement(Shard(1), 16, 4)
         self.assertTrue(p.is_shard())
         self.assertEqual(p.dim, 1)
 
     def test_from_placement_replicate(self):
         from torch.distributed.tensor.placement_types import Replicate
+
         p = CutePlacement.from_placement(Replicate(), 16, 4)
         self.assertTrue(p.is_replicate())
 
@@ -147,9 +156,7 @@ class TestViewPropagation(unittest.TestCase):
         self.assertEqual(out[0].local_size, B * S // D)
 
         # Verify device 0 holds correct flat indices
-        device0_indices = sorted(
-            out[0].layout(0, i) for i in range(out[0].local_size)
-        )
+        device0_indices = sorted(out[0].layout(0, i) for i in range(out[0].local_size))
         expected = sorted(b * S + s for b in range(B) for s in range(S // D))
         self.assertEqual(device0_indices, expected)
 
@@ -302,7 +309,6 @@ class TestEinsumPropagation(unittest.TestCase):
 
 
 class TestPointwisePropagation(unittest.TestCase):
-
     def test_matching_placements(self):
         D = 4
         p = CutePlacement.shard(0, 8, D)
@@ -348,7 +354,6 @@ class TestPointwisePropagation(unittest.TestCase):
 
 
 class TestReductionPropagation(unittest.TestCase):
-
     def test_reduce_non_sharded_dim(self):
         D = 2
         p = CutePlacement.shard(1, 16, D)
@@ -383,7 +388,6 @@ class TestReductionPropagation(unittest.TestCase):
 
 
 class TestEndToEnd(unittest.TestCase):
-
     def test_linear_3d_preserves_both_shardings(self):
         """
         (B, S, H) sharded [S(0), S(1)] -> view -> mm -> view
@@ -401,8 +405,8 @@ class TestEndToEnd(unittest.TestCase):
         # Step 1: view (B, S, H) -> (B*S, H)
         after_v1 = propagate_view(input_p, (B, S, H), (B * S, H), mesh_sizes)
         self.assertIsNotNone(after_v1)
-        self.assertTrue(after_v1[0].is_shard())       # dp: S(0)
-        self.assertFalse(after_v1[1].is_shard())      # sp: CuTe
+        self.assertTrue(after_v1[0].is_shard())  # dp: S(0)
+        self.assertFalse(after_v1[1].is_shard())  # sp: CuTe
         self.assertFalse(after_v1[1].is_replicate())
 
         # Step 2: mm (B*S, H) @ (H, O) -> (B*S, O)
@@ -421,6 +425,114 @@ class TestEndToEnd(unittest.TestCase):
         self.assertTrue(after_v2[0].is_shard())
         self.assertEqual(after_v2[1].dim, 1)
         self.assertTrue(after_v2[1].is_shard())
+
+
+class TestScaledBasis(unittest.TestCase):
+    """Test ScaledBasis coordinate-producing strides."""
+
+    def test_basis_creation(self):
+        e0 = E(0)
+        self.assertEqual(e0.value, 1)
+        self.assertEqual(e0.index, 0)
+
+    def test_basis_scaling(self):
+        self.assertEqual((3 * E(0)).value, 3)
+        self.assertEqual((E(1) * 5).value, 5)
+        self.assertEqual((E(1) * 5).index, 1)
+
+    def test_basis_addition(self):
+        result = E(0) + E(1)
+        self.assertIsInstance(result, ArithmeticTuple)
+        self.assertEqual(result.values, (1, 1))
+
+    def test_scaled_basis_addition(self):
+        result = 3 * E(0) + 5 * E(1)
+        self.assertEqual(result.values, (3, 5))
+
+    def test_arithmetic_tuple_addition(self):
+        a = ArithmeticTuple(1, 2)
+        b = ArithmeticTuple(3, 4)
+        self.assertEqual((a + b).values, (4, 6))
+
+    def test_arithmetic_tuple_unequal_length(self):
+        a = ArithmeticTuple(1, 2, 3)
+        b = ArithmeticTuple(4, 5)
+        self.assertEqual((a + b).values, (5, 7, 3))
+
+    def test_make_basis_like_scalar(self):
+        b = make_basis_like(4)
+        self.assertIsInstance(b, ScaledBasis)
+        self.assertEqual(b.index, 0)
+
+    def test_make_basis_like_tuple(self):
+        b = make_basis_like((3, 4))
+        self.assertEqual(len(b), 2)
+        self.assertEqual(b[0].index, 0)
+        self.assertEqual(b[1].index, 1)
+
+    def test_make_basis_like_nested(self):
+        b = make_basis_like(((2, 3), 4))
+        # ((E(0), E(1)), E(2))
+        self.assertIsInstance(b[0], tuple)
+        self.assertEqual(b[0][0].index, 0)
+        self.assertEqual(b[0][1].index, 1)
+        self.assertEqual(b[1].index, 2)
+
+    def test_coordinate_layout_2d(self):
+        """Layout((4, 8), (E(0), E(1))) maps (i, j) -> (i, j)."""
+        L = Layout((4, 8), (E(0), E(1)))
+        result = L(2, 3)
+        self.assertIsInstance(result, ArithmeticTuple)
+        self.assertEqual(result.values, (2, 3))
+
+    def test_coordinate_layout_scaled(self):
+        """Layout((4, 8), (E(0), 2*E(1))) maps (i, j) -> (i, 2j)."""
+        L = Layout((4, 8), (E(0), 2 * E(1)))
+        result = L(2, 3)
+        self.assertEqual(result.values, (2, 6))
+
+    def test_coordinate_layout_integer_index(self):
+        """Integer index uses idx2crd then coordinate strides."""
+        L = Layout((4, 8), (E(0), E(1)))
+        # Lexicographic: idx 9 -> (9//8, 9%8) = (1, 1) -> (1, 1)
+        result = L(9)
+        self.assertEqual(result.values, (1, 1))
+
+    def test_coordinate_split_decomposition(self):
+        """
+        Use coordinate layout to decompose flat indices into split coords.
+        Split (32,) -> (4, 8): flat_idx -> (g0, g1).
+        """
+        coord_split = Layout((4, 8), (E(0), E(1)))
+
+        # flat 0 -> (0, 0), flat 1 -> (0, 1), flat 8 -> (1, 0)
+        self.assertEqual(coord_split(0).values, (0, 0))
+        self.assertEqual(coord_split(1).values, (0, 1))
+        self.assertEqual(coord_split(8).values, (1, 0))
+        self.assertEqual(coord_split(31).values, (3, 7))
+
+    def test_shard_split_coverage(self):
+        """
+        Verify that evaluating coord_split(shard(device, local))
+        reveals which split pieces each device covers.
+        """
+        shard = Layout((2, 4, 4), (4, 8, 1))  # S(1) after flatten
+        coord_split = Layout((4, 8), (E(0), E(1)))
+
+        for dev in range(2):
+            g0_vals = set()
+            g1_vals = set()
+            for b in range(4):
+                for s in range(4):
+                    flat = shard(dev, b, s)
+                    coords = coord_split(flat)
+                    g0_vals.add(coords[0])
+                    g1_vals.add(coords[1])
+
+            # All devices cover all g0 (B dim) -> piece 0 not sharded
+            self.assertEqual(len(g0_vals), 4)
+            # Each device covers half of g1 (S dim) -> piece 1 sharded
+            self.assertEqual(len(g1_vals), 4)  # 4 out of 8
 
 
 if __name__ == "__main__":

@@ -8,9 +8,17 @@ Rules are strictly redistribution-free: they return output placements
 assuming the given inputs are already in place, or None if incompatible.
 """
 
-from torch.distributed._pycute import Layout, coalesce, flatten, is_tuple, product
+from ._pycute import (
+    ArithmeticTuple,
+    E,
+    Layout,
+    coalesce,
+    flatten,
+    is_tuple,
+    make_basis_like,
+    product,
+)
 from .placement import CutePlacement
-
 
 # =============================================================================
 # View / Reshape propagation
@@ -97,40 +105,36 @@ def _build_inverse_mapping(dim_mapping):
     return inv
 
 
-def _analyze_split_coverage(local_shape, local_stride, group_shape):
+def _analyze_split_coverage(placement, group_shape):
     """
-    Determine which split pieces are sharded by matching shard modes
-    against split pieces via stride ranges.
+    Determine which split pieces are sharded using coordinate-producing strides.
 
-    The local modes of the shard layout have strides from the original
-    tensor dims. Each split piece k covers stride range [S_k, S_k * G_k).
-    A shard mode with stride in that range contributes to piece k's coverage.
+    Creates a coordinate layout Layout(group_shape, (E(0), E(1), ...)) that maps
+    flat_offset -> (g0, g1, ...) coordinates. Evaluates the shard layout through
+    this coordinate layout to find which pieces each device fully covers.
 
     Returns: dict mapping piece_idx -> local coverage count.
     """
-    # Flatten local modes
-    if is_tuple(local_shape):
-        local_modes = list(zip(flatten(local_stride), flatten(local_shape)))
-    else:
-        local_modes = [(local_stride, local_shape)]
+    coord_strides = make_basis_like(group_shape)
+    coord_split = Layout(group_shape, coord_strides)
 
-    # Compute split strides (row-major)
-    n = len(group_shape)
-    split_strides = [1] * n
-    for k in range(n - 2, -1, -1):
-        split_strides[k] = split_strides[k + 1] * group_shape[k + 1]
+    n_pieces = len(group_shape)
+    n_local = placement.local_size
+    mesh_size = placement.mesh_dim_size
 
-    coverage = {}
-    for k in range(n):
-        piece_stride = split_strides[k]
-        piece_end = piece_stride * group_shape[k]
-        piece_coverage = 1
-        for mode_stride, mode_size in local_modes:
-            if piece_stride <= mode_stride < piece_end:
-                piece_coverage *= mode_size
-        coverage[k] = piece_coverage
+    # Evaluate for device 0: for each local element, get its split coordinates
+    coverage = {k: set() for k in range(n_pieces)}
+    for i in range(n_local):
+        flat = placement.layout(0, i)  # device 0, local index i
+        coords = coord_split(flat)
+        if isinstance(coords, ArithmeticTuple):
+            for k in range(n_pieces):
+                coverage[k].add(coords[k])
+        else:
+            # Single piece (rank-1 split) — coords is just an int
+            coverage[0].add(coords)
 
-    return coverage
+    return {k: len(v) for k, v in coverage.items()}
 
 
 def propagate_view(placements, input_shape, output_shape, mesh_sizes):
@@ -164,13 +168,12 @@ def propagate_view(placements, input_shape, output_shape, mesh_sizes):
         if entries[0][0] == "split":
             group_shape = entries[0][2]
 
-            # Use mode-stride matching to find which piece is sharded
-            coverage = _analyze_split_coverage(
-                placement.local_shape, placement.local_stride, group_shape
-            )
+            # Use coordinate-producing strides to find which piece is sharded
+            coverage = _analyze_split_coverage(placement, group_shape)
 
             sharded_pieces = [
-                k for k in range(len(group_shape))
+                k
+                for k in range(len(group_shape))
                 if coverage[k] < group_shape[k] and group_shape[k] > 1
             ]
 
@@ -184,16 +187,12 @@ def propagate_view(placements, input_shape, output_shape, mesh_sizes):
                 return None
 
             # Find the output dim for this piece
-            target_entry = next(
-                (e for e in entries if e[3] == shard_piece), None
-            )
+            target_entry = next((e for e in entries if e[3] == shard_piece), None)
             if target_entry is None:
                 return None
 
             out_dim = target_entry[1]
-            output_places.append(
-                CutePlacement.shard(out_dim, piece_size, mesh_size)
-            )
+            output_places.append(CutePlacement.shard(out_dim, piece_size, mesh_size))
             continue
 
         # --- Identity or Flatten: single entry ---
@@ -201,9 +200,7 @@ def propagate_view(placements, input_shape, output_shape, mesh_sizes):
 
         if entry[0] == "identity":
             out_dim = entry[1]
-            output_places.append(
-                CutePlacement(dim=out_dim, layout=placement.layout)
-            )
+            output_places.append(CutePlacement(dim=out_dim, layout=placement.layout))
 
         elif entry[0] == "flatten":
             out_dim = entry[1]
@@ -326,8 +323,10 @@ def propagate_einsum(
         if not pa.is_replicate() and not pb.is_replicate():
             a_dim, b_dim = pa.dim, pb.dim
             if (
-                a_dim is not None and b_dim is not None
-                and a_dim < len(inputs[0]) and b_dim < len(inputs[1])
+                a_dim is not None
+                and b_dim is not None
+                and a_dim < len(inputs[0])
+                and b_dim < len(inputs[1])
             ):
                 a_label = inputs[0][a_dim]
                 b_label = inputs[1][b_dim]
@@ -354,9 +353,7 @@ def propagate_einsum(
             label = inputs[0][a_dim]
             if categories.get(label) == "m":
                 out_dim = out_label_to_dim[label]
-                output_placements.append(
-                    CutePlacement(dim=out_dim, layout=pa.layout)
-                )
+                output_placements.append(CutePlacement(dim=out_dim, layout=pa.layout))
             else:
                 return None
         else:
@@ -366,9 +363,7 @@ def propagate_einsum(
             label = inputs[1][b_dim]
             if categories.get(label) == "n":
                 out_dim = out_label_to_dim[label]
-                output_placements.append(
-                    CutePlacement(dim=out_dim, layout=pb.layout)
-                )
+                output_placements.append(CutePlacement(dim=out_dim, layout=pb.layout))
             else:
                 return None
 
