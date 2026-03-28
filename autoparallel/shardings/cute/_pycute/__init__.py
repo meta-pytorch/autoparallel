@@ -33,7 +33,7 @@ from torch.distributed._pycute import (
     size,
     slice_,
     suffix_product,
-)
+)  # noqa: F401 — suffix_product re-exported for use in propagation/placement
 # Import base composition for non-ScaledBasis cases
 from torch.distributed._pycute import composition as _base_composition
 

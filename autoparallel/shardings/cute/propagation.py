@@ -10,7 +10,7 @@ Propagation:
 - Slice: CuTe slice tensor_layout and all tilers
 """
 
-from ._pycute import E, Layout, codomain_divide, composition, is_tuple, product
+from ._pycute import E, Layout, codomain_divide, composition, is_tuple, product, suffix_product
 from .placement import TiledLayout
 
 
@@ -256,9 +256,7 @@ def _tiler_for_output(tiler, tensor_layout, input_labels,
     o_shape = output_shape if is_tuple(output_shape) else (output_shape,)
 
     # Output row-major strides
-    o_strides = [1] * len(o_shape)
-    for k in range(len(o_shape) - 2, -1, -1):
-        o_strides[k] = o_strides[k + 1] * o_shape[k + 1]
+    o_strides = suffix_product(o_shape)
 
     # --- Rank-matched: direct label-based transformation ---
     if len(t_shape) == len(input_labels):
@@ -291,9 +289,7 @@ def _tiler_for_output(tiler, tensor_layout, input_labels,
     i_shape = tensor_layout.shape if is_tuple(tensor_layout.shape) else (tensor_layout.shape,)
 
     # Input row-major strides
-    i_strides = [1] * len(i_shape)
-    for k in range(len(i_shape) - 2, -1, -1):
-        i_strides[k] = i_strides[k + 1] * i_shape[k + 1]
+    i_strides = suffix_product(i_shape)
 
     # Compute totals for stride scaling
     k_total = 1

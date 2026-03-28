@@ -10,7 +10,7 @@ Both tensor_layout and mesh_tilers transform under CuTe operations:
 - Slice: CuTe slice all with same coordinate
 """
 
-from ._pycute import Layout, coalesce, codomain_divide, flatten, is_tuple, logical_divide, product
+from ._pycute import Layout, coalesce, codomain_divide, flatten, is_tuple, logical_divide, product, suffix_product
 
 
 class TiledLayout:
@@ -82,13 +82,11 @@ class TiledLayout:
         chunk = dim_size // mesh_dim_size
 
         # Tensor strides (row-major)
-        t_strides = [1] * len(t_shape)
-        for k in range(len(t_shape) - 2, -1, -1):
-            t_strides[k] = t_strides[k + 1] * t_shape[k + 1]
+        t_strides = suffix_product(t_shape)
 
         # Tiler: same as tensor but shard_dim has local size
         tiler_shape = tuple(chunk if k == shard_dim else t_shape[k] for k in range(len(t_shape)))
-        mesh_tiler = Layout(tiler_shape, tuple(t_strides))
+        mesh_tiler = Layout(tiler_shape, t_strides)
 
         return TiledLayout(Layout(tensor_shape), (mesh_tiler,))
 
@@ -101,9 +99,7 @@ class TiledLayout:
         t_shape = tensor_shape if is_tuple(tensor_shape) else (tensor_shape,)
 
         # Tensor strides (row-major)
-        t_strides = [1] * len(t_shape)
-        for k in range(len(t_shape) - 2, -1, -1):
-            t_strides[k] = t_strides[k + 1] * t_shape[k + 1]
+        t_strides = suffix_product(t_shape)
 
         # Build tilers sequentially — each operates on the previous tiler's local
         mesh_tilers = []
@@ -114,7 +110,7 @@ class TiledLayout:
             chunk = current_local[shard_dim] // mesh_dim_size
 
             tiler_shape = tuple(chunk if k == shard_dim else current_local[k] for k in range(len(t_shape)))
-            mesh_tilers.append(Layout(tiler_shape, tuple(t_strides)))
+            mesh_tilers.append(Layout(tiler_shape, t_strides))
 
             current_local[shard_dim] = chunk
 
