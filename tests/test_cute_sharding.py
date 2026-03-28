@@ -13,6 +13,8 @@ from autoparallel.shardings.cute._pycute import (
     coalesce,
     codomain_divide,
     make_basis_like,
+    max_common_layout,
+    max_common_vector,
 )
 from autoparallel.shardings.cute.placement import TiledLayout
 from autoparallel.shardings.cute.propagation import (
@@ -346,6 +348,38 @@ class TestScaledBasis(unittest.TestCase):
         cov = codomain_divide(Layout((4, 4), (8, 1)), (4, 8))
         self.assertEqual(cov[0], 4)
         self.assertEqual(cov[1], 4)
+
+
+class TestMaxCommon(unittest.TestCase):
+    """max_common_layout and max_common_vector."""
+
+    def test_same_layout(self):
+        a = Layout((4, 8), (8, 1))
+        self.assertEqual(max_common_vector(a, a), 32)
+
+    def test_col_vs_row_major(self):
+        a = Layout((4, 4), (1, 4))
+        b = Layout((4, 4), (4, 1))
+        self.assertEqual(max_common_vector(a, b), 4)
+
+    def test_col_major_vs_padded(self):
+        a = Layout((4, 8), (1, 4))
+        b = Layout((4, 8), (1, 5))
+        self.assertEqual(max_common_vector(a, b), 4)
+
+    def test_contiguous_vs_strided(self):
+        a = Layout(16, 1)
+        b = Layout(16, 2)
+        self.assertEqual(max_common_vector(a, b), 1)
+
+    def test_max_common_layout_returns_layout(self):
+        a = Layout((4, 4), (1, 4))
+        b = Layout((4, 4), (4, 1))
+        mcl = max_common_layout(a, b)
+        self.assertEqual(mcl.size(), 4)
+        # Verify postcondition: b(mcl(i)) == i for the common vector
+        for i in range(mcl.size()):
+            self.assertEqual(b(mcl(i)), i)
 
 
 if __name__ == "__main__":

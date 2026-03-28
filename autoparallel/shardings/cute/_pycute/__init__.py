@@ -38,6 +38,7 @@ from torch.distributed._pycute import (
 from torch.distributed._pycute import composition as _base_composition
 
 from .codomain_divide import codomain_divide
+from .max_common import max_common_layout, max_common_vector
 from .scaled_basis import (
     ArithmeticTuple,
     E,

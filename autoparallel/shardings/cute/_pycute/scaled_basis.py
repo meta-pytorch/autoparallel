@@ -51,17 +51,39 @@ class ScaledBasis:
         return NotImplemented
 
     def __add__(self, other: ScaledBasis | ArithmeticTuple | int) -> ArithmeticTuple:
-        if isinstance(other, int) and other == 0:
-            return _basis_to_atuple(self)
+        if isinstance(other, int):
+            if other == 0:
+                return _basis_to_atuple(self)
+            # int + ScaledBasis: treat int as value at no specific index
+            # This produces an ArithmeticTuple with the int added to position 0
+            # Actually, for mixed stride addition (e.g., 16 + 3*E(1)):
+            # return an ArithmeticTuple that tracks both contributions
+            return _basis_to_atuple(self) + ArithmeticTuple(other)
         if isinstance(other, ScaledBasis):
             return _basis_to_atuple(self) + _basis_to_atuple(other)
         if isinstance(other, ArithmeticTuple):
             return _basis_to_atuple(self) + other
         return NotImplemented
 
-    def __radd__(self, other: int) -> ArithmeticTuple:
-        if isinstance(other, int) and other == 0:
-            return _basis_to_atuple(self)
+    def __radd__(self, other: int | ArithmeticTuple) -> ArithmeticTuple:
+        if isinstance(other, int):
+            if other == 0:
+                return _basis_to_atuple(self)
+            return ArithmeticTuple(other) + _basis_to_atuple(self)
+        if isinstance(other, ArithmeticTuple):
+            return other + _basis_to_atuple(self)
+        return NotImplemented
+
+    def __floordiv__(self, other: int) -> ScaledBasis:
+        """Floor divide the value, keeping the basis index."""
+        if isinstance(other, int):
+            return ScaledBasis(self.value // other, self.index)
+        return NotImplemented
+
+    def __mod__(self, other: int) -> ScaledBasis:
+        """Modulo the value, keeping the basis index."""
+        if isinstance(other, int):
+            return ScaledBasis(self.value % other, self.index)
         return NotImplemented
 
     def __eq__(self, other: object) -> bool:
