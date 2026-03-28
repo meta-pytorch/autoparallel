@@ -10,8 +10,21 @@ Propagation:
 - Slice: CuTe slice tensor_layout and all tilers
 """
 
-from ._pycute import E, Layout, codomain_divide, composition, is_tuple, product, suffix_product
+from ._pycute import (
+    E,
+    Layout,
+    ScaledBasis,
+    codomain_divide,
+    composition,
+    flatten,
+    is_tuple,
+    make_basis_like,
+    product,
+)
 from .placement import TiledLayout
+
+# Base composition from torch (handles E(k) strides in layout_a)
+from torch.distributed._pycute import composition as _base_composition
 
 
 # =============================================================================
@@ -245,73 +258,52 @@ def _tiler_for_output(tiler, tensor_layout, input_labels,
                       categories, output_labels, output_shape):
     """Build output tiler from an input tiler using equation labels.
 
-    Rank-matched (tiler rank == equation rank): iterate output labels,
-    each dim inherits the tiler's local size or full coverage for new dims.
-    All strides come from the output tensor (row-major).
-
-    Rank-mismatched (after view): preserves tiler mode structure via stride
-    scaling. Each mode is classified as M/batch vs K by comparing its stride
-    against the input tensor's strides. M strides are scaled, K modes dropped.
+    Unified algebraic pipeline (works for both rank-matched and rank-mismatched):
+    1. Tag: compose coord layout (E(k) strides) with tiler → each mode gets
+       an E(k) stride indicating which input dim it belongs to.
+    2. Filter: drop contracted (K) modes, remap kept modes to output dim
+       indices, add new output dims (N for A, M for B) with full coverage.
+    3. Compose: composition(Layout(output_shape), selector) converts E(k)
+       strides to output element strides. Same algebraic pattern as
+       transpose (mode selection) and reduction (mode projection).
     """
-    t_shape = tiler.shape if is_tuple(tiler.shape) else (tiler.shape,)
     o_shape = output_shape if is_tuple(output_shape) else (output_shape,)
-    o_strides = suffix_product(o_shape)
-
-    # --- Rank-matched: single pass over output labels ---
-    if len(t_shape) == len(input_labels):
-        # Map input labels to their tiler local sizes
-        local_for_label = {}
-        for i, label in enumerate(input_labels):
-            if categories.get(label) != "contract":
-                local_for_label[label] = t_shape[i]
-
-        new_shape = tuple(
-            local_for_label.get(label, o_shape[i])
-            for i, label in enumerate(output_labels)
-        )
-        if len(new_shape) == 1:
-            return Layout(new_shape[0], o_strides[0])
-        return Layout(new_shape, o_strides)
-
-    # --- Rank-mismatched: stride-based mode classification ---
-    # Preserves hierarchical mode structure from the original tensor shape.
-    t_stride = tiler.stride if is_tuple(tiler.stride) else (tiler.stride,)
     i_shape = tensor_layout.shape if is_tuple(tensor_layout.shape) else (tensor_layout.shape,)
-    i_strides = suffix_product(i_shape)
 
-    # Compute totals for stride scaling
-    k_total = 1
-    other_total = 1
-    for i, label in enumerate(input_labels):
-        if categories.get(label) == "contract":
-            k_total *= i_shape[i]
-    for i in range(len(o_shape)):
-        if output_labels[i] not in input_labels:
-            other_total *= o_shape[i]
+    # Step 1: Tag each tiler mode with its input dim via E(k)
+    coord_input = Layout(i_shape, make_basis_like(i_shape))
+    tagged = _base_composition(coord_input, tiler)
 
-    m_stride_in = max(i_strides)
-    scale = other_total // k_total if k_total > 0 else 1
+    # Step 2: Group modes by output dim, drop contracted
+    t_shape = flatten(tagged.shape) if is_tuple(tagged.shape) else (tagged.shape,)
+    t_stride = flatten(tagged.stride) if is_tuple(tagged.stride) else (tagged.stride,)
 
-    new_shape = []
-    new_stride = []
-    for i in range(len(t_shape)):
-        s = t_stride[i]
-        if s == 0:
-            new_shape.append(t_shape[i])
-            new_stride.append(0)
-        elif s < m_stride_in:
-            continue  # K mode — skip
-        else:
-            new_shape.append(t_shape[i])
-            new_stride.append(s * scale)
+    out_modes = {}  # out_idx -> [(shape, stride), ...]
+    for sh, st in zip(t_shape, t_stride):
+        if isinstance(st, ScaledBasis):
+            label = input_labels[st.index]
+            if categories.get(label) == "contract":
+                continue
+            out_idx = output_labels.index(label)
+            out_modes.setdefault(out_idx, []).append(
+                (sh, ScaledBasis(st.value, out_idx)))
 
-    # Add the replacement dim (N for A, M for B)
-    new_shape.append(other_total)
-    new_stride.append(1)
+    # Add output dims not in input (N for A, M for B)
+    for out_i, label in enumerate(output_labels):
+        if label not in input_labels:
+            out_modes.setdefault(out_i, []).append((o_shape[out_i], E(out_i)))
 
-    if len(new_shape) == 1:
-        return Layout(new_shape[0], new_stride[0])
-    return Layout(tuple(new_shape), tuple(new_stride))
+    # Build selector in output dim order
+    sel_shape = []
+    sel_stride = []
+    for out_i in range(len(output_labels)):
+        for sh, st in out_modes.get(out_i, []):
+            sel_shape.append(sh)
+            sel_stride.append(st)
+
+    # Step 3: Compose with output layout → E(k) → integer strides
+    selector = Layout(tuple(sel_shape), tuple(sel_stride))
+    return composition(Layout(o_shape), selector)
 
 
 # =============================================================================
