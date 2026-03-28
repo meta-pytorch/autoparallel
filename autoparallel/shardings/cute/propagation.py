@@ -151,22 +151,47 @@ def _classify_einsum_dims(inputs, output):
 
 
 def propagate_einsum(equation, tiled_a, tiled_b, output_shape):
-    """Einsum: redistribution-free strategies."""
+    """Einsum via tensor folding (CuTe paper section 1.3).
+
+    Classify dims as M̂ (row), N̂ (col), K̂ (reduction), L̂ (batch).
+    For each tiler, determine which dim it shards, apply GEMM rules,
+    and transform the tiler for the output element space.
+
+    M-dim tilers from A pass to C with strides scaled by N_total / K_total.
+    N-dim tilers from B pass to C with strides scaled by M_total / K_total.
+    K-dim tilers -> Partial. L-dim tilers pass through if both inputs match.
+    """
     inputs, output = _parse_einsum(equation)
     categories = _classify_einsum_dims(inputs, output)
 
     a_placements = tiled_a.get_placements()
     b_placements = tiled_b.get_placements()
 
-    # Build output shard specs
-    shard_specs = []
+    # Compute dim sizes for stride scaling
+    a_shape = tiled_a.tensor_layout.shape if is_tuple(tiled_a.tensor_layout.shape) else (tiled_a.tensor_layout.shape,)
+    b_shape = tiled_b.tensor_layout.shape if is_tuple(tiled_b.tensor_layout.shape) else (tiled_b.tensor_layout.shape,)
+
+    k_total = 1
+    n_total = 1
+    for i, label in enumerate(inputs[0]):
+        if categories.get(label) == "contract":
+            k_total *= a_shape[i]
+    for i, label in enumerate(inputs[1]):
+        if categories.get(label) == "n":
+            n_total *= b_shape[i]
+
+    m_total = 1
+    for i, label in enumerate(inputs[0]):
+        if categories.get(label) == "m":
+            m_total *= a_shape[i]
+
+    out_tilers = []
     is_partial = False
 
-    # For each mesh dim in A
-    for entry in a_placements:
+    for idx, entry in enumerate(a_placements):
         if entry[0] != "shard":
             continue
-        a_dim, a_mesh = entry[1], entry[2]
+        a_dim = entry[1]
         if a_dim >= len(inputs[0]):
             return None
         a_label = inputs[0][a_dim]
@@ -180,13 +205,24 @@ def propagate_einsum(equation, tiled_a, tiled_b, output_shape):
         if cat == "m":
             if b_match:
                 return None
-            out_dim = output.index(a_label)
-            shard_specs.append((out_dim, a_mesh))
+            # M-dim: transform tiler from A's element space to C's
+            # Scale M strides by (N_total / K_total), replace K modes with N
+            tiler = tiled_a.mesh_tilers[idx]
+            new_tiler = _transform_tiler_for_output(
+                tiler, inputs[0], categories, a_shape,
+                output, output_shape, "m", n_total, k_total
+            )
+            out_tilers.append(new_tiler)
         elif cat == "batch":
             if not b_match:
                 return None
-            out_dim = output.index(a_label)
-            shard_specs.append((out_dim, a_mesh))
+            tiler = tiled_a.mesh_tilers[idx]
+            # Batch: same elements, but K replaced by N in output
+            new_tiler = _transform_tiler_for_output(
+                tiler, inputs[0], categories, a_shape,
+                output, output_shape, "batch", n_total, k_total
+            )
+            out_tilers.append(new_tiler)
         elif cat == "contract":
             if not b_match:
                 return None
@@ -194,31 +230,134 @@ def propagate_einsum(equation, tiled_a, tiled_b, output_shape):
         else:
             return None
 
-    # For each mesh dim in B not already handled
-    for entry in b_placements:
+    for idx, entry in enumerate(b_placements):
         if entry[0] != "shard":
             continue
-        b_dim, b_mesh = entry[1], entry[2]
+        b_dim = entry[1]
         if b_dim >= len(inputs[1]):
             return None
         b_label = inputs[1][b_dim]
-        if any(e[0] == "shard" and e[1] < len(inputs[0]) and inputs[0][e[1]] == b_label for e in a_placements):
-            continue  # already handled
+        if any(
+            e[0] == "shard" and e[1] < len(inputs[0]) and inputs[0][e[1]] == b_label
+            for e in a_placements
+        ):
+            continue
         cat = categories.get(b_label, "other")
         if cat == "n":
-            out_dim = output.index(b_label)
-            shard_specs.append((out_dim, b_mesh))
+            tiler = tiled_b.mesh_tilers[idx]
+            new_tiler = _transform_tiler_for_output(
+                tiler, inputs[1], categories, b_shape,
+                output, output_shape, "n", m_total, k_total
+            )
+            out_tilers.append(new_tiler)
         else:
             return None
 
-    if shard_specs:
-        out = TiledLayout.shard_multi(output_shape, shard_specs)
-    else:
-        out = TiledLayout.replicate(output_shape)
-
+    out = TiledLayout(Layout(output_shape), tuple(out_tilers))
     if is_partial:
         out._is_partial = True
     return out
+
+
+def _transform_tiler_for_output(tiler, input_labels, categories, input_shape,
+                                 output_labels, output_shape, shard_cat,
+                                 other_total, k_total):
+    """Transform a tiler from input element space to output element space.
+
+    Detects which tiler modes are M/batch vs K by comparing strides
+    against the input tensor's strides. M/batch strides are scaled by
+    output_inner / input_inner. K modes are replaced by N/M (full coverage).
+    """
+    t_shape = tiler.shape if is_tuple(tiler.shape) else (tiler.shape,)
+    t_stride = tiler.stride if is_tuple(tiler.stride) else (tiler.stride,)
+    i_shape = input_shape if is_tuple(input_shape) else (input_shape,)
+    o_shape = output_shape if is_tuple(output_shape) else (output_shape,)
+
+    # Compute output row-major strides
+    o_strides = [1] * len(o_shape)
+    for k in range(len(o_shape) - 2, -1, -1):
+        o_strides[k] = o_strides[k + 1] * o_shape[k + 1]
+
+    # Compute input row-major strides
+    i_strides = [1] * len(i_shape)
+    for k in range(len(i_shape) - 2, -1, -1):
+        i_strides[k] = i_strides[k + 1] * i_shape[k + 1]
+
+    # If tiler rank matches input labels, do mode-by-mode transformation
+    if len(t_shape) == len(input_labels):
+        new_shape = []
+        new_stride = []
+        output_dims_added = set()
+
+        for i, label in enumerate(input_labels):
+            cat = categories.get(label, "other")
+            if cat == "contract":
+                continue  # skip K dims
+            out_idx = list(output_labels).index(label)
+            output_dims_added.add(out_idx)
+            new_shape.append(t_shape[i])
+            new_stride.append(o_strides[out_idx] * t_shape[i] // t_shape[i]
+                             if t_shape[i] == i_shape[i]
+                             else o_strides[out_idx])
+            # Simpler: use output stride for this dim's position
+            new_stride[-1] = o_strides[out_idx]
+
+        # Add output dims not from input
+        for i in range(len(o_shape)):
+            if i not in output_dims_added:
+                new_shape.append(o_shape[i])
+                new_stride.append(o_strides[i])
+
+        if len(new_shape) == 1:
+            return Layout(new_shape[0], new_stride[0])
+        return Layout(tuple(new_shape), tuple(new_stride))
+
+    # Tiler rank differs from input rank (e.g., after view).
+    # Detect M vs K modes by stride comparison.
+    # K modes have strides < input's M-dim stride.
+    # For 'mk,kn->mn': K is the innermost dim of input.
+
+    # Find the boundary stride: strides >= input's outermost K stride are M modes.
+    # Input has K dims with known strides. Find the max M stride.
+    k_dim_strides = set()
+    for i, label in enumerate(input_labels):
+        if categories.get(label) == "contract":
+            k_dim_strides.add(i_strides[i])
+
+    # The M-dim stride in the input is the stride of the first non-K dim
+    # For (32, 16) with 'mk': m stride = 16, k stride = 1.
+    m_stride_in = max(i_strides)  # outermost stride = M stride
+    k_stride_in = min(i_strides)  # innermost stride = K stride
+
+    # Scale factor: how M strides change from input to output
+    # Input M stride = product of K dims. Output M stride = product of N dims.
+    scale = other_total // k_total if k_total > 0 else 1
+
+    new_shape = []
+    new_stride = []
+
+    for i in range(len(t_shape)):
+        s = t_stride[i]
+        if s == 0:
+            # stride 0 mode: pass through
+            new_shape.append(t_shape[i])
+            new_stride.append(0)
+        elif s >= k_stride_in and s < m_stride_in:
+            # This mode's stride is in the K-dim range — it IS a K mode
+            # Replace with corresponding N/output dim
+            continue  # skip K modes
+        else:
+            # M/batch mode — scale stride
+            new_shape.append(t_shape[i])
+            new_stride.append(s * scale)
+
+    # Add the N/output dim that replaces K. Size = other_total (N for A, M for B).
+    new_shape.append(other_total)
+    new_stride.append(1)  # innermost stride
+
+    if len(new_shape) == 1:
+        return Layout(new_shape[0], new_stride[0])
+    return Layout(tuple(new_shape), tuple(new_stride))
 
 
 # =============================================================================

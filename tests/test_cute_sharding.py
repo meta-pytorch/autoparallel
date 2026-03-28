@@ -331,6 +331,50 @@ class TestEndToEnd(unittest.TestCase):
         placements = after_v2.get_placements()
         self.assertEqual(placements[0], ("shard", 0, 2))
 
+    def test_linear_3d_both_dims_sharded(self):
+        """
+        (B, S, H) sharded on dim 0 AND dim 1 across 2D mesh.
+        view(B*S, H) -> mm -> view(B, S, O)
+        Both shardings should be preserved through the entire chain.
+        This is the KEY motivating example for CuTe layouts.
+        """
+        B, S, H, O = 4, 8, 16, 32
+        dp_size, sp_size = 2, 4
+
+        # Shard dim 0 on mesh dim 0 (dp), dim 1 on mesh dim 1 (sp)
+        input_t = TiledLayout.shard_multi(
+            (B, S, H), [(0, dp_size), (1, sp_size)]
+        )
+        placements_in = input_t.get_placements()
+        self.assertEqual(placements_in[0], ("shard", 0, dp_size))
+        self.assertEqual(placements_in[1], ("shard", 1, sp_size))
+
+        # Step 1: view (B, S, H) -> (B*S, H)
+        # Both tilers are invariant — they use tensor strides
+        after_v1 = propagate_view(input_t, (B * S, H))
+        self.assertIsNotNone(after_v1)
+        self.assertEqual(after_v1.mesh_tilers, input_t.mesh_tilers)
+
+        # After view, placements should still be recoverable via codomain_divide
+        # (tiler rank 3 != tensor rank 2, so get_placements uses codomain_divide)
+        placements_v1 = after_v1.get_placements()
+        # Both shardings survive — this is what DTensor CANNOT do!
+        self.assertEqual(len(placements_v1), 2)
+
+        # Step 2: mm (B*S, H) @ (H, O) -> (B*S, O)
+        weight = TiledLayout.replicate((H, O))
+        after_mm = propagate_einsum("mk,kn->mn", after_v1, weight, (B * S, O))
+        self.assertIsNotNone(after_mm)
+
+        # Step 3: view (B*S, O) -> (B, S, O)
+        after_v2 = propagate_view(after_mm, (B, S, O))
+        self.assertIsNotNone(after_v2)
+
+        # Both shardings recovered!
+        placements_out = after_v2.get_placements()
+        self.assertEqual(placements_out[0], ("shard", 0, dp_size))
+        self.assertEqual(placements_out[1], ("shard", 1, sp_size))
+
 
 class TestScaledBasis(unittest.TestCase):
 
