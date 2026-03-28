@@ -245,8 +245,9 @@ def _tiler_for_output(tiler, tensor_layout, input_labels,
                       categories, output_labels, output_shape):
     """Build output tiler from an input tiler using equation labels.
 
-    Rank-matched (tiler rank == equation rank): per-dim local sizes are
-    mapped to output positions via labels. Clean, no stride comparison.
+    Rank-matched (tiler rank == equation rank): iterate output labels,
+    each dim inherits the tiler's local size or full coverage for new dims.
+    All strides come from the output tensor (row-major).
 
     Rank-mismatched (after view): preserves tiler mode structure via stride
     scaling. Each mode is classified as M/batch vs K by comparing its stride
@@ -254,51 +255,36 @@ def _tiler_for_output(tiler, tensor_layout, input_labels,
     """
     t_shape = tiler.shape if is_tuple(tiler.shape) else (tiler.shape,)
     o_shape = output_shape if is_tuple(output_shape) else (output_shape,)
-
-    # Output row-major strides
     o_strides = suffix_product(o_shape)
 
-    # --- Rank-matched: direct label-based transformation ---
+    # --- Rank-matched: single pass over output labels ---
     if len(t_shape) == len(input_labels):
-        new_shape = []
-        new_stride = []
-        output_dims_added = set()
-
+        # Map input labels to their tiler local sizes
+        local_for_label = {}
         for i, label in enumerate(input_labels):
-            cat = categories.get(label, "other")
-            if cat == "contract":
-                continue  # skip K dims
-            out_idx = list(output_labels).index(label)
-            output_dims_added.add(out_idx)
-            new_shape.append(t_shape[i])
-            new_stride.append(o_strides[out_idx])
+            if categories.get(label) != "contract":
+                local_for_label[label] = t_shape[i]
 
-        # Add output dims not from input (N for A, M for B)
-        for i in range(len(o_shape)):
-            if i not in output_dims_added:
-                new_shape.append(o_shape[i])
-                new_stride.append(o_strides[i])
-
+        new_shape = tuple(
+            local_for_label.get(label, o_shape[i])
+            for i, label in enumerate(output_labels)
+        )
         if len(new_shape) == 1:
-            return Layout(new_shape[0], new_stride[0])
-        return Layout(tuple(new_shape), tuple(new_stride))
+            return Layout(new_shape[0], o_strides[0])
+        return Layout(new_shape, o_strides)
 
     # --- Rank-mismatched: stride-based mode classification ---
     # Preserves hierarchical mode structure from the original tensor shape.
     t_stride = tiler.stride if is_tuple(tiler.stride) else (tiler.stride,)
     i_shape = tensor_layout.shape if is_tuple(tensor_layout.shape) else (tensor_layout.shape,)
-
-    # Input row-major strides
     i_strides = suffix_product(i_shape)
 
     # Compute totals for stride scaling
     k_total = 1
     other_total = 1
     for i, label in enumerate(input_labels):
-        cat = categories.get(label)
-        if cat == "contract":
+        if categories.get(label) == "contract":
             k_total *= i_shape[i]
-    # "other" = dims from the OTHER input that appear in output but not this one
     for i in range(len(o_shape)):
         if output_labels[i] not in input_labels:
             other_total *= o_shape[i]
