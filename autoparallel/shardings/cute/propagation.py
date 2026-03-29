@@ -15,7 +15,7 @@ Propagation:
 """
 
 from ._pycute import Layout, is_tuple, logical_divide, product, suffix_product
-from .placement import ShardedLayout, _local_size, _mode_has_mesh, _to_uniform
+from .placement import ShardedLayout, _ensure_tuple, _local_size, _mode_has_mesh, _to_uniform
 
 from torch.distributed.tensor._ops._view_ops import (
     Flatten,
@@ -92,8 +92,8 @@ def _view_hier(hier_layout, old_global, new_global):
     """
     h_shape = hier_layout.shape
     h_stride = hier_layout.stride
-    old_g = old_global if is_tuple(old_global) else (old_global,)
-    new_g = new_global if is_tuple(new_global) else (new_global,)
+    old_g = _ensure_tuple(old_global)
+    new_g = _ensure_tuple(new_global)
 
     ops = view_groups(old_g, new_g)
 
@@ -459,7 +459,7 @@ def propagate_einsum(equation, sharded_a, sharded_b, output_shape):
             out_modes_bc.append(bc[i])
 
     # Build output hier with output-space strides
-    o_shape = output_shape if is_tuple(output_shape) else (output_shape,)
+    o_shape = _ensure_tuple(output_shape)
     out_local = tuple(_local_size(mode) for mode in out_modes_bc)
     out_hier = _to_uniform(logical_divide(Layout(o_shape), out_local))
 

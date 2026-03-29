@@ -15,6 +15,11 @@ Examples:
 from ._pycute import Layout, is_tuple, logical_divide, product
 
 
+def _ensure_tuple(x):
+    """Ensure x is a tuple. Wraps scalars as 1-tuples."""
+    return x if is_tuple(x) else (x,)
+
+
 def _to_uniform(layout):
     """Convert a CuTe Layout to uniform 3-level nesting.
 
@@ -92,13 +97,13 @@ class ShardedLayout:
     @staticmethod
     def replicate(tensor_shape):
         """All devices hold all elements."""
-        t_shape = tensor_shape if is_tuple(tensor_shape) else (tensor_shape,)
+        t_shape = _ensure_tuple(tensor_shape)
         return ShardedLayout(_to_uniform(Layout(t_shape)))
 
     @staticmethod
     def shard(tensor_shape, shard_dim, mesh_dim_size):
         """Shard tensor_shape[shard_dim] across mesh_dim_size devices."""
-        t_shape = tensor_shape if is_tuple(tensor_shape) else (tensor_shape,)
+        t_shape = _ensure_tuple(tensor_shape)
         assert t_shape[shard_dim] % mesh_dim_size == 0
 
         local = list(t_shape)
@@ -113,7 +118,7 @@ class ShardedLayout:
         shard_specs: list of (shard_dim, mesh_dim_size) per mesh dim.
         For S(0),S(0) (same dim repeated), applies sequential divisions.
         """
-        t_shape = tensor_shape if is_tuple(tensor_shape) else (tensor_shape,)
+        t_shape = _ensure_tuple(tensor_shape)
 
         dim_counts = {}
         for dim, _ in shard_specs:
