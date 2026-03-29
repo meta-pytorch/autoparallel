@@ -14,8 +14,8 @@ Propagation:
 - Einsum: = broadcast + reduce
 """
 
-from ._pycute import Layout, is_tuple, logical_divide, product, suffix_product
-from .placement import ShardedLayout, _ensure_tuple, _local_size, _mode_has_mesh, _to_uniform
+from ._pycute import Layout, is_tuple, product
+from .placement import ShardedLayout, _ensure_tuple, _mode_has_mesh
 
 from torch.distributed.tensor._ops._view_ops import (
     Flatten,
@@ -281,8 +281,9 @@ def _hier_broadcast_shapes(a_shape, b_shape):
 
     Each mode is a tuple of sub-dims. Compatible if:
     - Same structure (equal)
-    - One is size-1 broadcast
-    - Incompatible: different shardings or different non-broadcast sizes
+    - One is size-1 (broadcast dim)
+    - One has no mesh (replicate on this dim): sharded one wins
+    - Both have mesh: must match exactly
     """
     result = []
     for sa, sb in zip(a_shape, b_shape):
@@ -292,10 +293,14 @@ def _hier_broadcast_shapes(a_shape, b_shape):
             result.append(sb)
         elif product(sb) == 1:
             result.append(sa)
-        elif _mode_has_mesh(sa) or _mode_has_mesh(sb):
-            return None  # incompatible sharding
+        elif _mode_has_mesh(sa) and _mode_has_mesh(sb):
+            return None  # both sharded differently
+        elif _mode_has_mesh(sa) and not _mode_has_mesh(sb):
+            result.append(sa)  # sharded wins over replicate
+        elif not _mode_has_mesh(sa) and _mode_has_mesh(sb):
+            result.append(sb)  # sharded wins over replicate
         elif product(sa) != product(sb):
-            return None  # different sizes
+            return None  # different sizes, both flat
         else:
             result.append(sa)  # same global size, both flat
     return tuple(result)
@@ -306,20 +311,32 @@ def propagate_pointwise(all_shardeds, output_shape):
     if not all_shardeds:
         return None
 
-    ref = all_shardeds[0]
+    result = all_shardeds[0]
 
     for sharded in all_shardeds[1:]:
-        if sharded.is_replicate():
-            continue
-        if ref.is_replicate():
-            ref = sharded
-            continue
+        r_shape = result.hier_layout.shape
+        s_shape = sharded.hier_layout.shape
 
-        bc = _hier_broadcast_shapes(ref.hier_layout.shape, sharded.hier_layout.shape)
+        if len(r_shape) != len(s_shape):
+            return None
+
+        bc = _hier_broadcast_shapes(r_shape, s_shape)
         if bc is None:
             return None
 
-    return ShardedLayout(ref.hier_layout)
+        # Build broadcast layout with strides from contributing inputs
+        bc_stride = []
+        for i in range(len(bc)):
+            if product(r_shape[i]) > 1 and (product(s_shape[i]) == 1 or _mode_has_mesh(r_shape[i])):
+                bc_stride.append(result.hier_layout.stride[i])
+            elif product(s_shape[i]) > 1:
+                bc_stride.append(sharded.hier_layout.stride[i])
+            else:
+                bc_stride.append(result.hier_layout.stride[i])
+
+        result = ShardedLayout(Layout(bc, tuple(bc_stride)))
+
+    return result
 
 
 # =============================================================================
@@ -327,26 +344,37 @@ def propagate_pointwise(all_shardeds, output_shape):
 # =============================================================================
 
 
-def propagate_reduction(sharded, reduce_dim, keepdim, output_shape):
-    """Reduction: drop dim from hier_layout.
+def propagate_reduction(sharded, reduce_dim, keepdim=False, output_shape=None):
+    """Reduction: drop one or more dims from hier_layout.
 
-    If reduced dim has mesh → Partial.
+    reduce_dim: int or list/tuple of ints.
+    If any reduced dim has mesh → Partial.
     """
     h_shape = sharded.hier_layout.shape
-    is_sharded_reduce = _mode_has_mesh(h_shape[reduce_dim])
+
+    # Normalize to a set of dims
+    if isinstance(reduce_dim, int):
+        reduce_dims = {reduce_dim}
+    else:
+        reduce_dims = set(reduce_dim)
+
+    is_sharded_reduce = any(_mode_has_mesh(h_shape[d]) for d in reduce_dims)
 
     ndim = len(h_shape)
+    # Project out all reduced dims at once
+    coord = tuple(0 if k in reduce_dims else None for k in range(ndim))
+    new_hier = sharded.hier_layout(*coord)
+
     if keepdim:
-        coord = tuple(0 if k == reduce_dim else None for k in range(ndim))
-        new_hier = sharded.hier_layout(*coord)
-        nh_shape = new_hier.shape if is_tuple(new_hier.shape) else (new_hier.shape,)
-        nh_stride = new_hier.stride if is_tuple(new_hier.stride) else (new_hier.stride,)
-        ins_shape = nh_shape[:reduce_dim] + (((1, 1),),) + nh_shape[reduce_dim:]
-        ins_stride = nh_stride[:reduce_dim] + (((0, 0),),) + nh_stride[reduce_dim:]
-        new_hier = Layout(ins_shape, ins_stride)
-    else:
-        coord = tuple(0 if k == reduce_dim else None for k in range(ndim))
-        new_hier = sharded.hier_layout(*coord)
+        # Re-insert size-1 dims at each reduced position
+        nh_shape = _ensure_tuple(new_hier.shape)
+        nh_stride = _ensure_tuple(new_hier.stride)
+        result_shape = list(nh_shape)
+        result_stride = list(nh_stride)
+        for d in sorted(reduce_dims):
+            result_shape.insert(d, ((1, 1),))
+            result_stride.insert(d, ((0, 0),))
+        new_hier = Layout(tuple(result_shape), tuple(result_stride))
 
     result = ShardedLayout(new_hier)
     if is_sharded_reduce:
@@ -355,7 +383,7 @@ def propagate_reduction(sharded, reduce_dim, keepdim, output_shape):
 
 
 # =============================================================================
-# Einsum = broadcast + reduce
+# Einsum = expand + pointwise + reduce
 # =============================================================================
 
 
@@ -390,44 +418,46 @@ def _classify_einsum_dims(inputs, output):
 _SIZE_1_MODE = ((1, 1),)
 
 
+def _expand_to_joint(sharded, input_labels, all_labels):
+    """Expand a ShardedLayout to the joint label space by inserting size-1 modes."""
+    h_shape = sharded.hier_layout.shape
+    h_stride = sharded.hier_layout.stride
+
+    new_shape = []
+    new_stride = []
+    for label in all_labels:
+        if label in input_labels:
+            idx = list(input_labels).index(label)
+            new_shape.append(h_shape[idx])
+            new_stride.append(h_stride[idx])
+        else:
+            new_shape.append(_SIZE_1_MODE)
+            new_stride.append(((0, 0),))
+
+    return ShardedLayout(Layout(tuple(new_shape), tuple(new_stride)))
+
+
 def propagate_einsum(equation, sharded_a, sharded_b, output_shape):
-    """Einsum = unsqueeze + broadcast + reduce."""
+    """Einsum = expand + pointwise + reduce.
+
+    1. Parse equation, classify dims, check einsum-specific compatibility
+    2. Expand A and B to joint label space (unsqueeze)
+    3. Pointwise broadcast
+    4. Reduce contracted dims
+    """
     inputs, output_labels = _parse_einsum(equation)
     categories = _classify_einsum_dims(inputs, output_labels)
-
-    a_shape = sharded_a.hier_layout.shape
-    b_shape = sharded_b.hier_layout.shape
 
     # Build joint label space
     all_labels = list(dict.fromkeys(list(inputs[0]) + list(inputs[1])))
 
-    # Expand A and B to joint space
-    a_expanded = []
+    # Step 1: Check einsum-specific compatibility BEFORE expanding
+    a_shape = sharded_a.hier_layout.shape
+    b_shape = sharded_b.hier_layout.shape
     for label in all_labels:
-        if label in inputs[0]:
-            idx = list(inputs[0]).index(label)
-            a_expanded.append(a_shape[idx])
-        else:
-            a_expanded.append(_SIZE_1_MODE)
-
-    b_expanded = []
-    for label in all_labels:
-        if label in inputs[1]:
-            idx = list(inputs[1]).index(label)
-            b_expanded.append(b_shape[idx])
-        else:
-            b_expanded.append(_SIZE_1_MODE)
-
-    # Broadcast
-    bc = _hier_broadcast_shapes(tuple(a_expanded), tuple(b_expanded))
-    if bc is None:
-        return None
-
-    # Check einsum compatibility
-    for i, label in enumerate(all_labels):
         cat = categories.get(label)
-        a_sharded = _mode_has_mesh(a_expanded[i])
-        b_sharded = _mode_has_mesh(b_expanded[i])
+        a_sharded = _mode_has_mesh(a_shape[list(inputs[0]).index(label)]) if label in inputs[0] else False
+        b_sharded = _mode_has_mesh(b_shape[list(inputs[1]).index(label)]) if label in inputs[1] else False
 
         if cat == "m" and b_sharded:
             return None
@@ -438,41 +468,19 @@ def propagate_einsum(equation, sharded_a, sharded_b, output_shape):
         if cat == "contract" and a_sharded != b_sharded:
             return None
 
-    # Reduce: drop contracted dims
-    is_partial = False
-    out_modes_bc = []
-    for i, label in enumerate(all_labels):
-        if categories.get(label) == "contract":
-            if _mode_has_mesh(bc[i]):
-                is_partial = True
-            continue
-        if label in output_labels:
-            out_modes_bc.append(bc[i])
+    # Step 2: Expand to joint space
+    expanded_a = _expand_to_joint(sharded_a, inputs[0], all_labels)
+    expanded_b = _expand_to_joint(sharded_b, inputs[1], all_labels)
 
-    # Build output hier with output-space strides
-    o_shape = _ensure_tuple(output_shape)
-    out_local = tuple(_local_size(mode) for mode in out_modes_bc)
-    out_hier = _to_uniform(logical_divide(Layout(o_shape), out_local))
+    # Step 3: Pointwise broadcast
+    joint = propagate_pointwise([expanded_a, expanded_b], output_shape)
+    if joint is None:
+        return None
 
-    # Overlay broadcast level-2 structure (for merged dims with mesh)
-    oh_shape = out_hier.shape
-    final_shape = list(oh_shape)
-    final_stride = list(out_hier.stride)
+    # Step 4: Reduce contracted dims
+    contract_dims = [i for i, label in enumerate(all_labels) if categories.get(label) == "contract"]
+    if not contract_dims:
+        return joint
 
-    for idx, mode_bc in enumerate(out_modes_bc):
-        if len(mode_bc) > 1 or _mode_has_mesh(mode_bc):
-            label = output_labels[idx]
-            if label in inputs[0]:
-                src_idx = list(inputs[0]).index(label)
-                final_shape[idx] = mode_bc
-                final_stride[idx] = sharded_a.hier_layout.stride[src_idx]
-            elif label in inputs[1]:
-                src_idx = list(inputs[1]).index(label)
-                final_shape[idx] = mode_bc
-                final_stride[idx] = sharded_b.hier_layout.stride[src_idx]
-
-    out_hier = Layout(tuple(final_shape), tuple(final_stride))
-    result = ShardedLayout(out_hier)
-    if is_partial:
-        result._is_partial = True
+    result = propagate_reduction(joint, contract_dims, keepdim=False, output_shape=output_shape)
     return result

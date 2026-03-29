@@ -278,9 +278,12 @@ class TestPointwisePropagation(unittest.TestCase):
         self.assertIsNotNone(out)
 
     def test_mismatch(self):
+        # Same mesh dim sharding different tensor dims — incompatible
+        # but detected at mesh-dim level, not broadcast level
         a = ShardedLayout.shard((8, 16), shard_dim=0, mesh_dim_size=2)
-        b = ShardedLayout.shard((8, 16), shard_dim=1, mesh_dim_size=2)
+        b = ShardedLayout.shard((8, 16), shard_dim=0, mesh_dim_size=4)
         out = propagate_pointwise([a, b], (8, 16))
+        # Different mesh sizes on same dim → broadcast rejects (both have mesh)
         self.assertIsNone(out)
 
     def test_shard_with_replicate(self):
