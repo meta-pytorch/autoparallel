@@ -1,15 +1,17 @@
 """
-ShardedLayout: Sharding as a single hierarchical CuTe Layout.
+ShardedLayout: Sharding as a single hierarchical CuTe Layout + mesh dim map.
 
 Always uses uniform 3-level nesting:
 - Level 1: tensor dims — always a tuple of level-2 modes
 - Level 2: sub-dims (from merge/split history) — always a tuple of level-3 sub-dims
-- Level 3: (local, mesh...) — always a tuple starting with scalar local
+- Level 3: (local, mesh...) — always a tuple with at least (local, 1) for replicate
+
+mesh_dim_map tracks which mesh dimension each tensor dim's mesh belongs to.
 
 Examples:
-  Replicate (4, 8, 16):    (((4,),), ((8,),), ((16,),))
-  S(0)=2 on (4, 8, 16):   (((2, 2),), ((8,),), ((16,),))
-  After merge (32, 16):    (((2, 2), (8,)), ((16,),))
+  Replicate (4, 8, 16):    shape=(((4,1),), ((8,1),), ((16,1),))  map={}
+  S(0)=2 on dim 0:         shape=(((2,2),), ((8,1),), ((16,1),))  map={0: 0}
+  S(0)=2 dim 0, S(1)=4 dim 1:  map={0: 0, 1: 1}
 """
 
 from ._pycute import Layout, is_tuple, logical_divide, product
@@ -23,9 +25,7 @@ def _ensure_tuple(x):
 def _to_uniform(layout):
     """Convert a CuTe Layout to uniform 3-level nesting.
 
-    Takes output of logical_divide and wraps every mode into
-    tuple-of-tuples-of-tuples structure. Every sub-dim is always
-    (local, mesh...) with at least one mesh element (1 for replicate).
+    Every sub-dim is always (local, mesh...) with at least (local, 1) for replicate.
     """
     shape = _ensure_tuple(layout.shape)
     stride = _ensure_tuple(layout.stride)
@@ -34,14 +34,9 @@ def _to_uniform(layout):
     new_stride = []
     for s, st in zip(shape, stride):
         if is_tuple(s):
-            # Already (local, mesh...) from logical_divide — keep as-is
-            sub_s = s
-            sub_st = st
-            # Wrap as single sub-dim in level-2
-            new_shape.append((sub_s,))
-            new_stride.append((sub_st,))
+            new_shape.append((s,))
+            new_stride.append((st,))
         else:
-            # Flat scalar — wrap as ((X, 1),) with mesh=1, stride=0
             new_shape.append(((s, 1),))
             new_stride.append(((st, 0),))
 
@@ -49,7 +44,7 @@ def _to_uniform(layout):
 
 
 def _has_mesh(subdim):
-    """Check if a level-3 sub-dim has mesh sharding. Sub-dim is always a tuple."""
+    """Check if a level-3 sub-dim has mesh sharding."""
     return len(subdim) > 1 and product(subdim[1:]) > 1
 
 
@@ -57,7 +52,7 @@ def _local_size(mode):
     """Get the local (per-device) size of a level-2 mode (tuple of sub-dims)."""
     result = 1
     for sub in mode:
-        result *= sub[0]  # first element of each sub-dim is local
+        result *= sub[0]
     return result
 
 
@@ -76,18 +71,18 @@ def _global_shape(hier_layout):
 
 class ShardedLayout:
     """
-    Sharding described by a single hierarchical CuTe Layout.
+    Sharding described by a hierarchical CuTe Layout + mesh dim identity map.
 
-    Always uses uniform 3-level nesting:
-    - Level 1: tuple of level-2 modes (one per tensor dim)
-    - Level 2: tuple of level-3 sub-dims (from merge/split history)
-    - Level 3: tuple (local, mesh...) — local is always scalar
-
-    global_shape is derived as product per top-level mode.
+    Attributes:
+        hier_layout: Layout with uniform 3-level nesting.
+        mesh_dim_map: dict mapping tensor dim → mesh dim index.
+            Only contains entries for sharded dims.
+            Empty for replicate. Example: {0: 0, 1: 1} for S(0) on dim 0, S(1) on dim 1.
     """
 
-    def __init__(self, hier_layout):
+    def __init__(self, hier_layout, mesh_dim_map=None):
         self.hier_layout = hier_layout
+        self.mesh_dim_map = mesh_dim_map or {}
         self._is_partial = False
 
     @staticmethod
@@ -97,24 +92,42 @@ class ShardedLayout:
         return ShardedLayout(_to_uniform(Layout(t_shape)))
 
     @staticmethod
-    def shard(tensor_shape, shard_dim, mesh_dim_size):
-        """Shard tensor_shape[shard_dim] across mesh_dim_size devices."""
+    def shard(tensor_shape, shard_dim, mesh_dim_size, mesh_dim=0):
+        """Shard tensor_shape[shard_dim] across mesh_dim_size devices.
+
+        mesh_dim: which mesh dimension this shard belongs to (default 0).
+        """
         t_shape = _ensure_tuple(tensor_shape)
         assert t_shape[shard_dim] % mesh_dim_size == 0
 
         local = list(t_shape)
         local[shard_dim] //= mesh_dim_size
         hier = logical_divide(Layout(t_shape), tuple(local))
-        return ShardedLayout(_to_uniform(hier))
+        return ShardedLayout(_to_uniform(hier), {shard_dim: mesh_dim})
 
     @staticmethod
     def shard_multi(tensor_shape, shard_specs):
         """Shard with multiple mesh dims.
 
         shard_specs: list of (shard_dim, mesh_dim_size) per mesh dim.
-        For S(0),S(0) (same dim repeated), applies sequential divisions.
+        mesh_dim index = position in shard_specs.
         """
         t_shape = _ensure_tuple(tensor_shape)
+
+        # Build mesh_dim_map: mesh dim index = position in shard_specs
+        mesh_dim_map = {}
+        for mesh_dim_idx, (shard_dim, _) in enumerate(shard_specs):
+            # For S(0),S(0): multiple mesh dims on same tensor dim
+            # Store as list or use the last one (they accumulate in the hier layout)
+            if shard_dim in mesh_dim_map:
+                # Multiple mesh dims on same tensor dim — store as tuple
+                existing = mesh_dim_map[shard_dim]
+                if isinstance(existing, tuple):
+                    mesh_dim_map[shard_dim] = existing + (mesh_dim_idx,)
+                else:
+                    mesh_dim_map[shard_dim] = (existing, mesh_dim_idx)
+            else:
+                mesh_dim_map[shard_dim] = mesh_dim_idx
 
         dim_counts = {}
         for dim, _ in shard_specs:
@@ -128,7 +141,7 @@ class ShardedLayout:
                 assert local[dim] % mesh_size == 0
                 local[dim] //= mesh_size
             hier = logical_divide(Layout(t_shape), tuple(local))
-            return ShardedLayout(_to_uniform(hier))
+            return ShardedLayout(_to_uniform(hier), mesh_dim_map)
 
         # S(0),S(0) case: sequential logical_divide
         hier = Layout(t_shape)
@@ -141,7 +154,7 @@ class ShardedLayout:
             hier = logical_divide(hier, divisor)
             current_local[dim] = chunk
 
-        return ShardedLayout(_to_uniform(hier))
+        return ShardedLayout(_to_uniform(hier), mesh_dim_map)
 
     @property
     def global_shape(self):
@@ -179,7 +192,8 @@ class ShardedLayout:
                 g = product(mode)
                 l = _local_size(mode)
                 mesh_size = g // l
-                placements.append(("shard", i, mesh_size))
+                mesh_dim = self.mesh_dim_map.get(i)
+                placements.append(("shard", i, mesh_size, mesh_dim))
         if not placements:
             return [("replicate", None, None)]
         return placements
@@ -187,13 +201,14 @@ class ShardedLayout:
     def __eq__(self, other):
         if not isinstance(other, ShardedLayout):
             return NotImplemented
-        return self.hier_layout == other.hier_layout
+        return (self.hier_layout == other.hier_layout
+                and self.mesh_dim_map == other.mesh_dim_map)
 
     def __hash__(self):
-        return hash(self.hier_layout)
+        return hash((self.hier_layout, tuple(sorted(self.mesh_dim_map.items()))))
 
     def __repr__(self):
-        return f"ShardedLayout(hier={self.hier_layout})"
+        return f"ShardedLayout(hier={self.hier_layout}, mesh_map={self.mesh_dim_map})"
 
     def __str__(self):
         placements = self.get_placements()
