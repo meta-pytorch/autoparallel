@@ -31,8 +31,9 @@ from torch.distributed.tensor._ops._view_ops import (
 
 
 def _split_subdim(sub, sub_st, split_point):
-    """Split a level-3 sub-dim at a global-size boundary.
-    Returns ((left, left_st), (right, right_st)) or None."""
+    """Split a level-3 sub-dim (local, mesh...) at a global-size boundary.
+    Returns ((left, left_st), (right, right_st)) or None.
+    Sub-dim always has at least (local, mesh) with mesh=1 for replicate."""
     gs = product(sub)
     if gs == split_point:
         return (sub, sub_st), None
@@ -40,31 +41,21 @@ def _split_subdim(sub, sub_st, split_point):
         return None
 
     local = sub[0]
+    mesh = sub[1:]
     local_st = sub_st[0] if is_tuple(sub_st) else sub_st
+    mesh_st = sub_st[1:] if is_tuple(sub_st) else ()
+    mesh_product = product(mesh)
 
-    if len(sub) == 1:
-        # Flat sub-dim (X,)
-        left = (split_point,)
-        right = (local // split_point,)
-        left_st = (local_st,)
-        right_st = (local_st * split_point,)
+    if split_point >= mesh_product and split_point % mesh_product == 0:
+        left_local = split_point // mesh_product
+        right_local = local // left_local
+        left = (left_local,) + tuple(mesh)
+        right = (right_local, 1)
+        left_st = (local_st,) + tuple(mesh_st)
+        right_st = (local_st * left_local * mesh_product, 0)
         return (left, left_st), (right, right_st)
     else:
-        # Sharded sub-dim (local, mesh...)
-        mesh = sub[1:]
-        mesh_st = sub_st[1:] if is_tuple(sub_st) else ()
-        mesh_product = product(mesh)
-
-        if split_point >= mesh_product and split_point % mesh_product == 0:
-            left_local = split_point // mesh_product
-            right_local = local // left_local
-            left = (left_local,) + tuple(mesh)
-            right = (right_local,)
-            left_st = (local_st,) + tuple(mesh_st)
-            right_st = (local_st * left_local * mesh_product,)
-            return (left, left_st), (right, right_st)
-        else:
-            return None
+        return None
 
 
 def _collect_input_dims(op):
@@ -350,8 +341,8 @@ def propagate_reduction(sharded, reduce_dim, keepdim, output_shape):
         new_hier = sharded.hier_layout(*coord)
         nh_shape = new_hier.shape if is_tuple(new_hier.shape) else (new_hier.shape,)
         nh_stride = new_hier.stride if is_tuple(new_hier.stride) else (new_hier.stride,)
-        ins_shape = nh_shape[:reduce_dim] + (((1,),),) + nh_shape[reduce_dim:]
-        ins_stride = nh_stride[:reduce_dim] + (((0,),),) + nh_stride[reduce_dim:]
+        ins_shape = nh_shape[:reduce_dim] + (((1, 1),),) + nh_shape[reduce_dim:]
+        ins_stride = nh_stride[:reduce_dim] + (((0, 0),),) + nh_stride[reduce_dim:]
         new_hier = Layout(ins_shape, ins_stride)
     else:
         coord = tuple(0 if k == reduce_dim else None for k in range(ndim))
@@ -395,8 +386,8 @@ def _classify_einsum_dims(inputs, output):
     return categories
 
 
-# Uniform 3-level size-1 mode
-_SIZE_1_MODE = ((1,),)
+# Uniform 3-level size-1 mode: ((local=1, mesh=1),)
+_SIZE_1_MODE = ((1, 1),)
 
 
 def propagate_einsum(equation, sharded_a, sharded_b, output_shape):

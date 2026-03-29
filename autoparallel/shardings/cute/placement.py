@@ -24,30 +24,26 @@ def _to_uniform(layout):
     """Convert a CuTe Layout to uniform 3-level nesting.
 
     Takes output of logical_divide and wraps every mode into
-    tuple-of-tuples-of-tuples structure.
+    tuple-of-tuples-of-tuples structure. Every sub-dim is always
+    (local, mesh...) with at least one mesh element (1 for replicate).
     """
-    shape = layout.shape if is_tuple(layout.shape) else (layout.shape,)
-    stride = layout.stride if is_tuple(layout.stride) else (layout.stride,)
+    shape = _ensure_tuple(layout.shape)
+    stride = _ensure_tuple(layout.stride)
 
     new_shape = []
     new_stride = []
     for s, st in zip(shape, stride):
         if is_tuple(s):
-            # Could be (local, mesh...) from logical_divide
-            # Check for trivial (X, 1) — collapse to (X,)
-            if len(s) == 2 and s[1] == 1:
-                sub_s = (s[0],)
-                sub_st = (st[0] if is_tuple(st) else st,)
-            else:
-                sub_s = s
-                sub_st = st
+            # Already (local, mesh...) from logical_divide — keep as-is
+            sub_s = s
+            sub_st = st
             # Wrap as single sub-dim in level-2
             new_shape.append((sub_s,))
             new_stride.append((sub_st,))
         else:
-            # Flat scalar — wrap as ((X,),)
-            new_shape.append(((s,),))
-            new_stride.append(((st,),))
+            # Flat scalar — wrap as ((X, 1),) with mesh=1, stride=0
+            new_shape.append(((s, 1),))
+            new_stride.append(((st, 0),))
 
     return Layout(tuple(new_shape), tuple(new_stride))
 
