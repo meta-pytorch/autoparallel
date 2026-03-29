@@ -25,6 +25,7 @@ from autoparallel.shardings.cute.propagation import (
     propagate_reduction,
     propagate_slice,
     propagate_transpose,
+    propagate_unsqueeze,
     propagate_view,
 )
 
@@ -214,6 +215,56 @@ class TestGatherPropagation(unittest.TestCase):
         out = propagate_gather(t, dim=1, index_layout=index)
         self.assertIsNotNone(out)
         self.assertTrue(out.is_replicate())
+
+
+class TestUnsqueezePropagation(unittest.TestCase):
+
+    def test_unsqueeze_replicate(self):
+        t = ShardedLayout.replicate((4, 8))
+        out = propagate_unsqueeze(t, dim=0)
+        self.assertEqual(out.global_shape, (1, 4, 8))
+        self.assertTrue(out.is_replicate())
+
+    def test_unsqueeze_middle(self):
+        t = ShardedLayout.shard((4, 8), shard_dim=0, mesh_dim_size=2)
+        out = propagate_unsqueeze(t, dim=1)
+        self.assertEqual(out.global_shape, (4, 1, 8))
+        placements = out.get_placements()
+        self.assertEqual(placements[0][:3], ("shard", 0, 2))
+
+    def test_unsqueeze_end(self):
+        t = ShardedLayout.shard((4, 8), shard_dim=0, mesh_dim_size=2)
+        out = propagate_unsqueeze(t, dim=2)
+        self.assertEqual(out.global_shape, (4, 8, 1))
+        placements = out.get_placements()
+        self.assertEqual(placements[0][:3], ("shard", 0, 2))
+
+    def test_unsqueeze_before_shard(self):
+        t = ShardedLayout.shard((4, 8), shard_dim=1, mesh_dim_size=2)
+        out = propagate_unsqueeze(t, dim=0)
+        self.assertEqual(out.global_shape, (1, 4, 8))
+        # Shard dim shifted: was dim 1, now dim 2
+        placements = out.get_placements()
+        self.assertEqual(placements[0][:3], ("shard", 2, 2))
+
+    def test_unsqueeze_mesh_dim_map_shift(self):
+        t = ShardedLayout.shard_multi((4, 8, 16), [(0, 2), (1, 4)])
+        # mesh_dim_map: {0: 0, 1: 1}
+        out = propagate_unsqueeze(t, dim=1)
+        # dim 0 stays, dim 1+ shift up
+        # mesh_dim_map: {0: 0, 2: 1}
+        self.assertEqual(out.global_shape, (4, 1, 8, 16))
+        placements = out.get_placements()
+        self.assertEqual(placements[0][:3], ("shard", 0, 2))
+        self.assertEqual(placements[1][:3], ("shard", 2, 4))
+
+    def test_unsqueeze_squeeze_roundtrip(self):
+        t = ShardedLayout.shard((4, 8), shard_dim=0, mesh_dim_size=2)
+        unsqueezed = propagate_unsqueeze(t, dim=1)
+        # Squeeze back via slice at index 0 on the size-1 dim
+        squeezed = propagate_slice(unsqueezed, dim=1, index=0)
+        self.assertEqual(squeezed.global_shape, t.global_shape)
+        self.assertEqual(squeezed.get_placements(), t.get_placements())
 
 
 class TestEinsumPropagation(unittest.TestCase):

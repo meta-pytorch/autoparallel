@@ -353,7 +353,7 @@ def propagate_gather(sharded, dim, index_layout):
 
 
 # =============================================================================
-# Pointwise — broadcast hierarchical shapes
+# Broadcast -- core building block for pointwise and einsum
 # =============================================================================
 
 
@@ -387,57 +387,71 @@ def _hier_broadcast_shapes(a_shape, b_shape):
     return tuple(result)
 
 
+def propagate_broadcast(a, b):
+    """Broadcast two ShardedLayouts. Returns the result or None.
+
+    Checks shape compatibility and mesh_dim_map compatibility:
+    1. Same tensor dim, different mesh dims -> incompatible
+    2. Same mesh dim, different tensor dims -> incompatible
+    """
+    a_shape = a.hier_layout.shape
+    b_shape = b.hier_layout.shape
+
+    if len(a_shape) != len(b_shape):
+        return None
+
+    bc = _hier_broadcast_shapes(a_shape, b_shape)
+    if bc is None:
+        return None
+
+    # Check mesh dim compatibility
+    # 1. Same tensor dim must use same mesh dim
+    for dim in set(a.mesh_dim_map) & set(b.mesh_dim_map):
+        if a.mesh_dim_map[dim] != b.mesh_dim_map[dim]:
+            return None
+
+    # 2. Same mesh dim must not be on different tensor dims
+    a_mesh_to_tensor = {v: k for k, v in a.mesh_dim_map.items() if not isinstance(v, tuple)}
+    for dim, mesh_dim in b.mesh_dim_map.items():
+        if isinstance(mesh_dim, tuple):
+            continue
+        if mesh_dim in a_mesh_to_tensor and a_mesh_to_tensor[mesh_dim] != dim:
+            return None
+
+    # Build broadcast strides
+    bc_stride = []
+    for i in range(len(bc)):
+        if product(a_shape[i]) > 1 and (product(b_shape[i]) == 1 or _mode_has_mesh(a_shape[i])):
+            bc_stride.append(a.hier_layout.stride[i])
+        elif product(b_shape[i]) > 1:
+            bc_stride.append(b.hier_layout.stride[i])
+        else:
+            bc_stride.append(a.hier_layout.stride[i])
+
+    # Merge mesh_dim_maps
+    merged_map = dict(a.mesh_dim_map)
+    for dim, mesh_dim in b.mesh_dim_map.items():
+        if dim not in merged_map:
+            merged_map[dim] = mesh_dim
+
+    return ShardedLayout(Layout(bc, tuple(bc_stride)), merged_map)
+
+
+# =============================================================================
+# Pointwise = fold of broadcast
+# =============================================================================
+
+
 def propagate_pointwise(all_shardeds, output_shape):
-    """Pointwise: broadcast hierarchical shapes. Merge mesh_dim_maps."""
+    """Pointwise: pairwise broadcast of all inputs."""
     if not all_shardeds:
         return None
 
     result = all_shardeds[0]
-    result_map = dict(result.mesh_dim_map)
-
     for sharded in all_shardeds[1:]:
-        r_shape = result.hier_layout.shape
-        s_shape = sharded.hier_layout.shape
-
-        if len(r_shape) != len(s_shape):
+        result = propagate_broadcast(result, sharded)
+        if result is None:
             return None
-
-        bc = _hier_broadcast_shapes(r_shape, s_shape)
-        if bc is None:
-            return None
-
-        # Check mesh dim compatibility:
-        # 1. Same tensor dim must use same mesh dim
-        for dim in set(result_map) & set(sharded.mesh_dim_map):
-            if result_map[dim] != sharded.mesh_dim_map[dim]:
-                return None
-
-        # 2. Same mesh dim must not be on different tensor dims
-        result_mesh_to_tensor = {v: k for k, v in result_map.items() if not isinstance(v, tuple)}
-        for dim, mesh_dim in sharded.mesh_dim_map.items():
-            if isinstance(mesh_dim, tuple):
-                continue
-            if mesh_dim in result_mesh_to_tensor and result_mesh_to_tensor[mesh_dim] != dim:
-                return None  # same mesh dim on different tensor dims
-
-        # Build broadcast layout
-        bc_stride = []
-        for i in range(len(bc)):
-            if product(r_shape[i]) > 1 and (product(s_shape[i]) == 1 or _mode_has_mesh(r_shape[i])):
-                bc_stride.append(result.hier_layout.stride[i])
-            elif product(s_shape[i]) > 1:
-                bc_stride.append(sharded.hier_layout.stride[i])
-            else:
-                bc_stride.append(result.hier_layout.stride[i])
-
-        # Merge mesh_dim_maps
-        merged_map = dict(result_map)
-        for dim, mesh_dim in sharded.mesh_dim_map.items():
-            if dim not in merged_map:
-                merged_map[dim] = mesh_dim
-
-        result = ShardedLayout(Layout(bc, tuple(bc_stride)), merged_map)
-        result_map = merged_map
 
     return result
 
@@ -498,7 +512,35 @@ def propagate_reduction(sharded, reduce_dim, keepdim=False, output_shape=None):
 
 
 # =============================================================================
-# Einsum = expand + pointwise + reduce
+# Unsqueeze
+# =============================================================================
+
+
+# Uniform 3-level size-1 mode: ((local=1, mesh=1),)
+_SIZE_1_MODE = ((1, 1),)
+_SIZE_1_STRIDE = ((0, 0),)
+
+
+def propagate_unsqueeze(sharded, dim):
+    """Unsqueeze: insert a size-1 dim at position dim."""
+    h_shape = sharded.hier_layout.shape
+    h_stride = sharded.hier_layout.stride
+
+    new_shape = h_shape[:dim] + (_SIZE_1_MODE,) + h_shape[dim:]
+    new_stride = h_stride[:dim] + (_SIZE_1_STRIDE,) + h_stride[dim:]
+    new_hier = Layout(new_shape, new_stride)
+
+    # Shift mesh_dim_map keys >= dim up by 1
+    new_map = {}
+    for src, mesh_dim in sharded.mesh_dim_map.items():
+        new_key = src if src < dim else src + 1
+        new_map[new_key] = mesh_dim
+
+    return ShardedLayout(new_hier, new_map)
+
+
+# =============================================================================
+# Einsum = unsqueeze + pointwise + reduce
 # =============================================================================
 
 
@@ -529,37 +571,22 @@ def _classify_einsum_dims(inputs, output):
     return categories
 
 
-# Uniform 3-level size-1 mode: ((local=1, mesh=1),)
-_SIZE_1_MODE = ((1, 1),)
-
-
-def _expand_to_joint(sharded, input_labels, all_labels):
-    """Expand a ShardedLayout to the joint label space by inserting size-1 modes."""
-    h_shape = sharded.hier_layout.shape
-    h_stride = sharded.hier_layout.stride
-
-    new_shape = []
-    new_stride = []
-    new_map = {}
+def _unsqueeze_to_joint(sharded, input_labels, all_labels):
+    """Expand a ShardedLayout to the joint label space via unsqueezes."""
+    result = sharded
+    insert_count = 0
     for out_i, label in enumerate(all_labels):
-        if label in input_labels:
-            idx = list(input_labels).index(label)
-            new_shape.append(h_shape[idx])
-            new_stride.append(h_stride[idx])
-            if idx in sharded.mesh_dim_map:
-                new_map[out_i] = sharded.mesh_dim_map[idx]
-        else:
-            new_shape.append(_SIZE_1_MODE)
-            new_stride.append(((0, 0),))
-
-    return ShardedLayout(Layout(tuple(new_shape), tuple(new_stride)), new_map)
+        if label not in input_labels:
+            result = propagate_unsqueeze(result, out_i)
+            insert_count += 1
+    return result
 
 
 def propagate_einsum(equation, sharded_a, sharded_b, output_shape):
-    """Einsum = expand + pointwise + reduce.
+    """Einsum = unsqueeze + pointwise + reduce.
 
     1. Parse equation, classify dims, check einsum-specific compatibility
-    2. Expand A and B to joint label space (unsqueeze)
+    2. Unsqueeze A and B to joint label space
     3. Pointwise broadcast
     4. Reduce contracted dims
     """
@@ -586,9 +613,9 @@ def propagate_einsum(equation, sharded_a, sharded_b, output_shape):
         if cat == "contract" and a_sharded != b_sharded:
             return None
 
-    # Step 2: Expand to joint space
-    expanded_a = _expand_to_joint(sharded_a, inputs[0], all_labels)
-    expanded_b = _expand_to_joint(sharded_b, inputs[1], all_labels)
+    # Step 2: Unsqueeze to joint space
+    expanded_a = _unsqueeze_to_joint(sharded_a, inputs[0], all_labels)
+    expanded_b = _unsqueeze_to_joint(sharded_b, inputs[1], all_labels)
 
     # Step 3: Pointwise broadcast
     joint = propagate_pointwise([expanded_a, expanded_b], output_shape)
