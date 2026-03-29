@@ -1,75 +1,75 @@
 """
 ShardedLayout: Sharding as a single hierarchical CuTe Layout.
 
-The hierarchical layout is produced by logical_divide(Layout(tensor_shape), local_sizes).
-Each sharded dim has shape (local, mesh_size), replicated dims are flat.
-Convention: (local, mesh) — local is tile (stride 1, contiguous blocks).
+Always uses uniform 3-level nesting:
+- Level 1: tensor dims — always a tuple of level-2 modes
+- Level 2: sub-dims (from merge/split history) — always a tuple of level-3 sub-dims
+- Level 3: (local, mesh...) — always a tuple starting with scalar local
 
-3-level nesting:
-- Level 1: tensor dims (global_shape derived as product per mode)
-- Level 2: merge/split history (tuple of sub-dim tuples)
-- Level 3: (local, mesh...) sharding per sub-dim
+Examples:
+  Replicate (4, 8, 16):    (((4,),), ((8,),), ((16,),))
+  S(0)=2 on (4, 8, 16):   (((2, 2),), ((8,),), ((16,),))
+  After merge (32, 16):    (((2, 2), (8,)), ((16,),))
 """
 
 from ._pycute import Layout, is_tuple, logical_divide, product
 
 
-def _clean_hier(layout):
-    """Collapse trivial (X, 1):(s, 0) modes to flat X:s.
+def _to_uniform(layout):
+    """Convert a CuTe Layout to uniform 3-level nesting.
 
-    logical_divide always produces (tile, rest) pairs. For replicated dims
-    (divided by full size), rest=1. This cleanup makes replicate dims flat,
-    so is_tuple(mode) ↔ sharded.
+    Takes output of logical_divide and wraps every mode into
+    tuple-of-tuples-of-tuples structure.
     """
     shape = layout.shape if is_tuple(layout.shape) else (layout.shape,)
     stride = layout.stride if is_tuple(layout.stride) else (layout.stride,)
+
     new_shape = []
     new_stride = []
     for s, st in zip(shape, stride):
-        if is_tuple(s) and len(s) == 2 and s[1] == 1:
-            new_shape.append(s[0])
-            new_stride.append(st[0] if is_tuple(st) else st)
+        if is_tuple(s):
+            # Could be (local, mesh...) from logical_divide
+            # Check for trivial (X, 1) — collapse to (X,)
+            if len(s) == 2 and s[1] == 1:
+                sub_s = (s[0],)
+                sub_st = (st[0] if is_tuple(st) else st,)
+            else:
+                sub_s = s
+                sub_st = st
+            # Wrap as single sub-dim in level-2
+            new_shape.append((sub_s,))
+            new_stride.append((sub_st,))
         else:
-            new_shape.append(s)
-            new_stride.append(st)
-    if len(new_shape) == 1:
-        return Layout(new_shape[0], new_stride[0])
+            # Flat scalar — wrap as ((X,),)
+            new_shape.append(((s,),))
+            new_stride.append(((st,),))
+
     return Layout(tuple(new_shape), tuple(new_stride))
 
 
-def _is_level2(mode):
-    """Level-2 = tuple where ALL elements are tuples."""
-    if not is_tuple(mode):
-        return False
-    return all(is_tuple(m) for m in mode)
-
-
-def _has_mesh(mode):
-    """Check if a mode has any mesh sharding."""
-    if not is_tuple(mode):
-        return False
-    if _is_level2(mode):
-        return any(_has_mesh(sub) for sub in mode)
-    return product(mode[1:]) > 1
+def _has_mesh(subdim):
+    """Check if a level-3 sub-dim has mesh sharding. Sub-dim is always a tuple."""
+    return len(subdim) > 1 and product(subdim[1:]) > 1
 
 
 def _local_size(mode):
-    """Get the local (per-device) size of a mode."""
-    if not is_tuple(mode):
-        return mode
-    if _is_level2(mode):
-        result = 1
-        for sub in mode:
-            result *= _local_size(sub)
-        return result
-    return mode[0]
+    """Get the local (per-device) size of a level-2 mode (tuple of sub-dims)."""
+    result = 1
+    for sub in mode:
+        result *= sub[0]  # first element of each sub-dim is local
+    return result
+
+
+def _mode_has_mesh(mode):
+    """Check if a level-2 mode has any mesh sharding."""
+    return any(_has_mesh(sub) for sub in mode)
 
 
 def _global_shape(hier_layout):
-    """Derive global tensor shape from hierarchical layout."""
+    """Derive global tensor shape from uniform 3-level layout."""
     shape = hier_layout.shape
     if not is_tuple(shape):
-        return (product(shape),) if is_tuple(shape) else (shape,)
+        return (shape,)
     return tuple(product(s) for s in shape)
 
 
@@ -77,11 +77,12 @@ class ShardedLayout:
     """
     Sharding described by a single hierarchical CuTe Layout.
 
-    Attributes:
-        hier_layout: Layout with hierarchical shape (local, mesh) per dim.
-            Produced by logical_divide(Layout(tensor_shape), local_sizes).
-            Uses element-space strides.
-            global_shape is derived as product per top-level mode.
+    Always uses uniform 3-level nesting:
+    - Level 1: tuple of level-2 modes (one per tensor dim)
+    - Level 2: tuple of level-3 sub-dims (from merge/split history)
+    - Level 3: tuple (local, mesh...) — local is always scalar
+
+    global_shape is derived as product per top-level mode.
     """
 
     def __init__(self, hier_layout):
@@ -91,19 +92,19 @@ class ShardedLayout:
     @staticmethod
     def replicate(tensor_shape):
         """All devices hold all elements."""
-        return ShardedLayout(Layout(tensor_shape))
+        t_shape = tensor_shape if is_tuple(tensor_shape) else (tensor_shape,)
+        return ShardedLayout(_to_uniform(Layout(t_shape)))
 
     @staticmethod
     def shard(tensor_shape, shard_dim, mesh_dim_size):
         """Shard tensor_shape[shard_dim] across mesh_dim_size devices."""
         t_shape = tensor_shape if is_tuple(tensor_shape) else (tensor_shape,)
-        dim_size = t_shape[shard_dim]
-        assert dim_size % mesh_dim_size == 0
+        assert t_shape[shard_dim] % mesh_dim_size == 0
 
         local = list(t_shape)
         local[shard_dim] //= mesh_dim_size
-        hier = _clean_hier(logical_divide(Layout(t_shape), tuple(local)))
-        return ShardedLayout(hier)
+        hier = logical_divide(Layout(t_shape), tuple(local))
+        return ShardedLayout(_to_uniform(hier))
 
     @staticmethod
     def shard_multi(tensor_shape, shard_specs):
@@ -114,7 +115,6 @@ class ShardedLayout:
         """
         t_shape = tensor_shape if is_tuple(tensor_shape) else (tensor_shape,)
 
-        # Check if any dim is sharded by multiple mesh dims
         dim_counts = {}
         for dim, _ in shard_specs:
             dim_counts[dim] = dim_counts.get(dim, 0) + 1
@@ -122,13 +122,12 @@ class ShardedLayout:
         has_repeated = any(c > 1 for c in dim_counts.values())
 
         if not has_repeated:
-            # Simple case: each dim sharded at most once
             local = list(t_shape)
             for dim, mesh_size in shard_specs:
                 assert local[dim] % mesh_size == 0
                 local[dim] //= mesh_size
-            hier = _clean_hier(logical_divide(Layout(t_shape), tuple(local)))
-            return ShardedLayout(hier)
+            hier = logical_divide(Layout(t_shape), tuple(local))
+            return ShardedLayout(_to_uniform(hier))
 
         # S(0),S(0) case: sequential logical_divide
         hier = Layout(t_shape)
@@ -141,11 +140,11 @@ class ShardedLayout:
             hier = logical_divide(hier, divisor)
             current_local[dim] = chunk
 
-        return ShardedLayout(_clean_hier(hier))
+        return ShardedLayout(_to_uniform(hier))
 
     @property
     def global_shape(self):
-        """Derived global tensor shape from hier_layout."""
+        """Derived global tensor shape."""
         return _global_shape(self.hier_layout)
 
     @property
@@ -158,30 +157,26 @@ class ShardedLayout:
         return product(self.global_shape)
 
     def is_replicate(self):
-        """True if no dim is sharded (all mesh parts are 1)."""
+        """True if no dim is sharded."""
         shape = self.hier_layout.shape
         if not is_tuple(shape):
             return True
-        return not any(_has_mesh(s) for s in shape)
+        return not any(_mode_has_mesh(mode) for mode in shape)
 
     def get_placements(self):
-        """Extract per-mesh-dim placements from hierarchical shape.
-
-        Each dim with mesh → Shard.
-        Flat dims → Replicate.
-        """
+        """Extract per-mesh-dim placements from hierarchical shape."""
         if self.is_replicate():
             return [("replicate", None, None)]
 
         shape = self.hier_layout.shape
         if not is_tuple(shape):
-            shape = (shape,)
+            return [("replicate", None, None)]
 
         placements = []
-        for i, s in enumerate(shape):
-            if _has_mesh(s):
-                g = product(s)
-                l = _local_size(s)
+        for i, mode in enumerate(shape):
+            if _mode_has_mesh(mode):
+                g = product(mode)
+                l = _local_size(mode)
                 mesh_size = g // l
                 placements.append(("shard", i, mesh_size))
         if not placements:
