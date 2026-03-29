@@ -276,7 +276,7 @@ def propagate_view(sharded, new_shape):
     new_hier = _view_hier(sharded.hier_layout, sharded.global_shape, new_shape)
     if new_hier is None:
         return None
-    return ShardedLayout(new_hier, new_shape)
+    return ShardedLayout(new_hier)
 
 
 # =============================================================================
@@ -297,7 +297,7 @@ def propagate_transpose(sharded, dim0, dim1):
     new_h_shape = tuple(h_shape[d] for d in dims)
     new_h_stride = tuple(h_stride[d] for d in dims)
     new_hier = Layout(new_h_shape, new_h_stride)
-    return ShardedLayout(new_hier, new_global)
+    return ShardedLayout(new_hier)
 
 
 def propagate_permute(sharded, dims):
@@ -310,7 +310,7 @@ def propagate_permute(sharded, dims):
     new_h_shape = tuple(h_shape[d] for d in dims)
     new_h_stride = tuple(h_stride[d] for d in dims)
     new_hier = Layout(new_h_shape, new_h_stride)
-    return ShardedLayout(new_hier, new_global)
+    return ShardedLayout(new_hier)
 
 
 # =============================================================================
@@ -335,7 +335,7 @@ def propagate_slice(sharded, dim, index):
     new_hier = sharded.hier_layout(*coord)
     g_shape = sharded.global_shape if is_tuple(sharded.global_shape) else (sharded.global_shape,)
     new_global = tuple(s for i, s in enumerate(g_shape) if i != dim)
-    return ShardedLayout(new_hier, new_global)
+    return ShardedLayout(new_hier)
 
 
 # =============================================================================
@@ -368,7 +368,7 @@ def propagate_gather(sharded, dim, index_layout):
     g_shape = sharded.global_shape if is_tuple(sharded.global_shape) else (sharded.global_shape,)
     g_dim_size = index_layout.shape if not is_tuple(index_layout.shape) else product(index_layout.shape)
     new_global = g_shape[:dim] + (g_dim_size,) + g_shape[dim + 1:]
-    return ShardedLayout(new_hier, new_global)
+    return ShardedLayout(new_hier)
 
 
 # =============================================================================
@@ -435,7 +435,7 @@ def propagate_pointwise(all_shardeds, output_shape):
             ref = sharded
             ref_shape = s_shape
 
-    return ShardedLayout(ref.hier_layout, output_shape)
+    return ShardedLayout(ref.hier_layout)
 
 
 # =============================================================================
@@ -473,7 +473,7 @@ def propagate_reduction(sharded, reduce_dim, keepdim, output_shape):
         coord = tuple(0 if k == reduce_dim else None for k in range(ndim))
         new_hier = sharded.hier_layout(*coord)
 
-    result = ShardedLayout(new_hier, output_shape)
+    result = ShardedLayout(new_hier)
     if is_sharded_reduce:
         result._is_partial = True
     return result
@@ -638,7 +638,7 @@ def propagate_einsum(equation, sharded_a, sharded_b, output_shape):
     else:
         out_hier = Layout(tuple(final_shape), tuple(final_stride))
 
-    result = ShardedLayout(out_hier, output_shape)
+    result = ShardedLayout(out_hier)
     if is_partial:
         result._is_partial = True
     return result

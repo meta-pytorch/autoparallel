@@ -5,11 +5,13 @@ The hierarchical layout is produced by logical_divide(Layout(tensor_shape), loca
 Each sharded dim has shape (local, mesh_size), replicated dims are flat.
 Convention: (local, mesh) — local is tile (stride 1, contiguous blocks).
 
-The hier_layout is VIEW-INVARIANT (element-space strides).
-View only changes global_shape metadata.
+3-level nesting:
+- Level 1: tensor dims (global_shape derived as product per mode)
+- Level 2: merge/split history (tuple of sub-dim tuples)
+- Level 3: (local, mesh...) sharding per sub-dim
 """
 
-from ._pycute import Layout, codomain_divide, flatten, is_tuple, logical_divide, product
+from ._pycute import Layout, is_tuple, logical_divide, product
 
 
 def _clean_hier(layout):
@@ -63,6 +65,14 @@ def _local_size(mode):
     return mode[0]
 
 
+def _global_shape(hier_layout):
+    """Derive global tensor shape from hierarchical layout."""
+    shape = hier_layout.shape
+    if not is_tuple(shape):
+        return (product(shape),) if is_tuple(shape) else (shape,)
+    return tuple(product(s) for s in shape)
+
+
 class ShardedLayout:
     """
     Sharding described by a single hierarchical CuTe Layout.
@@ -70,19 +80,18 @@ class ShardedLayout:
     Attributes:
         hier_layout: Layout with hierarchical shape (local, mesh) per dim.
             Produced by logical_divide(Layout(tensor_shape), local_sizes).
-            Uses element-space strides — invariant under view.
-        global_shape: Current tensor shape (changes on view/transpose/slice).
+            Uses element-space strides.
+            global_shape is derived as product per top-level mode.
     """
 
-    def __init__(self, hier_layout, global_shape):
+    def __init__(self, hier_layout):
         self.hier_layout = hier_layout
-        self.global_shape = global_shape
         self._is_partial = False
 
     @staticmethod
     def replicate(tensor_shape):
         """All devices hold all elements."""
-        return ShardedLayout(Layout(tensor_shape), tensor_shape)
+        return ShardedLayout(Layout(tensor_shape))
 
     @staticmethod
     def shard(tensor_shape, shard_dim, mesh_dim_size):
@@ -94,7 +103,7 @@ class ShardedLayout:
         local = list(t_shape)
         local[shard_dim] //= mesh_dim_size
         hier = _clean_hier(logical_divide(Layout(t_shape), tuple(local)))
-        return ShardedLayout(hier, t_shape)
+        return ShardedLayout(hier)
 
     @staticmethod
     def shard_multi(tensor_shape, shard_specs):
@@ -119,22 +128,7 @@ class ShardedLayout:
                 assert local[dim] % mesh_size == 0
                 local[dim] //= mesh_size
             hier = _clean_hier(logical_divide(Layout(t_shape), tuple(local)))
-            return ShardedLayout(hier, t_shape)
-
-        # S(0),S(0) case: sequential logical_divide
-        hier = Layout(t_shape)
-        current_local = list(t_shape)
-        for dim, mesh_size in shard_specs:
-            assert current_local[dim] % mesh_size == 0
-            current_local[dim] //= mesh_size
-            divisor = tuple(current_local[i] if i == dim else
-                            (current_local[i] if dim_counts.get(i, 0) > 1 else t_shape[i])
-                            for i in range(len(t_shape)))
-            # Actually, sequential divide is simpler: divide the current hier layout
-            local_for_this = list(t_shape)
-            local_for_this[dim] = current_local[dim]
-            # For repeated dims, we need to divide the rest of the previous division
-            pass
+            return ShardedLayout(hier)
 
         # S(0),S(0) case: sequential logical_divide
         hier = Layout(t_shape)
@@ -147,11 +141,16 @@ class ShardedLayout:
             hier = logical_divide(hier, divisor)
             current_local[dim] = chunk
 
-        return ShardedLayout(_clean_hier(hier), t_shape)
+        return ShardedLayout(_clean_hier(hier))
+
+    @property
+    def global_shape(self):
+        """Derived global tensor shape from hier_layout."""
+        return _global_shape(self.hier_layout)
 
     @property
     def tensor_shape(self):
-        """Current tensor shape (for compatibility with existing API)."""
+        """Alias for global_shape."""
         return self.global_shape
 
     @property
@@ -165,19 +164,10 @@ class ShardedLayout:
             return True
         return not any(_has_mesh(s) for s in shape)
 
-    def _hier_mode_shape(self, dim):
-        """Get the hierarchical shape of a specific dim."""
-        shape = self.hier_layout.shape
-        if not is_tuple(shape):
-            return shape if dim == 0 else None
-        if dim < len(shape):
-            return shape[dim]
-        return None
-
     def get_placements(self):
         """Extract per-mesh-dim placements from hierarchical shape.
 
-        Each dim with shape (local, mesh) → Shard.
+        Each dim with mesh → Shard.
         Flat dims → Replicate.
         """
         if self.is_replicate():
@@ -187,30 +177,13 @@ class ShardedLayout:
         if not is_tuple(shape):
             shape = (shape,)
 
-        # If hier rank matches global rank, direct read
-        if len(shape) == len(self.global_shape if is_tuple(self.global_shape) else (self.global_shape,)):
-            placements = []
-            for i, s in enumerate(shape):
-                if _has_mesh(s):
-                    # Compute total mesh product for this dim
-                    g = product(s)
-                    l = _local_size(s)
-                    mesh_size = g // l
-                    placements.append(("shard", i, mesh_size))
-            if not placements:
-                return [("replicate", None, None)]
-            return placements
-
-        # Rank mismatch (after view): use codomain_divide
-        g_shape = self.global_shape if is_tuple(self.global_shape) else (self.global_shape,)
-        coverage = codomain_divide(self.hier_layout, g_shape)
         placements = []
-        for k in range(len(g_shape)):
-            g_s = g_shape[k]
-            c_s = coverage.get(k, g_s)
-            if c_s < g_s:
-                mesh_size = g_s // c_s
-                placements.append(("shard", k, mesh_size))
+        for i, s in enumerate(shape):
+            if _has_mesh(s):
+                g = product(s)
+                l = _local_size(s)
+                mesh_size = g // l
+                placements.append(("shard", i, mesh_size))
         if not placements:
             return [("replicate", None, None)]
         return placements
@@ -218,16 +191,13 @@ class ShardedLayout:
     def __eq__(self, other):
         if not isinstance(other, ShardedLayout):
             return NotImplemented
-        return (
-            self.hier_layout == other.hier_layout
-            and self.global_shape == other.global_shape
-        )
+        return self.hier_layout == other.hier_layout
 
     def __hash__(self):
-        return hash((self.hier_layout, self.global_shape))
+        return hash(self.hier_layout)
 
     def __repr__(self):
-        return f"ShardedLayout(hier={self.hier_layout}, shape={self.global_shape})"
+        return f"ShardedLayout(hier={self.hier_layout})"
 
     def __str__(self):
         placements = self.get_placements()
