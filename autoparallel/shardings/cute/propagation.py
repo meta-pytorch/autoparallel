@@ -1,30 +1,26 @@
 """
 CuTe-based sharding propagation rules.
 
-TiledLayout = tensor_layout + tuple of mesh_tilers (one per mesh dim).
-shard_layout = sequential logical_divide.
+ShardedLayout = hierarchical CuTe Layout (local, mesh) per dim.
 
 Propagation:
-- View: tensor_layout changes, mesh_tilers invariant
-- Transpose/Permute: reorder modes in tensor_layout and all tilers
-- Slice: CuTe slice tensor_layout and all tilers
+- View: reshape hier_layout to match new shape (merge/split local parts, mesh invariant)
+- Transpose/Permute: swap top-level modes in hier_layout
+- Slice: partial evaluation on hier_layout
+- Pointwise: broadcast hierarchical shapes
+- Reduction: drop dim (flat=normal, hierarchical=Partial)
+- Einsum: = broadcast + reduce (ranks always match thanks to view)
 """
 
-from ._pycute import (
-    E,
-    Layout,
-    ScaledBasis,
-    codomain_divide,
-    composition,
-    flatten,
-    is_tuple,
-    make_basis_like,
-    product,
-)
-from .placement import TiledLayout
+from ._pycute import Layout, flatten, is_tuple, logical_divide, product, suffix_product
+from .placement import ShardedLayout
 
-# Base composition from torch (handles E(k) strides in layout_a)
-from torch.distributed._pycute import composition as _base_composition
+from torch.distributed.tensor._ops._view_ops import (
+    Flatten,
+    InputDim,
+    Split,
+    view_groups,
+)
 
 
 # =============================================================================
@@ -32,11 +28,255 @@ from torch.distributed._pycute import composition as _base_composition
 # =============================================================================
 
 
-def propagate_view(tiled, new_shape):
-    """View: tensor_layout changes, mesh_tilers invariant."""
-    if product(tiled.tensor_shape) != product(new_shape):
+def _get_local(mode_shape):
+    """Get the local (scalar) size from a hierarchical mode shape."""
+    if _is_level2(mode_shape):
+        # Level-2: product of each sub-dim's local
+        result = 1
+        for sub in mode_shape:
+            result *= _get_local(sub)
+        return result
+    if is_tuple(mode_shape):
+        return mode_shape[0]
+    return mode_shape
+
+
+def _get_mesh(mode_shape):
+    """Get the mesh modes from a hierarchical mode shape. () if flat."""
+    if _is_level2(mode_shape):
+        # Level-2: collect mesh from all sub-dims
+        result = []
+        for sub in mode_shape:
+            result.extend(_get_mesh(sub))
+        return tuple(result)
+    if is_tuple(mode_shape):
+        return mode_shape[1:]
+    return ()
+
+
+def _make_mode(local, mesh_modes):
+    """Build a hierarchical mode: scalar if flat, tuple if sharded."""
+    if not mesh_modes:
+        return local
+    return (local,) + tuple(mesh_modes)
+
+
+def _is_level2(mode):
+    """Level-2 = tuple where ALL elements are tuples (each is a sub-dim)."""
+    if not is_tuple(mode):
+        return False
+    return all(is_tuple(m) for m in mode)
+
+
+def _wrap_subdim(s):
+    """Wrap a flat scalar or level-3 mode as a sub-dim for level-2 grouping."""
+    if is_tuple(s):
+        return s
+    return (s,)
+
+
+def _unwrap_subdim(s):
+    """Unwrap a 1-tuple back to scalar: (4,) → 4."""
+    if is_tuple(s) and len(s) == 1:
+        return s[0]
+    return s
+
+
+def _get_subdims(mode, mode_stride):
+    """Get list of (sub_shape, sub_stride) from a mode."""
+    if _is_level2(mode):
+        return list(zip(mode, mode_stride))
+    else:
+        return [(_wrap_subdim(mode), mode_stride)]
+
+
+def _split_subdim(sub, sub_st, split_point):
+    """Split a sub-dim at a global-size boundary.
+    Returns ((left_shape, left_stride), (right_shape, right_stride)) or None."""
+    gs = product(sub)
+    if gs == split_point:
+        return (sub, sub_st), None
+    if split_point <= 0 or gs % split_point != 0:
         return None
-    return TiledLayout(Layout(new_shape), tiled.mesh_tilers)
+
+    if len(sub) == 1:
+        # Flat sub-dim (X,): split into two flat pieces
+        local = sub[0]
+        local_st = sub_st[0] if is_tuple(sub_st) else sub_st
+        left = (split_point,)
+        right = (local // split_point,)
+        left_st = (local_st,)
+        right_st = (local_st * split_point,)
+        return (left, left_st), (right, right_st)
+    else:
+        # Sharded sub-dim (local, mesh...): split the local part
+        local = sub[0]
+        mesh = sub[1:]
+        local_st = sub_st[0] if is_tuple(sub_st) else sub_st
+        mesh_st = sub_st[1:] if is_tuple(sub_st) else ()
+        mesh_product = product(mesh)
+
+        if split_point >= mesh_product and split_point % mesh_product == 0:
+            # Mesh fits in left piece
+            left_local = split_point // mesh_product
+            right_local = local // left_local
+            left = (left_local,) + tuple(mesh)
+            right = (right_local,)
+            left_st = (local_st,) + tuple(mesh_st)
+            right_st = (local_st * left_local * mesh_product,)
+            return (left, left_st), (right, right_st)
+        else:
+            return None
+
+
+def _collect_input_dims(op):
+    """Recursively collect InputDim indices from a view_groups op."""
+    if isinstance(op, InputDim):
+        return [op.input_dim]
+    elif isinstance(op, Flatten):
+        dims = []
+        for sub in op.input_dims:
+            dims.extend(_collect_input_dims(sub))
+        return dims
+    elif isinstance(op, Split):
+        return _collect_input_dims(op.input_dim)
+    return []
+
+
+def _view_hier(hier_layout, old_global, new_global):
+    """Transform hier_layout using 3-level nesting.
+
+    Uses view_groups for merge/split grouping:
+    - InputDim: pass through
+    - Flatten: nest source dims into level-2 tuple (merge = nest)
+    - Split: peel level-2 if aligned, split sub-dims if not (split = peel)
+    """
+    h_shape = hier_layout.shape if is_tuple(hier_layout.shape) else (hier_layout.shape,)
+    h_stride = hier_layout.stride if is_tuple(hier_layout.stride) else (hier_layout.stride,)
+    old_g = old_global if is_tuple(old_global) else (old_global,)
+    new_g = new_global if is_tuple(new_global) else (new_global,)
+
+    ops = view_groups(old_g, new_g)
+
+    # Extract per-source-dim sub-dims
+    src_subdims = []
+    for s, st in zip(h_shape, h_stride):
+        src_subdims.append(_get_subdims(s, st))
+
+    # Identify split groups
+    split_groups = {}
+    for out_i, op in enumerate(ops):
+        if isinstance(op, Split):
+            key = id(op.input_dim)
+            if key not in split_groups:
+                split_groups[key] = {
+                    "input_op": op.input_dim,
+                    "group_shape": op.group_shape,
+                    "outputs": [],
+                }
+            split_groups[key]["outputs"].append((out_i, op.split_id))
+
+    out_shape = [None] * len(new_g)
+    out_stride = [None] * len(new_g)
+    processed = set()
+
+    for out_i, op in enumerate(ops):
+        if out_i in processed:
+            continue
+
+        if isinstance(op, InputDim):
+            out_shape[out_i] = h_shape[op.input_dim]
+            out_stride[out_i] = h_stride[op.input_dim]
+
+        elif isinstance(op, Flatten):
+            # Merge: concatenate sub-dim lists from all source dims
+            input_dims = _collect_input_dims(op)
+            merged = []
+            for d in input_dims:
+                merged.extend(src_subdims[d])
+
+            if len(merged) == 1:
+                out_shape[out_i] = _unwrap_subdim(merged[0][0])
+                out_stride[out_i] = merged[0][1]
+            else:
+                out_shape[out_i] = tuple(s for s, _ in merged)
+                out_stride[out_i] = tuple(st for _, st in merged)
+
+        elif isinstance(op, Split):
+            group = split_groups[id(op.input_dim)]
+            input_dims = _collect_input_dims(group["input_op"])
+            group_shape = group["group_shape"]
+            outputs = sorted(group["outputs"], key=lambda x: x[1])
+
+            # Collect all sub-dims from source
+            all_subs = []
+            for d in input_dims:
+                all_subs.extend(src_subdims[d])
+
+            # Greedily assign sub-dims to each split piece,
+            # splitting individual sub-dims at boundaries when needed
+            sub_idx = 0
+            pieces = []
+            ok = True
+
+            for target_size in group_shape:
+                acc = 1
+                piece = []
+
+                while acc < target_size and sub_idx < len(all_subs):
+                    sub_s, sub_st = all_subs[sub_idx]
+                    gs = product(sub_s)
+
+                    if acc * gs <= target_size:
+                        acc *= gs
+                        piece.append((sub_s, sub_st))
+                        sub_idx += 1
+                    else:
+                        needed = target_size // acc
+                        result = _split_subdim(sub_s, sub_st, needed)
+                        if result is None:
+                            ok = False
+                            break
+                        (left_s, left_st), right = result
+                        piece.append((left_s, left_st))
+                        acc *= product(left_s)
+                        if right is not None:
+                            all_subs[sub_idx] = right
+                        else:
+                            sub_idx += 1
+                        break
+
+                if not ok or acc != target_size:
+                    return None
+                pieces.append(piece)
+
+            for (oi, sid), piece in zip(outputs, pieces):
+                if len(piece) == 1:
+                    out_shape[oi] = _unwrap_subdim(piece[0][0])
+                    out_stride[oi] = piece[0][1]
+                else:
+                    out_shape[oi] = tuple(s for s, _ in piece)
+                    out_stride[oi] = tuple(st for _, st in piece)
+                processed.add(oi)
+
+            for oi, _ in outputs:
+                processed.add(oi)
+
+    if any(s is None for s in out_shape):
+        return None
+    if len(out_shape) == 1:
+        return Layout(out_shape[0], out_stride[0])
+    return Layout(tuple(out_shape), tuple(out_stride))
+
+
+def propagate_view(sharded, new_shape):
+    """View: reshape hier_layout using 3-level nesting."""
+    if product(sharded.global_shape) != product(new_shape):
+        return None
+    new_hier = _view_hier(sharded.hier_layout, sharded.global_shape, new_shape)
+    if new_hier is None:
+        return None
+    return ShardedLayout(new_hier, new_shape)
 
 
 # =============================================================================
@@ -44,31 +284,33 @@ def propagate_view(tiled, new_shape):
 # =============================================================================
 
 
-def _make_perm_layout(layout, dims):
-    """Build a permutation layout for the given layout and dim ordering."""
-    shape = layout.shape if is_tuple(layout.shape) else (layout.shape,)
-    perm_shape = tuple(shape[d] for d in dims)
-    perm_stride = tuple(E(d) for d in dims)
-    return Layout(perm_shape, perm_stride)
-
-
-def propagate_transpose(tiled, dim0, dim1):
-    """Transpose: composition with permutation layout using ScaledBasis."""
-    t_shape = tiled.tensor_layout.shape if is_tuple(tiled.tensor_layout.shape) else (tiled.tensor_layout.shape,)
-    ndim = len(t_shape)
+def propagate_transpose(sharded, dim0, dim1):
+    """Transpose: swap top-level modes in hier_layout."""
+    g_shape = sharded.global_shape if is_tuple(sharded.global_shape) else (sharded.global_shape,)
+    ndim = len(g_shape)
     dims = list(range(ndim))
     dims[dim0], dims[dim1] = dims[dim1], dims[dim0]
+    new_global = tuple(g_shape[d] for d in dims)
 
-    new_tensor = composition(tiled.tensor_layout, _make_perm_layout(tiled.tensor_layout, dims))
-    new_tilers = tuple(composition(t, _make_perm_layout(t, dims)) for t in tiled.mesh_tilers)
-    return TiledLayout(new_tensor, new_tilers)
+    h_shape = sharded.hier_layout.shape if is_tuple(sharded.hier_layout.shape) else (sharded.hier_layout.shape,)
+    h_stride = sharded.hier_layout.stride if is_tuple(sharded.hier_layout.stride) else (sharded.hier_layout.stride,)
+    new_h_shape = tuple(h_shape[d] for d in dims)
+    new_h_stride = tuple(h_stride[d] for d in dims)
+    new_hier = Layout(new_h_shape, new_h_stride)
+    return ShardedLayout(new_hier, new_global)
 
 
-def propagate_permute(tiled, dims):
-    """Permute: composition with permutation layout using ScaledBasis."""
-    new_tensor = composition(tiled.tensor_layout, _make_perm_layout(tiled.tensor_layout, dims))
-    new_tilers = tuple(composition(t, _make_perm_layout(t, dims)) for t in tiled.mesh_tilers)
-    return TiledLayout(new_tensor, new_tilers)
+def propagate_permute(sharded, dims):
+    """Permute: reorder top-level modes in hier_layout."""
+    g_shape = sharded.global_shape if is_tuple(sharded.global_shape) else (sharded.global_shape,)
+    new_global = tuple(g_shape[d] for d in dims)
+
+    h_shape = sharded.hier_layout.shape if is_tuple(sharded.hier_layout.shape) else (sharded.hier_layout.shape,)
+    h_stride = sharded.hier_layout.stride if is_tuple(sharded.hier_layout.stride) else (sharded.hier_layout.stride,)
+    new_h_shape = tuple(h_shape[d] for d in dims)
+    new_h_stride = tuple(h_stride[d] for d in dims)
+    new_hier = Layout(new_h_shape, new_h_stride)
+    return ShardedLayout(new_hier, new_global)
 
 
 # =============================================================================
@@ -76,22 +318,24 @@ def propagate_permute(tiled, dims):
 # =============================================================================
 
 
-def propagate_slice(tiled, dim, index):
-    """Slice: CuTe slice tensor_layout and all tilers with same coord."""
-    # Check if any tiler shards this dim
-    t_shape = tiled.tensor_layout.shape if is_tuple(tiled.tensor_layout.shape) else (tiled.tensor_layout.shape,)
+def propagate_slice(sharded, dim, index):
+    """Slice: partial evaluation on hier_layout."""
+    h_shape = sharded.hier_layout.shape if is_tuple(sharded.hier_layout.shape) else (sharded.hier_layout.shape,)
 
-    for tiler in tiled.mesh_tilers:
-        m_shape = tiler.shape if is_tuple(tiler.shape) else (tiler.shape,)
-        if len(m_shape) == len(t_shape) and m_shape[dim] < t_shape[dim]:
+    # Check if dim is sharded (hierarchical shape)
+    if dim < len(h_shape) and is_tuple(h_shape[dim]):
+        local_size = h_shape[dim][0]
+        g_shape = sharded.global_shape if is_tuple(sharded.global_shape) else (sharded.global_shape,)
+        if local_size < g_shape[dim]:
             return None  # slicing a sharded dim
 
-    ndim = len(t_shape)
+    ndim = len(h_shape)
     coord = tuple(index if k == dim else None for k in range(ndim))
 
-    new_tensor = tiled.tensor_layout(*coord)
-    new_tilers = tuple(t(*coord) for t in tiled.mesh_tilers)
-    return TiledLayout(new_tensor, new_tilers)
+    new_hier = sharded.hier_layout(*coord)
+    g_shape = sharded.global_shape if is_tuple(sharded.global_shape) else (sharded.global_shape,)
+    new_global = tuple(s for i, s in enumerate(g_shape) if i != dim)
+    return ShardedLayout(new_hier, new_global)
 
 
 # =============================================================================
@@ -99,40 +343,144 @@ def propagate_slice(tiled, dim, index):
 # =============================================================================
 
 
-def propagate_gather(tiled, dim, index_layout):
+def propagate_gather(sharded, dim, index_layout):
     """Gather with CuTe-expressible index pattern along dim."""
-    t_shape = tiled.tensor_layout.shape if is_tuple(tiled.tensor_layout.shape) else (tiled.tensor_layout.shape,)
+    h_shape = sharded.hier_layout.shape if is_tuple(sharded.hier_layout.shape) else (sharded.hier_layout.shape,)
 
-    for tiler in tiled.mesh_tilers:
-        m_shape = tiler.shape if is_tuple(tiler.shape) else (tiler.shape,)
-        if len(m_shape) == len(t_shape) and m_shape[dim] < t_shape[dim]:
+    # Check if dim is sharded
+    if dim < len(h_shape) and is_tuple(h_shape[dim]):
+        g_shape = sharded.global_shape if is_tuple(sharded.global_shape) else (sharded.global_shape,)
+        local_size = h_shape[dim][0]
+        if local_size < g_shape[dim]:
             return None
 
-    t_stride = tiled.tensor_layout.stride if is_tuple(tiled.tensor_layout.stride) else (tiled.tensor_layout.stride,)
-    dim_stride = t_stride[dim]
+    h_stride = sharded.hier_layout.stride if is_tuple(sharded.hier_layout.stride) else (sharded.hier_layout.stride,)
+    dim_stride = h_stride[dim]
 
     new_dim_stride = (
         tuple(s * dim_stride for s in index_layout.stride)
         if is_tuple(index_layout.stride) else index_layout.stride * dim_stride
     )
-    new_shape = t_shape[:dim] + (index_layout.shape,) + t_shape[dim + 1:]
-    new_stride = t_stride[:dim] + (new_dim_stride,) + t_stride[dim + 1:]
-    new_tensor = Layout(new_shape, new_stride)
+    new_shape = h_shape[:dim] + (index_layout.shape,) + h_shape[dim + 1:]
+    new_stride = h_stride[:dim] + (new_dim_stride,) + h_stride[dim + 1:]
+    new_hier = Layout(new_shape, new_stride)
 
-    # Update tilers: replace dim with gathered size (was replicate = full)
-    new_tilers = []
-    for tiler in tiled.mesh_tilers:
-        m_shape = tiler.shape if is_tuple(tiler.shape) else (tiler.shape,)
-        m_stride = tiler.stride if is_tuple(tiler.stride) else (tiler.stride,)
-        nm_shape = m_shape[:dim] + (index_layout.shape,) + m_shape[dim + 1:]
-        nm_stride = m_stride[:dim] + (new_dim_stride,) + m_stride[dim + 1:]
-        new_tilers.append(Layout(nm_shape, nm_stride))
-
-    return TiledLayout(new_tensor, tuple(new_tilers))
+    g_shape = sharded.global_shape if is_tuple(sharded.global_shape) else (sharded.global_shape,)
+    g_dim_size = index_layout.shape if not is_tuple(index_layout.shape) else product(index_layout.shape)
+    new_global = g_shape[:dim] + (g_dim_size,) + g_shape[dim + 1:]
+    return ShardedLayout(new_hier, new_global)
 
 
 # =============================================================================
-# Einsum
+# Pointwise — broadcast hierarchical shapes
+# =============================================================================
+
+
+def _hier_broadcast_shapes(a_shape, b_shape):
+    """Broadcast two hierarchical shapes.
+
+    Rules:
+    - Both flat, same size: OK
+    - One is size 1 (broadcast): other wins
+    - One sharded, other size 1: sharded wins
+    - One sharded, other flat same size: INCOMPATIBLE (different device assignment)
+    - Both sharded: must match exactly
+    """
+    result = []
+    for sa, sb in zip(a_shape, b_shape):
+        if sa == sb:
+            result.append(sa)
+        elif sa == 1:
+            result.append(sb)
+        elif sb == 1:
+            result.append(sa)
+        elif is_tuple(sa) and is_tuple(sb):
+            return None  # both sharded differently
+        elif is_tuple(sa) and not is_tuple(sb):
+            # sa sharded, sb flat — incompatible unless sb == 1 (handled above)
+            return None
+        elif not is_tuple(sa) and is_tuple(sb):
+            return None
+        else:
+            return None  # different flat sizes
+    return tuple(result)
+
+
+def propagate_pointwise(all_shardeds, output_shape):
+    """Pointwise: broadcast hierarchical shapes."""
+    if not all_shardeds:
+        return None
+
+    ref = all_shardeds[0]
+    ref_shape = ref.hier_layout.shape if is_tuple(ref.hier_layout.shape) else (ref.hier_layout.shape,)
+
+    for sharded in all_shardeds[1:]:
+        if sharded.is_replicate():
+            continue
+        if ref.is_replicate():
+            ref = sharded
+            ref_shape = ref.hier_layout.shape if is_tuple(ref.hier_layout.shape) else (ref.hier_layout.shape,)
+            continue
+
+        s_shape = sharded.hier_layout.shape if is_tuple(sharded.hier_layout.shape) else (sharded.hier_layout.shape,)
+        if len(s_shape) != len(ref_shape):
+            return None
+            return None
+
+        bc = _hier_broadcast_shapes(ref_shape, s_shape)
+        if bc is None:
+            return None
+        # Use the sharded one as ref (non-replicate wins)
+        if ref.is_replicate() and not sharded.is_replicate():
+            ref = sharded
+            ref_shape = s_shape
+
+    return ShardedLayout(ref.hier_layout, output_shape)
+
+
+# =============================================================================
+# Reduction
+# =============================================================================
+
+
+def _is_hier_dim_sharded(mode_shape):
+    """Check if a hierarchical mode shape is sharded (has mesh modes with product > 1)."""
+    if is_tuple(mode_shape) and len(mode_shape) > 1:
+        return product(mode_shape[1:]) > 1
+    return False
+
+
+def propagate_reduction(sharded, reduce_dim, keepdim, output_shape):
+    """Reduction: drop dim from hier_layout.
+
+    If reduced dim is hierarchical (sharded) → Partial.
+    """
+    h_shape = sharded.hier_layout.shape if is_tuple(sharded.hier_layout.shape) else (sharded.hier_layout.shape,)
+    is_sharded_reduce = _is_hier_dim_sharded(h_shape[reduce_dim] if reduce_dim < len(h_shape) else 1)
+
+    # Remove or collapse the reduced dim
+    ndim = len(h_shape)
+    if keepdim:
+        coord = tuple(0 if k == reduce_dim else None for k in range(ndim))
+        new_hier = sharded.hier_layout(*coord)
+        # Re-insert size-1 dim at reduce_dim position
+        nh_shape = new_hier.shape if is_tuple(new_hier.shape) else (new_hier.shape,)
+        nh_stride = new_hier.stride if is_tuple(new_hier.stride) else (new_hier.stride,)
+        ins_shape = nh_shape[:reduce_dim] + (1,) + nh_shape[reduce_dim:]
+        ins_stride = nh_stride[:reduce_dim] + (0,) + nh_stride[reduce_dim:]
+        new_hier = Layout(ins_shape, ins_stride)
+    else:
+        coord = tuple(0 if k == reduce_dim else None for k in range(ndim))
+        new_hier = sharded.hier_layout(*coord)
+
+    result = ShardedLayout(new_hier, output_shape)
+    if is_sharded_reduce:
+        result._is_partial = True
+    return result
+
+
+# =============================================================================
+# Einsum = broadcast + reduce
 # =============================================================================
 
 
@@ -163,228 +511,134 @@ def _classify_einsum_dims(inputs, output):
     return categories
 
 
-def propagate_einsum(equation, tiled_a, tiled_b, output_shape):
-    """Einsum via tensor folding (CuTe paper section 1.3).
+def propagate_einsum(equation, sharded_a, sharded_b, output_shape):
+    """Einsum = unsqueeze + broadcast + reduce.
 
-    Works directly with CuTe tiler layouts — no get_placements().
-    Each tiler mode is classified by the einsum equation labels.
-
-    For rank-matched tilers (tiler rank == equation rank): direct mode
-    classification via labels. For rank-mismatched (after view):
-    codomain_divide decomposes the tiler through the tensor shape,
-    recovering per-dim local sizes for classification.
+    Works at the original dim level via hierarchical shapes.
     """
     inputs, output_labels = _parse_einsum(equation)
     categories = _classify_einsum_dims(inputs, output_labels)
 
-    out_tilers = []
-    is_partial = False
+    a_shape = sharded_a.hier_layout.shape
+    a_shape = a_shape if is_tuple(a_shape) else (a_shape,)
+    b_shape = sharded_b.hier_layout.shape
+    b_shape = b_shape if is_tuple(b_shape) else (b_shape,)
 
-    n_mesh = max(len(tiled_a.mesh_tilers), len(tiled_b.mesh_tilers))
+    # Build the joint label space from the equation
+    all_labels = list(dict.fromkeys(list(inputs[0]) + list(inputs[1])))
 
-    for idx in range(n_mesh):
-        a_tiler = tiled_a.mesh_tilers[idx] if idx < len(tiled_a.mesh_tilers) else None
-        b_tiler = tiled_b.mesh_tilers[idx] if idx < len(tiled_b.mesh_tilers) else None
-
-        a_cat = _classify_tiler(a_tiler, tiled_a.tensor_layout, inputs[0], categories) if a_tiler else None
-        b_cat = _classify_tiler(b_tiler, tiled_b.tensor_layout, inputs[1], categories) if b_tiler else None
-
-        if a_cat is None and b_cat is None:
-            continue
-
-        if a_cat == "m":
-            if b_cat is not None:
-                return None
-            out_tilers.append(_tiler_for_output(
-                a_tiler, tiled_a.tensor_layout, inputs[0],
-                categories, output_labels, output_shape))
-        elif a_cat == "batch":
-            if b_cat != "batch":
-                return None
-            out_tilers.append(_tiler_for_output(
-                a_tiler, tiled_a.tensor_layout, inputs[0],
-                categories, output_labels, output_shape))
-        elif a_cat == "contract":
-            if b_cat != "contract":
-                return None
-            is_partial = True
-        elif a_cat is None and b_cat == "n":
-            out_tilers.append(_tiler_for_output(
-                b_tiler, tiled_b.tensor_layout, inputs[1],
-                categories, output_labels, output_shape))
+    # Expand A and B to joint space (unsqueeze missing dims as size 1)
+    a_expanded = []
+    for label in all_labels:
+        if label in inputs[0]:
+            idx = list(inputs[0]).index(label)
+            a_expanded.append(a_shape[idx] if idx < len(a_shape) else 1)
         else:
-            return None
+            a_expanded.append(1)
 
-    out = TiledLayout(Layout(output_shape), tuple(out_tilers))
-    if is_partial:
-        out._is_partial = True
-    return out
+    b_expanded = []
+    for label in all_labels:
+        if label in inputs[1]:
+            idx = list(inputs[1]).index(label)
+            b_expanded.append(b_shape[idx] if idx < len(b_shape) else 1)
+        else:
+            b_expanded.append(1)
 
-
-def _get_local_sizes(tiler, tensor_layout):
-    """Get per-dim local sizes for a tiler relative to its tensor.
-
-    For rank-matched tilers, returns tiler shape directly.
-    For rank-mismatched (after view), uses codomain_divide.
-    Returns a dict {dim_index: local_size}.
-    """
-    t_shape = tensor_layout.shape if is_tuple(tensor_layout.shape) else (tensor_layout.shape,)
-    m_shape = tiler.shape if is_tuple(tiler.shape) else (tiler.shape,)
-
-    if len(m_shape) == len(t_shape):
-        return {i: (product(m_shape[i]) if is_tuple(m_shape[i]) else m_shape[i])
-                for i in range(len(t_shape))}
-    else:
-        return codomain_divide(tiler, tuple(t_shape))
-
-
-def _classify_tiler(tiler, tensor_layout, input_labels, categories):
-    """Find the einsum category of the dim a tiler shards.
-
-    Returns 'm', 'n', 'batch', 'contract', or None (replicate).
-    """
-    t_shape = tensor_layout.shape if is_tuple(tensor_layout.shape) else (tensor_layout.shape,)
-    local_sizes = _get_local_sizes(tiler, tensor_layout)
-
-    for i in range(min(len(t_shape), len(input_labels))):
-        t_s = product(t_shape[i]) if is_tuple(t_shape[i]) else t_shape[i]
-        l_s = local_sizes.get(i, t_s)
-        if l_s < t_s:
-            return categories.get(input_labels[i])
-    return None
-
-
-def _tiler_for_output(tiler, tensor_layout, input_labels,
-                      categories, output_labels, output_shape):
-    """Build output tiler from an input tiler using equation labels.
-
-    Unified algebraic pipeline (works for both rank-matched and rank-mismatched):
-    1. Tag: compose coord layout (E(k) strides) with tiler → each mode gets
-       an E(k) stride indicating which input dim it belongs to.
-    2. Filter: drop contracted (K) modes, remap kept modes to output dim
-       indices, add new output dims (N for A, M for B) with full coverage.
-    3. Compose: composition(Layout(output_shape), selector) converts E(k)
-       strides to output element strides. Same algebraic pattern as
-       transpose (mode selection) and reduction (mode projection).
-    """
-    o_shape = output_shape if is_tuple(output_shape) else (output_shape,)
-    i_shape = tensor_layout.shape if is_tuple(tensor_layout.shape) else (tensor_layout.shape,)
-
-    # Step 1: Tag each tiler mode with its input dim via E(k)
-    coord_input = Layout(i_shape, make_basis_like(i_shape))
-    tagged = _base_composition(coord_input, tiler)
-
-    # Step 2: Group modes by output dim, drop contracted
-    t_shape = flatten(tagged.shape) if is_tuple(tagged.shape) else (tagged.shape,)
-    t_stride = flatten(tagged.stride) if is_tuple(tagged.stride) else (tagged.stride,)
-
-    out_modes = {}  # out_idx -> [(shape, stride), ...]
-    for sh, st in zip(t_shape, t_stride):
-        if isinstance(st, ScaledBasis):
-            label = input_labels[st.index]
-            if categories.get(label) == "contract":
-                continue
-            out_idx = output_labels.index(label)
-            out_modes.setdefault(out_idx, []).append(
-                (sh, ScaledBasis(st.value, out_idx)))
-
-    # Add output dims not in input (N for A, M for B)
-    for out_i, label in enumerate(output_labels):
-        if label not in input_labels:
-            out_modes.setdefault(out_i, []).append((o_shape[out_i], E(out_i)))
-
-    # Build selector in output dim order
-    sel_shape = []
-    sel_stride = []
-    for out_i in range(len(output_labels)):
-        for sh, st in out_modes.get(out_i, []):
-            sel_shape.append(sh)
-            sel_stride.append(st)
-
-    # Step 3: Compose with output layout → E(k) → integer strides
-    selector = Layout(tuple(sel_shape), tuple(sel_stride))
-    return composition(Layout(o_shape), selector)
-
-
-# =============================================================================
-# Pointwise
-# =============================================================================
-
-
-def propagate_pointwise(all_tileds, output_shape):
-    """Pointwise: all inputs must have compatible mesh_tilers.
-
-    Pointwise is identity on coordinates — same shard pattern passes through.
-    """
-    if not all_tileds:
+    # Broadcast
+    bc = _hier_broadcast_shapes(tuple(a_expanded), tuple(b_expanded))
+    if bc is None:
         return None
 
-    ref = all_tileds[0]
-    for tiled in all_tileds[1:]:
-        if tiled.mesh_tilers != ref.mesh_tilers:
-            if tiled.is_replicate():
-                continue
-            if ref.is_replicate():
-                ref = tiled
-                continue
-            return None
+    # Check compatibility for einsum rules
+    for i, label in enumerate(all_labels):
+        cat = categories.get(label)
+        a_sharded = _is_hier_dim_sharded(a_expanded[i])
+        b_sharded = _is_hier_dim_sharded(b_expanded[i])
 
-    return TiledLayout(Layout(output_shape), ref.mesh_tilers)
+        if cat == "m" and b_sharded:
+            return None  # M sharded in B
+        if cat == "n" and a_sharded:
+            return None  # N sharded in A
+        if cat == "batch":
+            if a_sharded != b_sharded:
+                return None  # batch must match
+        if cat == "contract":
+            if a_sharded != b_sharded:
+                return None  # K must match on both
 
+    # Reduce: drop contracted dims, detect Partial
+    is_partial = False
+    out_hier_shape = []
+    for i, label in enumerate(all_labels):
+        cat = categories.get(label)
+        if cat == "contract":
+            if _is_hier_dim_sharded(bc[i]):
+                is_partial = True
+            continue  # drop from output
+        if label in output_labels:
+            out_hier_shape.append(bc[i])
 
-# =============================================================================
-# Reduction
-# =============================================================================
+    # Build output hier_layout preserving 3-level structure from broadcast.
+    # The broadcast gives us the correct SHAPE; we need OUTPUT strides.
+    # Strategy: construct a replicate output layout, then use _view_hier
+    # to reshape it to match the broadcast structure. The broadcast shape
+    # encodes which dims are sharded, and _view_hier computes the strides.
+    o_shape = output_shape if is_tuple(output_shape) else (output_shape,)
 
+    # Collect output modes from broadcast (non-contracted, in output order)
+    out_modes = []
+    for i, label in enumerate(all_labels):
+        if categories.get(label) == "contract":
+            continue
+        if label in output_labels:
+            out_modes.append(bc[i])
 
-def _make_reduce_layout(layout, reduce_dim):
-    """Build projection layout that removes reduce_dim using E(k) strides."""
-    shape = layout.shape if is_tuple(layout.shape) else (layout.shape,)
-    ndim = len(shape)
-    out_shape = []
-    out_stride = []
-    for k in range(ndim):
-        if k != reduce_dim:
-            out_shape.append(shape[k])
-            out_stride.append(E(k))
-    if len(out_shape) == 1:
-        return Layout(out_shape[0], out_stride[0])
-    return Layout(tuple(out_shape), tuple(out_stride))
+    # Compute output local sizes
+    out_local = tuple(_get_local(mode) for mode in out_modes)
 
+    # Build output hier with output-space strides
+    from .placement import _clean_hier
+    out_hier = _clean_hier(logical_divide(Layout(o_shape), out_local))
 
-def propagate_reduction(tiled, reduce_dim, keepdim, output_shape):
-    """Reduction = composition with projection that removes reduce_dim.
+    # If broadcast has level-2 structure (from merged dims), overlay it.
+    # The simple logical_divide gives flat (local, mesh) per dim.
+    # The broadcast may have level-2 nesting ((sub0, sub1), ...) from view merge.
+    # For the output, we carry the input's level-2 structure.
+    # This happens when the einsum equation has fewer labels than the input's
+    # hier rank (rank-mismatch from view), but with 3-level nesting on view,
+    # the input's hier is already reshaped to match, so bc has the right structure.
 
-    If sharded dim reduced -> Partial (tiler becomes replicate after projection).
-    """
-    # Check if reduce_dim is sharded
-    placements = tiled.get_placements()
-    is_sharded_reduce = any(
-        e[0] == "shard" and e[1] == reduce_dim for e in placements
-    )
+    # Overlay broadcast shape onto output hier strides
+    oh_shape = out_hier.shape if is_tuple(out_hier.shape) else (out_hier.shape,)
+    oh_stride = out_hier.stride if is_tuple(out_hier.stride) else (out_hier.stride,)
 
-    if keepdim:
-        # keepdim: output has same rank, reduced dim size 1
-        # Use slice at index 0 on the reduced dim (size 1 = same as any index)
-        new_tensor = Layout(output_shape)
-        # Tilers: reduce_dim becomes size 1
-        new_tilers = []
-        for tiler in tiled.mesh_tilers:
-            t_shape = tiler.shape if is_tuple(tiler.shape) else (tiler.shape,)
-            new_shape = tuple(1 if k == reduce_dim else t_shape[k] for k in range(len(t_shape)))
-            t_stride = tiler.stride if is_tuple(tiler.stride) else (tiler.stride,)
-            new_tilers.append(Layout(new_shape, t_stride))
-        result = TiledLayout(new_tensor, tuple(new_tilers))
+    final_shape = list(oh_shape)
+    final_stride = list(oh_stride)
+    for idx, (mode_bc, s, st) in enumerate(zip(out_modes, oh_shape, oh_stride)):
+        if _is_level2(mode_bc):
+            # Level-2: get strides from the contributing input
+            label = output_labels[idx]
+            if label in inputs[0]:
+                src_idx = list(inputs[0]).index(label)
+                a_st = sharded_a.hier_layout.stride
+                a_st = a_st if is_tuple(a_st) else (a_st,)
+                if src_idx < len(a_st):
+                    final_shape[idx] = mode_bc
+                    final_stride[idx] = a_st[src_idx]
+            elif label in inputs[1]:
+                src_idx = list(inputs[1]).index(label)
+                b_st = sharded_b.hier_layout.stride
+                b_st = b_st if is_tuple(b_st) else (b_st,)
+                if src_idx < len(b_st):
+                    final_shape[idx] = mode_bc
+                    final_stride[idx] = b_st[src_idx]
+
+    if len(final_shape) == 1:
+        out_hier = Layout(final_shape[0], final_stride[0])
     else:
-        # Project out reduce_dim via composition with E(k) projection
-        new_tensor = composition(tiled.tensor_layout, _make_reduce_layout(tiled.tensor_layout, reduce_dim))
-        new_tilers = tuple(
-            composition(t, _make_reduce_layout(t, reduce_dim))
-            for t in tiled.mesh_tilers
-        )
-        result = TiledLayout(new_tensor, new_tilers)
+        out_hier = Layout(tuple(final_shape), tuple(final_stride))
 
-    if is_sharded_reduce:
+    result = ShardedLayout(out_hier, output_shape)
+    if is_partial:
         result._is_partial = True
-
     return result

@@ -1,11 +1,14 @@
 """
 CuTe-based sharding placement and propagation.
 
-TiledLayout = tensor_layout + mesh_tiler.
-shard_layout = logical_divide(tensor_layout, mesh_tiler) — derived, not stored.
+ShardedLayout = hierarchical CuTe Layout (local, mesh) per dim.
+Produced by logical_divide(Layout(tensor_shape), local_sizes).
 """
 
-from .placement import TiledLayout
+from .placement import ShardedLayout
+
+# Keep TiledLayout as alias during transition
+TiledLayout = ShardedLayout
 from .propagation import (
     propagate_einsum,
     propagate_gather,
