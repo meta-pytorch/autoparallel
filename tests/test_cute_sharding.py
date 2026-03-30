@@ -272,51 +272,56 @@ class TestEinsumPropagation(unittest.TestCase):
     def test_both_replicate(self):
         a = ShardedLayout.replicate((16, 8))
         b = ShardedLayout.replicate((8, 32))
-        out = propagate_einsum("mk,kn->mn", a, b, (16, 32))
+        out = propagate_einsum("mk,kn->mn", a, b)
         self.assertIsNotNone(out)
         self.assertTrue(out.is_replicate())
+        self.assertEqual(out.global_shape, (16, 32))
 
     def test_m_shard(self):
         a = ShardedLayout.shard((16, 8), shard_dim=0, mesh_dim_size=2)
         b = ShardedLayout.replicate((8, 32))
-        out = propagate_einsum("mk,kn->mn", a, b, (16, 32))
+        out = propagate_einsum("mk,kn->mn", a, b)
         self.assertIsNotNone(out)
+        self.assertEqual(out.global_shape, (16, 32))
         placements = out.get_placements()
         self.assertEqual(placements[0], ("shard", 0, 2, (0,)))
 
     def test_n_shard(self):
         a = ShardedLayout.replicate((16, 8))
         b = ShardedLayout.shard((8, 32), shard_dim=1, mesh_dim_size=2)
-        out = propagate_einsum("mk,kn->mn", a, b, (16, 32))
+        out = propagate_einsum("mk,kn->mn", a, b)
         self.assertIsNotNone(out)
+        self.assertEqual(out.global_shape, (16, 32))
         placements = out.get_placements()
         self.assertEqual(placements[0], ("shard", 1, 2, (0,)))
 
     def test_k_shard_both(self):
         a = ShardedLayout.shard((16, 8), shard_dim=1, mesh_dim_size=2)
         b = ShardedLayout.shard((8, 32), shard_dim=0, mesh_dim_size=2)
-        out = propagate_einsum("mk,kn->mn", a, b, (16, 32))
+        out = propagate_einsum("mk,kn->mn", a, b)
         self.assertIsNotNone(out)
+        self.assertEqual(out.global_shape, (16, 32))
         self.assertTrue(len(out.partial) > 0)
 
     def test_k_shard_only_a(self):
         a = ShardedLayout.shard((16, 8), shard_dim=1, mesh_dim_size=2)
         b = ShardedLayout.replicate((8, 32))
-        out = propagate_einsum("mk,kn->mn", a, b, (16, 32))
+        out = propagate_einsum("mk,kn->mn", a, b)
         self.assertIsNone(out)
 
     def test_batch_both(self):
         a = ShardedLayout.shard((4, 8, 16), shard_dim=0, mesh_dim_size=2)
         b = ShardedLayout.shard((4, 16, 32), shard_dim=0, mesh_dim_size=2)
-        out = propagate_einsum("bmk,bkn->bmn", a, b, (4, 8, 32))
+        out = propagate_einsum("bmk,bkn->bmn", a, b)
         self.assertIsNotNone(out)
+        self.assertEqual(out.global_shape, (4, 8, 32))
         placements = out.get_placements()
         self.assertEqual(placements[0], ("shard", 0, 2, (0,)))
 
     def test_batch_a_only(self):
         a = ShardedLayout.shard((4, 8, 16), shard_dim=0, mesh_dim_size=2)
         b = ShardedLayout.replicate((4, 16, 32))
-        out = propagate_einsum("bmk,bkn->bmn", a, b, (4, 8, 32))
+        out = propagate_einsum("bmk,bkn->bmn", a, b)
         self.assertIsNone(out)
 
 
@@ -325,14 +330,15 @@ class TestPointwisePropagation(unittest.TestCase):
     def test_matching(self):
         a = ShardedLayout.shard((8, 16), shard_dim=0, mesh_dim_size=2)
         b = ShardedLayout.shard((8, 16), shard_dim=0, mesh_dim_size=2)
-        out = propagate_pointwise([a, b], (8, 16))
+        out = propagate_pointwise([a, b])
         self.assertIsNotNone(out)
+        self.assertEqual(out.global_shape, (8, 16))
 
     def test_mismatch(self):
         # Same mesh dim sharding different tensor dims — incompatible
         a = ShardedLayout.shard((8, 16), shard_dim=0, mesh_dim_size=2)
         b = ShardedLayout.shard((8, 16), shard_dim=0, mesh_dim_size=4)
-        out = propagate_pointwise([a, b], (8, 16))
+        out = propagate_pointwise([a, b])
         # Different mesh sizes on same dim → broadcast rejects (both have mesh)
         self.assertIsNone(out)
 
@@ -341,19 +347,19 @@ class TestPointwisePropagation(unittest.TestCase):
         # Same mesh dim assigned to different tensor dims → incompatible
         a = ShardedLayout.shard((8, 16), shard_dim=0, mesh_dim_size=2, mesh_dim=0)
         b = ShardedLayout.shard((8, 16), shard_dim=1, mesh_dim_size=2, mesh_dim=0)
-        out = propagate_pointwise([a, b], (8, 16))
+        out = propagate_pointwise([a, b])
         self.assertIsNone(out)
 
     def test_shard_with_replicate(self):
         a = ShardedLayout.shard((8, 16), shard_dim=0, mesh_dim_size=2)
         b = ShardedLayout.replicate((8, 16))
-        out = propagate_pointwise([a, b], (8, 16))
+        out = propagate_pointwise([a, b])
         self.assertIsNotNone(out)
 
     def test_all_replicate(self):
         a = ShardedLayout.replicate((8, 16))
         b = ShardedLayout.replicate((8, 16))
-        out = propagate_pointwise([a, b], (8, 16))
+        out = propagate_pointwise([a, b])
         self.assertTrue(out.is_replicate())
 
 
@@ -361,37 +367,42 @@ class TestReductionPropagation(unittest.TestCase):
 
     def test_reduce_non_sharded(self):
         t = ShardedLayout.shard((8, 16), shard_dim=1, mesh_dim_size=2)
-        out = propagate_reduction(t, reduce_dim=0, keepdim=False, output_shape=(16,))
+        out = propagate_reduction(t, reduce_dim=0, keepdim=False)
+        self.assertEqual(out.global_shape, (16,))
         placements = out.get_placements()
         self.assertEqual(placements[0], ("shard", 0, 2, (0,)))
 
     def test_reduce_sharded(self):
         t = ShardedLayout.shard((8, 16), shard_dim=0, mesh_dim_size=2)
-        out = propagate_reduction(t, reduce_dim=0, keepdim=False, output_shape=(16,))
+        out = propagate_reduction(t, reduce_dim=0, keepdim=False)
+        self.assertEqual(out.global_shape, (16,))
         self.assertEqual(out.partial, {0: "sum"})
 
     def test_reduce_sharded_max(self):
         t = ShardedLayout.shard((8, 16), shard_dim=0, mesh_dim_size=2)
-        out = propagate_reduction(t, reduce_dim=0, keepdim=False, output_shape=(16,), reduce_op="max")
+        out = propagate_reduction(t, reduce_dim=0, keepdim=False, reduce_op="max")
+        self.assertEqual(out.global_shape, (16,))
         self.assertEqual(out.partial, {0: "max"})
 
     def test_reduce_non_sharded_no_partial(self):
         t = ShardedLayout.shard((8, 16), shard_dim=1, mesh_dim_size=2)
-        out = propagate_reduction(t, reduce_dim=0, keepdim=False, output_shape=(16,))
+        out = propagate_reduction(t, reduce_dim=0, keepdim=False)
+        self.assertEqual(out.global_shape, (16,))
         self.assertEqual(out.partial, {})
 
     def test_reduce_multi_mesh_partial(self):
         """S(0),S(1): reduce dim 1 (mesh dim 1) -> partial on mesh dim 1 only."""
         t = ShardedLayout.shard_multi((4, 8, 16), [(0, 2), (1, 4)])
-        out = propagate_reduction(t, reduce_dim=1, keepdim=False, output_shape=(4, 16))
+        out = propagate_reduction(t, reduce_dim=1, keepdim=False)
+        self.assertEqual(out.global_shape, (4, 16))
         self.assertEqual(out.partial, {1: "sum"})
-        # dim 0 shard (mesh dim 0) should still be intact
         placements = out.get_placements()
         self.assertEqual(placements[0][:3], ("shard", 0, 2))
 
     def test_reduce_replicate(self):
         t = ShardedLayout.replicate((8, 16))
-        out = propagate_reduction(t, reduce_dim=0, keepdim=False, output_shape=(16,))
+        out = propagate_reduction(t, reduce_dim=0, keepdim=False)
+        self.assertEqual(out.global_shape, (16,))
         self.assertTrue(out.is_replicate())
 
 
@@ -406,7 +417,7 @@ class TestEndToEnd(unittest.TestCase):
         self.assertIsNotNone(after_v1)
 
         weight = ShardedLayout.replicate((H, O))
-        after_mm = propagate_einsum("mk,kn->mn", after_v1, weight, (B * S, O))
+        after_mm = propagate_einsum("mk,kn->mn", after_v1, weight)
         self.assertIsNotNone(after_mm)
 
         after_v2 = propagate_view(after_mm, (B, S, O))
@@ -437,7 +448,7 @@ class TestEndToEnd(unittest.TestCase):
 
         # Step 2: mm (B*S, H) @ (H, O) -> (B*S, O)
         weight = ShardedLayout.replicate((H, O))
-        after_mm = propagate_einsum("mk,kn->mn", after_v1, weight, (B * S, O))
+        after_mm = propagate_einsum("mk,kn->mn", after_v1, weight)
         self.assertIsNotNone(after_mm)
 
         # Step 3: view (B*S, O) -> (B, S, O)

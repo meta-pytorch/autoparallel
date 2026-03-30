@@ -439,7 +439,7 @@ def propagate_broadcast(a, b):
 # =============================================================================
 
 
-def propagate_pointwise(all_shardeds, output_shape):
+def propagate_pointwise(all_shardeds):
     """Pointwise: pairwise broadcast of all inputs."""
     if not all_shardeds:
         return None
@@ -458,7 +458,7 @@ def propagate_pointwise(all_shardeds, output_shape):
 # =============================================================================
 
 
-def propagate_reduction(sharded, reduce_dim, keepdim=False, output_shape=None, reduce_op="sum"):
+def propagate_reduction(sharded, reduce_dim, keepdim=False, reduce_op="sum"):
     """Reduction: drop one or more dims from hier_layout.
 
     reduce_dim: int or list/tuple of ints.
@@ -582,7 +582,7 @@ def _unsqueeze_to_joint(sharded, input_labels, all_labels):
     return result
 
 
-def propagate_einsum(equation, sharded_a, sharded_b, output_shape):
+def propagate_einsum(equation, sharded_a, sharded_b):
     """Einsum = unsqueeze + pointwise + reduce.
 
     1. Parse equation, classify dims, check einsum-specific compatibility
@@ -618,7 +618,7 @@ def propagate_einsum(equation, sharded_a, sharded_b, output_shape):
     expanded_b = _unsqueeze_to_joint(sharded_b, inputs[1], all_labels)
 
     # Step 3: Pointwise broadcast
-    joint = propagate_pointwise([expanded_a, expanded_b], output_shape)
+    joint = propagate_pointwise([expanded_a, expanded_b])
     if joint is None:
         return None
 
@@ -627,5 +627,5 @@ def propagate_einsum(equation, sharded_a, sharded_b, output_shape):
     if not contract_dims:
         return joint
 
-    result = propagate_reduction(joint, contract_dims, keepdim=False, output_shape=output_shape)
+    result = propagate_reduction(joint, contract_dims, keepdim=False)
     return result
