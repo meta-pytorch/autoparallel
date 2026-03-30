@@ -18,6 +18,7 @@ from autoparallel.shardings.cute._pycute import (
 )
 from autoparallel.shardings.cute.placement import ShardedLayout
 from autoparallel.shardings.cute.propagation import (
+    plan_redistribute,
     propagate_einsum,
     propagate_gather,
     propagate_permute,
@@ -459,6 +460,74 @@ class TestEndToEnd(unittest.TestCase):
         placements_out = after_v2.get_placements()
         self.assertEqual(placements_out[0], ("shard", 0, dp_size, (0,)))
         self.assertEqual(placements_out[1], ("shard", 1, sp_size, (1,)))
+
+
+class TestRedistribute(unittest.TestCase):
+
+    def test_same_layout(self):
+        s = ShardedLayout.shard((8, 16), shard_dim=0, mesh_dim_size=2)
+        self.assertEqual(plan_redistribute(s, s), [])
+
+    def test_shard_to_replicate(self):
+        source = ShardedLayout.shard((8, 16), shard_dim=0, mesh_dim_size=2)
+        target = ShardedLayout.replicate((8, 16))
+        result = plan_redistribute(source, target)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0][0], "all_gather")
+        self.assertEqual(result[0][1], 0)
+
+    def test_replicate_to_shard(self):
+        source = ShardedLayout.replicate((8, 16))
+        target = ShardedLayout.shard((8, 16), shard_dim=0, mesh_dim_size=2)
+        result = plan_redistribute(source, target)
+        self.assertEqual(result, [])  # no communication needed
+
+    def test_different_dims(self):
+        source = ShardedLayout.shard((8, 16), shard_dim=0, mesh_dim_size=2)
+        target = ShardedLayout.shard((8, 16), shard_dim=1, mesh_dim_size=2)
+        result = plan_redistribute(source, target)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0][0], "all_to_all")
+        self.assertEqual(result[0][1], 0)
+
+    def test_partial_to_replicate(self):
+        source = ShardedLayout.shard((16, 8), shard_dim=1, mesh_dim_size=2)
+        # Simulate partial from K-sharded reduction
+        source = propagate_reduction(source, reduce_dim=1, keepdim=False)
+        self.assertEqual(source.partial, {0: "sum"})
+        target = ShardedLayout.replicate((16,))
+        result = plan_redistribute(source, target)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0][0], "all_reduce")
+        self.assertEqual(result[0][2]["reduce_op"], "sum")
+
+    def test_partial_to_shard(self):
+        source = ShardedLayout.shard((16, 8), shard_dim=1, mesh_dim_size=2)
+        source = propagate_reduction(source, reduce_dim=1, keepdim=False)
+        target = ShardedLayout.shard((16,), shard_dim=0, mesh_dim_size=2)
+        result = plan_redistribute(source, target)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0][0], "reduce_scatter")
+        self.assertEqual(result[0][2]["reduce_op"], "sum")
+
+    def test_multi_mesh_swap(self):
+        source = ShardedLayout.shard_multi((4, 8, 16), [(0, 2), (1, 4)])
+        target = ShardedLayout.shard_multi((4, 8, 16), [(1, 2), (0, 4)])
+        result = plan_redistribute(source, target)
+        # Both mesh dims shard different tensor dims -> all_to_all on each
+        types = {r[0] for r in result}
+        self.assertTrue("all_to_all" in types)
+
+    def test_shape_mismatch(self):
+        source = ShardedLayout.replicate((8, 16))
+        target = ShardedLayout.replicate((4, 32))
+        with self.assertRaises(ValueError):
+            plan_redistribute(source, target)
+
+    def test_replicate_to_replicate(self):
+        source = ShardedLayout.replicate((8, 16))
+        target = ShardedLayout.replicate((8, 16))
+        self.assertEqual(plan_redistribute(source, target), [])
 
 
 class TestScaledBasis(unittest.TestCase):

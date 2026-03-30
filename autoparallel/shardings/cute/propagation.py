@@ -629,3 +629,82 @@ def propagate_einsum(equation, sharded_a, sharded_b):
 
     result = propagate_reduction(joint, contract_dims, keepdim=False)
     return result
+
+
+# =============================================================================
+# Redistribute planning
+# =============================================================================
+
+
+def _reverse_mesh_map(mesh_dim_map):
+    """Build mesh_dim -> set of tensor_dims from mesh_dim_map."""
+    reverse = {}
+    for tensor_dim, mesh_dims in mesh_dim_map.items():
+        for md in mesh_dims:
+            reverse.setdefault(md, set()).add(tensor_dim)
+    return reverse
+
+
+def plan_redistribute(source, target):
+    """Compare two ShardedLayouts and plan collectives for redistribution.
+
+    Stays within CuTe layout algebra — uses mesh_dim_map for classification
+    and hier_layout for cost analysis.
+
+    Args:
+        source: current ShardedLayout
+        target: desired ShardedLayout (must have same global_shape)
+
+    Returns:
+        list of (collective_type, mesh_dim, info) tuples where:
+        - collective_type: "all_gather", "all_reduce", "reduce_scatter", "all_to_all"
+        - mesh_dim: the mesh dimension index
+        - info: dict with extra details (reduce_op for reductions, tensor_dims, etc.)
+        Empty list if no communication needed.
+    """
+    if source.global_shape != target.global_shape:
+        raise ValueError(
+            f"Cannot redistribute: shapes differ {source.global_shape} vs {target.global_shape}"
+        )
+
+    # Build reverse maps: mesh_dim -> set of tensor_dims
+    src_reverse = _reverse_mesh_map(source.mesh_dim_map)
+    tgt_reverse = _reverse_mesh_map(target.mesh_dim_map)
+
+    all_mesh_dims = set(src_reverse) | set(tgt_reverse)
+    collectives = []
+
+    # 1. Resolve partials first
+    for md, reduce_op in source.partial.items():
+        tgt_dims = tgt_reverse.get(md, set())
+        if tgt_dims:
+            # Target shards on this mesh dim -> reduce_scatter (fused)
+            collectives.append(("reduce_scatter", md, {"reduce_op": reduce_op}))
+        else:
+            # Target replicates on this mesh dim -> all_reduce
+            collectives.append(("all_reduce", md, {"reduce_op": reduce_op}))
+        # Remove from further processing — partial is resolved
+        all_mesh_dims.discard(md)
+
+    # 2. Per mesh dim classification
+    for md in sorted(all_mesh_dims):
+        src_dims = src_reverse.get(md, set())
+        tgt_dims = tgt_reverse.get(md, set())
+
+        if src_dims == tgt_dims:
+            # Same sharding — no communication
+            continue
+        elif src_dims and not tgt_dims:
+            # Source shards, target replicates -> all_gather
+            collectives.append(("all_gather", md, {"tensor_dims": src_dims}))
+        elif not src_dims and tgt_dims:
+            # Source replicates, target shards -> no communication (local reinterpret)
+            continue
+        else:
+            # Both shard but on different tensor dims -> all_to_all
+            collectives.append(("all_to_all", md, {
+                "source_dims": src_dims,
+                "target_dims": tgt_dims,
+            }))
+
+    return collectives

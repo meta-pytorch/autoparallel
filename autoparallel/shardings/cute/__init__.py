@@ -10,6 +10,7 @@ from .placement import ShardedLayout
 # Keep TiledLayout as alias during transition
 TiledLayout = ShardedLayout
 from .propagation import (
+    plan_redistribute,
     propagate_broadcast,
     propagate_einsum,
     propagate_gather,
