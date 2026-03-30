@@ -78,7 +78,7 @@ class ShardedLayout:
       - (mesh_dim_0, mesh_dim_1) for S(0),S(0) style multi-mesh
     """
 
-    def __init__(self, hier_layout, mesh_dim_map=None):
+    def __init__(self, hier_layout, mesh_dim_map=None, partial=None):
         self.hier_layout = hier_layout
         ndim = len(_ensure_tuple(hier_layout.shape))
         if mesh_dim_map is None:
@@ -86,7 +86,7 @@ class ShardedLayout:
         else:
             # Fill missing dims with empty tuples
             self.mesh_dim_map = {i: mesh_dim_map.get(i, ()) for i in range(ndim)}
-        self._is_partial = False
+        self.partial = partial or {}  # {mesh_dim_index: reduce_op_str}
 
     @staticmethod
     def replicate(tensor_shape):

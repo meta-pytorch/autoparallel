@@ -231,7 +231,7 @@ def propagate_view(sharded, new_shape):
                             new_map[oi2] = (mesh_dims[mesh_idx],)
                             mesh_idx += 1
 
-    return ShardedLayout(new_hier, new_map)
+    result = ShardedLayout(new_hier, new_map); result.partial = dict(sharded.partial); return result
 
 
 # =============================================================================
@@ -258,7 +258,7 @@ def propagate_transpose(sharded, dim0, dim1):
         else:
             new_map[src] = mesh_dim
 
-    return ShardedLayout(new_hier, new_map)
+    result = ShardedLayout(new_hier, new_map); result.partial = dict(sharded.partial); return result
 
 
 def propagate_permute(sharded, dims):
@@ -271,7 +271,7 @@ def propagate_permute(sharded, dims):
     inv_perm = {d: i for i, d in enumerate(dims)}
     new_map = {inv_perm[src]: mesh_dim for src, mesh_dim in sharded.mesh_dim_map.items()}
 
-    return ShardedLayout(new_hier, new_map)
+    result = ShardedLayout(new_hier, new_map); result.partial = dict(sharded.partial); return result
 
 
 # =============================================================================
@@ -298,7 +298,7 @@ def propagate_slice(sharded, dim, index):
         new_key = src if src < dim else src - 1
         new_map[new_key] = mesh_dim
 
-    return ShardedLayout(new_hier, new_map)
+    result = ShardedLayout(new_hier, new_map); result.partial = dict(sharded.partial); return result
 
 
 # =============================================================================
@@ -332,7 +332,9 @@ def propagate_gather(sharded, dim, index_layout):
     new_shape = h_shape[:dim] + (new_dim_shape,) + h_shape[dim + 1:]
     new_stride = h_stride[:dim] + (new_dim_stride,) + h_stride[dim + 1:]
     new_hier = Layout(new_shape, new_stride)
-    return ShardedLayout(new_hier, dict(sharded.mesh_dim_map))
+    result = ShardedLayout(new_hier, dict(sharded.mesh_dim_map))
+    result.partial = dict(sharded.partial)
+    return result
 
 
 # =============================================================================
@@ -420,7 +422,16 @@ def propagate_broadcast(a, b):
     for dim in a.mesh_dim_map:
         merged_map[dim] = a.mesh_dim_map[dim] or b.mesh_dim_map[dim]
 
-    return ShardedLayout(Layout(bc, tuple(bc_stride)), merged_map)
+    # Merge partials: compatible if same mesh dim has same reduce_op or only one has it
+    merged_partial = dict(a.partial)
+    for md, op in b.partial.items():
+        if md in merged_partial and merged_partial[md] != op:
+            return None  # conflicting reduce ops on same mesh dim
+        merged_partial[md] = op
+
+    result = ShardedLayout(Layout(bc, tuple(bc_stride)), merged_map)
+    result.partial = merged_partial
+    return result
 
 
 # =============================================================================
@@ -447,11 +458,12 @@ def propagate_pointwise(all_shardeds, output_shape):
 # =============================================================================
 
 
-def propagate_reduction(sharded, reduce_dim, keepdim=False, output_shape=None):
+def propagate_reduction(sharded, reduce_dim, keepdim=False, output_shape=None, reduce_op="sum"):
     """Reduction: drop one or more dims from hier_layout.
 
     reduce_dim: int or list/tuple of ints.
-    If any reduced dim has mesh → Partial.
+    reduce_op: reduction operation ("sum", "max", "mean", etc.).
+    If any reduced dim has mesh, those mesh dims become partial.
     """
     h_shape = sharded.hier_layout.shape
 
@@ -460,7 +472,12 @@ def propagate_reduction(sharded, reduce_dim, keepdim=False, output_shape=None):
     else:
         reduce_dims = set(reduce_dim)
 
-    is_sharded_reduce = any(_mode_has_mesh(h_shape[d]) for d in reduce_dims)
+    # Collect which mesh dims become partial
+    new_partial = dict(sharded.partial)  # inherit existing partials
+    for d in reduce_dims:
+        if _mode_has_mesh(h_shape[d]):
+            for md in sharded.mesh_dim_map[d]:
+                new_partial[md] = reduce_op
 
     ndim = len(h_shape)
     coord = tuple(0 if k in reduce_dims else None for k in range(ndim))
@@ -479,21 +496,18 @@ def propagate_reduction(sharded, reduce_dim, keepdim=False, output_shape=None):
     # Transform mesh_dim_map: remove reduced dims, shift others
     new_map = {}
     if keepdim:
-        # Dims don't shift with keepdim
-        for src, mesh_dim in sharded.mesh_dim_map.items():
+        for src, mesh_dims in sharded.mesh_dim_map.items():
             if src not in reduce_dims:
-                new_map[src] = mesh_dim
+                new_map[src] = mesh_dims
     else:
-        # Shift higher dims down
-        for src, mesh_dim in sharded.mesh_dim_map.items():
+        for src, mesh_dims in sharded.mesh_dim_map.items():
             if src in reduce_dims:
                 continue
             shift = sum(1 for rd in reduce_dims if rd < src)
-            new_map[src - shift] = mesh_dim
+            new_map[src - shift] = mesh_dims
 
     result = ShardedLayout(new_hier, new_map)
-    if is_sharded_reduce:
-        result._is_partial = True
+    result.partial = new_partial
     return result
 
 
@@ -522,7 +536,7 @@ def propagate_unsqueeze(sharded, dim):
         new_key = src if src < dim else src + 1
         new_map[new_key] = mesh_dims
 
-    return ShardedLayout(new_hier, new_map)
+    result = ShardedLayout(new_hier, new_map); result.partial = dict(sharded.partial); return result
 
 
 # =============================================================================
