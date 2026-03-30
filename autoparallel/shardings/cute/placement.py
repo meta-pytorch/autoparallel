@@ -6,12 +6,9 @@ Always uses uniform 3-level nesting:
 - Level 2: sub-dims (from merge/split history) — always a tuple of level-3 sub-dims
 - Level 3: (local, mesh...) — always a tuple with at least (local, 1) for replicate
 
-mesh_dim_map tracks which mesh dimension each tensor dim's mesh belongs to.
-
-Examples:
-  Replicate (4, 8, 16):    shape=(((4,1),), ((8,1),), ((16,1),))  map={}
-  S(0)=2 on dim 0:         shape=(((2,2),), ((8,1),), ((16,1),))  map={0: 0}
-  S(0)=2 dim 0, S(1)=4 dim 1:  map={0: 0, 1: 1}
+mesh_dim_map: always has an entry for every tensor dim.
+  - Replicate dim: empty tuple ()
+  - Sharded dim: tuple of mesh dim indices, e.g. (0,) or (0, 1) for S(0),S(0)
 """
 
 from ._pycute import Layout, is_tuple, logical_divide, product
@@ -23,10 +20,7 @@ def _ensure_tuple(x):
 
 
 def _to_uniform(layout):
-    """Convert a CuTe Layout to uniform 3-level nesting.
-
-    Every sub-dim is always (local, mesh...) with at least (local, 1) for replicate.
-    """
+    """Convert a CuTe Layout to uniform 3-level nesting."""
     shape = _ensure_tuple(layout.shape)
     stride = _ensure_tuple(layout.stride)
 
@@ -41,6 +35,11 @@ def _to_uniform(layout):
             new_stride.append(((st, 0),))
 
     return Layout(tuple(new_shape), tuple(new_stride))
+
+
+def _empty_map(ndim):
+    """Create a mesh_dim_map with empty tuples for all dims."""
+    return {i: () for i in range(ndim)}
 
 
 def _has_mesh(subdim):
@@ -73,16 +72,20 @@ class ShardedLayout:
     """
     Sharding described by a hierarchical CuTe Layout + mesh dim identity map.
 
-    Attributes:
-        hier_layout: Layout with uniform 3-level nesting.
-        mesh_dim_map: dict mapping tensor dim → mesh dim index.
-            Only contains entries for sharded dims.
-            Empty for replicate. Example: {0: 0, 1: 1} for S(0) on dim 0, S(1) on dim 1.
+    mesh_dim_map always has an entry for every tensor dim:
+      - () for replicate dims
+      - (mesh_dim_id,) for single-mesh sharded dims
+      - (mesh_dim_0, mesh_dim_1) for S(0),S(0) style multi-mesh
     """
 
     def __init__(self, hier_layout, mesh_dim_map=None):
         self.hier_layout = hier_layout
-        self.mesh_dim_map = mesh_dim_map or {}
+        ndim = len(_ensure_tuple(hier_layout.shape))
+        if mesh_dim_map is None:
+            self.mesh_dim_map = _empty_map(ndim)
+        else:
+            # Fill missing dims with empty tuples
+            self.mesh_dim_map = {i: mesh_dim_map.get(i, ()) for i in range(ndim)}
         self._is_partial = False
 
     @staticmethod
@@ -93,17 +96,14 @@ class ShardedLayout:
 
     @staticmethod
     def shard(tensor_shape, shard_dim, mesh_dim_size, mesh_dim=0):
-        """Shard tensor_shape[shard_dim] across mesh_dim_size devices.
-
-        mesh_dim: which mesh dimension this shard belongs to (default 0).
-        """
+        """Shard tensor_shape[shard_dim] across mesh_dim_size devices."""
         t_shape = _ensure_tuple(tensor_shape)
         assert t_shape[shard_dim] % mesh_dim_size == 0
 
         local = list(t_shape)
         local[shard_dim] //= mesh_dim_size
         hier = logical_divide(Layout(t_shape), tuple(local))
-        return ShardedLayout(_to_uniform(hier), {shard_dim: mesh_dim})
+        return ShardedLayout(_to_uniform(hier), {shard_dim: (mesh_dim,)})
 
     @staticmethod
     def shard_multi(tensor_shape, shard_specs):
@@ -114,20 +114,10 @@ class ShardedLayout:
         """
         t_shape = _ensure_tuple(tensor_shape)
 
-        # Build mesh_dim_map: mesh dim index = position in shard_specs
-        mesh_dim_map = {}
+        # Build mesh_dim_map: start with empty, always append
+        mesh_dim_map = _empty_map(len(t_shape))
         for mesh_dim_idx, (shard_dim, _) in enumerate(shard_specs):
-            # For S(0),S(0): multiple mesh dims on same tensor dim
-            # Store as list or use the last one (they accumulate in the hier layout)
-            if shard_dim in mesh_dim_map:
-                # Multiple mesh dims on same tensor dim — store as tuple
-                existing = mesh_dim_map[shard_dim]
-                if isinstance(existing, tuple):
-                    mesh_dim_map[shard_dim] = existing + (mesh_dim_idx,)
-                else:
-                    mesh_dim_map[shard_dim] = (existing, mesh_dim_idx)
-            else:
-                mesh_dim_map[shard_dim] = mesh_dim_idx
+            mesh_dim_map[shard_dim] = mesh_dim_map[shard_dim] + (mesh_dim_idx,)
 
         dim_counts = {}
         for dim, _ in shard_specs:
@@ -172,10 +162,7 @@ class ShardedLayout:
 
     def is_replicate(self):
         """True if no dim is sharded."""
-        shape = self.hier_layout.shape
-        if not is_tuple(shape):
-            return True
-        return not any(_mode_has_mesh(mode) for mode in shape)
+        return all(len(v) == 0 for v in self.mesh_dim_map.values())
 
     def get_placements(self):
         """Extract per-mesh-dim placements from hierarchical shape."""
@@ -188,12 +175,11 @@ class ShardedLayout:
 
         placements = []
         for i, mode in enumerate(shape):
-            if _mode_has_mesh(mode):
+            if self.mesh_dim_map[i]:
                 g = product(mode)
                 l = _local_size(mode)
                 mesh_size = g // l
-                mesh_dim = self.mesh_dim_map.get(i)
-                placements.append(("shard", i, mesh_size, mesh_dim))
+                placements.append(("shard", i, mesh_size, self.mesh_dim_map[i]))
         if not placements:
             return [("replicate", None, None)]
         return placements

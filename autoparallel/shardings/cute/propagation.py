@@ -204,40 +204,23 @@ def propagate_view(sharded, new_shape):
     for out_i, op in enumerate(ops):
         if isinstance(op, InputDim):
             src = op.input_dim
-            if src in sharded.mesh_dim_map:
-                new_map[out_i] = sharded.mesh_dim_map[src]
+            new_map[out_i] = sharded.mesh_dim_map[src]
         elif isinstance(op, Flatten):
-            # Merge: collect mesh dims from all source dims
+            # Merge: concatenate mesh dim tuples from all source dims
             src_dims = _collect_input_dims(op)
-            mesh_dims = []
+            mesh_dims = ()
             for d in src_dims:
-                if d in sharded.mesh_dim_map:
-                    entry = sharded.mesh_dim_map[d]
-                    if isinstance(entry, tuple):
-                        mesh_dims.extend(entry)
-                    else:
-                        mesh_dims.append(entry)
-            if len(mesh_dims) == 1:
-                new_map[out_i] = mesh_dims[0]
-            elif len(mesh_dims) > 1:
-                new_map[out_i] = tuple(mesh_dims)
+                mesh_dims = mesh_dims + sharded.mesh_dim_map[d]
+            new_map[out_i] = mesh_dims
         elif isinstance(op, Split):
-            # Split: distribute mesh dims to output dims
-            # The 3-level sub-dim structure determines which output dim gets which mesh
-            # For now: mesh dims go to the first output dim that has mesh in the hier shape
             src_dims = _collect_input_dims(op)
             if op.split_id == 0:
                 # Collect all mesh dims from source
-                mesh_dims = []
+                mesh_dims = ()
                 for d in src_dims:
-                    if d in sharded.mesh_dim_map:
-                        entry = sharded.mesh_dim_map[d]
-                        if isinstance(entry, tuple):
-                            mesh_dims.extend(entry)
-                        else:
-                            mesh_dims.append(entry)
+                    mesh_dims = mesh_dims + sharded.mesh_dim_map[d]
                 if mesh_dims:
-                    # Distribute: check which output dims have mesh in the hier shape
+                    # Distribute: assign mesh dims to output dims that have mesh
                     split_key = id(op.input_dim)
                     split_outputs = [(oi2, o.split_id) for oi2, o in enumerate(ops)
                                      if isinstance(o, Split) and id(o.input_dim) == split_key]
@@ -245,7 +228,7 @@ def propagate_view(sharded, new_shape):
                     mesh_idx = 0
                     for oi2, _ in split_outputs:
                         if mesh_idx < len(mesh_dims) and _mode_has_mesh(new_hier.shape[oi2]):
-                            new_map[oi2] = mesh_dims[mesh_idx]
+                            new_map[oi2] = (mesh_dims[mesh_idx],)
                             mesh_idx += 1
 
     return ShardedLayout(new_hier, new_map)
@@ -405,18 +388,22 @@ def propagate_broadcast(a, b):
         return None
 
     # Check mesh dim compatibility
-    # 1. Same tensor dim must use same mesh dim
-    for dim in set(a.mesh_dim_map) & set(b.mesh_dim_map):
-        if a.mesh_dim_map[dim] != b.mesh_dim_map[dim]:
+    # 1. Same tensor dim with both sharded must use same mesh dims
+    for dim in a.mesh_dim_map:
+        a_mds = a.mesh_dim_map[dim]
+        b_mds = b.mesh_dim_map[dim]
+        if a_mds and b_mds and a_mds != b_mds:
             return None
 
     # 2. Same mesh dim must not be on different tensor dims
-    a_mesh_to_tensor = {v: k for k, v in a.mesh_dim_map.items() if not isinstance(v, tuple)}
-    for dim, mesh_dim in b.mesh_dim_map.items():
-        if isinstance(mesh_dim, tuple):
-            continue
-        if mesh_dim in a_mesh_to_tensor and a_mesh_to_tensor[mesh_dim] != dim:
-            return None
+    a_mesh_to_tensor = {}
+    for tensor_dim, mesh_dims in a.mesh_dim_map.items():
+        for md in mesh_dims:
+            a_mesh_to_tensor[md] = tensor_dim
+    for tensor_dim, mesh_dims in b.mesh_dim_map.items():
+        for md in mesh_dims:
+            if md in a_mesh_to_tensor and a_mesh_to_tensor[md] != tensor_dim:
+                return None
 
     # Build broadcast strides
     bc_stride = []
@@ -428,11 +415,10 @@ def propagate_broadcast(a, b):
         else:
             bc_stride.append(a.hier_layout.stride[i])
 
-    # Merge mesh_dim_maps
-    merged_map = dict(a.mesh_dim_map)
-    for dim, mesh_dim in b.mesh_dim_map.items():
-        if dim not in merged_map:
-            merged_map[dim] = mesh_dim
+    # Merge mesh_dim_maps: take non-empty, both present is already checked compatible
+    merged_map = {}
+    for dim in a.mesh_dim_map:
+        merged_map[dim] = a.mesh_dim_map[dim] or b.mesh_dim_map[dim]
 
     return ShardedLayout(Layout(bc, tuple(bc_stride)), merged_map)
 
@@ -530,11 +516,11 @@ def propagate_unsqueeze(sharded, dim):
     new_stride = h_stride[:dim] + (_SIZE_1_STRIDE,) + h_stride[dim:]
     new_hier = Layout(new_shape, new_stride)
 
-    # Shift mesh_dim_map keys >= dim up by 1
-    new_map = {}
-    for src, mesh_dim in sharded.mesh_dim_map.items():
+    # Shift keys >= dim up by 1, insert empty tuple at dim
+    new_map = {dim: ()}
+    for src, mesh_dims in sharded.mesh_dim_map.items():
         new_key = src if src < dim else src + 1
-        new_map[new_key] = mesh_dim
+        new_map[new_key] = mesh_dims
 
     return ShardedLayout(new_hier, new_map)
 

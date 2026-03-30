@@ -41,12 +41,12 @@ class TestShardedLayout(unittest.TestCase):
         t = ShardedLayout.shard((4, 8, 16), shard_dim=0, mesh_dim_size=2)
         self.assertFalse(t.is_replicate())
         placements = t.get_placements()
-        self.assertEqual(placements[0], ("shard", 0, 2, 0))
+        self.assertEqual(placements[0], ("shard", 0, 2, (0,)))
 
     def test_shard_dim1(self):
         t = ShardedLayout.shard((4, 8, 16), shard_dim=1, mesh_dim_size=2)
         placements = t.get_placements()
-        self.assertEqual(placements[0], ("shard", 1, 2, 0))
+        self.assertEqual(placements[0], ("shard", 1, 2, (0,)))
 
     def test_replicate_placements(self):
         t = ShardedLayout.replicate((4, 8, 16))
@@ -75,8 +75,8 @@ class TestShardedLayout(unittest.TestCase):
         """S(0),S(1) on (4, 8, 16) with mesh (2, 4)."""
         t = ShardedLayout.shard_multi((4, 8, 16), [(0, 2), (1, 4)])
         placements = t.get_placements()
-        self.assertEqual(placements[0], ("shard", 0, 2, 0))
-        self.assertEqual(placements[1], ("shard", 1, 4, 1))
+        self.assertEqual(placements[0], ("shard", 0, 2, (0,)))
+        self.assertEqual(placements[1], ("shard", 1, 4, (1,)))
 
     def test_shard_multi_view_invariant(self):
         """S(0),S(1) through view: sharding preserved."""
@@ -132,7 +132,7 @@ class TestViewPropagation(unittest.TestCase):
         # View to (2, 16, 16): split — mesh=4 goes to dim 1 (size 16)
         v2 = propagate_view(v1, (2, 16, 16))
         self.assertIsNotNone(v2)
-        self.assertEqual(v2.get_placements()[0], ("shard", 1, 4, 0))
+        self.assertEqual(v2.get_placements()[0], ("shard", 1, 4, (0,)))
         # View back to (4, 8, 16)
         v3 = propagate_view(v2, (4, 8, 16))
         self.assertIsNotNone(v3)
@@ -174,7 +174,7 @@ class TestSlicePropagation(unittest.TestCase):
         out = propagate_slice(t, dim=1, index=3)
         self.assertIsNotNone(out)
         placements = out.get_placements()
-        self.assertEqual(placements[0], ("shard", 0, 2, 0))
+        self.assertEqual(placements[0], ("shard", 0, 2, (0,)))
 
     def test_slice_sharded_dim(self):
         t = ShardedLayout.shard((4, 8, 16), shard_dim=0, mesh_dim_size=2)
@@ -192,7 +192,7 @@ class TestSlicePropagation(unittest.TestCase):
         out = propagate_slice(t, dim=0, index=2)
         self.assertIsNotNone(out)
         placements = out.get_placements()
-        self.assertEqual(placements[0], ("shard", 0, 2, 0))  # dim 1 -> dim 0
+        self.assertEqual(placements[0], ("shard", 0, 2, (0,)))  # dim 1 -> dim 0
 
 
 class TestGatherPropagation(unittest.TestCase):
@@ -282,7 +282,7 @@ class TestEinsumPropagation(unittest.TestCase):
         out = propagate_einsum("mk,kn->mn", a, b, (16, 32))
         self.assertIsNotNone(out)
         placements = out.get_placements()
-        self.assertEqual(placements[0], ("shard", 0, 2, 0))
+        self.assertEqual(placements[0], ("shard", 0, 2, (0,)))
 
     def test_n_shard(self):
         a = ShardedLayout.replicate((16, 8))
@@ -290,7 +290,7 @@ class TestEinsumPropagation(unittest.TestCase):
         out = propagate_einsum("mk,kn->mn", a, b, (16, 32))
         self.assertIsNotNone(out)
         placements = out.get_placements()
-        self.assertEqual(placements[0], ("shard", 1, 2, 0))
+        self.assertEqual(placements[0], ("shard", 1, 2, (0,)))
 
     def test_k_shard_both(self):
         a = ShardedLayout.shard((16, 8), shard_dim=1, mesh_dim_size=2)
@@ -311,7 +311,7 @@ class TestEinsumPropagation(unittest.TestCase):
         out = propagate_einsum("bmk,bkn->bmn", a, b, (4, 8, 32))
         self.assertIsNotNone(out)
         placements = out.get_placements()
-        self.assertEqual(placements[0], ("shard", 0, 2, 0))
+        self.assertEqual(placements[0], ("shard", 0, 2, (0,)))
 
     def test_batch_a_only(self):
         a = ShardedLayout.shard((4, 8, 16), shard_dim=0, mesh_dim_size=2)
@@ -363,7 +363,7 @@ class TestReductionPropagation(unittest.TestCase):
         t = ShardedLayout.shard((8, 16), shard_dim=1, mesh_dim_size=2)
         out = propagate_reduction(t, reduce_dim=0, keepdim=False, output_shape=(16,))
         placements = out.get_placements()
-        self.assertEqual(placements[0], ("shard", 0, 2, 0))
+        self.assertEqual(placements[0], ("shard", 0, 2, (0,)))
 
     def test_reduce_sharded(self):
         t = ShardedLayout.shard((8, 16), shard_dim=0, mesh_dim_size=2)
@@ -393,7 +393,7 @@ class TestEndToEnd(unittest.TestCase):
         after_v2 = propagate_view(after_mm, (B, S, O))
         self.assertIsNotNone(after_v2)
         placements = after_v2.get_placements()
-        self.assertEqual(placements[0], ("shard", 0, 2, 0))
+        self.assertEqual(placements[0], ("shard", 0, 2, (0,)))
 
     def test_linear_3d_both_dims_sharded(self):
         """
@@ -409,8 +409,8 @@ class TestEndToEnd(unittest.TestCase):
             (B, S, H), [(0, dp_size), (1, sp_size)]
         )
         placements_in = input_t.get_placements()
-        self.assertEqual(placements_in[0], ("shard", 0, dp_size, 0))
-        self.assertEqual(placements_in[1], ("shard", 1, sp_size, 1))
+        self.assertEqual(placements_in[0], ("shard", 0, dp_size, (0,)))
+        self.assertEqual(placements_in[1], ("shard", 1, sp_size, (1,)))
 
         # Step 1: view (B, S, H) -> (B*S, H)
         after_v1 = propagate_view(input_t, (B * S, H))
@@ -427,8 +427,8 @@ class TestEndToEnd(unittest.TestCase):
 
         # Both shardings recovered!
         placements_out = after_v2.get_placements()
-        self.assertEqual(placements_out[0], ("shard", 0, dp_size, 0))
-        self.assertEqual(placements_out[1], ("shard", 1, sp_size, 1))
+        self.assertEqual(placements_out[0], ("shard", 0, dp_size, (0,)))
+        self.assertEqual(placements_out[1], ("shard", 1, sp_size, (1,)))
 
 
 class TestScaledBasis(unittest.TestCase):
