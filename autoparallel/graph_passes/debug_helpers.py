@@ -11,7 +11,6 @@ from typing import Any, Callable
 
 import torch
 from torch._functorch.aot_autograd import aot_export_joint_with_descriptors
-from torch._inductor.fx_passes.bucketing import is_wait_tensor
 from torch._inductor.fx_passes.overlap_scheduling import (
     get_group_name,
     schedule_overlap_bucketing,
@@ -113,7 +112,46 @@ def _is_communication_node(node):
     if not isinstance(node.target, torch._ops.OpOverload):
         return False
 
-    return node.target.namespace == "_c10d_functional"
+    return node.target.namespace in ("_c10d_functional", "c10d_functional")
+
+
+def _is_wait_tensor(node):
+    return _is_communication_node(node) and node.target._opname == "wait_tensor"
+
+
+def _resolve_comm_node(node, global_time):
+    """Resolve the actual collective node from a wait_tensor's argument.
+
+    With insert_overlap_deps=True or chained waits, the wait_tensor's arg may
+    be a control_deps wrapper or another wait_tensor rather than the collective
+    itself. Walk through these to find the node tracked in global_time.
+    """
+    arg = node.args[0]
+    # Walk through chained waits
+    while isinstance(arg, torch.fx.Node) and _is_wait_tensor(arg):
+        arg = arg.args[0]
+    # Walk through wrappers like control_deps
+    while (
+        isinstance(arg, torch.fx.Node)
+        and arg not in global_time
+        and arg.op == "call_function"
+        and not _is_communication_node(arg)
+    ):
+        # control_deps args can be tuples; search all Node args
+        found = False
+        for a in arg.args:
+            if isinstance(a, torch.fx.Node) and a in global_time:
+                arg = a
+                found = True
+                break
+        if not found:
+            for a in arg.args:
+                if isinstance(a, torch.fx.Node):
+                    arg = a
+                    break
+            else:
+                break
+    return arg
 
 
 def make_custom_runtime_estimation(mesh):
@@ -215,7 +253,7 @@ def apply_schedule_overlap_bucket(gm, custom_runtime_estimation):
 
 def _get_tid(node):
     if _is_communication_node(node):
-        if node.target == torch.ops._c10d_functional.wait_tensor.default:
+        if _is_wait_tensor(node):
             return 0
         return f"group-{node.args[-1]}"
     return 0
@@ -316,14 +354,12 @@ def create_execution_trace(
         event = {"ph": "X", "cat": cat, "name": node_name, "pid": 0, "tid": tid}
 
         if _is_communication_node(node):
-            if tid == 0 and is_wait_tensor(node) and node.args[0].op != "placeholder":
-                # if it's wait tensor, walk up chained waits to find the collective
-                # Now this may happen for all_to_all in dsv3 (wait(wait(all_to_all)))
-                comm_node = node.args[0]
-                while is_wait_tensor(comm_node):
-                    comm_node = comm_node.args[0]
-                comm_end_time = global_time[comm_node]
-                curr_time[tid] = max(curr_time[tid], comm_end_time)
+            if tid == 0 and _is_wait_tensor(node) and node.args[0].op != "placeholder":
+                comm_node = _resolve_comm_node(node, global_time)
+                if comm_node in global_time:
+                    comm_end_time = global_time[comm_node]
+                    curr_time[tid] = max(curr_time[tid], comm_end_time)
+
             else:
                 curr_time[tid] = max(curr_time[0], curr_time[tid])
 
