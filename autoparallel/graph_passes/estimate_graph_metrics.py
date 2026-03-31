@@ -7,10 +7,14 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
-from torch._inductor.fx_passes.bucketing import is_wait_tensor
 from torch._inductor.fx_passes.memory_estimator import MemoryTracker
 
-from autoparallel.graph_passes.debug_helpers import _get_tid, _is_communication_node
+from autoparallel.graph_passes.debug_helpers import (
+    _get_tid,
+    _is_communication_node,
+    _is_wait_tensor,
+    _resolve_comm_node,
+)
 
 
 @dataclass
@@ -50,8 +54,12 @@ def estimate_graph_metrics(
             curr_time[tid] = curr_time[0]
 
         if _is_communication_node(node):
-            if tid == 0 and is_wait_tensor(node) and node.args[0].op != "placeholder":
-                comm_end_time = global_time.pop(node.args[0])
+            if tid == 0 and _is_wait_tensor(node) and node.args[0].op != "placeholder":
+                comm_node = _resolve_comm_node(node, global_time)
+                if comm_node in global_time:
+                    comm_end_time = global_time.pop(comm_node)
+                else:
+                    comm_end_time = curr_time[0]
                 stall = max(0.0, comm_end_time - curr_time[0])
                 exposed_comm_time += stall
                 curr_time[tid] = max(curr_time[tid], comm_end_time)
