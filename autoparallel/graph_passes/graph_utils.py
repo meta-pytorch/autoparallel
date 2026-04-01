@@ -220,7 +220,7 @@ def fix_scatter_on_aliased_inputs(graph: torch.fx.Graph) -> None:
                 clone = graph.call_function(torch.ops.aten.clone.default, (input_node,))
                 clone.meta = input_node.meta.copy()
                 clone.meta["val"] = val.clone()
-                node.args = (clone, *node.args[1:])
+                node.replace_input_with(input_node, clone)
 
 
 def assert_has_no_collectives(gm: torch.fx.GraphModule):
