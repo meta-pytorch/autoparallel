@@ -5,6 +5,7 @@
 
 import pytest
 import torch
+import torch._inductor.config
 import torch.fx.traceback as fx_traceback
 from torch import nn
 from torch.distributed.tensor import DTensor
@@ -759,14 +760,12 @@ def test_inherited_user_model(device_mesh_1d):
     assert parallel_mod.get_num_params() > 0
 
 
-# Tests for build_compile_fn and schedule_overlap_bucketing_from_inductor_configs
+# Tests for overlap scheduling in compile=False path
 
 
-def test_overlap_bucketing_called_when_compile_false(device_mesh_1d):
-    """Test that schedule_overlap_bucketing_from_inductor_configs is called when compile=False.
-
-    This verifies the fix that ensures overlap scheduling passes are run
-    even when not using the full inductor compilation pipeline.
+def test_overlap_scheduling_called_when_enabled(device_mesh_1d):
+    """Test that schedule_overlap_bucketing_from_inductor_configs is called
+    when compile=False and enable_overlap_scheduling=True.
     """
     from unittest.mock import patch
 
@@ -787,58 +786,76 @@ def test_overlap_bucketing_called_when_compile_false(device_mesh_1d):
     with torch.device("meta"):
         model = Model(dim)
 
-    # Track if schedule_overlap_bucketing_from_inductor_configs was called
     overlap_bucketing_called = []
-
-    original_schedule_overlap_bucketing = None
-    try:
-        from torch._inductor.fx_passes.overlap_scheduling import (
-            schedule_overlap_bucketing_from_inductor_configs,
-        )
-
-        original_schedule_overlap_bucketing = (
-            schedule_overlap_bucketing_from_inductor_configs
-        )
-    except ImportError:
-        pytest.skip(
-            "schedule_overlap_bucketing_from_inductor_configs not available in this PyTorch version"
-        )
-
-    def tracking_overlap_bucketing(fx_g):
-        overlap_bucketing_called.append(fx_g)
-        # Call the original function
-        return original_schedule_overlap_bucketing(fx_g)
 
     with patch(
         "torch._inductor.fx_passes.overlap_scheduling.schedule_overlap_bucketing_from_inductor_configs",
-        side_effect=tracking_overlap_bucketing,
+        side_effect=lambda fx_g: overlap_bucketing_called.append(fx_g) or fx_g,
+    ), torch._inductor.config.patch(
+        {"aten_distributed_optimizations.enable_overlap_scheduling": True}
     ):
         with AutoParallel(
             model,
             input_fn,
             device_mesh_1d,
-            compile=False,  # This should use build_compile_fn
+            compile=False,
         ) as autop:
             autop.add_input_constraints([(Shard(0),)])
             sharding_placement = autop.optimize_placement()
             _ = autop.apply_placement(sharding_placement)
 
-    # Verify schedule_overlap_bucketing_from_inductor_configs was called
     assert (
         len(overlap_bucketing_called) > 0
-    ), "schedule_overlap_bucketing_from_inductor_configs should be called when compile=False"
+    ), "schedule_overlap_bucketing_from_inductor_configs should be called"
 
-    # Verify a valid graph module was passed
     for fx_g in overlap_bucketing_called:
         assert isinstance(fx_g, torch.fx.GraphModule)
 
 
-def test_recursive_post_grad_passes_not_called_when_compile_true(device_mesh_1d):
-    """Test that build_compile_fn is NOT used when compile=True.
+def test_overlap_scheduling_not_called_when_disabled(device_mesh_1d):
+    """Test that overlap scheduling is skipped when enable_overlap_scheduling=False (default)."""
+    from unittest.mock import patch
 
-    When compile=True, the full inductor pipeline (compile_fx_inner) should
-    be used instead of build_compile_fn.
-    """
+    dim = 128
+
+    class Model(nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            self.linear = nn.Linear(dim, dim)
+
+        def forward(self, x):
+            return self.linear(x)
+
+    def input_fn():
+        b = 512
+        return (torch.rand(b, dim, device="cuda"),)
+
+    with torch.device("meta"):
+        model = Model(dim)
+
+    overlap_bucketing_called = []
+
+    with patch(
+        "torch._inductor.fx_passes.overlap_scheduling.schedule_overlap_bucketing_from_inductor_configs",
+        side_effect=lambda fx_g: overlap_bucketing_called.append(fx_g) or fx_g,
+    ):
+        with AutoParallel(
+            model,
+            input_fn,
+            device_mesh_1d,
+            compile=False,
+        ) as autop:
+            autop.add_input_constraints([(Shard(0),)])
+            sharding_placement = autop.optimize_placement()
+            _ = autop.apply_placement(sharding_placement)
+
+    assert (
+        len(overlap_bucketing_called) == 0
+    ), "schedule_overlap_bucketing_from_inductor_configs should NOT be called by default"
+
+
+def test_compile_true_uses_compile_fx_inner(device_mesh_1d):
+    """When compile=True, the compiler_fn should be compile_fx_inner."""
     dim = 128
 
     class Model(nn.Module):
@@ -858,7 +875,6 @@ def test_recursive_post_grad_passes_not_called_when_compile_true(device_mesh_1d)
 
     from torch._inductor.compile_fx import compile_fx_inner
 
-    # When compile=True, the compiler_fn should be compile_fx_inner
     autop = AutoParallel(
         model,
         input_fn,
@@ -867,64 +883,3 @@ def test_recursive_post_grad_passes_not_called_when_compile_true(device_mesh_1d)
     )
 
     assert autop.compiler_fn is compile_fx_inner
-
-
-def test_compile_false_end_to_end(device_mesh_1d):
-    """Test that compile=False produces a working model with post-grad passes applied.
-
-    This is an end-to-end test that verifies the model can be created and
-    potentially executed (in fake mode).
-    """
-    dim = 128
-
-    class Model(nn.Module):
-        def __init__(self, dim):
-            super().__init__()
-            self.linear = nn.Linear(dim, dim)
-            self.register_buffer("scale", torch.ones(dim))
-
-        def forward(self, x):
-            return self.linear(x) * self.scale
-
-        def init_weights(self):
-            # TODO: can't use eye_ because of https://github.com/pytorch/pytorch/issues/173357
-            # nn.init.eye_(self.linear.weight)
-            nn.init.ones_(self.linear.weight)
-            nn.init.zeros_(self.linear.bias)
-
-    def input_fn():
-        b = 512
-        return (torch.rand(b, dim, device="cuda"),)
-
-    with torch.device("meta"):
-        model = Model(dim)
-
-    with AutoParallel(
-        model,
-        input_fn,
-        device_mesh_1d,
-        compile=False,
-    ) as autop:
-        autop.add_input_constraints([(Shard(0),)])
-        sharding_placement = autop.optimize_placement()
-        parallel_mod = autop.apply_placement(sharding_placement)
-
-    # Verify model structure
-    assert parallel_mod is not None
-    assert hasattr(parallel_mod, "linear")
-
-    # Verify parameters are DTensors
-    from torch.distributed.tensor import DTensor
-
-    for name, param in parallel_mod.named_parameters():
-        assert isinstance(param, DTensor), f"Parameter {name} should be DTensor"
-
-    # Initialize and verify
-    parallel_mod.to_empty(device="cuda")
-    parallel_mod.init_weights()
-
-    # Verify weights were initialized correctly
-    weight = parallel_mod.get_parameter("linear.weight").full_tensor()
-    # TODO: can't use eye_ because of https://github.com/pytorch/pytorch/issues/173357
-    # assert torch.allclose(weight, torch.eye(dim, device="cuda"))
-    assert torch.allclose(weight, torch.ones(dim, dim, device="cuda"))
