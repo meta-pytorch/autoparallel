@@ -33,6 +33,7 @@ from .graph_passes.graph_utils import (
     _replace_view_mm_view_with_einsum,
     assert_has_no_collectives,
     cleanup_graph,
+    fix_scatter_on_aliased_inputs,
     update_joint_with_descriptors,
 )
 from .input_validation import (
@@ -460,6 +461,7 @@ class AutoParallel:
         # )
         self.parallel_gm = parallel_gm
         update_joint_with_descriptors(self.joint_with_descriptors, parallel_gm)
+        fix_scatter_on_aliased_inputs(parallel_gm.graph)
         # Allow DCE to remove unused wait_tensor nodes in the backward graph.
         # Pushed onto self.stack so it's restored in AutoParallel.__exit__.
         self.stack.enter_context(_suppress_wait_tensor_side_effect())
