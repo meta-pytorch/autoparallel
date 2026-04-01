@@ -685,6 +685,10 @@ class NumericsLogger:
 
 
 def debug_boxed_nop_preserve_node_meta(fx_g, example_inputs, numerics_logger):
+    from torch._inductor.fx_passes.post_grad import view_to_reshape
+
+    view_to_reshape(fx_g)
+
     def run(args):
         with torch.fx.traceback.preserve_node_meta():
             interp = DebugInterpreter(fx_g)

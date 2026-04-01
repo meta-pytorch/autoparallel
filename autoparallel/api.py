@@ -76,6 +76,14 @@ def _boxed_nop_preserve_node_meta(fx_g, example_inputs):
         ):
             schedule_overlap_bucketing_from_inductor_configs(fx_g)
 
+    # Replace aten.view with aten.reshape for eager execution. Graph passes
+    # (sharding redistributions, collective bucketing) can produce non-contiguous
+    # tensors that break aten.view's contiguity requirement. Inductor handles this
+    # in compile_fx; we need to do it here for the compile=False path.
+    from torch._inductor.fx_passes.post_grad import view_to_reshape
+
+    view_to_reshape(fx_g)
+
     def run(args):
         with torch.fx.traceback.preserve_node_meta():
             return torch.fx.Interpreter(fx_g).boxed_run(args)
