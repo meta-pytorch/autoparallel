@@ -10,8 +10,11 @@ from autoparallel.shardings.cute._pycute import (
     E,
     Layout,
     ScaledBasis,
+    XorStride,
     coalesce,
     codomain_divide,
+    composition,
+    logical_divide,
     make_basis_like,
     max_common_layout,
     max_common_vector,
@@ -577,6 +580,79 @@ class TestMaxCommon(unittest.TestCase):
         self.assertEqual(mcl.size(), 4)
         for i in range(mcl.size()):
             self.assertEqual(b(mcl(i)), i)
+
+
+class TestXorStride(unittest.TestCase):
+
+    def test_mul_odd_even(self):
+        x = XorStride(7)
+        self.assertEqual(x * 1, XorStride(7))
+        self.assertEqual(x * 0, XorStride(0))
+        self.assertEqual(x * 3, XorStride(7))  # odd
+        self.assertEqual(x * 4, XorStride(0))  # even
+
+    def test_add_xor_xor(self):
+        self.assertEqual(XorStride(3) + XorStride(5), XorStride(6))
+
+    def test_add_int_xor(self):
+        self.assertEqual(4 + XorStride(3), 7)
+        self.assertEqual(XorStride(3) + 4, 7)
+
+    def test_add_resolves_to_int(self):
+        result = 0 + XorStride(5)
+        self.assertIsInstance(result, int)
+        self.assertEqual(result, 5)
+
+    def test_pure_xor_layout(self):
+        """Pure XOR strides: Layout((2,2), (XorStride(1), XorStride(3)))."""
+        L = Layout((2, 2), (XorStride(1), XorStride(3)))
+        # Equivalent to Swizzle(1,0,1) on compact (2,2): 0,1,3,2
+        self.assertEqual(L(0, 0), 0)
+        self.assertEqual(L(1, 0), 1)
+        self.assertEqual(L(0, 1), 3)
+        self.assertEqual(L(1, 1), 2)
+
+    def test_mixed_strides(self):
+        """Mixed regular + XorStride: Layout((4, 2), (1, XorStride(7)))."""
+        L = Layout((4, 2), (1, XorStride(7)))
+        for g in range(4):
+            self.assertEqual(L(g, 0), g)
+            self.assertEqual(L(g, 1), 7 - g)
+
+    def test_zigzag_n2(self):
+        """Zigzag for N=2 GPUs (4 chunks)."""
+        L = Layout((2, 2), (1, XorStride(3)))
+        self.assertEqual(L(0, 0), 0)
+        self.assertEqual(L(1, 0), 1)
+        self.assertEqual(L(0, 1), 3)
+        self.assertEqual(L(1, 1), 2)
+
+    def test_zigzag_n4(self):
+        """Zigzag for N=4 GPUs (8 chunks)."""
+        L = Layout((4, 2), (1, XorStride(7)))
+        for g in range(4):
+            self.assertEqual(L(g, 0), g)
+            self.assertEqual(L(g, 1), 7 - g)
+
+    def test_zigzag_n8(self):
+        """Zigzag for N=8 GPUs (16 chunks)."""
+        L = Layout((8, 2), (1, XorStride(15)))
+        for g in range(8):
+            self.assertEqual(L(g, 0), g)
+            self.assertEqual(L(g, 1), 15 - g)
+
+    def test_zigzag_via_logical_divide(self):
+        """Ring attention: logical_divide a sequence dim, then compose with XorStride."""
+        t = Layout((8,))
+        t_bits = logical_divide(t, (Layout((2, 2, 2)),))
+        R = Layout((2, 2, 2), (1, 2, XorStride(7)))
+        result = composition(t_bits, R)
+        for pair in range(2):
+            for b1 in range(2):
+                for b0 in range(2):
+                    gpu = b0 + 2 * b1
+                    expected = gpu if pair == 0 else 7 - gpu
+                    self.assertEqual(result(b0, b1, pair), expected)
 
 
 if __name__ == "__main__":

@@ -48,6 +48,33 @@ from .scaled_basis import (
     is_scaled_basis,
     make_basis_like,
 )
+from .xor_stride import XorStride, is_xor_stride
+
+
+# =============================================================================
+# Fix Layout.__getitem__ for tuple shape with non-tuple stride (ScaledBasis)
+# =============================================================================
+#
+# torch's Layout.__getitem__ assumes stride is always subscriptable when shape
+# is a tuple: `Layout(self.shape[i], self.stride[i])`. This fails when stride
+# is a scalar or ScaledBasis (e.g. Layout((a, b), E(0))[0] tries E(0)[0]).
+#
+# The math is well-defined: for Layout((s0, s1, ...), d), the sub-stride for
+# mode i is d * product(shape[:i]) — the standard CuTe sub-stride computation.
+# ScaledBasis supports multiplication, so this works for E(k) strides too.
+
+_original_getitem = Layout.__getitem__
+
+
+def _patched_getitem(self, i):
+    if is_tuple(self.shape) and not is_tuple(self.stride):
+        # Tuple shape, scalar/ScaledBasis stride: compute sub-stride
+        sub_stride = self.stride * product(self.shape[:i])
+        return Layout(self.shape[i], sub_stride)
+    return _original_getitem(self, i)
+
+
+Layout.__getitem__ = _patched_getitem
 
 
 def _basis_get(basis, tup):
