@@ -17,13 +17,13 @@ from torch.distributed.tensor.placement_types import Replicate, Shard
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from torch.testing._internal.distributed.fake_pg import FakeStore
 
+from autoparallel import AutoParallelPP
 from autoparallel._testing.models.dsv3 import (
     DeepSeekV3Model,
     DeepSeekV3ModelArgs,
     MoEArgs,
     dsv3_loss_fn,
 )
-from autoparallel.api import AutoParallelPP
 from autoparallel.graph_passes.graph_multiplex import multiplex_fw_bw_graph
 from autoparallel.graph_passes.graph_pp_runner import (
     GraphCallables,
@@ -89,40 +89,9 @@ def compare_tuples(tuple1: Union[list, tuple], tuple2: Union[list, tuple]) -> bo
     return True
 
 
-def _get_pp_module_and_graphs(
-    model: torch.nn.Module,
-    mesh: DeviceMesh,
-    tracing_input_fn: Callable,
-    graph_passes: list[str] = [],
-    use_loss_fn: bool = False,
-) -> tuple[torch.nn.Module, GraphCallables, GraphMeta]:
-
-    with AutoParallelPP(
-        model,
-        tracing_input_fn,
-        mesh,
-        dynamic=True,
-        compile=False,
-        reshard_after_forward=False,
-        loss_fn=dsv3_loss_fn if use_loss_fn else None,
-    ) as autop:
-        autop.add_parameter_memory_constraint(low=None, high=None)
-
-        # x_sharding = (Shard(0), Replicate())
-        x_sharding = (Shard(0), Shard(0))
-        if autop.loss_fn is not None:
-            autop.add_input_constraints([x_sharding, x_sharding])
-            autop.add_output_constraints([(Replicate(), Replicate())])
-        else:
-            autop.add_input_constraints([x_sharding])
-            autop.add_output_constraints([x_sharding])
-
-        sharding_placement = autop.optimize_placement()
-        res = autop.apply_placement_pp(
-            sharding_placement=sharding_placement,
-            graph_passes=graph_passes,
-        )
-        pp_mod = autop.parallel_model
+def _extract_graph_modules_and_meta(
+    res: dict,
+) -> tuple[GraphCallables, GraphMeta]:
     graph_callables = res["graph_callables"]
     graph_modules = GraphCallables(
         fw=graph_callables["fw"],
@@ -141,13 +110,7 @@ def _get_pp_module_and_graphs(
         num_buffers=graph_meta["num_buffers"],
         num_input_grads=graph_meta["num_input_grads"],
     )
-
-    pp_mod.to_empty(device="cuda")
-    pp_mod.init_weights(buffer_device="cuda")
-    return pp_mod, graph_modules, graph_meta
-
-
-# graph_passes=["split_dI_dW", "split_fsdp_collectives"],
+    return graph_modules, graph_meta
 
 
 def _get_fw_inputs(
@@ -286,7 +249,7 @@ def _run_graph_test(
             assert len(sharded_grads) == len(sharded_params)
 
 
-def test_graph_partition(
+def run_all_graph_pass_tests(
     model: torch.nn.Module,
     mesh: DeviceMesh,
     tracing_input_fn: Callable,
@@ -294,116 +257,64 @@ def test_graph_partition(
     fake_evaluate: bool = True,
     use_loss_fn: bool = True,
 ):
-    pp_mod, graph_modules, graph_meta = _get_pp_module_and_graphs(
-        model, mesh, tracing_input_fn, use_loss_fn=use_loss_fn
-    )
-    sharded_params, buffers, x = _get_fw_inputs(pp_mod, eval_input_fn)
-    _run_graph_test(
-        pp_mod,
-        graph_modules,
-        graph_meta,
-        sharded_params,
-        buffers,
-        x,
-        fake_evaluate,
-        use_fsdp_collectives=False,
-        use_split_dI_dW=False,
-        use_multiplexed_graph=True,
-    )
-    print("All good!")
+    test_configs: list[tuple[str, list[str], bool, bool]] = [
+        ("graph_partition", [], False, False),
+        ("split_fsdp_collectives", ["split_fsdp_collectives"], True, False),
+        ("split_dI_dW", ["split_dI_dW"], False, True),
+        ("combined", ["split_fsdp_collectives", "split_dI_dW"], True, True),
+    ]
 
-
-def test_split_fsdp_collectives(
-    model: torch.nn.Module,
-    mesh: DeviceMesh,
-    tracing_input_fn: Callable,
-    eval_input_fn: Callable,
-    fake_evaluate: bool = True,
-    use_loss_fn: bool = True,
-):
-    pp_mod, graph_modules, graph_meta = _get_pp_module_and_graphs(
+    with AutoParallelPP(
         model,
-        mesh,
         tracing_input_fn,
-        graph_passes=["split_fsdp_collectives"],
-        use_loss_fn=use_loss_fn,
-    )
-    sharded_params, buffers, x = _get_fw_inputs(pp_mod, eval_input_fn)
-    _run_graph_test(
-        pp_mod,
-        graph_modules,
-        graph_meta,
-        sharded_params,
-        buffers,
-        x,
-        fake_evaluate,
-        use_fsdp_collectives=True,
-        use_split_dI_dW=False,
-        use_multiplexed_graph=True,
-    )
-    print("All good!")
-
-
-def test_split_dI_dW(
-    model: torch.nn.Module,
-    mesh: DeviceMesh,
-    tracing_input_fn: Callable,
-    eval_input_fn: Callable,
-    fake_evaluate: bool = True,
-    use_loss_fn: bool = True,
-):
-    pp_mod, graph_modules, graph_meta = _get_pp_module_and_graphs(
-        model,
         mesh,
-        tracing_input_fn,
-        graph_passes=["split_dI_dW"],
-        use_loss_fn=use_loss_fn,
-    )
-    sharded_params, buffers, x = _get_fw_inputs(pp_mod, eval_input_fn)
-    _run_graph_test(
-        pp_mod,
-        graph_modules,
-        graph_meta,
-        sharded_params,
-        buffers,
-        x,
-        fake_evaluate,
-        use_fsdp_collectives=False,
-        use_split_dI_dW=True,
-        use_multiplexed_graph=True,
-    )
-    print("All good!")
+        dynamic=True,
+        compile=False,
+        reshard_after_forward=False,
+    ) as autop:
+        autop.add_parameter_memory_constraint(low=None, high=None)
 
+        x_sharding = (Shard(0), Shard(0))
+        if use_loss_fn:
+            autop.add_input_constraints([x_sharding, x_sharding])
+            autop.add_output_constraints([(Replicate(), Replicate())])
+        else:
+            autop.add_input_constraints([x_sharding])
+            autop.add_output_constraints([x_sharding])
 
-def test_combined(
-    model: torch.nn.Module,
-    mesh: DeviceMesh,
-    tracing_input_fn: Callable,
-    eval_input_fn: Callable,
-    fake_evaluate: bool = True,
-    use_loss_fn: bool = True,
-):
-    pp_mod, graph_modules, graph_meta = _get_pp_module_and_graphs(
-        model,
-        mesh,
-        tracing_input_fn,
-        graph_passes=["split_fsdp_collectives", "split_dI_dW"],
-        use_loss_fn=use_loss_fn,
-    )
-    sharded_params, buffers, x = _get_fw_inputs(pp_mod, eval_input_fn)
-    _run_graph_test(
-        pp_mod,
-        graph_modules,
-        graph_meta,
-        sharded_params,
-        buffers,
-        x,
-        fake_evaluate,
-        use_fsdp_collectives=True,
-        use_split_dI_dW=True,
-        use_multiplexed_graph=True,
-    )
-    print("All good!")
+        sharding_placement = autop.optimize_placement()
+
+        # Get pp_mod and inputs once (identical across all graph_passes configs)
+        res = autop.apply_placement_pp(
+            sharding_placement=sharding_placement,
+            graph_passes=[],
+        )
+        pp_mod = autop.parallel_model
+        with unset_fake_temporarily():
+            pp_mod.to_empty(device="cuda")
+            pp_mod.init_weights(buffer_device="cuda")
+            sharded_params, buffers, x = _get_fw_inputs(pp_mod, eval_input_fn)
+
+        for name, graph_passes, use_fsdp, use_split in test_configs:
+            if graph_passes:
+                res = autop.apply_placement_pp(
+                    sharding_placement=sharding_placement,
+                    graph_passes=graph_passes,
+                )
+            graph_modules, graph_meta = _extract_graph_modules_and_meta(res)
+            _run_graph_test(
+                pp_mod,
+                graph_modules,
+                graph_meta,
+                sharded_params,
+                buffers,
+                x,
+                fake_evaluate,
+                use_fsdp_collectives=use_fsdp,
+                use_split_dI_dW=use_split,
+                use_multiplexed_graph=True,
+            )
+            print(f"{name}: All good!")
 
 
 if __name__ == "__main__":
@@ -466,6 +377,22 @@ if __name__ == "__main__":
         model = DeepSeekV3Model(config).bfloat16()
         model.tok_embeddings = None  # type: ignore[assignment]
 
+    if use_loss_fn:
+
+        class ModelWithLoss(torch.nn.Module):
+            def __init__(self, model):
+                super().__init__()
+                self.model = model
+
+            def forward(self, h, labels):
+                output = self.model(h)
+                return dsv3_loss_fn(output, labels)
+
+            def init_weights(self, *args, **kwargs):
+                return self.model.init_weights(*args, **kwargs)
+
+        model = ModelWithLoss(model)
+
     def make_input_fn(sharded: bool = False, with_target: bool = False):
         """Create input generator. `sharded` uses mesh-adjusted batch size."""
 
@@ -493,11 +420,6 @@ if __name__ == "__main__":
     input_fn = make_input_fn(sharded=False, with_target=use_loss_fn)
     eval_fn = make_input_fn(sharded=True, with_target=use_loss_fn)
 
-    test_graph_partition(model, mesh, input_fn, eval_fn, fake_evaluate, use_loss_fn)
-    test_split_fsdp_collectives(
-        model, mesh, input_fn, eval_fn, fake_evaluate, use_loss_fn
-    )
-    test_split_dI_dW(model, mesh, input_fn, eval_fn, fake_evaluate, use_loss_fn)
-    test_combined(model, mesh, input_fn, eval_fn, fake_evaluate, use_loss_fn)
+    run_all_graph_pass_tests(model, mesh, input_fn, eval_fn, fake_evaluate, use_loss_fn)
     if torch.distributed.is_initialized():
         torch.distributed.destroy_process_group()

@@ -8,9 +8,7 @@ from typing import Any, Optional
 import torch
 import torch.distributed.distributed_c10d as c10d
 from torch.distributed._tensor.experimental import local_map as _local_map
-
-# Import GroupName for type checking
-GroupName = c10d.GroupName
+from torch.distributed.distributed_c10d import GroupName
 
 _local_map_device_mesh = None
 

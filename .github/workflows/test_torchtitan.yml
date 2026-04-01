@@ -47,15 +47,15 @@ jobs:
         pip install --quiet -r requirements.txt
 
         # Run TorchTitan training with AutoParallel
-        NGPU=4 CONFIG_FILE="./torchtitan/models/llama3/train_configs/debug_model.toml" ./run_train.sh \
-          --model.name autoparallel.llama3 \
-          --parallelism.tensor_parallel_degree 4 \
-          --training.dataset c4 \
-          --compile.enable \
-          --job.custom_config_module=torchtitan.experiments.autoparallel.job_config
+        NGPU=4 ./run_train.sh \
+          --module autoparallel.llama3 \
+          --config autoparallel_llama3_debugmodel \
+          --parallelism.tensor_parallel_degree 4
 
-        NGPU=4 CONFIG_FILE=./torchtitan/models/deepseek_v3/train_configs/debug_model.toml ./run_train.sh \
-          --model.name autoparallel.local_map_deepseek_v3 \
-          --parallelism.data_parallel_shard_degree 4 \
-          --parallelism.expert_parallel_degree 4 \
-          --job.custom_config_module=torchtitan.experiments.autoparallel.job_config
+        # TODO: Re-enable deepseek_v3 test once torchtitan experiment is fixed
+        # (deepseek_v3 experiment is also disabled in torchtitan's own CI)
+        # NGPU=4 ./run_train.sh \
+        #   --module autoparallel.deepseek_v3 \
+        #   --config autoparallel_deepseek_v3_debugmodel \
+        #   --parallelism.data_parallel_shard_degree 4 \
+        #   --parallelism.expert_parallel_degree 4

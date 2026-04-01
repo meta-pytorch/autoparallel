@@ -11,55 +11,10 @@ import torch.nn.functional as F
 from torch import nn
 from torch._functorch._aot_autograd.fx_utils import get_param_nodes
 from torch.distributed._tensor.experimental import local_map
+from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
-from torch.testing._internal.distributed.fake_pg import FakeStore
 
-from autoparallel.api import AutoParallel
-
-
-@pytest.fixture(scope="module", autouse=True)
-def init_pg():
-    world_size = 256
-    fake_store = FakeStore()
-    if torch.distributed.is_initialized():
-        return
-    torch.distributed.init_process_group(
-        "fake", store=fake_store, rank=0, world_size=world_size
-    )
-
-
-@pytest.fixture(scope="module")
-def device_mesh_1d():
-    world_size = torch.distributed.get_world_size()
-    mesh = torch.distributed.device_mesh.init_device_mesh(
-        "cuda", (world_size,), mesh_dim_names=("dp",)
-    )
-    return mesh
-
-
-@pytest.fixture(scope="module")
-def device_mesh_2d():
-    world_size = torch.distributed.get_world_size()
-    mesh = torch.distributed.device_mesh.init_device_mesh(
-        "cuda",
-        (world_size // 8, 8),
-        mesh_dim_names=(
-            "dp",
-            "tp",
-        ),
-    )
-    return mesh
-
-
-@pytest.fixture(scope="module")
-def device_mesh_local_map():
-    world_size = torch.distributed.get_world_size()
-    mesh = torch.distributed.device_mesh.init_device_mesh(
-        "cuda",
-        (world_size // 32, 8, 4),  # dp=8, tp=8, cp=4
-        mesh_dim_names=("dp", "tp", "cp"),
-    )
-    return mesh
+from autoparallel.api import AutoParallel, auto_parallel
 
 
 class FFN(nn.Module):
@@ -152,6 +107,11 @@ def test_optimization_finds_fsdp_and_ddp_1d(device_mesh_1d, high_mem, model_type
         model = model_fn()
 
     with AutoParallel(model, input_fn, device_mesh_1d) as autop:
+        placement = (Shard(0),)
+        n_inputs = 2 if model_type == "ffn_with_multiple_input_output" else 1
+        n_outputs = 3 if model_type == "ffn_with_multiple_input_output" else 1
+        autop.add_input_constraints([placement] * n_inputs)
+        autop.add_output_constraints([placement] * n_outputs)
         autop.add_parameter_memory_constraint(low=low_mem, high=high_mem)
 
         sharding_placement = autop.optimize_placement()
@@ -281,6 +241,11 @@ def test_optimization_finds_fsdp_tp_2d(
         model = model_fn()
 
     with AutoParallel(model, input_fn, device_mesh_2d) as autop:
+        placement = (Shard(0), Replicate())
+        n_inputs = 2 if model_type == "ffn_with_multiple_input_output" else 1
+        n_outputs = 3 if model_type == "ffn_with_multiple_input_output" else 1
+        autop.add_input_constraints([placement] * n_inputs)
+        autop.add_output_constraints([placement] * n_outputs)
         autop.add_parameter_memory_constraint(low=low_mem, high=high_mem)
 
         sharding_placement = autop.optimize_placement()
@@ -335,24 +300,23 @@ def test_in_graph_tensor_ctor(device_mesh_1d):
                 self.linear.bias.fill_(98.6)
             self.buf = torch.arange(dim)
 
-    def input_fn():
-        b = 512
-        inputs = (torch.rand(b, dim, device="cuda"),)
-        return inputs
-
     with torch.device("meta"):
         model = Model(dim)
-    with AutoParallel(
-        model,
-        input_fn,
-        device_mesh_1d,
-    ) as autop:
-        x_sharding = (Shard(0),)
-        autop.add_input_constraints([x_sharding])
-        sharding_placement = autop.optimize_placement()
 
-        # AutoParallel produces a module with meta-DTensor parameters that need to be initialized
-        parallel_mod = autop.apply_placement(sharding_placement)
+    batch_size = 512
+    local_batch_size = batch_size // device_mesh_1d.size()
+    x = DTensor.from_local(
+        torch.rand(local_batch_size, dim, device="cuda"),
+        device_mesh_1d,
+        [Shard(0)],
+    )
+    parallel_mod = auto_parallel(
+        model,
+        device_mesh_1d,
+        sample_inputs=(x,),
+        out_shardings=(Shard(0),),
+        compile=False,
+    )
     parallel_mod.to_empty(device="cuda")
     parallel_mod.init_weights()
     assert torch.equal(
@@ -383,11 +347,11 @@ class LocalMapTransformerBlock(nn.Module):
 
     def forward(self, x):
         @local_map(
-            out_placements=((Shard(0), Shard(1), Shard(2)),),
+            out_placements=((Shard(0), Shard(2)),),
             in_placements=(
-                (Shard(0), Shard(1), Shard(2)),  # query
-                (Shard(0), Shard(1), Replicate()),  # key
-                (Shard(0), Shard(1), Replicate()),  # value
+                (Shard(0), Shard(2)),  # query
+                (Shard(0), Replicate()),  # key
+                (Shard(0), Replicate()),  # value
             ),
             redistribute_inputs=True,
             in_grad_placements=None,
@@ -424,16 +388,15 @@ class LocalMapTransformerBlock(nn.Module):
 
 @patch("torch.cuda.device_count", lambda: 8)
 @patch("torch.cuda.get_device_name", lambda device: "H100")
-def test_local_map_placement_respected(device_mesh_local_map, device="cuda"):
-    # Setup per example_local_map.py
-    bs = 8 * device_mesh_local_map.shape[0]
+def test_local_map_placement_respected(device_mesh_2d, device="cuda"):
+    bs = 8 * device_mesh_2d.shape[0]
     dim1 = 6144
     dim2 = dim1 * 4
     nheads = 48
     seq_len = 256
 
     def model_fn():
-        return LocalMapTransformerBlock(nheads, dim1, dim2, device_mesh_local_map)
+        return LocalMapTransformerBlock(nheads, dim1, dim2, device_mesh_2d)
 
     def input_fn():
         return torch.randn(bs, seq_len, dim1, device=device, requires_grad=True)
@@ -441,10 +404,10 @@ def test_local_map_placement_respected(device_mesh_local_map, device="cuda"):
     with torch.device("meta"):
         model = model_fn()
 
-    with AutoParallel(model, input_fn, device_mesh_local_map) as autop:
+    with AutoParallel(model, input_fn, device_mesh_2d) as autop:
         autop.add_parameter_memory_constraint(low=None, high=None)
 
-        x_sharding = (Shard(0), Replicate(), Shard(1))
+        x_sharding = (Shard(0), Shard(1))
         autop.add_input_constraints([x_sharding])
         autop.add_output_constraints([x_sharding])
 
@@ -465,32 +428,28 @@ def test_local_map_placement_respected(device_mesh_local_map, device="cuda"):
     # Check fw inputs
     assert len(fw_spec.input_specs) == 3  # query, key, value
     q_spec, k_spec, v_spec = fw_spec.input_specs
-    assert q_spec.placements == (Shard(dim=0), Shard(dim=1), Shard(dim=2))
-    assert k_spec.placements == v_spec.placements == (Shard(0), Shard(1), Replicate())
+    assert q_spec.placements == (Shard(dim=0), Shard(dim=2))
+    assert k_spec.placements == v_spec.placements == (Shard(0), Replicate())
 
     # Check fw outputs incl saved activations
     assert len(fw_spec.output_specs) == 8
     fw_out_spec, *act_specs = fw_spec.output_specs
-    assert fw_out_spec.placements == (Shard(0), Shard(1), Shard(2))
+    assert fw_out_spec.placements == (Shard(0), Shard(2))
     for act_spec in act_specs:
-        assert act_spec.placements == (Replicate(), Replicate(), Replicate())
+        assert act_spec.placements == (Replicate(), Replicate())
 
     # Check bw inputs incl saved activations
     assert len(bw_spec.input_specs) == 8
     *act_specs, bw_in_spec = bw_spec.input_specs
-    assert bw_in_spec.placements == (Shard(0), Shard(1), Shard(2))
+    assert bw_in_spec.placements == (Shard(0), Shard(2))
     for act_spec in act_specs:
-        assert act_spec.placements == (Replicate(), Replicate(), Replicate())
+        assert act_spec.placements == (Replicate(), Replicate())
 
     # Check bw outputs
     assert len(bw_spec.output_specs) == 3  # query, key, value
     grad_q_spec, grad_k_spec, grad_v_spec = bw_spec.output_specs
-    assert grad_q_spec.placements == (Shard(dim=0), Shard(dim=1), Shard(dim=2))
-    assert (
-        grad_k_spec.placements
-        == grad_v_spec.placements
-        == (Shard(0), Shard(1), Replicate())
-    )
+    assert grad_q_spec.placements == (Shard(dim=0), Shard(dim=2))
+    assert grad_k_spec.placements == grad_v_spec.placements == (Shard(0), Replicate())
 
 
 @patch("torch.cuda.device_count", lambda: 8)
@@ -544,6 +503,48 @@ def test_get_attr_nodes(device_mesh_1d):
 
 @patch("torch.cuda.device_count", lambda: 8)
 @patch("torch.cuda.get_device_name", lambda device: "H100")
+def test_parameter_memory_constraint_indivisible_param(device_mesh_2d):
+    """Parameter whose size is >= world_size but not divisible by it
+    should not make the memory constraint infeasible."""
+    # world_size = 32*8 = 256. A bias of size 280 is >= 256 but 280 % 256 != 0,
+    # so it can't be fully sharded across all devices.
+    dim1 = 1024
+    dim2 = 280
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear1 = nn.Linear(dim1, dim2, bias=True)
+            self.linear2 = nn.Linear(dim2, dim1, bias=True)
+
+        def forward(self, x):
+            return self.linear2(F.relu(self.linear1(x)))
+
+    bs = 8 * device_mesh_2d.shape[0]
+
+    def input_fn():
+        return torch.rand(bs, dim1, device="cuda", requires_grad=True)
+
+    with torch.device("meta"):
+        model = Model()
+
+    with AutoParallel(model, input_fn, device_mesh_2d) as autop:
+        x_sharding = (Shard(0), Replicate())
+        autop.add_input_constraints([x_sharding])
+        autop.add_output_constraints([x_sharding])
+        autop.add_parameter_memory_constraint(low=None, high=None)
+
+        sharding_placement = autop.optimize_placement()
+
+    # Should solve without error. Verify params got some placement.
+    param_nodes = get_param_nodes(autop.gm.graph)
+    assert len(param_nodes) > 0
+    for node in param_nodes:
+        assert node in sharding_placement
+
+
+@patch("torch.cuda.device_count", lambda: 8)
+@patch("torch.cuda.get_device_name", lambda device: "H100")
 def test_world_size_larger_than_parameter(device_mesh_1d):
     # make a parameter which is smaller than the world size
     dim: int = device_mesh_1d.shape[0] // 2
@@ -573,6 +574,7 @@ def test_world_size_larger_than_parameter(device_mesh_1d):
     ) as autop:
         x_sharding = (Shard(0),)
         autop.add_input_constraints([x_sharding])
+        autop.add_output_constraints([x_sharding])
         autop.add_parameter_memory_constraint()
         sharding_placement = autop.optimize_placement()
 

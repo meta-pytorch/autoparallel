@@ -18,7 +18,7 @@ import torch.fx
 
 def format_sharding_log(
     graph: torch.fx.Graph,
-    opt: dict[torch.fx.Node, list[dict[str, Any]]],
+    opt: dict[torch.fx.Node, list[Any]],
     colored: bool = False,
     verbose: bool = False,
     violated_constraints_log: str = "",
@@ -33,12 +33,8 @@ def format_sharding_log(
     Args:
         graph: The FX graph to format.
         opt: Dictionary mapping nodes to their optimization results. Each value
-            is a list of dicts containing:
-            - "full_strat": The strategy object
-            - "comm_cost": Communication cost
-            - "compute_cost": Computation cost
-            - "sharding_transition_cost": Cost of sharding transitions
-            - "cost": Total cost
+            is a list of DecisionVar objects (or any object with strategy,
+            comm_cost, compute_cost, sharding_transition_cost, and cost attrs).
         colored: Whether to use ANSI color codes in the output.
         verbose: Whether to include verbose information (shapes, stack traces).
         violated_constraints_log: Optional string with violated constraints info.
@@ -124,16 +120,13 @@ def format_sharding_log(
 
         # Accumulate costs
         for entry in d:
-            total_cost += entry.get("cost", 0.0)
-            total_comm_cost += entry.get("comm_cost", 0.0)
-            total_compute_cost += entry.get("compute_cost", 0.0)
-            total_transition_cost += entry.get("sharding_transition_cost", 0.0)
+            total_cost += entry.cost
+            total_comm_cost += entry.comm_cost
+            total_compute_cost += entry.compute_cost
+            total_transition_cost += entry.sharding_transition_cost
 
-        strat = str(d[0]["full_strat"])
-        costs = [
-            (x["comm_cost"], x["compute_cost"], x["sharding_transition_cost"])
-            for x in d
-        ]
+        strat = str(d[0].strategy)
+        costs = [(x.comm_cost, x.compute_cost, x.sharding_transition_cost) for x in d]
         shard_order = node.meta.get("shard_order")
         if shard_order:
             annotation = f"  {plc_txt}{attr_color(strat)} {shard_order=} {cost_txt}{attr_color(str(costs))}"
