@@ -10,6 +10,7 @@ Builds a JSON-serializable dict directly from the FX graph, DeviceMesh,
 and optimizer solution — no text parsing required.
 """
 
+import operator
 import re
 from typing import Any
 
@@ -169,11 +170,17 @@ def export_sharding_json(
         node_comm = 0.0
         for argi, pred in enumerate(input_nodes):
             pred_strategy = solution.get(pred)
-            src_placement = (
-                _get_output_spec_placement(pred_strategy.output_specs)
-                if pred_strategy is not None
-                else None
-            )
+            if pred_strategy is not None:
+                src_specs = pred_strategy.output_specs
+                # For getitem nodes, resolve the tuple to the specific element
+                if node.target is operator.getitem and isinstance(
+                    src_specs, (list, tuple)
+                ):
+                    idx = node.args[1]
+                    src_specs = src_specs[idx]
+                src_placement = _get_output_spec_placement(src_specs)
+            else:
+                src_placement = None
             # Find the DecisionVar for this argument
             dv = dvs[argi] if argi < len(dvs) else None
             dst_placement = _pretty_print(dv.input_spec) if dv is not None else None

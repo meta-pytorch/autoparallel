@@ -634,7 +634,7 @@ tr.arch-bwd {{ opacity: 0.6; }}
         # Collective badges
         coll_html = ""
         for _, ctype, cfrom, cto, ccost in n["_collectives"]:
-            coll_html += f'<span class="collective-badge">{_esc(ctype)} ({ccost:.0f})</span> '
+            coll_html += f'<span class="collective-badge">{_esc(ctype)}: {_esc(cfrom)}&rarr;{_esc(cto)} ({ccost:.0f})</span> '
 
         is_linked = "cluster_root" in n
         row_class = "node-row linked-row" if is_linked else "node-row"
