@@ -244,7 +244,7 @@ def shard_node_given_placements(node, sharding_placement, *, meta: bool):
             tensor, FakeTensor
         ), f"only FakeTensor params supported for now, got {type(tensor)}"
         with unset_fake_temporarily():
-            tensor = torch.randn(tensor.shape, dtype=tensor.dtype, device="meta")
+            tensor = torch.empty(tensor.shape, dtype=tensor.dtype, device="meta")
             sharded_tensor = DTensor.from_local(
                 tensor, mesh, curr_placement
             ).redistribute(mesh, tgt_spec.placements)
