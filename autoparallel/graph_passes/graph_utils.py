@@ -191,6 +191,38 @@ def is_collective(node: torch.fx.Node) -> bool:
     )
 
 
+_SCATTER_OPS = {
+    torch.ops.aten.diagonal_scatter.default,
+    torch.ops.aten.select_scatter.default,
+    torch.ops.aten.slice_scatter.default,
+    torch.ops.aten.as_strided_scatter.default,
+}
+
+
+def fix_scatter_on_aliased_inputs(graph: torch.fx.Graph) -> None:
+    """Insert clone before scatter ops whose input has zero strides (aliased from expand).
+
+    Inductor's reinplace_inplaceable_ops decomposes scatter ops into copy_,
+    which fails on aliased tensors. Cloning materializes the aliased view
+    into a contiguous tensor.
+    """
+    for node in graph.nodes:
+        if node.op != "call_function" or node.target not in _SCATTER_OPS:
+            continue
+        input_node = node.args[0]
+        if not isinstance(input_node, torch.fx.Node):
+            continue
+        val = input_node.meta.get("val")
+        if val is None or not isinstance(val, torch.Tensor):
+            continue
+        if any(s == 0 for s in val.stride()):
+            with graph.inserting_before(node):
+                clone = graph.call_function(torch.ops.aten.clone.default, (input_node,))
+                clone.meta = input_node.meta.copy()
+                clone.meta["val"] = val.clone()
+                node.replace_input_with(input_node, clone)
+
+
 def assert_has_no_collectives(gm: torch.fx.GraphModule):
     for node in gm.graph.nodes:
         if is_collective(node):
