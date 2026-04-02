@@ -7,10 +7,8 @@
 HTML visualizer that consumes the JSON dict from export_json.py.
 
 Supports cluster collapsing for multi-layer models, phase filtering,
-and redistribution highlighting.
+redistribution highlighting, and hierarchical module tree view.
 """
-
-import math
 
 
 def _classify_placement(placement):
@@ -68,6 +66,8 @@ _STRATEGY_BGS = {
     "unknown": "#F9FAFB",
 }
 
+_MODULE_PATH_PREFIXES = ("L['self'].", "_export_root.")
+
 
 def _infer_collective(src, dst):
     if not src or not dst or src == dst:
@@ -97,6 +97,226 @@ def _esc(s):
         .replace(">", "&gt;")
         .replace('"', "&quot;")
     )
+
+
+def _strip_module_prefix(path):
+    for prefix in _MODULE_PATH_PREFIXES:
+        if path.startswith(prefix):
+            path = path[len(prefix):]
+    return path
+
+
+class _ModuleTreeNode:
+    __slots__ = ("name", "children", "own_nodes", "_all_nodes_cache")
+
+    def __init__(self, name):
+        self.name = name
+        self.children = {}
+        self.own_nodes = []
+        self._all_nodes_cache = None
+
+    def all_nodes(self):
+        if self._all_nodes_cache is not None:
+            return self._all_nodes_cache
+        result = list(self.own_nodes)
+        for child in self.children.values():
+            result.extend(child.all_nodes())
+        self._all_nodes_cache = result
+        return result
+
+    def invalidate_cache(self):
+        self._all_nodes_cache = None
+        for child in self.children.values():
+            child.invalidate_cache()
+
+
+def _build_module_tree(display_nodes, min_group_size=3):
+    """Build a hierarchical tree from module_path, then prune it."""
+    root = _ModuleTreeNode("")
+
+    for n in display_nodes:
+        raw_path = n.get("module_path", "")
+        if not raw_path:
+            if n.get("op") == "placeholder":
+                key = "inputs"
+            else:
+                key = "other"
+            root.children.setdefault(key, _ModuleTreeNode(key)).own_nodes.append(n)
+            continue
+
+        path = _strip_module_prefix(raw_path)
+        parts = path.split(".")
+        node = root
+        for part in parts[:-1]:
+            if part not in node.children:
+                node.children[part] = _ModuleTreeNode(part)
+            node = node.children[part]
+        leaf_name = parts[-1]
+        if leaf_name not in node.children:
+            node.children[leaf_name] = _ModuleTreeNode(leaf_name)
+        node.children[leaf_name].own_nodes.append(n)
+
+    _prune_tree(root, min_group_size)
+    return root
+
+
+def _prune_tree(node, min_group_size):
+    """Prune the tree bottom-up with two rules:
+    1. Collapse single-child chains (when parent has no own_nodes)
+    2. Promote small groups (absorb children with fewer than N total nodes)
+    """
+    # Recurse first (bottom-up)
+    for child in list(node.children.values()):
+        _prune_tree(child, min_group_size)
+
+    # Rule 1: single-child collapse
+    while len(node.children) == 1 and not node.own_nodes:
+        only_key = next(iter(node.children))
+        only_child = node.children[only_key]
+        if node.name:
+            node.name = f"{node.name}.{only_child.name}"
+        else:
+            node.name = only_child.name
+        node.own_nodes = only_child.own_nodes
+        node.children = only_child.children
+        node.invalidate_cache()
+
+    # Rule 2: promote small groups
+    for key in list(node.children):
+        child = node.children[key]
+        if len(child.all_nodes()) < min_group_size:
+            node.own_nodes.extend(child.all_nodes())
+            del node.children[key]
+            node.invalidate_cache()
+
+
+def _tree_node_stats(tree_node):
+    """Compute summary stats for a tree node (all descendants)."""
+    all_n = tree_node.all_nodes()
+    comm = sum(n["_total_comm"] for n in all_n)
+    compute = sum(n.get("compute_cost", 0) for n in all_n)
+    strategies = [n["_strategy"] for n in all_n]
+    dominant = max(set(strategies), key=strategies.count) if strategies else "unknown"
+    all_colls = []
+    for n in all_n:
+        all_colls.extend(n["_collectives"])
+    return {
+        "num_nodes": len(all_n),
+        "comm_cost": comm,
+        "compute_cost": compute,
+        "dominant": dominant,
+        "color": _STRATEGY_COLORS.get(dominant, "#D1D5DB"),
+        "bg": _STRATEGY_BGS.get(dominant, "#F9FAFB"),
+        "collectives": all_colls,
+    }
+
+
+def _render_tree_block(tree_node, cluster_counts, depth=0):
+    """Recursively render a module tree node as nested HTML blocks."""
+    stats = _tree_node_stats(tree_node)
+    if stats["num_nodes"] == 0:
+        return ""
+
+    indent = depth * 20
+    coll_html = ""
+    for cname, ctype, cfrom, cto, ccost in stats["collectives"][:5]:
+        coll_html += f'<span class="collective-badge">{_esc(ctype)}: {_esc(cfrom)}&rarr;{_esc(cto)} ({ccost:.0f})</span> '
+    if len(stats["collectives"]) > 5:
+        coll_html += f'<span class="collective-badge">+{len(stats["collectives"]) - 5} more</span>'
+
+    # Detail table for own_nodes (nodes at this exact level)
+    detail_rows = ""
+    for n in tree_node.own_nodes:
+        comm = n["_total_comm"]
+        compute = n.get("compute_cost", 0)
+        cost_class = "cost-high" if comm > 100 else "cost-med" if comm > 0 else "cost-low"
+        shape_str = ",".join(str(s) for s in n.get("shape", []))
+        dtype = n.get("dtype", "")
+        placement = n.get("placement", "")
+        phase = n.get("phase", "")
+        row_class = "arch-row arch-bwd" if phase == "backward" else "arch-row"
+        cluster_html = ""
+        cid = n.get("cluster_id")
+        if cid is not None and "cluster_root" not in n and cid in cluster_counts:
+            cluster_html = f'<span class="cluster-badge">&times;{cluster_counts[cid] + 1}</span>'
+        phase_badge = (
+            '<span class="phase-badge phase-bwd">bwd</span>'
+            if phase == "backward"
+            else '<span class="phase-badge phase-fwd">fwd</span>'
+        )
+
+        detail_rows += (
+            f'<tr class="{row_class}" data-phase="{phase}">'
+            f'<td style="font-family:monospace">{_esc(n["name"])}{cluster_html}</td>'
+            f'<td>{phase_badge}</td>'
+            f'<td>{_esc(dtype)}[{shape_str}]</td>'
+            f'<td><span class="placement-chip" style="background:{n["_bg"]};color:{n["_color"]}">{_esc(placement)}</span></td>'
+            f'<td class="{cost_class}" style="font-family:monospace">{comm:.1f}</td>'
+            f'<td style="font-family:monospace">{compute:.1f}</td>'
+            f'</tr>'
+        )
+
+    has_children = bool(tree_node.children)
+    has_detail = bool(detail_rows)
+
+    # For leaf nodes or nodes with only own_nodes, click expands the detail table
+    # For interior nodes, click expands the children
+    toggle_target = "expanded" if (has_detail or has_children) else ""
+
+    # Compute which phases this block contains
+    all_phases = set(n.get("phase", "") for n in tree_node.all_nodes())
+    phases_attr = " ".join(sorted(all_phases))
+
+    html = f'''
+<div class="func-block" style="background:{stats['bg']};border-color:{stats['color']};margin-left:{indent}px"
+     data-phases="{phases_attr}"
+     onclick="event.stopPropagation(); this.classList.toggle('expanded')">
+  <div style="display:flex;justify-content:space-between;align-items:center">
+    <div>
+      <span class="func-name">{_esc(tree_node.name)}</span>
+      <span class="strategy-badge" style="background:{stats['color']}">{stats['dominant'].upper()}</span>
+      {f'<span style="font-size:11px;color:#94a3b8;margin-left:4px">&#9660;</span>' if has_children else ''}
+    </div>
+    <div style="text-align:right;font-size:12px;color:#64748b">
+      {stats['num_nodes']} ops &middot; comm: {stats['comm_cost']:.0f} &middot; compute: {stats['compute_cost']:.0f}
+    </div>
+  </div>
+  <div class="func-meta">{coll_html if coll_html else "No redistributions"}</div>
+  <div class="func-details">'''
+
+    if has_detail:
+        html += f'''
+    <table><tr><th>Node</th><th>Phase</th><th>Shape</th><th>Placement</th><th>Comm</th><th>Compute</th></tr>
+    {detail_rows}</table>'''
+
+    if has_children:
+        if has_detail:
+            html += '<div style="margin-top:10px"></div>'
+        # Render children sorted by cost (descending)
+        sorted_children = sorted(
+            tree_node.children.values(),
+            key=lambda c: sum(n["_total_comm"] + n.get("compute_cost", 0) for n in c.all_nodes()),
+            reverse=True,
+        )
+        for child in sorted_children:
+            html += _render_tree_block(child, cluster_counts, depth + 1)
+
+    html += '</div></div>'
+    return html
+
+
+def _flatten_tree_for_costs(tree_node, result=None, prefix=""):
+    """Flatten the tree into a list of (name, stats) for the cost-by-module view.
+    Only includes nodes that have children (interior nodes) or own_nodes (leaves)."""
+    if result is None:
+        result = []
+    full_name = f"{prefix}.{tree_node.name}" if prefix else tree_node.name
+    stats = _tree_node_stats(tree_node)
+    if stats["num_nodes"] > 0:
+        result.append((full_name or "root", stats))
+    for child in tree_node.children.values():
+        _flatten_tree_for_costs(child, result, full_name)
+    return result
 
 
 def generate_visualization_html(data: dict) -> str:
@@ -156,43 +376,12 @@ def generate_visualization_html(data: dict) -> str:
         s = n["_strategy"]
         strategy_counts[s] = strategy_counts.get(s, 0) + 1
 
-    # Group by module_path (fall back to source.func)
-    def _group_key(n):
-        if n.get("module_path"):
-            return n["module_path"]
-        src = n.get("source")
-        if src and src.get("func"):
-            return src["func"]
-        if n.get("op") == "placeholder":
-            return "inputs"
-        return "other"
+    # Build hierarchical module tree
+    module_tree = _build_module_tree(display_nodes)
 
-    module_groups = {}
-    for n in display_nodes:
-        key = _group_key(n)
-        module_groups.setdefault(key, []).append(n)
-
-    module_summary = []
-    for mname, mnodes in module_groups.items():
-        comm = sum(n["_total_comm"] for n in mnodes)
-        compute = sum(n.get("compute_cost", 0) for n in mnodes)
-        strategies = [n["_strategy"] for n in mnodes]
-        dominant = max(set(strategies), key=strategies.count) if strategies else "unknown"
-        all_colls = []
-        for n in mnodes:
-            all_colls.extend(n["_collectives"])
-        module_summary.append({
-            "name": mname,
-            "nodes": mnodes,
-            "num_nodes": len(mnodes),
-            "comm_cost": comm,
-            "compute_cost": compute,
-            "dominant": dominant,
-            "color": _STRATEGY_COLORS.get(dominant, "#D1D5DB"),
-            "bg": _STRATEGY_BGS.get(dominant, "#F9FAFB"),
-            "collectives": all_colls,
-        })
-    module_summary.sort(key=lambda m: m["comm_cost"] + m["compute_cost"], reverse=True)
+    # Flat list for cost-by-module view
+    module_cost_list = _flatten_tree_for_costs(module_tree)
+    module_cost_list.sort(key=lambda x: x[1]["comm_cost"] + x[1]["compute_cost"], reverse=True)
 
     # Top costly nodes
     costly = sorted(display_nodes, key=_node_total_cost, reverse=True)
@@ -246,7 +435,7 @@ h1 {{ font-size: 24px; font-weight: 700; margin-bottom: 4px; }}
 .strategy-badge {{ display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 500; color: white; }}
 .cluster-badge {{ display: inline-block; padding: 1px 6px; border-radius: 8px; font-size: 10px; font-weight: 600; color: #6B7280; background: #F1F5F9; margin-left: 4px; }}
 .func-details {{ display: none; margin-top: 10px; padding-top: 10px; border-top: 1px solid rgba(0,0,0,0.1); font-size: 12px; }}
-.func-block.expanded .func-details {{ display: block; }}
+.func-block.expanded > .func-details {{ display: block; }}
 .cost-bar-container {{ margin-bottom: 10px; }}
 .cost-bar-label {{ font-size: 12px; margin-bottom: 3px; display: flex; justify-content: space-between; }}
 .cost-bar {{ height: 24px; border-radius: 4px; display: flex; overflow: hidden; background: #f1f5f9; }}
@@ -269,6 +458,10 @@ tr:hover td {{ background: #f8fafc; }}
 .legend-dot {{ width: 12px; height: 12px; border-radius: 3px; }}
 tr.linked-row {{ opacity: 0.45; }}
 tr.linked-row td {{ font-style: italic; }}
+tr.arch-bwd {{ opacity: 0.6; }}
+.phase-badge {{ display: inline-block; padding: 1px 6px; border-radius: 8px; font-size: 10px; font-weight: 600; }}
+.phase-fwd {{ color: #10B981; background: #ECFDF5; }}
+.phase-bwd {{ color: #6B7280; background: #F1F5F9; }}
 </style></head><body>
 <div class="container">
 <h1>AutoParallel Strategy Visualizer</h1>
@@ -348,54 +541,14 @@ tr.linked-row td {{ font-style: italic; }}
 <div id="tab-arch" class="tab-content active">
 <div class="card"><div class="card-title">Computation Blocks by Module</div>'''
 
-    for ms in module_summary:
-        coll_html = ""
-        for cname, ctype, cfrom, cto, ccost in ms["collectives"][:5]:
-            coll_html += f'<span class="collective-badge">{_esc(ctype)}: {_esc(cfrom)}&rarr;{_esc(cto)} ({ccost:.0f})</span> '
-        if len(ms["collectives"]) > 5:
-            coll_html += f'<span class="collective-badge">+{len(ms["collectives"]) - 5} more</span>'
-
-        detail_rows = ""
-        for n in ms["nodes"]:
-            comm = n["_total_comm"]
-            compute = n.get("compute_cost", 0)
-            cost_class = "cost-high" if comm > 100 else "cost-med" if comm > 0 else "cost-low"
-            shape_str = ",".join(str(s) for s in n.get("shape", []))
-            dtype = n.get("dtype", "")
-            placement = n.get("placement", "")
-            phase = n.get("phase", "")
-            cluster_html = ""
-            cid = n.get("cluster_id")
-            if cid is not None and "cluster_root" not in n and cid in cluster_counts:
-                cluster_html = f'<span class="cluster-badge">&times;{cluster_counts[cid] + 1}</span>'
-
-            detail_rows += (
-                f'<tr class="arch-row" data-phase="{phase}">'
-                f'<td style="font-family:monospace">{_esc(n["name"])}{cluster_html}</td>'
-                f'<td>{_esc(dtype)}[{shape_str}]</td>'
-                f'<td><span class="placement-chip" style="background:{n["_bg"]};color:{n["_color"]}">{_esc(placement)}</span></td>'
-                f'<td class="{cost_class}" style="font-family:monospace">{comm:.1f}</td>'
-                f'<td style="font-family:monospace">{compute:.1f}</td>'
-                f'</tr>'
-            )
-
-        html += f'''
-<div class="func-block" style="background:{ms['bg']};border-color:{ms['color']}" onclick="this.classList.toggle('expanded')">
-  <div style="display:flex;justify-content:space-between;align-items:center">
-    <div>
-      <span class="func-name">{_esc(ms['name'])}</span>
-      <span class="strategy-badge" style="background:{ms['color']}">{ms['dominant'].upper()}</span>
-    </div>
-    <div style="text-align:right;font-size:12px;color:#64748b">
-      {ms['num_nodes']} ops &middot; comm: {ms['comm_cost']:.0f} &middot; compute: {ms['compute_cost']:.0f}
-    </div>
-  </div>
-  <div class="func-meta">{coll_html if coll_html else "No redistributions"}</div>
-  <div class="func-details">
-    <table><tr><th>Node</th><th>Shape</th><th>Placement</th><th>Comm</th><th>Compute</th></tr>
-    {detail_rows}</table>
-  </div>
-</div>'''
+    # Render top-level tree children sorted by cost
+    sorted_top = sorted(
+        module_tree.children.values(),
+        key=lambda c: sum(n["_total_comm"] + n.get("compute_cost", 0) for n in c.all_nodes()),
+        reverse=True,
+    )
+    for child in sorted_top:
+        html += _render_tree_block(child, cluster_counts, depth=0)
 
     html += '</div></div>'
 
@@ -432,15 +585,15 @@ tr.linked-row td {{ font-style: italic; }}
 
     # Cost by module
     html += '</div><div class="card"><div class="card-title">Cost by Module</div>'
-    func_max = max((m["comm_cost"] + m["compute_cost"]) for m in module_summary) if module_summary else 1
-    for ms in module_summary:
-        total = ms["comm_cost"] + ms["compute_cost"]
+    func_max = max((s["comm_cost"] + s["compute_cost"]) for _, s in module_cost_list) if module_cost_list else 1
+    for mname, stats in module_cost_list:
+        total = stats["comm_cost"] + stats["compute_cost"]
         if total == 0:
             continue
-        comm_w = ms["comm_cost"] / func_max * 100
-        comp_w = ms["compute_cost"] / func_max * 100
+        comm_w = stats["comm_cost"] / func_max * 100
+        comp_w = stats["compute_cost"] / func_max * 100
         html += f'''<div class="cost-bar-container">
-  <div class="cost-bar-label"><span style="font-weight:600">{_esc(ms["name"])}</span><span style="color:#64748b">{ms["num_nodes"]} ops &middot; total: {total:.0f}</span></div>
+  <div class="cost-bar-label"><span style="font-weight:600">{_esc(mname)}</span><span style="color:#64748b">{stats["num_nodes"]} ops &middot; total: {total:.0f}</span></div>
   <div class="cost-bar">
     <div class="cost-bar-segment" style="width:{comm_w}%;background:#DC2626"></div>
     <div class="cost-bar-segment" style="width:{comp_w}%;background:#10B981"></div>
@@ -541,10 +694,15 @@ function filterPhase(phase, btn) {
     var match = row.dataset.phase === phase;
     row.style.display = (!match || (clustersCollapsed && row.dataset.linked === '1')) ? 'none' : '';
   });
-  // Also filter architecture rows
+  // Filter architecture rows and hide blocks with no matching phase
   document.querySelectorAll('.arch-row').forEach(row => {
     if (phase === 'all') { row.style.display = ''; return; }
     row.style.display = row.dataset.phase === phase ? '' : 'none';
+  });
+  document.querySelectorAll('.func-block').forEach(block => {
+    if (phase === 'all') { block.style.display = ''; return; }
+    var phases = block.dataset.phases || '';
+    block.style.display = phases.indexOf(phase) >= 0 ? '' : 'none';
   });
 }
 
