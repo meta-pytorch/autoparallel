@@ -930,6 +930,31 @@ class ShardingOptimizer:
             violated_constraints_log=self.get_violated_constraints_log(),
         )
 
+    def get_json(self):
+        from autoparallel.export_json import export_sharding_json
+
+        selected_by_node = {}
+        for key in self.selected_keys:
+            node = self.nodes[key[0]]
+            selected_by_node.setdefault(node, []).append(
+                self._resolve_decision_var(key)
+            )
+
+        # Build node-level cluster mapping: linked_node -> root_node
+        cluster_roots: dict[torch.fx.Node, torch.fx.Node] = {}
+        for linked_key, root_key in self.cluster_links.items():
+            linked_node = self.nodes[linked_key[0]]
+            root_node = self.nodes[root_key[0]]
+            cluster_roots[linked_node] = root_node
+
+        return export_sharding_json(
+            graph=self.graph,
+            mesh=self.mesh,
+            solution={node: dvs[0].strategy for node, dvs in selected_by_node.items()},
+            selected_dvs=selected_by_node,
+            cluster_roots=cluster_roots,
+        )
+
     def print_costs_for_node(self, node, arg=0, **kwargs):
         from tabulate import tabulate  # type: ignore
         from torch.distributed.tensor._op_schema import _pretty_print_spec
