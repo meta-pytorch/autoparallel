@@ -63,6 +63,10 @@ logger = logging.getLogger(__name__)
 
 
 def _boxed_nop_preserve_node_meta(fx_g, example_inputs):
+    from autoparallel.graph_passes.bucket_collectives import bucket_collectives
+
+    bucket_collectives(fx_g)
+
     if torch._inductor.config.aten_distributed_optimizations.enable_overlap_scheduling:
         from torch._inductor.fx_passes.overlap_scheduling import (
             schedule_overlap_bucketing_from_inductor_configs,
@@ -275,6 +279,18 @@ class AutoParallel:
             )
             torch._inductor.config.comprehensive_padding = False
 
+            if self.compiler_fn is compile_fx_inner:
+                from autoparallel.graph_passes.bucket_collectives import (
+                    bucket_collectives,
+                )
+
+                self.old_post_grad_custom_post_pass = (
+                    torch._inductor.config.post_grad_custom_post_pass
+                )
+                torch._inductor.config.post_grad_custom_post_pass = (
+                    lambda gm: bucket_collectives(gm.owning_module)
+                )
+
             rescale_grad_comm_cost_for_mp = 1.0
             if self.mp_policy is not None:
                 param_size = self.mp_policy.param_dtype.itemsize
@@ -312,6 +328,10 @@ class AutoParallel:
         torch._inductor.config.comprehensive_padding = (
             self.old_inductor_comprehensive_padding
         )
+        if hasattr(self, "old_post_grad_custom_post_pass"):
+            torch._inductor.config.post_grad_custom_post_pass = (
+                self.old_post_grad_custom_post_pass
+            )
         self.active = None
         return self.stack.__exit__(exc_type, exc_val, exc_tb)
 
@@ -462,6 +482,13 @@ class AutoParallel:
         self.parallel_gm = parallel_gm
         update_joint_with_descriptors(self.joint_with_descriptors, parallel_gm)
         fix_scatter_on_aliased_inputs(parallel_gm.graph)
+        # Tag FSDP/DDP collectives on the joint graph so the bucketing
+        # pass can identify them after partitioning into fw/bw subgraphs.
+        from autoparallel.graph_passes.bucket_collectives import (
+            tag_collectives_for_bucketing,
+        )
+
+        tag_collectives_for_bucketing(parallel_gm.graph)
         # Allow DCE to remove unused wait_tensor nodes in the backward graph.
         # Pushed onto self.stack so it's restored in AutoParallel.__exit__.
         self.stack.enter_context(_suppress_wait_tensor_side_effect())
