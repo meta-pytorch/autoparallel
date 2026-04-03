@@ -697,5 +697,244 @@ class TestXorStride(unittest.TestCase):
                     self.assertEqual(result(b0, b1, pair), expected)
 
 
+class TestReductionExtended(unittest.TestCase):
+    """Additional reduction tests from DTensor coverage gaps."""
+
+    def test_keepdim_sharded(self):
+        """keepdim=True on sharded dim: size-1 dim kept, Partial emitted."""
+        t = ShardedLayout.shard((8, 16), shard_dim=0, mesh_dim_size=2)
+        out = propagate_reduction(t, reduce_dim=0, keepdim=True)
+        self.assertEqual(out.global_shape, (1, 16))
+        self.assertEqual(out.partial, {0: "sum"})
+
+    def test_keepdim_non_sharded(self):
+        """keepdim=True on non-sharded dim: size-1 kept, no Partial."""
+        t = ShardedLayout.shard((8, 16), shard_dim=0, mesh_dim_size=2)
+        out = propagate_reduction(t, reduce_dim=1, keepdim=True)
+        self.assertEqual(out.global_shape, (8, 1))
+        self.assertEqual(out.partial, {})
+        placements = out.get_placements()
+        self.assertEqual(placements[0][:3], ("shard", 0, 2))
+
+    def test_multi_dim_reduction(self):
+        """Reduce dims [0, 2] simultaneously on a 4D tensor."""
+        t = ShardedLayout.shard_multi((4, 8, 16, 32), [(0, 2), (2, 4)])
+        out = propagate_reduction(t, reduce_dim=[0, 2], keepdim=False)
+        self.assertEqual(out.global_shape, (8, 32))
+        # dim 0 was sharded on mesh 0 -> partial
+        # dim 2 was sharded on mesh 1 -> partial
+        self.assertEqual(out.partial, {0: "sum", 1: "sum"})
+
+    def test_multi_dim_reduction_mixed(self):
+        """Reduce [0, 1]: dim 0 sharded (-> partial), dim 1 not (no partial)."""
+        t = ShardedLayout.shard((4, 8, 16), shard_dim=0, mesh_dim_size=2)
+        out = propagate_reduction(t, reduce_dim=[0, 1], keepdim=False)
+        self.assertEqual(out.global_shape, (16,))
+        self.assertEqual(out.partial, {0: "sum"})
+
+
+class TestViewExtended(unittest.TestCase):
+    """Additional view tests from DTensor coverage gaps."""
+
+    def test_squeeze(self):
+        """Squeeze: remove size-1 dim (inverse of unsqueeze)."""
+        t = ShardedLayout.shard((4, 8), shard_dim=0, mesh_dim_size=2)
+        unsqueezed = propagate_unsqueeze(t, dim=1)
+        self.assertEqual(unsqueezed.global_shape, (4, 1, 8))
+        # Squeeze via view (4, 1, 8) -> (4, 8)
+        squeezed = propagate_view(unsqueezed, (4, 8))
+        self.assertIsNotNone(squeezed)
+        self.assertEqual(squeezed.global_shape, (4, 8))
+        self.assertEqual(squeezed.get_placements(), t.get_placements())
+
+    def test_flatten_non_leftmost_sharded(self):
+        """Flatten dims 0+1 when dim 1 is sharded."""
+        t = ShardedLayout.shard((4, 8, 16), shard_dim=1, mesh_dim_size=2)
+        out = propagate_view(t, (32, 16))
+        self.assertIsNotNone(out)
+        self.assertEqual(out.global_shape, (32, 16))
+        # Shard should be on merged dim 0
+        placements = out.get_placements()
+        self.assertEqual(placements[0][0], "shard")
+        self.assertEqual(placements[0][1], 0)
+
+    def test_merge_split_round_trip(self):
+        """(4, 8, 16) -> (32, 16) -> (2, 16, 16): Flatten+Split case."""
+        t = ShardedLayout.shard((4, 8, 16), shard_dim=1, mesh_dim_size=4)
+        v1 = propagate_view(t, (32, 16))
+        self.assertIsNotNone(v1)
+        v2 = propagate_view(v1, (2, 16, 16))
+        self.assertIsNotNone(v2)
+        # Mesh should land on the dim that contains it
+        self.assertEqual(v2.get_placements()[0], ("shard", 1, 4, (0,)))
+
+
+class TestBroadcastExtended(unittest.TestCase):
+    """Additional broadcast/pointwise tests from DTensor coverage gaps."""
+
+    def test_size_1_broadcasting(self):
+        """(8, 1) + (8, 16): dim 1 broadcasts from size 1."""
+        a = ShardedLayout.shard((8, 1), shard_dim=0, mesh_dim_size=2)
+        b = ShardedLayout.shard((8, 16), shard_dim=0, mesh_dim_size=2)
+        out = propagate_broadcast(a, b)
+        self.assertIsNotNone(out)
+        self.assertEqual(out.global_shape, (8, 16))
+        placements = out.get_placements()
+        self.assertEqual(placements[0][:3], ("shard", 0, 2))
+
+    def test_size_1_sharded_broadcast(self):
+        """(8, 1) replicate + (8, 16) sharded on dim 1: take sharded."""
+        a = ShardedLayout.replicate((8, 1))
+        b = ShardedLayout.shard((8, 16), shard_dim=1, mesh_dim_size=2)
+        out = propagate_broadcast(a, b)
+        self.assertIsNotNone(out)
+        self.assertEqual(out.global_shape, (8, 16))
+        placements = out.get_placements()
+        self.assertEqual(placements[0][:3], ("shard", 1, 2))
+
+
+class TestEinsumExtended(unittest.TestCase):
+    """Additional einsum tests from DTensor coverage gaps."""
+
+    def test_batched_mm_bij_bjk(self):
+        """Batched mm with different label convention: bij,bjk->bik."""
+        a = ShardedLayout.shard((4, 8, 16), shard_dim=0, mesh_dim_size=2)
+        b = ShardedLayout.shard((4, 16, 32), shard_dim=0, mesh_dim_size=2)
+        out = propagate_einsum("bij,bjk->bik", a, b)
+        self.assertIsNotNone(out)
+        self.assertEqual(out.global_shape, (4, 8, 32))
+        placements = out.get_placements()
+        self.assertEqual(placements[0], ("shard", 0, 2, (0,)))
+
+    def test_free_dimension(self):
+        """Label in one input + output but not the other (not m/n/k)."""
+        # a has dims (batch, m, k), b has dims (k, n)
+        # batch is free on a side — like a non-batched b
+        a = ShardedLayout.shard((4, 8, 16), shard_dim=0, mesh_dim_size=2)
+        b = ShardedLayout.replicate((16, 32))
+        out = propagate_einsum("bmk,kn->bmn", a, b)
+        self.assertIsNotNone(out)
+        self.assertEqual(out.global_shape, (4, 8, 32))
+        placements = out.get_placements()
+        self.assertEqual(placements[0], ("shard", 0, 2, (0,)))
+
+    def test_partial_on_k_dim(self):
+        """K-sharded contraction produces Partial, verify reduce_op."""
+        a = ShardedLayout.shard((16, 8), shard_dim=1, mesh_dim_size=4)
+        b = ShardedLayout.shard((8, 32), shard_dim=0, mesh_dim_size=4)
+        out = propagate_einsum("mk,kn->mn", a, b)
+        self.assertIsNotNone(out)
+        self.assertEqual(out.partial, {0: "sum"})
+        self.assertTrue(out.is_replicate())  # output dims not sharded
+
+
+class TestCatExtended(unittest.TestCase):
+    """Additional cat tests from DTensor coverage gaps."""
+
+    def test_cat_three_tensors(self):
+        """Cat with 3 inputs, all replicate on cat dim."""
+        a = ShardedLayout.replicate((4, 8))
+        b = ShardedLayout.replicate((4, 8))
+        c = ShardedLayout.replicate((4, 8))
+        out = propagate_cat([a, b, c], dim=0)
+        self.assertIsNotNone(out)
+        self.assertEqual(out.global_shape, (12, 8))
+        self.assertTrue(out.is_replicate())
+
+    def test_cat_different_sizes_replicate(self):
+        """Cat tensors with different sizes on cat dim, replicate."""
+        a = ShardedLayout.replicate((4, 8))
+        b = ShardedLayout.replicate((6, 8))
+        out = propagate_cat([a, b], dim=0)
+        self.assertIsNotNone(out)
+        self.assertEqual(out.global_shape, (10, 8))
+        self.assertTrue(out.is_replicate())
+
+    def test_cat_dim1(self):
+        """Cat on non-zero dim."""
+        a = ShardedLayout.shard((4, 8), shard_dim=0, mesh_dim_size=2)
+        b = ShardedLayout.shard((4, 8), shard_dim=0, mesh_dim_size=2)
+        out = propagate_cat([a, b], dim=1)
+        self.assertIsNotNone(out)
+        self.assertEqual(out.global_shape, (4, 16))
+        placements = out.get_placements()
+        self.assertEqual(placements[0][:3], ("shard", 0, 2))
+
+
+class TestSliceExtended(unittest.TestCase):
+    """Additional slice tests from DTensor coverage gaps."""
+
+    def test_slice_replicate_preserves_other_shard(self):
+        """Slice on replicate dim, sharding on another dim survives."""
+        t = ShardedLayout.shard((4, 8, 16), shard_dim=2, mesh_dim_size=2)
+        out = propagate_slice(t, dim=0, index=1)
+        self.assertIsNotNone(out)
+        self.assertEqual(out.global_shape, (8, 16))
+        placements = out.get_placements()
+        self.assertEqual(placements[0][:3], ("shard", 1, 2))
+
+
+class TestGatherExtended(unittest.TestCase):
+    """Additional gather tests from DTensor coverage gaps."""
+
+    def test_gather_preserves_other_shard(self):
+        """Gather on non-sharded dim, sharding on other dim survives."""
+        t = ShardedLayout.shard((4, 8, 16), shard_dim=0, mesh_dim_size=2)
+        index = Layout((3, 2), (2, 1))  # multi-mode index
+        out = propagate_gather(t, dim=1, index_layout=index)
+        self.assertIsNotNone(out)
+        placements = out.get_placements()
+        self.assertEqual(placements[0][:3], ("shard", 0, 2))
+
+
+class TestInteractions(unittest.TestCase):
+    """Cross-operator interaction tests."""
+
+    def test_transpose_then_view(self):
+        """Transpose then view: sub-dim structure survives transpose."""
+        t = ShardedLayout.shard((4, 8, 16), shard_dim=0, mesh_dim_size=2)
+        # Transpose dims 0, 1: (4,8,16) -> (8,4,16), shard now on dim 1
+        transposed = propagate_transpose(t, 0, 1)
+        self.assertEqual(transposed.global_shape, (8, 4, 16))
+        # View (8,4,16) -> (32,16): merge dims 0,1
+        viewed = propagate_view(transposed, (32, 16))
+        self.assertIsNotNone(viewed)
+        self.assertEqual(viewed.global_shape, (32, 16))
+        # Shard should be on merged dim 0
+        self.assertFalse(viewed.is_replicate())
+
+    def test_unsqueeze_then_broadcast(self):
+        """Unsqueeze creates size-1 dim, then pointwise broadcasts it."""
+        a = ShardedLayout.shard((8, 16), shard_dim=0, mesh_dim_size=2)
+        # Unsqueeze a at dim 2: (8, 16) -> (8, 16, 1)
+        a_unsqueezed = propagate_unsqueeze(a, dim=2)
+        self.assertEqual(a_unsqueezed.global_shape, (8, 16, 1))
+
+        b = ShardedLayout.shard((8, 16, 4), shard_dim=0, mesh_dim_size=2)
+        # Broadcast: (8, 16, 1) + (8, 16, 4) -> (8, 16, 4)
+        out = propagate_broadcast(a_unsqueezed, b)
+        self.assertIsNotNone(out)
+        self.assertEqual(out.global_shape, (8, 16, 4))
+        placements = out.get_placements()
+        self.assertEqual(placements[0][:3], ("shard", 0, 2))
+
+    def test_view_transpose_view_round_trip(self):
+        """View -> transpose -> view: the sub-dim preservation test."""
+        t = ShardedLayout.shard_multi((4, 8, 16), [(0, 2), (1, 4)])
+        # View (4,8,16) -> (32,16)
+        v1 = propagate_view(t, (32, 16))
+        self.assertIsNotNone(v1)
+        # Transpose (32,16) -> (16,32)
+        tr = propagate_transpose(v1, 0, 1)
+        self.assertEqual(tr.global_shape, (16, 32))
+        # Transpose back (16,32) -> (32,16)
+        tr2 = propagate_transpose(tr, 0, 1)
+        self.assertEqual(tr2.global_shape, (32, 16))
+        # View (32,16) -> (4,8,16): should recover original shardings
+        v2 = propagate_view(tr2, (4, 8, 16))
+        self.assertIsNotNone(v2)
+        self.assertEqual(v2.get_placements(), t.get_placements())
+
+
 if __name__ == "__main__":
     unittest.main()
