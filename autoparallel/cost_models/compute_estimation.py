@@ -370,6 +370,27 @@ def compute_read_write_time(read_write_bytes):
     return read_write_time
 
 
+def _compute_efficiency(flops, read_write_bytes, dtype):
+    """Returns compute utilization efficiency based on arithmetic intensity.
+
+    Uses a Hill function to smoothly interpolate between a low-efficiency
+    floor (memory-bound regime) and a high-efficiency ceiling (compute-bound
+    regime), with the transition centered at the device's roofline ridge point.
+    """
+    peak_flops = _get_device_tflops(dtype) * 10**12
+    peak_bandwidth = _get_device_gmem_bandwidth()
+    ridge = peak_flops / peak_bandwidth
+
+    ai = flops / read_write_bytes
+    ratio = ai / ridge
+
+    floor = 0.50
+    ceiling = 0.80
+    # Hill function: ratio^2 / (1 + ratio^2) ∈ [0, 1)
+    t = ratio**2 / (1 + ratio**2)
+    return floor + (ceiling - floor) * t
+
+
 def _get_dtype_from_args(args):
     # suppose only one dtype per op, taking the
     # first dtype that shows up. This might not
@@ -438,7 +459,17 @@ def estimate_strategy_runtime_cost(node, strategy):
     flops, out = _compute_flops(node.target, *args, **kwargs)
 
     read_write_bytes = compute_memory_cost(node.target, args, out)
-    read_write_time = compute_read_write_time(read_write_bytes)
+
+    # Operator kernels use streaming access patterns that achieve higher memory
+    # bandwidth than the 70% in compute_read_write_time (used for collective
+    # reshuffles with non-contiguous access).
+    gpu_memory_bandwidth = _get_device_gmem_bandwidth()
+    memory_efficiency = 0.85
+    kernel_launch_overhead = 7  # us
+    read_write_time = max(
+        read_write_bytes / gpu_memory_bandwidth / memory_efficiency * 1e6,
+        kernel_launch_overhead,
+    )
 
     if flops == 0:
         result = read_write_time
@@ -448,8 +479,7 @@ def estimate_strategy_runtime_cost(node, strategy):
         # TODO: use PyTorch's version once it's giving correct results
         gpu_flops = _get_device_tflops(dtype) * 10**12
 
-        # suppose 70% efficiency for the operator
-        compute_efficiency = 0.70
+        compute_efficiency = _compute_efficiency(flops, read_write_bytes, dtype)
         compute_time = flops / gpu_flops * 1e6  # us
         compute_time = compute_time / compute_efficiency
 
