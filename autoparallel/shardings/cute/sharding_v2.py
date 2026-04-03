@@ -213,8 +213,10 @@ class ShardedLayout:
 @dataclass
 class Carry:
     """Output dim inherits sharding from input dim(s).
-    Multiple sources -> check compatibility, pick sharded one."""
+    Multiple sources -> check compatibility, pick sharded one.
+    index_layout: if set, dim mode is built from this Layout (for gather)."""
     sources: list  # [(input_idx, dim_idx), ...]
+    index_layout: object = None  # Layout for gather — replaces the dim mode
 
 
 @dataclass
@@ -255,6 +257,24 @@ class Remove:
 
 def _apply_carry(spec, inputs):
     """Apply Carry primitive. Returns ((mode_shape, mode_stride), mesh_dims) or None."""
+    if spec.index_layout is not None:
+        # Gather: build dim mode from index_layout, scaled by source dim stride
+        inp_idx, dim_idx = spec.sources[0]
+        inp = inputs[inp_idx]
+        dim_stride = inp.hier_layout.stride[dim_idx]
+
+        idx_shape = spec.index_layout.shape
+        idx_stride = spec.index_layout.stride
+        if is_tuple(idx_shape):
+            new_shape = tuple((s,) for s in idx_shape)
+            new_stride = tuple((st * dim_stride,) if not is_tuple(st) else
+                               tuple(x * dim_stride for x in st) for st in idx_stride)
+        else:
+            first_st = dim_stride[0] if is_tuple(dim_stride) else dim_stride
+            new_shape = ((idx_shape,),)
+            new_stride = ((idx_stride * first_st,),)
+        return (new_shape, new_stride), ()  # gather dim is always replicate
+
     if len(spec.sources) == 1:
         inp_idx, dim_idx = spec.sources[0]
         inp = inputs[inp_idx]
@@ -635,52 +655,22 @@ def propagate_slice(sharded, dim, index):
     ndim = len(sharded.global_shape)
     recipe = [Carry([(0, i)]) for i in range(ndim) if i != dim]
     removed = [Remove((0, dim), reduce_op=None)]
-    result = propagate(recipe, removed, [sharded])
-    if result is None:
-        return None
-    # Apply partial evaluation to get correct strides on surviving dims
-    # Build the actual layout via partial eval on hier_layout
-    coord = tuple(index if k == dim else None for k in range(ndim))
-    new_hier = sharded.hier_layout(*coord)
-    # Wrap in proper shape if needed
-    nh_shape = _ensure_tuple(new_hier.shape)
-    nh_stride = _ensure_tuple(new_hier.stride)
-    actual_hier = Layout(nh_shape, nh_stride)
-    result.hier_layout = actual_hier
-    return result
+    return propagate(recipe, removed, [sharded])
 
 
 def propagate_gather(sharded, dim, index_layout):
-    h_shape = sharded.hier_layout.shape
-    if _mode_has_mesh(h_shape[dim]):
-        return None
-
-    h_stride = sharded.hier_layout.stride
-    dim_stride = h_stride[dim]
-
-    # Build new dim from index_layout, wrapped in uniform 3-level
-    idx_shape = index_layout.shape
-    idx_stride = index_layout.stride
-    if is_tuple(idx_shape):
-        new_dim_shape = tuple((s,) for s in idx_shape)
-        new_dim_stride = tuple((st * dim_stride,) if not is_tuple(st) else
-                               tuple(x * dim_stride for x in st) for st in idx_stride)
-    else:
-        new_dim_shape = ((idx_shape,),)
-        new_dim_stride = ((idx_stride * dim_stride,),) if not is_tuple(dim_stride) else \
-                         ((idx_stride * dim_stride[0],),)
-
-    new_shape = h_shape[:dim] + (new_dim_shape,) + h_shape[dim + 1:]
-    new_stride = h_stride[:dim] + (new_dim_stride,) + h_stride[dim + 1:]
-    new_hier = Layout(new_shape, new_stride)
-
-    # Build mesh_dim_map: remove dim, shift
-    new_map = {}
-    for src, mesh_dims in sharded.mesh_dim_map.items():
-        new_map[src] = mesh_dims
-    result = ShardedLayout(new_hier, new_map)
-    result.partial = dict(sharded.partial)
-    return result
+    ndim = len(sharded.global_shape)
+    # Gathered dim: Remove (reject if sharded) + Carry from index_layout
+    recipe = []
+    removed = []
+    for i in range(ndim):
+        if i == dim:
+            # Replace this dim with index_layout structure
+            removed.append(Remove((0, i), reduce_op=None))
+            recipe.append(Carry([(0, i)], index_layout=index_layout))
+        else:
+            recipe.append(Carry([(0, i)]))
+    return propagate(recipe, removed, [sharded])
 
 
 def propagate_reduction(sharded, reduce_dim, keepdim=False, reduce_op="sum"):
@@ -769,6 +759,35 @@ def propagate_view(sharded, new_shape):
                 }
             split_groups[key]["outputs"].append((out_i, op.split_id))
 
+    # For Flatten+Split cases (Split whose source is a Flatten of multiple dims),
+    # we first merge those dims into a temporary ShardedLayout, then split.
+    # Collect which input dims need pre-merging.
+    merge_split_groups = {}  # key -> (merged input dims, group_shape, outputs)
+    for key, group in split_groups.items():
+        input_dims = _collect_input_dims(group["input_op"])
+        if len(input_dims) > 1:
+            merge_split_groups[key] = (input_dims, group["group_shape"], group["outputs"])
+
+    # Pre-merge: create a temporary ShardedLayout with merged dims
+    # We'll reference this temporary input for the Split specs
+    temp_input = None
+    temp_dim_idx = None
+    if merge_split_groups:
+        # There should be one merge-split group per view (simplification for common cases)
+        # Build a temporary layout by merging the source dims
+        for key, (input_dims, group_shape, outputs) in merge_split_groups.items():
+            merge_recipe = [Merge([(0, d) for d in input_dims])]
+            # Also carry all dims NOT in the merge group
+            all_merged = set(input_dims)
+            for i in range(len(old_g)):
+                if i not in all_merged:
+                    merge_recipe.append(Carry([(0, i)]))
+            temp_input = propagate(merge_recipe, [], [sharded])
+            if temp_input is None:
+                return None
+            temp_dim_idx = 0  # merged dim is always first in our recipe
+
+    # Build the recipe
     recipe = [None] * len(new_g)
     processed = set()
 
@@ -789,205 +808,73 @@ def propagate_view(sharded, new_shape):
             group_shape = group["group_shape"]
             outputs = sorted(group["outputs"], key=lambda x: x[1])
 
-            # If source is a single dim, use it directly.
-            # If source is a Flatten, we need to merge first then split.
             if len(input_dims) == 1:
+                # Simple split from a single source dim
                 source_dim = input_dims[0]
+                for oi, sid in outputs:
+                    recipe[oi] = Split(
+                        source=(0, source_dim),
+                        sizes=tuple(group_shape),
+                        split_idx=sid,
+                    )
+                    processed.add(oi)
             else:
-                # Flatten + Split: need to handle as merge-then-split
-                # For now, use the first input dim and handle via the split logic
-                source_dim = input_dims[0]
-
-            for oi, sid in outputs:
-                recipe[oi] = Split(
-                    source=(0, source_dim) if len(input_dims) == 1 else (0, input_dims[0]),
-                    sizes=tuple(group_shape),
-                    split_idx=sid,
-                )
-                processed.add(oi)
+                # Flatten+Split: use the pre-merged temporary input
+                # The Split references the merged dim in temp_input
+                for oi, sid in outputs:
+                    recipe[oi] = Split(
+                        source=(1, temp_dim_idx),  # input 1 = temp_input, dim 0 = merged
+                        sizes=tuple(group_shape),
+                        split_idx=sid,
+                    )
+                    processed.add(oi)
 
     if any(r is None for r in recipe):
         return None
 
-    # For Split specs that come from a Flatten source, we need a special merge+split.
-    # Handle this by creating a temporary merged layout.
-    # Check if any Split has a multi-dim source
-    needs_merge_split = False
-    for out_i, op in enumerate(ops):
-        if isinstance(op, ViewSplit):
-            group = split_groups[id(op.input_dim)]
-            input_dims = _collect_input_dims(group["input_op"])
-            if len(input_dims) > 1:
-                needs_merge_split = True
-                break
+    if merge_split_groups:
+        # We have Split specs referencing temp_input (input idx 1)
+        # Also remap any Carry specs: they should reference the original input (idx 0)
+        # But some dims in the original are consumed by the merge — those
+        # surviving dims are in temp_input at shifted positions.
+        # Simpler approach: run the split specs against temp_input,
+        # and carry specs against the original input.
 
-    if needs_merge_split:
-        # Fall back to direct hier_layout manipulation for complex view cases
-        return _propagate_view_direct(sharded, new_shape)
+        # Rebuild recipe: splits reference temp_input, carries reference original
+        # We need to pass both as inputs to propagate
+        # But propagate expects consistent input references per spec.
+        # Instead, just split the temp_input directly.
 
-    result = propagate(recipe, [], [sharded])
+        # Build a split-only recipe on temp_input
+        split_recipe = []
+        carry_from_original = []
+        for out_i, spec in enumerate(recipe):
+            if isinstance(spec, Split) and spec.source[0] == 1:
+                # Remap to input 0 (temp_input will be the sole input)
+                split_recipe.append(Split(
+                    source=(0, spec.source[1]),
+                    sizes=spec.sizes,
+                    split_idx=spec.split_idx,
+                ))
+            elif isinstance(spec, Carry):
+                # This dim was carried from original. Find it in temp_input.
+                # In the merge recipe, non-merged dims were appended after the merged dim.
+                orig_dim = spec.sources[0][1]
+                all_merged = set()
+                for _, (input_dims, _, _) in merge_split_groups.items():
+                    all_merged.update(input_dims)
+                # Position in temp_input: merged dim is 0, then non-merged in order
+                non_merged = [i for i in range(len(old_g)) if i not in all_merged]
+                temp_pos = 1 + non_merged.index(orig_dim)
+                split_recipe.append(Carry([(0, temp_pos)]))
+            elif isinstance(spec, Merge):
+                split_recipe.append(spec)
+            else:
+                split_recipe.append(spec)
 
-    # Propagate view mesh_dim_map for splits that come from a merged source
-    if result is not None:
-        # Fix up mesh_dim_map for split groups
-        for key, group in split_groups.items():
-            input_dims = _collect_input_dims(group["input_op"])
-            outputs = sorted(group["outputs"], key=lambda x: x[1])
-            if len(input_dims) == 1:
-                continue  # already handled by Split primitive
+        return propagate(split_recipe, [], [temp_input])
 
-    return result
-
-
-def _propagate_view_direct(sharded, new_shape):
-    """Direct hier_layout manipulation for complex view cases (merge+split)."""
-    new_hier = _view_hier(sharded.hier_layout, sharded.global_shape, new_shape)
-    if new_hier is None:
-        return None
-
-    old_g = _ensure_tuple(sharded.global_shape)
-    new_g = _ensure_tuple(new_shape)
-    ops = view_groups(old_g, new_g)
-
-    new_map = {}
-    split_groups = {}
-    for out_i, op in enumerate(ops):
-        if isinstance(op, ViewSplit):
-            key = id(op.input_dim)
-            if key not in split_groups:
-                split_groups[key] = {
-                    "input_op": op.input_dim,
-                    "group_shape": op.group_shape,
-                    "outputs": [],
-                }
-            split_groups[key]["outputs"].append((out_i, op.split_id))
-
-    for out_i, op in enumerate(ops):
-        if isinstance(op, InputDim):
-            new_map[out_i] = sharded.mesh_dim_map[op.input_dim]
-        elif isinstance(op, Flatten):
-            src_dims = _collect_input_dims(op)
-            mesh_dims = ()
-            for d in src_dims:
-                mesh_dims = mesh_dims + sharded.mesh_dim_map[d]
-            new_map[out_i] = mesh_dims
-        elif isinstance(op, ViewSplit):
-            group = split_groups[id(op.input_dim)]
-            if op.split_id == 0:
-                src_dims = _collect_input_dims(group["input_op"])
-                mesh_dims = ()
-                for d in src_dims:
-                    mesh_dims = mesh_dims + sharded.mesh_dim_map[d]
-                if mesh_dims:
-                    split_outputs = [(oi2, o.split_id) for oi2, o in enumerate(ops)
-                                     if isinstance(o, ViewSplit) and id(o.input_dim) == id(op.input_dim)]
-                    split_outputs.sort(key=lambda x: x[1])
-                    mesh_idx = 0
-                    for oi2, _ in split_outputs:
-                        if mesh_idx < len(mesh_dims) and _mode_has_mesh(new_hier.shape[oi2]):
-                            new_map[oi2] = (mesh_dims[mesh_idx],)
-                            mesh_idx += 1
-
-    result = ShardedLayout(new_hier, new_map)
-    result.partial = dict(sharded.partial)
-    return result
-
-
-def _view_hier(hier_layout, old_global, new_global):
-    """Transform hier_layout for view (direct sub-dim manipulation)."""
-    h_shape = hier_layout.shape
-    h_stride = hier_layout.stride
-    old_g = _ensure_tuple(old_global)
-    new_g = _ensure_tuple(new_global)
-    ops = view_groups(old_g, new_g)
-
-    src_subdims = []
-    for s, st in zip(h_shape, h_stride):
-        src_subdims.append(list(zip(s, st)))
-
-    split_groups = {}
-    for out_i, op in enumerate(ops):
-        if isinstance(op, ViewSplit):
-            key = id(op.input_dim)
-            if key not in split_groups:
-                split_groups[key] = {
-                    "input_op": op.input_dim,
-                    "group_shape": op.group_shape,
-                    "outputs": [],
-                }
-            split_groups[key]["outputs"].append((out_i, op.split_id))
-
-    out_shape = [None] * len(new_g)
-    out_stride = [None] * len(new_g)
-    processed = set()
-
-    for out_i, op in enumerate(ops):
-        if out_i in processed:
-            continue
-
-        if isinstance(op, InputDim):
-            out_shape[out_i] = h_shape[op.input_dim]
-            out_stride[out_i] = h_stride[op.input_dim]
-
-        elif isinstance(op, Flatten):
-            input_dims = _collect_input_dims(op)
-            merged = []
-            for d in input_dims:
-                merged.extend(src_subdims[d])
-            out_shape[out_i] = tuple(s for s, _ in merged)
-            out_stride[out_i] = tuple(st for _, st in merged)
-
-        elif isinstance(op, ViewSplit):
-            group = split_groups[id(op.input_dim)]
-            input_dims = _collect_input_dims(group["input_op"])
-            group_shape = group["group_shape"]
-            outputs = sorted(group["outputs"], key=lambda x: x[1])
-
-            all_subs = []
-            for d in input_dims:
-                all_subs.extend(src_subdims[d])
-
-            sub_idx = 0
-            pieces = []
-            ok = True
-            for target_size in group_shape:
-                acc = 1
-                piece = []
-                while acc < target_size and sub_idx < len(all_subs):
-                    sub_s, sub_st = all_subs[sub_idx]
-                    gs = product(sub_s)
-                    if acc * gs <= target_size:
-                        acc *= gs
-                        piece.append((sub_s, sub_st))
-                        sub_idx += 1
-                    else:
-                        needed = target_size // acc
-                        result = _split_subdim(sub_s, sub_st, needed)
-                        if result is None:
-                            ok = False
-                            break
-                        (left_s, left_st), right = result
-                        piece.append((left_s, left_st))
-                        acc *= product(left_s)
-                        if right is not None:
-                            all_subs[sub_idx] = right
-                        else:
-                            sub_idx += 1
-                        break
-                if not ok or acc != target_size:
-                    return None
-                pieces.append(piece)
-
-            for (oi, sid), piece in zip(outputs, pieces):
-                out_shape[oi] = tuple(s for s, _ in piece)
-                out_stride[oi] = tuple(st for _, st in piece)
-                processed.add(oi)
-            for oi, _ in outputs:
-                processed.add(oi)
-
-    if any(s is None for s in out_shape):
-        return None
-    return Layout(tuple(out_shape), tuple(out_stride))
+    return propagate(recipe, [], [sharded])
 
 
 def _parse_einsum(equation):
