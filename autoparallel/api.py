@@ -272,6 +272,8 @@ class AutoParallel:
             else:
                 set_nccl_topo_config(None)
 
+            self.stack.enter_context(self.mesh)
+
             self.build_model_graph()
             self.old_inductor_comprehensive_padding = (
                 torch._inductor.config.comprehensive_padding
