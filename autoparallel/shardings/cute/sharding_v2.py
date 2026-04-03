@@ -682,27 +682,13 @@ def propagate_reduction(sharded, reduce_dim, keepdim=False, reduce_op="sum"):
 
     recipe = []
     removed = []
-    src_dim = 0
     for i in range(ndim):
         if i in reduce_dims:
             removed.append(Remove((0, i), reduce_op=reduce_op))
-        else:
             if keepdim:
-                recipe.append(Carry([(0, i)]))
-            else:
-                recipe.append(Carry([(0, i)]))
-
-    # For keepdim, insert size-1 dims at reduced positions
-    if keepdim:
-        recipe_with_keepdim = []
-        carry_idx = 0
-        for i in range(ndim):
-            if i in reduce_dims:
-                recipe_with_keepdim.append(Insert())
-            else:
-                recipe_with_keepdim.append(recipe[carry_idx])
-                carry_idx += 1
-        recipe = recipe_with_keepdim
+                recipe.append(Insert())
+        else:
+            recipe.append(Carry([(0, i)]))
 
     return propagate(recipe, removed, [sharded])
 
