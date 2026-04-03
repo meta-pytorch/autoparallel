@@ -303,7 +303,7 @@ def test_ac_joint_pass_marks_recomputable_nodes(device_mesh_1d):
     from autoparallel.graph_passes.activation_checkpointing import ac_joint_pass
 
     graph = _build_parallel_graph(AttentionBlockNoAC, device_mesh_1d)
-    ac_joint_pass(graph, ac_stage_size_in_GiB=None, reshard_after_forward=False)
+    ac_joint_pass(graph, ac_stage_size_in_GiB=None)
 
     from torch._functorch.partitioners import _has_tag_is_backward
 
@@ -382,7 +382,7 @@ def test_ac_joint_pass_respects_user_annotations(device_mesh_1d):
         if recompute is not None:
             user_tagged[n.name] = recompute
 
-    ac_joint_pass(graph, ac_stage_size_in_GiB=None, reshard_after_forward=False)
+    ac_joint_pass(graph, ac_stage_size_in_GiB=None)
 
     # User-tagged nodes without AP_AC_GRAPH_ID should keep their original tag
     for n in graph.nodes:
