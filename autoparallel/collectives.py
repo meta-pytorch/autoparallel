@@ -8,27 +8,20 @@ from typing import Any, Optional
 import torch
 import torch.distributed.distributed_c10d as c10d
 from torch.distributed._tensor.experimental import local_map as _local_map
+from torch.distributed.device_mesh import _mesh_resources
 from torch.distributed.distributed_c10d import GroupName
-
-_local_map_device_mesh = None
 
 
 def local_map(*args, **kwargs):
-    # TODO: ideally after we get out of the local map region we should
-    # just reset the global device mesh to None. For now we just keep it
-    # around.
-    global _local_map_device_mesh
-    _local_map_device_mesh = kwargs.get("device_mesh", None)
+    # TODO: upstream this fallback into PyTorch's local_map, matching
+    # DTensor.from_local and distribute_tensor which already do this.
+    if kwargs.get("device_mesh", None) is None:
+        kwargs["device_mesh"] = _mesh_resources.get_current_mesh()
     return _local_map(*args, **kwargs)
 
 
 def get_mesh_from_global():
-    global _local_map_device_mesh
-    if _local_map_device_mesh is None:
-        raise RuntimeError(
-            "No mesh found, make sure to call this collective in a local_map region"
-        )
-    return _local_map_device_mesh
+    return _mesh_resources.get_current_mesh()
 
 
 def _get_group_name_from_axis_name(mesh_name):
