@@ -172,8 +172,10 @@ def get_identical_regions(
         # NOTE: this seems like it's missing in the original implementation
         # from PyTorch. Given that fully_expand_region_group doesn't check
         # if the root from a region is in a seen node, it might end up
-        # having duplicate nodes in different clusters
-        if region_group[0][0] in seen_nodes:
+        # having duplicate nodes in different clusters. We must check all
+        # regions' root nodes, because any region's root could have been
+        # claimed by a prior group.
+        if any(region[0] in seen_nodes for region in region_group):
             continue
         fully_expand_region_group(
             region_group,
