@@ -1,0 +1,1130 @@
+"""
+CuTe-based sharding propagation via 5 primitives.
+
+Every propagation rule is a dim recipe composed from:
+  Carry  — output dim inherits sharding from input dim(s)
+  Insert — new replicate dim
+  Remove — dim disappears; if sharded → Partial
+  Merge  — multiple dims become one (view flatten, cat)
+  Split  — one dim becomes multiple (view unflatten)
+
+A generic engine applies the recipe on ShardedLayout (CuTe hier_layout + mesh_dim_map + partial).
+
+CuTe is used for: representation (hierarchical layouts), construction (logical_divide),
+redistribution (composition + right_inverse). NOT for propagation rules.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Optional
+
+from ._pycute import Layout, is_tuple, logical_divide, product
+
+from torch.distributed.tensor._ops._view_ops import (
+    Flatten,
+    InputDim,
+    Split as ViewSplit,
+    view_groups,
+)
+
+
+# =============================================================================
+# Helpers (ported from placement.py)
+# =============================================================================
+
+
+def _ensure_tuple(x):
+    return x if is_tuple(x) else (x,)
+
+
+def _to_uniform(layout):
+    """Convert a CuTe Layout to uniform 3-level nesting."""
+    shape = _ensure_tuple(layout.shape)
+    stride = _ensure_tuple(layout.stride)
+    new_shape = []
+    new_stride = []
+    for s, st in zip(shape, stride):
+        if is_tuple(s):
+            new_shape.append((s,))
+            new_stride.append((st,))
+        else:
+            new_shape.append(((s, 1),))
+            new_stride.append(((st, 0),))
+    return Layout(tuple(new_shape), tuple(new_stride))
+
+
+def _empty_map(ndim):
+    return {i: () for i in range(ndim)}
+
+
+def _has_mesh(subdim):
+    """Check if a level-3 sub-dim has mesh sharding."""
+    return len(subdim) > 1 and product(subdim[1:]) > 1
+
+
+def _local_size(mode):
+    """Get the local (per-device) size of a level-2 mode (tuple of sub-dims)."""
+    result = 1
+    for sub in mode:
+        result *= sub[0]
+    return result
+
+
+def _mode_has_mesh(mode):
+    """Check if a level-2 mode has any mesh sharding."""
+    return any(_has_mesh(sub) for sub in mode)
+
+
+def _global_shape(hier_layout):
+    shape = hier_layout.shape
+    if not is_tuple(shape):
+        return (shape,)
+    return tuple(product(s) for s in shape)
+
+
+_SIZE_1_MODE = ((1, 1),)
+_SIZE_1_STRIDE = ((0, 0),)
+
+
+# =============================================================================
+# ShardedLayout
+# =============================================================================
+
+
+class ShardedLayout:
+    """
+    Sharding = hierarchical CuTe Layout + mesh dim identity map + partial.
+
+    hier_layout: 3-level nesting (tensor dims → sub-dims → (local, mesh...))
+    mesh_dim_map: {tensor_dim: (mesh_dim_ids...)}
+    partial: {mesh_dim: reduce_op}
+    """
+
+    def __init__(self, hier_layout, mesh_dim_map=None, partial=None):
+        self.hier_layout = hier_layout
+        ndim = len(_ensure_tuple(hier_layout.shape))
+        if mesh_dim_map is None:
+            self.mesh_dim_map = _empty_map(ndim)
+        else:
+            self.mesh_dim_map = {i: mesh_dim_map.get(i, ()) for i in range(ndim)}
+        self.partial = partial or {}
+
+    @staticmethod
+    def replicate(tensor_shape):
+        t_shape = _ensure_tuple(tensor_shape)
+        return ShardedLayout(_to_uniform(Layout(t_shape)))
+
+    @staticmethod
+    def shard(tensor_shape, shard_dim, mesh_dim_size, mesh_dim=0):
+        t_shape = _ensure_tuple(tensor_shape)
+        assert t_shape[shard_dim] % mesh_dim_size == 0
+        local = list(t_shape)
+        local[shard_dim] //= mesh_dim_size
+        hier = logical_divide(Layout(t_shape), tuple(local))
+        return ShardedLayout(_to_uniform(hier), {shard_dim: (mesh_dim,)})
+
+    @staticmethod
+    def shard_multi(tensor_shape, shard_specs):
+        t_shape = _ensure_tuple(tensor_shape)
+        mesh_dim_map = _empty_map(len(t_shape))
+        for mesh_dim_idx, (shard_dim, _) in enumerate(shard_specs):
+            mesh_dim_map[shard_dim] = mesh_dim_map[shard_dim] + (mesh_dim_idx,)
+
+        dim_counts = {}
+        for dim, _ in shard_specs:
+            dim_counts[dim] = dim_counts.get(dim, 0) + 1
+
+        if not any(c > 1 for c in dim_counts.values()):
+            local = list(t_shape)
+            for dim, mesh_size in shard_specs:
+                assert local[dim] % mesh_size == 0
+                local[dim] //= mesh_size
+            hier = logical_divide(Layout(t_shape), tuple(local))
+            return ShardedLayout(_to_uniform(hier), mesh_dim_map)
+
+        # S(0),S(0) case: sequential logical_divide
+        hier = Layout(t_shape)
+        current_local = list(t_shape)
+        for dim, mesh_size in shard_specs:
+            assert current_local[dim] % mesh_size == 0
+            chunk = current_local[dim] // mesh_size
+            divisor = tuple(chunk if i == dim else current_local[i]
+                            for i in range(len(t_shape)))
+            hier = logical_divide(hier, divisor)
+            current_local[dim] = chunk
+        return ShardedLayout(_to_uniform(hier), mesh_dim_map)
+
+    @property
+    def global_shape(self):
+        return _global_shape(self.hier_layout)
+
+    @property
+    def local_sizes(self):
+        return tuple(_local_size(mode) for mode in self.hier_layout.shape)
+
+    def _ld(self):
+        return logical_divide(Layout(self.global_shape), self.local_sizes)
+
+    @property
+    def tensor_shape(self):
+        return self.global_shape
+
+    @property
+    def num_elements(self):
+        return product(self.global_shape)
+
+    def is_replicate(self):
+        return all(len(v) == 0 for v in self.mesh_dim_map.values())
+
+    def get_placements(self):
+        if self.is_replicate():
+            return [("replicate", None, None)]
+        shape = self.hier_layout.shape
+        if not is_tuple(shape):
+            return [("replicate", None, None)]
+        placements = []
+        for i, mode in enumerate(shape):
+            if self.mesh_dim_map[i]:
+                g = product(mode)
+                l = _local_size(mode)
+                mesh_size = g // l
+                placements.append(("shard", i, mesh_size, self.mesh_dim_map[i]))
+        return placements or [("replicate", None, None)]
+
+    def __eq__(self, other):
+        if not isinstance(other, ShardedLayout):
+            return NotImplemented
+        return (self.hier_layout == other.hier_layout
+                and self.mesh_dim_map == other.mesh_dim_map)
+
+    def __hash__(self):
+        return hash((self.hier_layout, tuple(sorted(self.mesh_dim_map.items()))))
+
+    def __repr__(self):
+        return f"ShardedLayout(hier={self.hier_layout}, mesh_map={self.mesh_dim_map})"
+
+
+# =============================================================================
+# DimSpec: the 5 primitives
+# =============================================================================
+
+
+@dataclass
+class Carry:
+    """Output dim inherits sharding from input dim(s).
+    Multiple sources -> check compatibility, pick sharded one."""
+    sources: list  # [(input_idx, dim_idx), ...]
+
+
+@dataclass
+class Insert:
+    """New replicate dim."""
+    size: int = 1
+
+
+@dataclass
+class Merge:
+    """Multiple dims become one.
+    cross_tensor=False: view flatten (concatenate sub-dims from same input).
+    cross_tensor=True: cat (extend with source-index mode)."""
+    sources: list  # [(input_idx, dim_idx), ...]
+    cross_tensor: bool = False
+
+
+@dataclass
+class Split:
+    """One dim becomes multiple. This spec represents ONE part of the split."""
+    source: tuple  # (input_idx, dim_idx)
+    sizes: tuple   # full group_shape
+    split_idx: int  # which part of the split this output dim is
+
+
+@dataclass
+class Remove:
+    """Input dim is removed. If sharded and reduce_op is set -> Partial.
+    If sharded and reduce_op is None -> reject (return None)."""
+    source: tuple  # (input_idx, dim_idx)
+    reduce_op: Optional[str] = None
+
+
+# =============================================================================
+# Primitive implementations
+# =============================================================================
+
+
+def _apply_carry(spec, inputs):
+    """Apply Carry primitive. Returns ((mode_shape, mode_stride), mesh_dims) or None."""
+    if len(spec.sources) == 1:
+        inp_idx, dim_idx = spec.sources[0]
+        inp = inputs[inp_idx]
+        return (inp.hier_layout.shape[dim_idx], inp.hier_layout.stride[dim_idx]), inp.mesh_dim_map[dim_idx]
+
+    # Multiple sources: check compatibility, pick the sharded one
+    modes = []
+    for inp_idx, dim_idx in spec.sources:
+        inp = inputs[inp_idx]
+        mode_shape = inp.hier_layout.shape[dim_idx]
+        mode_stride = inp.hier_layout.stride[dim_idx]
+        mesh_dims = inp.mesh_dim_map[dim_idx]
+        is_sharded = _mode_has_mesh(mode_shape)
+        is_size_1 = product(mode_shape) == 1
+        modes.append((mode_shape, mode_stride, mesh_dims, is_sharded, is_size_1))
+
+    # Find the winner: sharded > non-size-1-replicate > size-1
+    winner = None
+    for i, (ms, mst, md, sharded, size1) in enumerate(modes):
+        if size1:
+            continue
+        if winner is None:
+            winner = i
+        elif sharded and not modes[winner][3]:
+            winner = i  # sharded wins over replicate
+        elif sharded and modes[winner][3]:
+            # Both sharded: must be compatible (same mesh_dims AND same structure)
+            if md != modes[winner][2]:
+                return None  # incompatible mesh dims
+            if ms != modes[winner][0]:
+                return None  # incompatible sharding structure (different mesh sizes)
+    if winner is None:
+        winner = 0  # all size-1
+
+    # Verify all non-size-1 sharded modes are compatible
+    w_ms, w_mst, w_md, w_sharded, _ = modes[winner]
+    for i, (ms, mst, md, sharded, size1) in enumerate(modes):
+        if i == winner or size1:
+            continue
+        if sharded and w_sharded:
+            if md != w_md or ms != w_ms:
+                return None
+
+    return (w_ms, w_mst), w_md
+
+
+def _apply_insert(spec):
+    """Apply Insert primitive."""
+    return (_SIZE_1_MODE, _SIZE_1_STRIDE), ()
+
+
+def _apply_merge(spec, inputs):
+    """Apply Merge primitive. Returns ((merged_shape, merged_stride), mesh_dims)."""
+    if spec.cross_tensor:
+        return _apply_merge_cross_tensor(spec, inputs)
+    return _apply_merge_within_tensor(spec, inputs)
+
+
+def _apply_merge_within_tensor(spec, inputs):
+    """View flatten: concatenate sub-dim lists from source dims."""
+    merged_shape = ()
+    merged_stride = ()
+    merged_mesh = ()
+    for inp_idx, dim_idx in spec.sources:
+        inp = inputs[inp_idx]
+        merged_shape = merged_shape + inp.hier_layout.shape[dim_idx]
+        merged_stride = merged_stride + inp.hier_layout.stride[dim_idx]
+        merged_mesh = merged_mesh + inp.mesh_dim_map[dim_idx]
+    return (merged_shape, merged_stride), merged_mesh
+
+
+def _apply_merge_cross_tensor(spec, inputs):
+    """Cat: extend dim with source-index mode.
+
+    Each device holds its local chunks from all sources.
+    Output has non-contiguous layout in global index space.
+    """
+    # All sources must have compatible sharding on this dim
+    src_modes = []
+    all_mesh = set()
+    common_mesh = None
+    for inp_idx, dim_idx in spec.sources:
+        inp = inputs[inp_idx]
+        mode_shape = inp.hier_layout.shape[dim_idx]
+        mode_stride = inp.hier_layout.stride[dim_idx]
+        mesh_dims = inp.mesh_dim_map[dim_idx]
+        src_modes.append((mode_shape, mode_stride, mesh_dims))
+        if mesh_dims:
+            if common_mesh is None:
+                common_mesh = mesh_dims
+            elif mesh_dims != common_mesh:
+                return None  # incompatible cat dim shardings
+
+    if common_mesh is None:
+        common_mesh = ()
+
+    # Check if all sources have the same sharding structure on this dim
+    all_same = all(m[0] == src_modes[0][0] for m in src_modes)
+    if not all_same and common_mesh:
+        return None  # can't cat with different sharding structures
+
+    # For replicate cat dim: just build a bigger replicate dim
+    if not common_mesh:
+        total_size = sum(product(m[0]) for m in src_modes)
+        return (((total_size, 1),), ((1, 0),)), ()
+
+    # Sharded cat dim: each device holds local chunks from all sources.
+    # Keep the original sub-dim structure, add a source-index sub-dim.
+    base_shape = src_modes[0][0]  # all same
+    base_stride = src_modes[0][1]
+    num_sources = len(spec.sources)
+
+    # The source offset = global size of one source tensor on this dim
+    source_global_size = product(base_shape)
+
+    # Compute element stride for this dim from the first input's layout
+    first_inp = inputs[spec.sources[0][0]]
+    dim_idx = spec.sources[0][1]
+    elem_stride = _get_elem_stride(first_inp, dim_idx)
+
+    # Output sub-dims: original sub-dims + a (num_sources, 1) source-index sub-dim
+    # The source-index sub-dim has stride = source_global_size * elem_stride
+    # and is local (each device holds all sources), so mesh=1
+    source_sub = (num_sources, 1)
+    source_sub_stride = (source_global_size * elem_stride, 0)
+
+    out_shape = base_shape + (source_sub,)
+    out_stride = base_stride + (source_sub_stride,)
+
+    return (out_shape, out_stride), common_mesh
+
+
+def _get_elem_stride(sharded, dim_idx):
+    """Get the element stride for a dim (stride of the local part)."""
+    mode_stride = sharded.hier_layout.stride[dim_idx]
+    # First sub-dim's first element stride
+    first_sub_st = mode_stride[0]
+    if is_tuple(first_sub_st):
+        return first_sub_st[0]
+    return first_sub_st
+
+
+def _split_subdim(sub, sub_st, split_point):
+    """Split a level-3 sub-dim at a global-size boundary."""
+    gs = product(sub)
+    if gs == split_point:
+        return (sub, sub_st), None
+    if split_point <= 0 or gs % split_point != 0:
+        return None
+
+    local = sub[0]
+    mesh = sub[1:]
+    local_st = sub_st[0] if is_tuple(sub_st) else sub_st
+    mesh_st = sub_st[1:] if is_tuple(sub_st) else ()
+    mesh_product = product(mesh)
+
+    if split_point >= mesh_product and split_point % mesh_product == 0:
+        left_local = split_point // mesh_product
+        right_local = local // left_local
+        left = (left_local,) + tuple(mesh)
+        right = (right_local, 1)
+        left_st = (local_st,) + tuple(mesh_st)
+        right_st = (local_st * left_local * mesh_product, 0)
+        return (left, left_st), (right, right_st)
+    return None
+
+
+def _apply_split(spec, inputs, all_split_specs):
+    """Apply Split primitive for one part of a split group.
+
+    Returns list of ((mode_shape, mode_stride), mesh_dims) for ALL parts
+    of this split group (called once for split_idx=0, returns all).
+    """
+    inp_idx, dim_idx = spec.source
+    inp = inputs[inp_idx]
+    h_shape = inp.hier_layout.shape[dim_idx]
+    h_stride = inp.hier_layout.stride[dim_idx]
+    src_mesh = inp.mesh_dim_map[dim_idx]
+
+    src_subdims = list(zip(h_shape, h_stride))
+    sub_idx = 0
+    pieces = []
+
+    for target_size in spec.sizes:
+        acc = 1
+        piece = []
+        while acc < target_size and sub_idx < len(src_subdims):
+            sub_s, sub_st = src_subdims[sub_idx]
+            gs = product(sub_s)
+            if acc * gs <= target_size:
+                acc *= gs
+                piece.append((sub_s, sub_st))
+                sub_idx += 1
+            else:
+                needed = target_size // acc
+                result = _split_subdim(sub_s, sub_st, needed)
+                if result is None:
+                    return None
+                (left_s, left_st), right = result
+                piece.append((left_s, left_st))
+                acc *= product(left_s)
+                if right is not None:
+                    src_subdims[sub_idx] = right
+                else:
+                    sub_idx += 1
+                break
+        if acc != target_size:
+            return None
+        pieces.append(piece)
+
+    # Build output modes and distribute mesh_dims
+    results = []
+    mesh_dims_list = list(src_mesh)
+    mesh_idx = 0
+    for piece in pieces:
+        out_shape = tuple(s for s, _ in piece)
+        out_stride = tuple(st for _, st in piece)
+        # Assign mesh dims to this piece based on which sub-dims have mesh
+        piece_mesh = []
+        for sub_s, sub_st in piece:
+            if _has_mesh(sub_s):
+                if mesh_idx < len(mesh_dims_list):
+                    piece_mesh.append(mesh_dims_list[mesh_idx])
+                    mesh_idx += 1
+        results.append(((out_shape, out_stride), tuple(piece_mesh)))
+
+    return results
+
+
+# =============================================================================
+# Generic propagation engine
+# =============================================================================
+
+
+def propagate(recipe, removed, inputs):
+    """Apply a dim recipe to produce the output ShardedLayout.
+
+    recipe: list of DimSpec (Carry, Insert, Merge, Split) for output dims
+    removed: list of Remove specs for contracted/sliced dims
+    inputs: list of ShardedLayout
+    """
+    # 1. Process removed dims
+    partial = {}
+    for r in removed:
+        inp_idx, dim_idx = r.source
+        inp = inputs[inp_idx]
+        if _mode_has_mesh(inp.hier_layout.shape[dim_idx]):
+            if r.reduce_op is not None:
+                for md in inp.mesh_dim_map[dim_idx]:
+                    partial[md] = r.reduce_op
+            else:
+                return None  # reject (e.g., slice on sharded dim)
+
+    # Also check mesh_dim_map compatibility for multi-source Carry
+    # Same mesh dim on different tensor dims -> incompatible
+    all_carry_sources = []
+    for spec in recipe:
+        if isinstance(spec, Carry) and len(spec.sources) > 1:
+            all_carry_sources.append(spec)
+
+    if len(inputs) > 1 and all_carry_sources:
+        # Check: same mesh dim must not be assigned to different output dims
+        mesh_to_out = {}
+        for out_dim, spec in enumerate(recipe):
+            if isinstance(spec, Carry):
+                for inp_idx, dim_idx in spec.sources:
+                    for md in inputs[inp_idx].mesh_dim_map[dim_idx]:
+                        if md in mesh_to_out and mesh_to_out[md] != out_dim:
+                            return None
+                        mesh_to_out[md] = out_dim
+
+    # 2. Build output dims
+    out_shapes = []
+    out_strides = []
+    out_map = {}
+
+    # Pre-compute all Split groups (a Split group shares the same source)
+    split_cache = {}
+
+    for out_dim, spec in enumerate(recipe):
+        if isinstance(spec, Carry):
+            result = _apply_carry(spec, inputs)
+            if result is None:
+                return None
+            (mode_shape, mode_stride), mesh_dims = result
+            out_shapes.append(mode_shape)
+            out_strides.append(mode_stride)
+            out_map[out_dim] = mesh_dims
+
+        elif isinstance(spec, Insert):
+            (mode_shape, mode_stride), mesh_dims = _apply_insert(spec)
+            out_shapes.append(mode_shape)
+            out_strides.append(mode_stride)
+            out_map[out_dim] = mesh_dims
+
+        elif isinstance(spec, Merge):
+            result = _apply_merge(spec, inputs)
+            if result is None:
+                return None
+            (mode_shape, mode_stride), mesh_dims = result
+            out_shapes.append(mode_shape)
+            out_strides.append(mode_stride)
+            out_map[out_dim] = mesh_dims
+
+        elif isinstance(spec, Split):
+            cache_key = (spec.source, spec.sizes)
+            if cache_key not in split_cache:
+                all_parts = _apply_split(spec, inputs, recipe)
+                if all_parts is None:
+                    return None
+                split_cache[cache_key] = all_parts
+            parts = split_cache[cache_key]
+            (mode_shape, mode_stride), mesh_dims = parts[spec.split_idx]
+            out_shapes.append(mode_shape)
+            out_strides.append(mode_stride)
+            out_map[out_dim] = mesh_dims
+
+    out_hier = Layout(tuple(out_shapes), tuple(out_strides))
+    result = ShardedLayout(out_hier, out_map)
+    result.partial = partial
+
+    # Inherit partials from inputs
+    for inp in inputs:
+        for md, op in inp.partial.items():
+            if md in result.partial and result.partial[md] != op:
+                return None
+            result.partial[md] = op if md not in result.partial else result.partial[md]
+
+    return result
+
+
+# =============================================================================
+# Recipe generators for each operator
+# =============================================================================
+
+
+def _collect_input_dims(op):
+    """Recursively collect InputDim indices from a view_groups op."""
+    if isinstance(op, InputDim):
+        return [op.input_dim]
+    elif isinstance(op, Flatten):
+        dims = []
+        for sub in op.input_dims:
+            dims.extend(_collect_input_dims(sub))
+        return dims
+    elif isinstance(op, ViewSplit):
+        return _collect_input_dims(op.input_dim)
+    return []
+
+
+def propagate_transpose(sharded, dim0, dim1):
+    ndim = len(sharded.global_shape)
+    perm = list(range(ndim))
+    perm[dim0], perm[dim1] = perm[dim1], perm[dim0]
+    recipe = [Carry([(0, perm[i])]) for i in range(ndim)]
+    return propagate(recipe, [], [sharded])
+
+
+def propagate_permute(sharded, dims):
+    recipe = [Carry([(0, dims[i])]) for i in range(len(dims))]
+    return propagate(recipe, [], [sharded])
+
+
+def propagate_unsqueeze(sharded, dim):
+    ndim = len(sharded.global_shape)
+    recipe = []
+    src = 0
+    for i in range(ndim + 1):
+        if i == dim:
+            recipe.append(Insert())
+        else:
+            recipe.append(Carry([(0, src)]))
+            src += 1
+    return propagate(recipe, [], [sharded])
+
+
+def propagate_slice(sharded, dim, index):
+    ndim = len(sharded.global_shape)
+    recipe = [Carry([(0, i)]) for i in range(ndim) if i != dim]
+    removed = [Remove((0, dim), reduce_op=None)]
+    result = propagate(recipe, removed, [sharded])
+    if result is None:
+        return None
+    # Apply partial evaluation to get correct strides on surviving dims
+    # Build the actual layout via partial eval on hier_layout
+    coord = tuple(index if k == dim else None for k in range(ndim))
+    new_hier = sharded.hier_layout(*coord)
+    # Wrap in proper shape if needed
+    nh_shape = _ensure_tuple(new_hier.shape)
+    nh_stride = _ensure_tuple(new_hier.stride)
+    actual_hier = Layout(nh_shape, nh_stride)
+    result.hier_layout = actual_hier
+    return result
+
+
+def propagate_gather(sharded, dim, index_layout):
+    h_shape = sharded.hier_layout.shape
+    if _mode_has_mesh(h_shape[dim]):
+        return None
+
+    h_stride = sharded.hier_layout.stride
+    dim_stride = h_stride[dim]
+
+    # Build new dim from index_layout, wrapped in uniform 3-level
+    idx_shape = index_layout.shape
+    idx_stride = index_layout.stride
+    if is_tuple(idx_shape):
+        new_dim_shape = tuple((s,) for s in idx_shape)
+        new_dim_stride = tuple((st * dim_stride,) if not is_tuple(st) else
+                               tuple(x * dim_stride for x in st) for st in idx_stride)
+    else:
+        new_dim_shape = ((idx_shape,),)
+        new_dim_stride = ((idx_stride * dim_stride,),) if not is_tuple(dim_stride) else \
+                         ((idx_stride * dim_stride[0],),)
+
+    new_shape = h_shape[:dim] + (new_dim_shape,) + h_shape[dim + 1:]
+    new_stride = h_stride[:dim] + (new_dim_stride,) + h_stride[dim + 1:]
+    new_hier = Layout(new_shape, new_stride)
+
+    # Build mesh_dim_map: remove dim, shift
+    new_map = {}
+    for src, mesh_dims in sharded.mesh_dim_map.items():
+        new_map[src] = mesh_dims
+    result = ShardedLayout(new_hier, new_map)
+    result.partial = dict(sharded.partial)
+    return result
+
+
+def propagate_reduction(sharded, reduce_dim, keepdim=False, reduce_op="sum"):
+    ndim = len(sharded.global_shape)
+    if isinstance(reduce_dim, int):
+        reduce_dims = {reduce_dim}
+    else:
+        reduce_dims = set(reduce_dim)
+
+    recipe = []
+    removed = []
+    src_dim = 0
+    for i in range(ndim):
+        if i in reduce_dims:
+            removed.append(Remove((0, i), reduce_op=reduce_op))
+        else:
+            if keepdim:
+                recipe.append(Carry([(0, i)]))
+            else:
+                recipe.append(Carry([(0, i)]))
+
+    # For keepdim, insert size-1 dims at reduced positions
+    if keepdim:
+        recipe_with_keepdim = []
+        carry_idx = 0
+        for i in range(ndim):
+            if i in reduce_dims:
+                recipe_with_keepdim.append(Insert())
+            else:
+                recipe_with_keepdim.append(recipe[carry_idx])
+                carry_idx += 1
+        recipe = recipe_with_keepdim
+
+    return propagate(recipe, removed, [sharded])
+
+
+def propagate_broadcast(a, b):
+    a_shape = a.global_shape
+    b_shape = b.global_shape
+    if len(a_shape) != len(b_shape):
+        return None
+
+    recipe = []
+    for d in range(len(a_shape)):
+        if a_shape[d] == 1 and b_shape[d] == 1:
+            recipe.append(Carry([(0, d)]))
+        elif a_shape[d] == 1:
+            recipe.append(Carry([(1, d)]))
+        elif b_shape[d] == 1:
+            recipe.append(Carry([(0, d)]))
+        else:
+            recipe.append(Carry([(0, d), (1, d)]))
+
+    return propagate(recipe, [], [a, b])
+
+
+def propagate_pointwise(all_shardeds):
+    if not all_shardeds:
+        return None
+    result = all_shardeds[0]
+    for sharded in all_shardeds[1:]:
+        result = propagate_broadcast(result, sharded)
+        if result is None:
+            return None
+    return result
+
+
+def propagate_view(sharded, new_shape):
+    if product(sharded.global_shape) != product(new_shape):
+        return None
+
+    old_g = _ensure_tuple(sharded.global_shape)
+    new_g = _ensure_tuple(new_shape)
+    ops = view_groups(old_g, new_g)
+
+    # Identify split groups
+    split_groups = {}
+    for out_i, op in enumerate(ops):
+        if isinstance(op, ViewSplit):
+            key = id(op.input_dim)
+            if key not in split_groups:
+                split_groups[key] = {
+                    "input_op": op.input_dim,
+                    "group_shape": op.group_shape,
+                    "outputs": [],
+                }
+            split_groups[key]["outputs"].append((out_i, op.split_id))
+
+    recipe = [None] * len(new_g)
+    processed = set()
+
+    for out_i, op in enumerate(ops):
+        if out_i in processed:
+            continue
+
+        if isinstance(op, InputDim):
+            recipe[out_i] = Carry([(0, op.input_dim)])
+
+        elif isinstance(op, Flatten):
+            input_dims = _collect_input_dims(op)
+            recipe[out_i] = Merge([(0, d) for d in input_dims])
+
+        elif isinstance(op, ViewSplit):
+            group = split_groups[id(op.input_dim)]
+            input_dims = _collect_input_dims(group["input_op"])
+            group_shape = group["group_shape"]
+            outputs = sorted(group["outputs"], key=lambda x: x[1])
+
+            # If source is a single dim, use it directly.
+            # If source is a Flatten, we need to merge first then split.
+            if len(input_dims) == 1:
+                source_dim = input_dims[0]
+            else:
+                # Flatten + Split: need to handle as merge-then-split
+                # For now, use the first input dim and handle via the split logic
+                source_dim = input_dims[0]
+
+            for oi, sid in outputs:
+                recipe[oi] = Split(
+                    source=(0, source_dim) if len(input_dims) == 1 else (0, input_dims[0]),
+                    sizes=tuple(group_shape),
+                    split_idx=sid,
+                )
+                processed.add(oi)
+
+    if any(r is None for r in recipe):
+        return None
+
+    # For Split specs that come from a Flatten source, we need a special merge+split.
+    # Handle this by creating a temporary merged layout.
+    # Check if any Split has a multi-dim source
+    needs_merge_split = False
+    for out_i, op in enumerate(ops):
+        if isinstance(op, ViewSplit):
+            group = split_groups[id(op.input_dim)]
+            input_dims = _collect_input_dims(group["input_op"])
+            if len(input_dims) > 1:
+                needs_merge_split = True
+                break
+
+    if needs_merge_split:
+        # Fall back to direct hier_layout manipulation for complex view cases
+        return _propagate_view_direct(sharded, new_shape)
+
+    result = propagate(recipe, [], [sharded])
+
+    # Propagate view mesh_dim_map for splits that come from a merged source
+    if result is not None:
+        # Fix up mesh_dim_map for split groups
+        for key, group in split_groups.items():
+            input_dims = _collect_input_dims(group["input_op"])
+            outputs = sorted(group["outputs"], key=lambda x: x[1])
+            if len(input_dims) == 1:
+                continue  # already handled by Split primitive
+
+    return result
+
+
+def _propagate_view_direct(sharded, new_shape):
+    """Direct hier_layout manipulation for complex view cases (merge+split)."""
+    new_hier = _view_hier(sharded.hier_layout, sharded.global_shape, new_shape)
+    if new_hier is None:
+        return None
+
+    old_g = _ensure_tuple(sharded.global_shape)
+    new_g = _ensure_tuple(new_shape)
+    ops = view_groups(old_g, new_g)
+
+    new_map = {}
+    split_groups = {}
+    for out_i, op in enumerate(ops):
+        if isinstance(op, ViewSplit):
+            key = id(op.input_dim)
+            if key not in split_groups:
+                split_groups[key] = {
+                    "input_op": op.input_dim,
+                    "group_shape": op.group_shape,
+                    "outputs": [],
+                }
+            split_groups[key]["outputs"].append((out_i, op.split_id))
+
+    for out_i, op in enumerate(ops):
+        if isinstance(op, InputDim):
+            new_map[out_i] = sharded.mesh_dim_map[op.input_dim]
+        elif isinstance(op, Flatten):
+            src_dims = _collect_input_dims(op)
+            mesh_dims = ()
+            for d in src_dims:
+                mesh_dims = mesh_dims + sharded.mesh_dim_map[d]
+            new_map[out_i] = mesh_dims
+        elif isinstance(op, ViewSplit):
+            group = split_groups[id(op.input_dim)]
+            if op.split_id == 0:
+                src_dims = _collect_input_dims(group["input_op"])
+                mesh_dims = ()
+                for d in src_dims:
+                    mesh_dims = mesh_dims + sharded.mesh_dim_map[d]
+                if mesh_dims:
+                    split_outputs = [(oi2, o.split_id) for oi2, o in enumerate(ops)
+                                     if isinstance(o, ViewSplit) and id(o.input_dim) == id(op.input_dim)]
+                    split_outputs.sort(key=lambda x: x[1])
+                    mesh_idx = 0
+                    for oi2, _ in split_outputs:
+                        if mesh_idx < len(mesh_dims) and _mode_has_mesh(new_hier.shape[oi2]):
+                            new_map[oi2] = (mesh_dims[mesh_idx],)
+                            mesh_idx += 1
+
+    result = ShardedLayout(new_hier, new_map)
+    result.partial = dict(sharded.partial)
+    return result
+
+
+def _view_hier(hier_layout, old_global, new_global):
+    """Transform hier_layout for view (direct sub-dim manipulation)."""
+    h_shape = hier_layout.shape
+    h_stride = hier_layout.stride
+    old_g = _ensure_tuple(old_global)
+    new_g = _ensure_tuple(new_global)
+    ops = view_groups(old_g, new_g)
+
+    src_subdims = []
+    for s, st in zip(h_shape, h_stride):
+        src_subdims.append(list(zip(s, st)))
+
+    split_groups = {}
+    for out_i, op in enumerate(ops):
+        if isinstance(op, ViewSplit):
+            key = id(op.input_dim)
+            if key not in split_groups:
+                split_groups[key] = {
+                    "input_op": op.input_dim,
+                    "group_shape": op.group_shape,
+                    "outputs": [],
+                }
+            split_groups[key]["outputs"].append((out_i, op.split_id))
+
+    out_shape = [None] * len(new_g)
+    out_stride = [None] * len(new_g)
+    processed = set()
+
+    for out_i, op in enumerate(ops):
+        if out_i in processed:
+            continue
+
+        if isinstance(op, InputDim):
+            out_shape[out_i] = h_shape[op.input_dim]
+            out_stride[out_i] = h_stride[op.input_dim]
+
+        elif isinstance(op, Flatten):
+            input_dims = _collect_input_dims(op)
+            merged = []
+            for d in input_dims:
+                merged.extend(src_subdims[d])
+            out_shape[out_i] = tuple(s for s, _ in merged)
+            out_stride[out_i] = tuple(st for _, st in merged)
+
+        elif isinstance(op, ViewSplit):
+            group = split_groups[id(op.input_dim)]
+            input_dims = _collect_input_dims(group["input_op"])
+            group_shape = group["group_shape"]
+            outputs = sorted(group["outputs"], key=lambda x: x[1])
+
+            all_subs = []
+            for d in input_dims:
+                all_subs.extend(src_subdims[d])
+
+            sub_idx = 0
+            pieces = []
+            ok = True
+            for target_size in group_shape:
+                acc = 1
+                piece = []
+                while acc < target_size and sub_idx < len(all_subs):
+                    sub_s, sub_st = all_subs[sub_idx]
+                    gs = product(sub_s)
+                    if acc * gs <= target_size:
+                        acc *= gs
+                        piece.append((sub_s, sub_st))
+                        sub_idx += 1
+                    else:
+                        needed = target_size // acc
+                        result = _split_subdim(sub_s, sub_st, needed)
+                        if result is None:
+                            ok = False
+                            break
+                        (left_s, left_st), right = result
+                        piece.append((left_s, left_st))
+                        acc *= product(left_s)
+                        if right is not None:
+                            all_subs[sub_idx] = right
+                        else:
+                            sub_idx += 1
+                        break
+                if not ok or acc != target_size:
+                    return None
+                pieces.append(piece)
+
+            for (oi, sid), piece in zip(outputs, pieces):
+                out_shape[oi] = tuple(s for s, _ in piece)
+                out_stride[oi] = tuple(st for _, st in piece)
+                processed.add(oi)
+            for oi, _ in outputs:
+                processed.add(oi)
+
+    if any(s is None for s in out_shape):
+        return None
+    return Layout(tuple(out_shape), tuple(out_stride))
+
+
+def _parse_einsum(equation):
+    if "->" not in equation:
+        raise ValueError(f"Einsum equation must contain '->': {equation}")
+    inputs_str, output = equation.split("->")
+    return inputs_str.split(","), output
+
+
+def _classify_einsum_dims(inputs, output):
+    assert len(inputs) == 2
+    a_dims, b_dims = set(inputs[0]), set(inputs[1])
+    out_dims = set(output)
+    categories = {}
+    for d in a_dims | b_dims | out_dims:
+        in_a, in_b, in_out = d in a_dims, d in b_dims, d in out_dims
+        if in_a and in_b and in_out:
+            categories[d] = "batch"
+        elif in_a and in_b and not in_out:
+            categories[d] = "contract"
+        elif in_a and not in_b and in_out:
+            categories[d] = "m"
+        elif not in_a and in_b and in_out:
+            categories[d] = "n"
+        else:
+            categories[d] = "other"
+    return categories
+
+
+def propagate_einsum(equation, sharded_a, sharded_b):
+    inputs_labels, output_labels = _parse_einsum(equation)
+    categories = _classify_einsum_dims(inputs_labels, output_labels)
+    all_labels = list(dict.fromkeys(list(inputs_labels[0]) + list(inputs_labels[1])))
+
+    # Pre-check einsum-specific constraints
+    for label in all_labels:
+        cat = categories.get(label)
+        a_idx = inputs_labels[0].index(label) if label in inputs_labels[0] else None
+        b_idx = inputs_labels[1].index(label) if label in inputs_labels[1] else None
+        a_sharded = a_idx is not None and _mode_has_mesh(sharded_a.hier_layout.shape[a_idx])
+        b_sharded = b_idx is not None and _mode_has_mesh(sharded_b.hier_layout.shape[b_idx])
+
+        if cat == "m" and b_sharded:
+            return None
+        if cat == "n" and a_sharded:
+            return None
+        if cat == "batch" and a_sharded != b_sharded:
+            return None
+        if cat == "contract" and a_sharded != b_sharded:
+            return None
+
+    # Build recipe
+    recipe = []
+    for label in output_labels:
+        sources = []
+        if label in inputs_labels[0]:
+            sources.append((0, inputs_labels[0].index(label)))
+        if label in inputs_labels[1]:
+            sources.append((1, inputs_labels[1].index(label)))
+        recipe.append(Carry(sources))
+
+    removed = []
+    for label in all_labels:
+        if categories.get(label) == "contract":
+            if label in inputs_labels[0]:
+                removed.append(Remove((0, inputs_labels[0].index(label)), reduce_op="sum"))
+
+    return propagate(recipe, removed, [sharded_a, sharded_b])
+
+
+def propagate_cat(shardeds, dim):
+    """Cat: cross-tensor merge on dim, carry on other dims."""
+    if not shardeds:
+        return None
+    ndim = len(shardeds[0].global_shape)
+
+    recipe = []
+    for d in range(ndim):
+        if d == dim:
+            recipe.append(Merge(
+                [(i, d) for i in range(len(shardeds))],
+                cross_tensor=True
+            ))
+        else:
+            recipe.append(Carry([(i, d) for i in range(len(shardeds))]))
+
+    return propagate(recipe, [], shardeds)
+
+
+# =============================================================================
+# Redistribute planning
+# =============================================================================
+
+
+def _reverse_mesh_map(mesh_dim_map):
+    reverse = {}
+    for tensor_dim, mesh_dims in mesh_dim_map.items():
+        for md in mesh_dims:
+            reverse.setdefault(md, set()).add(tensor_dim)
+    return reverse
+
+
+def plan_redistribute(source, target):
+    """Plan collectives for redistribution between two ShardedLayouts."""
+    if source.global_shape != target.global_shape:
+        raise ValueError(
+            f"Cannot redistribute: shapes differ {source.global_shape} vs {target.global_shape}"
+        )
+
+    src_reverse = _reverse_mesh_map(source.mesh_dim_map)
+    tgt_reverse = _reverse_mesh_map(target.mesh_dim_map)
+    all_mesh_dims = set(src_reverse) | set(tgt_reverse)
+    collectives = []
+
+    # 1. Resolve partials
+    for md, reduce_op in source.partial.items():
+        tgt_dims = tgt_reverse.get(md, set())
+        if tgt_dims:
+            collectives.append(("reduce_scatter", md, {"reduce_op": reduce_op}))
+        else:
+            collectives.append(("all_reduce", md, {"reduce_op": reduce_op}))
+        all_mesh_dims.discard(md)
+
+    # 2. Per mesh dim classification
+    for md in sorted(all_mesh_dims):
+        src_dims = src_reverse.get(md, set())
+        tgt_dims = tgt_reverse.get(md, set())
+        if src_dims == tgt_dims:
+            continue
+        elif src_dims and not tgt_dims:
+            collectives.append(("all_gather", md, {"tensor_dims": src_dims}))
+        elif not src_dims and tgt_dims:
+            continue  # local reinterpret
+        else:
+            collectives.append(("all_to_all", md, {
+                "source_dims": src_dims,
+                "target_dims": tgt_dims,
+            }))
+
+    return collectives
