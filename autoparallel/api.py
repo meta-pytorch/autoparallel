@@ -27,7 +27,10 @@ from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
 from .apply_sharding import apply_sharding_to_model
 from .cast_parametrization import apply_dtype_cast, canonicalize_mp, set_dtype_cast
-from .graph_passes.activation_checkpointing import ac_joint_pass
+from .graph_passes.activation_checkpointing import (
+    ac_joint_pass,
+    mark_fsdp_all_gather_recomputation,
+)
 from .graph_passes.graph_utils import (
     _add_alias,
     _replace_view_mm_view_with_einsum,
@@ -449,10 +452,11 @@ class AutoParallel:
         )
         t_trace = time.perf_counter()
 
+        mark_fsdp_all_gather_recomputation(
+            parallel_gm.graph, self.reshard_after_forward
+        )
         if self.enable_ac:
-            ac_joint_pass(
-                parallel_gm.graph, self.ac_stage_size_in_GiB, self.reshard_after_forward
-            )
+            ac_joint_pass(parallel_gm.graph, self.ac_stage_size_in_GiB)
         t_ac = time.perf_counter()
         # now rename input/param/tangent/output/grad_param/grad_input nodes following
         # our convention
