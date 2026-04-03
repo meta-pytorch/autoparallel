@@ -428,6 +428,40 @@ class TestEndToEnd(unittest.TestCase):
         self.assertEqual(placements_out[0], ("shard", 0, dp_size, (0,)))
         self.assertEqual(placements_out[1], ("shard", 1, sp_size, (1,)))
 
+    def test_fsdp_tp_linear(self):
+        """FSDP+TP: input S(0)R @ weight RS(1) -> output S(0)S(1).
+
+        2D mesh: mesh_dim 0 = FSDP (data parallel), mesh_dim 1 = TP (tensor parallel).
+        Input (M, K) sharded on dim 0 across FSDP.
+        Weight (K, N) sharded on dim 1 across TP.
+        Output (M, N) should be S(0) on dim 0, S(1) on dim 1.
+        """
+        M, K, N = 16, 32, 64
+        fsdp_size, tp_size = 2, 4
+
+        # Input: S(0) on dim 0 (FSDP shards rows), R on dim 1
+        input_t = ShardedLayout.shard((M, K), shard_dim=0, mesh_dim_size=fsdp_size, mesh_dim=0)
+        self.assertEqual(input_t.mesh_dim_map, {0: (0,), 1: ()})
+
+        # Weight: R on dim 0, S(1) on dim 1 (TP shards columns)
+        weight = ShardedLayout.shard((K, N), shard_dim=1, mesh_dim_size=tp_size, mesh_dim=1)
+        self.assertEqual(weight.mesh_dim_map, {0: (), 1: (1,)})
+
+        # Einsum: mk,kn->mn
+        # m: Carry from input (S(0)) — FSDP sharding preserved
+        # n: Carry from weight (S(1)) — TP sharding preserved
+        # k: contracted, both replicate on k → no Partial
+        out = propagate_einsum("mk,kn->mn", input_t, weight)
+        self.assertIsNotNone(out)
+        self.assertEqual(out.global_shape, (M, N))
+        self.assertEqual(out.partial, {})
+
+        # Output: S(0) on dim 0 (from input), S(1) on dim 1 (from weight)
+        self.assertEqual(out.mesh_dim_map, {0: (0,), 1: (1,)})
+        placements = out.get_placements()
+        self.assertEqual(placements[0], ("shard", 0, fsdp_size, (0,)))
+        self.assertEqual(placements[1], ("shard", 1, tp_size, (1,)))
+
 
 class TestRedistribute(unittest.TestCase):
 
