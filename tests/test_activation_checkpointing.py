@@ -108,7 +108,6 @@ def _build_joint_graph(model, input_fn, mesh):
     sharding optimizer."""
     autop = AutoParallel(model, input_fn, mesh)
     try:
-        autop.stack.enter_context(mesh)
         autop.build_model_graph()
         return autop.gm
     finally:
@@ -425,11 +424,11 @@ def test_ac_joint_pass_stages_recomputation(device_mesh_1d):
 # ---------------------------------------------------------------------------
 
 
-def _make_local_map_block():
+def _make_local_map_block(mesh):
     """Build a Block class that uses local_map-wrapped ops inside a
-    checkpoint region.  The local_map decorators pick up the mesh from
-    the global DeviceMesh context set by AutoParallel."""
-    from autoparallel.collectives import local_map
+    checkpoint region.  The local_map decorators capture `mesh`, so the
+    class factory must receive the mesh at definition time."""
+    from torch.distributed._tensor.experimental import local_map
 
     def policy_fn(ctx, op, *args, **kwargs):
         if (
@@ -449,6 +448,7 @@ def _make_local_map_block():
         ),
         redistribute_inputs=True,
         in_grad_placements=None,
+        device_mesh=mesh,
     )
     def replicate_linear(w, x):
         with fx_traceback.annotate({"inside_local_map": 1}):
@@ -459,6 +459,7 @@ def _make_local_map_block():
         in_placements=((Shard(0), Shard(0), Replicate()),),
         redistribute_inputs=True,
         in_grad_placements=None,
+        device_mesh=mesh,
     )
     def sharded_pointwise(x):
         with fx_traceback.annotate({"inside_local_map": 0}):
@@ -473,6 +474,7 @@ def _make_local_map_block():
         ),
         redistribute_inputs=True,
         in_grad_placements=None,
+        device_mesh=mesh,
     )
     def context_parallel_attention(query, key, value):
         with fx_traceback.annotate({"inside_local_map": 2}):
@@ -527,7 +529,7 @@ def test_local_map_ac_recompute_tags(device_mesh_3d):
     """Recompute tags from user checkpoint policy survive graph capture
     when local_map ops are used inside the checkpointed function."""
     mesh = device_mesh_3d
-    Block, policy_fn = _make_local_map_block()
+    Block, policy_fn = _make_local_map_block(mesh)
 
     nheads, dim, ffn_dim = 8, 128, 512
     bs = 8 * mesh.shape[0]
@@ -555,7 +557,7 @@ def test_local_map_ac_seq_nr_consistency(device_mesh_3d):
     """seq_nr consistency holds when local_map ops are used inside a
     checkpoint region."""
     mesh = device_mesh_3d
-    Block, _ = _make_local_map_block()
+    Block, _ = _make_local_map_block(mesh)
 
     nheads, dim, ffn_dim = 8, 128, 512
     bs = 8 * mesh.shape[0]
@@ -587,7 +589,7 @@ def test_local_map_custom_metadata_propagation(device_mesh_3d):
     """Custom fx_traceback annotations propagate through local_map + checkpoint
     onto the parallel graph."""
     mesh = device_mesh_3d
-    Block, _ = _make_local_map_block()
+    Block, _ = _make_local_map_block(mesh)
 
     nheads, dim, ffn_dim = 8, 128, 512
     bs = 8 * mesh.shape[0]
