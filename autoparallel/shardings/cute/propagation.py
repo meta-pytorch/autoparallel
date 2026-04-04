@@ -1016,8 +1016,12 @@ def propagate_unbind(sharded, dim):
 # =============================================================================
 
 
-def _propagate_replicate_affected(sharded, affected_dims):
-    """Generic: carry all dims, reject if any affected dim is sharded."""
+def propagate_replicate_affected(sharded, affected_dims):
+    """Generic: carry all dims, reject if any affected dim is sharded.
+
+    Used for ops where the affected dims must be replicate:
+    flip, roll, cumsum, cumprod, softmax, cummax, cummin, etc.
+    """
     ndim = len(sharded.global_shape)
     if isinstance(affected_dims, int):
         affected_dims = {affected_dims}
@@ -1032,19 +1036,9 @@ def _propagate_replicate_affected(sharded, affected_dims):
     return propagate(recipe, [], [sharded])
 
 
-def propagate_flip(sharded, dims):
-    """flip: reverse elements along dims. Affected dims must be replicate."""
-    return _propagate_replicate_affected(sharded, dims)
-
-
-def propagate_roll(sharded, shifts, dims):
-    """roll: circular shift along dims. Affected dims must be replicate."""
-    return _propagate_replicate_affected(sharded, dims)
-
-
 def propagate_sort(sharded, dim):
     """sort: sort along dim. Affected dim must be replicate. Returns (values, indices)."""
-    result = _propagate_replicate_affected(sharded, dim)
+    result = propagate_replicate_affected(sharded, dim)
     if result is None:
         return None
     return result, result  # both outputs have same sharding
@@ -1052,7 +1046,7 @@ def propagate_sort(sharded, dim):
 
 def propagate_topk(sharded, dim, k):
     """topk: top-k along dim. Affected dim must be replicate."""
-    result = _propagate_replicate_affected(sharded, dim)
+    result = propagate_replicate_affected(sharded, dim)
     if result is None:
         return None
     # Output dim changes size to k — but sharding on other dims is unchanged
@@ -1078,27 +1072,7 @@ def propagate_argmax(sharded, dim=None, keepdim=False):
             if _mode_has_mesh(sharded.hier_layout.shape[d]):
                 return None
         return ShardedLayout.replicate(())
-    return _propagate_replicate_affected(sharded, dim)
-
-
-def propagate_argmin(sharded, dim=None, keepdim=False):
-    """argmin: indices of min. Same as argmax."""
-    return propagate_argmax(sharded, dim, keepdim)
-
-
-def propagate_cumsum(sharded, dim):
-    """cumsum: cumulative sum. Affected dim must be replicate."""
-    return _propagate_replicate_affected(sharded, dim)
-
-
-def propagate_cumprod(sharded, dim):
-    """cumprod: cumulative product. Affected dim must be replicate."""
-    return _propagate_replicate_affected(sharded, dim)
-
-
-def propagate_softmax(sharded, dim):
-    """softmax: normalize along dim. Affected dim must be replicate."""
-    return _propagate_replicate_affected(sharded, dim)
+    return propagate_replicate_affected(sharded, dim)
 
 
 def propagate_layer_norm(sharded, normalized_dims):
@@ -1108,17 +1082,7 @@ def propagate_layer_norm(sharded, normalized_dims):
         affected = list(range(ndim - normalized_dims, ndim))
     else:
         affected = list(normalized_dims)
-    return _propagate_replicate_affected(sharded, affected)
-
-
-# =============================================================================
-# Select (= single-index slice)
-# =============================================================================
-
-
-def propagate_select(sharded, dim, index):
-    """select: remove one element along dim. Same as slice with single index."""
-    return propagate_slice(sharded, dim, index)
+    return propagate_replicate_affected(sharded, affected)
 
 
 # =============================================================================

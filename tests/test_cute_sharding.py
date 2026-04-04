@@ -30,14 +30,12 @@ from autoparallel.shardings.cute import (
     propagate_broadcast,
     propagate_cat,
     propagate_convolution,
-    propagate_cumsum,
     propagate_dot,
     propagate_dropout,
     propagate_einsum,
     propagate_embedding,
     propagate_expand,
     propagate_flatten,
-    propagate_flip,
     propagate_gather,
     propagate_identity,
     propagate_index_select,
@@ -48,11 +46,9 @@ from autoparallel.shardings.cute import (
     propagate_pointwise,
     propagate_reduction,
     propagate_repeat,
-    propagate_roll,
+    propagate_replicate_affected,
     propagate_scatter,
-    propagate_select,
     propagate_slice,
-    propagate_softmax,
     propagate_sort,
     propagate_split,
     propagate_squeeze,
@@ -1285,23 +1281,23 @@ class TestReplicateAffectedOps(unittest.TestCase):
 
     def test_flip_non_sharded(self):
         t = ShardedLayout.shard((4, 8), shard_dim=0, mesh_dim_size=2)
-        out = propagate_flip(t, dims=[1])
+        out = propagate_replicate_affected(t, [1])
         self.assertIsNotNone(out)
         self.assertEqual(out.get_placements()[0][:3], ("shard", 0, 2))
 
     def test_flip_sharded_rejects(self):
         t = ShardedLayout.shard((4, 8), shard_dim=0, mesh_dim_size=2)
-        out = propagate_flip(t, dims=[0])
+        out = propagate_replicate_affected(t, [0])
         self.assertIsNone(out)
 
     def test_roll_non_sharded(self):
         t = ShardedLayout.shard((4, 8), shard_dim=0, mesh_dim_size=2)
-        out = propagate_roll(t, shifts=2, dims=[1])
+        out = propagate_replicate_affected(t, [1])
         self.assertIsNotNone(out)
 
     def test_roll_sharded_rejects(self):
         t = ShardedLayout.shard((4, 8), shard_dim=0, mesh_dim_size=2)
-        out = propagate_roll(t, shifts=2, dims=[0])
+        out = propagate_replicate_affected(t, [0])
         self.assertIsNone(out)
 
     def test_sort(self):
@@ -1334,22 +1330,22 @@ class TestReplicateAffectedOps(unittest.TestCase):
 
     def test_cumsum(self):
         t = ShardedLayout.shard((4, 8), shard_dim=0, mesh_dim_size=2)
-        out = propagate_cumsum(t, dim=1)
+        out = propagate_replicate_affected(t, 1)
         self.assertIsNotNone(out)
 
     def test_cumsum_sharded_rejects(self):
         t = ShardedLayout.shard((4, 8), shard_dim=0, mesh_dim_size=2)
-        out = propagate_cumsum(t, dim=0)
+        out = propagate_replicate_affected(t, 0)
         self.assertIsNone(out)
 
     def test_softmax(self):
         t = ShardedLayout.shard((4, 8), shard_dim=0, mesh_dim_size=2)
-        out = propagate_softmax(t, dim=1)
+        out = propagate_replicate_affected(t, 1)
         self.assertIsNotNone(out)
 
     def test_softmax_sharded_rejects(self):
         t = ShardedLayout.shard((4, 8), shard_dim=0, mesh_dim_size=2)
-        out = propagate_softmax(t, dim=0)
+        out = propagate_replicate_affected(t, 0)
         self.assertIsNone(out)
 
     def test_layer_norm(self):
@@ -1367,7 +1363,7 @@ class TestSelectIndexSelect(unittest.TestCase):
 
     def test_select(self):
         t = ShardedLayout.shard((4, 8, 16), shard_dim=0, mesh_dim_size=2)
-        out = propagate_select(t, dim=1, index=3)
+        out = propagate_slice(t, dim=1, index=3)
         self.assertIsNotNone(out)
         self.assertEqual(out.get_placements()[0][:3], ("shard", 0, 2))
 
@@ -1461,7 +1457,7 @@ class TestOpRegistry(unittest.TestCase):
         self.assertEqual(get_propagation_rule("aten.permute.default"), propagate_permute)
         self.assertEqual(get_propagation_rule("aten.transpose.int"), propagate_transpose)
         self.assertEqual(get_propagation_rule("aten.unsqueeze.default"), propagate_unsqueeze)
-        self.assertEqual(get_propagation_rule("aten.select.int"), propagate_select)
+        self.assertEqual(get_propagation_rule("aten.select.int"), propagate_slice)
         self.assertEqual(get_propagation_rule("aten.embedding.default"), propagate_embedding)
         self.assertEqual(get_propagation_rule("aten.convolution.default"), propagate_convolution)
 
@@ -1498,6 +1494,42 @@ class TestOpRegistry(unittest.TestCase):
         from autoparallel.shardings.cute import OP_REGISTRY
         # Should have a substantial number of ops registered
         self.assertGreater(len(OP_REGISTRY), 200)
+
+    def test_registry_aten_calling_convention(self):
+        """Registry functions match ATen signatures — call with op args directly."""
+        from autoparallel.shardings.cute import get_propagation_rule
+
+        t = ShardedLayout.shard((4, 8), shard_dim=0, mesh_dim_size=2)
+
+        # aten.roll(self, shifts, dims) — shifts is unused for sharding
+        roll_fn = get_propagation_rule("aten.roll.default")
+        out = roll_fn(t, [2], [1])
+        self.assertIsNotNone(out)
+
+        # aten.flip(self, dims)
+        flip_fn = get_propagation_rule("aten.flip.default")
+        out = flip_fn(t, [1])
+        self.assertIsNotNone(out)
+
+        # aten._softmax(self, dim, half_to_float)
+        softmax_fn = get_propagation_rule("aten._softmax.default")
+        out = softmax_fn(t, 1, False)
+        self.assertIsNotNone(out)
+
+        # aten.cumsum(self, dim)
+        cumsum_fn = get_propagation_rule("aten.cumsum.default")
+        out = cumsum_fn(t, 1)
+        self.assertIsNotNone(out)
+
+        # aten.sort(self, dim, descending) — returns tuple
+        sort_fn = get_propagation_rule("aten.sort.default")
+        result = sort_fn(t, 1, False)
+        self.assertIsNotNone(result)
+
+        # aten.select.int(self, dim, index)
+        select_fn = get_propagation_rule("aten.select.int")
+        out = select_fn(t, 1, 3)
+        self.assertIsNotNone(out)
 
 
 if __name__ == "__main__":

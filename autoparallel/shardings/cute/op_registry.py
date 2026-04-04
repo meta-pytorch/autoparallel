@@ -12,21 +12,17 @@ map to propagate_pointwise, all reduction variants map to propagate_reduction).
 from .propagation import (
     propagate_addmm,
     propagate_argmax,
-    propagate_argmin,
     propagate_baddbmm,
     propagate_bmm,
     propagate_broadcast,
     propagate_cat,
     propagate_convolution,
-    propagate_cumsum,
-    propagate_cumprod,
     propagate_dot,
     propagate_dropout,
     propagate_einsum,
     propagate_embedding,
     propagate_expand,
     propagate_flatten,
-    propagate_flip,
     propagate_gather,
     propagate_identity,
     propagate_index_select,
@@ -37,11 +33,9 @@ from .propagation import (
     propagate_pointwise,
     propagate_reduction,
     propagate_repeat,
-    propagate_roll,
+    propagate_replicate_affected,
     propagate_scatter,
-    propagate_select,
     propagate_slice,
-    propagate_softmax,
     propagate_sort,
     propagate_split,
     propagate_squeeze,
@@ -316,37 +310,46 @@ _REDUCTION_OPS = {
     "aten.logsumexp.default": "sum",
 }
 
-# Ops that require replicate on affected dims (non-linear reductions, order-dependent)
-_REPLICATE_AFFECTED_OPS = [
-    "aten.argmax.default",
-    "aten.argmin.default",
-    "aten.cumsum.default",
-    "aten.cumprod.default",
-    "aten.cummax.default",
-    "aten.cummin.default",
-    "aten.logcumsumexp.default",
-    "aten.sort.default",
-    "aten.sort.stable",
-    "aten.topk.default",
-    "aten.kthvalue.default",
-    "aten.median.default",
-    "aten.median.dim",
-    "aten.mode.default",
-    "aten.nanmedian.default",
-    "aten.nanmedian.dim",
-    "aten._softmax.default",
-    "aten._softmax_backward_data.default",
-    "aten._log_softmax.default",
-    "aten._log_softmax_backward_data.default",
-    "aten._safe_softmax.default",
-    "aten.native_layer_norm.default",
-    "aten.native_layer_norm_backward.default",
-    "aten._fused_rms_norm.default",
-    "aten._fused_rms_norm_backward.default",
-    "aten.std.correction",
-    "aten.var.correction",
-    "aten.var_mean.correction",
-]
+# Ops that require replicate on affected dims (non-linear reductions, order-dependent).
+# Each mapped via lambda to match the ATen signature, forwarding only the
+# relevant args to propagate_replicate_affected(sharded, affected_dims).
+_REPLICATE_AFFECTED_OPS = {
+    # (self, dim?) — dim is the affected dim
+    "aten.argmax.default": lambda self, dim=None, keepdim=False: propagate_argmax(self, dim, keepdim),
+    "aten.argmin.default": lambda self, dim=None, keepdim=False: propagate_argmax(self, dim, keepdim),
+    # (self, dim) — single affected dim
+    "aten.cumsum.default": lambda self, dim, **kw: propagate_replicate_affected(self, dim),
+    "aten.cumprod.default": lambda self, dim, **kw: propagate_replicate_affected(self, dim),
+    "aten.cummax.default": lambda self, dim: propagate_replicate_affected(self, dim),
+    "aten.cummin.default": lambda self, dim: propagate_replicate_affected(self, dim),
+    "aten.logcumsumexp.default": lambda self, dim: propagate_replicate_affected(self, dim),
+    # (self, dim, extra...) — dim is affected, extra args ignored
+    "aten._softmax.default": lambda self, dim, half_to_float: propagate_replicate_affected(self, dim),
+    "aten._softmax_backward_data.default": lambda grad, output, dim, dtype: propagate_replicate_affected(grad, dim),
+    "aten._log_softmax.default": lambda self, dim, half_to_float: propagate_replicate_affected(self, dim),
+    "aten._log_softmax_backward_data.default": lambda grad, output, dim, dtype: propagate_replicate_affected(grad, dim),
+    "aten._safe_softmax.default": lambda self, dim, dtype=None: propagate_replicate_affected(self, dim),
+    # sort/topk: dim is affected, returns tuples (handled by propagate_sort/propagate_topk)
+    "aten.sort.default": lambda self, dim=-1, descending=False: propagate_sort(self, dim),
+    "aten.sort.stable": lambda self, *, stable=None, dim=-1, descending=False: propagate_sort(self, dim),
+    "aten.topk.default": lambda self, k, dim=-1, largest=True, sorted=True: propagate_topk(self, dim, k),
+    "aten.kthvalue.default": lambda self, k, dim=-1, keepdim=False: propagate_replicate_affected(self, dim),
+    # (self) — all dims, or (self, dim, keepdim)
+    "aten.median.default": lambda self: propagate_replicate_affected(self, list(range(len(self.global_shape)))),
+    "aten.median.dim": lambda self, dim, keepdim=False: propagate_replicate_affected(self, dim),
+    "aten.mode.default": lambda self, dim=-1, keepdim=False: propagate_replicate_affected(self, dim),
+    "aten.nanmedian.default": lambda self: propagate_replicate_affected(self, list(range(len(self.global_shape)))),
+    "aten.nanmedian.dim": lambda self, dim, keepdim=False: propagate_replicate_affected(self, dim),
+    # (self, dim?, correction?, keepdim) — dim is affected
+    "aten.std.correction": lambda self, dim=None, *, correction=None, keepdim=False: propagate_replicate_affected(self, dim if dim is not None else list(range(len(self.global_shape)))),
+    "aten.var.correction": lambda self, dim=None, *, correction=None, keepdim=False: propagate_replicate_affected(self, dim if dim is not None else list(range(len(self.global_shape)))),
+    "aten.var_mean.correction": lambda self, dim=None, *, correction=None, keepdim=False: propagate_replicate_affected(self, dim if dim is not None else list(range(len(self.global_shape)))),
+    # layer norm / rms norm: normalized_shape determines affected dims
+    "aten.native_layer_norm.default": lambda input, normalized_shape, weight, bias, eps: propagate_layer_norm(input, len(normalized_shape)),
+    "aten.native_layer_norm_backward.default": lambda grad, input, normalized_shape, mean, rstd, weight, bias, mask: propagate_layer_norm(grad, len(normalized_shape)),
+    "aten._fused_rms_norm.default": lambda input, normalized_shape, weight, eps=None: propagate_layer_norm(input, len(normalized_shape)),
+    "aten._fused_rms_norm_backward.default": lambda grad, input, normalized_shape, mean, weight, eps, mask: propagate_layer_norm(grad, len(normalized_shape)),
+}
 
 # Random ops: identity but reject Partial
 _RANDOM_OPS = [
@@ -377,11 +380,8 @@ for op in _POINTWISE_OPS:
 for op, reduce_op in _REDUCTION_OPS.items():
     OP_REGISTRY[op] = propagate_reduction
 
-# Replicate-affected
-for op in _REPLICATE_AFFECTED_OPS:
-    # These map to various specific functions depending on the op
-    # For the registry, we use a generic marker; the caller extracts the dim arg
-    OP_REGISTRY[op] = propagate_softmax  # placeholder — caller dispatches by op
+# Replicate-affected (with ATen-matching lambdas)
+OP_REGISTRY.update(_REPLICATE_AFFECTED_OPS)
 
 # Random
 for op in _RANDOM_OPS:
@@ -413,15 +413,15 @@ OP_REGISTRY.update({
     "aten.expand_copy.default": propagate_expand,
     "aten.repeat.default": propagate_repeat,
     # Tensor ops
-    "aten.select.int": propagate_select,
+    "aten.select.int": propagate_slice,
     "aten.slice.Tensor": propagate_slice,
     "aten.cat.default": propagate_cat,
     "aten.stack.default": propagate_stack,
     "aten.split.Tensor": propagate_split,
     "aten.split_with_sizes.default": propagate_split,
     "aten.unbind.int": propagate_unbind,
-    "aten.flip.default": propagate_flip,
-    "aten.roll.default": propagate_roll,
+    "aten.flip.default": lambda self, dims: propagate_replicate_affected(self, dims),
+    "aten.roll.default": lambda self, shifts, dims=None: propagate_replicate_affected(self, dims or []),
     "aten.gather.default": propagate_gather,
     "aten.index_select.default": propagate_index_select,
     "aten.scatter.src": propagate_scatter,
