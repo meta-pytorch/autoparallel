@@ -637,18 +637,44 @@ class TestRedistributeDetailed(unittest.TestCase):
     def test_s0s0_ltr_to_rtl(self):
         """S(0)S(0) left-to-right -> S(0)S(0) right-to-left.
 
-        LTR: specs [(0,2),(0,4)] -> mesh0 gets stride 16, mesh1 gets stride 64
-        RTL: specs [(0,4),(0,2)] -> mesh0 gets stride 16, mesh1 gets stride 32
+        LTR: specs [(0,2),(0,4)] -> mesh0(size=2, outermost, gs=64), mesh1(size=4, innermost, gs=16)
+        RTL: specs [(0,4),(0,2)] -> mesh0(size=4, outermost, gs=32), mesh1(size=2, innermost, gs=16)
 
-        mesh_dim 0: gs 16 -> 16, same -> no_op
-        mesh_dim 1: gs 64 -> 32, different -> all_to_all
+        mesh_dim 0 (outermost): gs 64 -> 32, different -> all_to_all
+        mesh_dim 1 (innermost): gs 16 -> 16, same -> no_op
         """
         ltr = ShardedLayout.shard_multi((8, 16), [(0, 2), (0, 4)])
         rtl = ShardedLayout.shard_multi((8, 16), [(0, 4), (0, 2)])
         result = plan_redistribute(ltr, rtl)
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0][0], "all_to_all")
-        self.assertEqual(result[0][1], 1)  # mesh_dim 1
+        self.assertEqual(result[0][1], 0)  # mesh_dim 0 (outermost)
+
+    def test_s0s0_per_mesh_dim_stride_values(self):
+        """Verify per-mesh-dim GPU strides match mesh dim sizes, not tuple positions.
+
+        For shard_multi((8, 16), [(0, 2), (0, 4)]):
+          mesh_dim 0 (size 2, outermost) should have the larger stride
+          mesh_dim 1 (size 4, innermost) should have the smaller stride
+
+        The nested logical_divide produces (4, 2) in innermost-first order,
+        but mesh_dim_map is outermost-first. The extraction must reverse.
+        """
+        from autoparallel.shardings.cute.sharding_v2 import _get_per_mesh_dim_gpu_stride
+
+        sl = ShardedLayout.shard_multi((8, 16), [(0, 2), (0, 4)])
+
+        md0_info = _get_per_mesh_dim_gpu_stride(sl, 0)
+        md1_info = _get_per_mesh_dim_gpu_stride(sl, 1)
+
+        self.assertIsNotNone(md0_info)
+        self.assertIsNotNone(md1_info)
+
+        _, md0_stride = md0_info
+        _, md1_stride = md1_info
+
+        # mesh_dim 0 (size 2, outermost) has larger stride than mesh_dim 1 (size 4, innermost)
+        self.assertGreater(md0_stride, md1_stride)
 
     def test_s0s0_ltr_to_rs0_ltr(self):
         """S(0)S(0) LTR -> RS(0) LTR.

@@ -1421,6 +1421,11 @@ def _get_per_mesh_dim_gpu_stride(sharded, mesh_dim):
     Walks hier_layout's 3-level structure to find the stride element
     corresponding to the given mesh dim. Returns (tensor_dim, gpu_stride)
     or None if this mesh dim doesn't shard any tensor dim.
+
+    For S(0)S(0), nested logical_divide produces innermost-first ordering
+    in the tuple (complement from last divide comes before mesh from first divide),
+    but mesh_dim_map is outermost-first (first spec = mesh_dim 0 = outermost).
+    So we reverse the flattened mesh elements to match mesh_dim_map order.
     """
     for tensor_dim, mesh_dims in sharded.mesh_dim_map.items():
         if mesh_dim in mesh_dims:
@@ -1429,8 +1434,8 @@ def _get_per_mesh_dim_gpu_stride(sharded, mesh_dim):
             dim_shape = sharded.hier_layout.shape[tensor_dim]
             dim_stride = sharded.hier_layout.stride[tensor_dim]
 
-            # Walk sub-dims counting mesh elements to find the right one
-            mesh_count = 0
+            # Collect all mesh elements across sub-dims
+            all_mesh = []
             for sub_s, sub_st in zip(dim_shape, dim_stride):
                 if _has_mesh(sub_s):
                     mesh_parts = sub_s[1:]
@@ -1444,11 +1449,14 @@ def _get_per_mesh_dim_gpu_stride(sharded, mesh_dim):
                             return result
                         return [(s, st)]
 
-                    flat_mesh = _flatten_mesh(mesh_parts, mesh_strides)
-                    for mesh_size, mesh_stride in flat_mesh:
-                        if mesh_count == mesh_idx_in_dim:
-                            return tensor_dim, mesh_stride
-                        mesh_count += 1
+                    all_mesh.extend(_flatten_mesh(mesh_parts, mesh_strides))
+
+            # Reverse: nested logical_divide produces innermost-first,
+            # but mesh_dim_map is outermost-first (construction order).
+            all_mesh.reverse()
+
+            if mesh_idx_in_dim < len(all_mesh):
+                return tensor_dim, all_mesh[mesh_idx_in_dim][1]
 
     return None
 
