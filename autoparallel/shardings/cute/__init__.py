@@ -63,3 +63,10 @@ from .op_registry import (
     OP_REGISTRY,
     get_propagation_rule,
 )
+
+from .strategy import (
+    enumerate_shardings,
+    enumerate_strategies,
+    register_sharding_hint,
+    get_sharding_hints,
+)

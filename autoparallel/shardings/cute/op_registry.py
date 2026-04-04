@@ -372,9 +372,16 @@ OP_REGISTRY = {}
 for op in _IDENTITY_OPS:
     OP_REGISTRY[op] = propagate_identity
 
+def _pointwise_adapter(*args, **kwargs):
+    """Adapt ATen pointwise calling convention to propagate_pointwise(list)."""
+    from .placement import ShardedLayout
+    shardeds = [a for a in args if isinstance(a, ShardedLayout)]
+    return propagate_pointwise(shardeds) if shardeds else None
+
+
 # Pointwise
 for op in _POINTWISE_OPS:
-    OP_REGISTRY[op] = propagate_pointwise
+    OP_REGISTRY[op] = _pointwise_adapter
 
 # Reduction
 for op, reduce_op in _REDUCTION_OPS.items():

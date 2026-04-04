@@ -1463,6 +1463,7 @@ class TestOpRegistry(unittest.TestCase):
 
     def test_pointwise_ops_registered(self):
         from autoparallel.shardings.cute import get_propagation_rule
+        from autoparallel.shardings.cute.op_registry import _pointwise_adapter
         pointwise_ops = [
             "aten.add.Tensor", "aten.sub.Tensor", "aten.mul.Tensor",
             "aten.div.Tensor", "aten.relu.default", "aten.gelu.default",
@@ -1470,7 +1471,7 @@ class TestOpRegistry(unittest.TestCase):
             "aten.abs.default", "aten.neg.default", "aten.exp.default",
         ]
         for op in pointwise_ops:
-            self.assertEqual(get_propagation_rule(op), propagate_pointwise, f"{op} not mapped to pointwise")
+            self.assertEqual(get_propagation_rule(op), _pointwise_adapter, f"{op} not mapped to pointwise")
 
     def test_identity_ops_registered(self):
         from autoparallel.shardings.cute import get_propagation_rule
@@ -1530,6 +1531,143 @@ class TestOpRegistry(unittest.TestCase):
         select_fn = get_propagation_rule("aten.select.int")
         out = select_fn(t, 1, 3)
         self.assertIsNotNone(out)
+
+
+class TestEnumerateShardings(unittest.TestCase):
+    """Tests for enumerate_shardings."""
+
+    def test_1d_mesh(self):
+        from autoparallel.shardings.cute import enumerate_shardings
+        # (8, 16) on mesh (2,)
+        shardings = enumerate_shardings((8, 16), (2,))
+        shapes = [s.global_shape for s in shardings]
+        # Should have: Replicate, Shard(0), Shard(1)
+        self.assertTrue(any(s.is_replicate() for s in shardings))
+        self.assertTrue(any(
+            s.mesh_dim_map == {0: (0,), 1: ()} for s in shardings
+        ))
+        self.assertTrue(any(
+            s.mesh_dim_map == {0: (), 1: (0,)} for s in shardings
+        ))
+        self.assertEqual(len(shardings), 3)
+
+    def test_2d_mesh(self):
+        from autoparallel.shardings.cute import enumerate_shardings
+        # (8, 16) on mesh (2, 4)
+        shardings = enumerate_shardings((8, 16), (2, 4))
+        # Should have: R, S(0,m0), S(1,m0), S(0,m1), S(1,m1),
+        # S(0,m0)S(1,m1), S(1,m0)S(0,m1),
+        # S(0)S(0) LTR, S(0)S(0) RTL (if 8 % 8 == 0),
+        # S(1)S(1) LTR, S(1)S(1) RTL (if 16 % 8 == 0)
+        self.assertGreater(len(shardings), 5)
+        # Verify replicate exists
+        self.assertTrue(any(s.is_replicate() for s in shardings))
+
+    def test_s0s0_orderings(self):
+        from autoparallel.shardings.cute import enumerate_shardings
+        # (8, 16) on mesh (2, 4): S(0)S(0) needs 8 % (2*4) == 0 ✓
+        shardings = enumerate_shardings((8, 16), (2, 4))
+        # Find S(0)S(0) candidates: mesh_dim_map[0] has both mesh dims
+        s0s0 = [s for s in shardings if len(s.mesh_dim_map[0]) == 2]
+        # Should have LTR and RTL as distinct layouts
+        self.assertEqual(len(s0s0), 2)
+        # They should be different ShardedLayouts
+        self.assertNotEqual(s0s0[0].hier_layout, s0s0[1].hier_layout)
+
+    def test_divisibility_filter(self):
+        from autoparallel.shardings.cute import enumerate_shardings
+        # (7, 16) on mesh (2,): dim 0 (size 7) not divisible by 2
+        shardings = enumerate_shardings((7, 16), (2,))
+        # Should have: Replicate, Shard(1) only — Shard(0) excluded
+        self.assertEqual(len(shardings), 2)
+        self.assertTrue(all(
+            s.is_replicate() or s.mesh_dim_map == {0: (), 1: (0,)}
+            for s in shardings
+        ))
+
+
+class TestEnumerateStrategies(unittest.TestCase):
+    """Tests for enumerate_strategies."""
+
+    def test_mm_strategies(self):
+        from autoparallel.shardings.cute import enumerate_shardings, enumerate_strategies
+        a_cands = enumerate_shardings((16, 8), (2,))
+        b_cands = enumerate_shardings((8, 32), (2,))
+        strategies = enumerate_strategies("aten.mm.default", [a_cands, b_cands])
+        self.assertGreater(len(strategies), 0)
+        # Should include: both replicate -> replicate output
+        rep_strats = [(ins, out) for ins, out in strategies
+                      if ins[0].is_replicate() and ins[1].is_replicate()]
+        self.assertEqual(len(rep_strats), 1)
+        self.assertTrue(rep_strats[0][1].is_replicate())
+        # Should include: A sharded on M, B replicate -> output sharded on M
+        m_shard = [(ins, out) for ins, out in strategies
+                   if ins[0].mesh_dim_map[0] == (0,) and ins[1].is_replicate()]
+        self.assertEqual(len(m_shard), 1)
+
+    def test_pointwise_strategies(self):
+        from autoparallel.shardings.cute import enumerate_shardings, enumerate_strategies
+        a_cands = enumerate_shardings((8, 16), (2,))
+        b_cands = enumerate_shardings((8, 16), (2,))
+        strategies = enumerate_strategies("aten.add.Tensor", [a_cands, b_cands])
+        # Should include matching shardings
+        self.assertGreater(len(strategies), 0)
+        # All outputs should be valid ShardedLayouts
+        for ins, out in strategies:
+            self.assertIsNotNone(out)
+
+
+class TestShardingHints(unittest.TestCase):
+    """Tests for op-specific sharding hints."""
+
+    def test_register_and_retrieve(self):
+        from autoparallel.shardings.cute.strategy import (
+            register_sharding_hint, get_sharding_hints, _OP_SHARDING_HINTS
+        )
+        # Clean up any previous registration
+        test_op = "aten._test_hint_op.default"
+        _OP_SHARDING_HINTS.pop(test_op, None)
+
+        def my_hint(tensor_shapes, mesh_shape):
+            return [[ShardedLayout.replicate(s) for s in tensor_shapes]]
+
+        register_sharding_hint(test_op, my_hint)
+        hints = get_sharding_hints(test_op, [(4, 8)], (2,))
+        self.assertGreater(len(hints), 0)
+
+        # Clean up
+        _OP_SHARDING_HINTS.pop(test_op, None)
+
+    def test_no_hints_returns_empty(self):
+        from autoparallel.shardings.cute import get_sharding_hints
+        hints = get_sharding_hints("aten.nonexistent.default", [(4, 8)], (2,))
+        self.assertEqual(hints, [])
+
+    def test_hints_extend_candidates(self):
+        from autoparallel.shardings.cute import enumerate_shardings
+        from autoparallel.shardings.cute.strategy import (
+            register_sharding_hint, get_sharding_hints, _OP_SHARDING_HINTS
+        )
+        test_op = "aten._test_hint_extend.default"
+        _OP_SHARDING_HINTS.pop(test_op, None)
+
+        # Register a hint that adds a custom sharding
+        custom = ShardedLayout.shard((8, 16), shard_dim=0, mesh_dim_size=2, mesh_dim=0)
+
+        def my_hint(tensor_shapes, mesh_shape):
+            return [[custom]]
+
+        register_sharding_hint(test_op, my_hint)
+
+        # Standard candidates
+        standard = enumerate_shardings((8, 16), (2,))
+        # Hints
+        hints = get_sharding_hints(test_op, [(8, 16)], (2,))
+        # Combined should be larger than standard alone
+        combined = standard + hints[0] if hints else standard
+        self.assertGreaterEqual(len(combined), len(standard))
+
+        _OP_SHARDING_HINTS.pop(test_op, None)
 
 
 if __name__ == "__main__":

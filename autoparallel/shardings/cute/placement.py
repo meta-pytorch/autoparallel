@@ -176,7 +176,7 @@ class ShardedLayout:
                 and self.mesh_dim_map == other.mesh_dim_map)
 
     def __hash__(self):
-        return hash((self.hier_layout, tuple(sorted(self.mesh_dim_map.items()))))
+        return hash((repr(self.hier_layout), tuple(sorted(self.mesh_dim_map.items()))))
 
     def __repr__(self):
         return f"ShardedLayout(hier={self.hier_layout}, mesh_map={self.mesh_dim_map})"
