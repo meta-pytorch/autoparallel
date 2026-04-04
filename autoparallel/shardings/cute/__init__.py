@@ -64,3 +64,8 @@ from .redistribute import (
     plan_redistribute,
     plan_redistribute_detailed,
 )
+
+from .op_registry import (
+    OP_REGISTRY,
+    get_propagation_rule,
+)

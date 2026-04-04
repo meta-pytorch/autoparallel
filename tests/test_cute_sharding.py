@@ -1441,5 +1441,64 @@ class TestDropoutOp(unittest.TestCase):
         self.assertIsNone(out)
 
 
+class TestOpRegistry(unittest.TestCase):
+    """Tests for op registry mapping ATen ops to propagation functions."""
+
+    def test_registry_lookup(self):
+        from autoparallel.shardings.cute import get_propagation_rule
+        self.assertIsNotNone(get_propagation_rule("aten.mm.default"))
+        self.assertIsNotNone(get_propagation_rule("aten.add.Tensor"))
+        self.assertIsNotNone(get_propagation_rule("aten.view.default"))
+        self.assertIsNotNone(get_propagation_rule("aten.clone.default"))
+        self.assertIsNone(get_propagation_rule("aten.nonexistent.default"))
+
+    def test_registry_maps_to_correct_functions(self):
+        from autoparallel.shardings.cute import get_propagation_rule
+        self.assertEqual(get_propagation_rule("aten.mm.default"), propagate_mm)
+        self.assertEqual(get_propagation_rule("aten.bmm.default"), propagate_bmm)
+        self.assertEqual(get_propagation_rule("aten.cat.default"), propagate_cat)
+        self.assertEqual(get_propagation_rule("aten.view.default"), propagate_view)
+        self.assertEqual(get_propagation_rule("aten.permute.default"), propagate_permute)
+        self.assertEqual(get_propagation_rule("aten.transpose.int"), propagate_transpose)
+        self.assertEqual(get_propagation_rule("aten.unsqueeze.default"), propagate_unsqueeze)
+        self.assertEqual(get_propagation_rule("aten.select.int"), propagate_select)
+        self.assertEqual(get_propagation_rule("aten.embedding.default"), propagate_embedding)
+        self.assertEqual(get_propagation_rule("aten.convolution.default"), propagate_convolution)
+
+    def test_pointwise_ops_registered(self):
+        from autoparallel.shardings.cute import get_propagation_rule
+        pointwise_ops = [
+            "aten.add.Tensor", "aten.sub.Tensor", "aten.mul.Tensor",
+            "aten.div.Tensor", "aten.relu.default", "aten.gelu.default",
+            "aten.sigmoid.default", "aten.tanh.default", "aten.where.self",
+            "aten.abs.default", "aten.neg.default", "aten.exp.default",
+        ]
+        for op in pointwise_ops:
+            self.assertEqual(get_propagation_rule(op), propagate_pointwise, f"{op} not mapped to pointwise")
+
+    def test_identity_ops_registered(self):
+        from autoparallel.shardings.cute import get_propagation_rule
+        identity_ops = [
+            "aten.clone.default", "aten.contiguous.default",
+            "aten.detach.default", "aten.empty_like.default",
+        ]
+        for op in identity_ops:
+            self.assertEqual(get_propagation_rule(op), propagate_identity, f"{op} not mapped to identity")
+
+    def test_reduction_ops_registered(self):
+        from autoparallel.shardings.cute import get_propagation_rule
+        reduction_ops = [
+            "aten.sum.default", "aten.mean.default", "aten.max.default",
+            "aten.min.default", "aten.amax.default",
+        ]
+        for op in reduction_ops:
+            self.assertEqual(get_propagation_rule(op), propagate_reduction, f"{op} not mapped to reduction")
+
+    def test_registry_size(self):
+        from autoparallel.shardings.cute import OP_REGISTRY
+        # Should have a substantial number of ops registered
+        self.assertGreater(len(OP_REGISTRY), 200)
+
+
 if __name__ == "__main__":
     unittest.main()
