@@ -22,6 +22,7 @@ from autoparallel.shardings.cute._pycute import (
 from autoparallel.shardings.cute.sharding_v2 import (
     ShardedLayout,
     plan_redistribute,
+    plan_redistribute_detailed,
     propagate_addmm,
     propagate_argmax,
     propagate_baddbmm,
@@ -557,6 +558,130 @@ class TestRedistribute(unittest.TestCase):
         source = ShardedLayout.replicate((8, 16))
         target = ShardedLayout.replicate((8, 16))
         self.assertEqual(plan_redistribute(source, target), [])
+
+
+class TestRedistributeDetailed(unittest.TestCase):
+    """Tests for GPU-stride-based redistribution with vectorization."""
+
+    def test_same_sharding_vectorization(self):
+        source = ShardedLayout.shard((8, 16), shard_dim=0, mesh_dim_size=2)
+        target = ShardedLayout.shard((8, 16), shard_dim=0, mesh_dim_size=2)
+        detail = plan_redistribute_detailed(source, target)
+        self.assertEqual(detail["collectives"], [])
+        # Same layout -> vectorization = local tile size (all local elements contiguous)
+        from autoparallel.shardings.cute._pycute import product as cute_product
+        local_size = cute_product(source.local_sizes)
+        self.assertEqual(detail["vectorization_factor"], local_size)
+
+    def test_shard_to_replicate_vectorization(self):
+        source = ShardedLayout.shard((8, 16), shard_dim=0, mesh_dim_size=2)
+        target = ShardedLayout.replicate((8, 16))
+        detail = plan_redistribute_detailed(source, target)
+        self.assertEqual(len(detail["collectives"]), 1)
+        self.assertEqual(detail["collectives"][0][0], "all_gather")
+        # src local = 64, tgt local = 128 -> mcv = max contiguous agreement
+        self.assertGreater(detail["vectorization_factor"], 0)
+
+    def test_all_to_all_vectorization(self):
+        source = ShardedLayout.shard((8, 16), shard_dim=0, mesh_dim_size=2)
+        target = ShardedLayout.shard((8, 16), shard_dim=1, mesh_dim_size=2)
+        detail = plan_redistribute_detailed(source, target)
+        self.assertEqual(len(detail["collectives"]), 1)
+        self.assertEqual(detail["collectives"][0][0], "all_to_all")
+        # Vectorization factor: how many contiguous elements per message
+        self.assertGreater(detail["vectorization_factor"], 0)
+        self.assertLess(detail["vectorization_factor"], source.num_elements)
+
+    def test_element_mapping_exists(self):
+        source = ShardedLayout.shard((8, 16), shard_dim=0, mesh_dim_size=2)
+        target = ShardedLayout.shard((8, 16), shard_dim=1, mesh_dim_size=2)
+        detail = plan_redistribute_detailed(source, target)
+        # Element mapping should be a Layout
+        self.assertIsNotNone(detail["element_mapping"])
+
+    def test_gpu_stride_classification(self):
+        """Verify the GPU stride approach classifies all standard cases."""
+        # S(0) -> R: all_gather
+        s1 = ShardedLayout.shard((8, 16), shard_dim=0, mesh_dim_size=2)
+        t1 = ShardedLayout.replicate((8, 16))
+        r1 = plan_redistribute(s1, t1)
+        self.assertEqual(r1[0][0], "all_gather")
+
+        # R -> S(0): no communication (local reinterpret)
+        r2 = plan_redistribute(t1, s1)
+        self.assertEqual(r2, [])
+
+        # S(0) -> S(1): all_to_all (fused from all_gather + local_slice)
+        t3 = ShardedLayout.shard((8, 16), shard_dim=1, mesh_dim_size=2)
+        r3 = plan_redistribute(s1, t3)
+        self.assertEqual(r3[0][0], "all_to_all")
+
+        # Same: no communication
+        r4 = plan_redistribute(s1, s1)
+        self.assertEqual(r4, [])
+
+    def test_partial_gpu_stride(self):
+        """Partial cases use GPU stride + partial annotation."""
+        # Partial -> Replicate: all_reduce
+        source = ShardedLayout.shard((16, 8), shard_dim=1, mesh_dim_size=2)
+        source = propagate_reduction(source, reduce_dim=1, keepdim=False)
+        target = ShardedLayout.replicate((16,))
+        r = plan_redistribute(source, target)
+        self.assertEqual(r[0][0], "all_reduce")
+
+        # Partial -> Shard: reduce_scatter
+        target2 = ShardedLayout.shard((16,), shard_dim=0, mesh_dim_size=2)
+        r2 = plan_redistribute(source, target2)
+        self.assertEqual(r2[0][0], "reduce_scatter")
+
+    def test_s0s0_ltr_to_rtl(self):
+        """S(0)S(0) left-to-right -> S(0)S(0) right-to-left.
+
+        LTR: specs [(0,2),(0,4)] -> mesh0 gets stride 16, mesh1 gets stride 64
+        RTL: specs [(0,4),(0,2)] -> mesh0 gets stride 16, mesh1 gets stride 32
+
+        mesh_dim 0: gs 16 -> 16, same -> no_op
+        mesh_dim 1: gs 64 -> 32, different -> all_to_all
+        """
+        ltr = ShardedLayout.shard_multi((8, 16), [(0, 2), (0, 4)])
+        rtl = ShardedLayout.shard_multi((8, 16), [(0, 4), (0, 2)])
+        result = plan_redistribute(ltr, rtl)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0][0], "all_to_all")
+        self.assertEqual(result[0][1], 1)  # mesh_dim 1
+
+    def test_s0s0_ltr_to_rs0_ltr(self):
+        """S(0)S(0) LTR -> RS(0) LTR.
+
+        S(0)S(0) LTR: mesh0(size=2, gs=64), mesh1(size=4, gs=16)
+        RS(0) LTR: mesh0 gs=0 (replicate), mesh1(size=4, gs=32)
+
+        mesh_dim 0: gs 64 -> 0 -> all_gather
+        mesh_dim 1: gs 16 -> 32, different -> all_to_all
+        """
+        src = ShardedLayout.shard_multi((8, 16), [(0, 2), (0, 4)])
+        tgt = ShardedLayout.shard((8, 16), shard_dim=0, mesh_dim_size=4, mesh_dim=1)
+        result = plan_redistribute(src, tgt)
+        collectives_by_md = {md: ctype for ctype, md, info in result}
+        self.assertEqual(collectives_by_md.get(0), "all_gather")
+        # mesh_dim 1 has different strides (16 vs 32)
+        self.assertIn(1, collectives_by_md)
+
+    def test_s0s0_rtl_to_rs0_rtl(self):
+        """S(0)S(0) RTL -> RS(0) RTL.
+
+        S(0)S(0) RTL: mesh0(size=4, gs=32), mesh1(size=2, gs=16)
+        RS(0) RTL: mesh0 gs=0 (replicate), mesh1(size=2, gs=64)
+
+        mesh_dim 0: gs 32 -> 0 -> all_gather
+        mesh_dim 1: gs 16 -> 64, different -> all_to_all
+        """
+        src = ShardedLayout.shard_multi((8, 16), [(0, 4), (0, 2)])
+        tgt = ShardedLayout.shard((8, 16), shard_dim=0, mesh_dim_size=2, mesh_dim=1)
+        result = plan_redistribute(src, tgt)
+        collectives_by_md = {md: ctype for ctype, md, info in result}
+        self.assertEqual(collectives_by_md.get(0), "all_gather")
+        self.assertIn(1, collectives_by_md)
 
 
 class TestCatPropagation(unittest.TestCase):
