@@ -22,15 +22,45 @@ from autoparallel.shardings.cute._pycute import (
 from autoparallel.shardings.cute.sharding_v2 import (
     ShardedLayout,
     plan_redistribute,
+    propagate_addmm,
+    propagate_argmax,
+    propagate_baddbmm,
+    propagate_bmm,
     propagate_broadcast,
     propagate_cat,
+    propagate_convolution,
+    propagate_cumsum,
+    propagate_dot,
+    propagate_dropout,
     propagate_einsum,
+    propagate_embedding,
+    propagate_expand,
+    propagate_flatten,
+    propagate_flip,
     propagate_gather,
+    propagate_identity,
+    propagate_index_select,
+    propagate_layer_norm,
+    propagate_mm,
+    propagate_movedim,
     propagate_permute,
     propagate_pointwise,
     propagate_reduction,
+    propagate_repeat,
+    propagate_roll,
+    propagate_scatter,
+    propagate_select,
     propagate_slice,
+    propagate_softmax,
+    propagate_sort,
+    propagate_split,
+    propagate_squeeze,
+    propagate_stack,
+    propagate_t,
+    propagate_topk,
     propagate_transpose,
+    propagate_unbind,
+    propagate_unflatten,
     propagate_unsqueeze,
     propagate_view,
 )
@@ -934,6 +964,330 @@ class TestInteractions(unittest.TestCase):
         v2 = propagate_view(tr2, (4, 8, 16))
         self.assertIsNotNone(v2)
         self.assertEqual(v2.get_placements(), t.get_placements())
+
+
+class TestIdentityOps(unittest.TestCase):
+    """Identity ops: clone, contiguous, detach, etc."""
+
+    def test_identity_shard(self):
+        t = ShardedLayout.shard((4, 8), shard_dim=0, mesh_dim_size=2)
+        out = propagate_identity(t)
+        self.assertEqual(out, t)
+
+    def test_identity_replicate(self):
+        t = ShardedLayout.replicate((4, 8))
+        out = propagate_identity(t)
+        self.assertTrue(out.is_replicate())
+
+
+class TestNamedMatrixOps(unittest.TestCase):
+    """mm, bmm, addmm, dot, t — wrappers over einsum/transpose."""
+
+    def test_mm(self):
+        a = ShardedLayout.shard((16, 8), shard_dim=0, mesh_dim_size=2)
+        b = ShardedLayout.replicate((8, 32))
+        out = propagate_mm(a, b)
+        self.assertIsNotNone(out)
+        self.assertEqual(out.global_shape, (16, 32))
+        self.assertEqual(out.get_placements()[0][:3], ("shard", 0, 2))
+
+    def test_bmm(self):
+        a = ShardedLayout.shard((4, 8, 16), shard_dim=0, mesh_dim_size=2)
+        b = ShardedLayout.shard((4, 16, 32), shard_dim=0, mesh_dim_size=2)
+        out = propagate_bmm(a, b)
+        self.assertIsNotNone(out)
+        self.assertEqual(out.global_shape, (4, 8, 32))
+        self.assertEqual(out.get_placements()[0], ("shard", 0, 2, (0,)))
+
+    def test_addmm(self):
+        bias = ShardedLayout.replicate((32,))
+        a = ShardedLayout.shard((16, 8), shard_dim=0, mesh_dim_size=2)
+        b = ShardedLayout.replicate((8, 32))
+        out = propagate_addmm(bias, a, b)
+        self.assertIsNotNone(out)
+        self.assertEqual(out.global_shape, (16, 32))
+
+    def test_dot(self):
+        a = ShardedLayout.replicate((8,))
+        b = ShardedLayout.replicate((8,))
+        out = propagate_dot(a, b)
+        self.assertIsNotNone(out)
+        self.assertTrue(out.is_replicate())
+
+    def test_dot_sharded(self):
+        a = ShardedLayout.shard((8,), shard_dim=0, mesh_dim_size=2)
+        b = ShardedLayout.shard((8,), shard_dim=0, mesh_dim_size=2)
+        out = propagate_dot(a, b)
+        self.assertIsNotNone(out)
+        self.assertEqual(out.partial, {0: "sum"})
+
+    def test_t(self):
+        t = ShardedLayout.shard((4, 8), shard_dim=0, mesh_dim_size=2)
+        out = propagate_t(t)
+        self.assertEqual(out.global_shape, (8, 4))
+        self.assertEqual(out.get_placements()[0][:3], ("shard", 1, 2))
+
+    def test_movedim(self):
+        t = ShardedLayout.shard((4, 8, 16), shard_dim=0, mesh_dim_size=2)
+        out = propagate_movedim(t, 0, 2)
+        self.assertEqual(out.global_shape, (8, 16, 4))
+        self.assertEqual(out.get_placements()[0][:3], ("shard", 2, 2))
+
+
+class TestViewVariants(unittest.TestCase):
+    """squeeze, expand, flatten, unflatten, repeat."""
+
+    def test_squeeze_size1(self):
+        t = ShardedLayout.shard((4, 1, 8), shard_dim=0, mesh_dim_size=2)
+        out = propagate_squeeze(t, dim=1)
+        self.assertEqual(out.global_shape, (4, 8))
+        self.assertEqual(out.get_placements()[0][:3], ("shard", 0, 2))
+
+    def test_squeeze_not_size1(self):
+        t = ShardedLayout.shard((4, 8), shard_dim=0, mesh_dim_size=2)
+        out = propagate_squeeze(t, dim=1)
+        self.assertEqual(out.global_shape, (4, 8))  # no change
+
+    def test_squeeze_all(self):
+        t = ShardedLayout.shard((4, 1, 1, 8), shard_dim=0, mesh_dim_size=2)
+        out = propagate_squeeze(t)
+        self.assertEqual(out.global_shape, (4, 8))
+
+    def test_flatten(self):
+        t = ShardedLayout.shard((4, 8, 16), shard_dim=0, mesh_dim_size=2)
+        out = propagate_flatten(t, start_dim=0, end_dim=1)
+        self.assertEqual(out.global_shape, (32, 16))
+
+    def test_unflatten(self):
+        t = ShardedLayout.shard((32, 16), shard_dim=0, mesh_dim_size=2)
+        out = propagate_unflatten(t, dim=0, sizes=(4, 8))
+        self.assertEqual(out.global_shape, (4, 8, 16))
+
+    def test_expand_broadcast(self):
+        t = ShardedLayout.shard((4, 1), shard_dim=0, mesh_dim_size=2)
+        out = propagate_expand(t, (4, 8))
+        self.assertIsNotNone(out)
+        self.assertEqual(out.global_shape, (4, 8))
+        self.assertEqual(out.get_placements()[0][:3], ("shard", 0, 2))
+
+    def test_expand_add_leading(self):
+        t = ShardedLayout.shard((4, 8), shard_dim=0, mesh_dim_size=2)
+        out = propagate_expand(t, (3, 4, 8))
+        self.assertIsNotNone(out)
+        self.assertEqual(out.global_shape, (3, 4, 8))
+        # Shard shifted to dim 1
+        self.assertEqual(out.get_placements()[0][:3], ("shard", 1, 2))
+
+    def test_repeat_unsharded(self):
+        t = ShardedLayout.shard((4, 8), shard_dim=0, mesh_dim_size=2)
+        out = propagate_repeat(t, (1, 2))
+        # Dim 0: repeat=1 -> carry. Dim 1: repeat=2, not sharded -> ok
+        self.assertIsNotNone(out)
+        self.assertEqual(out.global_shape, (4, 16))
+
+    def test_repeat_sharded_rejects(self):
+        t = ShardedLayout.shard((4, 8), shard_dim=0, mesh_dim_size=2)
+        out = propagate_repeat(t, (2, 1))
+        # Dim 0: repeat=2, sharded -> reject
+        self.assertIsNone(out)
+
+
+class TestStackSplitUnbind(unittest.TestCase):
+    """stack, split, unbind."""
+
+    def test_stack(self):
+        a = ShardedLayout.shard((4, 8), shard_dim=0, mesh_dim_size=2)
+        b = ShardedLayout.shard((4, 8), shard_dim=0, mesh_dim_size=2)
+        out = propagate_stack([a, b], dim=0)
+        self.assertIsNotNone(out)
+        self.assertEqual(out.global_shape, (2, 4, 8))
+
+    def test_split_replicate(self):
+        t = ShardedLayout.shard((8, 16), shard_dim=1, mesh_dim_size=2)
+        results = propagate_split(t, [4, 4], dim=0)
+        self.assertIsNotNone(results)
+        self.assertEqual(len(results), 2)
+        for r in results:
+            self.assertEqual(r.global_shape, (4, 16))
+
+    def test_split_sharded_rejects(self):
+        t = ShardedLayout.shard((8, 16), shard_dim=0, mesh_dim_size=2)
+        results = propagate_split(t, [4, 4], dim=0)
+        self.assertIsNone(results)
+
+    def test_unbind(self):
+        t = ShardedLayout.shard((4, 8), shard_dim=1, mesh_dim_size=2)
+        results = propagate_unbind(t, dim=0)
+        self.assertIsNotNone(results)
+        self.assertEqual(len(results), 4)
+        for r in results:
+            self.assertEqual(r.global_shape, (8,))
+
+    def test_unbind_sharded_rejects(self):
+        t = ShardedLayout.shard((4, 8), shard_dim=0, mesh_dim_size=2)
+        results = propagate_unbind(t, dim=0)
+        self.assertIsNone(results)
+
+
+class TestReplicateAffectedOps(unittest.TestCase):
+    """flip, roll, sort, topk, argmax, cumsum, softmax, layer_norm."""
+
+    def test_flip_non_sharded(self):
+        t = ShardedLayout.shard((4, 8), shard_dim=0, mesh_dim_size=2)
+        out = propagate_flip(t, dims=[1])
+        self.assertIsNotNone(out)
+        self.assertEqual(out.get_placements()[0][:3], ("shard", 0, 2))
+
+    def test_flip_sharded_rejects(self):
+        t = ShardedLayout.shard((4, 8), shard_dim=0, mesh_dim_size=2)
+        out = propagate_flip(t, dims=[0])
+        self.assertIsNone(out)
+
+    def test_roll_non_sharded(self):
+        t = ShardedLayout.shard((4, 8), shard_dim=0, mesh_dim_size=2)
+        out = propagate_roll(t, shifts=2, dims=[1])
+        self.assertIsNotNone(out)
+
+    def test_roll_sharded_rejects(self):
+        t = ShardedLayout.shard((4, 8), shard_dim=0, mesh_dim_size=2)
+        out = propagate_roll(t, shifts=2, dims=[0])
+        self.assertIsNone(out)
+
+    def test_sort(self):
+        t = ShardedLayout.shard((4, 8), shard_dim=0, mesh_dim_size=2)
+        result = propagate_sort(t, dim=1)
+        self.assertIsNotNone(result)
+        values, indices = result
+        self.assertEqual(values.get_placements()[0][:3], ("shard", 0, 2))
+
+    def test_sort_sharded_rejects(self):
+        t = ShardedLayout.shard((4, 8), shard_dim=0, mesh_dim_size=2)
+        self.assertIsNone(propagate_sort(t, dim=0))
+
+    def test_topk(self):
+        t = ShardedLayout.shard((4, 8), shard_dim=0, mesh_dim_size=2)
+        result = propagate_topk(t, dim=1, k=3)
+        self.assertIsNotNone(result)
+        values, indices = result
+        self.assertEqual(values.global_shape, (4, 3))
+
+    def test_argmax_non_sharded(self):
+        t = ShardedLayout.shard((4, 8), shard_dim=0, mesh_dim_size=2)
+        out = propagate_argmax(t, dim=1)
+        self.assertIsNotNone(out)
+
+    def test_argmax_sharded_rejects(self):
+        t = ShardedLayout.shard((4, 8), shard_dim=0, mesh_dim_size=2)
+        out = propagate_argmax(t, dim=0)
+        self.assertIsNone(out)
+
+    def test_cumsum(self):
+        t = ShardedLayout.shard((4, 8), shard_dim=0, mesh_dim_size=2)
+        out = propagate_cumsum(t, dim=1)
+        self.assertIsNotNone(out)
+
+    def test_cumsum_sharded_rejects(self):
+        t = ShardedLayout.shard((4, 8), shard_dim=0, mesh_dim_size=2)
+        out = propagate_cumsum(t, dim=0)
+        self.assertIsNone(out)
+
+    def test_softmax(self):
+        t = ShardedLayout.shard((4, 8), shard_dim=0, mesh_dim_size=2)
+        out = propagate_softmax(t, dim=1)
+        self.assertIsNotNone(out)
+
+    def test_softmax_sharded_rejects(self):
+        t = ShardedLayout.shard((4, 8), shard_dim=0, mesh_dim_size=2)
+        out = propagate_softmax(t, dim=0)
+        self.assertIsNone(out)
+
+    def test_layer_norm(self):
+        t = ShardedLayout.shard((4, 8, 16), shard_dim=0, mesh_dim_size=2)
+        out = propagate_layer_norm(t, normalized_dims=2)
+        self.assertIsNotNone(out)  # last 2 dims (8, 16) not sharded
+
+    def test_layer_norm_sharded_rejects(self):
+        t = ShardedLayout.shard((4, 8, 16), shard_dim=1, mesh_dim_size=2)
+        out = propagate_layer_norm(t, normalized_dims=2)
+        self.assertIsNone(out)  # dim 1 is sharded and in normalized range
+
+
+class TestSelectIndexSelect(unittest.TestCase):
+
+    def test_select(self):
+        t = ShardedLayout.shard((4, 8, 16), shard_dim=0, mesh_dim_size=2)
+        out = propagate_select(t, dim=1, index=3)
+        self.assertIsNotNone(out)
+        self.assertEqual(out.get_placements()[0][:3], ("shard", 0, 2))
+
+    def test_index_select(self):
+        t = ShardedLayout.shard((4, 8, 16), shard_dim=0, mesh_dim_size=2)
+        out = propagate_index_select(t, dim=1, index_size=3)
+        self.assertIsNotNone(out)
+
+
+class TestScatterOp(unittest.TestCase):
+
+    def test_scatter_replicate(self):
+        t = ShardedLayout.replicate((4, 8))
+        src = ShardedLayout.replicate((4, 8))
+        out = propagate_scatter(t, dim=0, src_sharded=src)
+        self.assertIsNotNone(out)
+
+    def test_scatter_sharded_rejects(self):
+        t = ShardedLayout.shard((4, 8), shard_dim=0, mesh_dim_size=2)
+        src = ShardedLayout.replicate((4, 8))
+        out = propagate_scatter(t, dim=0, src_sharded=src)
+        self.assertIsNone(out)
+
+
+class TestEmbeddingOp(unittest.TestCase):
+
+    def test_embedding_colwise(self):
+        weight = ShardedLayout.shard((1000, 64), shard_dim=1, mesh_dim_size=2)
+        indices = ShardedLayout.replicate((4, 8))
+        out = propagate_embedding(weight, indices, mode="colwise")
+        self.assertIsNotNone(out)
+
+    def test_embedding_batch(self):
+        weight = ShardedLayout.replicate((1000, 64))
+        indices = ShardedLayout.shard((4, 8), shard_dim=0, mesh_dim_size=2)
+        out = propagate_embedding(weight, indices, mode="batch")
+        self.assertIsNotNone(out)
+
+
+class TestConvolutionOp(unittest.TestCase):
+
+    def test_conv_batch_shard(self):
+        # (N, C_in, H, W) sharded on batch
+        inp = ShardedLayout.shard((4, 3, 32, 32), shard_dim=0, mesh_dim_size=2)
+        # (C_out, C_in, kH, kW) replicate
+        weight = ShardedLayout.replicate((16, 3, 3, 3))
+        out = propagate_convolution(inp, weight)
+        self.assertIsNotNone(out)
+        self.assertEqual(out.get_placements()[0][:3], ("shard", 0, 2))
+
+    def test_conv_spatial_sharded_rejects(self):
+        inp = ShardedLayout.shard((4, 3, 32, 32), shard_dim=2, mesh_dim_size=2)
+        weight = ShardedLayout.replicate((16, 3, 3, 3))
+        out = propagate_convolution(inp, weight)
+        self.assertIsNone(out)
+
+
+class TestDropoutOp(unittest.TestCase):
+
+    def test_dropout_shard(self):
+        t = ShardedLayout.shard((4, 8), shard_dim=0, mesh_dim_size=2)
+        out = propagate_dropout(t)
+        self.assertIsNotNone(out)
+        self.assertEqual(out, t)
+
+    def test_dropout_partial_rejects(self):
+        t = ShardedLayout.shard((4, 8), shard_dim=0, mesh_dim_size=2)
+        t = propagate_reduction(t, reduce_dim=0)
+        self.assertTrue(len(t.partial) > 0)
+        out = propagate_dropout(t)
+        self.assertIsNone(out)
 
 
 if __name__ == "__main__":

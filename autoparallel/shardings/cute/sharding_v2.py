@@ -323,7 +323,9 @@ def _apply_carry(spec, inputs):
 
 def _apply_insert(spec):
     """Apply Insert primitive."""
-    return (_SIZE_1_MODE, _SIZE_1_STRIDE), ()
+    if spec.size == 1:
+        return (_SIZE_1_MODE, _SIZE_1_STRIDE), ()
+    return (((spec.size, 1),), ((1, 0),)), ()
 
 
 def _apply_merge(spec, inputs):
@@ -696,19 +698,29 @@ def propagate_reduction(sharded, reduce_dim, keepdim=False, reduce_op="sum"):
 def propagate_broadcast(a, b):
     a_shape = a.global_shape
     b_shape = b.global_shape
-    if len(a_shape) != len(b_shape):
-        return None
+    ndim_a = len(a_shape)
+    ndim_b = len(b_shape)
+    ndim_out = max(ndim_a, ndim_b)
 
     recipe = []
-    for d in range(len(a_shape)):
-        if a_shape[d] == 1 and b_shape[d] == 1:
-            recipe.append(Carry([(0, d)]))
-        elif a_shape[d] == 1:
-            recipe.append(Carry([(1, d)]))
-        elif b_shape[d] == 1:
-            recipe.append(Carry([(0, d)]))
+    for i in range(ndim_out):
+        a_idx = i - (ndim_out - ndim_a)
+        b_idx = i - (ndim_out - ndim_b)
+        has_a = a_idx >= 0
+        has_b = b_idx >= 0
+
+        if not has_a:
+            recipe.append(Carry([(1, b_idx)]))
+        elif not has_b:
+            recipe.append(Carry([(0, a_idx)]))
+        elif a_shape[a_idx] == 1 and b_shape[b_idx] == 1:
+            recipe.append(Carry([(0, a_idx)]))
+        elif a_shape[a_idx] == 1:
+            recipe.append(Carry([(1, b_idx)]))
+        elif b_shape[b_idx] == 1:
+            recipe.append(Carry([(0, a_idx)]))
         else:
-            recipe.append(Carry([(0, d), (1, d)]))
+            recipe.append(Carry([(0, a_idx), (1, b_idx)]))
 
     return propagate(recipe, [], [a, b])
 
@@ -948,6 +960,454 @@ def propagate_cat(shardeds, dim):
             recipe.append(Carry([(i, d) for i in range(len(shardeds))]))
 
     return propagate(recipe, [], shardeds)
+
+
+# =============================================================================
+# Identity ops: clone, contiguous, detach, fill_, zero_, etc.
+# All dims Carry from the single input.
+# =============================================================================
+
+
+def propagate_identity(sharded):
+    """Identity: all dims carried through (clone, contiguous, detach, etc.)."""
+    ndim = len(sharded.global_shape)
+    recipe = [Carry([(0, i)]) for i in range(ndim)]
+    return propagate(recipe, [], [sharded])
+
+
+# =============================================================================
+# Named matrix ops: mm, bmm, addmm, dot — wrappers over einsum
+# =============================================================================
+
+
+def propagate_mm(sharded_a, sharded_b):
+    """mm: (M, K) @ (K, N) -> (M, N)."""
+    return propagate_einsum("mk,kn->mn", sharded_a, sharded_b)
+
+
+def propagate_bmm(sharded_a, sharded_b):
+    """bmm: (B, M, K) @ (B, K, N) -> (B, M, N)."""
+    return propagate_einsum("bmk,bkn->bmn", sharded_a, sharded_b)
+
+
+def propagate_addmm(sharded_bias, sharded_a, sharded_b):
+    """addmm: bias + A @ B. Propagate mm, then broadcast with bias."""
+    mm_result = propagate_mm(sharded_a, sharded_b)
+    if mm_result is None:
+        return None
+    return propagate_broadcast(sharded_bias, mm_result)
+
+
+def propagate_baddbmm(sharded_self, sharded_a, sharded_b):
+    """baddbmm: self + batch(A @ B)."""
+    bmm_result = propagate_bmm(sharded_a, sharded_b)
+    if bmm_result is None:
+        return None
+    return propagate_broadcast(sharded_self, bmm_result)
+
+
+def propagate_dot(sharded_a, sharded_b):
+    """dot: (K,) . (K,) -> scalar."""
+    return propagate_einsum("k,k->", sharded_a, sharded_b)
+
+
+def propagate_t(sharded):
+    """t: 2D matrix transpose."""
+    return propagate_transpose(sharded, 0, 1)
+
+
+def propagate_movedim(sharded, source, destination):
+    """movedim: move dimension from source to destination position."""
+    ndim = len(sharded.global_shape)
+    dims = list(range(ndim))
+    dims.pop(source)
+    dims.insert(destination, source)
+    return propagate_permute(sharded, dims)
+
+
+# =============================================================================
+# View variants: squeeze, expand, flatten, unflatten, repeat
+# =============================================================================
+
+
+def propagate_squeeze(sharded, dim=None):
+    """squeeze: remove size-1 dims. If dim specified, only that dim."""
+    shape = sharded.global_shape
+    if dim is not None:
+        if shape[dim] != 1:
+            return propagate_identity(sharded)
+        new_shape = shape[:dim] + shape[dim + 1:]
+    else:
+        new_shape = tuple(s for s in shape if s != 1)
+    if not new_shape:
+        new_shape = (1,)  # scalar
+    return propagate_view(sharded, new_shape)
+
+
+def propagate_flatten(sharded, start_dim=0, end_dim=-1):
+    """flatten: merge dims [start_dim, end_dim] into one."""
+    shape = sharded.global_shape
+    ndim = len(shape)
+    if end_dim < 0:
+        end_dim = ndim + end_dim
+    new_shape = shape[:start_dim] + (product(shape[start_dim:end_dim + 1]),) + shape[end_dim + 1:]
+    return propagate_view(sharded, new_shape)
+
+
+def propagate_unflatten(sharded, dim, sizes):
+    """unflatten: split dim into sizes."""
+    shape = sharded.global_shape
+    new_shape = shape[:dim] + tuple(sizes) + shape[dim + 1:]
+    return propagate_view(sharded, new_shape)
+
+
+def propagate_expand(sharded, new_shape):
+    """expand: broadcast size-1 dims to new_shape. No data copy."""
+    old_shape = sharded.global_shape
+    ndim_out = len(new_shape)
+    ndim_in = len(old_shape)
+
+    # Align from the right (expand can add leading dims)
+    recipe = []
+    removed = []
+    for i in range(ndim_out):
+        in_idx = i - (ndim_out - ndim_in)
+        if in_idx < 0:
+            # Leading dim added by expand
+            recipe.append(Insert(size=new_shape[i]))
+        elif old_shape[in_idx] == 1 and new_shape[i] != 1:
+            # Broadcasting size-1 to new_shape[i]: replace with expanded size
+            removed.append(Remove((0, in_idx), reduce_op=None))
+            recipe.append(Insert(size=new_shape[i]))
+        else:
+            recipe.append(Carry([(0, in_idx)]))
+
+    return propagate(recipe, removed, [sharded])
+
+
+def propagate_repeat(sharded, repeats):
+    """repeat: tile tensor by repeats. Dims with repeat > 1 must be replicate."""
+    shape = sharded.global_shape
+    ndim = len(shape)
+    ndim_out = len(repeats)
+
+    # repeat can add leading dims if len(repeats) > ndim
+    recipe = []
+    removed = []
+    for i in range(ndim_out):
+        in_idx = i - (ndim_out - ndim)
+        if in_idx < 0:
+            # Leading dim added by repeat
+            recipe.append(Insert(size=repeats[i]))
+        elif repeats[i] == 1:
+            recipe.append(Carry([(0, in_idx)]))
+        else:
+            # Repeated dim: must not be sharded (modular, can't express)
+            removed.append(Remove((0, in_idx), reduce_op=None))
+            recipe.append(Insert(size=shape[in_idx] * repeats[i]))
+
+    return propagate(recipe, removed, [sharded])
+
+
+# =============================================================================
+# Stack, split, unbind — inverses of cat
+# =============================================================================
+
+
+def propagate_stack(shardeds, dim):
+    """stack: insert new dim, then cat. All inputs must have same shape."""
+    if not shardeds:
+        return None
+    # Unsqueeze each input at dim, then cat along dim
+    unsqueezed = []
+    for s in shardeds:
+        u = propagate_unsqueeze(s, dim)
+        if u is None:
+            return None
+        unsqueezed.append(u)
+    return propagate_cat(unsqueezed, dim)
+
+
+def propagate_split(sharded, split_sizes, dim):
+    """split: inverse of cat. Returns list of ShardedLayouts.
+
+    Each output has the same sharding on all dims, just different size on split dim.
+    If dim is sharded, reject (can't split a sharded dim cleanly).
+    """
+    if _mode_has_mesh(sharded.hier_layout.shape[dim]):
+        return None
+
+    ndim = len(sharded.global_shape)
+    results = []
+    for size in split_sizes:
+        # Carry all dims, but replace split dim's mode with the right size
+        recipe = []
+        for i in range(ndim):
+            if i == dim:
+                recipe.append(Insert(size=size))
+            else:
+                recipe.append(Carry([(0, i)]))
+        removed = [Remove((0, dim), reduce_op=None)]
+        out = propagate(recipe, removed, [sharded])
+        if out is None:
+            return None
+        results.append(out)
+    return results
+
+
+def propagate_unbind(sharded, dim):
+    """unbind: remove dim, returning one ShardedLayout per element.
+
+    Equivalent to selecting each index along dim.
+    If dim is sharded, reject.
+    """
+    if _mode_has_mesh(sharded.hier_layout.shape[dim]):
+        return None
+
+    size = sharded.global_shape[dim]
+    results = []
+    for i in range(size):
+        out = propagate_slice(sharded, dim, i)
+        if out is None:
+            return None
+        results.append(out)
+    return results
+
+
+# =============================================================================
+# Replicate-on-affected-dim ops: flip, roll, sort, topk, argmax, argmin,
+# cumsum, cumprod, softmax, layer_norm
+#
+# Pattern: dims touched by the op must be replicate. Other dims carry through.
+# If a touched dim is sharded, reject.
+# =============================================================================
+
+
+def _propagate_replicate_affected(sharded, affected_dims):
+    """Generic: carry all dims, reject if any affected dim is sharded."""
+    ndim = len(sharded.global_shape)
+    if isinstance(affected_dims, int):
+        affected_dims = {affected_dims}
+    else:
+        affected_dims = set(affected_dims)
+
+    for d in affected_dims:
+        if _mode_has_mesh(sharded.hier_layout.shape[d]):
+            return None
+
+    recipe = [Carry([(0, i)]) for i in range(ndim)]
+    return propagate(recipe, [], [sharded])
+
+
+def propagate_flip(sharded, dims):
+    """flip: reverse elements along dims. Affected dims must be replicate."""
+    return _propagate_replicate_affected(sharded, dims)
+
+
+def propagate_roll(sharded, shifts, dims):
+    """roll: circular shift along dims. Affected dims must be replicate."""
+    return _propagate_replicate_affected(sharded, dims)
+
+
+def propagate_sort(sharded, dim):
+    """sort: sort along dim. Affected dim must be replicate. Returns (values, indices)."""
+    result = _propagate_replicate_affected(sharded, dim)
+    if result is None:
+        return None
+    return result, result  # both outputs have same sharding
+
+
+def propagate_topk(sharded, dim, k):
+    """topk: top-k along dim. Affected dim must be replicate."""
+    result = _propagate_replicate_affected(sharded, dim)
+    if result is None:
+        return None
+    # Output dim changes size to k — but sharding on other dims is unchanged
+    ndim = len(sharded.global_shape)
+    recipe = []
+    for i in range(ndim):
+        if i == dim:
+            recipe.append(Insert(size=k))
+        else:
+            recipe.append(Carry([(0, i)]))
+    removed = [Remove((0, dim), reduce_op=None)]
+    out = propagate(recipe, removed, [sharded])
+    if out is None:
+        return None
+    return out, out  # values and indices
+
+
+def propagate_argmax(sharded, dim=None, keepdim=False):
+    """argmax: indices of max. Non-linear reduction — must replicate reduced dim."""
+    if dim is None:
+        # Global argmax — all dims reduced, must all be replicate
+        for d in range(len(sharded.global_shape)):
+            if _mode_has_mesh(sharded.hier_layout.shape[d]):
+                return None
+        return ShardedLayout.replicate(())
+    return _propagate_replicate_affected(sharded, dim)
+
+
+def propagate_argmin(sharded, dim=None, keepdim=False):
+    """argmin: indices of min. Same as argmax."""
+    return propagate_argmax(sharded, dim, keepdim)
+
+
+def propagate_cumsum(sharded, dim):
+    """cumsum: cumulative sum. Affected dim must be replicate."""
+    return _propagate_replicate_affected(sharded, dim)
+
+
+def propagate_cumprod(sharded, dim):
+    """cumprod: cumulative product. Affected dim must be replicate."""
+    return _propagate_replicate_affected(sharded, dim)
+
+
+def propagate_softmax(sharded, dim):
+    """softmax: normalize along dim. Affected dim must be replicate."""
+    return _propagate_replicate_affected(sharded, dim)
+
+
+def propagate_layer_norm(sharded, normalized_dims):
+    """layer_norm: normalize along last N dims. Affected dims must be replicate."""
+    ndim = len(sharded.global_shape)
+    if isinstance(normalized_dims, int):
+        affected = list(range(ndim - normalized_dims, ndim))
+    else:
+        affected = list(normalized_dims)
+    return _propagate_replicate_affected(sharded, affected)
+
+
+# =============================================================================
+# Select (= single-index slice)
+# =============================================================================
+
+
+def propagate_select(sharded, dim, index):
+    """select: remove one element along dim. Same as slice with single index."""
+    return propagate_slice(sharded, dim, index)
+
+
+# =============================================================================
+# Index_select (= gather with contiguous index)
+# =============================================================================
+
+
+def propagate_index_select(sharded, dim, index_size):
+    """index_select: select elements by indices along dim.
+    Indices must be replicate. Same as gather with Layout(index_size, 1)."""
+    return propagate_gather(sharded, dim, Layout(index_size, 1))
+
+
+# =============================================================================
+# Scatter (conservative: reject if sharded on scatter dim)
+# =============================================================================
+
+
+def propagate_scatter(sharded, dim, src_sharded):
+    """scatter: write src into self at index positions.
+    Conservative: reject if scatter dim is sharded on either input."""
+    if _mode_has_mesh(sharded.hier_layout.shape[dim]):
+        return None
+    if _mode_has_mesh(src_sharded.hier_layout.shape[dim]):
+        return None
+    return propagate_broadcast(sharded, src_sharded)
+
+
+# =============================================================================
+# Embedding (specialized gather: rowwise, colwise, or batch)
+# =============================================================================
+
+
+def propagate_embedding(weight_sharded, indices_sharded, mode="rowwise"):
+    """embedding: look up rows from weight by indices.
+
+    modes:
+    - 'rowwise': weight S(0) on vocab dim -> Partial (each rank has subset of rows)
+    - 'colwise': weight S(1) on embed dim -> output sharded on embed dim
+    - 'batch': weight replicate, indices sharded on batch dim -> output sharded on batch
+    """
+    if mode == "colwise":
+        # Weight sharded on dim 1 (embedding dim), indices replicate
+        # Output: same shape as indices + embed_dim, sharded on last dim
+        ndim_idx = len(indices_sharded.global_shape)
+        recipe = [Carry([(1, i)]) for i in range(ndim_idx)]
+        # Add embedding dim from weight
+        recipe.append(Carry([(0, 1)]))
+        return propagate(recipe, [], [weight_sharded, indices_sharded])
+
+    elif mode == "batch":
+        # Weight replicate, indices sharded on some dim
+        # Output follows indices sharding + replicate embed dim
+        ndim_idx = len(indices_sharded.global_shape)
+        embed_dim = weight_sharded.global_shape[1]
+        recipe = [Carry([(1, i)]) for i in range(ndim_idx)]
+        recipe.append(Insert(size=embed_dim))
+        return propagate(recipe, [], [weight_sharded, indices_sharded])
+
+    else:  # rowwise
+        # Weight sharded on dim 0 (vocab), output has Partial
+        # Each rank looks up its local rows; non-matching indices get zeros
+        ndim_idx = len(indices_sharded.global_shape)
+        recipe = [Carry([(1, i)]) for i in range(ndim_idx)]
+        recipe.append(Carry([(0, 1)]))
+        removed = [Remove((0, 0), reduce_op="sum")]
+        return propagate(recipe, removed, [weight_sharded, indices_sharded])
+
+
+# =============================================================================
+# Convolution (carry batch/channel dims, replicate spatial dims if sharded)
+# =============================================================================
+
+
+def propagate_convolution(input_sharded, weight_sharded):
+    """convolution: (N, C_in, *spatial) * (C_out, C_in, *kernel) -> (N, C_out, *spatial_out).
+
+    Batch dim (0): carry from input.
+    C_out (1): carry from weight dim 0.
+    C_in: contracted (like einsum K dim).
+    Spatial dims: carry from input (reject if sharded — would need halo exchange).
+    """
+    ndim = len(input_sharded.global_shape)
+
+    # Check: spatial dims on input must not be sharded
+    for d in range(2, ndim):
+        if _mode_has_mesh(input_sharded.hier_layout.shape[d]):
+            return None
+
+    # Check: C_in on both must match
+    a_cin_sharded = _mode_has_mesh(input_sharded.hier_layout.shape[1])
+    b_cin_sharded = _mode_has_mesh(weight_sharded.hier_layout.shape[1])
+    if a_cin_sharded != b_cin_sharded:
+        return None
+
+    recipe = []
+    # Batch dim from input
+    recipe.append(Carry([(0, 0)]))
+    # C_out from weight dim 0
+    recipe.append(Carry([(1, 0)]))
+    # Spatial dims from input
+    for d in range(2, ndim):
+        recipe.append(Carry([(0, d)]))
+
+    # C_in is contracted
+    removed = []
+    if a_cin_sharded and b_cin_sharded:
+        removed.append(Remove((0, 1), reduce_op="sum"))
+
+    return propagate(recipe, removed, [input_sharded, weight_sharded])
+
+
+# =============================================================================
+# Dropout / random ops (identity — same sharding, just reject Partial)
+# =============================================================================
+
+
+def propagate_dropout(sharded):
+    """dropout: identity sharding. Reject if Partial (need synchronized randomness)."""
+    if sharded.partial:
+        return None
+    return propagate_identity(sharded)
 
 
 # =============================================================================
