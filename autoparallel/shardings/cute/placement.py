@@ -20,19 +20,69 @@ def _ensure_tuple(x):
     return x if is_tuple(x) else (x,)
 
 
+def _flatten_subdim(s, st):
+    """Flatten a possibly-nested sub-dim into a flat tuple of scalars.
+
+    E.g., (1, (4, 2)) with strides (16, (16, 64)) -> (1, 4, 2) with strides (16, 16, 64).
+    Scalar s -> (s, 1) with strides (st, 0).
+    Already-flat tuple (local, mesh) -> unchanged.
+    """
+    if not is_tuple(s):
+        return (s, 1), (st, 0)
+
+    flat_s = []
+    flat_st = []
+    for si, sti in zip(s, st if is_tuple(st) else (st,)):
+        if is_tuple(si):
+            # Recurse into nested tuple
+            inner_s, inner_st = _flatten_subdim(si, sti)
+            flat_s.extend(inner_s)
+            flat_st.extend(inner_st)
+        else:
+            flat_s.append(si)
+            flat_st.append(sti)
+    return tuple(flat_s), tuple(flat_st)
+
+
 def _to_uniform(layout):
-    """Convert a CuTe Layout to uniform 3-level nesting."""
+    """Convert a CuTe Layout to uniform 3-level nesting.
+
+    Guarantees:
+    - Level 1: each tensor dim is a tuple of level-2 sub-dims
+    - Level 2: each sub-dim is a flat tuple (local, mesh...) of scalars
+    - No nested tuples at level 3, no scalar sub-dims at level 2
+
+    Detection:
+    - If all elements of a mode are tuples -> already level 2 (from view merge),
+      normalize each sub-dim individually (flatten nested, wrap scalars)
+    - If any element is a scalar -> level 1 (from logical_divide / S(0)S(0)),
+      flatten the whole mode and wrap as a single sub-dim
+    """
     shape = _ensure_tuple(layout.shape)
     stride = _ensure_tuple(layout.stride)
     new_shape = []
     new_stride = []
     for s, st in zip(shape, stride):
-        if is_tuple(s):
-            new_shape.append((s,))
-            new_stride.append((st,))
-        else:
+        if not is_tuple(s):
+            # Scalar mode: wrap as ((s, 1),)
             new_shape.append(((s, 1),))
             new_stride.append(((st, 0),))
+        elif all(is_tuple(elem) for elem in s):
+            # Already level 2: normalize each sub-dim individually
+            norm_subs = []
+            norm_strides = []
+            for sub_s, sub_st in zip(s, st):
+                flat_s, flat_st = _flatten_subdim(sub_s, sub_st)
+                norm_subs.append(flat_s)
+                norm_strides.append(flat_st)
+            new_shape.append(tuple(norm_subs))
+            new_stride.append(tuple(norm_strides))
+        else:
+            # Level 1 (may have nested tuples from S(0)S(0) or scalars):
+            # flatten and wrap as single sub-dim
+            flat_s, flat_st = _flatten_subdim(s, st)
+            new_shape.append((flat_s,))
+            new_stride.append((flat_st,))
     return Layout(tuple(new_shape), tuple(new_stride))
 
 
@@ -41,12 +91,19 @@ def _empty_map(ndim):
 
 
 def _has_mesh(subdim):
-    """Check if a level-3 sub-dim has mesh sharding."""
+    """Check if a level-3 sub-dim has mesh sharding.
+
+    Sub-dim is a flat tuple (local, mesh...) where all elements are scalars.
+    S(0)S(0) has len > 2: (local, mesh0, mesh1).
+    """
     return len(subdim) > 1 and product(subdim[1:]) > 1
 
 
 def _local_size(mode):
-    """Get the local (per-device) size of a level-2 mode (tuple of sub-dims)."""
+    """Get the local (per-device) size of a level-2 mode (tuple of sub-dims).
+
+    Each sub-dim is a flat tuple (local, mesh...). sub[0] is always the scalar local size.
+    """
     result = 1
     for sub in mode:
         result *= sub[0]

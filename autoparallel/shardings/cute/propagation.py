@@ -26,6 +26,7 @@ from .placement import (
     _has_mesh,
     _local_size,
     _mode_has_mesh,
+    _to_uniform,
     _SIZE_1_MODE,
     _SIZE_1_STRIDE,
 )
@@ -442,6 +443,11 @@ def propagate(recipe, removed, inputs):
     for md in result.partial:
         if md in sharded_mesh_dims:
             return None  # contradictory: can't be both partial and sharded
+
+    # Normalize to uniform 3-level nesting: flattens nested tuples from
+    # S(0)S(0) and wraps scalar sub-dims from cat as (s, 1) tuples.
+    # Guarantees all level-3 elements are scalars.
+    result.hier_layout = _to_uniform(result.hier_layout)
 
     # Post-condition invariant checks
     _validate_sharded_layout(result)
