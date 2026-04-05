@@ -1004,6 +1004,26 @@ class TestEinsumExtended(unittest.TestCase):
         self.assertEqual(out.partial, {0: "sum"})
         self.assertTrue(out.is_replicate())  # output dims not sharded
 
+    def test_m_shard_n_shard_same_mesh_dim_rejects(self):
+        """S(M) on mesh 0 + S(N) on mesh 0 → invalid.
+
+        Both M and N would need to be sharded on the same mesh dim,
+        but a single mesh dim can only partition one tensor dim.
+        This would produce a block-diagonal decomposition, not a valid matmul.
+        """
+        a = ShardedLayout.shard((1024, 1024), shard_dim=0, mesh_dim_size=8, mesh_dim=0)
+        b = ShardedLayout.shard((1024, 1024), shard_dim=1, mesh_dim_size=8, mesh_dim=0)
+        out = propagate_einsum("mk,kn->mn", a, b)
+        self.assertIsNone(out)
+
+    def test_m_shard_n_shard_different_mesh_dims_ok(self):
+        """S(M) on mesh 0 + S(N) on mesh 1 → valid S(0)S(1) output (FSDP+TP)."""
+        a = ShardedLayout.shard((1024, 1024), shard_dim=0, mesh_dim_size=2, mesh_dim=0)
+        b = ShardedLayout.shard((1024, 1024), shard_dim=1, mesh_dim_size=4, mesh_dim=1)
+        out = propagate_einsum("mk,kn->mn", a, b)
+        self.assertIsNotNone(out)
+        self.assertEqual(out.mesh_dim_map, {0: (0,), 1: (1,)})
+
 
 class TestCatExtended(unittest.TestCase):
     """Additional cat tests from DTensor coverage gaps."""

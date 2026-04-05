@@ -363,18 +363,15 @@ def propagate(recipe, removed, inputs):
             else:
                 return None  # reject (e.g., slice on sharded dim)
 
-    # Also check mesh_dim_map compatibility for multi-source Carry
-    # Same mesh dim on different tensor dims -> incompatible
-    all_carry_sources = []
-    for spec in recipe:
-        if isinstance(spec, Carry) and len(spec.sources) > 1:
-            all_carry_sources.append(spec)
-
-    if len(inputs) > 1 and all_carry_sources:
-        # Check: same mesh dim must not be assigned to different output dims
+    # Check mesh_dim_map compatibility across ALL Carry specs:
+    # Same mesh dim must not be assigned to different output dims
+    # (e.g., einsum where M from A and N from B both use mesh_dim 0
+    # would require mesh_dim 0 to shard two dims independently — invalid
+    # on a single mesh dim without S(0)S(0))
+    if len(inputs) > 1:
         mesh_to_out = {}
         for out_dim, spec in enumerate(recipe):
-            if isinstance(spec, Carry):
+            if isinstance(spec, Carry) and spec.index_layout is None:
                 for inp_idx, dim_idx in spec.sources:
                     for md in inputs[inp_idx].mesh_dim_map[dim_idx]:
                         if md in mesh_to_out and mesh_to_out[md] != out_dim:
