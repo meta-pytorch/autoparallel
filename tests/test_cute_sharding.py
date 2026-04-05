@@ -1727,5 +1727,137 @@ class TestInvariantValidation(unittest.TestCase):
         self.assertIsNone(out)
 
 
+class TestSilentCorrectnessEdgeCases(unittest.TestCase):
+    """Tests for potential silent correctness issues identified during design review.
+
+    Each test targets a specific edge case that could produce an internally
+    inconsistent ShardedLayout if the engine has gaps in its checks.
+    """
+
+    def test_s0s0_transpose(self):
+        """Case 1: S(0)S(0) through transpose — mesh structure must survive."""
+        t = ShardedLayout.shard_multi((8, 16), [(0, 2), (0, 4)])
+        self.assertEqual(t.mesh_dim_map, {0: (0, 1), 1: ()})
+
+        out = propagate_transpose(t, 0, 1)
+        self.assertIsNotNone(out)
+        self.assertEqual(out.global_shape, (16, 8))
+        # S(0)S(0) should move to dim 1
+        self.assertEqual(out.mesh_dim_map, {0: (), 1: (0, 1)})
+
+    def test_s0s0_view_merge(self):
+        """Case 1b: S(0)S(0) through view merge — should preserve structure."""
+        t = ShardedLayout.shard_multi((8, 16, 4), [(0, 2), (0, 4)])
+        # View (8, 16, 4) -> (8, 64): merge dims 1 and 2
+        out = propagate_view(t, (8, 64))
+        self.assertIsNotNone(out)
+        self.assertEqual(out.global_shape, (8, 64))
+        # S(0)S(0) stays on dim 0
+        self.assertEqual(out.mesh_dim_map[0], (0, 1))
+
+    def test_partial_plus_sharded_same_mesh_dim(self):
+        """Case 2: Partial on mesh_dim 0 + sharding on mesh_dim 0 is contradictory.
+
+        This can arise if a K-sharded reduction produces Partial on mesh_dim 0,
+        then a downstream op tries to carry a dim sharded on mesh_dim 0.
+        """
+        # Create a Partial result: K-sharded einsum
+        a = ShardedLayout.shard((16, 8), shard_dim=1, mesh_dim_size=2, mesh_dim=0)
+        b = ShardedLayout.shard((8, 32), shard_dim=0, mesh_dim_size=2, mesh_dim=0)
+        partial_result = propagate_einsum("mk,kn->mn", a, b)
+        self.assertIsNotNone(partial_result)
+        self.assertEqual(partial_result.partial, {0: "sum"})
+
+        # Now try pointwise with something sharded on mesh_dim 0
+        sharded = ShardedLayout.shard((16, 32), shard_dim=0, mesh_dim_size=2, mesh_dim=0)
+
+        # This should be rejected: partial_result has Partial on mesh 0,
+        # sharded has Shard on mesh 0 for dim 0.
+        # The pointwise Carry would inherit mesh_dim 0 on dim 0 from sharded,
+        # plus Partial on mesh_dim 0 from partial_result → contradictory.
+        out = propagate_pointwise([partial_result, sharded])
+        self.assertIsNone(out)
+
+    def test_cat_incompatible_non_cat_dims(self):
+        """Case 3: Cat where non-cat dims have incompatible shardings across inputs."""
+        # A shards dim 1 on mesh 0, B shards dim 1 on mesh 1
+        a = ShardedLayout.shard((4, 8), shard_dim=1, mesh_dim_size=2, mesh_dim=0)
+        b = ShardedLayout.shard((4, 8), shard_dim=1, mesh_dim_size=2, mesh_dim=1)
+        # Cat on dim 0: non-cat dim 1 has different mesh dims → incompatible
+        out = propagate_cat([a, b], dim=0)
+        self.assertIsNone(out)
+
+    def test_cat_one_replicate_one_sharded_non_cat_dim(self):
+        """Case 3b: Cat where one input is replicate, other sharded on non-cat dim."""
+        a = ShardedLayout.shard((4, 8), shard_dim=1, mesh_dim_size=2)
+        b = ShardedLayout.replicate((4, 8))
+        # Cat on dim 0: non-cat dim 1 — a is sharded, b is replicate
+        # Carry should pick the sharded one (compatible)
+        out = propagate_cat([a, b], dim=0)
+        self.assertIsNotNone(out)
+
+    def test_view_merge3_split2(self):
+        """Case 4: Merge 3 dims into 1, then split into 2 — mesh_dim redistribution."""
+        # (4, 8, 16) with S(0) on dim 1
+        t = ShardedLayout.shard((4, 8, 16), shard_dim=1, mesh_dim_size=2)
+        # Merge all 3 dims: (4, 8, 16) -> (512,)
+        v1 = propagate_view(t, (512,))
+        self.assertIsNotNone(v1)
+        self.assertEqual(v1.global_shape, (512,))
+        # Mesh should be on dim 0
+        self.assertFalse(v1.is_replicate())
+
+        # Split into 2 dims: (512,) -> (32, 16)
+        v2 = propagate_view(v1, (32, 16))
+        self.assertIsNotNone(v2)
+        self.assertEqual(v2.global_shape, (32, 16))
+
+    def test_einsum_batch_different_mesh_dims_rejects(self):
+        """Case 5: Batch dim sharded on different mesh dims across inputs → reject."""
+        # A: batch on mesh_dim 0, B: batch on mesh_dim 1
+        a = ShardedLayout.shard((4, 8, 16), shard_dim=0, mesh_dim_size=2, mesh_dim=0)
+        b = ShardedLayout.shard((4, 16, 32), shard_dim=0, mesh_dim_size=2, mesh_dim=1)
+        # Batch dim 'b' is in both A and B but on different mesh dims
+        out = propagate_einsum("bmk,bkn->bmn", a, b)
+        # Should be rejected: batch dims must match
+        self.assertIsNone(out)
+
+    def test_einsum_batch_same_mesh_dim_ok(self):
+        """Case 5b: Batch dim on same mesh dim across inputs → valid."""
+        a = ShardedLayout.shard((4, 8, 16), shard_dim=0, mesh_dim_size=2, mesh_dim=0)
+        b = ShardedLayout.shard((4, 16, 32), shard_dim=0, mesh_dim_size=2, mesh_dim=0)
+        out = propagate_einsum("bmk,bkn->bmn", a, b)
+        self.assertIsNotNone(out)
+        self.assertEqual(out.mesh_dim_map[0], (0,))
+
+    def test_expand_sharded_size1_dim(self):
+        """Case 6: Expand only broadcasts size-1 dims.
+
+        Sharded dims (size > 1) are not touched by expand — they pass through
+        via Carry. A size-1 dim that's replicate (mesh=1) expands normally.
+        A truly sharded size-1 dim would require mesh_size > 1 on a size-1 dim,
+        which is impossible (can't divide 1 by >1).
+
+        So expand is safe: it only operates on size-1 dims which can't be
+        meaningfully sharded.
+        """
+        # (4, 1, 8) with dim 0 sharded — expand dim 1 from 1 to 16
+        t = ShardedLayout.shard((4, 1, 8), shard_dim=0, mesh_dim_size=2)
+        out = propagate_expand(t, (4, 16, 8))
+        self.assertIsNotNone(out)
+        self.assertEqual(out.global_shape, (4, 16, 8))
+        # Shard on dim 0 preserved
+        self.assertEqual(out.get_placements()[0][:3], ("shard", 0, 2))
+
+    def test_expand_replicate_size1_dim_ok(self):
+        """Case 6b: Expand a size-1 replicate dim — should work."""
+        t = ShardedLayout.shard((4, 1), shard_dim=0, mesh_dim_size=2)
+        out = propagate_expand(t, (4, 8))
+        self.assertIsNotNone(out)
+        self.assertEqual(out.global_shape, (4, 8))
+        # Shard on dim 0 preserved
+        self.assertEqual(out.get_placements()[0][:3], ("shard", 0, 2))
+
+
 if __name__ == "__main__":
     unittest.main()

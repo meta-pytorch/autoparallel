@@ -435,6 +435,14 @@ def propagate(recipe, removed, inputs):
                 return None
             result.partial[md] = op if md not in result.partial else result.partial[md]
 
+    # Check: partial mesh_dims must not overlap with sharded mesh_dims
+    sharded_mesh_dims = set()
+    for mesh_dims in result.mesh_dim_map.values():
+        sharded_mesh_dims.update(mesh_dims)
+    for md in result.partial:
+        if md in sharded_mesh_dims:
+            return None  # contradictory: can't be both partial and sharded
+
     # Post-condition invariant checks
     _validate_sharded_layout(result)
 
