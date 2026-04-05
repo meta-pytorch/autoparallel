@@ -1690,5 +1690,42 @@ class TestShardingHints(unittest.TestCase):
         _OP_SHARDING_HINTS.pop(test_op, None)
 
 
+class TestInvariantValidation(unittest.TestCase):
+    """Tests for post-condition invariant assertions in the propagation engine."""
+
+    def test_valid_sharding_passes(self):
+        """Standard shardings pass validation without error."""
+        from autoparallel.shardings.cute.propagation import _validate_sharded_layout
+        _validate_sharded_layout(ShardedLayout.replicate((4, 8)))
+        _validate_sharded_layout(ShardedLayout.shard((4, 8), 0, 2))
+        _validate_sharded_layout(ShardedLayout.shard_multi((4, 8, 16), [(0, 2), (1, 4)]))
+
+    def test_mesh_dim_on_multiple_tensor_dims_rejects(self):
+        """Manually constructed layout with same mesh_dim on two tensor dims."""
+        from autoparallel.shardings.cute.propagation import _validate_sharded_layout
+        from autoparallel.shardings.cute._pycute import Layout
+        # Force invalid state: mesh_dim 0 on both tensor dims
+        sl = ShardedLayout.shard((8, 16), 0, 2, mesh_dim=0)
+        sl.mesh_dim_map[1] = (0,)  # inject: mesh_dim 0 also on dim 1
+        with self.assertRaises(AssertionError, msg="mesh dim on multiple tensor dims"):
+            _validate_sharded_layout(sl)
+
+    def test_partial_and_sharded_on_same_mesh_dim_rejects(self):
+        """Partial on mesh_dim 0 AND sharding on mesh_dim 0 is contradictory."""
+        from autoparallel.shardings.cute.propagation import _validate_sharded_layout
+        sl = ShardedLayout.shard((8, 16), 0, 2, mesh_dim=0)
+        sl.partial = {0: "sum"}  # inject: partial on mesh_dim 0
+        with self.assertRaises(AssertionError, msg="partial and sharded on same mesh dim"):
+            _validate_sharded_layout(sl)
+
+    def test_propagation_rejects_invalid_strategy(self):
+        """The engine itself rejects strategies that would violate invariants."""
+        # S(M) on mesh 0 + S(N) on mesh 0 → rejected before validation
+        a = ShardedLayout.shard((16, 8), shard_dim=0, mesh_dim_size=2, mesh_dim=0)
+        b = ShardedLayout.shard((8, 32), shard_dim=1, mesh_dim_size=2, mesh_dim=0)
+        out = propagate_einsum("mk,kn->mn", a, b)
+        self.assertIsNone(out)
+
+
 if __name__ == "__main__":
     unittest.main()

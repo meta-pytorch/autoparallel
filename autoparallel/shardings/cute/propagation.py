@@ -435,7 +435,61 @@ def propagate(recipe, removed, inputs):
                 return None
             result.partial[md] = op if md not in result.partial else result.partial[md]
 
+    # Post-condition invariant checks
+    _validate_sharded_layout(result)
+
     return result
+
+
+def _validate_sharded_layout(sl):
+    """Validate invariants on a ShardedLayout. Raises AssertionError on violation.
+
+    Invariants:
+    1. Global shape consistency: product of each mode = global_shape dim
+    2. Local * mesh = global per dim
+    3. No mesh_dim on multiple output tensor dims (single mesh dim can't
+       independently partition two dims)
+    4. Partial mesh_dims must not also be sharded (Partial = replicate with
+       pending reduction; sharding on same mesh_dim is contradictory)
+    5. mesh_dim_map must cover all dims
+    """
+    shape = sl.hier_layout.shape
+    ndim = len(_ensure_tuple(shape))
+
+    # Invariant 1 & 2: global = local * mesh per dim
+    global_shape = sl.global_shape
+    local_sizes = sl.local_sizes
+    for d in range(ndim):
+        g = global_shape[d]
+        l = local_sizes[d]
+        assert g > 0, f"Dim {d}: global_shape must be positive, got {g}"
+        assert l > 0, f"Dim {d}: local_size must be positive, got {l}"
+        assert g % l == 0, f"Dim {d}: global {g} not divisible by local {l}"
+
+    # Invariant 3: no mesh_dim on multiple tensor dims
+    mesh_to_tensor = {}
+    for tensor_dim, mesh_dims in sl.mesh_dim_map.items():
+        for md in mesh_dims:
+            if md in mesh_to_tensor:
+                other = mesh_to_tensor[md]
+                assert other == tensor_dim, (
+                    f"Mesh dim {md} assigned to both tensor dim {other} and {tensor_dim}. "
+                    f"A single mesh dim can't independently partition two tensor dims."
+                )
+            mesh_to_tensor[md] = tensor_dim
+
+    # Invariant 4: partial mesh_dims must not also be sharded
+    for md in sl.partial:
+        assert md not in mesh_to_tensor, (
+            f"Mesh dim {md} is both Partial('{sl.partial[md]}') and sharding "
+            f"tensor dim {mesh_to_tensor[md]}. Partial means replicate with "
+            f"pending reduction — can't also be sharded."
+        )
+
+    # Invariant 5: mesh_dim_map covers all dims
+    assert len(sl.mesh_dim_map) == ndim, (
+        f"mesh_dim_map has {len(sl.mesh_dim_map)} entries but tensor has {ndim} dims"
+    )
 
 
 # =============================================================================
