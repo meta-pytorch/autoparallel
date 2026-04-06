@@ -351,7 +351,50 @@ _REPLICATE_AFFECTED_OPS = {
     "aten._fused_rms_norm_backward.default": lambda grad, input, normalized_shape, mean, weight, eps, mask: propagate_layer_norm(grad, len(normalized_shape)),
 }
 
-# Random ops: identity but reject Partial
+# Linearity categories for pointwise ops.
+# Determines how Partial inputs propagate:
+#   "unary" — single tensor input, Partial passes through (neg, scalar mul)
+#   "additive" — Partial + Partial -> Partial (add, sub)
+#   "multiplicative" — Partial * Replicate -> Partial, Partial * Partial -> reject (mul, div)
+#   None — non-linear, reject if any input has Partial (default for all other pointwise)
+
+_UNARY_LINEAR_OPS = [
+    "aten.neg.default",
+    "aten.neg_.default",
+    "aten.to.dtype",
+    "aten.mul.Scalar",
+    "aten.mul_.Scalar",
+    "aten.div.Scalar",
+    "aten.div_.Scalar",
+]
+
+_ADDITIVE_LINEAR_OPS = [
+    "aten.add.Tensor",
+    "aten.add_.Tensor",
+    "aten.add.out",
+    "aten.add.Scalar",
+    "aten.add_.Scalar",
+    "aten.sub.Tensor",
+    "aten.sub_.Tensor",
+    "aten.sub.out",
+    "aten.sub.Scalar",
+    "aten.sub_.Scalar",
+    "aten.rsub.Scalar",
+    "aten.rsub.Tensor",
+]
+
+_MULTIPLICATIVE_LINEAR_OPS = [
+    "aten.mul.Tensor",
+    "aten.mul_.Tensor",
+    "aten.mul.out",
+    "aten.div.Tensor",
+    "aten.div_.Tensor",
+    "aten.div.out",
+    "aten.div.out_mode",
+    "aten.div.Tensor_mode",
+    "aten.div_.Tensor_mode",
+    "aten.true_divide.Tensor",
+]
 _RANDOM_OPS = [
     "aten.normal_.default",
     "aten.uniform_.default",
@@ -372,16 +415,35 @@ OP_REGISTRY = {}
 for op in _IDENTITY_OPS:
     OP_REGISTRY[op] = propagate_identity
 
-def _pointwise_adapter(*args, **kwargs):
-    """Adapt ATen pointwise calling convention to propagate_pointwise(list)."""
-    from .placement import ShardedLayout
-    shardeds = [a for a in args if isinstance(a, ShardedLayout)]
-    return propagate_pointwise(shardeds) if shardeds else None
+def _make_pointwise_adapter(linearity):
+    """Create a pointwise adapter with the given linearity."""
+    def adapter(*args, **kwargs):
+        from .placement import ShardedLayout
+        shardeds = [a for a in args if isinstance(a, ShardedLayout)]
+        return propagate_pointwise(shardeds, linearity=linearity) if shardeds else None
+    return adapter
+
+_pointwise_adapter = _make_pointwise_adapter(None)  # non-linear default
+_unary_linear_adapter = _make_pointwise_adapter("unary")
+_additive_linear_adapter = _make_pointwise_adapter("additive")
+_multiplicative_linear_adapter = _make_pointwise_adapter("multiplicative")
 
 
-# Pointwise
+# Pointwise: register with linearity
+_LINEAR_OP_SET = set(_UNARY_LINEAR_OPS + _ADDITIVE_LINEAR_OPS + _MULTIPLICATIVE_LINEAR_OPS)
 for op in _POINTWISE_OPS:
+    if op in _LINEAR_OP_SET:
+        continue  # registered below with specific linearity
     OP_REGISTRY[op] = _pointwise_adapter
+
+for op in _UNARY_LINEAR_OPS:
+    OP_REGISTRY[op] = _unary_linear_adapter
+
+for op in _ADDITIVE_LINEAR_OPS:
+    OP_REGISTRY[op] = _additive_linear_adapter
+
+for op in _MULTIPLICATIVE_LINEAR_OPS:
+    OP_REGISTRY[op] = _multiplicative_linear_adapter
 
 # Reduction
 for op, reduce_op in _REDUCTION_OPS.items():

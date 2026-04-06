@@ -1483,7 +1483,7 @@ class TestOpRegistry(unittest.TestCase):
 
     def test_pointwise_ops_registered(self):
         from autoparallel.shardings.cute import get_propagation_rule
-        from autoparallel.shardings.cute.op_registry import _pointwise_adapter
+        # All pointwise ops should have a registered rule (linear or non-linear)
         pointwise_ops = [
             "aten.add.Tensor", "aten.sub.Tensor", "aten.mul.Tensor",
             "aten.div.Tensor", "aten.relu.default", "aten.gelu.default",
@@ -1491,7 +1491,7 @@ class TestOpRegistry(unittest.TestCase):
             "aten.abs.default", "aten.neg.default", "aten.exp.default",
         ]
         for op in pointwise_ops:
-            self.assertEqual(get_propagation_rule(op), _pointwise_adapter, f"{op} not mapped to pointwise")
+            self.assertIsNotNone(get_propagation_rule(op), f"{op} not registered")
 
     def test_identity_ops_registered(self):
         from autoparallel.shardings.cute import get_propagation_rule
@@ -1725,6 +1725,69 @@ class TestInvariantValidation(unittest.TestCase):
         b = ShardedLayout.shard((8, 32), shard_dim=1, mesh_dim_size=2, mesh_dim=0)
         out = propagate_einsum("mk,kn->mn", a, b)
         self.assertIsNone(out)
+
+
+class TestPartialLinearity(unittest.TestCase):
+    """Tests for Partial propagation through pointwise ops with linearity."""
+
+    def _make_partial(self):
+        """Create a Partial("sum") tensor via K-sharded einsum."""
+        a = ShardedLayout.shard((16, 8), shard_dim=1, mesh_dim_size=2, mesh_dim=0)
+        b = ShardedLayout.shard((8, 32), shard_dim=0, mesh_dim_size=2, mesh_dim=0)
+        result = propagate_einsum("mk,kn->mn", a, b)
+        assert result is not None and result.partial == {0: "sum"}
+        return result
+
+    def test_add_partial_partial(self):
+        """add(Partial, Partial) -> Partial (additive linear)."""
+        p = self._make_partial()
+        from autoparallel.shardings.cute import get_propagation_rule
+        add_fn = get_propagation_rule("aten.add.Tensor")
+        out = add_fn(p, p)
+        self.assertIsNotNone(out)
+        self.assertEqual(out.partial, {0: "sum"})
+
+    def test_mul_partial_partial_rejects(self):
+        """mul(Partial, Partial) -> reject (non-linear in both args)."""
+        p = self._make_partial()
+        from autoparallel.shardings.cute import get_propagation_rule
+        mul_fn = get_propagation_rule("aten.mul.Tensor")
+        out = mul_fn(p, p)
+        self.assertIsNone(out)
+
+    def test_mul_partial_replicate(self):
+        """mul(Partial, Replicate) -> Partial (multiplicative linear in one arg)."""
+        p = self._make_partial()
+        r = ShardedLayout.replicate((16, 32))
+        from autoparallel.shardings.cute import get_propagation_rule
+        mul_fn = get_propagation_rule("aten.mul.Tensor")
+        out = mul_fn(p, r)
+        self.assertIsNotNone(out)
+        self.assertEqual(out.partial, {0: "sum"})
+
+    def test_relu_partial(self):
+        """relu(Partial) -> reject (non-linear, can't reduce after relu)."""
+        p = self._make_partial()
+        from autoparallel.shardings.cute import get_propagation_rule
+        relu_fn = get_propagation_rule("aten.relu.default")
+        out = relu_fn(p)
+        self.assertIsNone(out)
+
+    def test_neg_partial(self):
+        """neg(Partial) -> Partial (unary linear: -(a+b) = -a + -b)."""
+        p = self._make_partial()
+        from autoparallel.shardings.cute import get_propagation_rule
+        neg_fn = get_propagation_rule("aten.neg.default")
+        out = neg_fn(p)
+        self.assertIsNotNone(out)
+        self.assertEqual(out.partial, {0: "sum"})
+
+    def test_clone_partial(self):
+        """clone(Partial) -> Partial (identity preserves Partial)."""
+        p = self._make_partial()
+        out = propagate_identity(p)
+        self.assertIsNotNone(out)
+        self.assertEqual(out.partial, {0: "sum"})
 
 
 class TestSilentCorrectnessEdgeCases(unittest.TestCase):

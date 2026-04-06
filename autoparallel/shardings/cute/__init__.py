@@ -15,6 +15,7 @@ from .propagation import (
     Remove,
     Split,
     propagate,
+    check_partial_linearity,
     propagate_addmm,
     propagate_argmax,
     propagate_baddbmm,

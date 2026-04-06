@@ -345,12 +345,57 @@ def _apply_split(spec, inputs, all_split_specs):
 # =============================================================================
 
 
+def check_partial_linearity(inputs, linearity):
+    """Check if input Partials are compatible with the op's linearity.
+
+    Call BEFORE propagate() to reject invalid Partial combinations.
+    Returns True if compatible, False if should reject.
+
+    Linearity types:
+        None  — non-linear: reject if any input has Partial
+        "unary"  — Partial passes through from single input
+        "additive" — Partial + Partial -> Partial (same reduce_op required)
+        "multiplicative" — Partial * Replicate -> Partial, Partial * Partial -> reject
+    """
+    # Collect all partials across inputs
+    input_partials = {}
+    for i, inp in enumerate(inputs):
+        for md, op in inp.partial.items():
+            input_partials.setdefault(md, []).append((i, op))
+
+    if not input_partials:
+        return True  # no partials, always fine
+
+    if linearity is None:
+        return False  # non-linear, reject any Partial
+
+    for md, sources in input_partials.items():
+        if linearity == "unary":
+            pass  # single input, Partial passes through
+        elif linearity == "additive":
+            ops = set(op for _, op in sources)
+            if len(ops) > 1:
+                return False  # conflicting reduce ops
+        elif linearity == "multiplicative":
+            if len(sources) > 1:
+                return False  # both inputs have Partial on same mesh_dim
+        else:
+            return False  # unknown linearity, reject
+
+    return True
+
+
 def propagate(recipe, removed, inputs):
     """Apply a dim recipe to produce the output ShardedLayout.
 
     recipe: list of DimSpec (Carry, Insert, Merge, Split) for output dims
     removed: list of Remove specs for contracted/sliced dims
     inputs: list of ShardedLayout
+
+    Partial handling: partials from Remove (reductions) are created here.
+    Partials from inputs are unconditionally inherited. The CALLER is
+    responsible for checking linearity via check_partial_linearity()
+    before calling propagate() if the op is non-linear.
     """
     # 1. Process removed dims
     partial = {}
@@ -429,12 +474,14 @@ def propagate(recipe, removed, inputs):
     result = ShardedLayout(out_hier, out_map)
     result.partial = partial
 
-    # Inherit partials from inputs
+    # Unconditionally inherit partials from inputs.
+    # The caller is responsible for checking linearity beforehand.
     for inp in inputs:
         for md, op in inp.partial.items():
             if md in result.partial and result.partial[md] != op:
-                return None
-            result.partial[md] = op if md not in result.partial else result.partial[md]
+                return None  # conflicting reduce ops
+            if md not in result.partial:
+                result.partial[md] = op
 
     # Check: partial mesh_dims must not overlap with sharded mesh_dims
     sharded_mesh_dims = set()
@@ -594,6 +641,7 @@ def propagate_reduction(sharded, reduce_dim, keepdim=False, reduce_op="sum"):
 
 
 def propagate_broadcast(a, b):
+    """Broadcast two ShardedLayouts. Pure shape/sharding compatibility — no linearity concern."""
     a_shape = a.global_shape
     b_shape = b.global_shape
     ndim_a = len(a_shape)
@@ -623,9 +671,18 @@ def propagate_broadcast(a, b):
     return propagate(recipe, [], [a, b])
 
 
-def propagate_pointwise(all_shardeds):
+def propagate_pointwise(all_shardeds, linearity=None):
     if not all_shardeds:
         return None
+    # Pre-check: are input Partials compatible with this op's linearity?
+    if not check_partial_linearity(all_shardeds, linearity):
+        return None
+    if len(all_shardeds) == 1:
+        # Unary op: carry all dims
+        sharded = all_shardeds[0]
+        ndim = len(sharded.global_shape)
+        recipe = [Carry([(0, i)]) for i in range(ndim)]
+        return propagate(recipe, [], [sharded])
     result = all_shardeds[0]
     for sharded in all_shardeds[1:]:
         result = propagate_broadcast(result, sharded)
@@ -867,7 +924,8 @@ def propagate_cat(shardeds, dim):
 
 
 def propagate_identity(sharded):
-    """Identity: all dims carried through (clone, contiguous, detach, etc.)."""
+    """Identity: all dims carried through (clone, contiguous, detach, etc.).
+    Partial passes through (unary linear)."""
     ndim = len(sharded.global_shape)
     recipe = [Carry([(0, i)]) for i in range(ndim)]
     return propagate(recipe, [], [sharded])
@@ -889,17 +947,21 @@ def propagate_bmm(sharded_a, sharded_b):
 
 
 def propagate_addmm(sharded_bias, sharded_a, sharded_b):
-    """addmm: bias + A @ B. Propagate mm, then broadcast with bias."""
+    """addmm: bias + A @ B. Propagate mm, then broadcast with bias (additive linear)."""
     mm_result = propagate_mm(sharded_a, sharded_b)
     if mm_result is None:
+        return None
+    if not check_partial_linearity([sharded_bias, mm_result], "additive"):
         return None
     return propagate_broadcast(sharded_bias, mm_result)
 
 
 def propagate_baddbmm(sharded_self, sharded_a, sharded_b):
-    """baddbmm: self + batch(A @ B)."""
+    """baddbmm: self + batch(A @ B). Additive linear for the bias addition."""
     bmm_result = propagate_bmm(sharded_a, sharded_b)
     if bmm_result is None:
+        return None
+    if not check_partial_linearity([sharded_self, bmm_result], "additive"):
         return None
     return propagate_broadcast(sharded_self, bmm_result)
 
