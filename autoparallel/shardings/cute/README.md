@@ -207,6 +207,69 @@ The optimizer should use `ShardedLayout` natively — not convert to DTensorSpec
 2. **Cost model**: existing `autoparallel/cost_models/` provides compute and communication cost estimation
 3. **Graph application**: convert winning ShardedLayouts to DTensorSpec at the final step, or generate collective calls directly from `plan_redistribute()` output
 
+## Operator Coverage
+
+302 ATen ops covered by 19 direct recipe builders + 18 delegating wrappers.
+
+### Primitive usage by direct recipe builders
+
+| Function | Carry | Insert | Remove | Merge | Split | ATen ops |
+|----------|:-----:|:------:|:------:|:-----:|:-----:|:--------:|
+| `propagate_transpose` | x | | | | | 1 |
+| `propagate_permute` | x | | | | | 1 |
+| `propagate_unsqueeze` | x | x | | | | 1 |
+| `propagate_slice` | x | | x | | | 2 |
+| `propagate_gather` | x | | x | | | 1 |
+| `propagate_reduction` | x | x | x | | | 24 |
+| `propagate_broadcast` | x | | | | | (internal) |
+| `propagate_pointwise` | x | | | | | 191 |
+| `propagate_view` | x | | | x | x | 4 |
+| `propagate_einsum` | x | | x | | | (internal) |
+| `propagate_cat` | x | | | x | | 1 |
+| `propagate_identity` | x | | | | | 16 |
+| `propagate_expand` | x | x | x | | | 2 |
+| `propagate_repeat` | x | x | x | | | 1 |
+| `propagate_split` | x | x | x | | | 2 |
+| `propagate_topk` | x | x | x | | | (via lambda) |
+| `propagate_embedding` | x | x | x | | | 1 |
+| `propagate_convolution` | x | | x | | | 1 |
+| `propagate_replicate_affected` | x | | | | | 30 |
+
+### Delegating wrappers
+
+| Function | Delegates to | ATen ops |
+|----------|-------------|:--------:|
+| `propagate_mm` | einsum | 1 |
+| `propagate_bmm` | einsum | 1 |
+| `propagate_addmm` | mm + broadcast | 1 |
+| `propagate_baddbmm` | bmm + broadcast | 1 |
+| `propagate_dot` | einsum | 1 |
+| `propagate_t` | transpose | 1 |
+| `propagate_movedim` | permute | (internal) |
+| `propagate_squeeze` | view | 5 |
+| `propagate_flatten` | view | (internal) |
+| `propagate_unflatten` | view | (internal) |
+| `propagate_stack` | unsqueeze + cat | 1 |
+| `propagate_unbind` | slice | 1 |
+| `propagate_sort` | replicate_affected | (via lambda) |
+| `propagate_argmax` | replicate_affected | (via lambda) |
+| `propagate_layer_norm` | replicate_affected | (via lambda) |
+| `propagate_index_select` | gather | 1 |
+| `propagate_scatter` | broadcast | 4 |
+| `propagate_dropout` | identity | 5 |
+
+### Primitive coverage summary
+
+| Primitive | Used by | Role |
+|-----------|:-------:|------|
+| **Carry** | 19 functions | Universal — every op uses it to pass dims through |
+| **Remove** | 9 functions | Reduction, contraction, slice, expand, repeat |
+| **Insert** | 7 functions | Unsqueeze, keepdim, expand, repeat, topk, embedding |
+| **Merge** | 2 functions | View flatten (within-tensor), cat (cross-tensor) |
+| **Split** | 1 function | View unflatten |
+
+The vast majority of ops (261 of 302) use only Carry with optional Insert/Remove. Merge and Split are specialized for reshape and concatenation.
+
 ## Testing
 
 202 tests covering:
