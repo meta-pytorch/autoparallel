@@ -874,6 +874,98 @@ class TestXorStride(unittest.TestCase):
                     self.assertEqual(result(b0, b1, pair), expected)
 
 
+class TestModStride(unittest.TestCase):
+    """Tests for ModStride: modular arithmetic strides."""
+
+    def test_mul(self):
+        from autoparallel.shardings.cute._pycute import ModStride
+        m = ModStride(3, 4)
+        self.assertEqual(m * 0, ModStride(0, 4))
+        self.assertEqual(m * 1, ModStride(3, 4))
+        self.assertEqual(m * 2, ModStride(2, 4))  # 3*2 % 4 = 2
+        self.assertEqual(m * 3, ModStride(1, 4))  # 3*3 % 4 = 1
+
+    def test_add_mod_mod(self):
+        from autoparallel.shardings.cute._pycute import ModStride
+        self.assertEqual(ModStride(1, 4) + ModStride(3, 4), ModStride(0, 4))
+        self.assertEqual(ModStride(2, 4) + ModStride(2, 4), ModStride(0, 4))
+        self.assertEqual(ModStride(1, 4) + ModStride(1, 4), ModStride(2, 4))
+
+    def test_add_mod_int(self):
+        from autoparallel.shardings.cute._pycute import ModStride
+        result = ModStride(3, 4) + 5
+        self.assertIsInstance(result, int)
+        self.assertEqual(result, 0)  # (3+5) % 4 = 0
+
+    def test_add_int_mod(self):
+        from autoparallel.shardings.cute._pycute import ModStride
+        result = 5 + ModStride(3, 4)
+        self.assertIsInstance(result, int)
+        self.assertEqual(result, 0)  # (5+3) % 4 = 0
+
+    def test_add_mod_xor(self):
+        """ModStride + XorStride: resolves ModStride to int, then XOR."""
+        from autoparallel.shardings.cute._pycute import ModStride
+        result = ModStride(3, 4) + XorStride(7)
+        self.assertIsInstance(result, int)
+        self.assertEqual(result, 3 ^ 7)  # = 4
+
+    def test_add_xor_mod(self):
+        """XorStride + ModStride: same result."""
+        from autoparallel.shardings.cute._pycute import ModStride
+        result = XorStride(7) + ModStride(3, 4)
+        self.assertIsInstance(result, int)
+        self.assertEqual(result, 7 ^ 3)  # = 4
+
+    def test_ring_rotation(self):
+        """ModStride(3, 4) implements (g - step) % 4 as (g + 3*step) % 4."""
+        from autoparallel.shardings.cute._pycute import ModStride
+        for g in range(4):
+            for step in range(4):
+                ms = ModStride(1, 4) * g + ModStride(3, 4) * step
+                expected = (g - step) % 4
+                # ms is ModStride, resolve to int by adding 0
+                result = ms + 0
+                self.assertEqual(result, expected,
+                    f"g={g}, step={step}: got {result}, expected {expected}")
+
+    def test_layout_ring_rotation(self):
+        """Layout with ModStride for ring attention rotation."""
+        from autoparallel.shardings.cute._pycute import ModStride
+        # Layout((4, 4), (ModStride(1,4), ModStride(3,4)))
+        # (gpu, step) -> source_gpu = (gpu + 3*step) % 4
+        L = Layout((4, 4), (ModStride(1, 4), ModStride(3, 4)))
+        for step in range(4):
+            for gpu in range(4):
+                result = L(gpu, step)
+                expected = (gpu - step) % 4
+                self.assertEqual(result, expected,
+                    f"gpu={gpu}, step={step}: got {result}, expected {expected}")
+
+    def test_full_ring_attention_layout(self):
+        """Full ring attention: (b0, b1, step, pair) -> chunk index.
+
+        XorStride must be the LAST mode so all ModStride modes resolve
+        to an integer before the XOR is applied (left-to-right evaluation).
+        """
+        from autoparallel.shardings.cute._pycute import ModStride
+        # Layout((2, 2, 4, 2), (ModStride(1,4), ModStride(2,4), ModStride(3,4), XorStride(7)))
+        L = Layout(
+            (2, 2, 4, 2),
+            (ModStride(1, 4), ModStride(2, 4), ModStride(3, 4), XorStride(7))
+        )
+        for step in range(4):
+            for b1 in range(2):
+                for b0 in range(2):
+                    gpu = b0 + 2 * b1
+                    source_gpu = (gpu - step) % 4
+                    for pair in range(2):
+                        expected = source_gpu if pair == 0 else 7 - source_gpu
+                        result = L(b0, b1, step, pair)
+                        self.assertEqual(result, expected,
+                            f"step={step}, gpu={gpu}, pair={pair}: got {result}, expected {expected}")
+
+
 class TestReductionExtended(unittest.TestCase):
     """Additional reduction tests from DTensor coverage gaps."""
 

@@ -49,6 +49,7 @@ from .scaled_basis import (
     make_basis_like,
 )
 from .xor_stride import XorStride, is_xor_stride
+from .mod_stride import ModStride, is_mod_stride
 
 
 # =============================================================================
