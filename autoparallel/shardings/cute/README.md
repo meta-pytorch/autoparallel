@@ -131,7 +131,26 @@ For each mesh dim, compare source vs target GPU strides:
 | = 0 | > 0 | local reinterpret (no communication) |
 | = 0 | = 0 | no_op (or all_reduce if Partial) |
 | > 0 | > 0, same | no_op |
-| > 0 | > 0, different | all_to_all |
+| > 0 | > 0, different | ppermute or all_to_all (see below) |
+
+**ppermute detection**: when both layouts are sharded with different strides,
+`plan_redistribute` checks if the redistribution is a **permutation** — each source
+device sends its entire data to exactly one target device. If yes, returns
+`("ppermute", mesh_dim, {"perm": [(src, dst), ...]})` with the explicit permutation
+list. If data splits across multiple target devices, falls back to `all_to_all`.
+
+Detection uses `_detect_permutation`, which has two code paths:
+- **Integer strides**: analytical — map representative elements through both layouts
+- **Non-integer strides** (XorStride, ModStride): element-level sampling
+
+ppermute is the right collective for ring attention step transitions (circular shift)
+and S(0)S(0) reordering. It corresponds to JAX's `jax.lax.ppermute` and PyTorch's
+`torch.distributed._functional_collectives.permute_tensor`.
+
+**Collective hierarchy** (most specific to most general):
+```
+no_op -> local_reinterpret -> all_gather -> reduce_scatter -> all_reduce -> ppermute -> all_to_all
+```
 
 **Mesh dim ordering**: nested `logical_divide` produces innermost-first ordering in the tuple, but `mesh_dim_map` uses outermost-first (construction order). `_get_per_mesh_dim_gpu_stride` reverses the flattened mesh elements to match.
 
