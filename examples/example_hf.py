@@ -37,6 +37,7 @@ from transformers import (
 )
 
 from autoparallel.api import AutoParallel
+from autoparallel.compile import inductor_config
 
 logging.basicConfig(level=logging.DEBUG)
 
@@ -164,7 +165,7 @@ def main():
         input_constraints = [x_sharding]
 
     with AutoParallel(
-        model, input_fn, mesh, mp_policy, compile=True, repeated_subgraphs=True
+        model, input_fn, mesh, mp_policy, repeated_subgraphs=True
     ) as autop:
         autop.add_input_constraints(input_constraints)
         autop.add_parameter_memory_constraint(low=None, high=None)
@@ -173,6 +174,10 @@ def main():
         parallel_mod = autop.apply_placement(sharding_placement)
 
     print(f"\nAutoParallel pipeline completed in {time.time() - t0:.2f}s")
+
+    # --- Compile with AutoParallel-optimized Inductor passes ---
+    with inductor_config():
+        parallel_mod = torch.compile(parallel_mod)
 
     # --- Forward + backward ---
     parallel_mod.to_empty(device="cuda")

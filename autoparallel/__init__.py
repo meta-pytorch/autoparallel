@@ -5,5 +5,6 @@
 
 from autoparallel.api import AutoParallel, auto_parallel
 from autoparallel.api_pp import AutoParallelPP
+from autoparallel.compile import inductor_config
 
-__all__ = ["auto_parallel", "AutoParallel", "AutoParallelPP"]
+__all__ = ["auto_parallel", "AutoParallel", "AutoParallelPP", "inductor_config"]
