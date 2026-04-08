@@ -2060,5 +2060,52 @@ class TestSilentCorrectnessEdgeCases(unittest.TestCase):
         self.assertEqual(out.get_placements()[0][:3], ("shard", 0, 2))
 
 
+class TestCuTeBackend(unittest.TestCase):
+    """Tests for CuTeBackend — ShardingBackend implementation."""
+
+    def test_implements_protocol(self):
+        from autoparallel.shardings.backend import ShardingBackend
+        from autoparallel.shardings.cute_backend import CuTeBackend
+        backend = CuTeBackend()
+        self.assertIsInstance(backend, ShardingBackend)
+
+    def test_create_all_options_1d(self):
+        from autoparallel.shardings.cute_backend import CuTeBackend
+        backend = CuTeBackend()
+        options = backend.create_all_options(mesh=(2,), tensor_shape=(8, 16))
+        # Replicate + S(0) + S(1)
+        self.assertEqual(len(options), 3)
+        # All have ShardedLayout as output_spec
+        for opt in options:
+            self.assertIsInstance(opt.output_spec, ShardedLayout)
+            self.assertEqual(opt.compute_cost, 0.0)
+
+    def test_create_all_options_2d(self):
+        from autoparallel.shardings.cute_backend import CuTeBackend
+        backend = CuTeBackend()
+        options = backend.create_all_options(mesh=(2, 4), tensor_shape=(1024, 1024))
+        self.assertGreater(len(options), 5)
+
+    def test_redistribute_cost_same(self):
+        from autoparallel.shardings.cute_backend import CuTeBackend
+        backend = CuTeBackend()
+        s = ShardedLayout.shard((8, 16), shard_dim=0, mesh_dim_size=2)
+        self.assertEqual(backend.redistribute_cost(s, s, mesh=(2,)), 0.0)
+
+    def test_redistribute_cost_shard_to_replicate(self):
+        from autoparallel.shardings.cute_backend import CuTeBackend
+        backend = CuTeBackend()
+        src = ShardedLayout.shard((8, 16), shard_dim=0, mesh_dim_size=2)
+        tgt = ShardedLayout.replicate((8, 16))
+        cost = backend.redistribute_cost(src, tgt, mesh=(2,))
+        self.assertGreater(cost, 0.0)
+
+    def test_apply_solution_raises(self):
+        from autoparallel.shardings.cute_backend import CuTeBackend
+        backend = CuTeBackend()
+        with self.assertRaises(NotImplementedError):
+            backend.apply_solution(None, {}, None)
+
+
 if __name__ == "__main__":
     unittest.main()
