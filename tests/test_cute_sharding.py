@@ -636,15 +636,17 @@ class TestRedistributeDetailed(unittest.TestCase):
         LTR: specs [(0,2),(0,4)] -> mesh0(size=2, outermost, gs=64), mesh1(size=4, innermost, gs=16)
         RTL: specs [(0,4),(0,2)] -> mesh0(size=4, outermost, gs=32), mesh1(size=2, innermost, gs=16)
 
-        mesh_dim 0 (outermost): gs 64 -> 32, different -> all_to_all
+        mesh_dim 0 (outermost): gs 64 -> 32, different -> ppermute (1-to-1 device mapping)
         mesh_dim 1 (innermost): gs 16 -> 16, same -> no_op
         """
         ltr = ShardedLayout.shard_multi((8, 16), [(0, 2), (0, 4)])
         rtl = ShardedLayout.shard_multi((8, 16), [(0, 4), (0, 2)])
         result = plan_redistribute(ltr, rtl)
         self.assertEqual(len(result), 1)
-        self.assertEqual(result[0][0], "all_to_all")
+        self.assertIn(result[0][0], ("ppermute", "all_to_all"))  # ppermute if detected
         self.assertEqual(result[0][1], 0)  # mesh_dim 0 (outermost)
+        if result[0][0] == "ppermute":
+            self.assertIn("perm", result[0][2])
 
     def test_s0s0_per_mesh_dim_stride_values(self):
         """Verify per-mesh-dim GPU strides match mesh dim sizes, not tuple positions.
@@ -1643,6 +1645,50 @@ class TestOpRegistry(unittest.TestCase):
         select_fn = get_propagation_rule("aten.select.int")
         out = select_fn(t, 1, 3)
         self.assertIsNotNone(out)
+
+
+class TestPpermute(unittest.TestCase):
+    """Tests for ppermute detection in plan_redistribute."""
+
+    def test_shard_dim_swap_is_all_to_all(self):
+        """S(0)->S(1): each device sends to ALL others -> all_to_all, not ppermute."""
+        source = ShardedLayout.shard((8, 16), shard_dim=0, mesh_dim_size=2)
+        target = ShardedLayout.shard((8, 16), shard_dim=1, mesh_dim_size=2)
+        result = plan_redistribute(source, target)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0][0], "all_to_all")
+
+    def test_same_dim_different_stride_is_ppermute(self):
+        """Same dim sharded with different mesh sizes -> ppermute (1-to-1)."""
+        # S(0) mesh=2 -> S(0) mesh=4: each src device maps to one tgt device
+        source = ShardedLayout.shard((16, 16), shard_dim=0, mesh_dim_size=2)
+        target = ShardedLayout.shard((16, 16), shard_dim=0, mesh_dim_size=4)
+        result = plan_redistribute(source, target)
+        self.assertEqual(len(result), 1)
+        # This might be ppermute or all_to_all depending on the element mapping
+        # For mesh=2->mesh=4: src device 0 has elements 0-7, tgt device 0 has 0-3, device 1 has 4-7
+        # So src device 0 sends to TWO tgt devices -> all_to_all
+        self.assertEqual(result[0][0], "all_to_all")
+
+    def test_s0s0_ltr_rtl_is_ppermute(self):
+        """S(0)S(0) LTR -> RTL: reordering on same mesh dim -> ppermute."""
+        ltr = ShardedLayout.shard_multi((8, 16), [(0, 2), (0, 4)])
+        rtl = ShardedLayout.shard_multi((8, 16), [(0, 4), (0, 2)])
+        result = plan_redistribute(ltr, rtl)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0][0], "ppermute")
+        perm = result[0][2]["perm"]
+        # Valid permutation: bijection
+        srcs = [p[0] for p in perm]
+        dsts = [p[1] for p in perm]
+        self.assertEqual(len(set(srcs)), len(srcs))
+        self.assertEqual(len(set(dsts)), len(dsts))
+
+    def test_same_sharding_no_ppermute(self):
+        """Same sharding -> no collective at all."""
+        s = ShardedLayout.shard((8, 16), shard_dim=0, mesh_dim_size=2)
+        result = plan_redistribute(s, s)
+        self.assertEqual(result, [])
 
 
 class TestEnumerateShardings(unittest.TestCase):

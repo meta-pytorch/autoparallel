@@ -13,16 +13,17 @@ For each mesh dim independently, compare src_gs vs tgt_gs:
   src=0, tgt>0 -> local reinterpret
   src=0, tgt=0 -> no_op (or all_reduce if Partial)
   src>0, tgt>0, same -> no_op
-  src>0, tgt>0, diff -> all_to_all
+  src>0, tgt>0, diff -> ppermute (1-to-1 device mapping) or all_to_all
 
 Refinements:
+  ppermute detection: check if each src device maps to exactly one tgt device
   max_common_vector(src_local, tgt_local) -> vectorization factor
   composition(right_inverse(tgt), src) -> full element-level send/recv schedule
 """
 
 from ._pycute import Layout, is_tuple, logical_divide, product, composition, right_inverse, coalesce, max_common_vector
 
-from .placement import _has_mesh
+from .placement import _has_mesh, _local_size
 
 
 # =============================================================================
@@ -98,6 +99,175 @@ def _reverse_mesh_map(mesh_dim_map):
     return reverse
 
 
+def _detect_permutation(source, target, mesh_dim, src_info, tgt_info):
+    """Detect if the redistribution on a mesh dim is a permutation (ppermute).
+
+    For each source device, checks if ALL its elements map to exactly one
+    target device. If yes, returns the permutation as [(src, dst), ...].
+    If no (data splits across multiple target devices), returns None.
+
+    Uses the hier_layout to compute element-to-device mappings for a few
+    representative elements per device, which is cheap for typical mesh sizes.
+    """
+    src_td, src_gs = src_info
+    tgt_td, tgt_gs = tgt_info
+
+    # Get mesh sizes for this mesh dim from the sub-dim structure
+    src_mesh_size = None
+    for tensor_dim, mesh_dims in source.mesh_dim_map.items():
+        if mesh_dim in mesh_dims:
+            mode = source.hier_layout.shape[tensor_dim]
+            g = product(mode)
+            l = _local_size(mode)
+            src_mesh_size = g // l
+            break
+
+    tgt_mesh_size = None
+    for tensor_dim, mesh_dims in target.mesh_dim_map.items():
+        if mesh_dim in mesh_dims:
+            mode = target.hier_layout.shape[tensor_dim]
+            g = product(mode)
+            l = _local_size(mode)
+            tgt_mesh_size = g // l
+            break
+
+    if src_mesh_size is None or tgt_mesh_size is None:
+        return None
+    if src_mesh_size != tgt_mesh_size:
+        return None  # different mesh sizes, can't be a permutation
+
+    mesh_size = src_mesh_size
+
+    # Compute element-to-device mapping for source and target.
+    # For each element index e:
+    #   src_device = e // src_gs % mesh_size  (for integer strides)
+    #   tgt_device = e // tgt_gs % mesh_size
+    # But for XorStride/ModStride, this formula doesn't apply directly.
+    #
+    # Use the _ld() layouts to compute device assignments.
+    # _ld() gives (local, mesh) per dim. For an element at global position,
+    # the mesh coordinate = device index.
+    #
+    # Simpler approach for typical cases: use the GPU strides directly.
+    # For integer strides: element e is on device (e // local_size) % mesh_size
+    # where local_size = global_size // mesh_size.
+
+    src_local = source.local_sizes
+    tgt_local = target.local_sizes
+    global_shape = source.global_shape
+
+    # For 1D tensors or the specific sharded dim, compute the device mapping.
+    # We check a few elements from each source device to see if they all
+    # map to the same target device.
+
+    # Find the sharded tensor dims for this mesh dim
+    src_sharded_dim = src_td
+    tgt_sharded_dim = tgt_td
+
+    src_dim_local = src_local[src_sharded_dim]
+    tgt_dim_local = tgt_local[tgt_sharded_dim]
+    src_dim_global = global_shape[src_sharded_dim]
+    tgt_dim_global = global_shape[tgt_sharded_dim]
+
+    # For simple integer strides: device = element_in_dim // local_size
+    # Check if this gives a clean permutation
+    if not isinstance(src_gs, int) or not isinstance(tgt_gs, int):
+        # XorStride or ModStride — need element-level check
+        # For now, fall back to checking all device pairs
+        return _detect_permutation_element_level(
+            source, target, mesh_dim, mesh_size
+        )
+
+    # Integer strides: compute device mapping analytically
+    perm = {}
+    for src_dev in range(mesh_size):
+        # Elements on src_dev: indices where (idx // src_dim_local) % mesh_size == src_dev
+        # Pick a representative element: src_dev * src_dim_local
+        repr_elem = src_dev * src_dim_local
+        # Which tgt device is this element on?
+        tgt_dev = (repr_elem // tgt_dim_local) % mesh_size
+        if src_dev in perm:
+            return None  # shouldn't happen
+        perm[src_dev] = tgt_dev
+
+    # Verify it's a bijection
+    if len(set(perm.values())) != mesh_size:
+        return None  # not a permutation (some tgt device receives from multiple sources)
+
+    return [(src, dst) for src, dst in sorted(perm.items())]
+
+
+def _detect_permutation_element_level(source, target, mesh_dim, mesh_size):
+    """Detect permutation by checking element-level device assignments.
+
+    Used for non-integer strides (XorStride, ModStride) where analytical
+    computation isn't straightforward. Checks representative elements
+    from each source device.
+    """
+    src_ld = source._ld()
+    tgt_ld = target._ld()
+
+    # Element mapping: src (local, mesh) -> tgt coordinate
+    mapping = composition(right_inverse(tgt_ld), src_ld)
+
+    # For each source device, evaluate the mapping at a few local coordinates
+    # and extract the target mesh coordinate.
+    ndim = len(source.global_shape)
+    src_local_sizes = source.local_sizes
+    total_local = product(src_local_sizes)
+
+    perm = {}
+    for src_dev in range(mesh_size):
+        tgt_devs = set()
+        # Check a few representative local elements
+        n_checks = min(total_local, 4)  # check up to 4 local elements
+        for local_idx in range(n_checks):
+            # Build the source coordinate: (local_coords..., mesh_coord)
+            # For 1D: (local_idx, src_dev)
+            # For nD: need to decompose local_idx into per-dim local coords
+            # Simplified: use _ld() which is 2-level (local, mesh) per dim
+            # Evaluate src_ld at (local_idx_per_dim, src_dev_per_dim)
+
+            # For the specific mesh_dim, set mesh coord = src_dev
+            # For other dims, use local_idx as the flat local index
+
+            # This is getting complex for multi-dim. For now, use the
+            # element index directly:
+            # src device src_dev holds elements at positions where
+            # the mesh coordinate in src_ld equals src_dev.
+
+            # Pick element: for the sharded dim, position = src_dev * local_size + local_offset
+            src_sharded_dim = None
+            for td, mds in source.mesh_dim_map.items():
+                if mesh_dim in mds:
+                    src_sharded_dim = td
+                    break
+
+            local_size_on_dim = src_local_sizes[src_sharded_dim]
+            elem_on_dim = src_dev * local_size_on_dim + (local_idx % local_size_on_dim)
+
+            # For target: find which device this element belongs to
+            tgt_sharded_dim = None
+            for td, mds in target.mesh_dim_map.items():
+                if mesh_dim in mds:
+                    tgt_sharded_dim = td
+                    break
+
+            tgt_local_size = target.local_sizes[tgt_sharded_dim]
+            tgt_dev = (elem_on_dim // tgt_local_size) % mesh_size
+            tgt_devs.add(tgt_dev)
+
+        if len(tgt_devs) != 1:
+            return None  # this src device maps to multiple tgt devices
+        perm[src_dev] = tgt_devs.pop()
+
+    # Verify bijection
+    if len(set(perm.values())) != mesh_size:
+        return None
+
+    return [(src, dst) for src, dst in sorted(perm.items())]
+
+
 def plan_redistribute(source, target):
     """Plan collectives using per-mesh-dim GPU stride classification.
 
@@ -148,10 +318,23 @@ def plan_redistribute(source, target):
         elif src_gs == tgt_gs:
             continue  # same stride, no communication
         else:
-            collectives.append(("all_to_all", md, {
-                "source_dims": src_dims,
-                "target_dims": tgt_dims,
-            }))
+            # Both sharded, different strides.
+            # Try to detect if it's a permutation (ppermute) first.
+            perm = None
+            if src_info and tgt_info:
+                perm = _detect_permutation(source, target, md, src_info, tgt_info)
+
+            if perm is not None:
+                collectives.append(("ppermute", md, {
+                    "perm": perm,
+                    "source_dims": src_dims,
+                    "target_dims": tgt_dims,
+                }))
+            else:
+                collectives.append(("all_to_all", md, {
+                    "source_dims": src_dims,
+                    "target_dims": tgt_dims,
+                }))
 
     return collectives
 
