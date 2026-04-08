@@ -96,6 +96,74 @@ These are **not interchangeable**: ModStride provides rotation (cyclic shift), X
 provides reflection (bit flip). Ring attention needs both — rotation for the ring steps,
 reflection for the zigzag pairing.
 
+### Scaling to 8 GPUs
+
+The same pattern works for 8 GPUs (16 chunks). The GPU index needs 3 bits:
+
+```python
+N_gpus = 8
+
+ring_layout = Layout(
+    (2, 2, 2, N_gpus, 2),
+    (ModStride(1, 8), ModStride(2, 8), ModStride(4, 8), ModStride(7, 8), XorStride(15))
+)
+#  b0             b1             b2             step            pair
+#  gpu bit 0      gpu bit 1      gpu bit 2      ring rotation   zigzag
+```
+
+Output (first 3 of 8 steps):
+```
+Step 0: GPU 0: [0, 15]  GPU 1: [1, 14]  GPU 2: [2, 13]  GPU 3: [3, 12]
+        GPU 4: [4, 11]  GPU 5: [5, 10]  GPU 6: [6,  9]  GPU 7: [7,  8]
+
+Step 1: GPU 0: [7,  8]  GPU 1: [0, 15]  GPU 2: [1, 14]  GPU 3: [2, 13]
+        GPU 4: [3, 12]  GPU 5: [4, 11]  GPU 6: [5, 10]  GPU 7: [6,  9]
+
+Step 2: GPU 0: [6,  9]  GPU 1: [7,  8]  GPU 2: [0, 15]  GPU 3: [1, 14]
+        GPU 4: [2, 13]  GPU 5: [3, 12]  GPU 6: [4, 11]  GPU 7: [5, 10]
+...
+```
+
+### General formula for any power-of-2 GPUs
+
+For `N` GPUs (where `N` is a power of 2), the GPU index decomposes into
+`log2(N)` bits. The layout has `log2(N) + 2` modes:
+
+```python
+import math
+from autoparallel.shardings.cute._pycute import Layout, XorStride, ModStride
+
+def make_ring_attention_layout(n_gpus):
+    """Construct the full ring attention layout for n_gpus (must be power of 2).
+
+    Returns a Layout with modes:
+      - log2(n_gpus) modes of size 2: GPU index bits, strides ModStride(2^i, n_gpus)
+      - 1 mode of size n_gpus: ring step, stride ModStride(n_gpus - 1, n_gpus)
+      - 1 mode of size 2: zigzag pair, stride XorStride(2 * n_gpus - 1)
+
+    The XorStride mode must be last (left-to-right evaluation constraint).
+    """
+    n_bits = int(math.log2(n_gpus))
+    assert 2 ** n_bits == n_gpus, "n_gpus must be a power of 2"
+
+    shapes = [2] * n_bits + [n_gpus, 2]
+    strides = (
+        [ModStride(2**i, n_gpus) for i in range(n_bits)]
+        + [ModStride(n_gpus - 1, n_gpus)]
+        + [XorStride(2 * n_gpus - 1)]
+    )
+    return Layout(tuple(shapes), tuple(strides))
+
+
+# Usage:
+layout_4gpu = make_ring_attention_layout(4)   # (2, 2, 4, 2) modes
+layout_8gpu = make_ring_attention_layout(8)   # (2, 2, 2, 8, 2) modes
+layout_16gpu = make_ring_attention_layout(16) # (2, 2, 2, 2, 16, 2) modes
+
+# Evaluate: (gpu_bits..., step, pair) -> chunk index
+# Example for 8 GPUs: layout_8gpu(b0, b1, b2, step, pair)
+```
+
 ## Zigzag Assignment (Step 0)
 
 The zigzag pattern pairs each GPU with one "light" query chunk and one "heavy" one:
