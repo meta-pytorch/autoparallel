@@ -190,9 +190,17 @@ from autoparallel.shardings.cute import plan_redistribute
 # step1: Layout((4, 2), (1, XorStride(7))) but on shifted GPU positions
 
 collectives = plan_redistribute(step0_layout, step1_layout)
-# Currently yields: all_to_all (both sharded, different GPU strides)
-# Actual pattern: P2P ring shift (each GPU sends to g+1, receives from g-1)
+# Yields: ("ppermute", mesh_dim, {"perm": [(0, 1), (1, 2), (2, 3), (3, 0)], ...})
+# Each GPU sends to exactly one neighbor — detected as a collective permutation.
 ```
+
+The planner detects that the ring shift is a **ppermute** (collective permutation), not
+a full all_to_all. Each source device maps to exactly one target device. The permutation
+list `[(src, dst), ...]` encodes the ring shift pattern directly.
+
+This corresponds to:
+- JAX: `jax.lax.ppermute(x, axis_name, perm=[(0,1), (1,2), (2,3), (3,0)])`
+- PyTorch: `torch.distributed._functional_collectives.permute_tensor`
 
 ## Causal Attention Matrix
 
@@ -221,19 +229,19 @@ GPU 3:     3        2        2        2        9
 With zigzag, each GPU handles 9 attention pairs (perfectly balanced).
 With contiguous sharding, GPU 0 would handle 3 pairs while GPU 3 handles 22.
 
-## Current Limitations
+## Notes
 
-### `plan_redistribute` classifies as all_to_all
+### ppermute detection
 
-Our redistribution planner compares per-mesh-dim GPU strides between source and target
-layouts. When both are sharded with different strides, it classifies the collective as
-`all_to_all`. For ring attention, this is technically correct (data moves between GPUs)
-but overly general — the actual pattern is a simple ring shift (P2P send/recv), which
-is cheaper than a full all_to_all.
+`plan_redistribute` detects that ring attention's step-to-step transition is a
+**ppermute** (collective permutation), not a full all_to_all. The detection checks
+if each source device's data maps to exactly one target device. For ring shifts,
+this is always true — GPU `g` sends to GPU `(g+1) % N`.
 
-**Future optimization**: use the element mapping from `plan_redistribute_detailed` to
-detect the ring structure (each GPU sends to exactly one neighbor) and generate P2P
-`isend`/`irecv` pairs instead of a full all_to_all collective.
+The collective hierarchy from most specific to most general:
+```
+no_op → local_reinterpret → all_gather → reduce_scatter → all_reduce → ppermute → all_to_all
+```
 
 ### XorStride must be last in mixed layouts
 
