@@ -218,8 +218,8 @@ def force_save_fsdp_all_gather(graph: torch.fx.Graph) -> None:
             nodes_to_save.append(last_non_view_wait_chain_user)
             primal_origins.append(primal)
 
-    logger.info("force_save_fsdp_all_gather, primal_origins: %s", primal_origins)
-    logger.info("force_save_fsdp_all_gather, nodes_to_save: %s", nodes_to_save)
+    logger.debug("force_save_fsdp_all_gather, primal_origins: %s", primal_origins)
+    logger.debug("force_save_fsdp_all_gather, nodes_to_save: %s", nodes_to_save)
     for node in nodes_to_save:
         node.meta["recompute"] = CheckpointPolicy.MUST_SAVE
         node.meta["ac_graph_id"] = AP_AC_GRAPH_ID
@@ -349,8 +349,12 @@ def _mark_nodes_as_must_save(must_save_nodes: list[torch.fx.Node]) -> None:
             skipped_nodes[node] = node.meta["recompute"]
             continue
         node.meta["recompute"] = CheckpointPolicy.MUST_SAVE
-    print(f"mark_nodes_as_must_save, attempting to mark nodes: {must_save_nodes}")
-    print(f"mark_nodes_as_must_save, skipping already marked nodes: {skipped_nodes}")
+    logger.debug(
+        f"mark_nodes_as_must_save, attempting to mark nodes: {must_save_nodes}"
+    )
+    logger.debug(
+        f"mark_nodes_as_must_save, skipping already marked nodes: {skipped_nodes}"
+    )
 
 
 def mark_nodes_as_must_save_to_stage_recomputation(
@@ -465,7 +469,7 @@ def mark_nodes_as_must_save_to_stage_recomputation(
         )
         total_used_memory_in_GiB = total_used_memory / 2**30
         stage_size_in_GiB = total_used_memory_in_GiB**0.5
-        print(f"Computed stage_size {stage_size_in_GiB=}")
+        logger.debug(f"Computed stage_size {stage_size_in_GiB=}")
 
     target_mem = stage_size_in_GiB * 2**30
     for node in fwd_recomputable_nodes:
@@ -506,15 +510,28 @@ def _apply_ac_policy(joint_graph: torch.fx.Graph, save_list: set[torch.ops.OpOve
     _mark_nodes_as_must_save(must_save_nodes)
 
 
-def ac_joint_pass(
+def mark_fsdp_all_gather_recomputation(
     graph: torch.fx.Graph,
-    ac_stage_size_in_GiB: Optional[Union[float, str]] = 2.0,
     reshard_after_forward: bool = True,
 ):
+    """Mark FSDP all-gather nodes for recomputation or saving.
+
+    This should be called unconditionally (not just with AC) to ensure the
+    partitioner respects the reshard_after_forward contract from the sharding
+    optimizer. Without these tags, the partitioner may choose to save
+    all-gathered parameters between fwd and bwd, breaking the memory
+    assumptions of the sharding strategy.
+    """
     if reshard_after_forward:
         force_recompute_fsdp_all_gather(graph)
     else:
         force_save_fsdp_all_gather(graph)
+
+
+def ac_joint_pass(
+    graph: torch.fx.Graph,
+    ac_stage_size_in_GiB: Optional[Union[float, str]] = 2.0,
+):
     mark_nodes_as_must_save_to_stage_recomputation(
         graph, stage_size_in_GiB=ac_stage_size_in_GiB
     )

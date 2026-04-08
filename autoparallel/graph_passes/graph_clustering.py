@@ -118,7 +118,7 @@ def get_identical_regions(
     # needed to detect if replacing a region will create cycles
     t = time.time()
     node_to_recursive_ancestors = _populate_recursive_ancestor_map(graph)
-    logger.info(f"Populated recursive ancestors in {time.time() - t} s")
+    logger.debug(f"Populated recursive ancestors in {time.time() - t} s")
 
     input_pickler = InputPickler()
     hash_to_duplicates: dict[str, IdenticalNodes] = defaultdict(list)
@@ -131,7 +131,7 @@ def get_identical_regions(
         duplicates = hash_to_duplicates[_hash_node(node, strategies, input_pickler)]
         duplicates.append(node)
         node_to_duplicates[node] = duplicates
-    logger.info(f"Hashed nodes in {time.time() - t} s")
+    logger.debug(f"Hashed nodes in {time.time() - t} s")
 
     def _is_identical(n0: Node, n1: Node) -> bool:
         return (
@@ -172,8 +172,10 @@ def get_identical_regions(
         # NOTE: this seems like it's missing in the original implementation
         # from PyTorch. Given that fully_expand_region_group doesn't check
         # if the root from a region is in a seen node, it might end up
-        # having duplicate nodes in different clusters
-        if region_group[0][0] in seen_nodes:
+        # having duplicate nodes in different clusters. We must check all
+        # regions' root nodes, because any region's root could have been
+        # claimed by a prior group.
+        if any(region[0] in seen_nodes for region in region_group):
             continue
         fully_expand_region_group(
             region_group,
@@ -193,7 +195,7 @@ def get_identical_regions(
     for region_group in region_groups:
         region_group.sort(key=lambda rg: topological_ranking[rg[0]])
     region_groups.sort(key=lambda rg: topological_ranking[rg[0][0]])
-    logger.info(f"Expanded regions in {time.time() - t} s")
+    logger.debug(f"Expanded regions in {time.time() - t} s")
 
     # sanity check that we don't have duplicate nodes
     seen_nodes.clear()

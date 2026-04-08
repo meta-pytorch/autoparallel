@@ -33,6 +33,7 @@ from torch.distributed.tensor.placement_types import Replicate, Shard
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from torch.testing._internal.distributed.fake_pg import FakeStore
 
+import autoparallel._testing.models.dsv3 as dsv3_module
 from autoparallel._testing.models.dsv3 import (
     DeepSeekV3Model,
     DeepSeekV3ModelArgs,
@@ -42,7 +43,8 @@ from autoparallel._testing.models.dsv3 import (
     MoEArgs,
     dsv3_loss_fn,
 )
-from autoparallel.api import AutoParallelPP
+from autoparallel.api import move_to_fake
+from autoparallel.api_pp import AutoParallelPP, make_pp_module
 from autoparallel.graph_passes.graph_pp_runner import (
     GraphCallables,
     GraphMeta,
@@ -134,6 +136,8 @@ def run_test(
     schedule_name: str,
     rng_seed: Optional[int],
     logs_dir: str,
+    use_cache: bool,
+    use_inductor: bool = False,
 ):
     if not fake_evaluate:
         pp_degree = 2
@@ -157,6 +161,7 @@ def run_test(
         ), "world_size must be 4, for fake evaluation"
         rank = int(os.getenv("RANK"))
         device = torch.device(f"cuda:{rank}")
+        torch.cuda.set_device(device)
         fake_store = FakeStore()
         torch.distributed.init_process_group(
             "fake",
@@ -174,6 +179,7 @@ def run_test(
         ), "Need at least 8 GPUs for real evaluation"
         local_rank = int(os.getenv("LOCAL_RANK"))
         device = torch.device(f"cuda:{local_rank}")
+        torch.cuda.set_device(device)
         torch.distributed.init_process_group(backend="nccl")
 
     # Initialize device mesh (common for both modes)
@@ -372,9 +378,23 @@ def run_test(
         virtual_pp_stages = [DeepSeekV3Stage0(embed, layers[0], config)]
         for i in range(1, total_pp_stages - 1):
             virtual_pp_stages.append(DeepSeekV3StageI(layers[i], config))
-        virtual_pp_stages.append(
-            DeepSeekV3StageN(layers[total_pp_stages - 1], norm, output, config)
-        )
+        last_stage = DeepSeekV3StageN(layers[total_pp_stages - 1], norm, output, config)
+        if use_loss_fn:
+
+            class ModelWithLoss(torch.nn.Module):
+                def __init__(self, model):
+                    super().__init__()
+                    self.model = model
+
+                def forward(self, h, labels):
+                    output = self.model(h)
+                    return dsv3_loss_fn(output, labels)
+
+                def init_weights(self, *args, **kwargs):
+                    return self.model.init_weights(*args, **kwargs)
+
+            last_stage = ModelWithLoss(last_stage)
+        virtual_pp_stages.append(last_stage)
     # Step 2. Assign each logical stage(s) to pp ranks for the given schedule
     pp_rank_to_stage_indices = assign_logical_stages_to_pp_rank(
         schedule_name, pp_degree, stages_per_rank
@@ -414,10 +434,8 @@ def run_test(
     stage_graphs: dict[int, GraphCallables] = {}
     stage_graph_metas: dict[int, GraphMeta] = {}
     # Step 3. Apply AutoParallel to each logical stage assigned to this pp rank
-    use_cache = fake_evaluate
     root_cache = "tmp"
     os.makedirs(root_cache, exist_ok=True)
-    from autoparallel.api import AutoParallelPPModule
 
     for stage_idx in stage_indices_current_pp_rank:
         trace_structured(
@@ -439,8 +457,12 @@ def run_test(
                 k: nn.Parameter(v.detach())
                 for k, v in cache["sharded_param_dict"].items()
             }
-            pp_mod = AutoParallelPPModule(
-                cache["sharded_param_dict"], cache["sharded_buffer_dict"], stage_mod
+            fake_mode = FakeTensorMode()
+            stage_mod = move_to_fake(stage_mod, fake_mode, device)
+            pp_mod = make_pp_module(
+                cache["sharded_param_dict"],
+                cache["sharded_buffer_dict"],
+                stage_mod,
             )
         else:
             if stage_idx == 0:
@@ -458,17 +480,12 @@ def run_test(
                 dynamic=True,
                 compile=False,
                 reshard_after_forward=False,
-                loss_fn=(
-                    dsv3_loss_fn
-                    if use_loss_fn and stage_idx == total_pp_stages - 1
-                    else None
-                ),
             ) as autop:
                 autop.add_parameter_memory_constraint(low=None, high=None)
 
                 # x_sharding = (Shard(0), Replicate())
                 x_sharding = (Shard(0), Shard(0))
-                if autop.loss_fn is not None:
+                if use_loss_fn and stage_idx == total_pp_stages - 1:
                     autop.add_input_constraints([x_sharding, x_sharding])
                     autop.add_output_constraints([(Replicate(), Replicate())])
                 else:
@@ -486,11 +503,7 @@ def run_test(
                 )
                 graph_callables = cache["graph_callables"]
                 graph_meta = cache["graph_meta"]
-                pp_mod = AutoParallelPPModule(
-                    cache["sharded_param_dict"],
-                    cache["sharded_buffer_dict"],
-                    autop.init_weights_model,
-                )
+                pp_mod = autop.parallel_model
                 if use_cache:
                     torch.save(cache, stage_file)
 
@@ -603,19 +616,20 @@ def run_test(
         )
 
     # Step 7. Register the schedule with the graph runner
-
-    graph_pp_runner = GraphPPRunner(schedule)
+    graph_pp_runner = GraphPPRunner(schedule, inductor=use_inductor)
 
     # Step 8. Run the whole pipeline once using the graph runner
     has_last_stage = (total_pp_stages - 1) in stage_mods
-    with (
+    execution_fake_mode = (
         FakeTensorMode(
             allow_non_fake_inputs=True,
             shape_env=ShapeEnv(),
         )
         if fake_evaluate
         else nullcontext()
-    ):
+    )
+
+    with execution_fake_mode:
         with torch.no_grad():
             target, losses = (
                 (runtime_target_fn(), [])
@@ -691,11 +705,32 @@ if __name__ == "__main__":
         choices=["Interleaved1F1B", "ZBVZeroBubble", "DualPipeV"],
         help="Schedule to use for PP",
     )
+    parser.add_argument(
+        "--use-cache",
+        action="store_true",
+        default=False,
+        help="Use cached graph files if available (default: False)",
+    )
+    parser.add_argument(
+        "--inductor",
+        action="store_true",
+        default=False,
+        help="Compile subgraphs with Inductor (also forces balanced MoE routing)",
+    )
     args = parser.parse_args()
+
+    if args.use_cache and not args.fake_evaluate:
+        parser.error("--use-cache can only be used with --fake-evaluate")
 
     if args.rng_seed is not None:
         torch.use_deterministic_algorithms(True)
         torch.manual_seed(args.rng_seed)
+
+    if args.inductor:
+        # The DSv3 MoE implementation uses .tolist() and data-dependent grouped_mm
+        # offsets, which Inductor cannot compile. Force balanced routing to make
+        # all token counts static.
+        dsv3_module.FORCE_BALANCED_ROUTING = True
 
     run_test(
         fake_evaluate=args.fake_evaluate,
@@ -703,4 +738,6 @@ if __name__ == "__main__":
         schedule_name=args.schedule_name,
         rng_seed=args.rng_seed,
         logs_dir=args.logs_dir,
+        use_cache=args.use_cache,
+        use_inductor=args.inductor,
     )

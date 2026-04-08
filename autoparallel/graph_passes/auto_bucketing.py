@@ -3,12 +3,15 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+import logging
 from functools import partial
 
 import torch
 from torch._inductor.fx_passes.overlap_scheduling import schedule_overlap_bucketing
 
 from .autobucketing_inductor import bucket_func, bucket_plan, bucket_utils, reorder
+
+logger = logging.getLogger(__name__)
 
 
 class simplefsdp_autobucketing_config:
@@ -76,7 +79,7 @@ def simple_fsdp_autobucketing_reordering_pass(
             )
 
     if configs.enable_reorder_ir:
-        print("Reorder scheduler nodes with autobucketing algroithm")
+        logger.debug("Reorder scheduler nodes with autobucketing algroithm")
         node_length = len(snodes)
         snodes = reorder.reorder_all_gather(
             snodes, bucketable_nodes, all_gather_before_last_wait=False

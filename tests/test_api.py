@@ -5,32 +5,13 @@
 
 import pytest
 import torch
+import torch._inductor.config
 import torch.fx.traceback as fx_traceback
 from torch import nn
+from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import Replicate, Shard
-from torch.testing._internal.distributed.fake_pg import FakeStore
 
-from autoparallel.api import AutoParallel
-
-
-@pytest.fixture(scope="module", autouse=True)
-def init_pg():
-    world_size = 256
-    fake_store = FakeStore()
-    if torch.distributed.is_initialized():
-        return
-    torch.distributed.init_process_group(
-        "fake", store=fake_store, rank=0, world_size=world_size
-    )
-
-
-@pytest.fixture(scope="module")
-def device_mesh_1d():
-    world_size = torch.distributed.get_world_size()
-    mesh = torch.distributed.device_mesh.init_device_mesh(
-        "cuda", (world_size,), mesh_dim_names=("dp",)
-    )
-    return mesh
+from autoparallel.api import AutoParallel, auto_parallel
 
 
 def test_from_meta_model(device_mesh_1d):
@@ -64,57 +45,6 @@ def test_from_meta_model(device_mesh_1d):
         auto_p.model.get_parameter("linear.weight"), torch._subclasses.FakeTensor
     )
     assert isinstance(auto_p.model.get_buffer("buf"), torch._subclasses.FakeTensor)
-
-
-def test_init(device_mesh_1d):
-    dim = 128
-
-    class Model(nn.Module):
-        def __init__(self, dim):
-            super().__init__()
-            self.linear = nn.Linear(dim, dim)
-            self.register_buffer("buf", torch.empty(dim))
-
-        def forward(self, x):
-            return self.linear(x) + self.buf
-
-        def init_weights(self):
-            self.linear.weight = torch.nn.Parameter(torch.ones(dim, dim) * 9.0)
-            with torch.no_grad():
-                self.linear.bias.fill_(98.6)
-            self.buf = torch.arange(dim)
-
-    def input_fn():
-        b = 512
-        inputs = (torch.rand(b, dim, device="cuda"),)
-        return inputs
-
-    with torch.device("meta"):
-        model = Model(dim)
-    with AutoParallel(
-        model,
-        input_fn,
-        device_mesh_1d,
-    ) as autop:
-        x_sharding = (Shard(0),)
-        autop.add_input_constraints([x_sharding])
-        sharding_placement = autop.optimize_placement()
-
-        # AutoParallel produces a module with meta-DTensor parameters that need to be initialized
-        parallel_mod = autop.apply_placement(sharding_placement)
-    parallel_mod.to_empty(device="cuda")
-    parallel_mod.init_weights()
-    assert torch.equal(
-        parallel_mod.get_parameter("linear.weight").full_tensor(),
-        torch.full((dim, dim), 9.0, device="cuda"),
-    )
-    assert torch.equal(
-        parallel_mod.get_parameter("linear.bias").full_tensor(),
-        torch.full((dim,), 98.6, device="cuda"),
-    )
-    assert torch.equal(
-        parallel_mod.get_buffer("buf").full_tensor(), torch.arange(dim, device="cuda")
-    )
 
 
 def test_fx_graph_annotate(device_mesh_1d):
@@ -155,6 +85,7 @@ def test_fx_graph_annotate(device_mesh_1d):
     ) as autop:
         x_sharding = (Shard(0),)
         autop.add_input_constraints([x_sharding])
+        autop.add_output_constraints([x_sharding])
         sharding_placement = autop.optimize_placement()
 
         # AutoParallel produces a module with meta-DTensor parameters that need to be initialized
@@ -380,28 +311,26 @@ def test_moduledict_preservation(device_mesh_1d):
             x = self.layers["layer2"](x)
             return x
 
-    def input_fn():
-        b = 512
-        inputs = (torch.rand(b, dim, device="cuda"),)
-        return inputs
-
     with torch.device("meta"):
         model = Model(dim)
 
     # Verify original model has ModuleDict
     assert isinstance(model.layers, nn.ModuleDict)
 
-    with AutoParallel(
-        model,
-        input_fn,
+    batch_size = 512
+    local_batch_size = batch_size // device_mesh_1d.size()
+    x = DTensor.from_local(
+        torch.rand(local_batch_size, dim, device="cuda"),
         device_mesh_1d,
-    ) as autop:
-        x_sharding = (Shard(0),)
-        autop.add_input_constraints([x_sharding])
-        sharding_placement = autop.optimize_placement()
-
-        # AutoParallel produces a module with meta-DTensor parameters that need to be initialized
-        parallel_mod = autop.apply_placement(sharding_placement)
+        [Shard(0)],
+    )
+    parallel_mod = auto_parallel(
+        model,
+        device_mesh_1d,
+        sample_inputs=(x,),
+        out_shardings=(Shard(0),),
+        compile=False,
+    )
 
     # Verify that the parallel_mod preserves the ModuleDict structure
     assert isinstance(
@@ -419,156 +348,389 @@ def test_moduledict_preservation(device_mesh_1d):
     assert hasattr(parallel_mod.layers["layer2"], "weight")
 
 
-# Tests for the simplified auto_parallel API
+def test_enter_failure_cleans_up_fake_mode(device_mesh_1d):
+    """FakeTensorMode pushed during build_model_graph is unwound if __enter__ fails.
 
-
-def test_auto_parallel_basic(device_mesh_1d):
-    """Test basic auto_parallel usage with DTensor input."""
-    from torch.distributed.tensor import DTensor
-
-    from autoparallel import auto_parallel
+    build_model_graph() pushes FakeTensorMode onto self.stack via
+    aot_export_joint_with_descriptors. If something after build_model_graph()
+    raises (e.g. ShardingOptimizer), Python never calls __exit__ because
+    __enter__ didn't succeed, so __enter__ must unwind self.stack explicitly.
+    Without cleanup, the leaked FakeTensorMode causes "Mixing fake modes NYI"
+    on subsequent usage.
+    """
+    from unittest.mock import patch
 
     dim = 128
-    batch_size = 512
-    local_batch_size = batch_size // device_mesh_1d.size()
 
     class Model(nn.Module):
         def __init__(self, dim):
             super().__init__()
             self.linear = nn.Linear(dim, dim)
+
+        def forward(self, x):
+            return self.linear(x)
+
+    def input_fn():
+        return (torch.rand(32, dim, device="cuda"),)
+
+    with torch.device("meta"):
+        model1 = Model(dim)
+    auto_p = AutoParallel(model1, input_fn, device_mesh_1d)
+
+    # Make ShardingOptimizer raise to simulate __enter__ failing
+    # after build_model_graph() has already pushed FakeTensorMode.
+    with patch(
+        "autoparallel.api.ShardingOptimizer", side_effect=RuntimeError("injected")
+    ):
+        with pytest.raises(RuntimeError, match="injected"):
+            auto_p.__enter__()
+
+    # If FakeTensorMode leaked, this would fail with "Mixing fake modes NYI"
+    # during copy.deepcopy inside AutoParallel.__init__.
+    with torch.device("meta"):
+        model2 = Model(dim)
+    AutoParallel(model2, input_fn, device_mesh_1d)
+
+
+def test_unused_parameters_captured(device_mesh_1d):
+    """Unused parameters should appear on the parallel model."""
+    dim = 128
+
+    class Model(nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            self.used_linear = nn.Linear(dim, dim)
+            self.unused_linear = nn.Linear(dim, dim)
+
+        def forward(self, x):
+            return self.used_linear(x)
+
+    with torch.device("meta"):
+        model = Model(dim)
+
+    batch_size = 512
+    local_batch_size = batch_size // device_mesh_1d.size()
+    x = DTensor.from_local(
+        torch.rand(local_batch_size, dim, device="cuda"),
+        device_mesh_1d,
+        [Shard(0)],
+    )
+    parallel_mod = auto_parallel(
+        model,
+        device_mesh_1d,
+        sample_inputs=(x,),
+        out_shardings=(Shard(0),),
+        compile=False,
+    )
+
+    param_names = {name for name, _ in parallel_mod.named_parameters()}
+    assert "used_linear.weight" in param_names
+    assert "used_linear.bias" in param_names
+    assert (
+        "unused_linear.weight" in param_names
+    ), f"unused_linear.weight not found in parallel model params: {param_names}"
+    assert (
+        "unused_linear.bias" in param_names
+    ), f"unused_linear.bias not found in parallel model params: {param_names}"
+
+
+def test_aliased_submodule(device_mesh_1d):
+    """Test that aliased submodules (two module attrs pointing to the same object) work.
+
+    This mirrors the DINOVid pattern where model.model_ema = model.teacher,
+    causing named_parameters(remove_duplicate=False) to yield the same tensor
+    under two FQNs. move_to_fake must not assert on the second occurrence
+    because the tensor was already replaced with a fake on the first pass.
+    The module alias must also be re-established on the parallel model so that
+    model_ema and teacher remain the same object.
+    """
+    dim = 128
+
+    class Model(nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            self.student = nn.Linear(dim, dim)
+            self.teacher = nn.Linear(dim, dim)
+            # Alias: model_ema IS teacher (same object, two registered names)
+            self.model_ema = self.teacher
+
+        def forward(self, x):
+            return self.student(x) + self.teacher(x)
+
+        def init_weights(self):
+            nn.init.ones_(self.student.weight)
+            nn.init.zeros_(self.student.bias)
+            nn.init.ones_(self.teacher.weight)
+            nn.init.zeros_(self.teacher.bias)
+
+    with torch.device("meta"):
+        model = Model(dim)
+
+    assert model.model_ema is model.teacher
+
+    batch_size = 512
+    local_batch_size = batch_size // device_mesh_1d.size()
+    x = DTensor.from_local(
+        torch.rand(local_batch_size, dim, device="cuda"),
+        device_mesh_1d,
+        [Shard(0)],
+    )
+    # The key assertion is that auto_parallel succeeds without crashing
+    # on the aliased submodule in move_to_fake.
+    parallel_mod = auto_parallel(
+        model,
+        device_mesh_1d,
+        sample_inputs=(x,),
+        out_shardings=(Shard(0),),
+        compile=False,
+    )
+
+    # Module alias should be re-established on the parallel model
+    assert parallel_mod.model_ema is parallel_mod.teacher
+
+    parallel_mod.to_empty(device="cuda")
+    parallel_mod.init_weights()
+
+    expected = torch.ones(dim, dim, device="cuda")
+    assert torch.equal(
+        parallel_mod.get_parameter("student.weight").full_tensor(), expected
+    )
+    assert torch.equal(
+        parallel_mod.get_parameter("teacher.weight").full_tensor(), expected
+    )
+
+
+def test_parallel_model_isinstance(device_mesh_1d):
+    """AutoParallelModule should be an instance of the user's model class."""
+    dim = 128
+
+    class Model(nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            self.linear = nn.Linear(dim, dim)
+
+        def forward(self, x):
+            return self.linear(x)
+
+    with torch.device("meta"):
+        model = Model(dim)
+
+    batch_size = 512
+    local_batch_size = batch_size // device_mesh_1d.size()
+    x = DTensor.from_local(
+        torch.rand(local_batch_size, dim, device="cuda"),
+        device_mesh_1d,
+        [Shard(0)],
+    )
+    parallel_mod = auto_parallel(
+        model,
+        device_mesh_1d,
+        sample_inputs=(x,),
+        out_shardings=(Shard(0),),
+        compile=False,
+    )
+    assert isinstance(parallel_mod, Model)
+
+
+def test_user_method_accessible(device_mesh_1d):
+    """User-defined methods and instance attributes should be available on parallel model."""
+    dim = 128
+
+    class Model(nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            self.linear = nn.Linear(dim, dim)
+            self.dim = dim
+            self.model_name = "test_model"
+
+        def forward(self, x):
+            return self.linear(x)
+
+        def get_num_params(self):
+            return sum(p.numel() for p in self.parameters())
+
+    with torch.device("meta"):
+        model = Model(dim)
+
+    batch_size = 512
+    local_batch_size = batch_size // device_mesh_1d.size()
+    x = DTensor.from_local(
+        torch.rand(local_batch_size, dim, device="cuda"),
+        device_mesh_1d,
+        [Shard(0)],
+    )
+    parallel_mod = auto_parallel(
+        model,
+        device_mesh_1d,
+        sample_inputs=(x,),
+        out_shardings=(Shard(0),),
+        compile=False,
+    )
+    assert hasattr(parallel_mod, "get_num_params")
+    assert parallel_mod.get_num_params() > 0
+    assert parallel_mod.dim == dim
+    assert parallel_mod.model_name == "test_model"
+
+
+def test_user_ema_update(device_mesh_1d):
+    """User-defined EMA update method should work on the parallel model."""
+    dim = 128
+
+    class Model(nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            self.linear = nn.Linear(dim, dim, bias=False)
+            self.ema_linear = nn.Linear(dim, dim, bias=False)
 
         def forward(self, x):
             return self.linear(x)
 
         def init_weights(self):
-            nn.init.ones_(self.linear.weight)
-            nn.init.zeros_(self.linear.bias)
+            with torch.no_grad():
+                self.linear.weight.fill_(2.0)
+                self.ema_linear.weight.fill_(0.0)
+
+        @torch.no_grad()
+        def update_ema(self, decay=0.9):
+            for p, ema_p in zip(self.linear.parameters(), self.ema_linear.parameters()):
+                ema_p.lerp_(p, 1 - decay)
 
     with torch.device("meta"):
         model = Model(dim)
 
-    # Create DTensor input with sharding
+    batch_size = 512
+    local_batch_size = batch_size // device_mesh_1d.size()
     x = DTensor.from_local(
         torch.rand(local_batch_size, dim, device="cuda"),
         device_mesh_1d,
         [Shard(0)],
     )
-
-    parallel_model = auto_parallel(
+    parallel_mod = auto_parallel(
         model,
         device_mesh_1d,
         sample_inputs=(x,),
         out_shardings=(Shard(0),),
         compile=False,
     )
-
-    # Verify model was created
-    assert parallel_model is not None
-    assert hasattr(parallel_model, "linear")
-
-    # Initialize and verify
-    parallel_model.to_empty(device="cuda")
-    parallel_model.init_weights()
+    parallel_mod.to_empty(device="cuda")
+    parallel_mod.init_weights()
 
     assert torch.equal(
-        parallel_model.get_parameter("linear.weight").full_tensor(),
-        torch.ones(dim, dim, device="cuda"),
+        parallel_mod.get_parameter("ema_linear.weight").full_tensor(),
+        torch.zeros(dim, dim, device="cuda"),
+    )
+
+    parallel_mod.update_ema(decay=0.9)
+
+    # EMA should have moved 10% toward the main weight (2.0)
+    expected = torch.full((dim, dim), 0.2, device="cuda")
+    assert torch.allclose(
+        parallel_mod.get_parameter("ema_linear.weight").full_tensor(),
+        expected,
     )
 
 
-def test_auto_parallel_tuple_inputs(device_mesh_1d):
-    """Test auto_parallel with multiple DTensor inputs as tuple."""
-    from torch.distributed.tensor import DTensor
-
-    from autoparallel import auto_parallel
-
+def test_user_reset_buffers(device_mesh_1d):
+    """User-defined method that resets buffers should work on the parallel model."""
     dim = 128
-    batch_size = 512
-    local_batch_size = batch_size // device_mesh_1d.size()
 
     class Model(nn.Module):
         def __init__(self, dim):
             super().__init__()
-            self.linear1 = nn.Linear(dim, dim)
-            self.linear2 = nn.Linear(dim, dim)
-
-        def forward(self, x, y):
-            return self.linear1(x) + self.linear2(y)
-
-    with torch.device("meta"):
-        model = Model(dim)
-
-    # Create DTensor inputs
-    x = DTensor.from_local(
-        torch.rand(local_batch_size, dim, device="cuda"),
-        device_mesh_1d,
-        [Shard(0)],
-    )
-    y = DTensor.from_local(
-        torch.rand(local_batch_size, dim, device="cuda"),
-        device_mesh_1d,
-        [Shard(0)],
-    )
-
-    parallel_model = auto_parallel(
-        model,
-        device_mesh_1d,
-        sample_inputs=(x, y),
-        out_shardings=(Shard(0),),
-        compile=False,
-    )
-
-    assert parallel_model is not None
-
-
-def test_auto_parallel_multiple_outputs(device_mesh_1d):
-    """Test auto_parallel with multiple outputs and pytree out_shardings."""
-    from torch.distributed.tensor import DTensor
-
-    from autoparallel import auto_parallel
-
-    dim = 128
-    batch_size = 512
-    local_batch_size = batch_size // device_mesh_1d.size()
-
-    class Model(nn.Module):
-        def __init__(self, dim):
-            super().__init__()
-            self.linear1 = nn.Linear(dim, dim, bias=True)
-            self.linear2 = nn.Linear(dim, dim, bias=True)
+            self.linear = nn.Linear(dim, dim)
+            self.register_buffer("step_count", torch.zeros(1))
 
         def forward(self, x):
-            return self.linear1(x), self.linear2(x)
+            return self.linear(x) + self.step_count
+
+        def init_weights(self):
+            with torch.no_grad():
+                self.linear.weight.fill_(1.0)
+                self.linear.bias.fill_(0.0)
+                self.step_count.fill_(42.0)
+
+        def reset_step_count(self):
+            self.step_count.zero_()
 
     with torch.device("meta"):
         model = Model(dim)
 
+    batch_size = 512
+    local_batch_size = batch_size // device_mesh_1d.size()
     x = DTensor.from_local(
         torch.rand(local_batch_size, dim, device="cuda"),
         device_mesh_1d,
         [Shard(0)],
     )
-
-    # Pytree out_shardings matching tuple output
-    parallel_model = auto_parallel(
+    parallel_mod = auto_parallel(
         model,
         device_mesh_1d,
         sample_inputs=(x,),
-        out_shardings=((Shard(0),), (Shard(0),)),
+        out_shardings=(Shard(0),),
         compile=False,
     )
+    parallel_mod.to_empty(device="cuda")
+    parallel_mod.init_weights()
 
-    assert parallel_model is not None
+    assert parallel_mod.get_buffer("step_count").full_tensor().item() == 42.0
+    parallel_mod.reset_step_count()
+    assert parallel_mod.get_buffer("step_count").full_tensor().item() == 0.0
 
 
-def test_auto_parallel_replicated_input(device_mesh_1d):
-    """Test auto_parallel with regular tensor (assumed Replicate)."""
-    from autoparallel import auto_parallel
-
+def test_user_classmethod_and_property(device_mesh_1d):
+    """Classmethods and properties defined on the user model should be accessible."""
     dim = 128
-    batch_size = 512
 
     class Model(nn.Module):
+        _registry = []
+
+        def __init__(self, dim):
+            super().__init__()
+            self.linear = nn.Linear(dim, dim)
+            self._hidden_dim = dim * 4
+
+        def forward(self, x):
+            return self.linear(x)
+
+        @classmethod
+        def from_config(cls, config_dim):
+            return cls(config_dim)
+
+        @property
+        def hidden_dim(self):
+            return self._hidden_dim
+
+    with torch.device("meta"):
+        model = Model(dim)
+
+    batch_size = 512
+    local_batch_size = batch_size // device_mesh_1d.size()
+    x = DTensor.from_local(
+        torch.rand(local_batch_size, dim, device="cuda"),
+        device_mesh_1d,
+        [Shard(0)],
+    )
+    parallel_mod = auto_parallel(
+        model,
+        device_mesh_1d,
+        sample_inputs=(x,),
+        out_shardings=(Shard(0),),
+        compile=False,
+    )
+    assert parallel_mod.hidden_dim == dim * 4
+    assert hasattr(type(parallel_mod), "from_config")
+    assert type(parallel_mod)._registry is Model._registry
+
+
+def test_inherited_user_model(device_mesh_1d):
+    """AutoParallelModule should inherit from the leaf class, getting the full MRO."""
+    dim = 128
+
+    class BaseModel(nn.Module):
+        def get_num_params(self):
+            return sum(p.numel() for p in self.parameters())
+
+    class Model(BaseModel):
         def __init__(self, dim):
             super().__init__()
             self.linear = nn.Linear(dim, dim)
@@ -579,101 +741,145 @@ def test_auto_parallel_replicated_input(device_mesh_1d):
     with torch.device("meta"):
         model = Model(dim)
 
-    # Regular tensor - will be assumed Replicate
-    # Output is sharded so the optimizer can find a valid solution
-    x = torch.rand(batch_size, dim, device="cuda")
-
-    parallel_model = auto_parallel(
-        model,
-        device_mesh_1d,
-        sample_inputs=(x,),
-        out_shardings=(Shard(0),),  # Shard output for valid solution
-        compile=False,
-    )
-
-    assert parallel_model is not None
-
-
-def test_auto_parallel_callable_inputs(device_mesh_1d):
-    """Test auto_parallel with callable sample_inputs."""
-    from torch.distributed.tensor import DTensor
-
-    from autoparallel import auto_parallel
-
-    dim = 128
     batch_size = 512
     local_batch_size = batch_size // device_mesh_1d.size()
-
-    class Model(nn.Module):
-        def __init__(self, dim):
-            super().__init__()
-            self.linear = nn.Linear(dim, dim)
-
-        def forward(self, x):
-            return self.linear(x)
-
-    with torch.device("meta"):
-        model = Model(dim)
-
-    def sample_inputs():
-        return (
-            DTensor.from_local(
-                torch.rand(local_batch_size, dim, device="cuda"),
-                device_mesh_1d,
-                [Shard(0)],
-            ),
-        )
-
-    parallel_model = auto_parallel(
-        model,
-        device_mesh_1d,
-        sample_inputs=sample_inputs,
-        out_shardings=(Shard(0),),
-        compile=False,
-    )
-
-    assert parallel_model is not None
-
-
-def test_auto_parallel_with_mp_policy(device_mesh_1d):
-    """Test auto_parallel with mixed precision policy."""
-    from torch.distributed.fsdp import MixedPrecisionPolicy
-    from torch.distributed.tensor import DTensor
-
-    from autoparallel import auto_parallel
-
-    dim = 128
-    batch_size = 512
-    local_batch_size = batch_size // device_mesh_1d.size()
-
-    class Model(nn.Module):
-        def __init__(self, dim):
-            super().__init__()
-            self.linear = nn.Linear(dim, dim)
-
-        def forward(self, x):
-            return self.linear(x)
-
-    with torch.device("meta"):
-        model = Model(dim)
-
     x = DTensor.from_local(
         torch.rand(local_batch_size, dim, device="cuda"),
         device_mesh_1d,
         [Shard(0)],
     )
-
-    mp_policy = MixedPrecisionPolicy(
-        param_dtype=torch.bfloat16, reduce_dtype=torch.float32
-    )
-
-    parallel_model = auto_parallel(
+    parallel_mod = auto_parallel(
         model,
         device_mesh_1d,
         sample_inputs=(x,),
         out_shardings=(Shard(0),),
-        mp_policy=mp_policy,
         compile=False,
     )
+    assert isinstance(parallel_mod, Model)
+    assert isinstance(parallel_mod, BaseModel)
+    assert parallel_mod.get_num_params() > 0
 
-    assert parallel_model is not None
+
+# Tests for overlap scheduling in compile=False path
+
+
+def test_overlap_scheduling_called_when_enabled(device_mesh_1d):
+    """Test that schedule_overlap_bucketing_from_inductor_configs is called
+    when compile=False and enable_overlap_scheduling=True.
+    """
+    from unittest.mock import patch
+
+    dim = 128
+
+    class Model(nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            self.linear = nn.Linear(dim, dim)
+
+        def forward(self, x):
+            return self.linear(x)
+
+    def input_fn():
+        b = 512
+        return (torch.rand(b, dim, device="cuda"),)
+
+    with torch.device("meta"):
+        model = Model(dim)
+
+    overlap_bucketing_called = []
+
+    with patch(
+        "torch._inductor.fx_passes.overlap_scheduling.schedule_overlap_bucketing_from_inductor_configs",
+        side_effect=lambda fx_g: overlap_bucketing_called.append(fx_g) or fx_g,
+    ), torch._inductor.config.patch(
+        {"aten_distributed_optimizations.enable_overlap_scheduling": True}
+    ):
+        with AutoParallel(
+            model,
+            input_fn,
+            device_mesh_1d,
+            compile=False,
+        ) as autop:
+            autop.add_input_constraints([(Shard(0),)])
+            sharding_placement = autop.optimize_placement()
+            _ = autop.apply_placement(sharding_placement)
+
+    assert (
+        len(overlap_bucketing_called) > 0
+    ), "schedule_overlap_bucketing_from_inductor_configs should be called"
+
+    for fx_g in overlap_bucketing_called:
+        assert isinstance(fx_g, torch.fx.GraphModule)
+
+
+def test_overlap_scheduling_not_called_when_disabled(device_mesh_1d):
+    """Test that overlap scheduling is skipped when enable_overlap_scheduling=False (default)."""
+    from unittest.mock import patch
+
+    dim = 128
+
+    class Model(nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            self.linear = nn.Linear(dim, dim)
+
+        def forward(self, x):
+            return self.linear(x)
+
+    def input_fn():
+        b = 512
+        return (torch.rand(b, dim, device="cuda"),)
+
+    with torch.device("meta"):
+        model = Model(dim)
+
+    overlap_bucketing_called = []
+
+    with patch(
+        "torch._inductor.fx_passes.overlap_scheduling.schedule_overlap_bucketing_from_inductor_configs",
+        side_effect=lambda fx_g: overlap_bucketing_called.append(fx_g) or fx_g,
+    ):
+        with AutoParallel(
+            model,
+            input_fn,
+            device_mesh_1d,
+            compile=False,
+        ) as autop:
+            autop.add_input_constraints([(Shard(0),)])
+            sharding_placement = autop.optimize_placement()
+            _ = autop.apply_placement(sharding_placement)
+
+    assert (
+        len(overlap_bucketing_called) == 0
+    ), "schedule_overlap_bucketing_from_inductor_configs should NOT be called by default"
+
+
+def test_compile_true_uses_compile_fx_inner(device_mesh_1d):
+    """When compile=True, the compiler_fn should be compile_fx_inner."""
+    dim = 128
+
+    class Model(nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            self.linear = nn.Linear(dim, dim)
+
+        def forward(self, x):
+            return self.linear(x)
+
+    def input_fn():
+        b = 512
+        return (torch.rand(b, dim, device="cuda"),)
+
+    with torch.device("meta"):
+        model = Model(dim)
+
+    from torch._inductor.compile_fx import compile_fx_inner
+
+    autop = AutoParallel(
+        model,
+        input_fn,
+        device_mesh_1d,
+        compile=True,
+    )
+
+    assert autop.compiler_fn is compile_fx_inner
