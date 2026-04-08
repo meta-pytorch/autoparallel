@@ -272,8 +272,8 @@ def test_user_ac_policy_fn_applied_to_getitem(device_mesh_1d):
 
 
 def _build_parallel_graph(model_cls, mesh, *, context_fn=None):
-    """Run the full AutoParallel pipeline (with enable_ac=False) and return
-    the parallel graph for ac_joint_pass testing."""
+    """Run the full AutoParallel pipeline and return the parallel graph for
+    ac_joint_pass testing."""
     nheads, dim, ffn_dim = 8, 128, 512
     bs = 8 * mesh.shape[0]
     seq_len = 32
@@ -287,7 +287,7 @@ def _build_parallel_graph(model_cls, mesh, *, context_fn=None):
         else:
             model = model_cls(nheads, dim, ffn_dim)
 
-    with AutoParallel(model, input_fn, mesh, enable_ac=False) as autop:
+    with AutoParallel(model, input_fn, mesh) as autop:
         x_sharding = (Shard(0),)
         autop.add_input_constraints([x_sharding])
         autop.add_output_constraints([x_sharding])
@@ -317,6 +317,7 @@ def test_ac_joint_pass_marks_recomputable_nodes(device_mesh_1d):
             assert recompute in (
                 CheckpointPolicy.PREFER_RECOMPUTE,
                 CheckpointPolicy.MUST_SAVE,
+                CheckpointPolicy.MUST_RECOMPUTE,
             ), f"{n} has unexpected recompute={recompute}"
 
 
@@ -601,9 +602,10 @@ def test_local_map_custom_metadata_propagation(device_mesh_3d):
     with torch.device("meta"):
         model = Block(nheads, dim, ffn_dim)
 
-    with fx_traceback.preserve_node_meta(), AutoParallel(
-        model, input_fn, mesh, compile=True
-    ) as autop:
+    with (
+        fx_traceback.preserve_node_meta(),
+        AutoParallel(model, input_fn, mesh) as autop,
+    ):
         autop.add_parameter_memory_constraint(low=None, high=None)
         x_sharding = (Shard(0),) + (Replicate(),) * (mesh.ndim - 1)
         autop.add_input_constraints([x_sharding])

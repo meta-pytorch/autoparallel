@@ -45,7 +45,6 @@ def test_init(device_mesh_1d):
         device_mesh_1d,
         sample_inputs=(x,),
         out_shardings=(Shard(0),),
-        compile=False,
     )
     parallel_mod.to_empty(device="cuda")
     parallel_mod.init_weights()
@@ -95,7 +94,6 @@ def test_init_inplace_data(device_mesh_1d):
         device_mesh_1d,
         sample_inputs=(x,),
         out_shardings=(Shard(0),),
-        compile=False,
     )
     parallel_mod.to_empty(device="cuda")
     parallel_mod.init_weights()
@@ -168,7 +166,6 @@ def test_init_aliased_buffers(device_mesh_1d):
         device_mesh_1d,
         sample_inputs=(x,),
         out_shardings=(Shard(0),),
-        compile=False,
     )
 
     parallel_mod.to_empty(device="cuda")
@@ -222,7 +219,6 @@ def test_init_aliased_parameters(device_mesh_1d):
         device_mesh_1d,
         sample_inputs=(x,),
         out_shardings=(Shard(0),),
-        compile=False,
     )
 
     parallel_mod.to_empty(device="cuda")
@@ -286,7 +282,6 @@ def test_aliased_buffers_both_used_in_forward(device_mesh_1d):
         device_mesh_1d,
         sample_inputs=(x,),
         out_shardings=(Shard(0),),
-        compile=False,
     )
 
     parallel_mod.to_empty(device="cuda")
@@ -339,7 +334,6 @@ def test_aliased_parameters_both_used_in_forward(device_mesh_1d):
         device_mesh_1d,
         sample_inputs=(x,),
         out_shardings=(Shard(0),),
-        compile=False,
     )
 
     parallel_mod.to_empty(device="cuda")
@@ -388,7 +382,6 @@ def test_init_load_state_dict(device_mesh_1d):
         device_mesh_1d,
         sample_inputs=(x,),
         out_shardings=(Shard(0),),
-        compile=False,
     )
     parallel_mod.to_empty(device="cuda")
     parallel_mod.init_weights()
@@ -467,7 +460,6 @@ def test_init_submodule_init_weights(device_mesh_1d):
         device_mesh_1d,
         sample_inputs=(x,),
         out_shardings=(Shard(0),),
-        compile=False,
     )
     parallel_mod.to_empty(device="cuda")
     parallel_mod.init_weights()
@@ -526,7 +518,6 @@ def test_init_access_submodule_params(device_mesh_1d):
         device_mesh_1d,
         sample_inputs=(x,),
         out_shardings=(Shard(0),),
-        compile=False,
     )
     parallel_mod.to_empty(device="cuda")
     parallel_mod.init_weights()
@@ -599,7 +590,6 @@ def test_init_submodule_load_state_dict(device_mesh_1d):
         device_mesh_1d,
         sample_inputs=(x,),
         out_shardings=(Shard(0),),
-        compile=False,
     )
     parallel_mod.to_empty(device="cuda")
     parallel_mod.init_weights()
@@ -662,7 +652,6 @@ def test_init_optional_submodule(device_mesh_1d):
         device_mesh_1d,
         sample_inputs=(x,),
         out_shardings=(Shard(0),),
-        compile=False,
     )
     parallel_mod.to_empty(device="cuda")
     parallel_mod.init_weights()
@@ -711,7 +700,6 @@ def test_init_data_assign_raises(device_mesh_1d):
         device_mesh_1d,
         sample_inputs=(x,),
         out_shardings=(Shard(0),),
-        compile=False,
     )
     parallel_mod.to_empty(device="cuda")
     with pytest.raises(RuntimeError, match=r"Cannot use `.data = ...` on a DTensor"):
