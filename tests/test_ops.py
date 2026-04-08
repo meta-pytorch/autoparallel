@@ -7,7 +7,6 @@ import pytest
 import torch
 from torch import nn
 from torch.distributed.tensor.placement_types import Replicate, Shard
-from torch.testing._internal.distributed.fake_pg import FakeStore
 
 from autoparallel import AutoParallel, with_sharding_constraint
 from autoparallel.collectives import local_map
@@ -15,15 +14,6 @@ from autoparallel.ops import permutation
 
 
 def get_local_map_nodes(graph, is_backward=False):
-    """Get local_map nodes from an FX graph.
-
-    Args:
-        graph: The FX graph to search.
-        is_backward: If True, return backward nodes; if False, return forward nodes.
-
-    Returns:
-        List of local_map nodes.
-    """
     nodes = []
     for node in graph.nodes:
         if "local_map_kwargs" in node.meta:
@@ -34,16 +24,7 @@ def get_local_map_nodes(graph, is_backward=False):
 
 
 def verify_local_map_placements(sharding_placement, node, expected_placements):
-    """Verify that a local_map node has the expected output placements.
-
-    Args:
-        sharding_placement: The sharding placement dict from optimize_placement().
-        node: The FX node to check.
-        expected_placements: Expected tuple of Placement objects for output.
-    """
     spec = sharding_placement[node]
-    # local_map nodes have tuple output_specs (output + saved activations)
-    # The first element is the actual output
     if isinstance(spec.output_specs, tuple):
         output_spec = spec.output_specs[0]
     else:
@@ -51,35 +32,6 @@ def verify_local_map_placements(sharding_placement, node, expected_placements):
     assert (
         output_spec.placements == expected_placements
     ), f"Expected placements {expected_placements}, got {output_spec.placements}"
-
-
-@pytest.fixture(scope="module", autouse=True)
-def init_pg():
-    world_size = 64
-    fake_store = FakeStore()
-    if torch.distributed.is_initialized():
-        return
-    torch.distributed.init_process_group(
-        "fake", store=fake_store, rank=0, world_size=world_size
-    )
-
-
-@pytest.fixture(scope="module")
-def device_mesh_1d():
-    world_size = torch.distributed.get_world_size()
-    mesh = torch.distributed.device_mesh.init_device_mesh(
-        "cuda", (world_size,), mesh_dim_names=("dp",)
-    )
-    return mesh
-
-
-@pytest.fixture(scope="module")
-def device_mesh_2d():
-    world_size = torch.distributed.get_world_size()
-    mesh = torch.distributed.device_mesh.init_device_mesh(
-        "cuda", (world_size // 8, 8), mesh_dim_names=("dp", "tp")
-    )
-    return mesh
 
 
 class TestWithShardingConstraint:
