@@ -25,6 +25,9 @@ class OpOption:
     The optimizer only sees cost numbers and opaque spec objects.
     The backend knows how to interpret the specs.
 
+    Exposes .output_specs, .input_specs, .redistribute_cost as aliases
+    for compatibility with code expecting OpSpec-like objects.
+
     Attributes:
         output_spec: Backend-specific output sharding (DTensorSpec or ShardedLayout)
         input_specs: Backend-specific per-input shardings
@@ -39,6 +42,28 @@ class OpOption:
     compute_cost: float = 0.0
     comm_cost: float = 0.0
     redistribute_costs: list = field(default_factory=list)
+
+    # Aliases for OpSpec compatibility — the optimizer accesses these
+    @property
+    def output_specs(self):
+        return self.output_spec
+
+    @property
+    def redistribute_cost(self):
+        return self.redistribute_costs
+
+
+class OpOptionList(list):
+    """A list of OpOption that also exposes .strategies for OpStrategy compatibility.
+
+    The optimizer code accesses strats[node].strategies[i] — this class makes
+    strats[node] a plain list where .strategies is just self.
+    This eliminates the need for wrapper classes while keeping backward compat.
+    """
+
+    @property
+    def strategies(self):
+        return self
 
 
 @runtime_checkable
@@ -76,13 +101,13 @@ class ShardingBackend(Protocol):
     def create_all_options(
         self,
         mesh: Any,
-        tensor_shape: tuple[int, ...],
+        node: Any,
     ) -> list[OpOption]:
         """Generate all possible shardings for a tensor (placeholder/parameter).
 
         Args:
             mesh: Device mesh
-            tensor_shape: Global tensor shape
+            node: FX graph node — backend extracts shape/dtype/stride from node.meta["val"]
 
         Returns:
             List of OpOption where each has a single output_spec and

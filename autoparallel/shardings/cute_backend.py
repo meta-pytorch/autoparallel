@@ -103,9 +103,11 @@ class CuTeBackend:
     def create_all_options(
         self,
         mesh: Any,
-        tensor_shape: tuple[int, ...],
+        node: Any,
     ) -> list[OpOption]:
         """Generate all possible shardings for a tensor."""
+        tensor = node.meta["val"]
+        tensor_shape = tuple(tensor.shape)
         mesh_shape = _get_mesh_shape(mesh)
         shardings = enumerate_shardings(tensor_shape, mesh_shape)
 

@@ -2069,10 +2069,19 @@ class TestCuTeBackend(unittest.TestCase):
         backend = CuTeBackend()
         self.assertIsInstance(backend, ShardingBackend)
 
+    def _make_fake_node(self, shape):
+        """Create a minimal fake node with meta['val'] for testing."""
+        import torch
+        class FakeNode:
+            def __init__(self, tensor):
+                self.meta = {"val": tensor}
+        return FakeNode(torch.randn(shape))
+
     def test_create_all_options_1d(self):
         from autoparallel.shardings.cute_backend import CuTeBackend
         backend = CuTeBackend()
-        options = backend.create_all_options(mesh=(2,), tensor_shape=(8, 16))
+        node = self._make_fake_node((8, 16))
+        options = backend.create_all_options(mesh=(2,), node=node)
         # Replicate + S(0) + S(1)
         self.assertEqual(len(options), 3)
         # All have ShardedLayout as output_spec
@@ -2083,7 +2092,8 @@ class TestCuTeBackend(unittest.TestCase):
     def test_create_all_options_2d(self):
         from autoparallel.shardings.cute_backend import CuTeBackend
         backend = CuTeBackend()
-        options = backend.create_all_options(mesh=(2, 4), tensor_shape=(1024, 1024))
+        node = self._make_fake_node((1024, 1024))
+        options = backend.create_all_options(mesh=(2, 4), node=node)
         self.assertGreater(len(options), 5)
 
     def test_redistribute_cost_same(self):

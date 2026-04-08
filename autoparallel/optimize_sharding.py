@@ -138,12 +138,17 @@ def _assert_has_tensor_meta(spec_or_specs, node, label):
 
 class ShardingOptimizer:
     def __init__(
-        self, gm, mesh, rescale_grad_comm_cost_for_mp=1.0, repeated_subgraphs=False
+        self, gm, mesh, rescale_grad_comm_cost_for_mp=1.0, repeated_subgraphs=False,
+        backend=None,
     ):
         self.gm = gm
         self.graph = gm.graph
         self.nodes = list(self.graph.nodes)
         self.mesh = mesh
+        if backend is None:
+            from .shardings.dtensor_backend import DTensorBackend
+            backend = DTensorBackend()
+        self.backend = backend
         self.rescale_grad_comm_cost_for_mp = rescale_grad_comm_cost_for_mp
         self.node_map = {node: i for i, node in enumerate(self.graph.nodes)}
         self._name_counters: dict[str, int] = {}
@@ -192,16 +197,21 @@ class ShardingOptimizer:
         return prefix + f"_{idx:03}"
 
     def build_sharding_metadata(self):
+        """Build sharding metadata using the backend.
+
+        Returns dict[Node -> OpOptionList] where each OpOptionList is a list of
+        OpOption objects with .strategies property for backward compatibility.
+        """
+        from .shardings.backend import OpOptionList
+
         strats = {}
         for node in self.graph.nodes:
             if node.op in ("placeholder", "get_attr"):
-                strats[node] = _create_all_options(
-                    self.mesh, node.meta["val"].shape, tensor=node.meta["val"]
-                )
+                options = self.backend.create_all_options(self.mesh, node)
+                strats[node] = OpOptionList(options)
             elif node.op == "call_function":
-                # TODO: kwargs?
-                user_strats = tree_map_only(
-                    torch.fx.Node, lambda x: strats[x], node.args
+                input_options = tree_map_only(
+                    torch.fx.Node, lambda x: list(strats[x]), node.args
                 )
                 user_args = tree_map_only(
                     torch.fx.Node, lambda x: x.meta["val"], node.args
@@ -209,9 +219,10 @@ class ShardingOptimizer:
                 user_kwargs = tree_map_only(
                     torch.fx.Node, lambda x: x.meta["val"], node.kwargs
                 )
-                strats[node] = get_placement_options_for_node(
-                    self.mesh, node, user_strats, user_args, user_kwargs
+                options = self.backend.enumerate_options(
+                    self.mesh, node, input_options, user_args, user_kwargs
                 )
+                strats[node] = OpOptionList(options)
             elif node.op == "output":
                 user_strats = tree_map_only(
                     torch.fx.Node, lambda x: strats[x], node.args

@@ -64,15 +64,14 @@ class DTensorBackend:
     def create_all_options(
         self,
         mesh: Any,
-        tensor_shape: tuple[int, ...],
-        tensor_meta: Any = None,
-        tensor: Any = None,
+        node: Any,
     ) -> list[OpOption]:
         """Generate all possible shardings using DTensor's _create_all_options."""
         from .propagation_rules import _create_all_options
 
+        tensor = node.meta["val"]
         op_strategy = _create_all_options(
-            mesh, tensor_shape, tensor_meta=tensor_meta, tensor=tensor
+            mesh, tensor.shape, tensor=tensor
         )
         return self._op_strategy_to_options(op_strategy)
 
