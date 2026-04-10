@@ -261,18 +261,9 @@ class TestWithShardingConstraint:
 
     def test_with_sharding_constraint_no_mesh_outside_local_map_raises(self):
         """Test that with_sharding_constraint raises error when no mesh is available."""
-        import autoparallel.collectives as collectives
-
-        original_mesh = collectives._local_map_device_mesh
-        collectives._local_map_device_mesh = None
-
-        try:
-            x = torch.rand(10, 10)
-            with pytest.raises(RuntimeError, match="No mesh found"):
-                with_sharding_constraint(x, (Shard(0),))
-        finally:
-            # Restore original state
-            collectives._local_map_device_mesh = original_mesh
+        x = torch.rand(10, 10)
+        with pytest.raises(RuntimeError, match="No device mesh is currently active"):
+            with_sharding_constraint(x, (Shard(0),))
 
 
 class TestPermutation:
