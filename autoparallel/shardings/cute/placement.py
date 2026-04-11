@@ -135,7 +135,7 @@ class ShardedLayout:
     partial: {mesh_dim: reduce_op}
     """
 
-    def __init__(self, hier_layout, mesh_dim_map=None, partial=None):
+    def __init__(self, hier_layout, mesh_dim_map=None, partial=None, offset=None):
         self.hier_layout = hier_layout
         ndim = len(_ensure_tuple(hier_layout.shape))
         if mesh_dim_map is None:
@@ -143,6 +143,7 @@ class ShardedLayout:
         else:
             self.mesh_dim_map = {i: mesh_dim_map.get(i, ()) for i in range(ndim)}
         self.partial = partial or {}
+        self.offset = offset or {}  # {tensor_dim: int} — per-dim element offset
 
     @staticmethod
     def replicate(tensor_shape):
@@ -302,14 +303,31 @@ class ShardedLayout:
                 placements.append(("shard", i, mesh_size, self.mesh_dim_map[i]))
         return placements or [("replicate", None, None)]
 
+    def with_offset(self, offsets):
+        """Return a new ShardedLayout with the given offsets added.
+
+        Args:
+            offsets: dict {tensor_dim: int_offset} in element space.
+        """
+        new_offset = dict(self.offset)
+        for dim, off in offsets.items():
+            new_offset[dim] = new_offset.get(dim, 0) + off
+        return ShardedLayout(self.hier_layout, self.mesh_dim_map, self.partial, new_offset)
+
     def __eq__(self, other):
         if not isinstance(other, ShardedLayout):
             return NotImplemented
         return (self.hier_layout == other.hier_layout
-                and self.mesh_dim_map == other.mesh_dim_map)
+                and self.mesh_dim_map == other.mesh_dim_map
+                and self.offset == other.offset)
 
     def __hash__(self):
-        return hash((repr(self.hier_layout), tuple(sorted(self.mesh_dim_map.items()))))
+        return hash((repr(self.hier_layout),
+                      tuple(sorted(self.mesh_dim_map.items())),
+                      tuple(sorted(self.offset.items()))))
 
     def __repr__(self):
-        return f"ShardedLayout(hier={self.hier_layout}, mesh_map={self.mesh_dim_map})"
+        parts = f"ShardedLayout(hier={self.hier_layout}, mesh_map={self.mesh_dim_map}"
+        if self.offset:
+            parts += f", offset={self.offset}"
+        return parts + ")"

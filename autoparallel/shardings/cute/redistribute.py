@@ -288,6 +288,9 @@ def _build_rank_to_chunk(sharded, tensor_dim, mesh_dims, mesh_shape):
     - Shape is reversed (M_last, ..., M_first) so CuTe's col-major matches
       mesh's row-major rank indexing.
 
+    For non-integer local strides (XorStride), uses mesh strides directly
+    divided by the smallest mesh stride as the chunk unit.
+
     Args:
         sharded: ShardedLayout
         tensor_dim: which tensor dim has the coupled sharding
@@ -295,7 +298,7 @@ def _build_rank_to_chunk(sharded, tensor_dim, mesh_dims, mesh_shape):
         mesh_shape: tuple of mesh dim sizes in mesh dim order
 
     Returns:
-        Layout mapping flat rank -> chunk index
+        (Layout mapping flat rank -> chunk index, total_chunks) or (None, None)
     """
     dim_shape = sharded.hier_layout.shape[tensor_dim]
     dim_stride = sharded.hier_layout.stride[tensor_dim]
@@ -305,31 +308,38 @@ def _build_rank_to_chunk(sharded, tensor_dim, mesh_dims, mesh_shape):
         if _has_mesh(sub_s):
             local_size = sub_s[0]
             local_stride = sub_st[0]
-            divisor = local_size * local_stride
 
-            # Extract chunk strides for each mesh dim, in mesh_dim order
             mesh_parts_s = sub_s[1:]
             mesh_parts_st = sub_st[1:]
 
-            # mesh_dims gives the mesh dim indices in sub-dim order
-            # We need chunk strides in mesh_dim order (0, 1, 2, ...)
-            chunk_strides = {}
-            for i, md in enumerate(mesh_dims):
-                chunk_strides[md] = mesh_parts_st[i] // divisor
+            # Compute divisor: for integer local strides, use local_size * local_stride.
+            # For non-integer (XorStride), use the minimum mesh stride as unit.
+            if isinstance(local_stride, int) and local_stride > 0:
+                divisor = local_size * local_stride
+            else:
+                # XorStride local: mesh strides are the chunk strides directly
+                # (each "chunk" is the set of elements for one rank at one pair index)
+                divisor = 1
 
-            # Build the layout with reversed shape for CuTe col-major:
-            # CuTe col-major: Layout((a, b), (sa, sb))(i) = (i%a)*sa + (i//a)*sb
-            # Mesh row-major: rank = m0*M1 + m1, so m1 = rank%M1, m0 = rank//M1
-            # Match by reversing: Layout((M_last, ..., M_first), (cs_last, ..., cs_first))
+            chunk_strides = {}
+            total_chunks = 1
+            for i, md in enumerate(mesh_dims):
+                st = mesh_parts_st[i]
+                if isinstance(st, int):
+                    chunk_strides[md] = st // divisor if divisor > 1 else st
+                else:
+                    chunk_strides[md] = st  # keep ModStride/XorStride as-is
+                total_chunks *= mesh_parts_s[i]
+
             all_mds = sorted(chunk_strides.keys())
             rev_shape = tuple(mesh_shape[md] for md in reversed(all_mds))
             rev_strides = tuple(chunk_strides[md] for md in reversed(all_mds))
 
             if len(rev_shape) == 1:
-                return Layout(rev_shape[0], rev_strides[0])
-            return Layout(rev_shape, rev_strides)
+                return Layout(rev_shape[0], rev_strides[0]), total_chunks
+            return Layout(rev_shape, rev_strides), total_chunks
 
-    return None
+    return None, None
 
 
 def _compute_coupled_ppermute(source, target, tensor_dim, src_mesh_dims, tgt_mesh_dims, mesh_shape):
@@ -338,29 +348,73 @@ def _compute_coupled_ppermute(source, target, tensor_dim, src_mesh_dims, tgt_mes
     Uses CuTe rank-to-chunk composition:
     perm = composition(right_inverse(tgt_r2c), src_r2c)
 
+    When offsets differ, adjusts chunk indices by the offset difference
+    (in chunk space, modulo total_chunks).
+
     Returns list of (src_rank, tgt_rank) pairs, or None if identity.
     """
-    src_r2c = _build_rank_to_chunk(source, tensor_dim, src_mesh_dims, mesh_shape)
-    tgt_r2c = _build_rank_to_chunk(target, tensor_dim, tgt_mesh_dims, mesh_shape)
+    src_r2c, src_total = _build_rank_to_chunk(source, tensor_dim, src_mesh_dims, mesh_shape)
+    tgt_r2c, tgt_total = _build_rank_to_chunk(target, tensor_dim, tgt_mesh_dims, mesh_shape)
 
     if src_r2c is None or tgt_r2c is None:
         return None
 
-    perm_layout = composition(right_inverse(tgt_r2c), src_r2c)
-
     total_ranks = product(mesh_shape)
+
+    # Compute offset difference in chunk space
+    src_offset = getattr(source, 'offset', {}).get(tensor_dim, 0)
+    tgt_offset = getattr(target, 'offset', {}).get(tensor_dim, 0)
+
+    # Get local_size and local_stride for chunk conversion
+    dim_shape = source.hier_layout.shape[tensor_dim]
+    dim_stride = source.hier_layout.stride[tensor_dim]
+    divisor = 1
+    total_chunks = src_total
+    for sub_s, sub_st in zip(dim_shape, dim_stride):
+        if _has_mesh(sub_s):
+            local_stride = sub_st[0]
+            if isinstance(local_stride, int) and local_stride > 0:
+                divisor = sub_s[0] * local_stride
+            break
+
+    src_off_chunks = (src_offset // divisor) % total_chunks if divisor > 0 else 0
+    tgt_off_chunks = (tgt_offset // divisor) % total_chunks if divisor > 0 else 0
+
+    if src_off_chunks == tgt_off_chunks:
+        # No offset difference — use CuTe composition
+        perm_layout = composition(right_inverse(tgt_r2c), src_r2c)
+        perm = []
+        is_identity = True
+        for r in range(total_ranks):
+            tgt_r = perm_layout(r)
+            perm.append((r, tgt_r))
+            if r != tgt_r:
+                is_identity = False
+        return None if is_identity else perm
+
+    # Offset differs — enumerate directly with modular arithmetic
+    # For each rank, compute which chunk it holds in src and tgt
+    src_chunk_to_rank = {}
+    for r in range(total_ranks):
+        chunk = (src_off_chunks + src_r2c(r)) % total_chunks
+        src_chunk_to_rank[chunk] = r
+
     perm = []
     is_identity = True
-    for r in range(total_ranks):
-        tgt_r = perm_layout(r)
-        perm.append((r, tgt_r))
-        if r != tgt_r:
+    for tgt_rank in range(total_ranks):
+        tgt_chunk = (tgt_off_chunks + tgt_r2c(tgt_rank)) % total_chunks
+        src_rank = src_chunk_to_rank.get(tgt_chunk)
+        if src_rank is None:
+            return None  # not a permutation
+        perm.append((src_rank, tgt_rank))
+        if src_rank != tgt_rank:
             is_identity = False
 
-    if is_identity:
+    # Verify bijection
+    if len(set(p[0] for p in perm)) != total_ranks:
         return None
 
-    return perm
+    return None if is_identity else perm
 
 
 def plan_redistribute(source, target):
@@ -393,6 +447,16 @@ def plan_redistribute(source, target):
             collectives.append(("all_reduce", md, {"reduce_op": reduce_op}))
         all_mesh_dims.discard(md)
 
+    # Check if offsets differ on any tensor dim with mesh sharding
+    src_offset = getattr(source, 'offset', {})
+    tgt_offset = getattr(target, 'offset', {})
+    offset_differs = {}
+    for td in set(list(src_offset.keys()) + list(tgt_offset.keys())):
+        so = src_offset.get(td, 0)
+        to = tgt_offset.get(td, 0)
+        if so != to and source.mesh_dim_map.get(td, ()):
+            offset_differs[td] = (so, to)
+
     # Per mesh dim: compare GPU strides from hier_layout
     for md in sorted(all_mesh_dims):
         src_info = _get_per_mesh_dim_gpu_stride(source, md)
@@ -404,14 +468,20 @@ def plan_redistribute(source, target):
         src_dims = src_reverse.get(md, set())
         tgt_dims = tgt_reverse.get(md, set())
 
+        # Check if any tensor dim for this mesh dim has an offset difference
+        has_offset_diff = any(
+            td in offset_differs
+            for td in src_dims | tgt_dims
+        )
+
         if src_gs == 0 and tgt_gs == 0:
             continue  # no_op
         elif src_gs != 0 and tgt_gs == 0:
             collectives.append(("all_gather", md, {"tensor_dims": src_dims}))
         elif src_gs == 0 and tgt_gs != 0:
             continue  # local reinterpret
-        elif src_gs == tgt_gs:
-            continue  # same stride, no communication
+        elif src_gs == tgt_gs and not has_offset_diff:
+            continue  # same stride and same offset, no communication
         else:
             # Both sharded, different strides.
             # Try to detect if it's a permutation (ppermute) first.
@@ -431,22 +501,29 @@ def plan_redistribute(source, target):
                     "target_dims": tgt_dims,
                 }))
 
-    # Post-pass: detect coupled mesh dims (S(0)S(0) with different strides).
-    # When multiple mesh dims shard the same tensor dim, per-mesh-dim analysis
-    # can produce identity ppermutes even though the joint rank mapping differs.
-    # Replace those per-mesh-dim entries with a single global ppermute computed
-    # via rank-to-chunk CuTe composition.
+    # Post-pass: handle cases where per-mesh-dim analysis is insufficient.
+    # This covers:
+    # 1. Coupled mesh dims (S(0)S(0) with different strides/orderings)
+    # 2. Offset differences (same strides but different element-to-rank mapping)
+    # In both cases, compute the correct rank permutation via rank-to-chunk
+    # with offset-aware modular arithmetic.
     for td, src_mds in source.mesh_dim_map.items():
-        if len(src_mds) <= 1:
+        if not src_mds:
             continue
         tgt_mds = target.mesh_dim_map.get(td, ())
         if set(src_mds) != set(tgt_mds):
-            continue  # different mesh dims involved, per-mesh-dim is fine
+            continue
+
+        is_coupled = len(src_mds) > 1
+        has_offset = td in offset_differs
+
+        if not is_coupled and not has_offset:
+            continue
 
         # Check if any of these mesh dims had a collective emitted
         affected = [i for i, (ct, md, info) in enumerate(collectives)
                     if md in src_mds]
-        if not affected:
+        if not affected and not has_offset:
             continue
 
         # Derive mesh shape from the sub-dim structure

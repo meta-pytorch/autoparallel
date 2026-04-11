@@ -1790,6 +1790,65 @@ class TestRingAttentionPpermute(unittest.TestCase):
             self.assertEqual(sorted(srcs), list(range(4)))
             self.assertEqual(sorted(dsts), list(range(4)))
 
+    @staticmethod
+    def _make_ring_step_layout(n_gpus, step):
+        """Build ShardedLayout for ring attention at a specific step.
+
+        Uses XorStride zigzag + offset for ring rotation.
+        Operates in chunk space (tensor of 2*N chunks).
+        """
+        from autoparallel.shardings.cute._pycute import XorStride
+        n_chunks = 2 * n_gpus
+        # sub-dim: (local=2, mesh=N_gpus) with strides (XorStride(2N-1), 1)
+        # XorStride is local (zigzag pair), mesh stride 1 (chunk identity = GPU index)
+        hier = Layout(
+            (((2, n_gpus),),),
+            (((XorStride(n_chunks - 1), 1),),)
+        )
+        sl = ShardedLayout(hier, {0: (0,)})
+        if step > 0:
+            sl = sl.with_offset({0: step * (n_gpus - 1)})
+        return sl
+
+    def test_plan_redistribute_step0_to_step1(self):
+        """plan_redistribute detects circular shift ppermute between ring steps."""
+        step0 = self._make_ring_step_layout(4, step=0)
+        step1 = self._make_ring_step_layout(4, step=1)
+        result = plan_redistribute(step0, step1)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0][0], "ppermute")
+        perm = dict(result[0][2]["perm"])
+        for src in range(4):
+            self.assertEqual(perm[src], (src + 1) % 4)
+
+    def test_plan_redistribute_step1_to_step2(self):
+        """Step 1→2 also gives circular shift (same offset difference)."""
+        step1 = self._make_ring_step_layout(4, step=1)
+        step2 = self._make_ring_step_layout(4, step=2)
+        result = plan_redistribute(step1, step2)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0][0], "ppermute")
+        perm = dict(result[0][2]["perm"])
+        for src in range(4):
+            self.assertEqual(perm[src], (src + 1) % 4)
+
+    def test_plan_redistribute_same_step_noop(self):
+        """Same step → no redistribution needed."""
+        step0 = self._make_ring_step_layout(4, step=0)
+        result = plan_redistribute(step0, step0)
+        self.assertEqual(result, [])
+
+    def test_plan_redistribute_8gpu_step_transition(self):
+        """8-GPU ring attention step transition is circular shift."""
+        step0 = self._make_ring_step_layout(8, step=0)
+        step1 = self._make_ring_step_layout(8, step=1)
+        result = plan_redistribute(step0, step1)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0][0], "ppermute")
+        perm = dict(result[0][2]["perm"])
+        for src in range(8):
+            self.assertEqual(perm[src], (src + 1) % 8)
+
 
 class TestEnumerateShardings(unittest.TestCase):
     """Tests for enumerate_shardings."""
