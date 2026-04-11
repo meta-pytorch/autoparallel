@@ -60,6 +60,8 @@ from .redistribute import (
     plan_redistribute_detailed,
 )
 
+from .redistribute_tensor import redistribute_tensor
+
 from .op_registry import (
     OP_REGISTRY,
     get_propagation_rule,

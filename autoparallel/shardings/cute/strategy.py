@@ -141,11 +141,12 @@ def enumerate_shardings(tensor_shape, mesh_shape):
                 specs = []
                 # Add single-dim specs (order doesn't matter)
                 for td, md, ms in single_specs:
-                    specs.append((td, ms))
-                # Add same-dim specs in the chosen ordering
+                    specs.append((td, ms, md))
+                # Add same-dim specs in the chosen ordering,
+                # preserving the actual mesh dim index
                 for td, perm in ordering_combo:
                     for md, ms in perm:
-                        specs.append((td, ms))
+                        specs.append((td, ms, md))
 
                 try:
                     sl = ShardedLayout.shard_multi(tensor_shape, specs)

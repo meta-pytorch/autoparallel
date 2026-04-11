@@ -633,20 +633,21 @@ class TestRedistributeDetailed(unittest.TestCase):
     def test_s0s0_ltr_to_rtl(self):
         """S(0)S(0) left-to-right -> S(0)S(0) right-to-left.
 
-        LTR: specs [(0,2),(0,4)] -> mesh0(size=2, outermost, gs=64), mesh1(size=4, innermost, gs=16)
-        RTL: specs [(0,4),(0,2)] -> mesh0(size=4, outermost, gs=32), mesh1(size=2, innermost, gs=16)
-
-        mesh_dim 0 (outermost): gs 64 -> 32, different -> ppermute (1-to-1 device mapping)
-        mesh_dim 1 (innermost): gs 16 -> 16, same -> no_op
+        LTR and RTL have different nesting orders for the same tensor dim.
+        The per-mesh-dim analysis can't detect the difference (identity ppermute
+        per mesh dim), so a post-pass computes the global rank permutation
+        via rank-to-chunk CuTe composition and emits a single ppermute on the
+        full mesh (mesh_dim=None).
         """
         ltr = ShardedLayout.shard_multi((8, 16), [(0, 2), (0, 4)])
         rtl = ShardedLayout.shard_multi((8, 16), [(0, 4), (0, 2)])
         result = plan_redistribute(ltr, rtl)
         self.assertEqual(len(result), 1)
-        self.assertIn(result[0][0], ("ppermute", "all_to_all"))  # ppermute if detected
-        self.assertEqual(result[0][1], 0)  # mesh_dim 0 (outermost)
-        if result[0][0] == "ppermute":
-            self.assertIn("perm", result[0][2])
+        self.assertEqual(result[0][0], "ppermute")
+        self.assertIsNone(result[0][1])  # global ppermute on full mesh
+        perm = result[0][2]["perm"]
+        # Verify non-identity permutation
+        self.assertTrue(any(s != d for s, d in perm))
 
     def test_s0s0_per_mesh_dim_stride_values(self):
         """Verify per-mesh-dim GPU strides match mesh dim sizes, not tuple positions.
@@ -1689,6 +1690,105 @@ class TestPpermute(unittest.TestCase):
         s = ShardedLayout.shard((8, 16), shard_dim=0, mesh_dim_size=2)
         result = plan_redistribute(s, s)
         self.assertEqual(result, [])
+
+
+class TestRingAttentionPpermute(unittest.TestCase):
+    """Tests that ring attention step transitions yield correct ppermute calls."""
+
+    @staticmethod
+    def _make_ring_layout(n_gpus):
+        import math
+        from autoparallel.shardings.cute._pycute import ModStride, XorStride
+        n_bits = int(math.log2(n_gpus))
+        shapes = [2] * n_bits + [n_gpus, 2]
+        strides = (
+            [ModStride(2**i, n_gpus) for i in range(n_bits)]
+            + [ModStride(n_gpus - 1, n_gpus)]
+            + [XorStride(2 * n_gpus - 1)]
+        )
+        return Layout(tuple(shapes), tuple(strides))
+
+    @staticmethod
+    def _get_step_ppermute(ring, n_gpus, step_src, step_tgt):
+        """Compute the ppermute from step_src to step_tgt using the ring layout."""
+        import math
+        n_bits = int(math.log2(n_gpus))
+
+        def get_chunks(step):
+            gpu_to_chunks = {}
+            for g in range(n_gpus):
+                bits = [(g >> i) & 1 for i in range(n_bits)]
+                chunks = [ring(*(bits + [step, p])) for p in range(2)]
+                gpu_to_chunks[g] = chunks
+            return gpu_to_chunks
+
+        src_map = get_chunks(step_src)
+        tgt_map = get_chunks(step_tgt)
+
+        chunk_to_src = {}
+        for gpu, chunks in src_map.items():
+            for c in chunks:
+                chunk_to_src[c] = gpu
+
+        perm = []
+        for tgt_gpu in range(n_gpus):
+            chunks = tgt_map[tgt_gpu]
+            src_gpu = chunk_to_src[chunks[0]]
+            assert chunk_to_src[chunks[1]] == src_gpu
+            perm.append((src_gpu, tgt_gpu))
+        return sorted(perm)
+
+    def test_4gpu_zigzag_assignment(self):
+        """Step 0 produces correct zigzag: GPU g gets chunks {g, 7-g}."""
+        ring = self._make_ring_layout(4)
+        for g in range(4):
+            bits = [g & 1, (g >> 1) & 1]
+            c0 = ring(*(bits + [0, 0]))
+            c1 = ring(*(bits + [0, 1]))
+            self.assertEqual(c0, g)
+            self.assertEqual(c1, 7 - g)
+
+    def test_4gpu_all_steps_circular_shift(self):
+        """All step transitions on 4 GPUs are circular left shift ppermute."""
+        ring = self._make_ring_layout(4)
+        for step in range(3):
+            perm = self._get_step_ppermute(ring, 4, step, step + 1)
+            for src, dst in perm:
+                self.assertEqual(dst, (src + 1) % 4,
+                                 f"Step {step}->{step+1}: expected ({src}, {(src+1)%4}), got ({src}, {dst})")
+
+    def test_8gpu_all_steps_circular_shift(self):
+        """All step transitions on 8 GPUs are circular left shift ppermute."""
+        ring = self._make_ring_layout(8)
+        for step in range(7):
+            perm = self._get_step_ppermute(ring, 8, step, step + 1)
+            for src, dst in perm:
+                self.assertEqual(dst, (src + 1) % 8,
+                                 f"Step {step}->{step+1}: expected ({src}, {(src+1)%8}), got ({src}, {dst})")
+
+    def test_4gpu_load_balance(self):
+        """Zigzag achieves perfect load balance for causal attention on 4 GPUs.
+
+        Each GPU gets chunks (g, 7-g), work = (g+1) + (7-g+1) = 9 for all g.
+        """
+        ring = self._make_ring_layout(4)
+        for g in range(4):
+            bits = [g & 1, (g >> 1) & 1]
+            c0 = ring(*(bits + [0, 0]))
+            c1 = ring(*(bits + [0, 1]))
+            # Causal attention: chunk c has work proportional to (c+1)
+            work = (c0 + 1) + (c1 + 1)
+            self.assertEqual(work, 9, f"GPU {g}: work={work}, expected 9")
+
+    def test_4gpu_step_permutation_is_bijection(self):
+        """Each step transition is a valid permutation (bijection)."""
+        ring = self._make_ring_layout(4)
+        for step in range(3):
+            perm = self._get_step_ppermute(ring, 4, step, step + 1)
+            srcs = [p[0] for p in perm]
+            dsts = [p[1] for p in perm]
+            self.assertEqual(sorted(srcs), list(range(4)))
+            self.assertEqual(sorted(dsts), list(range(4)))
 
 
 class TestEnumerateShardings(unittest.TestCase):

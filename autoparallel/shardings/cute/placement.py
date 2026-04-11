@@ -160,34 +160,110 @@ class ShardedLayout:
 
     @staticmethod
     def shard_multi(tensor_shape, shard_specs):
+        """Create a ShardedLayout with multiple mesh dims sharding tensor dims.
+
+        Args:
+            tensor_shape: tuple of tensor dim sizes
+            shard_specs: list of (shard_dim, mesh_size) or (shard_dim, mesh_size, mesh_dim_idx).
+                The 2-tuple form assigns mesh_dim_idx sequentially (0, 1, 2, ...).
+                The 3-tuple form allows explicit mesh dim assignment, needed when
+                the nesting order differs from the mesh dim order (e.g., RTL).
+        """
         t_shape = _ensure_tuple(tensor_shape)
+
+        # Normalize to 3-tuples: (shard_dim, mesh_size, mesh_dim_idx)
+        normalized = []
+        for i, spec in enumerate(shard_specs):
+            if len(spec) == 3:
+                normalized.append(spec)
+            else:
+                normalized.append((spec[0], spec[1], i))
+
         mesh_dim_map = _empty_map(len(t_shape))
-        for mesh_dim_idx, (shard_dim, _) in enumerate(shard_specs):
+        for shard_dim, _, mesh_dim_idx in normalized:
             mesh_dim_map[shard_dim] = mesh_dim_map[shard_dim] + (mesh_dim_idx,)
 
         dim_counts = {}
-        for dim, _ in shard_specs:
+        for dim, mesh_size, _ in normalized:
             dim_counts[dim] = dim_counts.get(dim, 0) + 1
 
         if not any(c > 1 for c in dim_counts.values()):
             local = list(t_shape)
-            for dim, mesh_size in shard_specs:
+            for dim, mesh_size, _ in normalized:
                 assert local[dim] % mesh_size == 0
                 local[dim] //= mesh_size
             hier = logical_divide(Layout(t_shape), tuple(local))
             return ShardedLayout(_to_uniform(hier), mesh_dim_map)
 
-        # S(0),S(0) case: sequential logical_divide
-        hier = Layout(t_shape)
-        current_local = list(t_shape)
-        for dim, mesh_size in shard_specs:
-            assert current_local[dim] % mesh_size == 0
-            chunk = current_local[dim] // mesh_size
-            divisor = tuple(chunk if i == dim else current_local[i]
-                            for i in range(len(t_shape)))
-            hier = logical_divide(hier, divisor)
-            current_local[dim] = chunk
-        return ShardedLayout(_to_uniform(hier), mesh_dim_map)
+        # S(0),S(0) case: direct construction of 3-level hierarchy.
+        #
+        # Sequential logical_divide can collapse mesh sub-dims due to
+        # coalescing inside composition (when strides align). Instead,
+        # construct the (local, mesh0, mesh1, ...) sub-dim directly.
+        #
+        # For shard_specs [(dim, m0), (dim, m1), ...] on a dim of size G:
+        #   local = G / product(all m_i)
+        #   local_stride = base_stride (from the dim's position in the tensor)
+        #   m_k_stride = base_stride * local * product(m_{k+1}, ..., m_last)
+        #
+        # This gives contiguous-block partitioning: each rank gets a contiguous
+        # chunk whose size equals local.
+
+        # Group shard specs by tensor dim, preserving mesh dim indices
+        dim_specs = {}
+        for dim, mesh_size, mesh_dim_idx in normalized:
+            dim_specs.setdefault(dim, []).append((mesh_size, mesh_dim_idx))
+
+        # Build the per-dim sub-dim shapes and strides
+        sub_shapes = []
+        sub_strides = []
+        # Per-dim mesh_dim ordering for mesh_dim_map
+        dim_mesh_order = {}
+
+        # Compute base strides for each tensor dim (row-major)
+        base_strides = []
+        acc = 1
+        for d in range(len(t_shape) - 1, -1, -1):
+            base_strides.append(acc)
+            acc *= t_shape[d]
+        base_strides.reverse()
+
+        for d in range(len(t_shape)):
+            specs_for_dim = dim_specs.get(d, [])
+            if not specs_for_dim:
+                # Replicate dim
+                sub_shapes.append((t_shape[d], 1))
+                sub_strides.append((base_strides[d], 0))
+            else:
+                mesh_sizes = [ms for ms, _ in specs_for_dim]
+                mesh_dim_indices = [mdi for _, mdi in specs_for_dim]
+                dim_mesh_order[d] = tuple(mesh_dim_indices)
+
+                total_mesh = 1
+                for m in mesh_sizes:
+                    total_mesh *= m
+                assert t_shape[d] % total_mesh == 0
+                local = t_shape[d] // total_mesh
+                s = base_strides[d]
+
+                shape_parts = [local]
+                stride_parts = [s]
+                # Compute mesh strides: m_k_stride = s * local * product(m_{k+1}...)
+                for k, mk in enumerate(mesh_sizes):
+                    suffix_product = 1
+                    for j in range(k + 1, len(mesh_sizes)):
+                        suffix_product *= mesh_sizes[j]
+                    shape_parts.append(mk)
+                    stride_parts.append(s * local * suffix_product)
+
+                sub_shapes.append(tuple(shape_parts))
+                sub_strides.append(tuple(stride_parts))
+
+        hier = Layout(
+            tuple((sub_s,) for sub_s in sub_shapes),
+            tuple((sub_st,) for sub_st in sub_strides),
+        )
+        return ShardedLayout(hier, mesh_dim_map)
 
     @property
     def global_shape(self):

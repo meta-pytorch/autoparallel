@@ -38,10 +38,8 @@ def _get_per_mesh_dim_gpu_stride(sharded, mesh_dim):
     corresponding to the given mesh dim. Returns (tensor_dim, gpu_stride)
     or None if this mesh dim doesn't shard any tensor dim.
 
-    For S(0)S(0), nested logical_divide produces innermost-first ordering
-    in the tuple (complement from last divide comes before mesh from first divide),
-    but mesh_dim_map is outermost-first (first spec = mesh_dim 0 = outermost).
-    So we reverse the flattened mesh elements to match mesh_dim_map order.
+    The sub-dim layout has order (local, mesh0, mesh1, ...) matching
+    the mesh_dim_map order (construction order from shard_multi).
     """
     for tensor_dim, mesh_dims in sharded.mesh_dim_map.items():
         if mesh_dim in mesh_dims:
@@ -66,10 +64,6 @@ def _get_per_mesh_dim_gpu_stride(sharded, mesh_dim):
                         return [(s, st)]
 
                     all_mesh.extend(_flatten_mesh(mesh_parts, mesh_strides))
-
-            # Reverse: nested logical_divide produces innermost-first,
-            # but mesh_dim_map is outermost-first (construction order).
-            all_mesh.reverse()
 
             if mesh_idx_in_dim < len(all_mesh):
                 return tensor_dim, all_mesh[mesh_idx_in_dim][1]
@@ -268,6 +262,107 @@ def _detect_permutation_element_level(source, target, mesh_dim, mesh_size):
     return [(src, dst) for src, dst in sorted(perm.items())]
 
 
+def _get_mesh_dim_size(sharded, mesh_dim):
+    """Get the mesh size for a specific mesh dim from hier_layout."""
+    for tensor_dim, mesh_dims in sharded.mesh_dim_map.items():
+        if mesh_dim in mesh_dims:
+            idx = list(mesh_dims).index(mesh_dim)
+            dim_shape = sharded.hier_layout.shape[tensor_dim]
+            # Collect mesh parts from sub-dims
+            for sub_s in dim_shape:
+                if _has_mesh(sub_s):
+                    mesh_parts = sub_s[1:]
+                    if is_tuple(mesh_parts):
+                        if idx < len(mesh_parts):
+                            return mesh_parts[idx]
+                    elif idx == 0:
+                        return mesh_parts
+    return None
+
+
+def _build_rank_to_chunk(sharded, tensor_dim, mesh_dims, mesh_shape):
+    """Build a CuTe Layout mapping rank -> chunk index for coupled mesh dims.
+
+    For a tensor dim with sub-dim (local, mesh0, mesh1, ...):
+    - chunk_stride_i = sub_stride[mesh_pos_i] // (local_size * local_stride)
+    - Shape is reversed (M_last, ..., M_first) so CuTe's col-major matches
+      mesh's row-major rank indexing.
+
+    Args:
+        sharded: ShardedLayout
+        tensor_dim: which tensor dim has the coupled sharding
+        mesh_dims: tuple of mesh dim indices that shard this tensor dim
+        mesh_shape: tuple of mesh dim sizes in mesh dim order
+
+    Returns:
+        Layout mapping flat rank -> chunk index
+    """
+    dim_shape = sharded.hier_layout.shape[tensor_dim]
+    dim_stride = sharded.hier_layout.stride[tensor_dim]
+
+    # Find the sub-dim with mesh sharding
+    for sub_s, sub_st in zip(dim_shape, dim_stride):
+        if _has_mesh(sub_s):
+            local_size = sub_s[0]
+            local_stride = sub_st[0]
+            divisor = local_size * local_stride
+
+            # Extract chunk strides for each mesh dim, in mesh_dim order
+            mesh_parts_s = sub_s[1:]
+            mesh_parts_st = sub_st[1:]
+
+            # mesh_dims gives the mesh dim indices in sub-dim order
+            # We need chunk strides in mesh_dim order (0, 1, 2, ...)
+            chunk_strides = {}
+            for i, md in enumerate(mesh_dims):
+                chunk_strides[md] = mesh_parts_st[i] // divisor
+
+            # Build the layout with reversed shape for CuTe col-major:
+            # CuTe col-major: Layout((a, b), (sa, sb))(i) = (i%a)*sa + (i//a)*sb
+            # Mesh row-major: rank = m0*M1 + m1, so m1 = rank%M1, m0 = rank//M1
+            # Match by reversing: Layout((M_last, ..., M_first), (cs_last, ..., cs_first))
+            all_mds = sorted(chunk_strides.keys())
+            rev_shape = tuple(mesh_shape[md] for md in reversed(all_mds))
+            rev_strides = tuple(chunk_strides[md] for md in reversed(all_mds))
+
+            if len(rev_shape) == 1:
+                return Layout(rev_shape[0], rev_strides[0])
+            return Layout(rev_shape, rev_strides)
+
+    return None
+
+
+def _compute_coupled_ppermute(source, target, tensor_dim, src_mesh_dims, tgt_mesh_dims, mesh_shape):
+    """Compute rank permutation for coupled mesh dims on the same tensor dim.
+
+    Uses CuTe rank-to-chunk composition:
+    perm = composition(right_inverse(tgt_r2c), src_r2c)
+
+    Returns list of (src_rank, tgt_rank) pairs, or None if identity.
+    """
+    src_r2c = _build_rank_to_chunk(source, tensor_dim, src_mesh_dims, mesh_shape)
+    tgt_r2c = _build_rank_to_chunk(target, tensor_dim, tgt_mesh_dims, mesh_shape)
+
+    if src_r2c is None or tgt_r2c is None:
+        return None
+
+    perm_layout = composition(right_inverse(tgt_r2c), src_r2c)
+
+    total_ranks = product(mesh_shape)
+    perm = []
+    is_identity = True
+    for r in range(total_ranks):
+        tgt_r = perm_layout(r)
+        perm.append((r, tgt_r))
+        if r != tgt_r:
+            is_identity = False
+
+    if is_identity:
+        return None
+
+    return perm
+
+
 def plan_redistribute(source, target):
     """Plan collectives using per-mesh-dim GPU stride classification.
 
@@ -335,6 +430,46 @@ def plan_redistribute(source, target):
                     "source_dims": src_dims,
                     "target_dims": tgt_dims,
                 }))
+
+    # Post-pass: detect coupled mesh dims (S(0)S(0) with different strides).
+    # When multiple mesh dims shard the same tensor dim, per-mesh-dim analysis
+    # can produce identity ppermutes even though the joint rank mapping differs.
+    # Replace those per-mesh-dim entries with a single global ppermute computed
+    # via rank-to-chunk CuTe composition.
+    for td, src_mds in source.mesh_dim_map.items():
+        if len(src_mds) <= 1:
+            continue
+        tgt_mds = target.mesh_dim_map.get(td, ())
+        if set(src_mds) != set(tgt_mds):
+            continue  # different mesh dims involved, per-mesh-dim is fine
+
+        # Check if any of these mesh dims had a collective emitted
+        affected = [i for i, (ct, md, info) in enumerate(collectives)
+                    if md in src_mds]
+        if not affected:
+            continue
+
+        # Derive mesh shape from the sub-dim structure
+        mesh_shape = {}
+        for md in src_mds:
+            ms = _get_mesh_dim_size(source, md)
+            if ms is not None:
+                mesh_shape[md] = ms
+
+        all_mds = sorted(mesh_shape.keys())
+        mesh_shape_tuple = tuple(mesh_shape[md] for md in all_mds)
+
+        perm = _compute_coupled_ppermute(
+            source, target, td, src_mds, tgt_mds, mesh_shape_tuple
+        )
+
+        # Remove the per-mesh-dim entries
+        for i in reversed(affected):
+            collectives.pop(i)
+
+        # Add global ppermute if non-identity
+        if perm is not None:
+            collectives.append(("ppermute", None, {"perm": perm}))
 
     return collectives
 
