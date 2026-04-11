@@ -171,6 +171,7 @@ class AutoParallel:
         numerics_logger: NumericsLogger | None = None,
         cost_model: Any = None,
         repeated_subgraphs: bool = False,
+        backend: Any = None,
     ):
         self.stack = ExitStack()
         self.fake_mode = (
@@ -183,6 +184,7 @@ class AutoParallel:
         self.mp_policy = mp_policy
         self.cost_model = cost_model
         self.repeated_subgraphs = repeated_subgraphs
+        self.backend = backend
         # copy user model to avoid modifying it in-place
         # in dtype casting and move_to_fake
         model = copy.deepcopy(model)
@@ -258,6 +260,7 @@ class AutoParallel:
                 self.mesh,
                 rescale_grad_comm_cost_for_mp,
                 repeated_subgraphs=self.repeated_subgraphs,
+                backend=self.backend,
             )
 
             self.sharding_optimizer = sharding_optimizer

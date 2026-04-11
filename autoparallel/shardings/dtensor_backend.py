@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .backend import OpOption, ShardingBackend
+from .backend import OpOption, OpOptionList, ShardingBackend
 
 
 class DTensorBackend:
@@ -20,7 +20,7 @@ class DTensorBackend:
         self,
         mesh: Any,
         node: Any,
-        input_options: list[list[OpOption]],
+        input_options,
         user_args: tuple,
         user_kwargs: dict,
     ) -> list[OpOption]:
@@ -28,30 +28,28 @@ class DTensorBackend:
         from torch.distributed.tensor._op_schema import OpStrategy, OpSpec
         from .placement_options import get_placement_options_for_node
 
-        # Convert input OpOptions back to OpStrategy objects
-        input_strategies = []
-        for opts in input_options:
-            # Each input's options become an OpStrategy with one OpSpec per option
-            op_specs = []
+        # input_options is a tree where Node positions are OpOptionList
+        # and non-Node positions are raw values. Convert OpOptionList → OpStrategy.
+        def _to_strategy(opts):
             for opt in opts:
-                # opt.output_spec is a DTensorSpec (or OpSpec) from a previous step
                 if isinstance(opt.output_spec, OpStrategy):
-                    input_strategies.append(opt.output_spec)
-                    break
+                    return opt.output_spec
                 elif hasattr(opt, '_op_strategy'):
-                    input_strategies.append(opt._op_strategy)
-                    break
-            else:
-                # Build OpStrategy from individual OpOptions
-                specs = [
-                    OpSpec(
-                        opt.output_spec,
-                        input_specs=opt.input_specs,
-                        redistribute_cost=[opt.redistribute_costs[0]] if opt.redistribute_costs else [[0.0]],
-                    )
-                    for opt in opts
-                ]
-                input_strategies.append(OpStrategy(specs))
+                    return opt._op_strategy
+            specs = [
+                OpSpec(
+                    opt.output_spec,
+                    input_specs=opt.input_specs,
+                    redistribute_cost=[opt.redistribute_costs[0]] if opt.redistribute_costs else [[0.0]],
+                )
+                for opt in opts
+            ]
+            return OpStrategy(specs)
+
+        from torch.utils._pytree import tree_map_only
+        input_strategies = tree_map_only(
+            OpOptionList, _to_strategy, input_options
+        )
 
         # Call existing DTensor pipeline
         op_strategy = get_placement_options_for_node(

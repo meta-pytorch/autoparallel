@@ -81,6 +81,7 @@ class Block(nn.Module):
 
 
 world_size = 256
+use_cute_backend = False
 
 fake_store = FakeStore()
 torch.distributed.init_process_group(
@@ -122,7 +123,12 @@ with torch.device("meta"):
 mp_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
 # mp_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16)
 
-with AutoParallel(model, input_fn, mesh, mp_policy, compile=True) as autop:
+backend = None
+if use_cute_backend:
+    from autoparallel.shardings.cute_backend import CuTeBackend
+    backend = CuTeBackend()
+
+with AutoParallel(model, input_fn, mesh, mp_policy, compile=True, backend=backend) as autop:
     autop.add_parameter_memory_constraint(low=None, high=None)
 
     x_sharding = (Shard(0),) + (Replicate(),) * (mesh.ndim - 1)

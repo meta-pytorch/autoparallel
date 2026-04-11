@@ -211,7 +211,7 @@ class ShardingOptimizer:
                 strats[node] = OpOptionList(options)
             elif node.op == "call_function":
                 input_options = tree_map_only(
-                    torch.fx.Node, lambda x: list(strats[x]), node.args
+                    torch.fx.Node, lambda x: strats[x], node.args
                 )
                 user_args = tree_map_only(
                     torch.fx.Node, lambda x: x.meta["val"], node.args

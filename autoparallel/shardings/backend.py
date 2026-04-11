@@ -18,6 +18,28 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
 
+def _fmt_spec(spec):
+    """Format a spec (DTensorSpec, ShardedLayout, or tuple) concisely."""
+    if isinstance(spec, tuple):
+        return "(" + ", ".join(_fmt_spec(s) for s in spec) + ")"
+    # DTensorSpec: use placements' str() for concise S(0), R, P(sum)
+    if hasattr(spec, 'placements'):
+        return "(" + ", ".join(str(p) for p in spec.placements) + ")"
+    # ShardedLayout: show mesh_dim_map concisely
+    if hasattr(spec, 'mesh_dim_map'):
+        parts = []
+        for d, mds in sorted(spec.mesh_dim_map.items()):
+            if mds:
+                parts.append(f"S({d})")
+            else:
+                parts.append("R")
+        if spec.partial:
+            for md, op in spec.partial.items():
+                parts.append(f"P({op})")
+        return "(" + ", ".join(parts) + ")"
+    return str(spec)
+
+
 @dataclass
 class OpOption:
     """One valid strategy for an op — backend-agnostic.
@@ -52,6 +74,9 @@ class OpOption:
     def redistribute_cost(self):
         return self.redistribute_costs
 
+    def __repr__(self):
+        return f"OpOption({_fmt_spec(self.input_specs)} -> {_fmt_spec(self.output_spec)})"
+
 
 class OpOptionList(list):
     """A list of OpOption that also exposes .strategies for OpStrategy compatibility.
@@ -59,6 +84,8 @@ class OpOptionList(list):
     The optimizer code accesses strats[node].strategies[i] — this class makes
     strats[node] a plain list where .strategies is just self.
     This eliminates the need for wrapper classes while keeping backward compat.
+
+    Registered as a pytree leaf so tree_map doesn't descend into it.
     """
 
     @property
