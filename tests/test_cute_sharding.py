@@ -1872,6 +1872,104 @@ class TestRingAttentionPpermute(unittest.TestCase):
             self.assertEqual(perm[src], (src + 1) % 8)
 
 
+class TestPlanRedistributeEdgeCases(unittest.TestCase):
+    """Edge case tests for plan_redistribute."""
+
+    def test_s0s0_to_replicate(self):
+        """S(0)S(0) → Replicate emits two all_gathers (one per mesh dim)."""
+        src = ShardedLayout.shard_multi((16,), [(0, 2), (0, 2)])
+        tgt = ShardedLayout.replicate((16,))
+        result = plan_redistribute(src, tgt)
+        types = [ct for ct, _, _ in result]
+        self.assertEqual(types.count("all_gather"), 2)
+
+    def test_s0s0_to_s0(self):
+        """S(0)S(0) → S(0) on one mesh dim: all_gather on the other."""
+        src = ShardedLayout.shard_multi((16,), [(0, 2), (0, 2)])
+        tgt = ShardedLayout.shard((16,), shard_dim=0, mesh_dim_size=2, mesh_dim=0)
+        result = plan_redistribute(src, tgt)
+        collectives_by_type = {}
+        for ct, md, info in result:
+            collectives_by_type.setdefault(ct, []).append(md)
+        self.assertIn("all_gather", collectives_by_type)
+
+    def test_replicate_to_replicate(self):
+        """Replicate → Replicate: no collectives."""
+        src = ShardedLayout.replicate((8, 16))
+        tgt = ShardedLayout.replicate((8, 16))
+        self.assertEqual(plan_redistribute(src, tgt), [])
+
+    def test_s0_to_s0_same(self):
+        """Same S(0) → S(0): no collectives."""
+        sl = ShardedLayout.shard((8,), shard_dim=0, mesh_dim_size=4)
+        self.assertEqual(plan_redistribute(sl, sl), [])
+
+    def test_partial_to_partial_same(self):
+        """Partial → Partial with same reduce_op: all_reduce still needed."""
+        src = ShardedLayout.replicate((8,))
+        src.partial = {0: "sum"}
+        tgt = ShardedLayout.replicate((8,))
+        # Partial on src, no partial on tgt → all_reduce
+        result = plan_redistribute(src, tgt)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0][0], "all_reduce")
+
+    def test_partial_to_shard(self):
+        """Partial(sum) → S(0): reduce_scatter."""
+        src = ShardedLayout.replicate((8,))
+        src.partial = {0: "sum"}
+        tgt = ShardedLayout.shard((8,), shard_dim=0, mesh_dim_size=4)
+        result = plan_redistribute(src, tgt)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0][0], "reduce_scatter")
+
+    def test_shape_mismatch_raises(self):
+        """Different global shapes → ValueError."""
+        src = ShardedLayout.replicate((8,))
+        tgt = ShardedLayout.replicate((16,))
+        with self.assertRaises(ValueError):
+            plan_redistribute(src, tgt)
+
+    def test_multidim_shard_different_dims(self):
+        """S(0)R → RS(1): all_gather on dim 0, local reinterpret on dim 1."""
+        src = ShardedLayout.shard((8, 8), shard_dim=0, mesh_dim_size=2)
+        tgt = ShardedLayout.shard((8, 8), shard_dim=1, mesh_dim_size=2)
+        result = plan_redistribute(src, tgt)
+        types = {ct for ct, _, _ in result}
+        # Should have all_to_all (S(0) → S(1) on same mesh dim)
+        self.assertIn("all_to_all", types)
+
+    def test_offset_same_layout_different_offset(self):
+        """Same strides, different offset → ppermute."""
+        from autoparallel.shardings.cute._pycute import XorStride
+        N = 4
+        hier = Layout((((2, N),),), (((XorStride(2 * N - 1), 1),),))
+        sl0 = ShardedLayout(hier, {0: (0,)})
+        sl1 = sl0.with_offset({0: N - 1})
+        result = plan_redistribute(sl0, sl1)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0][0], "ppermute")
+        perm = dict(result[0][2]["perm"])
+        # Circular shift
+        for src in range(N):
+            self.assertEqual(perm[src], (src + 1) % N)
+
+    def test_offset_zero_is_noop(self):
+        """Offset {0: 0} is equivalent to no offset."""
+        sl1 = ShardedLayout.shard((8,), shard_dim=0, mesh_dim_size=4)
+        sl2 = sl1.with_offset({0: 0})
+        self.assertEqual(plan_redistribute(sl1, sl2), [])
+
+    def test_with_offset_accumulates(self):
+        """with_offset adds to existing offset."""
+        from autoparallel.shardings.cute._pycute import XorStride
+        hier = Layout((((2, 4),),), (((XorStride(7), 1),),))
+        sl = ShardedLayout(hier, {0: (0,)})
+        sl1 = sl.with_offset({0: 3})
+        sl2 = sl1.with_offset({0: 3})
+        self.assertEqual(sl2.offset, {0: 6})
+
+
 class TestEnumerateShardings(unittest.TestCase):
     """Tests for enumerate_shardings."""
 

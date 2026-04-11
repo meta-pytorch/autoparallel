@@ -279,6 +279,77 @@ class TestRedistributeTensor(unittest.TestCase):
         self.assertTrue(has_real_data_movement,
                         "LTR->RTL on asymmetric mesh should require data movement")
 
+    def test_shard_to_replicate_2d_mesh(self):
+        """S(0) on mesh_size=4 → Replicate on a 2D 4x4 tensor."""
+        t = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+        src = ShardedLayout.shard((4, 4), shard_dim=0, mesh_dim_size=4)
+        tgt = ShardedLayout.replicate((4, 4))
+        self._run_redistribute(t, src, tgt)
+
+    def test_shard_to_shard_different_dim_size(self):
+        """S(0) mesh=2 on dim 0 → S(0) mesh=2 on dim 1, same mesh, 4x4 tensor."""
+        t = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+        src = ShardedLayout.shard((4, 4), shard_dim=0, mesh_dim_size=2)
+        tgt = ShardedLayout.shard((4, 4), shard_dim=1, mesh_dim_size=2)
+
+        with LocalTensorMode(frozenset(range(2))):
+            from torch.distributed.device_mesh import init_device_mesh
+            mesh = init_device_mesh("cpu", (2,))
+
+            src_shards = {0: t[:2, :].contiguous(), 1: t[2:, :].contiguous()}
+            src_local = LocalTensor(src_shards)
+
+            result = redistribute_tensor(src_local, src, tgt, mesh)
+
+            tgt_shards = {0: t[:, :2].contiguous(), 1: t[:, 2:].contiguous()}
+            for rank in range(2):
+                r = result._local_tensors[rank]
+                expected = tgt_shards[rank]
+                self.assertTrue(
+                    torch.allclose(r, expected, atol=1e-6),
+                    f"Rank {rank}: got {r}, expected {expected}"
+                )
+
+    def test_partial_sum_to_shard_2d(self):
+        """Partial(sum) → S(1) via reduce_scatter on a 2D tensor."""
+        t = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+        src = ShardedLayout.replicate((2, 4))
+        src.partial = {0: "sum"}
+        tgt = ShardedLayout.shard((2, 4), shard_dim=1, mesh_dim_size=4)
+
+        with LocalTensorMode(frozenset(range(self.world_size))):
+            from torch.distributed.device_mesh import init_device_mesh
+            mesh = init_device_mesh("cpu", (self.world_size,))
+
+            shards = {r: t / self.world_size for r in range(self.world_size)}
+            src_local = LocalTensor(shards)
+
+            result = redistribute_tensor(src_local, src, tgt, mesh)
+
+            for rank in range(self.world_size):
+                r = result._local_tensors[rank] if isinstance(result, LocalTensor) else result
+                expected = t[:, rank:rank + 1]
+                self.assertTrue(
+                    torch.allclose(r, expected, atol=1e-5),
+                    f"Rank {rank}: got {r}, expected {expected}"
+                )
+
+    def test_all_to_all_s0_to_s1_square(self):
+        """S(0) → S(1) on a square 4x4 tensor, mesh=4."""
+        t = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+        src = ShardedLayout.shard((4, 4), shard_dim=0, mesh_dim_size=4)
+        tgt = ShardedLayout.shard((4, 4), shard_dim=1, mesh_dim_size=4)
+        self._run_redistribute(t, src, tgt)
+
+    def test_offset_no_change(self):
+        """Same layout with same offset → no-op."""
+        from autoparallel.shardings.cute._pycute import XorStride, Layout
+        N = 4
+        hier = Layout((((2, N),),), (((XorStride(2 * N - 1), 1),),))
+        sl = ShardedLayout(hier, {0: (0,)}).with_offset({0: 3})
+        from autoparallel.shardings.cute import plan_redistribute
+        self.assertEqual(plan_redistribute(sl, sl), [])
+
 
 if __name__ == "__main__":
     unittest.main()
