@@ -529,16 +529,15 @@ def get_flex_attention_placement_option(mesh, specs, user_args, node):
     flat_specs, _ = tree_flatten(specs)
     flat_uargs, _ = tree_flatten(user_args)
 
-    # Keep only FX Node entries (tensor nodes AND GraphModule nodes).
+    # Keep only FX Node entries that have strategies (skip GraphModule
+    # submodules which are not in strats and invisible to the ILP).
     node_specs = []
     node_uargs = []
-    is_tensor_input = []
     is_other_buffer = []
     for orig, spec, uarg in zip(flat_orig, flat_specs, flat_uargs):
-        if isinstance(orig, torch.fx.Node):
+        if isinstance(orig, torch.fx.Node) and isinstance(uarg, torch.Tensor):
             node_specs.append(spec)
             node_uargs.append(uarg)
-            is_tensor_input.append(isinstance(uarg, torch.Tensor))
             is_other_buffer.append(orig in other_buffer_nodes)
 
     # Q determines the reference batch and head sizes.
@@ -576,13 +575,10 @@ def get_flex_attention_placement_option(mesh, specs, user_args, node):
         placement = tuple(placement)
 
         in_specs = []
-        for uarg, producer_strat, is_tensor, is_buf in zip(
-            node_uargs, node_specs, is_tensor_input, is_other_buffer
+        for uarg, producer_strat, is_buf in zip(
+            node_uargs, node_specs, is_other_buffer
         ):
-            if not is_tensor:
-                # GraphModule submodule — no tensor to shard.
-                in_specs.append(None)
-            elif is_buf:
+            if is_buf:
                 # score_mod / mask_mod other_buffers — always replicate since
                 # we don't know how score_mod indexes into them.
                 in_specs.append(
@@ -623,16 +619,10 @@ def get_flex_attention_placement_option(mesh, specs, user_args, node):
             else:
                 out_specs.append(None)
 
-        redistribute_costs = []
-        for producer_strat, spec in zip(node_specs, in_specs):
-            if spec is None:
-                redistribute_costs.append(
-                    generate_dummy_redistribute_costs(producer_strat)
-                )
-            else:
-                redistribute_costs.append(
-                    generate_redistribute_costs(producer_strat, spec)
-                )
+        redistribute_costs = [
+            generate_redistribute_costs(producer_strat, spec)
+            for producer_strat, spec in zip(node_specs, in_specs)
+        ]
 
         strategies.append(
             OpSpec(

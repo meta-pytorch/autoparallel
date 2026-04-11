@@ -72,8 +72,10 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
         return super().run_node(n)
 
     def _get_input_nodes(self, node):
-        # node.all_input_nodes deduplicates, but we need repeated nodes preserved
-        return all_input_nodes(node)
+        # node.all_input_nodes deduplicates, but we need repeated nodes preserved.
+        # Filter to only nodes with sharding entries — HOP submodule nodes
+        # (GraphModules) are not in sharding_placement and should be skipped.
+        return [x for x in all_input_nodes(node) if x in self.sharding_placement]
 
     def _set_origin_and_target_device_order(self, node, curr_spec, tgt_spec):
         # shard_order should be automatically assigned once `placements` is set

@@ -87,7 +87,6 @@ from torch._functorch._aot_autograd.fx_utils import (
     get_plain_output_and_tangent_nodes,
 )
 from torch.distributed.tensor._dtensor_spec import DTensorSpec
-from torch.distributed.tensor._op_schema import OpSpec, OpStrategy
 from torch.distributed.tensor.placement_types import Placement, Replicate, Shard
 from torch.utils._pytree import tree_map_only
 
@@ -199,17 +198,8 @@ class ShardingOptimizer:
                 val = node.meta.get("val")
                 if isinstance(val, torch.Tensor):
                     strats[node] = _create_all_options(self.mesh, val.shape, tensor=val)
-                else:
-                    # GraphModule submodules used by HOPs (e.g. flex_attention's
-                    # score_mod / mask_mod). Give them a single-option dummy
-                    # strategy so the ILP can reference them without crashing.
-                    strats[node] = OpStrategy(
-                        [
-                            OpSpec(
-                                output_specs=None, input_specs=[], redistribute_cost=[]
-                            )
-                        ]
-                    )
+                # else: GraphModule submodules used by HOPs — not added to
+                # strats, invisible to the ILP. _all_input_nodes filters them.
             elif node.op == "call_function":
                 # TODO: kwargs?
                 # Use .get() so HOP submodule nodes (not in strats) map to None.
@@ -259,17 +249,20 @@ class ShardingOptimizer:
                         )
 
     def _all_input_nodes(self, node):
-        """Variant of node.all_input_nodes that preserves duplicate nodes."""
+        """Variant of node.all_input_nodes that preserves duplicate nodes.
+
+        Filters to only nodes present in self.strats so that HOP submodule
+        nodes (GraphModules without tensor val) are invisible to the ILP.
+        """
         # TODO: add kwargs?
-        return all_input_nodes(node)
+        return [x for x in all_input_nodes(node) if x in self.strats]
 
     def walk_over_options(self, node, constrain_arg=None):
         """Yield (argi, out_idx, inp_idx) for all valid strategy combinations."""
+        if node not in self.strats:
+            return
         op_strategy = self.strats[node]
         for argi in range(len(op_strategy.strategies[0].input_specs)):
-            # Skip None input_specs (e.g. GraphModule submodule args in HOPs).
-            if op_strategy.strategies[0].input_specs[argi] is None:
-                continue
             if constrain_arg is not None and argi != constrain_arg:
                 continue
             for out_idx, strategy in enumerate(op_strategy.strategies):
@@ -285,9 +278,10 @@ class ShardingOptimizer:
         """
         # Map each key to its canonical root key
         root_for_key = {}
-        for node_idx, (node, _) in enumerate(self.strats.items()):
+        for node, _ in self.strats.items():
             if node.op == "output":
                 continue
+            node_idx = self.node_map[node]
             for argi, out_idx, inp_idx in self.walk_over_options(node):
                 key = (node_idx, argi, out_idx, inp_idx)
                 root_for_key[key] = self.cluster_links.get(key, key)
@@ -364,11 +358,13 @@ class ShardingOptimizer:
         n_cluster_copied = 0
 
         decision_vars = {}
-        strats_items = list(enumerate(self.strats.items()))
+        strats_items = [
+            (self.node_map[node], node, strat) for node, strat in self.strats.items()
+        ]
 
         # Two passes: root nodes first (so their entries exist), then linked nodes.
         for is_linked_pass in (False, True):
-            for node_idx, (node, op_strategy) in strats_items:
+            for node_idx, node, op_strategy in strats_items:
                 if node.op == "output":
                     continue
                 is_linked = node_idx in self._cluster_linked_node_idxs
@@ -376,10 +372,6 @@ class ShardingOptimizer:
                     continue
 
                 num_args = len(op_strategy.strategies[0].input_specs)
-                if num_args == 0:
-                    # Nodes with no inputs (e.g. GraphModule submodules for
-                    # HOPs) have no decision variables — skip.
-                    continue
 
                 for out_idx, output_strategy in enumerate(op_strategy.strategies):
                     if is_linked:
@@ -397,8 +389,6 @@ class ShardingOptimizer:
                     for argi, redist_costs in enumerate(
                         output_strategy.redistribute_cost
                     ):
-                        if output_strategy.input_specs[argi] is None:
-                            continue
                         for inp_idx, default_comm_cost in enumerate(redist_costs):
                             key = (node_idx, argi, out_idx, inp_idx)
 
@@ -540,6 +530,8 @@ class ShardingOptimizer:
         for node_idx, node in enumerate(self.graph.nodes):
             if node.op not in {"placeholder", "call_function", "get_attr"}:
                 continue
+            if node not in self.strats:
+                continue
             if node_idx in self._cluster_linked_node_idxs:
                 continue
             arg_vars = {}
@@ -574,10 +566,6 @@ class ShardingOptimizer:
             eqs_per_arg = [[] for _ in self._all_input_nodes(node)]
             for (argi, out_idx), value in vars_per_output.items():
                 eqs_per_arg[argi].append(pulp.lpSum(value))
-            # Filter to args that have variables (skip None input_specs).
-            eqs_per_arg = [eq for eq in eqs_per_arg if eq]
-            if len(eqs_per_arg) <= 1:
-                continue
             arg0 = eqs_per_arg[0]
             for arg_eqs in eqs_per_arg[1:]:
                 assert len(arg0) == len(arg_eqs)
@@ -595,6 +583,8 @@ class ShardingOptimizer:
         """
         for node_idx, node in enumerate(self.graph.nodes):
             if node.op == "output":
+                continue
+            if node not in self.strats:
                 continue
             producer_is_linked = node_idx in self._cluster_linked_node_idxs
             # All args agree on the same output (ensured by consistency constraint),
@@ -785,15 +775,7 @@ class ShardingOptimizer:
                 dvs[0].strategy == dv.strategy for dv in dvs
             ), f"{[dv.var for dv in dvs]}: {[str(dv.strategy) for dv in dvs]}"
 
-        solution = {node: dvs[0].strategy for node, dvs in selected_by_node.items()}
-
-        # Nodes without decision variables (e.g. GraphModule submodules for
-        # HOPs) need dummy entries so apply_sharding can look them up.
-        for node, strat in self.strats.items():
-            if node not in solution and node.op != "output":
-                solution[node] = strat.strategies[0]
-
-        return solution
+        return {node: dvs[0].strategy for node, dvs in selected_by_node.items()}
 
     def get_solution(self, verbose=False):
         t0 = time.perf_counter()
