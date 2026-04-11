@@ -497,6 +497,48 @@ class AutoParallel:
             bw_compiler=self.compiler_fn,
         )
 
+        # Build a forward-only graph for inference (no backward, no
+        # activation saves).  Compilation is lazy — only paid on first
+        # call under torch.no_grad().
+        from .graph_passes.extract_forward import extract_forward_graph
+
+        fw_metadata = self.joint_with_descriptors._aot_state.fw_metadata
+        # num_forward_returns includes mutation outputs + user outputs +
+        # intermediate bases.  For now we only support the common case
+        # where there are no mutations or intermediate bases.
+        assert (
+            fw_metadata.num_mutated_inp_runtime_indices == 0
+        ), "Inference path does not support models with input mutations"
+        assert (
+            fw_metadata.num_intermediate_bases == 0
+        ), "Inference path does not support models with intermediate bases"
+        num_fwd_outputs = fw_metadata.num_forward_returns
+        fwd_only_gm = extract_forward_graph(self.parallel_gm, num_fwd_outputs)
+        compiler_fn = self.compiler_fn
+        out_spec = self.joint_with_descriptors.out_spec
+
+        _inference_fn_cache = None
+
+        def _get_inference_fn():
+            nonlocal _inference_fn_cache
+            if _inference_fn_cache is not None:
+                return _inference_fn_cache
+            example_inputs = [
+                n.meta["val"] for n in fwd_only_gm.graph.nodes if n.op == "placeholder"
+            ]
+            compiled = compiler_fn(fwd_only_gm, example_inputs)
+
+            # compiler_fn returns a boxed callable (takes a list of args).
+            # The graph output is always a tuple; use out_spec to
+            # reconstruct the original model output structure.
+            def inference_fn(args):
+                graph_out = compiled(args)
+                flat = list(graph_out)
+                return torch.utils._pytree.tree_unflatten(flat, out_spec)
+
+            _inference_fn_cache = inference_fn
+            return _inference_fn_cache
+
         # TODO: this probably belongs in the AOTAutograd API
         # TODO: pytree handling
         # Capture the exact FQNs the compiled graph expects as primals.
@@ -520,8 +562,11 @@ class AutoParallel:
             ] + [self.get_buffer(fqn).to_local() for fqn in graph_buffer_fqns]
             boxed_args = [*params, *args]
             del params
-            # NB: don't do self.parallel_model_fn work around Dynamo bug
-            out = parallel_model_fn(boxed_args)
+            if torch.is_grad_enabled():
+                # NB: don't do self.parallel_model_fn work around Dynamo bug
+                out = parallel_model_fn(boxed_args)
+            else:
+                out = _get_inference_fn()(boxed_args)
             return out
 
         self.parallel_model = make_parallel_module(
