@@ -513,17 +513,25 @@ def get_flex_attention_placement_option(mesh, specs, user_args, node):
             node_uargs.append(uarg)
             is_tensor_input.append(isinstance(uarg, torch.Tensor))
 
-    # Attention tensors have the same batch (dim 0) and heads (dim 1) as Q.
+    # Q determines the reference batch and head sizes.
     q_val = node.args[0].meta["val"]
     B, H = q_val.shape[0], q_val.shape[1]
 
-    def is_attention_tensor(t):
-        return (
-            isinstance(t, torch.Tensor)
-            and t.ndim >= 2
-            and t.shape[0] == B
-            and t.shape[1] == H
-        )
+    def tensor_placement(t, placement):
+        """Compute per-tensor placement, replacing Shard dims that don't match
+        the reference size with Replicate (e.g. block_mask with B=1)."""
+        dim_to_ref = {0: B, 1: H}
+        adjusted = []
+        for p in placement:
+            if (
+                p.is_shard()
+                and p.dim in dim_to_ref
+                and t.shape[p.dim] != dim_to_ref[p.dim]
+            ):
+                adjusted.append(Replicate())
+            else:
+                adjusted.append(p)
+        return tuple(adjusted)
 
     replicated = tuple(Replicate() for _ in range(mesh.ndim))
 
@@ -546,16 +554,16 @@ def get_flex_attention_placement_option(mesh, specs, user_args, node):
             if not is_tensor:
                 # GraphModule submodule — no tensor to shard.
                 in_specs.append(None)
-            elif is_attention_tensor(uarg):
+            elif uarg.ndim >= 2:
                 in_specs.append(
                     DTensorSpec(
                         mesh=mesh,
-                        placements=placement,
+                        placements=tensor_placement(uarg, placement),
                         tensor_meta=TensorMeta(uarg.shape, uarg.stride(), uarg.dtype),
                     )
                 )
             else:
-                # Auxiliary tensor (block mask etc.) — always replicate.
+                # Scalar or 1-D auxiliary tensor — always replicate.
                 in_specs.append(
                     DTensorSpec(
                         mesh=mesh,
@@ -570,7 +578,7 @@ def get_flex_attention_placement_option(mesh, specs, user_args, node):
                 out_specs.append(
                     DTensorSpec(
                         mesh=mesh,
-                        placements=placement,
+                        placements=tensor_placement(out, placement),
                         tensor_meta=TensorMeta(out.shape, out.stride(), out.dtype),
                     )
                 )

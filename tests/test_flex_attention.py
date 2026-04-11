@@ -70,7 +70,7 @@ class FlexAttnScoreModModel(torch.nn.Module):
 class FlexAttnBlockMaskModel(torch.nn.Module):
     """Model with a causal block_mask."""
 
-    def __init__(self, dim, n_heads, seqlen):
+    def __init__(self, dim, n_heads, seqlen, batch_size=None):
         super().__init__()
         self.dim = dim
         self.n_heads = n_heads
@@ -84,7 +84,12 @@ class FlexAttnBlockMaskModel(torch.nn.Module):
             return q_idx >= kv_idx
 
         self.block_mask = create_block_mask(
-            causal, B=None, H=None, Q_LEN=seqlen, KV_LEN=seqlen, device="cuda"
+            causal,
+            B=batch_size,
+            H=n_heads if batch_size is not None else None,
+            Q_LEN=seqlen,
+            KV_LEN=seqlen,
+            device="cuda",
         )
 
     def forward(self, x):
@@ -247,6 +252,82 @@ def test_flex_attention_block_mask_2d(device_mesh_2d):
     model = FlexAttnBlockMaskModel(DIM, N_HEADS, SEQLEN)
     model = model.to("meta")
     _run_auto_parallel(model, device_mesh_2d)
+
+
+def test_flex_attention_block_mask_explicit_bh(device_mesh_1d):
+    """block_mask with B=global_batch and H=n_heads (non-broadcast masks)."""
+    global_bs = LOCAL_BS * device_mesh_1d.size()
+    model = FlexAttnBlockMaskModel(DIM, N_HEADS, SEQLEN, batch_size=global_bs)
+    model = model.to("meta")
+    _run_auto_parallel(model, device_mesh_1d)
+
+
+def test_flex_attention_block_mask_sharding_matches_shape(device_mesh_1d):
+    """Verify block_mask tensors are shardable only on dims that match Q.
+
+    - B=global_batch, H=n_heads: block_mask can be sharded on both batch and heads.
+    - B=None, H=n_heads: block_mask has shape[0]=1, so batch dim must stay
+      Replicate, but head dim (shape[1]=H) can still be Shard(1).
+    - B=None, H=None: block_mask shape is [1,1,...], must be fully Replicate.
+    """
+    global_bs = LOCAL_BS * device_mesh_1d.size()
+    mesh = device_mesh_1d
+
+    from autoparallel.api import AutoParallel
+    from autoparallel.input_validation import (
+        _extract_input_info,
+        _flatten_out_shardings,
+        _make_input_fn,
+    )
+
+    def _get_flex_attn_strat(model):
+        x = _make_input(mesh, DIM)
+        shapes, dtypes, input_placements, treespec = _extract_input_info((x,), mesh)
+        input_fn = _make_input_fn(shapes, dtypes, treespec)
+        output_placements = _flatten_out_shardings(_out_shardings(mesh))
+
+        with AutoParallel(model, input_fn, mesh, compile=False) as autop:
+            autop.add_input_constraints(input_placements)
+            autop.add_output_constraints(output_placements)
+
+            for node in autop.gm.graph.nodes:
+                if node.op != "call_function":
+                    continue
+                if not isinstance(node.target, torch._ops.HigherOrderOperator):
+                    continue
+                if "backward" in node.target.name():
+                    continue
+                return autop.sharding_optimizer.strats[node]
+        raise AssertionError("flex_attention node not found")
+
+    def _block_mask_specs(strat):
+        """Collect input specs for block_mask tensors (not Q/K/V, not GraphModule)."""
+        specs = []
+        for s in strat.strategies:
+            for ispec in s.input_specs:
+                if ispec is None:
+                    continue
+                # Block_mask tensors have a trailing dim of size 1
+                if ispec.tensor_meta.shape[-1] == 1:
+                    specs.append(ispec)
+        return specs
+
+    # B=global_batch, H=n_heads: block_mask can be Shard(0)
+    model = FlexAttnBlockMaskModel(DIM, N_HEADS, SEQLEN, batch_size=global_bs)
+    model = model.to("meta")
+    bm_specs = _block_mask_specs(_get_flex_attn_strat(model))
+    assert any(
+        any(p == Shard(0) for p in spec.placements) for spec in bm_specs
+    ), "block_mask with explicit B should allow Shard(0)"
+
+    # B=None, H=None: block_mask shape [1,1,...] must be fully Replicate
+    model = FlexAttnBlockMaskModel(DIM, N_HEADS, SEQLEN)
+    model = model.to("meta")
+    bm_specs = _block_mask_specs(_get_flex_attn_strat(model))
+    for spec in bm_specs:
+        assert all(
+            p == Replicate() for p in spec.placements
+        ), f"block_mask with B=None, H=None should be Replicate, got {spec.placements}"
 
 
 def test_flex_attention_scale(device_mesh_1d):
