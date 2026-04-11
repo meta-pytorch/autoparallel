@@ -607,8 +607,12 @@ class ShardingOptimizer:
                 # the root-to-root edge already covers this.
                 if producer_is_linked and user_idx in self._cluster_linked_node_idxs:
                     continue
-                user_argi = [i for i, n in enumerate(user.all_input_nodes) if n == node]
-                assert len(user_argi) == 1
+                user_argi = [
+                    i for i, n in enumerate(self._all_input_nodes(user)) if n == node
+                ]
+                assert len(user_argi) >= 1
+                # Use the first matching arg; the same-output-across-args
+                # constraint already ensures all args agree.
                 user_argi = user_argi[0]
 
                 vars_producer = self._collect_vars(
@@ -634,6 +638,11 @@ class ShardingOptimizer:
                         group_by="inp_idx",
                         resolve_clusters=True,
                     )
+
+                # Skip edges where the consumer arg has no sharding decision
+                # (e.g. None input_specs for HOP submodule / SymInt args).
+                if not vars_consumer or not vars_producer:
+                    continue
 
                 assert (
                     vars_producer.keys() == vars_consumer.keys()
