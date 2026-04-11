@@ -8,7 +8,13 @@ non-contiguous) that DTensor cannot represent.
 
 from __future__ import annotations
 
+import operator
 from typing import Any
+
+import torch
+import torch.fx.traceback as fx_traceback
+from torch.fx.experimental.proxy_tensor import make_fx
+from torch.utils._pytree import tree_flatten
 
 from .backend import OpOption, ShardingBackend
 from .cute import (
@@ -172,15 +178,61 @@ class CuTeBackend:
         gm: Any,
         solution: dict,
         mesh: Any,
+        params_spec: Any = None,
+        buffers_spec: Any = None,
     ) -> Any:
         """Apply the chosen sharding solution to the FX graph.
 
-        DEFERRED — focus on strategy selection first.
+        Uses CuTe's redistribute_tensor for collective insertion.
+        Parameters and buffers are sharded via DTensor conversion.
+
+        Returns:
+            (parallel_gm, sharded_param_dict, sharded_buffer_dict)
         """
-        raise NotImplementedError(
-            "CuTe apply_solution not yet implemented. "
-            "Use DTensorBackend for graph application."
+        from ..apply_sharding import (
+            _copy_descriptors_and_rename_placeholders,
+            _get_inductor_decomp_table,
+            _shard_params_and_buffers,
         )
+        from ..graph_passes.graph_utils import cleanup_graph
+
+        # Convert solution to DTensorSpec for parameter sharding
+        dtensor_solution = _convert_solution_to_dtensor(solution, mesh)
+
+        # Create local args from placeholder nodes
+        local_args = _create_local_args(gm, solution)
+
+        # Interpret graph with collective insertion
+        from .cute.redistribute_tensor import redistribute_tensor
+
+        interp = _CuTeApplyShardingInterpreter(gm, solution, mesh, redistribute_tensor)
+        with fx_traceback.preserve_node_meta():
+            parallel_gm0 = make_fx(interp.run)(*local_args)
+        cleanup_graph(parallel_gm0)
+
+        # Decompose high-level collectives
+        decomp_table = _get_inductor_decomp_table()
+        interp2 = torch.fx.Interpreter(parallel_gm0)
+        with fx_traceback.preserve_node_meta():
+            parallel_gm = make_fx(interp2.run, decomposition_table=decomp_table)(
+                *local_args
+            )
+        cleanup_graph(parallel_gm)
+
+        # Copy descriptors and rename placeholders (if present)
+        try:
+            _copy_descriptors_and_rename_placeholders(gm, parallel_gm)
+        except (KeyError, StopIteration):
+            pass  # No descriptors in source graph (e.g., unit test)
+
+        # Shard parameters and buffers via DTensor
+        sharded_param_dict, sharded_buffer_dict = {}, {}
+        if params_spec is not None or buffers_spec is not None:
+            sharded_param_dict, sharded_buffer_dict = _shard_params_and_buffers(
+                gm, dtensor_solution, params_spec or {}, buffers_spec or {}
+            )
+
+        return parallel_gm, sharded_param_dict, sharded_buffer_dict
 
 
 # =============================================================================
@@ -226,3 +278,185 @@ def _get_tensor_arg_indices(node, user_args) -> list[int]:
 def _extract_non_tensor_args(user_args, tensor_indices) -> tuple:
     """Extract non-tensor args, preserving order."""
     return tuple(arg for i, arg in enumerate(user_args) if i not in tensor_indices)
+
+
+# =============================================================================
+# apply_solution helpers
+# =============================================================================
+
+
+class _CuTeApplyShardingInterpreter(torch.fx.Interpreter):
+    """FX Interpreter that inserts CuTe collectives at sharding mismatches.
+
+    For each graph node, compares the source output ShardedLayout with the
+    target input ShardedLayout. On mismatch, calls redistribute_tensor to
+    insert the appropriate funcol collective operations.
+    """
+
+    def __init__(self, module, sharding_placement, mesh, redistribute_fn):
+        super().__init__(module, garbage_collect_values=True, graph=None)
+        self.sharding_placement = sharding_placement
+        self.mesh = mesh
+        self.redistribute_fn = redistribute_fn
+
+    def run_node(self, n):
+        self._curr_node = n
+        return super().run_node(n)
+
+    def _get_input_nodes(self, node):
+        from ..graph_passes.graph_utils import all_input_nodes
+        return all_input_nodes(node)
+
+    def call_function(self, target, args, kwargs):
+        node = self._curr_node
+
+        if node not in self.sharding_placement:
+            return super().call_function(target, args, kwargs)
+
+        if target == operator.getitem:
+            return self._handle_getitem(target, args, kwargs)
+
+        input_nodes = self._get_input_nodes(node)
+        node_opt = self.sharding_placement[node]
+
+        flat_args, treespec = tree_flatten(args)
+        new_flat_args = list(flat_args)
+        tensor_idx = 0
+
+        for i, arg in enumerate(flat_args):
+            if isinstance(arg, torch.Tensor) and tensor_idx < len(input_nodes):
+                inp_node = input_nodes[tensor_idx]
+
+                if inp_node in self.sharding_placement:
+                    src_spec = self.sharding_placement[inp_node].output_spec
+                    tgt_spec = node_opt.input_specs[tensor_idx]
+
+                    if (isinstance(src_spec, ShardedLayout)
+                            and isinstance(tgt_spec, ShardedLayout)
+                            and src_spec != tgt_spec):
+                        new_flat_args[i] = self.redistribute_fn(
+                            arg, src_spec, tgt_spec, self.mesh
+                        )
+
+                tensor_idx += 1
+
+        new_args = list(treespec.unflatten(new_flat_args))
+
+        # Adjust shape for factory ops (zeros, ones, etc.)
+        from .propagation_rules import TENSOR_FACTORY_OPS
+        if target in TENSOR_FACTORY_OPS and target != torch.ops.aten.scalar_tensor.default:
+            out_spec = node_opt.output_spec
+            if isinstance(out_spec, ShardedLayout):
+                local_sizes = out_spec.local_sizes
+                val = list(new_args[0])
+                for dim in range(len(val)):
+                    mesh_dims = out_spec.mesh_dim_map.get(dim, ())
+                    if mesh_dims:
+                        val[dim] = local_sizes[dim]
+                new_args[0] = tuple(val)
+
+        return super().call_function(target, tuple(new_args), kwargs)
+
+    def _handle_getitem(self, target, args, kwargs):
+        node = self._curr_node
+        idx = args[1]
+        arg = args[0][idx]
+
+        if isinstance(arg, torch.Tensor):
+            input_nodes = self._get_input_nodes(node)
+            if input_nodes and input_nodes[0] in self.sharding_placement:
+                producer_opt = self.sharding_placement[input_nodes[0]]
+                # Producer output may be a tuple of specs
+                src_spec = producer_opt.output_spec
+                if isinstance(src_spec, (tuple, list)):
+                    src_spec = src_spec[idx]
+
+                if node in self.sharding_placement:
+                    tgt_spec = self.sharding_placement[node].input_specs[0]
+                    if (isinstance(src_spec, ShardedLayout)
+                            and isinstance(tgt_spec, ShardedLayout)
+                            and src_spec != tgt_spec):
+                        new_args_0 = list(args[0])
+                        new_args_0[idx] = self.redistribute_fn(
+                            arg, src_spec, tgt_spec, self.mesh
+                        )
+                        return super().call_function(target, (tuple(new_args_0), idx), kwargs)
+
+        return super().call_function(target, args, kwargs)
+
+
+def _create_local_args(gm, solution):
+    """Create local tensor args for placeholder nodes based on ShardedLayout specs."""
+    local_args = []
+    for node in gm.graph.find_nodes(op="placeholder"):
+        tensor = node.meta["val"]
+        if node in solution:
+            spec = solution[node].output_spec
+            if isinstance(spec, ShardedLayout):
+                local_shape = spec.local_sizes
+                local_t = torch.randn(local_shape, dtype=tensor.dtype, device="meta")
+                local_args.append(local_t)
+                continue
+        # Replicate or not in solution — use original shape
+        local_args.append(torch.randn(tensor.shape, dtype=tensor.dtype, device="meta"))
+    return local_args
+
+
+def _sharded_layout_to_dtensor_spec(sl, mesh):
+    """Convert ShardedLayout to DTensorSpec for parameter sharding.
+
+    For each mesh dim: if it shards tensor dim d → Shard(d), else Replicate.
+    If Partial → _Partial(reduce_op).
+    Works for standard shardings. Non-standard (XorStride, cat) not supported.
+    """
+    from torch.distributed.tensor._dtensor_spec import DTensorSpec
+    from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
+
+    # Build reverse map: mesh_dim -> (tensor_dim, ...)
+    mesh_ndim = mesh.ndim if hasattr(mesh, 'ndim') else len(mesh.shape)
+    placements = []
+    for md in range(mesh_ndim):
+        placed = False
+        for td, mesh_dims in sl.mesh_dim_map.items():
+            if md in mesh_dims:
+                placements.append(Shard(td))
+                placed = True
+                break
+        if not placed:
+            if md in sl.partial:
+                placements.append(Partial(sl.partial[md]))
+            else:
+                placements.append(Replicate())
+
+    return DTensorSpec(mesh, tuple(placements))
+
+
+def _convert_solution_to_dtensor(solution, mesh):
+    """Convert a ShardedLayout solution to DTensorSpec solution for param sharding."""
+    from torch.distributed.tensor._dtensor_spec import DTensorSpec
+    from torch.distributed.tensor.placement_types import Replicate
+
+    dtensor_solution = {}
+    for node, opt in solution.items():
+        out_spec = opt.output_spec
+        if isinstance(out_spec, ShardedLayout):
+            dt_out = _sharded_layout_to_dtensor_spec(out_spec, mesh)
+        else:
+            dt_out = out_spec
+
+        dt_inputs = []
+        for inp_spec in opt.input_specs:
+            if isinstance(inp_spec, ShardedLayout):
+                dt_inputs.append(_sharded_layout_to_dtensor_spec(inp_spec, mesh))
+            else:
+                dt_inputs.append(inp_spec)
+
+        # Create a minimal OpOption-like object with DTensorSpec
+        # that _shard_params_and_buffers can use
+        dtensor_solution[node] = OpOption(
+            output_spec=dt_out,
+            input_specs=tuple(dt_inputs),
+            redistribute_costs=opt.redistribute_costs,
+        )
+
+    return dtensor_solution

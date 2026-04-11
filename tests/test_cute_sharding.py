@@ -2389,11 +2389,77 @@ class TestCuTeBackend(unittest.TestCase):
         cost = backend.redistribute_cost(src, tgt, mesh=(2,))
         self.assertGreater(cost, 0.0)
 
-    def test_apply_solution_raises(self):
+    def test_apply_solution_empty(self):
+        """apply_solution with empty solution returns graph unchanged."""
         from autoparallel.shardings.cute_backend import CuTeBackend
         backend = CuTeBackend()
-        with self.assertRaises(NotImplementedError):
-            backend.apply_solution(None, {}, None)
+        # Create a minimal FX graph: just a placeholder and output
+        import torch
+        def f(x):
+            return x + 1
+        gm = torch.fx.symbolic_trace(f)
+        # Add fake meta to placeholder
+        for node in gm.graph.nodes:
+            if node.op == "placeholder":
+                node.meta["val"] = torch.randn(4, 4)
+            elif node.op == "output":
+                node.meta["desc"] = None
+        # Empty solution — no nodes to process
+        parallel_gm, params, buffers = backend.apply_solution(gm, {}, None)
+        self.assertIsNotNone(parallel_gm)
+
+    def test_apply_solution_inserts_collective(self):
+        """apply_solution inserts all_gather when S(0) → Replicate at an edge."""
+        from autoparallel.shardings.cute_backend import CuTeBackend
+        from autoparallel.shardings.backend import OpOption
+        import torch
+
+        backend = CuTeBackend()
+
+        # Graph: x (placeholder) -> mm(x, x) -> output
+        def f(x, y):
+            return torch.mm(x, y)
+
+        gm = torch.fx.symbolic_trace(f)
+        # Add fake meta
+        for node in gm.graph.nodes:
+            if node.op == "placeholder":
+                node.meta["val"] = torch.randn(4, 4)
+
+        # Build solution: x is S(0) mesh=2, mm wants replicate inputs
+        s0 = ShardedLayout.shard((4, 4), shard_dim=0, mesh_dim_size=2)
+        rep = ShardedLayout.replicate((4, 4))
+
+        nodes = list(gm.graph.nodes)
+        x_node = nodes[0]  # placeholder x
+        y_node = nodes[1]  # placeholder y
+        mm_node = nodes[2]  # mm
+
+        solution = {
+            x_node: OpOption(output_spec=s0, input_specs=(s0,)),
+            y_node: OpOption(output_spec=s0, input_specs=(s0,)),
+            mm_node: OpOption(output_spec=rep, input_specs=(rep, rep)),
+        }
+
+        # Create a fake 1D mesh
+        import torch.distributed as dist
+        from torch.testing._internal.distributed.fake_pg import FakeStore
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        store = FakeStore()
+        dist.init_process_group(backend="fake", world_size=2, rank=0, store=store)
+        from torch.distributed.device_mesh import init_device_mesh
+        mesh = init_device_mesh("cpu", (2,))
+
+        try:
+            parallel_gm, _, _ = backend.apply_solution(gm, solution, mesh)
+
+            # Check that the parallel graph has all_gather nodes
+            graph_str = str(parallel_gm.graph)
+            self.assertIn("all_gather", graph_str,
+                          f"Expected all_gather in graph, got:\n{graph_str}")
+        finally:
+            dist.destroy_process_group()
 
 
 if __name__ == "__main__":
