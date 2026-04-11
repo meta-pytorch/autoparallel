@@ -328,13 +328,17 @@ def _apply_split(spec, inputs, all_split_specs):
     for piece in pieces:
         out_shape = tuple(s for s, _ in piece)
         out_stride = tuple(st for _, st in piece)
-        # Assign mesh dims to this piece based on which sub-dims have mesh
+        # Assign mesh dims to this piece based on which sub-dims have mesh.
+        # A sub-dim (local, mesh0, mesh1, ...) with N mesh factors consumes
+        # N mesh dims from the list.
         piece_mesh = []
         for sub_s, sub_st in piece:
             if _has_mesh(sub_s):
-                if mesh_idx < len(mesh_dims_list):
-                    piece_mesh.append(mesh_dims_list[mesh_idx])
-                    mesh_idx += 1
+                n_mesh_factors = len(sub_s) - 1  # sub_s[0] is local, rest are mesh
+                for _ in range(n_mesh_factors):
+                    if mesh_idx < len(mesh_dims_list):
+                        piece_mesh.append(mesh_dims_list[mesh_idx])
+                        mesh_idx += 1
         results.append(((out_shape, out_stride), tuple(piece_mesh)))
 
     return results

@@ -160,6 +160,28 @@ class TestViewPropagation(unittest.TestCase):
         self.assertIsNotNone(v3)
         self.assertEqual(v3.get_placements(), orig_placements)
 
+    def test_s0s0_split_preserves_mesh_dims(self):
+        """S(0)S(0) view split keeps both mesh dims on the output dim that has mesh."""
+        src = ShardedLayout.shard_multi((16,), [(0, 2), (0, 2)])
+        self.assertEqual(src.mesh_dim_map, {0: (0, 1)})
+
+        # Split (16,) -> (4, 4): local=4 splits off, both mesh factors stay together
+        out = propagate_view(src, (4, 4))
+        self.assertIsNotNone(out)
+        self.assertEqual(out.global_shape, (4, 4))
+        # Both mesh dims must stay on tensor dim 0 (which has the mesh factors)
+        self.assertEqual(out.mesh_dim_map[0], (0, 1))
+        self.assertEqual(out.mesh_dim_map[1], ())
+
+    def test_s0s0_split_round_trip(self):
+        """S(0)S(0) split then merge recovers original mesh_dim_map."""
+        src = ShardedLayout.shard_multi((16,), [(0, 2), (0, 2)])
+        split = propagate_view(src, (4, 4))
+        self.assertIsNotNone(split)
+        merged = propagate_view(split, (16,))
+        self.assertIsNotNone(merged)
+        self.assertEqual(merged.mesh_dim_map, {0: (0, 1)})
+
 
 class TestTransposePropagation(unittest.TestCase):
 
