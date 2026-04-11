@@ -566,7 +566,7 @@ def get_flex_attention_placement_option(mesh, specs, user_args, node):
 
         out_specs = []
         for out in output_val:
-            if isinstance(out, torch.Tensor) and is_attention_tensor(out):
+            if isinstance(out, torch.Tensor):
                 out_specs.append(
                     DTensorSpec(
                         mesh=mesh,
