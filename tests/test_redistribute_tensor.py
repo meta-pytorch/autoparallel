@@ -8,12 +8,38 @@ This tests the full pipeline end-to-end without NCCL.
 """
 
 import unittest
+from unittest.mock import patch
 import torch
 import torch.distributed as dist
+import torch.distributed._functional_collectives as funcol
 from torch.distributed._local_tensor import LocalTensorMode, LocalTensor
 from torch.testing._internal.distributed.fake_pg import FakeStore
 
 from autoparallel.shardings.cute import ShardedLayout, redistribute_tensor
+from autoparallel.shardings.cute._pycute import Layout, XorStride
+
+
+def _local_permute_tensor(tensor, src_dst, group, tag=""):
+    """LocalTensor-aware permute_tensor for testing.
+
+    funcol.permute_tensor uses dist.get_rank() to compute split sizes before
+    calling all_to_all_single. Under LocalTensorMode with backend="fake",
+    get_rank() always returns 0, so all ranks compute the same split sizes.
+    This reimplementation directly permutes the per-rank tensors.
+    """
+    if isinstance(tensor, LocalTensor):
+        # src_dst[src] = dst: rank src sends to rank dst
+        # Invert: for each dst rank, find which src rank sends to it
+        inv = {dst: src for src, dst in enumerate(src_dst)}
+        new_shards = {}
+        for r in tensor._local_tensors:
+            src_rank = inv.get(r)
+            if src_rank is not None and src_rank in tensor._local_tensors:
+                new_shards[r] = tensor._local_tensors[src_rank].clone()
+            else:
+                new_shards[r] = tensor._local_tensors[r].clone()
+        return LocalTensor(new_shards)
+    return funcol.permute_tensor(tensor, src_dst, group, tag)
 
 
 def _setup_fake_dist(world_size):
@@ -343,12 +369,108 @@ class TestRedistributeTensor(unittest.TestCase):
 
     def test_offset_no_change(self):
         """Same layout with same offset → no-op."""
-        from autoparallel.shardings.cute._pycute import XorStride, Layout
         N = 4
         hier = Layout((((2, N),),), (((XorStride(2 * N - 1), 1),),))
         sl = ShardedLayout(hier, {0: (0,)}).with_offset({0: 3})
         from autoparallel.shardings.cute import plan_redistribute
         self.assertEqual(plan_redistribute(sl, sl), [])
+
+    @patch("autoparallel.shardings.cute.redistribute_tensor.funcol.permute_tensor",
+           side_effect=_local_permute_tensor)
+    def test_ring_attention_step0_to_step1(self, mock_permute):
+        """Ring attention step 0 → step 1 via global ppermute (circular shift)."""
+        N = self.world_size  # 4
+        n_chunks = 2 * N  # 8
+
+        # Build step 0 and step 1 layouts (chunk-level, 8 elements)
+        hier = Layout((((2, N),),), (((XorStride(n_chunks - 1), 1),),))
+        step0 = ShardedLayout(hier, {0: (0,)})
+        step1 = step0.with_offset({0: N - 1})
+
+        # Step 0: GPU g gets chunks {g, g^7} = {g, 7-g}
+        # Step 1: GPU g gets chunks {(g+3)%4, ((g+3)%4)^7}
+        # Transition: circular left shift — GPU g sends to GPU (g+1)%4
+
+        with LocalTensorMode(frozenset(range(N))):
+            from torch.distributed.device_mesh import init_device_mesh
+            mesh = init_device_mesh("cpu", (N,))
+
+            # Build step 0 shards: GPU g has value g (representing its chunk id)
+            src_shards = {g: torch.tensor([float(g), float(g ^ (n_chunks - 1))])
+                          for g in range(N)}
+            src_local = LocalTensor(src_shards)
+
+            result = redistribute_tensor(src_local, step0, step1, mesh)
+
+            # After circular shift: GPU g receives from GPU (g-1)%4
+            for g in range(N):
+                r = result._local_tensors[g] if isinstance(result, LocalTensor) else result
+                sender = (g - 1) % N
+                expected = torch.tensor([float(sender), float(sender ^ (n_chunks - 1))])
+                self.assertTrue(
+                    torch.allclose(r, expected, atol=1e-6),
+                    f"GPU {g}: got {r}, expected {expected} (from GPU {sender})"
+                )
+
+    @patch("autoparallel.shardings.cute.redistribute_tensor.funcol.permute_tensor",
+           side_effect=_local_permute_tensor)
+    def test_ring_attention_step1_to_step2(self, mock_permute):
+        """Ring attention step 1 → step 2: same circular shift pattern."""
+        N = self.world_size
+        n_chunks = 2 * N
+
+        hier = Layout((((2, N),),), (((XorStride(n_chunks - 1), 1),),))
+        step1 = ShardedLayout(hier, {0: (0,)}).with_offset({0: N - 1})
+        step2 = ShardedLayout(hier, {0: (0,)}).with_offset({0: 2 * (N - 1)})
+
+        with LocalTensorMode(frozenset(range(N))):
+            from torch.distributed.device_mesh import init_device_mesh
+            mesh = init_device_mesh("cpu", (N,))
+
+            src_shards = {g: torch.tensor([float(g)]) for g in range(N)}
+            src_local = LocalTensor(src_shards)
+
+            result = redistribute_tensor(src_local, step1, step2, mesh)
+
+            for g in range(N):
+                r = result._local_tensors[g] if isinstance(result, LocalTensor) else result
+                sender = (g - 1) % N
+                expected = torch.tensor([float(sender)])
+                self.assertTrue(
+                    torch.allclose(r, expected, atol=1e-6),
+                    f"GPU {g}: got {r}, expected {expected}"
+                )
+
+    @patch("autoparallel.shardings.cute.redistribute_tensor.funcol.permute_tensor",
+           side_effect=_local_permute_tensor)
+    def test_ring_attention_full_rotation(self, mock_permute):
+        """N steps of ring rotation returns data to original GPU."""
+        N = self.world_size
+        n_chunks = 2 * N
+
+        hier = Layout((((2, N),),), (((XorStride(n_chunks - 1), 1),),))
+
+        with LocalTensorMode(frozenset(range(N))):
+            from torch.distributed.device_mesh import init_device_mesh
+            mesh = init_device_mesh("cpu", (N,))
+
+            # Start: GPU g has value g
+            tensor = LocalTensor({g: torch.tensor([float(g)]) for g in range(N)})
+
+            # Apply N steps of circular shift
+            for step in range(N):
+                src = ShardedLayout(hier, {0: (0,)}).with_offset({0: step * (N - 1)})
+                tgt = ShardedLayout(hier, {0: (0,)}).with_offset({0: (step + 1) * (N - 1)})
+                tensor = redistribute_tensor(tensor, src, tgt, mesh)
+
+            # After N shifts, data should be back at original GPU
+            for g in range(N):
+                r = tensor._local_tensors[g] if isinstance(tensor, LocalTensor) else tensor
+                expected = torch.tensor([float(g)])
+                self.assertTrue(
+                    torch.allclose(r, expected, atol=1e-6),
+                    f"GPU {g}: got {r}, expected {expected} after full rotation"
+                )
 
 
 if __name__ == "__main__":
