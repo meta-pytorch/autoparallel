@@ -499,6 +499,32 @@ def get_flex_attention_placement_option(mesh, specs, user_args, node):
     combinations of {Replicate, Shard(0), Shard(1)} across mesh dimensions.
     Block-mask and other auxiliary tensors are always replicated.
     """
+    # Collect FX Nodes from score_mod_other_buffers and mask_mod_other_buffers.
+    # These must always be replicated since score_mod can index them arbitrarily.
+    # We identify them by parameter name from the HOP's fake-kernel signature.
+    other_buffer_nodes: set[torch.fx.Node] = set()
+    _BUFFER_PARAM_NAMES = ("score_mod_other_buffers", "mask_mod_other_buffers")
+    import inspect
+
+    from torch._higher_order_ops.flex_attention import (
+        flex_attention_backward_fake_tensor_mode,
+        flex_attention_fake_impl,
+    )
+
+    fake_impl = (
+        flex_attention_fake_impl
+        if node.target.name() == "flex_attention"
+        else flex_attention_backward_fake_tensor_mode
+    )
+    params = list(inspect.signature(fake_impl).parameters.keys())
+    for name in _BUFFER_PARAM_NAMES:
+        if name in params:
+            idx = params.index(name)
+            if idx < len(node.args) and isinstance(node.args[idx], (tuple, list)):
+                for item in tree_flatten(node.args[idx])[0]:
+                    if isinstance(item, torch.fx.Node):
+                        other_buffer_nodes.add(item)
+
     flat_orig, _ = tree_flatten(node.args)
     flat_specs, _ = tree_flatten(specs)
     flat_uargs, _ = tree_flatten(user_args)
@@ -507,11 +533,13 @@ def get_flex_attention_placement_option(mesh, specs, user_args, node):
     node_specs = []
     node_uargs = []
     is_tensor_input = []
+    is_other_buffer = []
     for orig, spec, uarg in zip(flat_orig, flat_specs, flat_uargs):
         if isinstance(orig, torch.fx.Node):
             node_specs.append(spec)
             node_uargs.append(uarg)
             is_tensor_input.append(isinstance(uarg, torch.Tensor))
+            is_other_buffer.append(orig in other_buffer_nodes)
 
     # Q determines the reference batch and head sizes.
     q_val = node.args[0].meta["val"]
@@ -548,12 +576,22 @@ def get_flex_attention_placement_option(mesh, specs, user_args, node):
         placement = tuple(placement)
 
         in_specs = []
-        for uarg, producer_strat, is_tensor in zip(
-            node_uargs, node_specs, is_tensor_input
+        for uarg, producer_strat, is_tensor, is_buf in zip(
+            node_uargs, node_specs, is_tensor_input, is_other_buffer
         ):
             if not is_tensor:
                 # GraphModule submodule — no tensor to shard.
                 in_specs.append(None)
+            elif is_buf:
+                # score_mod / mask_mod other_buffers — always replicate since
+                # we don't know how score_mod indexes into them.
+                in_specs.append(
+                    DTensorSpec(
+                        mesh=mesh,
+                        placements=replicated,
+                        tensor_meta=TensorMeta(uarg.shape, uarg.stride(), uarg.dtype),
+                    )
+                )
             elif uarg.ndim >= 2:
                 in_specs.append(
                     DTensorSpec(

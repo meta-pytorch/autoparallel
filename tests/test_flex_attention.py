@@ -149,6 +149,43 @@ class FlexAttnGQAModel(torch.nn.Module):
         return self.wo(out)
 
 
+class FlexAttnOtherBuffersModel(torch.nn.Module):
+    """Model where score_mod captures external tensors (other_buffers).
+
+    Uses a buffer with shape [B, H] which coincidentally matches the batch and
+    head dimensions of Q. Without explicit other_buffers handling, this would
+    be misclassified as an attention tensor and incorrectly sharded.
+    """
+
+    def __init__(self, dim, n_heads, batch_size):
+        super().__init__()
+        self.dim = dim
+        self.n_heads = n_heads
+        self.head_dim = dim // n_heads
+        self.wq = torch.nn.Linear(dim, dim, bias=False)
+        self.wk = torch.nn.Linear(dim, dim, bias=False)
+        self.wv = torch.nn.Linear(dim, dim, bias=False)
+        self.wo = torch.nn.Linear(dim, dim, bias=False)
+        # Shape [B, H] — deliberately matches attention tensor dims
+        self.per_batch_head_bias = torch.nn.Parameter(
+            torch.randn(batch_size, n_heads), requires_grad=False
+        )
+
+    def forward(self, x):
+        bsz, seqlen, _ = x.shape
+        q = self.wq(x).view(bsz, seqlen, self.n_heads, self.head_dim).transpose(1, 2)
+        k = self.wk(x).view(bsz, seqlen, self.n_heads, self.head_dim).transpose(1, 2)
+        v = self.wv(x).view(bsz, seqlen, self.n_heads, self.head_dim).transpose(1, 2)
+        bias = self.per_batch_head_bias
+
+        def score_mod(score, batch, head, q_idx, kv_idx):
+            return score + bias[batch, head]
+
+        out = flex_attention(q, k, v, score_mod=score_mod)
+        out = out.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
+        return self.wo(out)
+
+
 class FlexAttnScoreModBlockMaskModel(torch.nn.Module):
     """Model with both score_mod and block_mask together."""
 
@@ -360,3 +397,66 @@ def test_flex_attention_score_mod_block_mask_2d(device_mesh_2d):
     model = FlexAttnScoreModBlockMaskModel(DIM, N_HEADS, SEQLEN)
     model = model.to("meta")
     _run_auto_parallel(model, device_mesh_2d)
+
+
+def test_flex_attention_other_buffers(device_mesh_1d):
+    """score_mod capturing a [B, H] tensor as other_buffer."""
+    global_bs = LOCAL_BS * device_mesh_1d.size()
+    model = FlexAttnOtherBuffersModel(DIM, N_HEADS, global_bs)
+    model = model.to("meta")
+    _run_auto_parallel(model, device_mesh_1d)
+
+
+def test_flex_attention_other_buffers_replicated(device_mesh_1d):
+    """Verify other_buffers with shape [B, H] are Replicate, not co-sharded.
+
+    The per_batch_head_bias has shape [B, H] which matches the attention tensor
+    dimensions. Without explicit other_buffers handling, tensor_placement would
+    assign it the same Shard(0)/Shard(1) placement as Q — but score_mod indexes
+    it arbitrarily, so it must be Replicate.
+    """
+    global_bs = LOCAL_BS * device_mesh_1d.size()
+    model = FlexAttnOtherBuffersModel(DIM, N_HEADS, global_bs)
+    model = model.to("meta")
+    mesh = device_mesh_1d
+
+    from autoparallel.api import AutoParallel
+    from autoparallel.input_validation import (
+        _extract_input_info,
+        _flatten_out_shardings,
+        _make_input_fn,
+    )
+
+    x = _make_input(mesh, DIM)
+    shapes, dtypes, input_placements, treespec = _extract_input_info((x,), mesh)
+    input_fn = _make_input_fn(shapes, dtypes, treespec)
+    output_placements = _flatten_out_shardings(_out_shardings(mesh))
+
+    with AutoParallel(model, input_fn, mesh, compile=False) as autop:
+        autop.add_input_constraints(input_placements)
+        autop.add_output_constraints(output_placements)
+
+        strats = autop.sharding_optimizer.strats
+        for node in autop.gm.graph.nodes:
+            if node.op != "call_function":
+                continue
+            if not isinstance(node.target, torch._ops.HigherOrderOperator):
+                continue
+            if "backward" in node.target.name():
+                continue
+
+            strat = strats[node]
+            q_shape = strat.strategies[0].input_specs[0].tensor_meta.shape
+            B, H = q_shape[0], q_shape[1]
+
+            # Find the [B, H] other_buffer and verify it's always Replicate.
+            for si, s in enumerate(strat.strategies):
+                for i, ispec in enumerate(s.input_specs):
+                    if ispec is None:
+                        continue
+                    if ispec.tensor_meta.shape == torch.Size([B, H]):
+                        assert all(p == Replicate() for p in ispec.placements), (
+                            f"Strategy {si}, other_buffer Input {i} "
+                            f"(shape [{B}, {H}]) should be Replicate "
+                            f"but got {ispec.placements}"
+                        )
