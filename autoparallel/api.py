@@ -503,18 +503,10 @@ class AutoParallel:
         from .graph_passes.extract_forward import extract_forward_graph
 
         fw_metadata = self.joint_with_descriptors._aot_state.fw_metadata
-        # num_forward_returns includes mutation outputs + user outputs +
-        # intermediate bases.  For now we only support the common case
-        # where there are no mutations or intermediate bases.
-        assert (
-            fw_metadata.num_mutated_inp_runtime_indices == 0
-        ), "Inference path does not support models with input mutations"
-        assert (
-            fw_metadata.num_intermediate_bases == 0
-        ), "Inference path does not support models with intermediate bases"
         num_fwd_outputs = fw_metadata.num_forward_returns
         fwd_only_gm = extract_forward_graph(self.parallel_gm, num_fwd_outputs)
         compiler_fn = self.compiler_fn
+        aot_config = self.joint_with_descriptors._aot_state.aot_config
         out_spec = self.joint_with_descriptors.out_spec
 
         _inference_fn_cache = None
@@ -528,13 +520,20 @@ class AutoParallel:
             ]
             compiled = compiler_fn(fwd_only_gm, example_inputs)
 
-            # compiler_fn returns a boxed callable (takes a list of args).
-            # The graph output is always a tuple; use out_spec to
-            # reconstruct the original model output structure.
+            # Wrap with RuntimeWrapper to handle mutation write-back
+            # (e.g. buffer updates like BatchNorm running stats), output
+            # alias handling, and intermediate base stripping.
+            from torch._functorch._aot_autograd.runtime_wrappers import RuntimeWrapper
+
+            wrapped = RuntimeWrapper(
+                indices_of_inps_to_detach=[],
+                trace_joint=False,
+                disable_amp=False,
+            ).post_compile(compiled, aot_config, runtime_metadata=fw_metadata)
+
             def inference_fn(args):
-                graph_out = compiled(args)
-                flat = list(graph_out)
-                return torch.utils._pytree.tree_unflatten(flat, out_spec)
+                flat_outs = wrapped(args)
+                return torch.utils._pytree.tree_unflatten(flat_outs, out_spec)
 
             _inference_fn_cache = inference_fn
             return _inference_fn_cache
