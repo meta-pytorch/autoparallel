@@ -2053,6 +2053,37 @@ class TestEnumerateStrategies(unittest.TestCase):
         for ins, out in strategies:
             self.assertIsNotNone(out)
 
+    def test_pointwise_no_redundant_replicate_shard(self):
+        """Same-shape pointwise: (R, S(0)) and (S(0), R) are filtered out."""
+        from autoparallel.shardings.cute import enumerate_shardings, enumerate_strategies
+        a_cands = enumerate_shardings((8, 8), (2,))
+        b_cands = enumerate_shardings((8, 8), (2,))
+        strategies = enumerate_strategies("aten.add.Tensor", [a_cands, b_cands])
+
+        # No strategy should mix R and S inputs on a same-size dim
+        for ins, out in strategies:
+            has_sharded = any(not i.is_replicate() for i in ins)
+            has_replicate = any(i.is_replicate() for i in ins)
+            self.assertFalse(
+                has_sharded and has_replicate,
+                f"Redundant mixed R/S strategy found: {[i.mesh_dim_map for i in ins]}"
+            )
+
+    def test_broadcast_replicate_shard_kept(self):
+        """Broadcast pointwise: (S(0), R) is kept when shapes differ on dim 0."""
+        from autoparallel.shardings.cute import enumerate_shardings, enumerate_strategies
+        a_cands = enumerate_shardings((8, 8), (2,))
+        b_cands = enumerate_shardings((1, 8), (2,))
+        strategies = enumerate_strategies("aten.add.Tensor", [a_cands, b_cands])
+
+        # Should have at least one mixed R/S strategy (broadcast on dim 0)
+        mixed = [
+            ins for ins, out in strategies
+            if any(not i.is_replicate() for i in ins) and any(i.is_replicate() for i in ins)
+        ]
+        self.assertGreater(len(mixed), 0,
+                           "Broadcast (S(0), R) strategy should be kept for different dim sizes")
+
 
 class TestShardingHints(unittest.TestCase):
     """Tests for op-specific sharding hints."""

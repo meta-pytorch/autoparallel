@@ -187,9 +187,49 @@ def enumerate_strategies(op_name, input_candidates, *op_args, **op_kwargs):
         except (TypeError, IndexError, AssertionError):
             continue
         if output is not None:
-            results.append((combo, output))
+            if not _has_redundant_replicate(combo):
+                results.append((combo, output))
 
     return results
+
+
+def _has_redundant_replicate(input_shardings):
+    """Check if input shardings have a redundant R/S mixture.
+
+    Returns True if some inputs are replicate and others are sharded on the
+    same tensor dim with the same global size — making this strategy
+    functionally equivalent to the all-sharded version (since R → S is free).
+
+    Does NOT flag broadcast cases (different global sizes on the dim).
+    """
+    if len(input_shardings) < 2:
+        return False
+
+    # For each tensor dim, collect which inputs are sharded and which are replicate
+    ndim = len(input_shardings[0].global_shape)
+    for d in range(ndim):
+        sharded_inputs = []
+        replicate_inputs = []
+        for inp in input_shardings:
+            if d >= len(inp.global_shape):
+                continue
+            mesh_dims = inp.mesh_dim_map.get(d, ())
+            if mesh_dims:
+                sharded_inputs.append(inp)
+            else:
+                replicate_inputs.append(inp)
+
+        if not sharded_inputs or not replicate_inputs:
+            continue
+
+        # Check if the replicate inputs have the same global size on this dim
+        # as the sharded inputs — if so, it's a redundant R/S mixture
+        sharded_size = sharded_inputs[0].global_shape[d]
+        for rep in replicate_inputs:
+            if rep.global_shape[d] == sharded_size:
+                return True  # redundant: same size, could be S instead of R
+
+    return False
 
 
 # =============================================================================
