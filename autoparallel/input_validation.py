@@ -42,7 +42,11 @@ def _compute_expected_inputs(traced_inputs, input_constraints, mesh):
 
 
 def _check_forward_args(args, expected_inputs):
-    """Validate that forward() args match the shapes/dtypes used during tracing."""
+    """Validate that forward() args match the shapes/dtypes used during tracing.
+
+    When dynamic shapes are enabled, dimensions that are SymInt in the expected
+    shape accept any size. Concrete dimensions are checked exactly.
+    """
     if len(args) != len(expected_inputs):
         raise ValueError(
             f"AutoParallel: expected {len(expected_inputs)} arguments "
@@ -55,11 +59,19 @@ def _check_forward_args(args, expected_inputs):
                     f"AutoParallel: argument {i} should be a Tensor "
                     f"but got {type(arg).__name__}"
                 )
-            if arg.shape != expected.shape:
+            if len(arg.shape) != len(expected.shape):
                 raise ValueError(
-                    f"AutoParallel: argument {i} has shape {tuple(arg.shape)} "
-                    f"but expected {tuple(expected.shape)}"
+                    f"AutoParallel: argument {i} has {len(arg.shape)} dims "
+                    f"but expected {len(expected.shape)} dims"
                 )
+            for dim, (actual, exp) in enumerate(zip(arg.shape, expected.shape)):
+                if isinstance(exp, torch.SymInt):
+                    continue
+                if actual != exp:
+                    raise ValueError(
+                        f"AutoParallel: argument {i} has shape {tuple(arg.shape)} "
+                        f"but expected {tuple(expected.shape)}"
+                    )
             if arg.dtype != expected.dtype:
                 raise ValueError(
                     f"AutoParallel: argument {i} has dtype {arg.dtype} "

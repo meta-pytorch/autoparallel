@@ -107,6 +107,53 @@ from .shardings.propagation_rules import _create_all_options
 logger = logging.getLogger(__name__)
 
 
+def _concretize_symint(val):
+    """Concretize a SymInt to a plain int, pass through other values."""
+    if isinstance(val, torch.SymInt):
+        return val.node.hint
+    return val
+
+
+def _produces_tensor(val):
+    """Check if a node's meta value represents tensor output(s)."""
+    if isinstance(val, torch.Tensor):
+        return True
+    if isinstance(val, (tuple, list)):
+        return any(_produces_tensor(v) for v in val)
+    return False
+
+
+def _concretize_args(args):
+    """Concretize all SymInts and symbolic FakeTensors in an args tree.
+
+    Returns an args tree where:
+    - SymInts are replaced with their concrete hint values
+    - FakeTensors with symbolic shapes are replaced with concrete FakeTensors
+    - Other values are left unchanged
+    """
+    from torch._subclasses.fake_tensor import FakeTensor
+
+    def concretize(x):
+        if isinstance(x, torch.SymInt):
+            return x.node.hint
+        if isinstance(x, FakeTensor) and any(
+            isinstance(s, torch.SymInt) for s in x.shape
+        ):
+            concrete_shape = [
+                s.node.hint if isinstance(s, torch.SymInt) else s for s in x.shape
+            ]
+            concrete_stride = [
+                s.node.hint if isinstance(s, torch.SymInt) else s for s in x.stride()
+            ]
+            with x.fake_mode:
+                return torch.empty_strided(
+                    concrete_shape, concrete_stride, dtype=x.dtype, device=x.device
+                )
+        return x
+
+    return tree_map_only((torch.SymInt, FakeTensor), concretize, args)
+
+
 @dataclass
 class DecisionVar:
     """A decision variable in the ILP, representing one (node, arg, output_placement,
@@ -142,13 +189,16 @@ class ShardingOptimizer:
     ):
         self.gm = gm
         self.graph = gm.graph
-        self.nodes = list(self.graph.nodes)
         self.mesh = mesh
         self.rescale_grad_comm_cost_for_mp = rescale_grad_comm_cost_for_mp
-        self.node_map = {node: i for i, node in enumerate(self.graph.nodes)}
         self._name_counters: dict[str, int] = {}
         t0 = time.perf_counter()
         self.strats = self.build_sharding_metadata()
+        # nodes/node_map are derived from strats (not graph.nodes) so that
+        # shape-computation nodes skipped by build_sharding_metadata don't
+        # appear and indices stay consistent.
+        self.nodes = list(self.strats.keys())
+        self.node_map = {node: i for i, node in enumerate(self.nodes)}
         logger.debug("Placement options took %.3fs", time.perf_counter() - t0)
         from autoparallel.shardings.placement_options import get_placement_options_timer
 
@@ -199,15 +249,20 @@ class ShardingOptimizer:
                     self.mesh, node.meta["val"].shape, tensor=node.meta["val"]
                 )
             elif node.op == "call_function":
-                # TODO: kwargs?
+                if not _produces_tensor(node.meta["val"]):
+                    # Shape-computation nodes (sym_size, operator.mul, etc.)
+                    # produce scalars, not tensors — skip sharding.
+                    continue
                 user_strats = tree_map_only(
-                    torch.fx.Node, lambda x: strats[x], node.args
+                    torch.fx.Node,
+                    lambda x: strats.get(x, _concretize_symint(x.meta["val"])),
+                    node.args,
                 )
-                user_args = tree_map_only(
-                    torch.fx.Node, lambda x: x.meta["val"], node.args
+                user_args = _concretize_args(
+                    tree_map_only(torch.fx.Node, lambda x: x.meta["val"], node.args)
                 )
-                user_kwargs = tree_map_only(
-                    torch.fx.Node, lambda x: x.meta["val"], node.kwargs
+                user_kwargs = _concretize_args(
+                    tree_map_only(torch.fx.Node, lambda x: x.meta["val"], node.kwargs)
                 )
                 strats[node] = get_placement_options_for_node(
                     self.mesh, node, user_strats, user_args, user_kwargs
@@ -246,9 +301,12 @@ class ShardingOptimizer:
                         )
 
     def _all_input_nodes(self, node):
-        """Variant of node.all_input_nodes that preserves duplicate nodes."""
-        # TODO: add kwargs?
-        return all_input_nodes(node)
+        """Variant of node.all_input_nodes that preserves duplicate nodes.
+
+        Filters out nodes not in self.strats (e.g., shape-computation nodes
+        like sym_size / operator.mul that produce scalars, not tensors).
+        """
+        return [n for n in all_input_nodes(node) if n in self.strats]
 
     def walk_over_options(self, node, constrain_arg=None):
         """Yield (argi, out_idx, inp_idx) for all valid strategy combinations."""
@@ -482,6 +540,8 @@ class ShardingOptimizer:
         for node in self.graph.nodes:
             if node.op != "call_function":
                 continue
+            if node not in self.strats:
+                continue
             strat = self.strats[node]
             strat0 = strat.strategies[0]
             all_input_nodes = self._all_input_nodes(node)
@@ -515,9 +575,12 @@ class ShardingOptimizer:
 
         ∀i,a: Σ_{o,j} x_{i,a,o,j} = 1
         """
-        for node_idx, node in enumerate(self.graph.nodes):
+        for node in self.graph.nodes:
             if node.op not in {"placeholder", "call_function", "get_attr"}:
                 continue
+            if node not in self.node_map:
+                continue
+            node_idx = self.node_map[node]
             if node_idx in self._cluster_linked_node_idxs:
                 continue
             arg_vars = {}
@@ -537,9 +600,12 @@ class ShardingOptimizer:
 
         ∀i,o: Σ_j x_{i,0,o,j} = Σ_j x_{i,1,o,j} = ... = Σ_j x_{i,A_i-1,o,j}
         """
-        for node_idx, node in enumerate(self.graph.nodes):
+        for node in self.graph.nodes:
             if node.op != "call_function":
                 continue
+            if node not in self.node_map:
+                continue
+            node_idx = self.node_map[node]
             if node_idx in self._cluster_linked_node_idxs:
                 continue
             if len(self._all_input_nodes(node)) <= 1:
@@ -567,21 +633,28 @@ class ShardingOptimizer:
 
         ∀(i→k): Σ_j x_{i,0,o,j} = Σ_j x_{k,a,j,o}
         """
-        for node_idx, node in enumerate(self.graph.nodes):
+        for node in self.graph.nodes:
             if node.op == "output":
                 continue
+            if node not in self.node_map:
+                continue
+            node_idx = self.node_map[node]
             producer_is_linked = node_idx in self._cluster_linked_node_idxs
             # All args agree on the same output (ensured by consistency constraint),
             # so we use arg 0 for the producer side.
             for user in node.users:
                 if user.op == "output":
                     continue
+                if user not in self.node_map:
+                    continue
                 user_idx = self.node_map[user]
                 # Skip edges where both endpoints are cluster-linked;
                 # the root-to-root edge already covers this.
                 if producer_is_linked and user_idx in self._cluster_linked_node_idxs:
                     continue
-                user_argi = [i for i, n in enumerate(user.all_input_nodes) if n == node]
+                user_argi = [
+                    i for i, n in enumerate(self._all_input_nodes(user)) if n == node
+                ]
                 assert len(user_argi) == 1
                 user_argi = user_argi[0]
 
