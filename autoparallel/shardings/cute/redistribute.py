@@ -111,16 +111,17 @@ def _get_mesh_dim_size(sharded, mesh_dim):
     return None
 
 
-def _build_rank_to_chunk(sharded, tensor_dim, mesh_dims, mesh_shape):
-    """Build a CuTe Layout mapping rank -> chunk index for coupled mesh dims.
+def _build_rank_to_chunk(sharded, tensor_dim, mesh_dims, mesh_shape=None):
+    """Build a CuTe Layout mapping rank -> chunk index.
 
     For a tensor dim with sub-dim (local, mesh0, mesh1, ...):
     - chunk_stride_i = sub_stride[mesh_pos_i] // (local_size * local_stride)
+    - Mesh sizes derived from the sub-dim structure directly.
     - Shape is reversed (M_last, ..., M_first) so CuTe's col-major matches
       mesh's row-major rank indexing.
 
-    For non-integer local strides (XorStride), uses mesh strides directly
-    divided by the smallest mesh stride as the chunk unit.
+    For non-integer local strides (XorStride), mesh strides are used directly
+    as chunk strides (divisor=1).
 
     Args:
         sharded: ShardedLayout
@@ -153,17 +154,22 @@ def _build_rank_to_chunk(sharded, tensor_dim, mesh_dims, mesh_shape):
                 divisor = 1
 
             chunk_strides = {}
+            mesh_sizes = {}  # md -> mesh size from sub-dim
             total_chunks = 1
+            n_mesh_parts = len(mesh_parts_s) if is_tuple(mesh_parts_s) else 1
             for i, md in enumerate(mesh_dims):
+                if i >= n_mesh_parts:
+                    return None, None  # more mesh dims than sub-dim mesh factors
                 st = mesh_parts_st[i]
                 if isinstance(st, int):
                     chunk_strides[md] = st // divisor if divisor > 1 else st
                 else:
                     chunk_strides[md] = st  # keep ModStride/XorStride as-is
+                mesh_sizes[md] = mesh_parts_s[i]
                 total_chunks *= mesh_parts_s[i]
 
             all_mds = sorted(chunk_strides.keys())
-            rev_shape = tuple(mesh_shape[md] for md in reversed(all_mds))
+            rev_shape = tuple(mesh_sizes[md] for md in reversed(all_mds))
             rev_strides = tuple(chunk_strides[md] for md in reversed(all_mds))
 
             if len(rev_shape) == 1:

@@ -13,6 +13,7 @@ mesh_dim_map: always has an entry for every tensor dim.
 CuTe is used for: representation (hierarchical layouts), construction (logical_divide).
 """
 
+import torch
 from ._pycute import Layout, is_tuple, logical_divide, product
 
 
@@ -124,6 +125,21 @@ def _global_shape(hier_layout):
 
 _SIZE_1_MODE = ((1, 1),)
 _SIZE_1_STRIDE = ((0, 0),)
+
+
+class _TensorMeta:
+    """Minimal TensorMeta-compatible object for ShardedLayout."""
+    __slots__ = ['shape', 'stride', 'dtype']
+    def __init__(self, shape):
+        self.shape = torch.Size(shape)
+        strides = []
+        acc = 1
+        for s in reversed(shape):
+            strides.append(acc)
+            acc *= s
+        strides.reverse()
+        self.stride = tuple(strides)
+        self.dtype = torch.float32
 
 
 class ShardedLayout:
@@ -302,6 +318,34 @@ class ShardedLayout:
                 mesh_size = g // l
                 placements.append(("shard", i, mesh_size, self.mesh_dim_map[i]))
         return placements or [("replicate", None, None)]
+
+    @property
+    def placements(self):
+        """DTensorSpec-compatible placements for optimizer constraint matching."""
+        from torch.distributed.tensor.placement_types import Replicate, Shard, Partial
+        # Build one placement per mesh dim
+        # Invert mesh_dim_map: mesh_dim -> (tensor_dim, ...)
+        max_mesh_dim = -1
+        mesh_to_tensor = {}
+        for td, mds in self.mesh_dim_map.items():
+            for md in mds:
+                mesh_to_tensor[md] = td
+                if md > max_mesh_dim:
+                    max_mesh_dim = md
+        result = []
+        for md in range(max_mesh_dim + 1):
+            if md in self.partial:
+                result.append(Partial(self.partial[md]))
+            elif md in mesh_to_tensor:
+                result.append(Shard(mesh_to_tensor[md]))
+            else:
+                result.append(Replicate())
+        return tuple(result) if result else (Replicate(),)
+
+    @property
+    def tensor_meta(self):
+        """DTensorSpec-compatible tensor_meta for cost model compatibility."""
+        return _TensorMeta(self.global_shape)
 
     def with_offset(self, offsets):
         """Return a new ShardedLayout with the given offsets added.

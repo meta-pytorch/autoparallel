@@ -393,16 +393,29 @@ class AutoParallel:
             if mesh.ndim != 1:
                 mesh._flatten()
         with self.fake_mode:
-            (
-                parallel_gm,
-                sharded_param_dict,
-                sharded_buffer_dict,
-            ) = apply_sharding_to_model(
-                self.gm,
-                sharding_placement,
-                self.joint_with_descriptors.params_spec,
-                self.joint_with_descriptors.buffers_spec,
-            )
+            if self.backend is not None and hasattr(self.backend, 'apply_solution'):
+                (
+                    parallel_gm,
+                    sharded_param_dict,
+                    sharded_buffer_dict,
+                ) = self.backend.apply_solution(
+                    self.gm,
+                    sharding_placement,
+                    mesh,
+                    params_spec=self.joint_with_descriptors.params_spec,
+                    buffers_spec=self.joint_with_descriptors.buffers_spec,
+                )
+            else:
+                (
+                    parallel_gm,
+                    sharded_param_dict,
+                    sharded_buffer_dict,
+                ) = apply_sharding_to_model(
+                    self.gm,
+                    sharding_placement,
+                    self.joint_with_descriptors.params_spec,
+                    self.joint_with_descriptors.buffers_spec,
+                )
         t_apply = time.perf_counter()
         # clean it up by removing the added aliases from previous pass
         # as well as redundant views

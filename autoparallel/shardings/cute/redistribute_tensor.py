@@ -162,6 +162,21 @@ def redistribute_tensor(
     """
     collectives = plan_redistribute(source_layout, target_layout)
     if not collectives:
+        # No collectives needed, but may need local slice for R→S transitions.
+        # If the target has smaller local sizes (sharded) than the source
+        # (replicated), each rank takes its shard via narrow.
+        if source_layout.local_sizes != target_layout.local_sizes:
+            tensor = local_tensor
+            for dim in range(len(target_layout.local_sizes)):
+                src_local = source_layout.local_sizes[dim]
+                tgt_local = target_layout.local_sizes[dim]
+                if tgt_local < src_local:
+                    mesh_dims = target_layout.mesh_dim_map.get(dim, ())
+                    if mesh_dims:
+                        md = mesh_dims[0]
+                        coord = mesh.get_local_rank(md)
+                        tensor = tensor.narrow(dim, coord * tgt_local, tgt_local)
+            return tensor
         return local_tensor
 
     tensor = local_tensor

@@ -41,6 +41,8 @@ from .propagation import (
     propagate_repeat,
     propagate_replicate_affected,
     propagate_scatter,
+    propagate_sdpa,
+    propagate_sdpa_backward,
     propagate_slice,
     propagate_sort,
     propagate_split,

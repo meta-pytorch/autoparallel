@@ -696,6 +696,7 @@ def propagate_pointwise(all_shardeds, linearity=None):
 
 
 def propagate_view(sharded, new_shape):
+    new_shape = tuple(new_shape) if isinstance(new_shape, list) else new_shape
     if product(sharded.global_shape) != product(new_shape):
         return None
 
@@ -927,9 +928,9 @@ def propagate_cat(shardeds, dim):
 # =============================================================================
 
 
-def propagate_identity(sharded):
+def propagate_identity(sharded, *args, **kwargs):
     """Identity: all dims carried through (clone, contiguous, detach, etc.).
-    Partial passes through (unary linear)."""
+    Partial passes through (unary linear). Extra args ignored."""
     ndim = len(sharded.global_shape)
     recipe = [Carry([(0, i)]) for i in range(ndim)]
     return propagate(recipe, [], [sharded])
@@ -1336,4 +1337,104 @@ def propagate_dropout(sharded):
     if sharded.partial:
         return None
     return propagate_identity(sharded)
+
+
+# =============================================================================
+# Scaled dot-product attention (SDPA)
+# Only batch (dim 0) and heads (dim 1) can be sharded.
+# seq_len (dim 2) and head_dim (dim 3) participate in the attention reduction.
+# =============================================================================
+
+
+def propagate_sdpa(*args, **kwargs):
+    """SDPA forward: Q, K, V have shape (batch, heads, seq_len, head_dim).
+
+    Only batch (dim 0) and heads (dim 1) can be sharded — seq_len and head_dim
+    participate in the attention reduction and must be replicate.
+    All tensor inputs must agree on sharding for dims 0 and 1.
+    """
+    from .placement import ShardedLayout
+
+    tensor_args = [a for a in args if isinstance(a, ShardedLayout)]
+    if not tensor_args:
+        return None
+
+    q = tensor_args[0]
+    ndim = len(q.global_shape)
+    if ndim < 4:
+        return None
+
+    # Reject if dims 2+ (seq_len, head_dim) are sharded on any input
+    for inp in tensor_args:
+        for d in range(2, len(inp.global_shape)):
+            if inp.mesh_dim_map.get(d, ()):
+                return None
+
+    # Carry dims 0 (batch) and 1 (heads) from all inputs,
+    # carry dims 2+ from Q only (they're all replicate)
+    recipe = []
+    for d in range(ndim):
+        if d < 2:
+            recipe.append(Carry([(i, d) for i in range(len(tensor_args))]))
+        else:
+            recipe.append(Carry([(0, d)]))
+
+    result = propagate(recipe, [], tensor_args)
+    if result is None:
+        return None
+    # SDPA forward returns: (output, logsumexp, cum_seq_q, cum_seq_k, max_q, max_k,
+    # rng_state, unused, debug_attn_mask).
+    # output and logsumexp inherit sharding (both are per-batch, per-head).
+    # Other outputs are None (scalars/unused) or replicate.
+    return (result, result, None, None, None, None, None, None, None)
+
+
+def propagate_sdpa_backward(*args, **kwargs):
+    """SDPA backward: same sharding constraints as forward.
+
+    Inputs: grad_output, q, k, v, output, logsumexp, ...
+    All 4D tensor inputs must agree on batch/heads sharding.
+    Output: (grad_q, grad_k, grad_v) — all inherit the same sharding.
+    """
+    from .placement import ShardedLayout
+
+    tensor_args = [a for a in args if isinstance(a, ShardedLayout)]
+    if not tensor_args:
+        return None
+
+    # Extract only 4D tensor args for the recipe
+    args_4d = []
+    for inp in tensor_args:
+        try:
+            shape = inp.hier_layout.shape
+            ndim = len(shape) if is_tuple(shape) else 1
+            if ndim >= 4:
+                args_4d.append(inp)
+        except Exception:
+            continue
+
+    if not args_4d:
+        return None
+
+    ndim = len(args_4d[0].hier_layout.shape) if is_tuple(args_4d[0].hier_layout.shape) else 1
+
+    # Reject if dims 2+ are sharded on any 4D input
+    for inp in args_4d:
+        for d in range(2, ndim):
+            if inp.mesh_dim_map.get(d, ()):
+                return None
+
+    # Carry batch/heads from all 4D inputs, replicate seq/head_dim
+    recipe = []
+    for d in range(ndim):
+        if d < 2:
+            recipe.append(Carry([(i, d) for i in range(len(args_4d))]))
+        else:
+            recipe.append(Carry([(0, d)]))
+
+    result = propagate(recipe, [], args_4d)
+    if result is None:
+        return None
+    # SDPA backward returns (grad_q, grad_k, grad_v) — all same sharding.
+    return (result, result, result)
 

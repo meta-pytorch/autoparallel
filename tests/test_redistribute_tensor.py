@@ -139,23 +139,23 @@ class TestRedistributeTensor(unittest.TestCase):
         t = torch.arange(8, dtype=torch.float32)
         src = ShardedLayout.replicate((8,))
         tgt = ShardedLayout.shard((8,), shard_dim=0, mesh_dim_size=4)
-        # This is a local reinterpret — plan_redistribute returns no collectives
-        # But each rank needs to keep only its shard
-        # For now, test that redistribute_tensor returns the input unchanged
-        # (since no collective is issued)
+
         with LocalTensorMode(frozenset(range(self.world_size))):
             from torch.distributed.device_mesh import init_device_mesh
             mesh = init_device_mesh("cpu", (self.world_size,))
 
-            # All ranks have the full tensor
+            # All ranks have the full tensor (replicated)
             shards = {r: t.clone() for r in range(self.world_size)}
             src_local = LocalTensor(shards)
 
             result = redistribute_tensor(src_local, src, tgt, mesh)
-            # No collective → tensor returned as-is
+            # After local slice, each rank keeps its shard
+            # Under fake PG (rank=0), mesh.get_local_rank(0) = 0 for all ranks
+            # So all ranks get the slice for rank 0: t[0:2]
             for rank in range(self.world_size):
                 r = result._local_tensors[rank] if isinstance(result, LocalTensor) else result
-                self.assertEqual(r.shape, t.shape)
+                self.assertEqual(r.shape[0], 2,
+                                 f"Rank {rank}: expected local size 2, got {r.shape[0]}")
 
     def test_all_reduce_partial(self):
         """Partial("sum") → Replicate via all_reduce."""

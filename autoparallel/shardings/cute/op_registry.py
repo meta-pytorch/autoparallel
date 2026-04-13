@@ -10,6 +10,8 @@ map to propagate_pointwise, all reduction variants map to propagate_reduction).
 """
 
 from .propagation import (
+    Carry,
+    propagate,
     propagate_addmm,
     propagate_argmax,
     propagate_baddbmm,
@@ -35,6 +37,8 @@ from .propagation import (
     propagate_repeat,
     propagate_replicate_affected,
     propagate_scatter,
+    propagate_sdpa,
+    propagate_sdpa_backward,
     propagate_slice,
     propagate_sort,
     propagate_split,
@@ -71,7 +75,9 @@ _IDENTITY_OPS = [
     "aten.view.dtype",
     "aten.zero_.default",
     "aten.zeros_like.default",
+    "prims.convert_element_type.default",
     "prims.view_of.default",
+    "autoparallel.dtype_cast.default",
 ]
 
 # Pointwise ops: broadcast-compatible Carry across inputs
@@ -502,6 +508,21 @@ OP_REGISTRY.update({
     # Convolution
     "aten.convolution.default": propagate_convolution,
 })
+
+
+for _sdpa_op in [
+    "aten._scaled_dot_product_flash_attention.default",
+    "aten._scaled_dot_product_efficient_attention.default",
+    "aten._scaled_dot_product_cudnn_attention.default",
+]:
+    OP_REGISTRY[_sdpa_op] = propagate_sdpa
+
+for _sdpa_bw_op in [
+    "aten._scaled_dot_product_flash_attention_backward.default",
+    "aten._scaled_dot_product_efficient_attention_backward.default",
+    "aten._scaled_dot_product_cudnn_attention_backward.default",
+]:
+    OP_REGISTRY[_sdpa_bw_op] = propagate_sdpa_backward
 
 
 def get_propagation_rule(op_name):

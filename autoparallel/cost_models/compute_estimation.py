@@ -279,6 +279,18 @@ def _get_device_gmem_bandwidth():
 
 
 def _get_sharded_shape_stride(spec):
+    # ShardedLayout: local_sizes IS the sharded shape
+    if hasattr(spec, 'local_sizes'):
+        local = list(spec.local_sizes)
+        # Compute row-major strides
+        strides = []
+        acc = 1
+        for s in reversed(local):
+            strides.append(acc)
+            acc *= s
+        strides.reverse()
+        return local, strides
+
     mesh = spec.mesh
     tensor_shape = spec.tensor_meta.shape
     # TODO: take dtype into account as well
@@ -429,6 +441,9 @@ def estimate_strategy_runtime_cost(node, strategy):
 
     cache_key = None
     if strategy is not None:
+        # Skip cost estimation for non-DTensorSpec strategies (e.g., ShardedLayout)
+        if strategy.input_specs and not hasattr(strategy.input_specs[0], 'mesh'):
+            return 0
         input_specs_key = tuple(
             (s.placements, s.tensor_meta) for s in strategy.input_specs
         )

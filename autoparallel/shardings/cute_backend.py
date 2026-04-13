@@ -8,6 +8,7 @@ non-contiguous) that DTensor cannot represent.
 
 from __future__ import annotations
 
+import logging
 import operator
 from typing import Any
 
@@ -16,7 +17,9 @@ import torch.fx.traceback as fx_traceback
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.utils._pytree import tree_flatten
 
-from .backend import OpOption, ShardingBackend
+from .backend import OpOption, OpOptionList, ShardingBackend
+
+logger = logging.getLogger(__name__)
 from .cute import (
     ShardedLayout,
     enumerate_shardings,
@@ -45,24 +48,34 @@ class CuTeBackend:
         """
         # Get the ATen op name from the FX node
         op_name = _get_op_name(node)
+
+        # Handle getitem: inherit specs from producer's tuple output
+        if node.target == operator.getitem:
+            return self._handle_getitem(node, input_options)
+
         if op_name is None:
-            return []
+            return self._replicate_fallback(node, input_options)
 
         fn = get_propagation_rule(op_name)
         if fn is None:
-            return []
+            return self._replicate_fallback(node, input_options, op_name)
 
         mesh_shape = _get_mesh_shape(mesh)
 
-        # Extract ShardedLayout candidates per input
+        # Extract ShardedLayout candidates per input (skip non-OpOptionList entries)
         input_candidates = []
         for opts in input_options:
+            if not isinstance(opts, OpOptionList):
+                continue
             candidates = [opt.output_spec for opt in opts
                           if isinstance(opt.output_spec, ShardedLayout)]
             input_candidates.append(candidates)
 
-        if not input_candidates or any(len(c) == 0 for c in input_candidates):
-            return []
+        if not input_candidates or (not any(len(c) > 0 for c in input_candidates)):
+            logger.debug("Node %s (%s): no non-empty input_candidates (n=%d, lengths=%s), falling back",
+                         node.name, op_name, len(input_candidates),
+                         [len(c) for c in input_candidates])
+            return self._replicate_fallback(node, input_options, op_name)
 
         # Extract non-tensor args from user_args/user_kwargs
         # The propagation function expects ATen-matching args:
@@ -70,10 +83,59 @@ class CuTeBackend:
         tensor_arg_indices = _get_tensor_arg_indices(node, user_args)
         non_tensor_args = _extract_non_tensor_args(user_args, tensor_arg_indices)
 
-        # Run enumerate_strategies with non-tensor args
-        strategies = enumerate_strategies(
-            op_name, input_candidates, *non_tensor_args, **user_kwargs
-        )
+        # Run enumerate_strategies with non-tensor args.
+        # For multi-input ops like SDPA, the Cartesian product of all input
+        # candidates can be huge (21^8 ≈ 38B for SDPA backward on a 2D mesh).
+        # Use single-input enumeration for ops where all inputs must match.
+        _SDPA_OPS = {
+            "aten._scaled_dot_product_flash_attention.default",
+            "aten._scaled_dot_product_efficient_attention.default",
+            "aten._scaled_dot_product_cudnn_attention.default",
+            "aten._scaled_dot_product_flash_attention_backward.default",
+            "aten._scaled_dot_product_efficient_attention_backward.default",
+            "aten._scaled_dot_product_cudnn_attention_backward.default",
+        }
+        if op_name in _SDPA_OPS and input_candidates:
+            # SDPA: enumerate only with compatible input shapes.
+            # All 4D inputs must have the same sharding; non-4D inputs get replicate.
+            # Use first 4D input's candidates as the enumeration source.
+            strategies = []
+            first_4d_idx = None
+            for ci, cands in enumerate(input_candidates):
+                if cands and len(cands[0].global_shape) >= 4:
+                    first_4d_idx = ci
+                    break
+
+            if first_4d_idx is not None:
+                for sl in input_candidates[first_4d_idx]:
+                    combo = []
+                    for cands in input_candidates:
+                        if not cands:
+                            # Empty candidates (non-tensor input with None specs)
+                            # Use a dummy replicate spec with shape (1,)
+                            combo.append(ShardedLayout.replicate((1,)))
+                        elif len(cands[0].global_shape) == len(sl.global_shape):
+                            combo.append(sl)
+                        else:
+                            # Different ndim — use replicate for this input
+                            combo.append(ShardedLayout.replicate(cands[0].global_shape))
+                    combo = tuple(combo)
+                    try:
+                        output = fn(*list(combo) + list(non_tensor_args), **user_kwargs)
+                    except Exception as e:
+                        logger.debug("SDPA %s: candidate failed: %s", op_name, e)
+                        continue
+                    if output is not None:
+                        strategies.append((combo, output))
+            if not strategies:
+                logger.debug("SDPA %s: all candidates failed. first_4d_idx=%s, n_inputs=%d, "
+                             "candidate_shapes=%s",
+                             op_name, first_4d_idx, len(input_candidates),
+                             [len(c[0].global_shape) if c else 'empty' for c in input_candidates])
+        else:
+            strategies = enumerate_strategies(
+                op_name, input_candidates, *non_tensor_args, **user_kwargs
+            )
 
         # Convert to OpOption with costs
         results = []
@@ -104,7 +166,88 @@ class CuTeBackend:
                 redistribute_costs=redist_costs,
             ))
 
-        return results
+        return results if results else self._replicate_fallback(node, input_options, op_name)
+
+    def _handle_getitem(self, node, input_options):
+        """Handle operator.getitem: inherit specs from producer's tuple output."""
+        # node.args = (producer_node, index)
+        # input_options has the producer's OpOptionList at position 0
+        idx = node.args[1]
+        producer_opts = None
+        for opts in input_options:
+            if isinstance(opts, OpOptionList) and len(opts) > 0:
+                producer_opts = opts
+                break
+
+        if producer_opts is None:
+            logger.debug("getitem %s: no non-empty OpOptionList in input_options (types: %s, lengths: %s)",
+                         node.name,
+                         [type(x).__name__ for x in input_options],
+                         [len(x) if isinstance(x, (list, OpOptionList)) else 'N/A' for x in input_options])
+            return self._replicate_fallback(node, input_options)
+
+        results = []
+        for i, opt in enumerate(producer_opts):
+            out_spec = opt.output_spec
+            # If producer output is a tuple of specs, extract the indexed one
+            if isinstance(out_spec, (tuple, list)):
+                out_spec = out_spec[idx] if idx < len(out_spec) else None
+            results.append(OpOption(
+                output_spec=out_spec,
+                input_specs=(opt.output_spec,),
+                compute_cost=0.0,
+                comm_cost=0.0,
+                redistribute_costs=[[0.0] * len(producer_opts)],
+            ))
+        return results if results else self._replicate_fallback(node, input_options)
+
+    def _replicate_fallback(self, node, input_options, op_name=None):
+        """Fallback: all inputs and output replicate. Always valid."""
+        if op_name:
+            logger.warning("No CuTe propagation rule for %s — falling back to replicate", op_name)
+        else:
+            logger.warning("No CuTe propagation rule for node %s — falling back to replicate", node.name)
+        tensor = node.meta.get("val")
+        if tensor is None:
+            return []
+
+        # Handle tuple outputs (e.g., SDPA returns (output, logsumexp, ...))
+        if isinstance(tensor, (tuple, list)):
+            out_specs = []
+            for t in tensor:
+                if t is not None and hasattr(t, 'shape'):
+                    out_specs.append(ShardedLayout.replicate(tuple(t.shape)))
+                else:
+                    out_specs.append(None)
+            out_spec = tuple(out_specs)
+        elif hasattr(tensor, 'shape'):
+            out_spec = ShardedLayout.replicate(tuple(tensor.shape))
+        else:
+            return []
+
+        # Build replicate input specs — only process OpOptionList entries
+        rep_inputs = []
+        redist_costs = []
+        for opts in input_options:
+            if isinstance(opts, OpOptionList) and opts and hasattr(opts[0], 'output_spec'):
+                first = opts[0]
+                first_spec = first.output_spec
+                if hasattr(first_spec, 'global_shape'):
+                    rep_inputs.append(ShardedLayout.replicate(first_spec.global_shape))
+                elif isinstance(first_spec, (tuple, list)):
+                    # Producer has tuple output — pass through as-is for getitem
+                    rep_inputs.append(first_spec)
+                else:
+                    rep_inputs.append(out_spec)
+                redist_costs.append([0.0] * len(opts))
+
+        return [OpOption(
+            output_spec=out_spec,
+            input_specs=tuple(rep_inputs),
+            compute_cost=0.0,
+            comm_cost=0.0,
+            redistribute_costs=redist_costs,
+        )]
 
     def create_all_options(
         self,
@@ -118,13 +261,21 @@ class CuTeBackend:
         shardings = enumerate_shardings(tensor_shape, mesh_shape)
 
         # Add op-specific hints if available (merged at strategy enumeration time)
+        # redistribute_costs: one list per input arg, one cost per source option.
+        # For placeholders, there's one "input" (self) and N options.
+        # Cost from option i to option j: 0 if same, redistribute_cost otherwise.
+        n = len(shardings)
         return [
             OpOption(
                 output_spec=sl,
                 input_specs=(sl,),
                 compute_cost=0.0,
                 comm_cost=0.0,
-                redistribute_costs=[],
+                redistribute_costs=[[
+                    0.0 if sl == shardings[j]
+                    else self.redistribute_cost(shardings[j], sl, mesh)
+                    for j in range(n)
+                ]],
             )
             for sl in shardings
         ]
@@ -156,7 +307,15 @@ class CuTeBackend:
         tensor_bytes = tensor_elements * bytes_per_element
 
         for coll_type, mesh_dim, info in collectives:
-            mesh_dim_size = mesh_shape[mesh_dim] if mesh_dim < len(mesh_shape) else 1
+            if mesh_dim is None:
+                # Global collective across all mesh dims
+                mesh_dim_size = 1
+                for s in mesh_shape:
+                    mesh_dim_size *= s
+            elif isinstance(mesh_dim, int) and mesh_dim < len(mesh_shape):
+                mesh_dim_size = mesh_shape[mesh_dim]
+            else:
+                mesh_dim_size = 1
             if coll_type == "all_gather":
                 # Each device sends its shard to all others
                 total_cost += tensor_bytes * (mesh_dim_size - 1) / mesh_dim_size
@@ -199,8 +358,8 @@ class CuTeBackend:
         # Convert solution to DTensorSpec for parameter sharding
         dtensor_solution = _convert_solution_to_dtensor(solution, mesh)
 
-        # Create local args from placeholder nodes
-        local_args = _create_local_args(gm, solution)
+        # Create local args from placeholder nodes via DTensor sharding
+        local_args = _create_local_args(gm, solution, dtensor_solution, mesh)
 
         # Interpret graph with collective insertion
         from .cute.redistribute_tensor import redistribute_tensor
@@ -241,13 +400,19 @@ class CuTeBackend:
 
 
 def _get_op_name(node) -> str | None:
-    """Extract the ATen op name string from an FX node."""
+    """Extract the ATen op name string from an FX node.
+
+    Returns the dotted format "aten.mm.default" that matches op_registry keys.
+    """
     if node.op != "call_function":
         return None
     target = node.target
-    if hasattr(target, "name"):
-        # torch.ops.aten.mm.default -> "aten.mm.default"
-        return target.name()
+    # OpOverload: torch.ops.aten.mm.default -> "aten.mm.default"
+    if isinstance(target, torch._ops.OpOverload):
+        ns = target.namespace
+        op_name = target._schema.name.split("::")[-1]
+        overload = target._overloadname
+        return f"{ns}.{op_name}.{overload}"
     if hasattr(target, "__name__"):
         return target.__name__
     return str(target)
@@ -355,6 +520,22 @@ class _CuTeApplyShardingInterpreter(torch.fx.Interpreter):
                         val[dim] = local_sizes[dim]
                 new_args[0] = tuple(val)
 
+        # Adjust shape for view/reshape ops: convert global shape to local shape
+        _VIEW_TARGETS = {
+            torch.ops.aten.view.default,
+            torch.ops.aten.reshape.default,
+            torch.ops.aten._unsafe_view.default,
+            torch.ops.aten.view_copy.default,
+        }
+        if target in _VIEW_TARGETS:
+            out_spec = node_opt.output_spec
+            if isinstance(out_spec, ShardedLayout):
+                local_sizes = out_spec.local_sizes
+                new_args[1] = list(local_sizes)
+            elif isinstance(out_spec, (tuple, list)):
+                # Tuple output (shouldn't happen for view, but be safe)
+                pass
+
         return super().call_function(target, tuple(new_args), kwargs)
 
     def _handle_getitem(self, target, args, kwargs):
@@ -385,20 +566,33 @@ class _CuTeApplyShardingInterpreter(torch.fx.Interpreter):
         return super().call_function(target, args, kwargs)
 
 
-def _create_local_args(gm, solution):
-    """Create local tensor args for placeholder nodes based on ShardedLayout specs."""
+def _create_local_args(gm, solution, dtensor_solution, mesh):
+    """Create local tensor args for placeholder nodes.
+
+    Uses DTensor's shard_placeholder_inputs when dtensor_solution is available,
+    falls back to raw tensor creation for empty solutions.
+    """
+    if dtensor_solution:
+        from ..apply_sharding import shard_placeholder_inputs
+        try:
+            sharded = shard_placeholder_inputs(gm, dtensor_solution)
+            return [arg.to_local() for arg in sharded]
+        except (KeyError, AttributeError) as e:
+            import logging
+            logging.getLogger(__name__).warning("shard_placeholder_inputs failed: %s, falling back", e)
+
+    # Fallback: create meta tensors with local shapes
     local_args = []
     for node in gm.graph.find_nodes(op="placeholder"):
         tensor = node.meta["val"]
+        device = tensor.device if hasattr(tensor, 'device') else "meta"
         if node in solution:
             spec = solution[node].output_spec
             if isinstance(spec, ShardedLayout):
-                local_shape = spec.local_sizes
-                local_t = torch.randn(local_shape, dtype=tensor.dtype, device="meta")
+                local_t = torch.randn(spec.local_sizes, dtype=tensor.dtype, device=device)
                 local_args.append(local_t)
                 continue
-        # Replicate or not in solution — use original shape
-        local_args.append(torch.randn(tensor.shape, dtype=tensor.dtype, device="meta"))
+        local_args.append(torch.randn(tensor.shape, dtype=tensor.dtype, device=device))
     return local_args
 
 
@@ -428,7 +622,20 @@ def _sharded_layout_to_dtensor_spec(sl, mesh):
             else:
                 placements.append(Replicate())
 
-    return DTensorSpec(mesh, tuple(placements))
+    spec = DTensorSpec(mesh, tuple(placements))
+    # Set tensor_meta for compatibility with _shard_params_and_buffers
+    if hasattr(sl, 'global_shape'):
+        from torch.distributed.tensor._dtensor_spec import TensorMeta
+        shape = torch.Size(sl.global_shape)
+        # Row-major strides
+        strides = []
+        acc = 1
+        for s in reversed(sl.global_shape):
+            strides.append(acc)
+            acc *= s
+        strides.reverse()
+        spec.tensor_meta = TensorMeta(shape=shape, stride=tuple(strides), dtype=torch.float32)
+    return spec
 
 
 def _convert_solution_to_dtensor(solution, mesh):

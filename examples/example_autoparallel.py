@@ -81,7 +81,7 @@ class Block(nn.Module):
 
 
 world_size = 256
-use_cute_backend = False
+use_cute_backend = True # False
 
 fake_store = FakeStore()
 torch.distributed.init_process_group(
@@ -128,7 +128,7 @@ if use_cute_backend:
     from autoparallel.shardings.cute_backend import CuTeBackend
     backend = CuTeBackend()
 
-with AutoParallel(model, input_fn, mesh, mp_policy, compile=True, backend=backend) as autop:
+with AutoParallel(model, input_fn, mesh, mp_policy, compile=False, backend=backend) as autop:
     autop.add_parameter_memory_constraint(low=None, high=None)
 
     x_sharding = (Shard(0),) + (Replicate(),) * (mesh.ndim - 1)

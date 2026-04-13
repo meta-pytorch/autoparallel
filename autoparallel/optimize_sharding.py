@@ -136,6 +136,20 @@ def _assert_has_tensor_meta(spec_or_specs, node, label):
         ), f"{node} {label} doesn't have a tensor_meta"
 
 
+def _placements_match(spec, target_placement):
+    """Compare spec.placements with target_placement, padding with Replicate."""
+    if spec is None or not hasattr(spec, 'placements'):
+        return False
+    spec_placements = spec.placements
+    if spec_placements is None:
+        return False
+    # Pad shorter tuple with Replicate() for comparison
+    max_len = max(len(spec_placements), len(target_placement))
+    padded_spec = spec_placements + (Replicate(),) * (max_len - len(spec_placements))
+    padded_target = target_placement + (Replicate(),) * (max_len - len(target_placement))
+    return padded_spec == padded_target
+
+
 class ShardingOptimizer:
     def __init__(
         self, gm, mesh, rescale_grad_comm_cost_for_mp=1.0, repeated_subgraphs=False,
@@ -222,6 +236,10 @@ class ShardingOptimizer:
                 options = self.backend.enumerate_options(
                     self.mesh, node, input_options, user_args, user_kwargs
                 )
+                if not options:
+                    op_name = node.target.name() if hasattr(node.target, 'name') else str(node.target)
+                    logger.error("Node %s (%s) returned 0 options from enumerate_options",
+                                 node.name, op_name)
                 strats[node] = OpOptionList(options)
             elif node.op == "output":
                 user_strats = tree_map_only(
@@ -264,6 +282,10 @@ class ShardingOptimizer:
     def walk_over_options(self, node, constrain_arg=None):
         """Yield (argi, out_idx, inp_idx) for all valid strategy combinations."""
         op_strategy = self.strats[node]
+        if not op_strategy.strategies:
+            logger.error("Node %s (%s) has 0 strategies! op=%s",
+                         node.name, node.op, node.target)
+            return
         for argi in range(len(op_strategy.strategies[0].input_specs)):
             if constrain_arg is not None and argi != constrain_arg:
                 continue
@@ -332,6 +354,11 @@ class ShardingOptimizer:
             if isinstance(src_spec, DTensorSpec) and isinstance(tgt_spec, DTensorSpec):
                 comm_cost = estimate_strategy_comms_cost(src_spec, tgt_spec)
                 if src_spec.placements != tgt_spec.placements:
+                    sharding_transition_cost = 1
+            elif hasattr(src_spec, 'mesh_dim_map') and hasattr(tgt_spec, 'mesh_dim_map'):
+                # ShardedLayout: use CuTeBackend's redistribute_cost
+                if src_spec != tgt_spec:
+                    comm_cost = self.backend.redistribute_cost(src_spec, tgt_spec, self.mesh)
                     sharding_transition_cost = 1
 
         if node in grad_param_nodes:
@@ -845,8 +872,22 @@ class ShardingOptimizer:
         """
         idx_a = self.node_map[node_a]
         idx_b = self.node_map[node_b]
-        strat_a = [str(s.output_specs) for s in self.strats[node_a].strategies]
-        strat_b = [str(s.output_specs) for s in self.strats[node_b].strategies]
+
+        def _placement_key(spec):
+            """Extract a comparable placement key from a spec.
+            Uses .placements for both DTensorSpec and ShardedLayout."""
+            if hasattr(spec, 'placements'):
+                return spec.placements
+            return str(spec)
+
+        strat_a = [_placement_key(s.output_specs) for s in self.strats[node_a].strategies]
+        strat_b = [_placement_key(s.output_specs) for s in self.strats[node_b].strategies]
+        num_matched = sum(1 for sp in strat_a if sp in strat_b)
+        if num_matched == 0:
+            logger.warning("No matching placements for %s <-> %s (%s). "
+                          "strat_a=%s, strat_b=%s",
+                          node_a.name, node_b.name, constraint_name,
+                          strat_a[:3], strat_b[:3])
         num_inp_a = len(self.strats[node_a].strategies[0].redistribute_cost[0])
         num_inp_b = len(self.strats[node_b].strategies[0].redistribute_cost[0])
         for out_idx, sp in enumerate(strat_a):
@@ -937,7 +978,7 @@ class ShardingOptimizer:
         output_constraint_indices = [
             i
             for i, s in enumerate(strat.strategies)
-            if s.output_specs.placements == placement
+            if _placements_match(s.output_specs, placement)
         ]
         if len(output_constraint_indices) == 0:
             raise RuntimeError(
