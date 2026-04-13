@@ -390,11 +390,12 @@ def _make_local_args(gm, sharding_placement):
     (clean integer division, assumes even sharding). For dynamic shapes,
     SymInt dims produce symbolic local sizes (e.g., s0 // 32).
     """
-    from torch._subclasses.fake_tensor import FakeTensor
-
     local_args = []
     for node in gm.graph.find_nodes(op="placeholder"):
         tensor = node.meta["val"]
+        assert isinstance(
+            tensor, FakeTensor
+        ), f"expected FakeTensor placeholder, got {type(tensor)}"
         tgt_spec = sharding_placement[node].input_specs[0]
         mesh = tgt_spec.mesh
 
@@ -404,13 +405,8 @@ def _make_local_args(gm, sharding_placement):
                 dim = placement.dim
                 local_shape[dim] = local_shape[dim] // mesh.size(mesh_dim)
 
-        if isinstance(tensor, FakeTensor):
-            with tensor.fake_mode:
-                local = torch.empty(
-                    local_shape, dtype=tensor.dtype, device=tensor.device
-                )
-        else:
-            local = torch.empty(local_shape, dtype=tensor.dtype, device="meta")
+        with tensor.fake_mode:
+            local = torch.empty(local_shape, dtype=tensor.dtype, device=tensor.device)
         local_args.append(local)
     return local_args
 
