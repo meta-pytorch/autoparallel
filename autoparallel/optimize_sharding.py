@@ -72,6 +72,7 @@ runtime cost while satisfying all constraints.
 import logging
 import math
 import operator
+import tempfile
 import time
 from collections import defaultdict
 from dataclasses import dataclass
@@ -704,7 +705,12 @@ class ShardingOptimizer:
 
     def _solve(self, verbose=False):
         solver = pulp.PULP_CBC_CMD(msg=verbose)
-        self.prob.solve(solver)
+        # Use a dedicated temp directory for PuLP's intermediate files (.mps,
+        # .sol, etc.) so they are always cleaned up, even if the process is
+        # killed.  Without this, leftover files can fill up /tmp (tmpfs).
+        with tempfile.TemporaryDirectory() as tmpdir:
+            solver.tmpDir = tmpdir
+            self.prob.solve(solver)
 
         self.selected_keys = [
             key for key, dv in self.decision_vars.items() if dv.var.value() == 1
