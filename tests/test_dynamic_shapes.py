@@ -3,41 +3,14 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
-from unittest.mock import patch
-
 import pytest
 import torch
+from conftest import apply_cuda_patches
 from torch import nn
 from torch._functorch._aot_autograd.fx_utils import get_param_nodes
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
 from autoparallel.api import AutoParallel
-
-_CUDA_PATCHES = [
-    patch("torch.cuda.device_count", lambda: 8),
-    patch("torch.cuda.get_device_name", lambda *args, **kwargs: "H100"),
-    patch("torch.cuda.get_device_capability", lambda *args, **kwargs: (9, 0)),
-    patch(
-        "torch.cuda.get_device_properties",
-        lambda *args, **kwargs: type(
-            "Props",
-            (),
-            {
-                "major": 9,
-                "minor": 0,
-                "name": "H100",
-                "total_memory": 80 * 1024**3,
-                "multi_processor_count": 132,
-            },
-        )(),
-    ),
-]
-
-
-def _apply_cuda_patches(func):
-    for p in reversed(_CUDA_PATCHES):
-        func = p(func)
-    return func
 
 
 class FFN(nn.Module):
@@ -577,7 +550,7 @@ class TestConcretizeShape:
 # ============================================================================
 
 
-@_apply_cuda_patches
+@apply_cuda_patches
 def test_dynamic_produces_same_placement_as_static_1d(device_mesh_1d):
     """ILP solution should be identical with dynamic=True vs dynamic=False."""
     dim1, dim2 = 1024, 4096
@@ -619,7 +592,7 @@ def test_dynamic_produces_same_placement_as_static_1d(device_mesh_1d):
         )
 
 
-@_apply_cuda_patches
+@apply_cuda_patches
 def test_dynamic_produces_same_placement_as_static_2d(device_mesh_2d):
     """ILP solution for transformer block should be identical with dynamic=True."""
     dim1 = 6144
@@ -657,7 +630,7 @@ def test_dynamic_produces_same_placement_as_static_2d(device_mesh_2d):
         ), f"Param placement mismatch for {node_s.name}: static={sp} vs dynamic={dp}"
 
 
-@_apply_cuda_patches
+@apply_cuda_patches
 def test_dynamic_apply_placement_ffn(device_mesh_1d):
     """apply_placement should succeed with dynamic=True for a simple FFN."""
     dim1, dim2 = 1024, 4096
@@ -679,7 +652,7 @@ def test_dynamic_apply_placement_ffn(device_mesh_1d):
     assert parallel_model is not None
 
 
-@_apply_cuda_patches
+@apply_cuda_patches
 def test_dynamic_apply_placement_transformer(device_mesh_2d):
     """apply_placement should succeed with dynamic=True for transformer block."""
     dim1 = 6144
@@ -705,7 +678,7 @@ def test_dynamic_apply_placement_transformer(device_mesh_2d):
     assert parallel_model is not None
 
 
-@_apply_cuda_patches
+@apply_cuda_patches
 def test_dynamic_joint_graph_has_symbolic_shapes(device_mesh_2d):
     """The joint graph from dynamic=True should have symbolic shapes on inputs."""
     dim1 = 6144
@@ -739,7 +712,7 @@ def test_dynamic_joint_graph_has_symbolic_shapes(device_mesh_2d):
         assert has_symint, "joint graph should have symbolic shapes on inputs"
 
 
-@_apply_cuda_patches
+@apply_cuda_patches
 def test_dynamic_check_forward_args_accepts_different_batch(device_mesh_1d):
     """_check_forward_args should accept different batch sizes with dynamic shapes."""
     from autoparallel.input_validation import (
