@@ -881,8 +881,16 @@ def propagate_einsum(equation, sharded_a, sharded_b):
             return None
         if cat == "batch" and a_sharded != b_sharded:
             return None
+        # Batch dims must be sharded on the SAME mesh dims
+        if cat == "batch" and a_sharded and b_sharded:
+            if sharded_a.mesh_dim_map[a_idx] != sharded_b.mesh_dim_map[b_idx]:
+                return None
         if cat == "contract" and a_sharded != b_sharded:
             return None
+        # Contract dims must be sharded on the SAME mesh dims
+        if cat == "contract" and a_sharded and b_sharded:
+            if sharded_a.mesh_dim_map[a_idx] != sharded_b.mesh_dim_map[b_idx]:
+                return None
 
     # Build recipe
     recipe = []

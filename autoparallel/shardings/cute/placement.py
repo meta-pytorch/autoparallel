@@ -321,10 +321,16 @@ class ShardedLayout:
 
     @property
     def placements(self):
-        """DTensorSpec-compatible placements for optimizer constraint matching."""
+        """DTensorSpec-compatible placements for optimizer constraint matching.
+
+        Returns Shard(dim) ONLY when the sub-dim structure is simple contiguous
+        (single sub-dim, integer strides, mesh_stride == local_size * local_stride)
+        — i.e., exactly what DTensor's Shard(dim) represents.
+        For non-standard shardings (multi-sub-dim from view chains, XorStride, etc.),
+        returns None for that mesh dim position to indicate it's not DTensor-representable.
+        """
         from torch.distributed.tensor.placement_types import Replicate, Shard, Partial
-        # Build one placement per mesh dim
-        # Invert mesh_dim_map: mesh_dim -> (tensor_dim, ...)
+
         max_mesh_dim = -1
         mesh_to_tensor = {}
         for td, mds in self.mesh_dim_map.items():
@@ -332,15 +338,72 @@ class ShardedLayout:
                 mesh_to_tensor[md] = td
                 if md > max_mesh_dim:
                     max_mesh_dim = md
+        for md in self.partial:
+            if md > max_mesh_dim:
+                max_mesh_dim = md
+
         result = []
         for md in range(max_mesh_dim + 1):
             if md in self.partial:
                 result.append(Partial(self.partial[md]))
             elif md in mesh_to_tensor:
-                result.append(Shard(mesh_to_tensor[md]))
+                td = mesh_to_tensor[md]
+                if self._is_simple_shard(td, md):
+                    result.append(Shard(td))
+                else:
+                    # Non-standard sharding — not DTensor-representable
+                    result.append(None)
             else:
                 result.append(Replicate())
         return tuple(result) if result else (Replicate(),)
+
+    def _is_simple_shard(self, tensor_dim, mesh_dim):
+        """Check if a tensor dim is sharded in DTensor-compatible contiguous style.
+
+        Requires:
+        - Exactly one sub-dim with mesh sharding (others must be replicate/local-only)
+        - The sharded sub-dim has exactly 1 mesh factor (no S(0)S(0))
+        - Integer strides (not XorStride/ModStride)
+        - Contiguous: mesh_stride == local_size * local_stride within the sharded sub-dim
+        """
+        dim_shape = self.hier_layout.shape[tensor_dim]
+        dim_stride = self.hier_layout.stride[tensor_dim]
+
+        if not is_tuple(dim_shape):
+            return False
+
+        # Find which sub-dim has mesh sharding
+        sharded_sub = None
+        for sub_s, sub_st in zip(dim_shape, dim_stride):
+            if not is_tuple(sub_s):
+                continue
+            if _has_mesh(sub_s):
+                if sharded_sub is not None:
+                    return False  # multiple sub-dims with mesh — not simple
+                sharded_sub = (sub_s, sub_st)
+
+        if sharded_sub is None:
+            return False
+
+        sub_s, sub_st = sharded_sub
+
+        # Must have exactly 2 elements: (local, mesh) — no S(0)S(0)
+        if len(sub_s) != 2:
+            return False
+
+        local_s, mesh_s = sub_s
+        local_st, mesh_st = sub_st
+
+        # Both strides must be integers
+        if not isinstance(local_st, int) or not isinstance(mesh_st, int):
+            return False
+
+        # Mesh size must be > 1
+        if mesh_s <= 1:
+            return False
+
+        # Contiguous: mesh_stride == local_size * local_stride
+        return mesh_st == local_s * local_st
 
     @property
     def tensor_meta(self):
