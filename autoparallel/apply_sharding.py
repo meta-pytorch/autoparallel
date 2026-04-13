@@ -147,10 +147,8 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
 
         flat_args, treespec = tree_flatten(args)
         flat_args_t = [x for x in flat_args if isinstance(x, torch.Tensor)]
-        if len(flat_args_t) < len(flat_args) and isinstance(
-            target, torch._ops.HigherOrderOperator
-        ):
-            # HOPs have mixed arg types (tensors, GraphModules, ints, etc.).
+        if len(flat_args_t) < len(curr_specs):
+            # HOPs have mixed arg types (tensors, SymInts, etc.).
             # Filter specs to tensor-only entries matching flat_args_t.
             filtered_nodes = []
             filtered_curr = []
