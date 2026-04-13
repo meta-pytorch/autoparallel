@@ -1147,8 +1147,17 @@ class ShardingOptimizer:
         num_inp_a = len(self.strats[node_a].strategies[0].redistribute_cost[0])
         num_inp_b = len(self.strats[node_b].strategies[0].redistribute_cost[0])
         for out_idx, sp in enumerate(strat_a):
-            # TODO: fix this case
             if sp not in strat_b:
+                # This placement exists in node_a but not in node_b.
+                # Disable it: force sum of its decision variables to 0.
+                v_a = [
+                    self.pulp_variables[(idx_a, 0, out_idx, inp_idx)]
+                    for inp_idx in range(num_inp_a)
+                ]
+                self.prob += (
+                    pulp.lpSum(v_a) == 0,
+                    self._get_next_name(constraint_name + "_disable"),
+                )
                 continue
             out_idx_b = strat_b.index(sp)
             v_a = [
