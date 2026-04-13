@@ -64,12 +64,14 @@ class CuTeBackend:
 
         # Extract ShardedLayout candidates per input (skip non-OpOptionList entries)
         input_candidates = []
+        input_options_list = []  # parallel list of OpOptionList for cost computation
         for opts in input_options:
             if not isinstance(opts, OpOptionList):
                 continue
             candidates = [opt.output_spec for opt in opts
                           if isinstance(opt.output_spec, ShardedLayout)]
             input_candidates.append(candidates)
+            input_options_list.append(opts)
 
         if not input_candidates or (not any(len(c) > 0 for c in input_candidates)):
             logger.debug("Node %s (%s): no non-empty input_candidates (n=%d, lengths=%s), falling back",
@@ -145,8 +147,10 @@ class CuTeBackend:
             redist_costs = []
             total_comm = 0.0
             for arg_idx, inp_sharding in enumerate(input_shardings):
+                if arg_idx >= len(input_options_list):
+                    break
                 arg_costs = []
-                for src_opt in input_options[arg_idx]:
+                for src_opt in input_options_list[arg_idx]:
                     src_spec = src_opt.output_spec
                     if isinstance(src_spec, ShardedLayout) and src_spec != inp_sharding:
                         cost = self.redistribute_cost(src_spec, inp_sharding, mesh)
@@ -165,6 +169,45 @@ class CuTeBackend:
                 comm_cost=total_comm,
                 redistribute_costs=redist_costs,
             ))
+
+        # For boundary ops (alias, clone, contiguous), enumerate all possible
+        # output shardings independently — like placeholders. This decouples
+        # backward gradient placements from the backward compute chain,
+        # letting the optimizer choose the best placement with redistribution
+        # cost on the edge.
+        _BOUNDARY_OPS = {
+            "aten.alias.default",
+            "aten.clone.default",
+            "aten.contiguous.default",
+        }
+        if op_name in _BOUNDARY_OPS and node.meta.get("val") is not None:
+            tensor = node.meta["val"]
+            if hasattr(tensor, 'shape'):
+                all_shardings = enumerate_shardings(tuple(tensor.shape), mesh_shape)
+                existing = {s.output_spec.placements for s in results
+                            if isinstance(s.output_spec, ShardedLayout)}
+                for sl in all_shardings:
+                    if sl.placements in existing:
+                        continue
+                    existing.add(sl.placements)
+                    redist_costs = []
+                    for opts in input_options_list:
+                        arg_costs = []
+                        for src_opt in opts:
+                            src_spec = src_opt.output_spec
+                            if isinstance(src_spec, ShardedLayout) and src_spec != sl:
+                                cost = self.redistribute_cost(src_spec, sl, mesh)
+                            else:
+                                cost = 0.0
+                            arg_costs.append(cost)
+                        redist_costs.append(arg_costs)
+                    results.append(OpOption(
+                        output_spec=sl,
+                        input_specs=(sl,),
+                        compute_cost=0.0,
+                        comm_cost=min(c for costs in redist_costs for c in costs) if redist_costs else 0.0,
+                        redistribute_costs=redist_costs,
+                    ))
 
         return results if results else self._replicate_fallback(node, input_options, op_name)
 
