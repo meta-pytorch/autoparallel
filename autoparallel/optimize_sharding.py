@@ -198,8 +198,15 @@ class ShardingOptimizer:
                 val = node.meta.get("val")
                 if isinstance(val, torch.Tensor):
                     strats[node] = _create_all_options(self.mesh, val.shape, tensor=val)
-                # else: GraphModule submodules used by HOPs — not added to
-                # strats, invisible to the ILP. _all_input_nodes filters them.
+                else:
+                    # GraphModule submodules used by HOPs — not added to
+                    # strats, invisible to the ILP. _all_input_nodes filters
+                    # them. Guard: every skipped node must be consumed by a HOP.
+                    assert any(
+                        isinstance(u.target, torch._ops.HigherOrderOperator)
+                        or "local_map" in u.name
+                        for u in node.users
+                    ), f"Non-tensor get_attr {node} is not used by a HOP"
             elif node.op == "call_function":
                 # TODO: kwargs?
                 # Use .get() so HOP submodule nodes (not in strats) map to None.
@@ -255,7 +262,15 @@ class ShardingOptimizer:
         nodes (GraphModules without tensor val) are invisible to the ILP.
         """
         # TODO: add kwargs?
-        return [x for x in all_input_nodes(node) if x in self.strats]
+        result = []
+        for x in all_input_nodes(node):
+            if x in self.strats:
+                result.append(x)
+            else:
+                assert (
+                    x.op == "get_attr"
+                ), f"Non-get_attr node {x} (op={x.op}) missing from strats"
+        return result
 
     def walk_over_options(self, node, constrain_arg=None):
         """Yield (argi, out_idx, inp_idx) for all valid strategy combinations."""
@@ -630,8 +645,16 @@ class ShardingOptimizer:
                     )
 
                 # Skip edges where the consumer arg has no sharding decision
-                # (e.g. None input_specs for HOP submodule / SymInt args).
+                # (e.g. None input_specs for HOP SymInt args).
                 if not vars_consumer or not vars_producer:
+                    user_strat = self.strats[user]
+                    assert (
+                        user_argi < len(user_strat.strategies[0].input_specs)
+                        and user_strat.strategies[0].input_specs[user_argi] is None
+                    ), (
+                        f"Missing variables for non-None input_spec at "
+                        f"{user}[{user_argi}]"
+                    )
                     continue
 
                 assert (

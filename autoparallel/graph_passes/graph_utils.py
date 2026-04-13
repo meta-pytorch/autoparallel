@@ -341,7 +341,7 @@ def build_param_derived_set(graph: torch.fx.Graph) -> set[torch.fx.Node]:
     """
     param_derived = set(get_param_nodes(graph))
     for node in graph.nodes:
-        inputs = all_input_nodes(node)
+        inputs = node.all_input_nodes
         if inputs and all(inp in param_derived for inp in inputs):
             param_derived.add(node)
     return param_derived
