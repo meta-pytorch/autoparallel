@@ -12,32 +12,63 @@ from torch._inductor.fx_passes.bucketing import is_wait_tensor
 from torch._logging import trace_structured
 
 
-def _add_compute_annotations(gm: fx.GraphModule, tag: str):
+def _add_compute_annotations(gm: fx.GraphModule, tag: str) -> bool:
     """Add compute_region annotations to nodes without custom metadata."""
+    has_comm_region = False
     for n in gm.graph.nodes:
         if n.op == "placeholder":
             continue
         if n.meta.get("custom", None) is None:
             n.meta["custom"] = {"compute_region": tag}
         else:
-            assert "comm_region" in n.meta["custom"]
-            val = n.meta["custom"]["comm_region"]
-            n.meta["custom"]["comm_region"] = tag + " " + val
+            if "comm_region" in n.meta["custom"]:
+                has_comm_region = True
+                val = n.meta["custom"]["comm_region"]
+                n.meta["custom"]["comm_region"] = tag + " " + val
+            elif "compute_region" in n.meta["custom"]:
+                val = n.meta["custom"]["compute_region"]
+                n.meta["custom"]["compute_region"] = tag + " " + val
+            else:
+                n.meta["custom"]["compute_region"] = tag
+    return has_comm_region
 
 
 def _move_wait_tensors_to_compute_region(gm: fx.GraphModule, tag: str):
-    """Move wait_tensor nodes from comm_region to compute_region of their users."""
+    """Move the last wait_tensor node from each contiguous comm_region to the compute_region of its first user."""
+    # First pass: identify the last wait_tensor in each contiguous comm region
+    last_waits: list[fx.Node] = []
+    last_wait: fx.Node | None = None
+    in_comm_region = False
+
     for n in gm.graph.nodes:
         if n.op == "placeholder":
             continue
-        if "comm_region" in n.meta["custom"] and is_wait_tensor(n):
-            assert len(n.users) >= 1, "wait tensor must have at least one user"
-            user: fx.Node = next(iter(n.users))
-            if "compute_region" in user.meta["custom"]:
-                n.meta["custom"].pop("comm_region")
-                n.meta["custom"].update({"compute_region": tag + " " + "wait"})
-                if n.next is not user:
-                    user.prepend(n)
+        if "comm_region" in n.meta["custom"]:
+            in_comm_region = True
+            if is_wait_tensor(n):
+                last_wait = n
+        else:
+            # Transitioning out of a comm region — flush
+            if in_comm_region and last_wait is not None:
+                last_waits.append(last_wait)
+                last_wait = None
+            in_comm_region = False
+
+    # Handle graph ending inside a comm region
+    if in_comm_region and last_wait is not None:
+        last_waits.append(last_wait)
+
+    # Second pass: re-tag and move only the collected last-wait nodes
+    for n in last_waits:
+        assert len(n.users) >= 1, "wait tensor must have at least one user"
+        user: fx.Node = next(iter(n.users))
+        if "compute_region" in user.meta["custom"]:
+            val = n.meta["custom"].pop("comm_region")
+            if tag not in val:
+                val = tag + " " + val
+            n.meta["custom"].update({"compute_region": val + " " + "wait"})
+            if n.next is not user:
+                user.prepend(n)
 
 
 def multiplex_fw_bw_graph(
@@ -64,8 +95,9 @@ def multiplex_fw_bw_graph(
         The function preserves node metadata during the merging process.
     """
     if overlap_with_annotations:
-        _add_compute_annotations(fw_gm, "forward")
-        _add_compute_annotations(bw_gm, "backward")
+        fw_has_comm = _add_compute_annotations(fw_gm, "forward")
+        bw_has_comm = _add_compute_annotations(bw_gm, "backward")
+        assert fw_has_comm and bw_has_comm, "No comm region found in either graph"
         _move_wait_tensors_to_compute_region(fw_gm, "forward")
         _move_wait_tensors_to_compute_region(bw_gm, "backward")
 
