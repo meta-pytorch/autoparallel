@@ -335,40 +335,22 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
         return out
 
 
-def shard_node_given_placements(node, sharding_placement, *, meta: bool):
-    # TODO: not sure if we actually guarantee sharding_placement has ever
-    # input node lol
+def shard_node_given_placements(node, sharding_placement):
     tgt_spec = sharding_placement[node].input_specs[0]
     mesh = tgt_spec.mesh
-    # all tensors start as replicated
     curr_placement = (Replicate(),) * mesh.ndim
     tensor = node.meta["val"]
 
-    if meta:
-        assert isinstance(
-            tensor, FakeTensor
-        ), f"only FakeTensor params supported for now, got {type(tensor)}"
-        with unset_fake_temporarily():
-            tensor = torch.empty(tensor.shape, dtype=tensor.dtype, device="meta")
-            sharded_tensor = DTensor.from_local(
-                tensor, mesh, curr_placement
-            ).redistribute(mesh, tgt_spec.placements)
-    else:
+    assert isinstance(
+        tensor, FakeTensor
+    ), f"only FakeTensor params supported for now, got {type(tensor)}"
+    with unset_fake_temporarily():
+        tensor = torch.empty(tensor.shape, dtype=tensor.dtype, device="meta")
         sharded_tensor = DTensor.from_local(tensor, mesh, curr_placement).redistribute(
             mesh, tgt_spec.placements
         )
 
     return sharded_tensor
-
-
-def shard_placeholder_inputs(gm, sharding_placement):
-    nodes = [x for x in gm.graph.find_nodes(op="placeholder")]
-    sharded_tensors = []
-    for node in nodes:
-        sharded_tensors.append(
-            shard_node_given_placements(node, sharding_placement, meta=False)
-        )
-    return sharded_tensors
 
 
 def rename_placeholder_node(
@@ -401,12 +383,12 @@ def _has_symbolic_shapes(gm):
     return False
 
 
-def _make_symbolic_local_args(gm, sharding_placement):
-    """Create local FakeTensors with symbolic shapes for dynamic batch dims.
+def _make_local_args(gm, sharding_placement):
+    """Create local FakeTensors for each placeholder by dividing sharded dims.
 
-    For each placeholder, computes the local shape by dividing sharded dims
-    by the mesh size (clean integer division, assumes even sharding).
-    Non-sharded dims and parameter dims stay concrete.
+    Computes the local shape by dividing sharded dims by the mesh size
+    (clean integer division, assumes even sharding). For dynamic shapes,
+    SymInt dims produce symbolic local sizes (e.g., s0 // 32).
     """
     from torch._subclasses.fake_tensor import FakeTensor
 
@@ -518,7 +500,7 @@ def _shard_params_and_buffers(gm, sharding_placement, params_spec, buffers_spec)
         n = fqn_to_param[fqn]
         with unset_fake_temporarily():
             sharded_param_dict[fqn] = nn.Parameter(
-                shard_node_given_placements(n, sharding_placement, meta=True)
+                shard_node_given_placements(n, sharding_placement)
             )
             tgt_spec = sharding_placement[n].input_specs[0]
             sharded_param_dict[fqn]._spec.shard_order = tgt_spec.shard_order
@@ -526,9 +508,7 @@ def _shard_params_and_buffers(gm, sharding_placement, params_spec, buffers_spec)
     sharded_buffer_dict = {}
     for fqn in buffers_spec:
         n = fqn_to_buffer[fqn]
-        sharded_buffer_dict[fqn] = shard_node_given_placements(
-            n, sharding_placement, meta=True
-        )
+        sharded_buffer_dict[fqn] = shard_node_given_placements(n, sharding_placement)
 
     return sharded_param_dict, sharded_buffer_dict
 
@@ -536,11 +516,7 @@ def _shard_params_and_buffers(gm, sharding_placement, params_spec, buffers_spec)
 def apply_sharding_to_model(gm, sharding_placement, params_spec, buffers_spec):
     t0 = time.perf_counter()
     dynamic = _has_symbolic_shapes(gm)
-    if dynamic:
-        local_args = _make_symbolic_local_args(gm, sharding_placement)
-    else:
-        args = shard_placeholder_inputs(gm, sharding_placement)
-        local_args = [arg.to_local() for arg in args]
+    local_args = _make_local_args(gm, sharding_placement)
     t1 = time.perf_counter()
 
     parallel_gm = _lower_to_parallel_graph(gm, sharding_placement, local_args, dynamic)
