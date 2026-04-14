@@ -545,17 +545,25 @@ def get_flex_attention_placement_option(mesh, specs, user_args, node):
     B, H = q_val.shape[0], q_val.shape[1]
 
     def tensor_placement(t, placement):
-        """Compute per-tensor placement, replacing Shard dims that don't match
-        the reference size with Replicate (e.g. block_mask with B=1)."""
+        """Compute per-tensor placement, replacing Shard dims that can't be
+        validly sharded with Replicate.
+
+        A Shard(d) placement is valid only if:
+        - t.shape[d] > 1 (can meaningfully split)
+        - ref_size % t.shape[d] == 0 (GQA: Q heads divide evenly by KV heads)
+        - t.shape[d] % mesh_dim_size == 0 (tensor dim splits evenly across devices)
+        """
         dim_to_ref = {0: B, 1: H}
         adjusted = []
-        for p in placement:
-            if (
-                p.is_shard()
-                and p.dim in dim_to_ref
-                and t.shape[p.dim] != dim_to_ref[p.dim]
-            ):
-                adjusted.append(Replicate())
+        for mesh_dim, p in enumerate(placement):
+            if p.is_shard() and p.dim in dim_to_ref:
+                t_size = t.shape[p.dim]
+                ref_size = dim_to_ref[p.dim]
+                mesh_dim_size = mesh.shape[mesh_dim]
+                if t_size <= 1 or ref_size % t_size != 0 or t_size % mesh_dim_size != 0:
+                    adjusted.append(Replicate())
+                else:
+                    adjusted.append(p)
             else:
                 adjusted.append(p)
         return tuple(adjusted)

@@ -242,14 +242,14 @@ def _out_shardings(mesh):
     return tuple([Shard(0)] + [Replicate()] * (mesh.ndim - 1))
 
 
-def _run_auto_parallel(model, mesh, dim=DIM):
+def _run_auto_parallel(model, mesh, dim=DIM, compile=False):
     x = _make_input(mesh, dim)
     parallel_model = auto_parallel(
         model,
         mesh,
         sample_inputs=(x,),
         out_shardings=_out_shardings(mesh),
-        compile=False,
+        compile=compile,
     )
     assert parallel_model is not None
     return parallel_model
@@ -387,6 +387,53 @@ def test_flex_attention_gqa_2d(device_mesh_2d):
     _run_auto_parallel(model, device_mesh_2d)
 
 
+def test_flex_attention_gqa_head_sharding(device_mesh_2d):
+    """Verify GQA allows Shard(1) on KV heads when Hq % Hkv == 0.
+
+    With Hq=8 and Hkv=2, sharding on the head dim is valid since each
+    device gets a proportional slice of both Q (8/N) and KV (2/N) heads.
+    """
+    n_kv_heads = 2
+    mesh = device_mesh_2d
+
+    from autoparallel.api import AutoParallel
+    from autoparallel.input_validation import (
+        _extract_input_info,
+        _flatten_out_shardings,
+        _make_input_fn,
+    )
+
+    with torch.device("meta"):
+        model = FlexAttnGQAModel(DIM, N_HEADS, n_kv_heads)
+
+    x = _make_input(mesh, DIM)
+    shapes, dtypes, input_placements, treespec = _extract_input_info((x,), mesh)
+    input_fn = _make_input_fn(shapes, dtypes, treespec)
+    output_placements = _flatten_out_shardings(_out_shardings(mesh))
+
+    with AutoParallel(model, input_fn, mesh, compile=False) as autop:
+        autop.add_input_constraints(input_placements)
+        autop.add_output_constraints(output_placements)
+
+        strats = autop.sharding_optimizer.strats
+        for node in autop.gm.graph.nodes:
+            if node.op != "call_function":
+                continue
+            if not isinstance(node.target, torch._ops.HigherOrderOperator):
+                continue
+            if "backward" in node.target.name():
+                continue
+
+            strat = strats[node]
+            # Q has Hq=8, K/V have Hkv=2. Since 8 % 2 == 0, Shard(1) should
+            # be available for both Q and KV inputs.
+            has_head_shard = any(
+                any(p == Shard(1) for p in s.input_specs[0].placements)
+                for s in strat.strategies
+            )
+            assert has_head_shard, "GQA with Hq=8, Hkv=2 should allow Shard(1) on heads"
+
+
 def test_flex_attention_score_mod_block_mask(device_mesh_1d):
     model = FlexAttnScoreModBlockMaskModel(DIM, N_HEADS, SEQLEN)
     model = model.to("meta")
@@ -460,3 +507,18 @@ def test_flex_attention_other_buffers_replicated(device_mesh_1d):
                             f"(shape [{B}, {H}]) should be Replicate "
                             f"but got {ispec.placements}"
                         )
+
+
+def test_flex_attention_compile(device_mesh_1d):
+    """Smoke test with compile=True to verify the parallel graph is compilable."""
+    with torch.device("meta"):
+        model = FlexAttnModel(DIM, N_HEADS)
+    _run_auto_parallel(model, device_mesh_1d, compile=True)
+
+
+def test_flex_attention_gqa_compile(device_mesh_1d):
+    """Smoke test GQA with compile=True."""
+    n_kv_heads = 2
+    with torch.device("meta"):
+        model = FlexAttnGQAModel(DIM, N_HEADS, n_kv_heads)
+    _run_auto_parallel(model, device_mesh_1d, compile=True)
