@@ -196,19 +196,29 @@ class ShardingOptimizer:
         strats = {}
         for node in self.graph.nodes:
             if node.op in ("placeholder", "get_attr"):
-                strats[node] = _create_all_options(
-                    self.mesh, node.meta["val"].shape, tensor=node.meta["val"]
-                )
+                val = node.meta.get("val")
+                if isinstance(val, torch.Tensor):
+                    strats[node] = _create_all_options(self.mesh, val.shape, tensor=val)
+                else:
+                    # GraphModule submodules used by HOPs — not added to
+                    # strats, invisible to the ILP. _all_input_nodes filters
+                    # them. Guard: every skipped node must be consumed by a HOP.
+                    assert any(
+                        isinstance(u.target, torch._ops.HigherOrderOperator)
+                        or "local_map" in u.name
+                        for u in node.users
+                    ), f"Non-tensor get_attr {node} is not used by a HOP"
             elif node.op == "call_function":
                 # TODO: kwargs?
+                # Use .get() so HOP submodule nodes (not in strats) map to None.
                 user_strats = tree_map_only(
-                    torch.fx.Node, lambda x: strats[x], node.args
+                    torch.fx.Node, lambda x: strats.get(x), node.args
                 )
                 user_args = tree_map_only(
-                    torch.fx.Node, lambda x: x.meta["val"], node.args
+                    torch.fx.Node, lambda x: x.meta.get("val"), node.args
                 )
                 user_kwargs = tree_map_only(
-                    torch.fx.Node, lambda x: x.meta["val"], node.kwargs
+                    torch.fx.Node, lambda x: x.meta.get("val"), node.kwargs
                 )
                 strats[node] = get_placement_options_for_node(
                     self.mesh, node, user_strats, user_args, user_kwargs
@@ -247,12 +257,26 @@ class ShardingOptimizer:
                         )
 
     def _all_input_nodes(self, node):
-        """Variant of node.all_input_nodes that preserves duplicate nodes."""
+        """Variant of node.all_input_nodes that preserves duplicate nodes.
+
+        Filters to only nodes present in self.strats so that HOP submodule
+        nodes (GraphModules without tensor val) are invisible to the ILP.
+        """
         # TODO: add kwargs?
-        return all_input_nodes(node)
+        result = []
+        for x in all_input_nodes(node):
+            if x in self.strats:
+                result.append(x)
+            else:
+                assert (
+                    x.op == "get_attr"
+                ), f"Non-get_attr node {x} (op={x.op}) missing from strats"
+        return result
 
     def walk_over_options(self, node, constrain_arg=None):
         """Yield (argi, out_idx, inp_idx) for all valid strategy combinations."""
+        if node not in self.strats:
+            return
         op_strategy = self.strats[node]
         for argi in range(len(op_strategy.strategies[0].input_specs)):
             if constrain_arg is not None and argi != constrain_arg:
@@ -270,9 +294,10 @@ class ShardingOptimizer:
         """
         # Map each key to its canonical root key
         root_for_key = {}
-        for node_idx, (node, _) in enumerate(self.strats.items()):
+        for node, _ in self.strats.items():
             if node.op == "output":
                 continue
+            node_idx = self.node_map[node]
             for argi, out_idx, inp_idx in self.walk_over_options(node):
                 key = (node_idx, argi, out_idx, inp_idx)
                 root_for_key[key] = self.cluster_links.get(key, key)
@@ -349,11 +374,13 @@ class ShardingOptimizer:
         n_cluster_copied = 0
 
         decision_vars = {}
-        strats_items = list(enumerate(self.strats.items()))
+        strats_items = [
+            (self.node_map[node], node, strat) for node, strat in self.strats.items()
+        ]
 
         # Two passes: root nodes first (so their entries exist), then linked nodes.
         for is_linked_pass in (False, True):
-            for node_idx, (node, op_strategy) in strats_items:
+            for node_idx, node, op_strategy in strats_items:
                 if node.op == "output":
                     continue
                 is_linked = node_idx in self._cluster_linked_node_idxs
@@ -519,6 +546,8 @@ class ShardingOptimizer:
         for node_idx, node in enumerate(self.graph.nodes):
             if node.op not in {"placeholder", "call_function", "get_attr"}:
                 continue
+            if node not in self.strats:
+                continue
             if node_idx in self._cluster_linked_node_idxs:
                 continue
             arg_vars = {}
@@ -571,6 +600,8 @@ class ShardingOptimizer:
         for node_idx, node in enumerate(self.graph.nodes):
             if node.op == "output":
                 continue
+            if node not in self.strats:
+                continue
             producer_is_linked = node_idx in self._cluster_linked_node_idxs
             # All args agree on the same output (ensured by consistency constraint),
             # so we use arg 0 for the producer side.
@@ -582,8 +613,12 @@ class ShardingOptimizer:
                 # the root-to-root edge already covers this.
                 if producer_is_linked and user_idx in self._cluster_linked_node_idxs:
                     continue
-                user_argi = [i for i, n in enumerate(user.all_input_nodes) if n == node]
-                assert len(user_argi) == 1
+                user_argi = [
+                    i for i, n in enumerate(self._all_input_nodes(user)) if n == node
+                ]
+                assert len(user_argi) >= 1
+                # Use the first matching arg; the same-output-across-args
+                # constraint already ensures all args agree.
                 user_argi = user_argi[0]
 
                 vars_producer = self._collect_vars(
@@ -609,6 +644,19 @@ class ShardingOptimizer:
                         group_by="inp_idx",
                         resolve_clusters=True,
                     )
+
+                # Skip edges where the consumer arg has no sharding decision
+                # (e.g. None input_specs for HOP SymInt args).
+                if not vars_consumer or not vars_producer:
+                    user_strat = self.strats[user]
+                    assert (
+                        user_argi < len(user_strat.strategies[0].input_specs)
+                        and user_strat.strategies[0].input_specs[user_argi] is None
+                    ), (
+                        f"Missing variables for non-None input_spec at "
+                        f"{user}[{user_argi}]"
+                    )
+                    continue
 
                 assert (
                     vars_producer.keys() == vars_consumer.keys()

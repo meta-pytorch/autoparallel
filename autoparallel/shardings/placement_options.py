@@ -4,6 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import collections
+import itertools
 import logging
 import operator
 import time
@@ -23,7 +24,7 @@ from torch.distributed.tensor._op_schema import (
     TupleStrategy,
 )
 from torch.distributed.tensor._ops.utils import generate_redistribute_costs
-from torch.distributed.tensor.placement_types import Replicate
+from torch.distributed.tensor.placement_types import Replicate, Shard
 from torch.utils._pytree import tree_flatten, tree_map_only
 
 from autoparallel.shardings.propagation_rules import generate_dummy_redistribute_costs
@@ -483,12 +484,173 @@ def get_local_map_placement_option(
     )
 
 
+def _is_flex_attention_hop(node):
+    target = node.target
+    return isinstance(target, torch._ops.HigherOrderOperator) and target.name() in (
+        "flex_attention",
+        "flex_attention_backward",
+    )
+
+
+def get_flex_attention_placement_option(mesh, specs, user_args, node):
+    """Build OpStrategy for flex_attention / flex_attention_backward HOPs.
+
+    Attention is independent per (batch, head) pair, so we enumerate all
+    combinations of {Replicate, Shard(0), Shard(1)} across mesh dimensions.
+    Block-mask and other auxiliary tensors are always replicated.
+    """
+    # Collect FX Nodes from score_mod_other_buffers and mask_mod_other_buffers.
+    # These must always be replicated since score_mod can index them arbitrarily.
+    # We identify them by parameter name from the HOP's fake-kernel signature.
+    other_buffer_nodes: set[torch.fx.Node] = set()
+    _BUFFER_PARAM_NAMES = ("score_mod_other_buffers", "mask_mod_other_buffers")
+    import inspect
+
+    from torch._higher_order_ops.flex_attention import (
+        flex_attention_backward_fake_tensor_mode,
+        flex_attention_fake_impl,
+    )
+
+    fake_impl = (
+        flex_attention_fake_impl
+        if node.target.name() == "flex_attention"
+        else flex_attention_backward_fake_tensor_mode
+    )
+    params = list(inspect.signature(fake_impl).parameters.keys())
+    for name in _BUFFER_PARAM_NAMES:
+        if name in params:
+            idx = params.index(name)
+            if idx < len(node.args) and isinstance(node.args[idx], (tuple, list)):
+                for item in tree_flatten(node.args[idx])[0]:
+                    if isinstance(item, torch.fx.Node):
+                        other_buffer_nodes.add(item)
+
+    flat_orig, _ = tree_flatten(node.args)
+    flat_specs, _ = tree_flatten(specs)
+    flat_uargs, _ = tree_flatten(user_args)
+
+    # Keep only FX Node entries that have strategies (skip GraphModule
+    # submodules which are not in strats and invisible to the ILP).
+    node_specs = []
+    node_uargs = []
+    is_other_buffer = []
+    for orig, spec, uarg in zip(flat_orig, flat_specs, flat_uargs):
+        if isinstance(orig, torch.fx.Node) and isinstance(uarg, torch.Tensor):
+            node_specs.append(spec)
+            node_uargs.append(uarg)
+            is_other_buffer.append(orig in other_buffer_nodes)
+
+    # Q determines the reference batch and head sizes.
+    q_val = node.args[0].meta["val"]
+    B, H = q_val.shape[0], q_val.shape[1]
+
+    def tensor_placement(t, placement):
+        """Compute per-tensor placement, replacing Shard dims that can't be
+        validly sharded with Replicate.
+
+        A Shard(d) placement is valid only if:
+        - t.shape[d] > 1 (can meaningfully split)
+        - ref_size % t.shape[d] == 0 (GQA: Q heads divide evenly by KV heads)
+        - t.shape[d] % mesh_dim_size == 0 (tensor dim splits evenly across devices)
+        """
+        dim_to_ref = {0: B, 1: H}
+        adjusted = []
+        for mesh_dim, p in enumerate(placement):
+            if p.is_shard() and p.dim in dim_to_ref:
+                t_size = t.shape[p.dim]
+                ref_size = dim_to_ref[p.dim]
+                mesh_dim_size = mesh.shape[mesh_dim]
+                if t_size <= 1 or ref_size % t_size != 0 or t_size % mesh_dim_size != 0:
+                    adjusted.append(Replicate())
+                else:
+                    adjusted.append(p)
+            else:
+                adjusted.append(p)
+        return tuple(adjusted)
+
+    replicated = tuple(Replicate() for _ in range(mesh.ndim))
+
+    # Valid per-mesh-dim placements for attention tensors.
+    per_dim_options = [Replicate(), Shard(0), Shard(1)]
+    all_placements = list(itertools.product(per_dim_options, repeat=mesh.ndim))
+
+    # Build output specs structure. flex_attention returns a tuple.
+    output_val = node.meta["val"]
+    assert isinstance(output_val, (tuple, list))
+
+    strategies = []
+    for placement in all_placements:
+        placement = tuple(placement)
+
+        in_specs = []
+        for uarg, producer_strat, is_buf in zip(
+            node_uargs, node_specs, is_other_buffer
+        ):
+            if is_buf:
+                # score_mod / mask_mod other_buffers — always replicate since
+                # we don't know how score_mod indexes into them.
+                in_specs.append(
+                    DTensorSpec(
+                        mesh=mesh,
+                        placements=replicated,
+                        tensor_meta=TensorMeta(uarg.shape, uarg.stride(), uarg.dtype),
+                    )
+                )
+            elif uarg.ndim >= 2:
+                in_specs.append(
+                    DTensorSpec(
+                        mesh=mesh,
+                        placements=tensor_placement(uarg, placement),
+                        tensor_meta=TensorMeta(uarg.shape, uarg.stride(), uarg.dtype),
+                    )
+                )
+            else:
+                # Scalar or 1-D auxiliary tensor — always replicate.
+                in_specs.append(
+                    DTensorSpec(
+                        mesh=mesh,
+                        placements=replicated,
+                        tensor_meta=TensorMeta(uarg.shape, uarg.stride(), uarg.dtype),
+                    )
+                )
+
+        out_specs = []
+        for out in output_val:
+            if isinstance(out, torch.Tensor):
+                out_specs.append(
+                    DTensorSpec(
+                        mesh=mesh,
+                        placements=tensor_placement(out, placement),
+                        tensor_meta=TensorMeta(out.shape, out.stride(), out.dtype),
+                    )
+                )
+            else:
+                out_specs.append(None)
+
+        redistribute_costs = [
+            generate_redistribute_costs(producer_strat, spec)
+            for producer_strat, spec in zip(node_specs, in_specs)
+        ]
+
+        strategies.append(
+            OpSpec(
+                output_specs=tuple(out_specs),
+                input_specs=tuple(in_specs),
+                redistribute_cost=redistribute_costs,
+            )
+        )
+
+    return OpStrategy(strategies)
+
+
 def get_placement_options_for_node(mesh, node, specs, user_args, user_kwargs):
     if local_map_kwargs := node.meta.get("local_map_kwargs", {}):
         assert not user_kwargs
         return get_local_map_placement_option(
             mesh, specs, user_args, node, local_map_kwargs
         )
+    if _is_flex_attention_hop(node):
+        return get_flex_attention_placement_option(mesh, specs, user_args, node)
     return get_placement_options(mesh, node.target, specs, user_args, user_kwargs)
 
 
