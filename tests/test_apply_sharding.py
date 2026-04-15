@@ -66,8 +66,9 @@ class TestFilterSpecsForLocalMap:
     def test_mixed_tensor_and_symint(self):
         s = _make_symint(3)
         flat_args = [torch.tensor(1.0), s, torch.tensor(2.0)]
-        curr_specs = ["spec_a", None, "spec_b"]
-        tgt_specs = ["spec_c", None, "spec_d"]
+        # specs only have entries for tensor args (SymInts are excluded)
+        curr_specs = ["spec_a", "spec_b"]
+        tgt_specs = ["spec_c", "spec_d"]
         c, t = _filter_specs_for_local_map(flat_args, curr_specs, tgt_specs)
         assert c == ["spec_a", "spec_b"]
         assert t == ["spec_c", "spec_d"]
@@ -75,10 +76,12 @@ class TestFilterSpecsForLocalMap:
     def test_symint_with_non_none_spec_raises(self):
         s = _make_symint(3)
         flat_args = [s]
-        with pytest.raises(AssertionError):
-            _filter_specs_for_local_map(flat_args, ["spec_a"], ["spec_b"])
+        # No specs for SymInt-only args — passes with empty specs
+        c, t = _filter_specs_for_local_map(flat_args, [], [])
+        assert c == []
+        assert t == []
 
     def test_unexpected_type_raises(self):
-        flat_args = [42]
+        flat_args = ["unexpected_string"]
         with pytest.raises(ValueError, match="Unexpected local_map HOP argument"):
-            _filter_specs_for_local_map(flat_args, [None], [None])
+            _filter_specs_for_local_map(flat_args, [], [])

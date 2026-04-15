@@ -216,7 +216,7 @@ class TestMakeInputsDynamic:
 
 
 class TestConcretizeArgs:
-    """Tests for _concretize_args in optimize_sharding."""
+    """Tests for concretize_args in optimize_sharding."""
 
     def test_concretize_symints(self):
         from torch._subclasses import FakeTensorMode
@@ -226,7 +226,7 @@ class TestConcretizeArgs:
             StatelessSymbolicContext,
         )
 
-        from autoparallel.optimize_sharding import _concretize_args
+        from autoparallel.optimize_sharding import concretize_args
 
         shape_env = ShapeEnv()
         fake_mode = FakeTensorMode(shape_env=shape_env, static_shapes=False)
@@ -237,7 +237,7 @@ class TestConcretizeArgs:
         x = fake_mode.from_tensor(real, symbolic_context=sym_ctx)
 
         args = (x, x.shape[0], [x.shape[1], 32])
-        result = _concretize_args(args)
+        result = concretize_args(args)
 
         # FakeTensor should have concrete shapes
         assert isinstance(result[0], torch.Tensor)
@@ -254,10 +254,10 @@ class TestConcretizeArgs:
         assert result[2][1] == 32
 
     def test_passthrough_concrete(self):
-        from autoparallel.optimize_sharding import _concretize_args
+        from autoparallel.optimize_sharding import concretize_args
 
         args = (torch.randn(4, 4), 42, [1, 2, 3])
-        result = _concretize_args(args)
+        result = concretize_args(args)
 
         assert result[1] == 42
         assert result[2] == [1, 2, 3]
@@ -292,224 +292,62 @@ class TestProducesTensor:
         assert not _produces_tensor(None)
 
 
-class TestComputeLocalViewShape:
-    """Tests for _compute_local_view_shape in apply_sharding."""
+class TestShapeEnvSwap:
+    """Tests for ShapeEnv swap in apply_sharding_to_model."""
 
-    def _make_output_spec(self, placements, mesh_shape):
-        from torch.distributed._tensor.placement_types import DTensorSpec
-
-        class FakeMesh:
-            def __init__(self, shape):
-                self._shape = shape
-                self.ndim = len(shape)
-
-            @property
-            def shape(self):
-                return self._shape
-
-            def size(self, dim):
-                return self._shape[dim]
-
-        return DTensorSpec(mesh=FakeMesh(mesh_shape), placements=tuple(placements))
-
-    def test_flatten_batch_seq(self):
-        """[B, S, H] -> [B*S, H] with Shard(0) on dp."""
-        from autoparallel.apply_sharding import _compute_local_view_shape
-
-        output_spec = self._make_output_spec([Shard(0), Replicate()], (32, 8))
-
-        # Use SymInts for local input shape
-        from torch._subclasses import FakeTensorMode
-        from torch.fx.experimental.symbolic_shapes import (
-            DimDynamic,
-            ShapeEnv,
-            StatelessSymbolicContext,
-        )
-
-        shape_env = ShapeEnv()
-        fake_mode = FakeTensorMode(shape_env=shape_env, static_shapes=False)
-        t = fake_mode.from_tensor(
-            torch.empty(8, 256, 6144, device="meta"),
-            symbolic_context=StatelessSymbolicContext(
-                dynamic_sizes=[
-                    DimDynamic.DYNAMIC,
-                    DimDynamic.DYNAMIC,
-                    DimDynamic.STATIC,
-                ]
-            ),
-        )
-
-        local_out = _compute_local_view_shape(
-            global_input_shape=(256, 256, 6144),
-            global_output_shape=(65536, 6144),
-            local_input_shape=t.shape,
-            output_spec=output_spec,
-        )
-
-        # Output dim 0 should be symbolic (product of batch and seq)
-        assert isinstance(local_out[0], torch.SymInt)
-        # Output dim 1 should be concrete
-        assert local_out[1] == 6144
-
-    def test_unflatten_batch_seq(self):
-        """[B*S, H] -> [B, S, H] with Shard(0) on dp."""
-        from autoparallel.apply_sharding import _compute_local_view_shape
-
-        output_spec = self._make_output_spec([Shard(0), Replicate()], (32, 8))
-
-        from torch._subclasses import FakeTensorMode
-        from torch.fx.experimental.symbolic_shapes import (
-            DimDynamic,
-            ShapeEnv,
-            StatelessSymbolicContext,
-        )
-
-        shape_env = ShapeEnv()
-        fake_mode = FakeTensorMode(shape_env=shape_env, static_shapes=False)
-        t = fake_mode.from_tensor(
-            torch.empty(2048, 6144, device="meta"),
-            symbolic_context=StatelessSymbolicContext(
-                dynamic_sizes=[DimDynamic.DYNAMIC, DimDynamic.STATIC]
-            ),
-        )
-
-        local_out = _compute_local_view_shape(
-            global_input_shape=(65536, 6144),
-            global_output_shape=(256, 256, 6144),
-            local_input_shape=t.shape,
-            output_spec=output_spec,
-        )
-
-        # Split: sharded piece should be symbolic (B_local = B*S_local // S)
-        assert isinstance(local_out[0], torch.SymInt)
-        # Split: non-sharded piece should be concrete
-        assert local_out[1] == 256
-        assert local_out[2] == 6144
-
-    def test_split_heads_with_tp(self):
-        """[B, S, H] -> [B, S, nheads, head_dim] with TP on nheads."""
-        from autoparallel.apply_sharding import _compute_local_view_shape
-
-        output_spec = self._make_output_spec([Shard(0), Shard(2)], (32, 8))
-
-        from torch._subclasses import FakeTensorMode
-        from torch.fx.experimental.symbolic_shapes import (
-            DimDynamic,
-            ShapeEnv,
-            StatelessSymbolicContext,
-        )
-
-        shape_env = ShapeEnv()
-        fake_mode = FakeTensorMode(shape_env=shape_env, static_shapes=False)
-        t = fake_mode.from_tensor(
-            torch.empty(8, 256, 6144, device="meta"),
-            symbolic_context=StatelessSymbolicContext(
-                dynamic_sizes=[
-                    DimDynamic.DYNAMIC,
-                    DimDynamic.DYNAMIC,
-                    DimDynamic.STATIC,
-                ]
-            ),
-        )
-
-        local_out = _compute_local_view_shape(
-            global_input_shape=(256, 256, 6144),
-            global_output_shape=(256, 256, 48, 128),
-            local_input_shape=t.shape,
-            output_spec=output_spec,
-        )
-
-        # B and S should be symbolic (from local input)
-        assert isinstance(local_out[0], torch.SymInt)
-        assert isinstance(local_out[1], torch.SymInt)
-        # nheads should be 48 // 8 = 6 (TP sharded)
-        assert local_out[2] == 6
-        # head_dim stays concrete
-        assert local_out[3] == 128
-
-    def test_merge_heads(self):
-        """[B, S, nheads, head_dim] -> [B, S, H]"""
-        from autoparallel.apply_sharding import _compute_local_view_shape
-
-        output_spec = self._make_output_spec([Shard(0), Replicate()], (32, 8))
-
-        from torch._subclasses import FakeTensorMode
-        from torch.fx.experimental.symbolic_shapes import (
-            DimDynamic,
-            ShapeEnv,
-            StatelessSymbolicContext,
-        )
-
-        shape_env = ShapeEnv()
-        fake_mode = FakeTensorMode(shape_env=shape_env, static_shapes=False)
-        t = fake_mode.from_tensor(
-            torch.empty(8, 256, 48, 128, device="meta"),
-            symbolic_context=StatelessSymbolicContext(
-                dynamic_sizes=[
-                    DimDynamic.DYNAMIC,
-                    DimDynamic.DYNAMIC,
-                    DimDynamic.STATIC,
-                    DimDynamic.STATIC,
-                ]
-            ),
-        )
-
-        local_out = _compute_local_view_shape(
-            global_input_shape=(256, 256, 48, 128),
-            global_output_shape=(256, 256, 6144),
-            local_input_shape=t.shape,
-            output_spec=output_spec,
-        )
-
-        assert isinstance(local_out[0], torch.SymInt)
-        assert isinstance(local_out[1], torch.SymInt)
-        # Flatten of nheads*head_dim = 48*128 = 6144
-        assert local_out[2] == 6144
-
-
-class TestReSymbolizeGraph:
-    """Tests for _re_symbolize_graph."""
-
-    def test_re_symbolize_replaces_old_symints(self):
-        """Re-symbolize should produce fresh symbols not from the old ShapeEnv."""
+    def test_parallel_graph_has_fresh_symints(self):
+        """Parallel graph should have SymInts from a fresh ShapeEnv, not the joint graph's."""
         from torch._subclasses import FakeTensorMode
         from torch.fx.experimental.proxy_tensor import make_fx
-        from torch.fx.experimental.symbolic_shapes import ShapeEnv
+        from torch.fx.experimental.symbolic_shapes import (
+            DimDynamic,
+            ShapeEnv,
+            StatelessSymbolicContext,
+        )
 
-        from autoparallel.apply_sharding import _re_symbolize_graph
+        old_env = ShapeEnv()
+        fake_mode = FakeTensorMode(shape_env=old_env, static_shapes=False)
 
-        # Create a graph inside a FakeTensorMode (simulating the lowering)
-        shape_env = ShapeEnv()
-        fake_mode = FakeTensorMode(shape_env=shape_env)
-
+        real_x = torch.empty(8, 64, device="meta")
+        sym_ctx = StatelessSymbolicContext(
+            dynamic_sizes=[DimDynamic.DYNAMIC, DimDynamic.DYNAMIC]
+        )
+        x = fake_mode.from_tensor(real_x, symbolic_context=sym_ctx)
         with fake_mode:
-            x = torch.randn(8, 64)
+            x = x.to("cpu")
             w = torch.randn(64, 32)
 
-        def f(x, w):
-            return x @ w
+        # Swap ShapeEnv, create fresh symbolic tensor, trace
+        new_env = ShapeEnv()
+        fake_mode.shape_env = new_env
+        fake_mode.static_shapes = False
 
-        gm = make_fx(f, tracing_mode="symbolic")(x, w)
+        real_local = torch.empty(4, 64, device="meta")
+        fresh_ctx = StatelessSymbolicContext(
+            dynamic_sizes=[DimDynamic.DYNAMIC, DimDynamic.STATIC]
+        )
+        x_fresh = fake_mode.from_tensor(real_local, symbolic_context=fresh_ctx)
+        with fake_mode:
+            x_fresh = x_fresh.to("cpu")
 
-        # Re-symbolize
-        fresh_gm = _re_symbolize_graph(gm)
+        gm = make_fx(lambda x, w: x @ w, tracing_mode="symbolic")(x_fresh, w)
 
-        # Check placeholders have SymInt shapes
-        for node in fresh_gm.graph.nodes:
-            if node.op == "placeholder":
-                val = node.meta.get("val")
-                if isinstance(val, torch.Tensor):
-                    has_symint = any(isinstance(s, torch.SymInt) for s in val.shape)
-                    assert has_symint, f"{node.name} should have SymInt shapes"
+        # Restore
+        fake_mode.shape_env = old_env
 
-        # The SymInts should be from a different ShapeEnv than the original
-        for node in fresh_gm.graph.nodes:
+        # Check: placeholders have SymInts from new_env, not old_env
+        for node in gm.graph.nodes:
             if node.op == "placeholder":
                 val = node.meta.get("val")
                 if isinstance(val, torch.Tensor):
                     for s in val.shape:
                         if isinstance(s, torch.SymInt):
-                            assert s.node.shape_env is not shape_env
+                            assert id(s.node.shape_env) == id(
+                                new_env
+                            ), "SymInt should be from fresh ShapeEnv"
+                            assert id(s.node.shape_env) != id(
+                                old_env
+                            ), "SymInt should NOT be from old ShapeEnv"
 
 
 class TestConcretizeShape:

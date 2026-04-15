@@ -353,6 +353,28 @@ def get_placement_options(mesh, op, specs, user_args, user_kwargs):
     return out_strat
 
 
+def _concretize_tensor_meta(t: torch.Tensor) -> "TensorMeta | None":
+    """Build TensorMeta, concretizing any SymInts in shape/stride to hints.
+
+    Returns None if ANY shape/stride dim has an unbacked SymInt (hint=None),
+    which indicates a data-dependent shape that can't be statically sharded.
+    This causes the corresponding DTensorSpec to be None, which tells the
+    interpreter to skip redistribution for these tensors. This is correct for
+    HOP-internal activations (e.g., local_map forward outputs saved for
+    backward) whose distribution is managed by the HOP itself.
+    """
+    from autoparallel.optimize_sharding import concretize_symint
+
+    shape = [concretize_symint(s) for s in t.shape]
+    stride = [concretize_symint(s) for s in t.stride()]
+    # If any dim is still a SymInt (unbacked, hint=None), we can't create TensorMeta
+    if any(isinstance(s, torch.SymInt) for s in shape):
+        return None
+    if any(isinstance(s, torch.SymInt) for s in stride):
+        return None
+    return TensorMeta(torch.Size(shape), tuple(stride), t.dtype)
+
+
 def get_local_map_placement_option(
     mesh,
     specs,
@@ -380,53 +402,41 @@ def get_local_map_placement_option(
     replicated = tuple(Replicate() for _ in range(mesh.ndim))
     for activation in user_args[:num_activation_inputs]:
         # we have activation inputs for the bwd hop
-        if isinstance(activation, torch.SymInt):
+        if not isinstance(activation, torch.Tensor):
             in_specs.append(None)
         else:
-            in_specs.append(
-                DTensorSpec(
-                    mesh=mesh,
-                    placements=replicated,
-                    tensor_meta=TensorMeta(
-                        shape=activation.shape,
-                        stride=activation.stride(),
-                        dtype=activation.dtype,
-                    ),
+            tm = _concretize_tensor_meta(activation)
+            if tm is None:
+                in_specs.append(None)
+            else:
+                in_specs.append(
+                    DTensorSpec(mesh=mesh, placements=replicated, tensor_meta=tm)
                 )
-            )
 
     assert len(user_args) == (num_activation_inputs + len(in_placements))
 
     for example, placement in zip(user_args[num_activation_inputs:], in_placements):
-        if placement is None:
-            # not a dtensor
+        if placement is None or not isinstance(example, torch.Tensor):
             in_specs.append(None)
             continue
 
-        in_specs.append(
-            DTensorSpec(
-                mesh=mesh,
-                placements=placement,
-                tensor_meta=TensorMeta(
-                    shape=example.shape,
-                    stride=example.stride(),
-                    dtype=example.dtype,
-                ),
-            )
-        )
+        tm = _concretize_tensor_meta(example)
+        if tm is None:
+            in_specs.append(None)
+            continue
+
+        in_specs.append(DTensorSpec(mesh=mesh, placements=placement, tensor_meta=tm))
 
     out_specs = []
     output_val = node.meta["val"]
     assert isinstance(output_val, (torch.Tensor, list, tuple))
     outs = output_val if isinstance(output_val, (list, tuple)) else [output_val]
     for example, placement in zip(outs, out_placements):
-        if example is None:
-            # Due to how HOP backward is partitioned, it can return None
+        if example is None or not isinstance(example, torch.Tensor):
             out_specs.append(None)
             continue
 
         if placement is None:
-            # not a dtensor
             out_specs.append(None)
             continue
 
@@ -434,49 +444,42 @@ def get_local_map_placement_option(
             placement = [placement]
 
         assert isinstance(placement, (list, tuple)), "Not implemented"
-        out_specs.append(
-            DTensorSpec(
-                mesh=mesh,
-                placements=placement,
-                tensor_meta=TensorMeta(
-                    shape=example.shape,
-                    stride=example.stride(),
-                    dtype=example.dtype,
-                ),
-            )
-        )
+        tm = _concretize_tensor_meta(example)
+        if tm is None:
+            out_specs.append(None)
+            continue
+        out_specs.append(DTensorSpec(mesh=mesh, placements=placement, tensor_meta=tm))
 
     for example in outs[len(out_placements) :]:
-        if example is None or isinstance(example, torch.SymInt):
-            # Due to how HOP backward is partitioned, it can return None or SymInt
+        if not isinstance(example, torch.Tensor):
+            out_specs.append(None)
+            continue
+        tm = _concretize_tensor_meta(example)
+        if tm is None:
             out_specs.append(None)
             continue
         # we have activation outputs for the fwd hop
-        out_specs.append(
-            DTensorSpec(
-                mesh=mesh,
-                placements=replicated,
-                tensor_meta=TensorMeta(
-                    shape=example.shape,
-                    stride=example.stride(),
-                    dtype=example.dtype,
-                ),
-            )
-        )
+        out_specs.append(DTensorSpec(mesh=mesh, placements=replicated, tensor_meta=tm))
 
     redistribute_costs = []
+    filtered_in_specs = []
     for user_strategy, input_spec in zip(specs, in_specs):
-        if input_spec is None:
+        if not isinstance(user_strategy, OpStrategy):
+            # Non-tensor inputs (SymInts, None, ints, etc.) have no sharding
+            # and no corresponding entry in _all_input_nodes — skip them.
+            continue
+        elif input_spec is None:
             costs = generate_dummy_redistribute_costs(user_strategy)
         else:
             costs = generate_redistribute_costs(user_strategy, input_spec)
+        filtered_in_specs.append(input_spec)
         redistribute_costs.append(costs)
 
     return OpStrategy(
         [
             OpSpec(
                 output_specs=tuple(out_specs),
-                input_specs=tuple(in_specs),
+                input_specs=tuple(filtered_in_specs),
                 redistribute_cost=redistribute_costs,
             )
         ]

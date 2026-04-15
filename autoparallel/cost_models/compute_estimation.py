@@ -316,6 +316,12 @@ def _shard_args_for_node(node, strategy=None, rand_init=False):
     args = tree_map_only(torch.fx.Node, lambda x: x.meta["val"], node.args)
     kwargs = tree_map_only(torch.fx.Node, lambda x: x.meta["val"], node.kwargs)
 
+    # Concretize SymInts from dynamic shape nodes (sym_size, operator.mul, etc.)
+    # to prevent symbolic values from flowing into cost estimation.
+    from autoparallel.optimize_sharding import concretize_symint
+
+    args = tree_map_only(torch.SymInt, concretize_symint, args)
+
     if strategy is None:
         return args, kwargs
 

@@ -4,7 +4,6 @@
 # LICENSE file in the root directory of this source tree.
 
 import copy
-import functools
 import logging
 import operator
 import time
@@ -20,13 +19,6 @@ from torch._inductor.decomposition import select_decomp_table
 from torch._subclasses.fake_tensor import FakeTensor, unset_fake_temporarily
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor._dtensor_spec import DTensorSpec, ShardOrderEntry
-from torch.distributed.tensor._ops._view_ops import (
-    Flatten,
-    InputDim,
-    Singleton,
-    Split,
-    view_groups,
-)
 from torch.distributed.tensor.placement_types import Partial, Replicate, Shard  # noqa
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.utils._pytree import tree_flatten, tree_map_only
@@ -47,71 +39,11 @@ _VIEW_OPS = {
 }
 
 
-def _args_have_symints(args):
-    """Check if any args (including nested lists) contain SymInts."""
-    flat, _ = tree_flatten(args)
-    return any(isinstance(x, torch.SymInt) for x in flat)
-
-
 def _concretize_shape(shape):
     """Concretize a shape tuple, replacing SymInts with their hint values."""
-    return tuple(s.node.hint if isinstance(s, torch.SymInt) else s for s in shape)
+    from autoparallel.optimize_sharding import concretize_symint
 
-
-def _compute_local_dim(dim_spec, local_input_shape, output_dim, output_spec):
-    """Compute local size of one output dim from the view_groups dim mapping."""
-    if isinstance(dim_spec, InputDim):
-        return local_input_shape[dim_spec.input_dim]
-    elif isinstance(dim_spec, Flatten):
-        return functools.reduce(
-            operator.mul,
-            [
-                _compute_local_dim(d, local_input_shape, output_dim, output_spec)
-                for d in dim_spec.input_dims
-            ],
-        )
-    elif isinstance(dim_spec, Split):
-        inner_local = _compute_local_dim(
-            dim_spec.input_dim, local_input_shape, output_dim, output_spec
-        )
-        is_sharded = any(
-            p.is_shard() and p.dim == output_dim for p in output_spec.placements
-        )
-        if is_sharded and isinstance(inner_local, torch.SymInt):
-            # Derive from symbolic inner size to preserve dynamism.
-            # inner_local = local product of all pieces; divide out the other pieces.
-            other_product = 1
-            for i, s in enumerate(dim_spec.group_shape):
-                if i != dim_spec.split_id:
-                    other_product *= s
-            return inner_local // other_product
-        else:
-            # Concrete: use group_shape, adjust for sharding.
-            val = dim_spec.group_shape[dim_spec.split_id]
-            for mesh_dim, placement in enumerate(output_spec.placements):
-                if placement.is_shard() and placement.dim == output_dim:
-                    val = val // output_spec.mesh.size(mesh_dim)
-            return val
-    elif isinstance(dim_spec, Singleton):
-        return 1
-    else:
-        raise ValueError(f"Unknown dim spec: {dim_spec}")
-
-
-def _compute_local_view_shape(
-    global_input_shape, global_output_shape, local_input_shape, output_spec
-):
-    """Compute local view output shape using view_groups dim mapping.
-
-    Uses concrete global shapes to determine the dim mapping (Flatten, Split,
-    InputDim), then applies the mapping to the local input shape (which may
-    have symbolic dims from make_fx) to produce the local output shape.
-    """
-    mapping = view_groups(global_input_shape, global_output_shape)
-    return [
-        _compute_local_dim(dim_spec, local_input_shape, out_dim, output_spec)
-        for out_dim, dim_spec in enumerate(mapping)
-    ]
+    return tuple(concretize_symint(s) for s in shape)
 
 
 def _compute_shard_order(shard_order, reverse: bool):
@@ -129,21 +61,27 @@ def _compute_shard_order(shard_order, reverse: bool):
 def _filter_specs_for_local_map(flat_args, curr_specs, tgt_specs):
     """Filter curr/tgt specs to tensor-only entries for local_map HOPs.
 
-    Other ops filter out non-tensor/symint args from their specs already,
-    but local_map keeps them, so we need to strip them here.
+    flat_args may contain non-tensor values (SymInts, ints, None) that don't
+    have corresponding entries in curr_specs/tgt_specs. This function extracts
+    only the tensor entries from the specs.
     """
     curr_specs_t = []
     tgt_specs_t = []
-    for i, arg in enumerate(flat_args):
+    spec_idx = 0
+    for arg in flat_args:
         if isinstance(arg, torch.Tensor):
-            curr_specs_t.append(curr_specs[i])
-            tgt_specs_t.append(tgt_specs[i])
-        elif isinstance(arg, torch.SymInt):
-            assert curr_specs[i] is None
-            assert tgt_specs[i] is None
+            curr_specs_t.append(curr_specs[spec_idx])
+            tgt_specs_t.append(tgt_specs[spec_idx])
+            spec_idx += 1
+        elif isinstance(arg, (torch.SymInt, int, float, bool, type(None))):
+            # Non-tensor args don't have spec entries — skip them.
+            pass
         else:
-            raise ValueError("Unexpected local_map HOP argument")
+            raise ValueError(f"Unexpected local_map HOP argument type: {type(arg)}")
 
+    assert spec_idx == len(
+        curr_specs
+    ), f"Spec count mismatch: used {spec_idx} specs but had {len(curr_specs)}"
     assert len(curr_specs_t) == len(tgt_specs_t)
     return curr_specs_t, tgt_specs_t
 
@@ -154,9 +92,11 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
         module,
         sharding_placement,
         enable_ordered_sharding_optimization: bool = True,
+        dynamic: bool = False,
     ):
         super().__init__(module, garbage_collect_values=True, graph=None)
         self.sharding_placement = sharding_placement
+        self.dynamic = dynamic
         param_placement_order = {}
         if enable_ordered_sharding_optimization:
             param_placement_order = compute_optimal_placement_order_for_parameters(
@@ -225,7 +165,15 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
             all_input_nodes = self._get_input_nodes(node)
             curr_spec = self.sharding_placement[all_input_nodes[0]].output_specs[idx]
             tgt_spec = self.sharding_placement[node].input_specs[0]
-            new_args_0[idx] = self.redistribute_tensor(arg, curr_spec, tgt_spec, node)
+            # curr_spec/tgt_spec can be None for HOP-internal activations:
+            # tensors with data-dependent shapes (unbacked SymInts) that are
+            # saved by the forward local_map HOP and only consumed by the
+            # backward local_map HOP. These don't need redistribution because
+            # the HOP manages their distribution internally.
+            if curr_spec is not None and tgt_spec is not None:
+                new_args_0[idx] = self.redistribute_tensor(
+                    arg, curr_spec, tgt_spec, node
+                )
         else:
             tgt_spec = None
 
@@ -255,8 +203,13 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
         for n, arg, curr_spec, tgt_spec in zip(
             all_input_nodes, flat_args_t, curr_specs, tgt_specs
         ):
-            x = self.redistribute_tensor(arg, curr_spec, tgt_spec, node)
-            new_flat_args_t.append(x)
+            if curr_spec is None or tgt_spec is None:
+                # HOP-internal activations with data-dependent shapes (unbacked
+                # SymInts). See comment in _call_getitem for details.
+                new_flat_args_t.append(arg)
+            else:
+                x = self.redistribute_tensor(arg, curr_spec, tgt_spec, node)
+                new_flat_args_t.append(x)
             last_tgt_spec = tgt_spec
 
         new_flat_args = []
@@ -269,17 +222,40 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
 
         new_args = list(treespec.unflatten(new_flat_args))
 
-        # apply sharding to constructor functions as well
-        if target in TENSOR_FACTORY_OPS:
-            # scalar_tensor has a scalar as first arg, not a shape
-            if target != torch.ops.aten.scalar_tensor.default:
-                val = list(new_args[0])
+        # In static mode, shape args for factory and view ops are concrete
+        # global values baked into the graph. They need adjustment:
+        # - Factory ops: divide sharded dims by mesh size
+        # - View ops: wrap tensor as DTensor to convert global→local shapes
+        # In dynamic mode, SymInt shape args are computed from local tensors
+        # (via sym_size/mul nodes) and are already local. But concrete shape
+        # args are still global constants from the joint graph and need
+        # dividing by mesh size for sharded dims.
+        if target in TENSOR_FACTORY_OPS or (self.dynamic and target in _VIEW_OPS):
+            if target != torch.ops.aten.scalar_tensor.default and len(new_args) > 0:
                 spec = self.sharding_placement[node].output_specs
+                global_shape = _concretize_shape(node.meta["val"].shape)
+                orig_shape = (
+                    new_args[0] if target in TENSOR_FACTORY_OPS else new_args[1]
+                )
+                val = list(global_shape)
                 for mesh_size, placement in zip(spec.mesh.shape, spec.placements):
                     if placement.is_shard():
-                        # TODO: fix uneven cases ?
-                        val[placement.dim] //= mesh_size
-                new_args[0] = tuple(val)
+                        val[placement.dim] = val[placement.dim] // mesh_size
+                # Restore SymInt values (already local)
+                for i, s in enumerate(orig_shape):
+                    if isinstance(s, torch.SymInt):
+                        val[i] = s
+                if target in TENSOR_FACTORY_OPS:
+                    new_args[0] = tuple(val)
+                else:
+                    new_args[1] = val
+
+        if not self.dynamic and target in _VIEW_OPS and tgt_spec is not None:
+            new_args[0] = DTensor.from_local(
+                new_args[0], tgt_spec.mesh, tgt_spec.placements
+            )
+            new_args[0]._spec.shard_order = tgt_spec.shard_order
+            new_args[0] = new_args[0].contiguous()
 
         return new_args, last_tgt_spec
 
@@ -293,42 +269,6 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
             new_args, tgt_spec = self._call_getitem(args)
         else:
             new_args, tgt_spec = self._redistribute_and_adjust_args(target, args)
-
-        # View ops need special handling to convert global shape args to local.
-        # For static shapes, DTensor machinery handles this conversion.
-        # For dynamic shapes, we compute the local output shape using view_groups
-        # dim mapping applied to the local input tensor's shape. This avoids
-        # DTensor dispatch which can't handle symbolic expressions from make_fx.
-        if target in _VIEW_OPS and tgt_spec is not None:
-            if _args_have_symints(new_args):
-                output_spec = self.sharding_placement[self._curr_node].output_specs
-                # Get concrete global shapes from the joint graph's metadata.
-                # The tensor input node is the first Node arg of the view node.
-                input_node = [
-                    n
-                    for n in self._curr_node.all_input_nodes
-                    if isinstance(n.meta.get("val"), torch.Tensor)
-                ][0]
-                global_input_shape = _concretize_shape(input_node.meta["val"].shape)
-                global_output_shape = _concretize_shape(
-                    self._curr_node.meta["val"].shape
-                )
-                local_input_shape = new_args[0].shape
-                new_args[1] = _compute_local_view_shape(
-                    global_input_shape,
-                    global_output_shape,
-                    local_input_shape,
-                    output_spec,
-                )
-            else:
-                new_args[0] = DTensor.from_local(
-                    new_args[0], tgt_spec.mesh, tgt_spec.placements
-                )
-                # TODO: once `from_local` accept device order arg, we can remove the following
-                new_args[0]._spec.shard_order = tgt_spec.shard_order
-
-                # TODO: see if we can remove this contiguous properly
-                new_args[0] = new_args[0].contiguous()
 
         out = super().call_function(target, tuple(new_args), kwargs)
         out = tree_map_only(DTensor, lambda x: x.to_local(), out)
@@ -384,68 +324,67 @@ def _has_symbolic_shapes(gm):
 
 
 def _make_local_args(gm, sharding_placement):
-    """Create local FakeTensors for each placeholder by dividing sharded dims.
+    """Create local tensors for each placeholder via DTensor redistribute.
 
-    Computes the local shape by dividing sharded dims by the mesh size
-    (clean integer division, assumes even sharding). For dynamic shapes,
-    SymInt dims produce symbolic local sizes (e.g., s0 // 32).
+    Uses DTensor's redistribute to compute correct local shapes and strides.
+    When the FakeTensorMode has a ShapeEnv (dynamic shapes), re-creates the
+    local tensors with fresh SymInts for batch-dependent dims. The caller
+    must swap the ShapeEnv to a fresh one before calling this function.
     """
+    from torch.fx.experimental.symbolic_shapes import (
+        DimDynamic,
+        StatelessSymbolicContext,
+    )
+
     local_args = []
     for node in gm.graph.find_nodes(op="placeholder"):
         tensor = node.meta["val"]
-        assert isinstance(
-            tensor, FakeTensor
-        ), f"expected FakeTensor placeholder, got {type(tensor)}"
         tgt_spec = sharding_placement[node].input_specs[0]
         mesh = tgt_spec.mesh
+        curr_placement = (Replicate(),) * mesh.ndim
 
-        local_shape = list(tensor.shape)
-        for mesh_dim, placement in enumerate(tgt_spec.placements):
-            if placement.is_shard():
-                dim = placement.dim
-                local_shape[dim] = local_shape[dim] // mesh.size(mesh_dim)
+        # Use DTensor to compute the correct local shape and strides.
+        # Concretize any SymInts before DTensor to avoid ShapeEnv conflicts.
+        concrete_tensor = tensor
+        if isinstance(tensor, FakeTensor) and any(
+            isinstance(s, torch.SymInt) for s in tensor.shape
+        ):
+            with tensor.fake_mode:
+                concrete_tensor = torch.empty_strided(
+                    _concretize_shape(tensor.shape),
+                    _concretize_shape(tensor.stride()),
+                    dtype=tensor.dtype,
+                    device=tensor.device,
+                )
 
-        with tensor.fake_mode:
-            local = torch.empty(local_shape, dtype=tensor.dtype, device=tensor.device)
+        sharded = DTensor.from_local(
+            concrete_tensor, mesh, curr_placement
+        ).redistribute(mesh, tgt_spec.placements)
+        local = sharded.to_local()
+
+        # For dynamic shapes, re-create with fresh SymInts
+        if isinstance(tensor, FakeTensor) and tensor.fake_mode.shape_env is not None:
+            dynamic_sizes = [
+                DimDynamic.DYNAMIC if isinstance(s, torch.SymInt) else DimDynamic.STATIC
+                for s in tensor.shape
+            ]
+            real = torch.empty(
+                _concretize_shape(local.shape), dtype=local.dtype, device="meta"
+            )
+            sym_ctx = StatelessSymbolicContext(dynamic_sizes=dynamic_sizes)
+            local = tensor.fake_mode.from_tensor(real, symbolic_context=sym_ctx)
+            with tensor.fake_mode:
+                local = local.to(tensor.device)
+
         local_args.append(local)
     return local_args
-
-
-def _re_symbolize_graph(parallel_gm):
-    """Re-trace a parallel graph to replace old SymInts with fresh symbols.
-
-    The parallel graph produced by make_fx inside an existing FakeTensorMode
-    carries SymInts from the joint graph's ShapeEnv. Inductor can't codegen
-    these because they aren't derivable from the parallel graph's inputs.
-
-    This re-traces the graph with make_fx(tracing_mode='symbolic') outside
-    the FakeTensorMode, using real tensors on the original device. make_fx
-    creates a fresh ShapeEnv with clean symbols tied to the new placeholders.
-    """
-    concrete_args = []
-    for node in parallel_gm.graph.nodes:
-        if node.op != "placeholder":
-            continue
-        val = node.meta["val"]
-        if isinstance(val, torch.Tensor):
-            shape = tuple(
-                s.node.hint if isinstance(s, torch.SymInt) else s for s in val.shape
-            )
-            concrete_args.append(torch.empty(shape, dtype=val.dtype, device=val.device))
-        else:
-            concrete_args.append(val)
-
-    with unset_fake_temporarily():
-        return make_fx(
-            parallel_gm, tracing_mode="symbolic", _allow_non_fake_inputs=True
-        )(*concrete_args)
 
 
 def _lower_to_parallel_graph(gm, sharding_placement, local_args, dynamic=False):
     """Two-pass lowering: interpret with sharding collectives, then decompose."""
     decomp_table = _get_inductor_decomp_table()
 
-    interp = ApplyShardingInterpreter(gm, sharding_placement)
+    interp = ApplyShardingInterpreter(gm, sharding_placement, dynamic=dynamic)
 
     tracing_mode = "symbolic" if dynamic else "real"
 
@@ -461,10 +400,6 @@ def _lower_to_parallel_graph(gm, sharding_placement, local_args, dynamic=False):
             tracing_mode=tracing_mode,
         )(*local_args)
     cleanup_graph(parallel_gm)
-
-    if dynamic:
-        parallel_gm = _re_symbolize_graph(parallel_gm)
-        cleanup_graph(parallel_gm)
 
     return parallel_gm
 
@@ -512,6 +447,24 @@ def _shard_params_and_buffers(gm, sharding_placement, params_spec, buffers_spec)
 def apply_sharding_to_model(gm, sharding_placement, params_spec, buffers_spec):
     t0 = time.perf_counter()
     dynamic = _has_symbolic_shapes(gm)
+
+    # For dynamic shapes, swap ShapeEnv to a fresh one so that _make_local_args
+    # creates FakeTensors with fresh SymInts, and make_fx propagates them
+    # through the parallel graph. This produces symbols derivable from the
+    # parallel graph's own placeholders, which Inductor can codegen.
+    # The new ShapeEnv is kept (not restored) because the parallel graph's
+    # metadata references its symbols. update_joint_with_descriptors copies
+    # this metadata into joint_with_descriptors, making the old ShapeEnv unused.
+    if dynamic:
+        from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+        for node in gm.graph.find_nodes(op="placeholder"):
+            val = node.meta.get("val")
+            if isinstance(val, FakeTensor):
+                val.fake_mode.shape_env = ShapeEnv()
+                val.fake_mode.static_shapes = False
+                break
+
     local_args = _make_local_args(gm, sharding_placement)
     t1 = time.perf_counter()
 

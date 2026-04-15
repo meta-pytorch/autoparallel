@@ -107,11 +107,44 @@ from .shardings.propagation_rules import _create_all_options
 logger = logging.getLogger(__name__)
 
 
-def _concretize_symint(val):
-    """Concretize a SymInt to a plain int, pass through other values."""
+def concretize_symint(val):
+    """Concretize a SymInt to a plain int, pass through other values.
+
+    For unbacked SymInts (hint=None), returns the SymInt unchanged.
+    """
     if isinstance(val, torch.SymInt):
-        return val.node.hint
+        hint = val.node.hint
+        return hint if hint is not None else val
     return val
+
+
+def concretize_args(args):
+    """Concretize all SymInts and symbolic FakeTensors in an args tree.
+
+    Returns an args tree where:
+    - SymInts are replaced with their concrete hint values (via concretize_symint)
+    - FakeTensors with symbolic shapes are replaced with concrete FakeTensors
+    - Other values are left unchanged
+    """
+    from torch._subclasses.fake_tensor import FakeTensor
+
+    def concretize(x):
+        if isinstance(x, torch.SymInt):
+            return concretize_symint(x)
+        if isinstance(x, FakeTensor) and any(
+            isinstance(s, torch.SymInt) for s in x.shape
+        ):
+            concrete_shape = [concretize_symint(s) for s in x.shape]
+            concrete_stride = [concretize_symint(s) for s in x.stride()]
+            if any(not isinstance(s, int) for s in concrete_shape):
+                return x
+            with x.fake_mode:
+                return torch.empty_strided(
+                    concrete_shape, concrete_stride, dtype=x.dtype, device=x.device
+                )
+        return x
+
+    return tree_map_only((torch.SymInt, FakeTensor), concretize, args)
 
 
 def _produces_tensor(val):
@@ -121,37 +154,6 @@ def _produces_tensor(val):
     if isinstance(val, (tuple, list)):
         return any(_produces_tensor(v) for v in val)
     return False
-
-
-def _concretize_args(args):
-    """Concretize all SymInts and symbolic FakeTensors in an args tree.
-
-    Returns an args tree where:
-    - SymInts are replaced with their concrete hint values
-    - FakeTensors with symbolic shapes are replaced with concrete FakeTensors
-    - Other values are left unchanged
-    """
-    from torch._subclasses.fake_tensor import FakeTensor
-
-    def concretize(x):
-        if isinstance(x, torch.SymInt):
-            return x.node.hint
-        if isinstance(x, FakeTensor) and any(
-            isinstance(s, torch.SymInt) for s in x.shape
-        ):
-            concrete_shape = [
-                s.node.hint if isinstance(s, torch.SymInt) else s for s in x.shape
-            ]
-            concrete_stride = [
-                s.node.hint if isinstance(s, torch.SymInt) else s for s in x.stride()
-            ]
-            with x.fake_mode:
-                return torch.empty_strided(
-                    concrete_shape, concrete_stride, dtype=x.dtype, device=x.device
-                )
-        return x
-
-    return tree_map_only((torch.SymInt, FakeTensor), concretize, args)
 
 
 @dataclass
@@ -245,9 +247,9 @@ class ShardingOptimizer:
         strats = {}
         for node in self.graph.nodes:
             if node.op in ("placeholder", "get_attr"):
-                strats[node] = _create_all_options(
-                    self.mesh, node.meta["val"].shape, tensor=node.meta["val"]
-                )
+                val = node.meta["val"]
+                val = concretize_args(val)
+                strats[node] = _create_all_options(self.mesh, val.shape, tensor=val)
             elif node.op == "call_function":
                 if not _produces_tensor(node.meta["val"]):
                     # Shape-computation nodes (sym_size, operator.mul, etc.)
@@ -255,13 +257,13 @@ class ShardingOptimizer:
                     continue
                 user_strats = tree_map_only(
                     torch.fx.Node,
-                    lambda x: strats.get(x, _concretize_symint(x.meta["val"])),
+                    lambda x: strats.get(x, concretize_symint(x.meta["val"])),
                     node.args,
                 )
-                user_args = _concretize_args(
+                user_args = concretize_args(
                     tree_map_only(torch.fx.Node, lambda x: x.meta["val"], node.args)
                 )
-                user_kwargs = _concretize_args(
+                user_kwargs = concretize_args(
                     tree_map_only(torch.fx.Node, lambda x: x.meta["val"], node.kwargs)
                 )
                 strats[node] = get_placement_options_for_node(
