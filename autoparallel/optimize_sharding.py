@@ -262,20 +262,22 @@ class ShardingOptimizer:
                         for u in node.users
                     ), f"Non-tensor get_attr {node} is not used by a HOP"
             elif node.op == "call_function":
-                if not _produces_tensor(node.meta["val"]):
+                if not _produces_tensor(node.meta.get("val")):
                     # Shape-computation nodes (sym_size, operator.mul, etc.)
                     # produce scalars, not tensors — skip sharding.
                     continue
                 user_strats = tree_map_only(
                     torch.fx.Node,
-                    lambda x: strats.get(x, concretize_symint(x.meta["val"])),
+                    lambda x: strats.get(x, concretize_symint(x.meta.get("val"))),
                     node.args,
                 )
                 user_args = concretize_args(
-                    tree_map_only(torch.fx.Node, lambda x: x.meta["val"], node.args)
+                    tree_map_only(torch.fx.Node, lambda x: x.meta.get("val"), node.args)
                 )
                 user_kwargs = concretize_args(
-                    tree_map_only(torch.fx.Node, lambda x: x.meta["val"], node.kwargs)
+                    tree_map_only(
+                        torch.fx.Node, lambda x: x.meta.get("val"), node.kwargs
+                    )
                 )
                 strats[node] = get_placement_options_for_node(
                     self.mesh, node, user_strats, user_args, user_kwargs
