@@ -637,36 +637,36 @@ class TokenReorderer(nn.Module):
 
 
 def _token_dispatch(routed_input, num_tokens_per_expert, axis_name):
-    with fx_traceback.annotate({"comm_region": "token_dispatch"}):
-        ep_size = axis_size(axis_name)
 
+    ep_size = axis_size(axis_name)
+
+    with torch.no_grad():
+        num_tokens_per_expert_group = all_to_all(
+            num_tokens_per_expert,
+            None,
+            None,
+            axis_name,
+        )
+
+    if FORCE_BALANCED_ROUTING:
+        input_splits = None
+        output_splits = None
+    else:
         with torch.no_grad():
-            num_tokens_per_expert_group = all_to_all(
-                num_tokens_per_expert,
-                None,
-                None,
-                axis_name,
+            input_splits = (
+                num_tokens_per_expert.view(ep_size, -1)
+                .sum(dim=1)
+                .to(torch.device("cpu"), non_blocking=True)
             )
-
-        if FORCE_BALANCED_ROUTING:
-            input_splits = None
-            output_splits = None
-        else:
-            with torch.no_grad():
-                input_splits = (
-                    num_tokens_per_expert.view(ep_size, -1)
-                    .sum(dim=1)
-                    .to(torch.device("cpu"), non_blocking=True)
-                )
-                # NOTE: this would incur a device-to-host sync
-                output_splits = (
-                    num_tokens_per_expert_group.view(ep_size, -1)
-                    .sum(dim=1)
-                    .to(torch.device("cpu"), non_blocking=False)
-                )
-                input_splits = input_splits.tolist()
-                output_splits = output_splits.tolist()
-
+            # NOTE: this would incur a device-to-host sync
+            output_splits = (
+                num_tokens_per_expert_group.view(ep_size, -1)
+                .sum(dim=1)
+                .to(torch.device("cpu"), non_blocking=False)
+            )
+            input_splits = input_splits.tolist()
+            output_splits = output_splits.tolist()
+    with fx_traceback.annotate({"comm_region": "token_dispatch"}):
         routed_input = all_to_all(
             routed_input,
             output_splits,

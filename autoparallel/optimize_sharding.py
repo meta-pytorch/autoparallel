@@ -72,6 +72,7 @@ runtime cost while satisfying all constraints.
 import logging
 import math
 import operator
+import tempfile
 import time
 from collections import defaultdict
 from dataclasses import dataclass
@@ -247,9 +248,19 @@ class ShardingOptimizer:
         strats = {}
         for node in self.graph.nodes:
             if node.op in ("placeholder", "get_attr"):
-                val = node.meta["val"]
-                val = concretize_args(val)
-                strats[node] = _create_all_options(self.mesh, val.shape, tensor=val)
+                val = node.meta.get("val")
+                if isinstance(val, torch.Tensor):
+                    val = concretize_args(val)
+                    strats[node] = _create_all_options(self.mesh, val.shape, tensor=val)
+                else:
+                    # GraphModule submodules used by HOPs — not added to
+                    # strats, invisible to the ILP. _all_input_nodes filters
+                    # them. Guard: every skipped node must be consumed by a HOP.
+                    assert any(
+                        isinstance(u.target, torch._ops.HigherOrderOperator)
+                        or "local_map" in u.name
+                        for u in node.users
+                    ), f"Non-tensor get_attr {node} is not used by a HOP"
             elif node.op == "call_function":
                 if not _produces_tensor(node.meta["val"]):
                     # Shape-computation nodes (sym_size, operator.mul, etc.)
@@ -306,12 +317,14 @@ class ShardingOptimizer:
         """Variant of node.all_input_nodes that preserves duplicate nodes.
 
         Filters out nodes not in self.strats (e.g., shape-computation nodes
-        like sym_size / operator.mul that produce scalars, not tensors).
+        like sym_size / operator.mul, and HOP submodule get_attr nodes).
         """
         return [n for n in all_input_nodes(node) if n in self.strats]
 
     def walk_over_options(self, node, constrain_arg=None):
         """Yield (argi, out_idx, inp_idx) for all valid strategy combinations."""
+        if node not in self.strats:
+            return
         op_strategy = self.strats[node]
         for argi in range(len(op_strategy.strategies[0].input_specs)):
             if constrain_arg is not None and argi != constrain_arg:
@@ -329,9 +342,10 @@ class ShardingOptimizer:
         """
         # Map each key to its canonical root key
         root_for_key = {}
-        for node_idx, (node, _) in enumerate(self.strats.items()):
+        for node, _ in self.strats.items():
             if node.op == "output":
                 continue
+            node_idx = self.node_map[node]
             for argi, out_idx, inp_idx in self.walk_over_options(node):
                 key = (node_idx, argi, out_idx, inp_idx)
                 root_for_key[key] = self.cluster_links.get(key, key)
@@ -408,11 +422,13 @@ class ShardingOptimizer:
         n_cluster_copied = 0
 
         decision_vars = {}
-        strats_items = list(enumerate(self.strats.items()))
+        strats_items = [
+            (self.node_map[node], node, strat) for node, strat in self.strats.items()
+        ]
 
         # Two passes: root nodes first (so their entries exist), then linked nodes.
         for is_linked_pass in (False, True):
-            for node_idx, (node, op_strategy) in strats_items:
+            for node_idx, node, op_strategy in strats_items:
                 if node.op == "output":
                     continue
                 is_linked = node_idx in self._cluster_linked_node_idxs
@@ -657,7 +673,9 @@ class ShardingOptimizer:
                 user_argi = [
                     i for i, n in enumerate(self._all_input_nodes(user)) if n == node
                 ]
-                assert len(user_argi) == 1
+                assert len(user_argi) >= 1
+                # Use the first matching arg; the same-output-across-args
+                # constraint already ensures all args agree.
                 user_argi = user_argi[0]
 
                 vars_producer = self._collect_vars(
@@ -683,6 +701,19 @@ class ShardingOptimizer:
                         group_by="inp_idx",
                         resolve_clusters=True,
                     )
+
+                # Skip edges where the consumer arg has no sharding decision
+                # (e.g. None input_specs for HOP SymInt args).
+                if not vars_consumer or not vars_producer:
+                    user_strat = self.strats[user]
+                    assert (
+                        user_argi < len(user_strat.strategies[0].input_specs)
+                        and user_strat.strategies[0].input_specs[user_argi] is None
+                    ), (
+                        f"Missing variables for non-None input_spec at "
+                        f"{user}[{user_argi}]"
+                    )
+                    continue
 
                 assert (
                     vars_producer.keys() == vars_consumer.keys()
@@ -779,7 +810,12 @@ class ShardingOptimizer:
 
     def _solve(self, verbose=False):
         solver = pulp.PULP_CBC_CMD(msg=verbose)
-        self.prob.solve(solver)
+        # Use a dedicated temp directory for PuLP's intermediate files (.mps,
+        # .sol, etc.) so they are always cleaned up, even if the process is
+        # killed.  Without this, leftover files can fill up /tmp (tmpfs).
+        with tempfile.TemporaryDirectory() as tmpdir:
+            solver.tmpDir = tmpdir
+            self.prob.solve(solver)
 
         self.selected_keys = [
             key for key, dv in self.decision_vars.items() if dv.var.value() == 1
@@ -1222,8 +1258,17 @@ class ShardingOptimizer:
         num_inp_a = len(self.strats[node_a].strategies[0].redistribute_cost[0])
         num_inp_b = len(self.strats[node_b].strategies[0].redistribute_cost[0])
         for out_idx, sp in enumerate(strat_a):
-            # TODO: fix this case
             if sp not in strat_b:
+                # This placement exists in node_a but not in node_b.
+                # Disable it: force sum of its decision variables to 0.
+                v_a = [
+                    self.pulp_variables[(idx_a, 0, out_idx, inp_idx)]
+                    for inp_idx in range(num_inp_a)
+                ]
+                self.prob += (
+                    pulp.lpSum(v_a) == 0,
+                    self._get_next_name(constraint_name + "_disable"),
+                )
                 continue
             out_idx_b = strat_b.index(sp)
             v_a = [

@@ -896,7 +896,11 @@ def overlap_fw_bw(
         output,
         saved_intermediates,
     ) = _run_multiplexed_fw_bw_module(
-        multiplexed_fw_bw_module, fw_stage.graph_meta, bw_stage.graph_meta, bw_fw_args
+        multiplexed_fw_bw_module,
+        fw_stage.graph_meta,
+        bw_stage.graph_meta,
+        bw_fw_args,
+        inductor=fw_stage.inductor,
     )
 
     bw_stage._accumulate_stage_unsharded_grads(param_buffer_grads)

@@ -110,8 +110,9 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
 
     def _get_input_nodes(self, node):
         # node.all_input_nodes deduplicates, but we need repeated nodes preserved.
-        # Filter out shape-computation nodes (sym_size, operator.mul, etc.)
-        # that produce scalars and have no sharding placement.
+        # Filter out nodes without sharding entries: HOP submodule nodes
+        # (get_attr for GraphModules) and shape-computation nodes (sym_size,
+        # operator.mul, etc.) that produce scalars.
         return [n for n in all_input_nodes(node) if n in self.sharding_placement]
 
     def _set_origin_and_target_device_order(self, node, curr_spec, tgt_spec):
@@ -192,10 +193,20 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
 
         flat_args, treespec = tree_flatten(args)
         flat_args_t = [x for x in flat_args if isinstance(x, torch.Tensor)]
-        if len(flat_args_t) < len(flat_args) and "local_map" in node.name:
-            curr_specs, tgt_specs = _filter_specs_for_local_map(
-                flat_args, curr_specs, tgt_specs
-            )
+        if len(flat_args_t) < len(curr_specs):
+            # HOPs have mixed arg types (tensors, SymInts, etc.).
+            # Filter specs to tensor-only entries matching flat_args_t.
+            filtered_nodes = []
+            filtered_curr = []
+            filtered_tgt = []
+            for n, cs, ts in zip(all_input_nodes, curr_specs, tgt_specs):
+                if ts is not None:
+                    filtered_nodes.append(n)
+                    filtered_curr.append(cs)
+                    filtered_tgt.append(ts)
+            all_input_nodes = filtered_nodes
+            curr_specs = filtered_curr
+            tgt_specs = filtered_tgt
 
         assert len(flat_args_t) == len(curr_specs) == len(tgt_specs)
         last_tgt_spec = None
