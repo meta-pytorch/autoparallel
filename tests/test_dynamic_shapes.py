@@ -54,6 +54,41 @@ class TransformerBlock(nn.Module):
         return o0 + o
 
 
+class ViewHeavyModel(nn.Module):
+    """Model that exercises view/reshape with batch-dependent shapes."""
+
+    def __init__(self, dim, nheads):
+        super().__init__()
+        self.nheads = nheads
+        self.head_dim = dim // nheads
+        self.proj = nn.Linear(dim, dim, bias=False)
+        self.out_proj = nn.Linear(dim, dim, bias=False)
+
+    def forward(self, x):
+        bs, seq, _ = x.shape
+        # linear on last dim (no batch/seq flattening)
+        y = self.proj(x)
+        # unflatten: [B, S, D] -> [B, S, nheads, head_dim]
+        y = y.view(bs, seq, self.nheads, self.head_dim)
+        # permute + flatten: [B, nheads, S, head_dim] -> [B, S, D]
+        y = y.permute(0, 2, 1, 3).contiguous().view(bs, seq, -1)
+        return self.out_proj(y)
+
+
+class FactoryOpModel(nn.Module):
+    """Model that creates tensors with input-dependent shapes."""
+
+    def __init__(self, dim):
+        super().__init__()
+        self.linear = nn.Linear(dim, dim, bias=False)
+
+    def forward(self, x):
+        out = self.linear(x)
+        # Factory op with batch-dependent shape
+        mask = torch.zeros(x.shape[0], x.shape[1], dtype=x.dtype, device=x.device)
+        return out + mask.unsqueeze(-1)
+
+
 # ============================================================================
 # Unit tests — self-contained, no mesh/GPU required
 # ============================================================================
@@ -477,6 +512,172 @@ class TestConcretizeShape:
         assert all(isinstance(s, int) for s in result)
 
 
+class TestLocalizeShapeArg:
+    """Tests for _localize_shape_arg in apply_sharding."""
+
+    def _make_node_with_shape(self, shape, fake_mode):
+        """Create a minimal FX node with a FakeTensor meta['val']."""
+        from torch.fx import Graph
+
+        graph = Graph()
+        node = graph.placeholder("x")
+        real = torch.empty(shape, device="meta")
+        node.meta["val"] = fake_mode.from_tensor(real)
+        with fake_mode:
+            node.meta["val"] = node.meta["val"].to("cpu")
+        return node
+
+    def _make_output_spec(self, placements, mesh_shape):
+        from torch.distributed._tensor.placement_types import DTensorSpec
+
+        class FakeMesh:
+            def __init__(self, shape):
+                self._shape = shape
+                self.ndim = len(shape)
+
+            @property
+            def shape(self):
+                return self._shape
+
+            def size(self, dim):
+                return self._shape[dim]
+
+        return DTensorSpec(mesh=FakeMesh(mesh_shape), placements=tuple(placements))
+
+    def test_fully_concrete_shape(self):
+        """All concrete args: divide sharded dims by mesh size."""
+        from torch._subclasses import FakeTensorMode
+
+        from autoparallel.apply_sharding import _localize_shape_arg
+
+        fake_mode = FakeTensorMode()
+        # Node meta["val"] must be the OUTPUT shape (what the view produces)
+        node = self._make_node_with_shape((256 * 256, 6144), fake_mode)
+        spec = self._make_output_spec([Shard(0), Replicate()], (32, 8))
+
+        result = _localize_shape_arg(node, [256 * 256, 6144], spec)
+
+        assert result[0] == (256 * 256) // 32  # dim 0 sharded by dp
+        assert result[1] == 6144  # dim 1 not sharded
+
+    def test_mixed_symint_and_concrete(self):
+        """SymInt args preserved, concrete args divided."""
+        from torch._subclasses import FakeTensorMode
+        from torch.fx.experimental.symbolic_shapes import (
+            DimDynamic,
+            ShapeEnv,
+            StatelessSymbolicContext,
+        )
+
+        from autoparallel.apply_sharding import _localize_shape_arg
+
+        shape_env = ShapeEnv()
+        fake_mode = FakeTensorMode(shape_env=shape_env, static_shapes=False)
+        # Output shape: [batch*seq, hidden] — 2 dims
+        node = self._make_node_with_shape((256 * 256, 6144), fake_mode)
+
+        # Simulate interpreter producing SymInt for batch*seq, concrete for hidden
+        real = torch.empty(2048, device="meta")
+        sym_ctx = StatelessSymbolicContext(dynamic_sizes=[DimDynamic.DYNAMIC])
+        sym_val = fake_mode.from_tensor(real, symbolic_context=sym_ctx)
+        sym_batch_seq = sym_val.shape[0]
+
+        spec = self._make_output_spec([Shard(0), Shard(1)], (32, 8))
+        result = _localize_shape_arg(node, [sym_batch_seq, 6144], spec)
+
+        # SymInt preserved (already local)
+        assert isinstance(result[0], torch.SymInt)
+        assert result[0] is sym_batch_seq
+        # Concrete divided by tp mesh
+        assert result[1] == 6144 // 8
+
+    def test_multi_dim_sharding(self):
+        """Same dim sharded on multiple mesh dims."""
+        from torch._subclasses import FakeTensorMode
+
+        from autoparallel.apply_sharding import _localize_shape_arg
+
+        fake_mode = FakeTensorMode()
+        node = self._make_node_with_shape((1024, 64), fake_mode)
+        spec = self._make_output_spec([Shard(0), Shard(0)], (4, 64))
+
+        result = _localize_shape_arg(node, [1024, 64], spec)
+
+        # dim 0 divided by both mesh dims: 1024 // 4 // 64 = 4
+        assert result[0] == 4
+        assert result[1] == 64
+
+
+class TestCheckForwardArgsMultiInput:
+    """Tests for _check_forward_args with multiple inputs."""
+
+    def test_two_inputs_different_batch_accepted(self):
+        from torch._subclasses import FakeTensorMode
+        from torch.fx.experimental.symbolic_shapes import (
+            DimDynamic,
+            ShapeEnv,
+            StatelessSymbolicContext,
+        )
+
+        from autoparallel.input_validation import _check_forward_args
+
+        shape_env = ShapeEnv()
+        fake_mode = FakeTensorMode(shape_env=shape_env, static_shapes=False)
+
+        t1 = fake_mode.from_tensor(
+            torch.empty(16, 128),
+            symbolic_context=StatelessSymbolicContext(
+                dynamic_sizes=[DimDynamic.DYNAMIC, DimDynamic.STATIC]
+            ),
+        )
+        t2 = fake_mode.from_tensor(
+            torch.empty(16, 64),
+            symbolic_context=StatelessSymbolicContext(
+                dynamic_sizes=[DimDynamic.DYNAMIC, DimDynamic.STATIC]
+            ),
+        )
+
+        # Different batch sizes accepted
+        _check_forward_args([torch.randn(32, 128), torch.randn(32, 64)], [t1, t2])
+
+    def test_two_inputs_wrong_feature_rejected(self):
+        from torch._subclasses import FakeTensorMode
+        from torch.fx.experimental.symbolic_shapes import (
+            DimDynamic,
+            ShapeEnv,
+            StatelessSymbolicContext,
+        )
+
+        from autoparallel.input_validation import _check_forward_args
+
+        shape_env = ShapeEnv()
+        fake_mode = FakeTensorMode(shape_env=shape_env, static_shapes=False)
+
+        t1 = fake_mode.from_tensor(
+            torch.empty(16, 128),
+            symbolic_context=StatelessSymbolicContext(
+                dynamic_sizes=[DimDynamic.DYNAMIC, DimDynamic.STATIC]
+            ),
+        )
+        t2 = fake_mode.from_tensor(
+            torch.empty(16, 64),
+            symbolic_context=StatelessSymbolicContext(
+                dynamic_sizes=[DimDynamic.DYNAMIC, DimDynamic.STATIC]
+            ),
+        )
+
+        # Wrong feature dim on second input rejected
+        with pytest.raises(ValueError, match="has shape"):
+            _check_forward_args([torch.randn(32, 128), torch.randn(32, 999)], [t1, t2])
+
+    def test_arg_count_mismatch_rejected(self):
+        from autoparallel.input_validation import _check_forward_args
+
+        expected = [torch.empty(4, 8, device="meta")]
+        with pytest.raises(ValueError, match="expected 1"):
+            _check_forward_args([torch.randn(4, 8), torch.randn(4, 8)], expected)
+
+
 # ============================================================================
 # Integration tests — require fake process group and mesh fixtures
 # ============================================================================
@@ -688,3 +889,102 @@ def test_dynamic_check_forward_args_accepts_different_batch(device_mesh_1d):
             [torch.randn(local_bs, dim1 + 1)],
             expected,
         )
+
+
+@apply_cuda_patches
+def test_dynamic_apply_placement_view_heavy(device_mesh_2d):
+    """apply_placement with dynamic=True for a view-heavy model.
+
+    Exercises the _localize_shape_arg path for view/reshape ops where
+    shape args mix SymInts (batch-dependent, already local) and concrete
+    ints (global constants needing division by mesh size).
+    """
+    dim = 6144
+    nheads = 48
+    bs = 8 * device_mesh_2d.shape[0]
+
+    def input_fn():
+        return torch.randn(bs, 256, dim, device="cuda", requires_grad=True)
+
+    with torch.device("meta"):
+        model = ViewHeavyModel(dim, nheads)
+
+    placement = (Shard(0), Replicate())
+    with AutoParallel(
+        model, input_fn, device_mesh_2d, dynamic=True, compile=False
+    ) as autop:
+        autop.add_input_constraints([placement])
+        autop.add_output_constraints([placement])
+        autop.optimize_placement(verbose=False)
+        parallel_model = autop.apply_placement()
+
+    assert parallel_model is not None
+
+
+@apply_cuda_patches
+def test_dynamic_apply_placement_factory_op(device_mesh_1d):
+    """apply_placement with dynamic=True for a model with factory ops.
+
+    Exercises _localize_shape_arg for factory ops where shape depends
+    on the symbolic batch dimension.
+    """
+    dim = 1024
+    bs = 2048 * device_mesh_1d.shape[0]
+
+    def input_fn():
+        return torch.randn(bs, 64, dim, device="cuda", requires_grad=True)
+
+    with torch.device("meta"):
+        model = FactoryOpModel(dim)
+
+    placement = (Shard(0),)
+    with AutoParallel(
+        model, input_fn, device_mesh_1d, dynamic=True, compile=False
+    ) as autop:
+        autop.add_input_constraints([placement])
+        autop.add_output_constraints([placement])
+        autop.optimize_placement(verbose=False)
+        parallel_model = autop.apply_placement()
+
+    assert parallel_model is not None
+
+
+@apply_cuda_patches
+def test_dynamic_vs_static_parity_view_heavy(device_mesh_2d):
+    """ILP placement and apply_placement parity for view-heavy model."""
+    dim = 6144
+    nheads = 48
+    bs = 8 * device_mesh_2d.shape[0]
+
+    def input_fn():
+        return torch.randn(bs, 256, dim, device="cuda", requires_grad=True)
+
+    placement = (Shard(0), Replicate())
+
+    # Static
+    with torch.device("meta"):
+        model = ViewHeavyModel(dim, nheads)
+    with AutoParallel(model, input_fn, device_mesh_2d, dynamic=False) as autop_s:
+        autop_s.add_input_constraints([placement])
+        autop_s.add_output_constraints([placement])
+        static_placement = autop_s.optimize_placement(verbose=False)
+        autop_s.apply_placement()
+
+    # Dynamic
+    with torch.device("meta"):
+        model = ViewHeavyModel(dim, nheads)
+    with AutoParallel(model, input_fn, device_mesh_2d, dynamic=True) as autop_d:
+        autop_d.add_input_constraints([placement])
+        autop_d.add_output_constraints([placement])
+        dynamic_placement = autop_d.optimize_placement(verbose=False)
+        autop_d.apply_placement()
+
+    # Compare param placements
+    param_nodes_s = get_param_nodes(autop_s.gm.graph)
+    param_nodes_d = get_param_nodes(autop_d.gm.graph)
+    for node_s, node_d in zip(param_nodes_s, param_nodes_d):
+        sp = static_placement[node_s].output_specs.placements
+        dp = dynamic_placement[node_d].output_specs.placements
+        assert (
+            sp == dp
+        ), f"Param placement mismatch for {node_s.name}: static={sp} vs dynamic={dp}"
