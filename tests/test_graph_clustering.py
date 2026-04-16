@@ -129,9 +129,9 @@ def test_clustering_high_coverage(device_mesh_2d):
 
 
 def test_clustering_no_forward_backward_mixing(device_mesh_2d):
-    """Cluster groups should not mix forward and backward nodes from
-    different operations. The partitioner_tag in the hash prevents
-    different-phase nodes with identical shapes from being clustered."""
+    """Each cluster group's regions should contain only forward or only
+    backward nodes, never a mix. Expansion must not cross the phase boundary
+    by following saved-tensor edges from backward into forward."""
     n_layers = 4
     autop, _ = _setup_llama_autop(device_mesh_2d, n_layers=n_layers)
     with autop:
@@ -145,21 +145,7 @@ def test_clustering_no_forward_backward_mixing(device_mesh_2d):
         )
 
     for i, group in enumerate(clusters):
-        region0 = group[0]
-        targets = set(str(n.target) for n in region0)
-        tags = set(n.meta.get("partitioner_tag") for n in region0)
-        # A node's target+tag should be consistent within a region.
-        # The hash includes both, so different targets or different tags
-        # in the same region means expansion crossed a boundary — which
-        # is fine as long as both sides are truly identical. But pure
-        # forward ops should never share a root hash with pure backward
-        # ops of a *different* operation.
-        for region in group[1:]:
-            other_targets = set(str(n.target) for n in region)
-            other_tags = set(n.meta.get("partitioner_tag") for n in region)
-            assert (
-                targets == other_targets
-            ), f"Cluster group {i}: regions have different op targets"
-            assert (
-                tags == other_tags
-            ), f"Cluster group {i}: regions have different phase tags"
+        for j, region in enumerate(group):
+            tags = set(n.meta.get("partitioner_tag") for n in region)
+            tags.discard(None)
+            assert len(tags) <= 1, f"Cluster group {i}, region {j} mixes phases: {tags}"
