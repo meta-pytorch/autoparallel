@@ -46,6 +46,26 @@ def _concretize_shape(shape):
     return tuple(concretize_symint(s) for s in shape)
 
 
+def _localize_shape_arg(node, shape_arg, output_spec):
+    """Convert a global shape arg to local by dividing sharded dims.
+
+    Computes the local shape from the global shape in node.meta["val"],
+    dividing sharded dims by the corresponding mesh sizes. SymInt values
+    in shape_arg (computed from local tensors via sym_size/mul nodes)
+    are preserved as-is since they are already local.
+    """
+    global_shape = _concretize_shape(node.meta["val"].shape)
+    local_shape = list(global_shape)
+    for mesh_size, placement in zip(output_spec.mesh.shape, output_spec.placements):
+        if placement.is_shard():
+            local_shape[placement.dim] = local_shape[placement.dim] // mesh_size
+    # Restore SymInt values from the interpreter (already local)
+    for i, s in enumerate(shape_arg):
+        if isinstance(s, torch.SymInt):
+            local_shape[i] = s
+    return local_shape
+
+
 def _compute_shard_order(shard_order, reverse: bool):
     result = []
     for tensor_dim, mesh_dims in shard_order:
@@ -218,34 +238,24 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
 
         new_args = list(treespec.unflatten(new_flat_args))
 
-        # In static mode, shape args for factory and view ops are concrete
-        # global values baked into the graph. They need adjustment:
-        # - Factory ops: divide sharded dims by mesh size
-        # - View ops: wrap tensor as DTensor to convert global→local shapes
-        # In dynamic mode, SymInt shape args are computed from local tensors
-        # (via sym_size/mul nodes) and are already local. But concrete shape
-        # args are still global constants from the joint graph and need
-        # dividing by mesh size for sharded dims.
-        if target in TENSOR_FACTORY_OPS or (self.dynamic and target in _VIEW_OPS):
-            if target != torch.ops.aten.scalar_tensor.default and len(new_args) > 0:
+        # Localize shape args for factory and view ops.
+        # In static mode, shape args are concrete global values baked into the
+        # graph. In dynamic mode, SymInt args are already local (computed from
+        # local tensors via sym_size/mul), but concrete args are still global.
+        # _localize_shape_arg handles both: divides global shape by mesh size,
+        # then preserves any SymInt values from the interpreter.
+        if target in TENSOR_FACTORY_OPS:
+            if target != torch.ops.aten.scalar_tensor.default:
                 spec = self.sharding_placement[node].output_specs
-                global_shape = _concretize_shape(node.meta["val"].shape)
-                orig_shape = (
-                    new_args[0] if target in TENSOR_FACTORY_OPS else new_args[1]
-                )
-                val = list(global_shape)
-                for mesh_size, placement in zip(spec.mesh.shape, spec.placements):
-                    if placement.is_shard():
-                        val[placement.dim] = val[placement.dim] // mesh_size
-                # Restore SymInt values (already local)
-                for i, s in enumerate(orig_shape):
-                    if isinstance(s, torch.SymInt):
-                        val[i] = s
-                if target in TENSOR_FACTORY_OPS:
-                    new_args[0] = tuple(val)
-                else:
-                    new_args[1] = val
+                new_args[0] = tuple(_localize_shape_arg(node, new_args[0], spec))
+        elif self.dynamic and target in _VIEW_OPS:
+            spec = self.sharding_placement[node].output_specs
+            new_args[1] = _localize_shape_arg(node, new_args[1], spec)
 
+        # In static mode, view ops use DTensor wrapping to convert global
+        # shape args to local (DTensor handles the global→local conversion
+        # internally). Not needed in dynamic mode since shape args are already
+        # localized above.
         if not self.dynamic and target in _VIEW_OPS and tgt_spec is not None:
             new_args[0] = DTensor.from_local(
                 new_args[0], tgt_spec.mesh, tgt_spec.placements
