@@ -3,15 +3,9 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
-import pytest
-import torch
 from torch.distributed.tensor._dtensor_spec import ShardOrderEntry
-from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
-from autoparallel.apply_sharding import (
-    _compute_shard_order,
-    _filter_specs_for_local_map,
-)
+from autoparallel.apply_sharding import _compute_shard_order
 
 
 class TestComputeShardOrder:
@@ -44,44 +38,3 @@ class TestComputeShardOrder:
     def test_empty(self):
         assert _compute_shard_order((), reverse=False) == ()
         assert _compute_shard_order((), reverse=True) == ()
-
-
-def _make_symint(val: int) -> torch.SymInt:
-    shape_env = ShapeEnv()
-    from torch._dynamo.source import ConstantSource
-
-    sym = shape_env.create_symbol(val, source=ConstantSource(source_name=f"s{val}"))
-    return shape_env.create_symintnode(sym, hint=val)
-
-
-class TestFilterSpecsForLocalMap:
-    def test_tensors_only(self):
-        flat_args = [torch.tensor(1.0), torch.tensor(2.0)]
-        curr_specs = ["spec_a", "spec_b"]
-        tgt_specs = ["spec_c", "spec_d"]
-        c, t = _filter_specs_for_local_map(flat_args, curr_specs, tgt_specs)
-        assert c == ["spec_a", "spec_b"]
-        assert t == ["spec_c", "spec_d"]
-
-    def test_mixed_tensor_and_symint(self):
-        s = _make_symint(3)
-        flat_args = [torch.tensor(1.0), s, torch.tensor(2.0)]
-        # specs only have entries for tensor args (SymInts are excluded)
-        curr_specs = ["spec_a", "spec_b"]
-        tgt_specs = ["spec_c", "spec_d"]
-        c, t = _filter_specs_for_local_map(flat_args, curr_specs, tgt_specs)
-        assert c == ["spec_a", "spec_b"]
-        assert t == ["spec_c", "spec_d"]
-
-    def test_symint_with_non_none_spec_raises(self):
-        s = _make_symint(3)
-        flat_args = [s]
-        # No specs for SymInt-only args — passes with empty specs
-        c, t = _filter_specs_for_local_map(flat_args, [], [])
-        assert c == []
-        assert t == []
-
-    def test_unexpected_type_raises(self):
-        flat_args = ["unexpected_string"]
-        with pytest.raises(ValueError, match="Unexpected local_map HOP argument"):
-            _filter_specs_for_local_map(flat_args, [], [])

@@ -318,10 +318,22 @@ class ShardingOptimizer:
     def _all_input_nodes(self, node):
         """Variant of node.all_input_nodes that preserves duplicate nodes.
 
-        Filters out nodes not in self.strats (e.g., shape-computation nodes
-        like sym_size / operator.mul, and HOP submodule get_attr nodes).
+        Filters out nodes not in self.strats:
+        - get_attr: HOP submodule nodes (GraphModules)
+        - call_function producing non-tensors: shape-computation nodes
+          (sym_size, operator.mul, etc.)
         """
-        return [n for n in all_input_nodes(node) if n in self.strats]
+        result = []
+        for x in all_input_nodes(node):
+            if x in self.strats:
+                result.append(x)
+            elif x.op != "get_attr":
+                val = x.meta.get("val")
+                assert not isinstance(val, torch.Tensor), (
+                    f"Tensor-producing node {x} (op={x.op}) unexpectedly "
+                    f"missing from strats"
+                )
+        return result
 
     def walk_over_options(self, node, constrain_arg=None):
         """Yield (argi, out_idx, inp_idx) for all valid strategy combinations."""

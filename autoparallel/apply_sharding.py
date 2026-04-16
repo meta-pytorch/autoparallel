@@ -58,34 +58,6 @@ def _compute_shard_order(shard_order, reverse: bool):
     return tuple(result)
 
 
-def _filter_specs_for_local_map(flat_args, curr_specs, tgt_specs):
-    """Filter curr/tgt specs to tensor-only entries for local_map HOPs.
-
-    flat_args may contain non-tensor values (SymInts, ints, None) that don't
-    have corresponding entries in curr_specs/tgt_specs. This function extracts
-    only the tensor entries from the specs.
-    """
-    curr_specs_t = []
-    tgt_specs_t = []
-    spec_idx = 0
-    for arg in flat_args:
-        if isinstance(arg, torch.Tensor):
-            curr_specs_t.append(curr_specs[spec_idx])
-            tgt_specs_t.append(tgt_specs[spec_idx])
-            spec_idx += 1
-        elif isinstance(arg, (torch.SymInt, int, float, bool, type(None))):
-            # Non-tensor args don't have spec entries — skip them.
-            pass
-        else:
-            raise ValueError(f"Unexpected local_map HOP argument type: {type(arg)}")
-
-    assert spec_idx == len(
-        curr_specs
-    ), f"Spec count mismatch: used {spec_idx} specs but had {len(curr_specs)}"
-    assert len(curr_specs_t) == len(tgt_specs_t)
-    return curr_specs_t, tgt_specs_t
-
-
 class ApplyShardingInterpreter(torch.fx.Interpreter):
     def __init__(
         self,
@@ -110,10 +82,23 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
 
     def _get_input_nodes(self, node):
         # node.all_input_nodes deduplicates, but we need repeated nodes preserved.
-        # Filter out nodes without sharding entries: HOP submodule nodes
-        # (get_attr for GraphModules) and shape-computation nodes (sym_size,
-        # operator.mul, etc.) that produce scalars.
-        return [n for n in all_input_nodes(node) if n in self.sharding_placement]
+        # Filter out nodes without sharding entries:
+        # - get_attr: HOP submodule nodes (GraphModules)
+        # - call_function producing non-tensors: shape-computation nodes
+        #   (sym_size, operator.mul, etc.)
+        result = []
+        for x in all_input_nodes(node):
+            if x in self.sharding_placement:
+                result.append(x)
+            elif x.op != "get_attr":
+                # call_function nodes not in sharding_placement should only be
+                # scalar shape-computation nodes, not tensor producers.
+                val = x.meta.get("val")
+                assert not isinstance(val, torch.Tensor), (
+                    f"Tensor-producing node {x} (op={x.op}) unexpectedly "
+                    f"missing from sharding_placement"
+                )
+        return result
 
     def _set_origin_and_target_device_order(self, node, curr_spec, tgt_spec):
         # shard_order should be automatically assigned once `placements` is set
@@ -472,12 +457,21 @@ def apply_sharding_to_model(gm, sharding_placement, params_spec, buffers_spec):
     if dynamic:
         from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
+        # Find the shared FakeTensorMode and swap its ShapeEnv.
+        # All placeholder FakeTensors must share the same mode.
+        fake_mode = None
         for node in gm.graph.find_nodes(op="placeholder"):
             val = node.meta.get("val")
             if isinstance(val, FakeTensor):
-                val.fake_mode.shape_env = ShapeEnv()
-                val.fake_mode.static_shapes = False
-                break
+                if fake_mode is None:
+                    fake_mode = val.fake_mode
+                else:
+                    assert (
+                        val.fake_mode is fake_mode
+                    ), "All placeholder FakeTensors must share the same FakeTensorMode"
+        if fake_mode is not None:
+            fake_mode.shape_env = ShapeEnv()
+            fake_mode.static_shapes = False
 
     local_args = _make_local_args(gm, sharding_placement)
     t1 = time.perf_counter()
