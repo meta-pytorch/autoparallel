@@ -9,6 +9,16 @@ import torch
 from torch.distributed.tensor import DeviceMesh
 
 
+def _get_expected_dim_value(exp):
+    """Return a concrete expected dim value when a symbolic dim collapsed to one."""
+    if not isinstance(exp, torch.SymInt):
+        return exp
+    expr = exp.node.expr
+    if expr.is_number:
+        return int(expr)
+    return None
+
+
 def _compute_expected_inputs(traced_inputs, input_constraints, mesh):
     """Compute expected runtime inputs by applying sharding to traced global shapes.
 
@@ -65,9 +75,10 @@ def _check_forward_args(args, expected_inputs):
                     f"but expected {len(expected.shape)} dims"
                 )
             for dim, (actual, exp) in enumerate(zip(arg.shape, expected.shape)):
-                if isinstance(exp, torch.SymInt):
+                expected_dim = _get_expected_dim_value(exp)
+                if expected_dim is None:
                     continue
-                if actual != exp:
+                if actual != expected_dim:
                     raise ValueError(
                         f"AutoParallel: argument {i} has shape {tuple(arg.shape)} "
                         f"but expected {tuple(expected.shape)}"

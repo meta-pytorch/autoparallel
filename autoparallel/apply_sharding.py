@@ -380,7 +380,10 @@ def _make_local_args(gm, sharding_placement):
                 for s in tensor.shape
             ]
             real = torch.empty(
-                _concretize_shape(local.shape), dtype=local.dtype, device="meta"
+                _concretize_shape(local.shape),
+                dtype=local.dtype,
+                device="meta",
+                requires_grad=tensor.requires_grad,
             )
             sym_ctx = StatelessSymbolicContext(dynamic_sizes=dynamic_sizes)
             local = tensor.fake_mode.from_tensor(real, symbolic_context=sym_ctx)

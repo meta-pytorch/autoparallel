@@ -125,6 +125,28 @@ class TestCheckForwardArgs:
         with pytest.raises(ValueError, match="dims"):
             _check_forward_args([torch.randn(4, 8, 1)], expected)
 
+    def test_concretized_symint_dim_is_enforced(self):
+        from torch._subclasses import FakeTensorMode
+        from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+        from autoparallel.api import _make_inputs_dynamic
+        from autoparallel.input_validation import _check_forward_args
+
+        shape_env = ShapeEnv()
+        fake_mode = FakeTensorMode(shape_env=shape_env, static_shapes=False)
+
+        with fake_mode:
+            x = torch.randn(16, 128)
+            w = torch.randn(128, 64)
+
+        (sym_x,) = _make_inputs_dynamic((x,), fake_mode)
+
+        with fake_mode:
+            _ = sym_x @ w
+
+        with pytest.raises(ValueError, match="has shape"):
+            _check_forward_args([torch.randn(7, 999)], [sym_x])
+
 
 class TestMakeInputsDynamic:
     """Tests for _make_inputs_dynamic."""
@@ -213,6 +235,24 @@ class TestMakeInputsDynamic:
         # Should not raise OOM
         result = _make_inputs_dynamic((x,), fake_mode)
         assert isinstance(result[0].shape[0], torch.SymInt)
+
+    def test_preserves_requires_grad(self):
+        from torch._subclasses import FakeTensorMode
+        from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+        from autoparallel.api import _make_inputs_dynamic
+
+        shape_env = ShapeEnv()
+        fake_mode = FakeTensorMode(shape_env=shape_env, static_shapes=False)
+
+        with fake_mode:
+            x = torch.randn(16, 128, requires_grad=True)
+            y = torch.randn(16, 64, requires_grad=False)
+
+        sym_x, sym_y = _make_inputs_dynamic((x, y), fake_mode)
+
+        assert sym_x.requires_grad
+        assert not sym_y.requires_grad
 
 
 class TestConcretizeArgs:
@@ -348,6 +388,60 @@ class TestShapeEnvSwap:
                             assert id(s.node.shape_env) != id(
                                 old_env
                             ), "SymInt should NOT be from old ShapeEnv"
+
+    def test_make_local_args_preserves_requires_grad(self):
+        from unittest.mock import patch
+
+        from torch._subclasses import FakeTensorMode
+        from torch.distributed.device_mesh import DeviceMesh
+        from torch.distributed.tensor._dtensor_spec import DTensorSpec, TensorMeta
+        from torch.distributed.tensor.placement_types import Replicate
+        from torch.fx import Graph, GraphModule
+        from torch.fx.experimental.symbolic_shapes import (
+            DimDynamic,
+            ShapeEnv,
+            StatelessSymbolicContext,
+        )
+
+        from autoparallel.apply_sharding import _make_local_args
+
+        shape_env = ShapeEnv()
+        fake_mode = FakeTensorMode(shape_env=shape_env, static_shapes=False)
+
+        real = torch.empty(16, 128, device="meta", requires_grad=True)
+        sym_ctx = StatelessSymbolicContext(
+            dynamic_sizes=[DimDynamic.DYNAMIC, DimDynamic.STATIC]
+        )
+        tensor = fake_mode.from_tensor(real, symbolic_context=sym_ctx)
+
+        graph = Graph()
+        x = graph.placeholder("x")
+        x.meta["val"] = tensor
+        graph.output((x,))
+        gm = GraphModule(torch.nn.Module(), graph)
+
+        mesh = DeviceMesh("cpu", torch.arange(1))
+        spec = DTensorSpec(
+            mesh=mesh,
+            placements=(Replicate(),),
+            tensor_meta=TensorMeta(torch.Size([16, 128]), (128, 1), torch.float32),
+        )
+        sharding_placement = {x: type("Placement", (), {"input_specs": (spec,)})()}
+
+        with patch(
+            "autoparallel.apply_sharding.DTensor.from_local",
+            side_effect=lambda local, mesh, placements: type(
+                "DummyDTensor",
+                (),
+                {
+                    "redistribute": lambda self, mesh, placements: self,
+                    "to_local": lambda self: local,
+                },
+            )(),
+        ):
+            (local_arg,) = _make_local_args(gm, sharding_placement)
+
+        assert local_arg.requires_grad
 
 
 class TestConcretizeShape:

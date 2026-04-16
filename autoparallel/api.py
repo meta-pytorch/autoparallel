@@ -143,7 +143,9 @@ def _make_inputs_dynamic(
         sym_ctx: StatelessSymbolicContext = StatelessSymbolicContext(
             dynamic_sizes=[DimDynamic.DYNAMIC] * t.ndim,
         )
-        meta = torch.empty(t.shape, dtype=t.dtype, device="meta")
+        meta = torch.empty(
+            t.shape, dtype=t.dtype, device="meta", requires_grad=t.requires_grad
+        )
         sym = fake_mode.from_tensor(meta, symbolic_context=sym_ctx)
         with fake_mode:
             return sym.to(t.device)
