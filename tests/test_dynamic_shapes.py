@@ -979,12 +979,37 @@ def test_dynamic_vs_static_parity_view_heavy(device_mesh_2d):
         dynamic_placement = autop_d.optimize_placement(verbose=False)
         autop_d.apply_placement()
 
-    # Compare param placements
+    # Compare param placements — these must match exactly since they
+    # determine the model's weight distribution.
     param_nodes_s = get_param_nodes(autop_s.gm.graph)
     param_nodes_d = get_param_nodes(autop_d.gm.graph)
     for node_s, node_d in zip(param_nodes_s, param_nodes_d):
         sp = static_placement[node_s].output_specs.placements
         dp = dynamic_placement[node_d].output_specs.placements
+        assert sp == dp, (
+            f"Param placement mismatch for {node_s.name}: "
+            f"static={sp} vs dynamic={dp}"
+        )
+
+    # Compare intermediate node placements by target op. The ILP may
+    # choose different (but equivalent-cost) strategies for intermediate
+    # nodes, so we check that both graphs have the same set of ops in
+    # their placement solutions.
+    from collections import Counter
+
+    s_targets = Counter(
+        str(n.target)
+        for n in autop_s.gm.graph.nodes
+        if n.op == "call_function" and n in static_placement
+    )
+    d_targets = Counter(
+        str(n.target)
+        for n in autop_d.gm.graph.nodes
+        if n.op == "call_function" and n in dynamic_placement
+    )
+    # All static ops should appear in the dynamic graph (dynamic may have
+    # a few extra from symbolic decompositions)
+    for target, count in s_targets.items():
         assert (
-            sp == dp
-        ), f"Param placement mismatch for {node_s.name}: static={sp} vs dynamic={dp}"
+            target in d_targets
+        ), f"Op {target} in static graph ({count}x) missing from dynamic"
