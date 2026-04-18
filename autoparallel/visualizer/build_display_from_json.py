@@ -448,11 +448,17 @@ tr:hover td {{ background: #f8fafc; }}
 .cost-high {{ color: #DC2626; font-weight: 600; }}
 .cost-med {{ color: #F59E0B; }}
 .cost-low {{ color: #64748b; }}
-.filter-bar {{ display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }}
+.filter-bar {{ display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; align-items: center; }}
 .filter-btn {{ padding: 4px 12px; border-radius: 16px; border: 1px solid #e2e8f0; background: white; cursor: pointer; font-size: 12px; transition: all 0.15s; }}
 .filter-btn:hover {{ border-color: #3b82f6; }}
 .filter-btn.active {{ background: #3b82f6; color: white; border-color: #3b82f6; }}
+.search-box {{ padding: 5px 12px; border-radius: 16px; border: 1px solid #e2e8f0; font-size: 12px; width: 220px; outline: none; transition: border-color 0.15s; }}
+.search-box:focus {{ border-color: #3b82f6; }}
 .table-scroll {{ max-height: 600px; overflow-y: auto; }}
+th.sortable {{ cursor: pointer; user-select: none; }}
+th.sortable:hover {{ color: #3b82f6; }}
+th.sort-asc::after {{ content: " \\25B2"; font-size: 9px; }}
+th.sort-desc::after {{ content: " \\25BC"; font-size: 9px; }}
 .legend {{ display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 16px; }}
 .legend-item {{ display: flex; align-items: center; gap: 6px; font-size: 12px; }}
 .legend-dot {{ width: 12px; height: 12px; border-radius: 3px; }}
@@ -522,7 +528,7 @@ tr.arch-bwd {{ opacity: 0.6; }}
     if has_clusters:
         html += '''
   <div class="control-group">
-    <span class="control-label">Layers</span>
+    <span class="control-label">Detail View</span>
     <button class="filter-btn active" id="btn-cluster-collapse" onclick="toggleClusters(this)">Single Layer</button>
   </div>'''
 
@@ -531,9 +537,9 @@ tr.arch-bwd {{ opacity: 0.6; }}
     # Tabs
     html += '''
 <div class="tabs">
-  <div class="tab active" onclick="switchTab('arch')">Architecture</div>
-  <div class="tab" onclick="switchTab('cost')">Cost Breakdown</div>
-  <div class="tab" onclick="switchTab('detail')">All Nodes</div>
+  <div class="tab active" onclick="switchTab('arch', this)">Architecture</div>
+  <div class="tab" onclick="switchTab('cost', this)">Cost Breakdown</div>
+  <div class="tab" onclick="switchTab('detail', this)">All Nodes</div>
 </div>'''
 
     # ===== ARCHITECTURE TAB =====
@@ -608,6 +614,7 @@ tr.arch-bwd {{ opacity: 0.6; }}
 <div class="card">
 <div class="card-title">All Nodes</div>
 <div class="filter-bar">
+  <input type="text" class="search-box" placeholder="Search nodes..." oninput="searchNodes(this.value)">
   <button class="filter-btn active" onclick="filterNodes('all', this)">All</button>
   <button class="filter-btn" onclick="filterNodes('placeholder', this)">Params</button>
   <button class="filter-btn" onclick="filterNodes('forward', this)">Forward</button>
@@ -616,7 +623,7 @@ tr.arch-bwd {{ opacity: 0.6; }}
 </div>
 <div class="table-scroll">
 <table id="node-table"><thead>
-<tr><th>Name</th><th>Op</th><th>Phase</th><th>Shape</th><th>Placement</th><th>Comm</th><th>Compute</th><th>Redistribution</th><th>Module</th></tr>
+<tr><th class="sortable" onclick="sortTable(0, 'str', this)">Name</th><th class="sortable" onclick="sortTable(1, 'str', this)">Op</th><th class="sortable" onclick="sortTable(2, 'str', this)">Phase</th><th>Shape</th><th class="sortable" onclick="sortTable(4, 'str', this)">Placement</th><th class="sortable" onclick="sortTable(5, 'num', this)">Comm</th><th class="sortable" onclick="sortTable(6, 'num', this)">Compute</th><th>Redistribution</th><th class="sortable" onclick="sortTable(8, 'str', this)">Module</th></tr>
 </thead><tbody>'''
 
     all_display = compute_nodes
@@ -666,11 +673,11 @@ tr.arch-bwd {{ opacity: 0.6; }}
     html += '''</tbody></table></div></div></div>
 
 <script>
-function switchTab(id) {
+function switchTab(id, btn) {
   document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
   document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
   document.getElementById('tab-' + id).classList.add('active');
-  event.target.classList.add('active');
+  btn.classList.add('active');
 }
 
 var clustersCollapsed = true;
@@ -706,6 +713,21 @@ function filterPhase(phase, btn) {
   });
 }
 
+var currentSearch = '';
+
+function searchNodes(query) {
+  currentSearch = query.toLowerCase();
+  applyNodeFilters();
+}
+
+function applyNodeFilters() {
+  document.querySelectorAll('.node-row').forEach(row => {
+    if (clustersCollapsed && row.dataset.linked === '1') { row.style.display = 'none'; return; }
+    var text = row.textContent.toLowerCase();
+    row.style.display = (currentSearch === '' || text.indexOf(currentSearch) >= 0) ? '' : 'none';
+  });
+}
+
 function filterNodes(type, btn) {
   document.querySelectorAll('#tab-detail .filter-btn').forEach(b => b.classList.remove('active'));
   btn.classList.add('active');
@@ -716,8 +738,43 @@ function filterNodes(type, btn) {
     else if (type === 'backward') show = row.dataset.phase === 'backward';
     else if (type === 'redist') show = row.dataset.redist === '1';
     if (clustersCollapsed && row.dataset.linked === '1') show = false;
+    if (show && currentSearch !== '') {
+      show = row.textContent.toLowerCase().indexOf(currentSearch) >= 0;
+    }
     row.style.display = show ? '' : 'none';
   });
+}
+
+var sortState = {col: -1, dir: 'asc'};
+
+function sortTable(colIdx, type, th) {
+  var table = document.getElementById('node-table');
+  var tbody = table.tBodies[0];
+  var rows = Array.from(tbody.querySelectorAll('tr.node-row'));
+
+  // Toggle direction if same column
+  if (sortState.col === colIdx) {
+    sortState.dir = sortState.dir === 'asc' ? 'desc' : 'asc';
+  } else {
+    sortState.col = colIdx;
+    sortState.dir = 'asc';
+  }
+
+  // Update header classes
+  table.querySelectorAll('th').forEach(h => h.classList.remove('sort-asc', 'sort-desc'));
+  th.classList.add('sort-' + sortState.dir);
+
+  var dir = sortState.dir === 'asc' ? 1 : -1;
+  rows.sort(function(a, b) {
+    var aVal = a.cells[colIdx].textContent.trim();
+    var bVal = b.cells[colIdx].textContent.trim();
+    if (type === 'num') {
+      return (parseFloat(aVal) - parseFloat(bVal)) * dir;
+    }
+    return aVal.localeCompare(bVal) * dir;
+  });
+
+  rows.forEach(function(row) { tbody.appendChild(row); });
 }
 
 // Initial state: hide linked rows if clusters exist

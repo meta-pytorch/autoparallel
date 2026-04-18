@@ -104,7 +104,7 @@ def export_sharding_json(
     graph: torch.fx.Graph,
     mesh: Any,
     solution: dict[torch.fx.Node, Any],
-    selected_dvs: dict[torch.fx.Node, list[Any]],
+    selected_dvs: dict[torch.fx.Node, dict[int, Any]],
     cluster_roots: dict[torch.fx.Node, torch.fx.Node] | None = None,
 ) -> dict:
     """Export sharding optimization results as a JSON-serializable dict.
@@ -113,7 +113,7 @@ def export_sharding_json(
         graph: The FX graph.
         mesh: DeviceMesh instance.
         solution: Maps node -> OpSpec (the chosen strategy).
-        selected_dvs: Maps node -> list[DecisionVar] (one per argument),
+        selected_dvs: Maps node -> {argi: DecisionVar} (one per argument),
             built from ShardingOptimizer.selected_keys.
         cluster_roots: Optional mapping from linked nodes to their cluster
             root node (from ShardingOptimizer.cluster_links). When present,
@@ -168,6 +168,7 @@ def export_sharding_json(
         input_nodes = all_input_nodes(node)
         inputs = []
         node_comm = 0.0
+        node_transition = 0.0
         for argi, pred in enumerate(input_nodes):
             pred_strategy = solution.get(pred)
             if pred_strategy is not None:
@@ -181,11 +182,11 @@ def export_sharding_json(
                 src_placement = _get_output_spec_placement(src_specs)
             else:
                 src_placement = None
-            # Find the DecisionVar for this argument
-            dv = dvs[argi] if argi < len(dvs) else None
+            dv = dvs.get(argi)
             dst_placement = _pretty_print(dv.input_spec) if dv is not None else None
             comm_cost = dv.comm_cost if dv is not None else 0.0
             node_comm += comm_cost
+            node_transition += dv.sharding_transition_cost if dv is not None else 0.0
 
             inputs.append(
                 {
@@ -196,10 +197,11 @@ def export_sharding_json(
                 }
             )
 
-        compute_cost = dvs[0].compute_cost if dvs else 0.0
+        # Compute cost is split across args in the ILP; sum to get the full op cost.
+        compute_cost = sum(dv.compute_cost for dv in dvs.values())
         total_compute += compute_cost
         total_comm += node_comm
-        total_transition += dvs[0].sharding_transition_cost if dvs else 0.0
+        total_transition += node_transition
 
         entry: dict[str, Any] = {
             "name": node.name,

@@ -987,11 +987,13 @@ class ShardingOptimizer:
     def get_json(self):
         from autoparallel.export_json import export_sharding_json
 
-        selected_by_node = {}
+        # Build selected DVs keyed by (node, argi) for explicit ordering.
+        selected_by_node: dict[torch.fx.Node, dict[int, DecisionVar]] = {}
         for key in self.selected_keys:
-            node = self.nodes[key[0]]
-            selected_by_node.setdefault(node, []).append(
-                self._resolve_decision_var(key)
+            node_idx, argi, out_idx, inp_idx = key
+            node = self.nodes[node_idx]
+            selected_by_node.setdefault(node, {})[argi] = self._resolve_decision_var(
+                key
             )
 
         # Build node-level cluster mapping: linked_node -> root_node
@@ -1004,7 +1006,10 @@ class ShardingOptimizer:
         return export_sharding_json(
             graph=self.graph,
             mesh=self.mesh,
-            solution={node: dvs[0].strategy for node, dvs in selected_by_node.items()},
+            solution={
+                node: next(iter(dvs_by_argi.values())).strategy
+                for node, dvs_by_argi in selected_by_node.items()
+            },
             selected_dvs=selected_by_node,
             cluster_roots=cluster_roots,
         )
