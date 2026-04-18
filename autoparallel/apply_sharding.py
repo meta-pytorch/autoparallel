@@ -309,12 +309,27 @@ def _lower_to_parallel_graph(gm, sharding_placement, local_args):
 
 def _copy_descriptors_and_rename_placeholders(source_gm, target_gm):
     """Copy node descriptors from source graph and rename placeholders to match."""
+    from torch.utils._pytree import tree_flatten
+
     for n1, n2 in zip(
         (n for n in source_gm.graph.nodes if n.op in ("placeholder", "output")),
         (n for n in target_gm.graph.nodes if n.op in ("placeholder", "output")),
     ):
-        n2.meta["desc"] = n1.meta["desc"]
-        if n2.op == "placeholder":
+        if n2.op == "output":
+            # get_all_input_and_grad_nodes iterates with zip(n.args[0], desc),
+            # so both must be flat. make_fx may nest the output args (e.g.,
+            # ((fw_outs...), (grads...))) while desc from the source is flat.
+            # Flatten the target output args to match, and copy the flat desc.
+            flat_desc, _ = tree_flatten(n1.meta["desc"])
+            flat_args, _ = tree_flatten(n2.args[0])
+            assert len(flat_desc) == len(flat_args), (
+                f"Output desc has {len(flat_desc)} leaves but output args has "
+                f"{len(flat_args)} leaves"
+            )
+            n2.args = (tuple(flat_args),)
+            n2.meta["desc"] = flat_desc
+        else:
+            n2.meta["desc"] = n1.meta["desc"]
             n2.target = n1.target
             # node renaming is needed for partitioner as it searches for tangent
             # nodes. See https://fburl.com/kc4jtc3t for one case where it's used
