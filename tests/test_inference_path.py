@@ -39,11 +39,11 @@ def _auto_parallel_with_internals(model, mesh, sample_inputs, out_shardings):
         _make_input_fn,
     )
 
-    shapes, dtypes, input_placements, treespec = _extract_input_info(
+    shapes, dtypes, input_placements, treespec, devices = _extract_input_info(
         sample_inputs, mesh
     )
     output_placements = _flatten_out_shardings(out_shardings)
-    input_fn = _make_input_fn(shapes, dtypes, treespec)
+    input_fn = _make_input_fn(shapes, dtypes, treespec, devices)
 
     with AutoParallel(model, input_fn, mesh, compile=False) as autop:
         autop.add_input_constraints(input_placements)

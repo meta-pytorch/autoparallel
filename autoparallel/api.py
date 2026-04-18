@@ -404,8 +404,6 @@ class AutoParallel:
         t0 = time.perf_counter()
         self._assert_entered()
 
-        if sharding_placement is None:
-            sharding_placement = self.sharding_placement
         # TODO: what kind of updates do we have to do?
         #  - graph obvs
         #  - flat_args / updated_flat_args
@@ -485,8 +483,7 @@ class AutoParallel:
             sharded_buffer_dict,
         )
 
-    def apply_placement(self, sharding_placement=None):
-
+    def apply_placement(self, sharding_placement):
         sharded_param_dict, sharded_buffer_dict = self._apply_placement_common(
             sharding_placement
         )
@@ -546,12 +543,30 @@ class AutoParallel:
         graph_param_fqns = list(self.joint_with_descriptors.params_spec)
         graph_buffer_fqns = list(self.joint_with_descriptors.buffers_spec)
 
+        # Extract solved input placements from the solution dict.
+        # This is the ground truth for what the compiled graph expects.
+        from torch._functorch._aot_autograd.fx_utils import (
+            get_plain_input_and_grad_nodes,
+        )
+
+        input_nodes = get_plain_input_and_grad_nodes(self.gm.graph)
+        solved_input_placements = []
+        for desc in sorted(input_nodes, key=lambda d: d.idx):
+            node, _grad_node = input_nodes[desc]
+            strategy = sharding_placement[node]
+            solved_input_placements.append(tuple(strategy.output_specs.placements))
+
         expected_inputs = _compute_expected_inputs(
-            self._traced_inputs, self.input_constraints, self.mesh
+            self._traced_inputs, solved_input_placements, self.mesh
         )
 
         def forward(self, *args):
-            _check_forward_args(args, expected_inputs)
+            # Flatten pytree args (e.g. dicts, nested structures) to tensor
+            # leaves, matching how Dynamo flattened the inputs during tracing.
+            import torch.utils._pytree as pytree
+
+            flat_args, _ = pytree.tree_flatten(args)
+            _check_forward_args(flat_args, expected_inputs)
             # NB: don't close over the parameters/buffers, as the user may
             # reassign the module!
             # Use the exact param/buffer FQNs that the compiled graph
@@ -559,7 +574,7 @@ class AutoParallel:
             params = [
                 self.get_parameter(fqn).to_local() for fqn in graph_param_fqns
             ] + [self.get_buffer(fqn).to_local() for fqn in graph_buffer_fqns]
-            boxed_args = [*params, *args]
+            boxed_args = [*params, *flat_args]
             del params
             if torch.is_grad_enabled():
                 # NB: don't do self.parallel_model_fn work around Dynamo bug
@@ -652,14 +667,16 @@ def auto_parallel(
         raw_inputs = sample_inputs
 
     # Extract metadata and placements (does not materialize tensors)
-    shapes, dtypes, input_placements, treespec = _extract_input_info(raw_inputs, mesh)
+    shapes, dtypes, input_placements, treespec, devices = _extract_input_info(
+        raw_inputs, mesh
+    )
 
     # Flatten out_shardings to list
     output_placements = _flatten_out_shardings(out_shardings)
 
     # Create input_fn that will be called inside FakeTensorMode
     # It creates fresh tensors (which become fake tensors inside FakeTensorMode)
-    input_fn = _make_input_fn(shapes, dtypes, treespec)
+    input_fn = _make_input_fn(shapes, dtypes, treespec, devices=devices)
 
     # Use AutoParallel context manager
     with AutoParallel(
