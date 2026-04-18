@@ -185,7 +185,7 @@ def test_make_input_fn_dict_roundtrip(device_mesh_1d):
 
 
 def test_dict_input_integration(device_mesh_1d):
-    """Integration test: auto_parallel with dict inputs."""
+    """Integration test: auto_parallel with dict inputs validates correctly."""
     dim = 128
     batch_size = 512
     local_batch_size = batch_size // device_mesh_1d.size()
@@ -197,6 +197,10 @@ def test_dict_input_integration(device_mesh_1d):
 
         def forward(self, inputs):
             return self.linear(inputs["x"])
+
+        def init_weights(self):
+            nn.init.ones_(self.linear.weight)
+            nn.init.zeros_(self.linear.bias)
 
     with torch.device("meta"):
         model = DictModel(dim)
@@ -214,11 +218,13 @@ def test_dict_input_integration(device_mesh_1d):
         out_shardings=(Shard(0),),
         compile=False,
     )
+    parallel_mod.to_empty(device="cuda")
+    parallel_mod.init_weights()
 
     # Should work with correct dict input
     out = parallel_mod({"x": torch.rand(local_batch_size, dim, device="cuda")})
     assert out.shape == (local_batch_size, dim)
 
-    # Should reject wrong shape
+    # Validation should reject wrong shape inside a dict
     with pytest.raises(ValueError, match="shape"):
         parallel_mod({"x": torch.rand(local_batch_size + 1, dim, device="cuda")})
