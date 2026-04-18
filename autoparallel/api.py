@@ -563,9 +563,7 @@ class AutoParallel:
         def forward(self, *args):
             # Flatten pytree args (e.g. dicts, nested structures) to tensor
             # leaves, matching how Dynamo flattened the inputs during tracing.
-            import torch.utils._pytree as pytree
-
-            flat_args, _ = pytree.tree_flatten(args)
+            flat_args, _ = torch.utils._pytree.tree_flatten(args)
             _check_forward_args(flat_args, expected_inputs)
             # NB: don't close over the parameters/buffers, as the user may
             # reassign the module!
