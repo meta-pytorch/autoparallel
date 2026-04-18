@@ -4,19 +4,20 @@
 # LICENSE file in the root directory of this source tree.
 
 """
-AutoParallel with HuggingFace causal LM models.
+AutoParallel with HuggingFace models.
 
-Supports 1D and 2D device meshes with configurable shape and dim names.
+Supports causal LMs (decoder-only), seq2seq (encoder-decoder), and
+masked LMs (encoder-only) with 1D and 2D device meshes.
 
 Usage:
-    # 1D mesh (8 devices)
+    # Causal LM (default)
     python examples/example_hf.py --model gpt2 --mesh 8
 
-    # 2D mesh (2 x 4)
-    python examples/example_hf.py --model gpt2 --mesh 2,4
+    # Encoder-decoder (seq2seq)
+    python examples/example_hf.py --model google-t5/t5-base --mesh 8 --task seq2seq
 
-    # 2D mesh with custom dim names
-    python examples/example_hf.py --model gpt2 --mesh 2,4 --mesh-dim-names replicate,shard
+    # Encoder-only (masked LM)
+    python examples/example_hf.py --model google-bert/bert-base-uncased --mesh 8 --task masked-lm
 """
 
 import argparse
@@ -28,7 +29,12 @@ import torch
 from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor.placement_types import Replicate, Shard
 from torch.testing._internal.distributed.fake_pg import FakeStore
-from transformers import AutoConfig, AutoModelForCausalLM
+from transformers import (
+    AutoConfig,
+    AutoModelForCausalLM,
+    AutoModelForMaskedLM,
+    AutoModelForSeq2SeqLM,
+)
 
 from autoparallel.api import AutoParallel
 
@@ -54,6 +60,13 @@ def parse_args():
         type=str,
         default=None,
         help="Comma-separated mesh dim names (default: dim0,dim1,...)",
+    )
+    parser.add_argument(
+        "--task",
+        type=str,
+        default="causal-lm",
+        choices=["causal-lm", "seq2seq", "masked-lm"],
+        help="Model task type (default: causal-lm)",
     )
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--seq-len", type=int, default=128)
@@ -88,21 +101,27 @@ def main():
     # Shard input batch dim along the first mesh dim only; replicate on the rest.
     x_sharding = (Shard(0),) + (Replicate(),) * (ndim - 1)
 
+    task = args.task
     print(f"Model:      {args.model}")
+    print(f"Task:       {task}")
     print(f"Mesh:       {mesh_shape}, dim_names={dim_names}")
     print(f"Batch size: {args.batch_size} (global), Seq len: {args.seq_len}")
     print()
 
     # --- Load HF config and create model on meta device ---
     config = AutoConfig.from_pretrained(args.model)
-    # KV-cache is an inference-time optimization (caching keys/values for
-    # autoregressive generation). It's unnecessary during training and its
-    # management logic introduces graph breaks that Dynamo can't trace through.
-    config.use_cache = False
+    if hasattr(config, "use_cache"):
+        config.use_cache = False
     vocab_size = config.vocab_size
 
+    auto_model_cls = {
+        "causal-lm": AutoModelForCausalLM,
+        "seq2seq": AutoModelForSeq2SeqLM,
+        "masked-lm": AutoModelForMaskedLM,
+    }[task]
+
     with torch.device("meta"):
-        model = AutoModelForCausalLM.from_config(config)
+        model = auto_model_cls.from_config(config)
 
     num_params = sum(p.numel() for p in model.parameters())
     print(f"Config:     {type(config).__name__}, {num_params / 1e6:.1f}M params")
@@ -112,8 +131,26 @@ def main():
     batch_size = args.batch_size
     seq_len = args.seq_len
 
-    def input_fn():
-        return torch.randint(0, vocab_size, (batch_size, seq_len), device="cuda")
+    if task == "seq2seq":
+        # T5/BART forward: (input_ids, attention_mask, decoder_input_ids, ...)
+        # Must provide attention_mask as a tensor (not None) because AutoParallel's
+        # DTypeCastModule applies tree_map over args and calls torch.is_floating_point.
+        def input_fn():
+            input_ids = torch.randint(
+                0, vocab_size, (batch_size, seq_len), device="cuda"
+            )
+            attention_mask = torch.ones(
+                batch_size, seq_len, dtype=torch.long, device="cuda"
+            )
+            decoder_input_ids = torch.randint(
+                0, vocab_size, (batch_size, seq_len), device="cuda"
+            )
+            return input_ids, attention_mask, decoder_input_ids
+
+    else:
+
+        def input_fn():
+            return torch.randint(0, vocab_size, (batch_size, seq_len), device="cuda")
 
     # --- AutoParallel pipeline ---
     mp_policy = MixedPrecisionPolicy(
@@ -121,10 +158,15 @@ def main():
     )
 
     t0 = time.time()
+    if task == "seq2seq":
+        input_constraints = [x_sharding, x_sharding, x_sharding]
+    else:
+        input_constraints = [x_sharding]
+
     with AutoParallel(
         model, input_fn, mesh, mp_policy, compile=True, repeated_subgraphs=True
     ) as autop:
-        autop.add_input_constraints([x_sharding])
+        autop.add_input_constraints(input_constraints)
         autop.add_parameter_memory_constraint(low=None, high=None)
 
         sharding_placement = autop.optimize_placement(verbose=True)
@@ -136,8 +178,14 @@ def main():
     parallel_mod.to_empty(device="cuda")
 
     local_batch = batch_size // mesh_shape[0]
-    x = torch.randint(0, vocab_size, (local_batch, seq_len), device="cuda")
-    out = parallel_mod(x)
+    if task == "seq2seq":
+        x = torch.randint(0, vocab_size, (local_batch, seq_len), device="cuda")
+        attn_mask = torch.ones(local_batch, seq_len, dtype=torch.long, device="cuda")
+        dec_x = torch.randint(0, vocab_size, (local_batch, seq_len), device="cuda")
+        out = parallel_mod(x, attn_mask, dec_x)
+    else:
+        x = torch.randint(0, vocab_size, (local_batch, seq_len), device="cuda")
+        out = parallel_mod(x)
 
     if isinstance(out, torch.Tensor):
         loss = out.sum()

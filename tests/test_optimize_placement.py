@@ -10,11 +10,11 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from torch._functorch._aot_autograd.fx_utils import get_param_nodes
-from torch.distributed._tensor.experimental import local_map
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
 
 from autoparallel.api import AutoParallel, auto_parallel
+from autoparallel.collectives import local_map
 
 
 class FFN(nn.Module):
@@ -333,7 +333,7 @@ def test_in_graph_tensor_ctor(device_mesh_1d):
 
 
 class LocalMapTransformerBlock(nn.Module):
-    def __init__(self, nheads, dim1, dim2, mesh):
+    def __init__(self, nheads, dim1, dim2):
         super().__init__()
         self.nheads = nheads
         bias = False
@@ -343,7 +343,6 @@ class LocalMapTransformerBlock(nn.Module):
         self.wo = nn.Linear(dim1, dim1, bias=bias)
         self.w1 = nn.Linear(dim1, dim2, bias=bias)
         self.w2 = nn.Linear(dim2, dim1, bias=bias)
-        self.mesh = mesh
 
     def forward(self, x):
         @local_map(
@@ -355,7 +354,6 @@ class LocalMapTransformerBlock(nn.Module):
             ),
             redistribute_inputs=True,
             in_grad_placements=None,
-            device_mesh=self.mesh,
         )
         def _context_parallel_attention(query, key, value):
             out = F.scaled_dot_product_attention(
@@ -396,7 +394,7 @@ def test_local_map_placement_respected(device_mesh_2d, device="cuda"):
     seq_len = 256
 
     def model_fn():
-        return LocalMapTransformerBlock(nheads, dim1, dim2, device_mesh_2d)
+        return LocalMapTransformerBlock(nheads, dim1, dim2)
 
     def input_fn():
         return torch.randn(bs, seq_len, dim1, device=device, requires_grad=True)

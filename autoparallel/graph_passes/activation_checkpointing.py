@@ -510,15 +510,28 @@ def _apply_ac_policy(joint_graph: torch.fx.Graph, save_list: set[torch.ops.OpOve
     _mark_nodes_as_must_save(must_save_nodes)
 
 
-def ac_joint_pass(
+def mark_fsdp_all_gather_recomputation(
     graph: torch.fx.Graph,
-    ac_stage_size_in_GiB: Optional[Union[float, str]] = 2.0,
     reshard_after_forward: bool = True,
 ):
+    """Mark FSDP all-gather nodes for recomputation or saving.
+
+    This should be called unconditionally (not just with AC) to ensure the
+    partitioner respects the reshard_after_forward contract from the sharding
+    optimizer. Without these tags, the partitioner may choose to save
+    all-gathered parameters between fwd and bwd, breaking the memory
+    assumptions of the sharding strategy.
+    """
     if reshard_after_forward:
         force_recompute_fsdp_all_gather(graph)
     else:
         force_save_fsdp_all_gather(graph)
+
+
+def ac_joint_pass(
+    graph: torch.fx.Graph,
+    ac_stage_size_in_GiB: Optional[Union[float, str]] = 2.0,
+):
     mark_nodes_as_must_save_to_stage_recomputation(
         graph, stage_size_in_GiB=ac_stage_size_in_GiB
     )

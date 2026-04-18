@@ -87,6 +87,8 @@ def _prepare_op_strategy(op_strategy, output_only=False):
 
 def _hash_node(node, strategies, input_pickler):
     key = (
+        str(node.target),
+        node.meta.get("partitioner_tag"),
         node.meta.get("stack_trace"),
         _normalize_args(node),
         _prepare_op_strategy(strategies[node]),
@@ -133,13 +135,23 @@ def get_identical_regions(
         node_to_duplicates[node] = duplicates
     logger.debug(f"Hashed nodes in {time.time() - t} s")
 
+    # Phase tag of the region group currently being expanded, used by
+    # _is_identical to prevent expansion from crossing the fwd/bwd boundary.
+    _expanding_phase: Optional[str] = None
+
     def _is_identical(n0: Node, n1: Node) -> bool:
-        return (
-            n0 in node_to_duplicates
-            and n1 in node_to_duplicates
-            and node_to_duplicates[n0] is node_to_duplicates[n1]
-            and n0 is not n1
-        )
+        if (
+            n0 not in node_to_duplicates
+            or n1 not in node_to_duplicates
+            or node_to_duplicates[n0] is not node_to_duplicates[n1]
+            or n0 is n1
+        ):
+            return False
+        # Don't let expansion cross the forward/backward boundary.
+        if _expanding_phase is not None:
+            if n0.meta.get("partitioner_tag") != _expanding_phase:
+                return False
+        return True
 
     # Create region groups; a region group is a group
     # of regions that are all identical. In this initial state
@@ -172,9 +184,12 @@ def get_identical_regions(
         # NOTE: this seems like it's missing in the original implementation
         # from PyTorch. Given that fully_expand_region_group doesn't check
         # if the root from a region is in a seen node, it might end up
-        # having duplicate nodes in different clusters
-        if region_group[0][0] in seen_nodes:
+        # having duplicate nodes in different clusters. We must check all
+        # regions' root nodes, because any region's root could have been
+        # claimed by a prior group.
+        if any(region[0] in seen_nodes for region in region_group):
             continue
+        _expanding_phase = region_group[0][0].meta.get("partitioner_tag")
         fully_expand_region_group(
             region_group,
             seen_nodes,

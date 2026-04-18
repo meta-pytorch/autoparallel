@@ -5,5 +5,11 @@
 
 from autoparallel.api import AutoParallel, auto_parallel
 from autoparallel.api_pp import AutoParallelPP
+from autoparallel.collectives import with_sharding_constraint
 
-__all__ = ["auto_parallel", "AutoParallel", "AutoParallelPP"]
+__all__ = [
+    "auto_parallel",
+    "AutoParallel",
+    "AutoParallelPP",
+    "with_sharding_constraint",
+]

@@ -187,7 +187,7 @@ def apply_dtype_cast(model, mp_policy: MixedPrecisionPolicy):
 class DTypeCastModule(torch.nn.Module):
     def forward(self, *args, **kwargs):
         def cast_fn(x):
-            if not torch.is_floating_point(x):
+            if not isinstance(x, torch.Tensor) or not torch.is_floating_point(x):
                 return x
             return x.to(self._mp_policy.param_dtype)
 
@@ -196,6 +196,8 @@ class DTypeCastModule(torch.nn.Module):
         output = super().forward(*args, **kwargs)
 
         def cast_out_fn(x):
+            if not isinstance(x, torch.Tensor):
+                return x
             return x.to(self._mp_policy.output_dtype)
 
         output = tree_map(cast_out_fn, output)

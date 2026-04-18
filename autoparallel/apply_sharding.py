@@ -51,28 +51,6 @@ def _compute_shard_order(shard_order, reverse: bool):
     return tuple(result)
 
 
-def _filter_specs_for_local_map(flat_args, curr_specs, tgt_specs):
-    """Filter curr/tgt specs to tensor-only entries for local_map HOPs.
-
-    Other ops filter out non-tensor/symint args from their specs already,
-    but local_map keeps them, so we need to strip them here.
-    """
-    curr_specs_t = []
-    tgt_specs_t = []
-    for i, arg in enumerate(flat_args):
-        if isinstance(arg, torch.Tensor):
-            curr_specs_t.append(curr_specs[i])
-            tgt_specs_t.append(tgt_specs[i])
-        elif isinstance(arg, torch.SymInt):
-            assert curr_specs[i] is None
-            assert tgt_specs[i] is None
-        else:
-            raise ValueError("Unexpected local_map HOP argument")
-
-    assert len(curr_specs_t) == len(tgt_specs_t)
-    return curr_specs_t, tgt_specs_t
-
-
 class ApplyShardingInterpreter(torch.fx.Interpreter):
     def __init__(
         self,
@@ -94,8 +72,19 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
         return super().run_node(n)
 
     def _get_input_nodes(self, node):
-        # node.all_input_nodes deduplicates, but we need repeated nodes preserved
-        return all_input_nodes(node)
+        # node.all_input_nodes deduplicates, but we need repeated nodes preserved.
+        # Filter to only nodes with sharding entries — HOP submodule nodes
+        # (GraphModules) are not in sharding_placement and should be skipped.
+        result = []
+        for x in all_input_nodes(node):
+            if x in self.sharding_placement:
+                result.append(x)
+            else:
+                assert x.op == "get_attr", (
+                    f"Non-get_attr node {x} (op={x.op}) missing from "
+                    f"sharding_placement"
+                )
+        return result
 
     def _set_origin_and_target_device_order(self, node, curr_spec, tgt_spec):
         # shard_order should be automatically assigned once `placements` is set
@@ -167,10 +156,20 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
 
         flat_args, treespec = tree_flatten(args)
         flat_args_t = [x for x in flat_args if isinstance(x, torch.Tensor)]
-        if len(flat_args_t) < len(flat_args) and "local_map" in node.name:
-            curr_specs, tgt_specs = _filter_specs_for_local_map(
-                flat_args, curr_specs, tgt_specs
-            )
+        if len(flat_args_t) < len(curr_specs):
+            # HOPs have mixed arg types (tensors, SymInts, etc.).
+            # Filter specs to tensor-only entries matching flat_args_t.
+            filtered_nodes = []
+            filtered_curr = []
+            filtered_tgt = []
+            for n, cs, ts in zip(all_input_nodes, curr_specs, tgt_specs):
+                if ts is not None:
+                    filtered_nodes.append(n)
+                    filtered_curr.append(cs)
+                    filtered_tgt.append(ts)
+            all_input_nodes = filtered_nodes
+            curr_specs = filtered_curr
+            tgt_specs = filtered_tgt
 
         assert len(flat_args_t) == len(curr_specs) == len(tgt_specs)
         last_tgt_spec = None
@@ -244,7 +243,7 @@ def shard_node_given_placements(node, sharding_placement, *, meta: bool):
             tensor, FakeTensor
         ), f"only FakeTensor params supported for now, got {type(tensor)}"
         with unset_fake_temporarily():
-            tensor = torch.randn(tensor.shape, dtype=tensor.dtype, device="meta")
+            tensor = torch.empty(tensor.shape, dtype=tensor.dtype, device="meta")
             sharded_tensor = DTensor.from_local(
                 tensor, mesh, curr_placement
             ).redistribute(mesh, tgt_spec.placements)
