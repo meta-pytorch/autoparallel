@@ -108,6 +108,86 @@ from .shardings.propagation_rules import _create_all_options
 logger = logging.getLogger(__name__)
 
 
+def concretize_symint(val):
+    """Concretize a SymInt to a plain int, pass through other values.
+
+    For unbacked SymInts (hint=None), returns the SymInt unchanged.
+    """
+    if isinstance(val, torch.SymInt):
+        hint = val.node.hint
+        return hint if hint is not None else val
+    return val
+
+
+def concretize_args(args):
+    """Concretize all SymInts and symbolic FakeTensors in an args tree.
+
+    Returns an args tree where:
+    - SymInts are replaced with their concrete hint values (via concretize_symint)
+    - FakeTensors with symbolic shapes are replaced with concrete FakeTensors
+    - Other values are left unchanged
+    """
+    from torch._subclasses.fake_tensor import FakeTensor
+
+    def concretize(x):
+        if isinstance(x, torch.SymInt):
+            return concretize_symint(x)
+        if isinstance(x, FakeTensor) and any(
+            isinstance(s, torch.SymInt) for s in x.shape
+        ):
+            concrete_shape = [concretize_symint(s) for s in x.shape]
+            concrete_stride = [concretize_symint(s) for s in x.stride()]
+            if any(not isinstance(s, int) for s in concrete_shape):
+                return x
+            with x.fake_mode:
+                return torch.empty_strided(
+                    concrete_shape, concrete_stride, dtype=x.dtype, device=x.device
+                )
+        return x
+
+    return tree_map_only((torch.SymInt, FakeTensor), concretize, args)
+
+
+def _produces_tensor(val):
+    """Check if a node's meta value represents tensor output(s)."""
+    if isinstance(val, torch.Tensor):
+        return True
+    if isinstance(val, (tuple, list)):
+        return any(_produces_tensor(v) for v in val)
+    return False
+
+
+def concretize_gm(gm):
+    """Create a structural copy of gm with all symbolic shapes concretized.
+
+    Returns (concrete_gm, orig_to_concrete, concrete_to_orig) where:
+    - concrete_gm has identical graph structure but concrete metadata
+    - orig_to_concrete maps original nodes → concrete nodes
+    - concrete_to_orig maps concrete nodes → original nodes
+
+    The concretized graph is used for the optimization pipeline (ILP solver,
+    placement options, cost estimation) which needs concrete shapes. The
+    original graph is preserved for apply_sharding which needs symbolic shapes
+    for runtime flexibility.
+    """
+
+    concrete_graph = torch.fx.Graph()
+    orig_to_concrete: dict[torch.fx.Node, torch.fx.Node] = {}
+
+    for node in gm.graph.nodes:
+        new_node = concrete_graph.node_copy(node, lambda n: orig_to_concrete[n])
+        orig_to_concrete[node] = new_node
+        # node_copy does copy.copy(node.meta), so new_node.meta is a shallow
+        # copy. Concretize meta["val"] in-place on the copy.
+        val = new_node.meta.get("val")
+        if val is not None:
+            new_node.meta["val"] = concretize_args(val)
+
+    concrete_gm = torch.fx.GraphModule(gm, concrete_graph)
+    concrete_to_orig = {v: k for k, v in orig_to_concrete.items()}
+    return concrete_gm, orig_to_concrete, concrete_to_orig
+
+
 @dataclass
 class DecisionVar:
     """A decision variable in the ILP, representing one (node, arg, output_placement,
@@ -141,15 +221,26 @@ class ShardingOptimizer:
     def __init__(
         self, gm, mesh, rescale_grad_comm_cost_for_mp=1.0, repeated_subgraphs=False
     ):
-        self.gm = gm
-        self.graph = gm.graph
-        self.nodes = list(self.graph.nodes)
+        self.orig_gm = gm
+        # The optimizer works on a concretized copy of the graph where all
+        # symbolic shapes are replaced with their concrete hint values. This
+        # centralizes dynamic-shape handling: the optimization pipeline
+        # (placement options, cost estimation, clustering, ILP) only sees
+        # concrete metadata, while the original symbolic graph is preserved
+        # for apply_sharding.
+        concrete_gm, self._orig_to_concrete, self._concrete_to_orig = concretize_gm(gm)
+        self.gm = concrete_gm
+        self.graph = concrete_gm.graph
         self.mesh = mesh
         self.rescale_grad_comm_cost_for_mp = rescale_grad_comm_cost_for_mp
-        self.node_map = {node: i for i, node in enumerate(self.graph.nodes)}
         self._name_counters: dict[str, int] = {}
         t0 = time.perf_counter()
         self.strats = self.build_sharding_metadata()
+        # nodes/node_map are derived from strats (not graph.nodes) so that
+        # shape-computation nodes skipped by build_sharding_metadata don't
+        # appear and indices stay consistent.
+        self.nodes = list(self.strats.keys())
+        self.node_map = {node: i for i, node in enumerate(self.nodes)}
         logger.debug("Placement options took %.3fs", time.perf_counter() - t0)
         from autoparallel.shardings.placement_options import get_placement_options_timer
 
@@ -192,6 +283,14 @@ class ShardingOptimizer:
         self._name_counters[prefix] += 1
         return prefix + f"_{idx:03}"
 
+    def _normalize_node(self, node):
+        """Map a node to its concrete-graph counterpart.
+
+        Public methods that accept nodes should call this so callers can pass
+        nodes from either the original or the concrete graph.
+        """
+        return self._orig_to_concrete.get(node, node)
+
     def build_sharding_metadata(self):
         strats = {}
         for node in self.graph.nodes:
@@ -209,10 +308,14 @@ class ShardingOptimizer:
                         for u in node.users
                     ), f"Non-tensor get_attr {node} is not used by a HOP"
             elif node.op == "call_function":
-                # TODO: kwargs?
-                # Use .get() so HOP submodule nodes (not in strats) map to None.
+                if not _produces_tensor(node.meta.get("val")):
+                    # Shape-computation nodes (sym_size, operator.mul, etc.)
+                    # produce scalars, not tensors — skip sharding.
+                    continue
                 user_strats = tree_map_only(
-                    torch.fx.Node, lambda x: strats.get(x), node.args
+                    torch.fx.Node,
+                    lambda x: strats.get(x, x.meta.get("val")),
+                    node.args,
                 )
                 user_args = tree_map_only(
                     torch.fx.Node, lambda x: x.meta.get("val"), node.args
@@ -259,18 +362,21 @@ class ShardingOptimizer:
     def _all_input_nodes(self, node):
         """Variant of node.all_input_nodes that preserves duplicate nodes.
 
-        Filters to only nodes present in self.strats so that HOP submodule
-        nodes (GraphModules without tensor val) are invisible to the ILP.
+        Filters out nodes not in self.strats:
+        - get_attr: HOP submodule nodes (GraphModules)
+        - call_function producing non-tensors: shape-computation nodes
+          (sym_size, operator.mul, etc.)
         """
-        # TODO: add kwargs?
         result = []
         for x in all_input_nodes(node):
             if x in self.strats:
                 result.append(x)
-            else:
-                assert (
-                    x.op == "get_attr"
-                ), f"Non-get_attr node {x} (op={x.op}) missing from strats"
+            elif x.op != "get_attr":
+                val = x.meta.get("val")
+                assert not isinstance(val, torch.Tensor), (
+                    f"Tensor-producing node {x} (op={x.op}) unexpectedly "
+                    f"missing from strats"
+                )
         return result
 
     def walk_over_options(self, node, constrain_arg=None):
@@ -510,6 +616,8 @@ class ShardingOptimizer:
         for node in self.graph.nodes:
             if node.op != "call_function":
                 continue
+            if node not in self.strats:
+                continue
             strat = self.strats[node]
             strat0 = strat.strategies[0]
             all_input_nodes = self._all_input_nodes(node)
@@ -543,11 +651,12 @@ class ShardingOptimizer:
 
         ∀i,a: Σ_{o,j} x_{i,a,o,j} = 1
         """
-        for node_idx, node in enumerate(self.graph.nodes):
+        for node in self.graph.nodes:
             if node.op not in {"placeholder", "call_function", "get_attr"}:
                 continue
-            if node not in self.strats:
+            if node not in self.node_map:
                 continue
+            node_idx = self.node_map[node]
             if node_idx in self._cluster_linked_node_idxs:
                 continue
             arg_vars = {}
@@ -567,9 +676,12 @@ class ShardingOptimizer:
 
         ∀i,o: Σ_j x_{i,0,o,j} = Σ_j x_{i,1,o,j} = ... = Σ_j x_{i,A_i-1,o,j}
         """
-        for node_idx, node in enumerate(self.graph.nodes):
+        for node in self.graph.nodes:
             if node.op != "call_function":
                 continue
+            if node not in self.node_map:
+                continue
+            node_idx = self.node_map[node]
             if node_idx in self._cluster_linked_node_idxs:
                 continue
             if len(self._all_input_nodes(node)) <= 1:
@@ -597,16 +709,19 @@ class ShardingOptimizer:
 
         ∀(i→k): Σ_j x_{i,0,o,j} = Σ_j x_{k,a,j,o}
         """
-        for node_idx, node in enumerate(self.graph.nodes):
+        for node in self.graph.nodes:
             if node.op == "output":
                 continue
-            if node not in self.strats:
+            if node not in self.node_map:
                 continue
+            node_idx = self.node_map[node]
             producer_is_linked = node_idx in self._cluster_linked_node_idxs
             # All args agree on the same output (ensured by consistency constraint),
             # so we use arg 0 for the producer side.
             for user in node.users:
                 if user.op == "output":
+                    continue
+                if user not in self.node_map:
                     continue
                 user_idx = self.node_map[user]
                 # Skip edges where both endpoints are cluster-linked;
@@ -806,6 +921,14 @@ class ShardingOptimizer:
 
         return {node: dvs[0].strategy for node, dvs in selected_by_node.items()}
 
+    def _to_orig_solution(self, solution):
+        """Translate a solution from concrete-graph nodes to original-graph nodes."""
+        return {self._concrete_to_orig[node]: spec for node, spec in solution.items()}
+
+    def _to_concrete_solution(self, solution):
+        """Translate a solution from original-graph nodes to concrete-graph nodes."""
+        return {self._orig_to_concrete[node]: spec for node, spec in solution.items()}
+
     def get_solution(self, verbose=False):
         t0 = time.perf_counter()
         self._set_objective()
@@ -814,7 +937,7 @@ class ShardingOptimizer:
         logger.debug(
             "ILP solve took %.3fs (objective=%.4f)", time.perf_counter() - t0, obj_value
         )
-        return self._extract_and_validate_solution()
+        return self._to_orig_solution(self._extract_and_validate_solution())
 
     def resolve(self, verbose=False):
         """Re-solve the ILP after adding or removing constraints.
@@ -830,7 +953,7 @@ class ShardingOptimizer:
             time.perf_counter() - t0,
             obj_value,
         )
-        return self._extract_and_validate_solution()
+        return self._to_orig_solution(self._extract_and_validate_solution())
 
     def remove_constraints(self, names):
         """Remove constraints by name, allowing re-solve to revert to the
@@ -870,8 +993,9 @@ class ShardingOptimizer:
 
         # Compute objective values from selected_keys for current solution
         # (solution_b is the current state after last solve)
-        cost_a = self._compute_solution_cost(solution_a)
-        cost_b = self._compute_solution_cost(solution_b)
+        # Translate to concrete nodes for internal cost computation
+        cost_a = self._compute_solution_cost(self._to_concrete_solution(solution_a))
+        cost_b = self._compute_solution_cost(self._to_concrete_solution(solution_b))
 
         lines = []
         lines.append(
@@ -984,10 +1108,19 @@ class ShardingOptimizer:
             violated_constraints_log=self.get_violated_constraints_log(),
         )
 
+    def get_strategy(self, node):
+        """Look up the OpStrategy for a node.
+
+        Accepts nodes from either the original or concrete graph.
+        """
+        node = self._normalize_node(node)
+        return self.strats[node]
+
     def print_costs_for_node(self, node, arg=0, **kwargs):
         from tabulate import tabulate  # type: ignore
         from torch.distributed.tensor._op_schema import _pretty_print_spec
 
+        node = self._normalize_node(node)
         tgt_strat = self.strats[node]
         src_strat = self.strats[self._all_input_nodes(node)[arg]]
         src_placements = [""] + [
@@ -1015,6 +1148,8 @@ class ShardingOptimizer:
             start_node: optional node to begin from (default: first graph node)
             max_nodes: optional limit on number of nodes to report
         """
+        if start_node is not None:
+            start_node = self._normalize_node(start_node)
         from tabulate import tabulate  # type: ignore
         from torch.distributed.tensor._op_schema import _pretty_print_spec
 
@@ -1293,6 +1428,7 @@ class ShardingOptimizer:
         For nodes with tuple output_specs (e.g. SDPA), the placement is matched
         against the first DTensorSpec element in the tuple.
         """
+        node = self._normalize_node(node)
         assert node in self.strats, (node, self.strats.keys())
         strat = self.strats[node]
         if placement is None:

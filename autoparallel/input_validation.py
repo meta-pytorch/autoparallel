@@ -9,6 +9,16 @@ import torch
 from torch.distributed.tensor import DeviceMesh
 
 
+def _get_expected_dim_value(exp):
+    """Return a concrete expected dim value when a symbolic dim collapsed to one."""
+    if not isinstance(exp, torch.SymInt):
+        return exp
+    expr = exp.node.expr
+    if expr.is_number:
+        return int(expr)
+    return None
+
+
 def _compute_expected_inputs(traced_inputs, input_constraints, mesh):
     """Compute expected runtime inputs by applying sharding to traced global shapes.
 
@@ -42,7 +52,11 @@ def _compute_expected_inputs(traced_inputs, input_constraints, mesh):
 
 
 def _check_forward_args(args, expected_inputs):
-    """Validate that forward() args match the shapes/dtypes used during tracing."""
+    """Validate that forward() args match the shapes/dtypes used during tracing.
+
+    When dynamic shapes are enabled, dimensions that are SymInt in the expected
+    shape accept any size. Concrete dimensions are checked exactly.
+    """
     if len(args) != len(expected_inputs):
         raise ValueError(
             f"AutoParallel: expected {len(expected_inputs)} arguments "
@@ -55,11 +69,20 @@ def _check_forward_args(args, expected_inputs):
                     f"AutoParallel: argument {i} should be a Tensor "
                     f"but got {type(arg).__name__}"
                 )
-            if arg.shape != expected.shape:
+            if len(arg.shape) != len(expected.shape):
                 raise ValueError(
-                    f"AutoParallel: argument {i} has shape {tuple(arg.shape)} "
-                    f"but expected {tuple(expected.shape)}"
+                    f"AutoParallel: argument {i} has {len(arg.shape)} dims "
+                    f"but expected {len(expected.shape)} dims"
                 )
+            for dim, (actual, exp) in enumerate(zip(arg.shape, expected.shape)):
+                expected_dim = _get_expected_dim_value(exp)
+                if expected_dim is None:
+                    continue
+                if actual != expected_dim:
+                    raise ValueError(
+                        f"AutoParallel: argument {i} has shape {tuple(arg.shape)} "
+                        f"but expected {tuple(expected.shape)}"
+                    )
             if arg.dtype != expected.dtype:
                 raise ValueError(
                     f"AutoParallel: argument {i} has dtype {arg.dtype} "

@@ -4,9 +4,9 @@
 # LICENSE file in the root directory of this source tree.
 
 from contextlib import ExitStack
-from unittest.mock import patch
 
 import torch
+from conftest import apply_cuda_patches
 from torch import nn
 from torch._functorch._aot_autograd.fx_utils import get_param_and_grad_nodes
 from torch._functorch.aot_autograd import aot_export_joint_with_descriptors
@@ -395,8 +395,7 @@ class ModelWithAllNonTrainableParams(nn.Module):
         return x
 
 
-@patch("torch.cuda.device_count", lambda: 8)
-@patch("torch.cuda.get_device_name", lambda device: "H100")
+@apply_cuda_patches
 def test_compute_optimal_placement_order_with_non_trainable_params(device_mesh_2d):
     """Test that compute_optimal_placement_order_for_parameters handles parameters with grad=None."""
 
@@ -459,8 +458,7 @@ def test_compute_optimal_placement_order_with_non_trainable_params(device_mesh_2
         ), "Expected at least one parameter to have a valid gradient"
 
 
-@patch("torch.cuda.device_count", lambda: 8)
-@patch("torch.cuda.get_device_name", lambda device: "H100")
+@apply_cuda_patches
 def test_compute_optimal_placement_order_with_all_non_trainable_params(device_mesh_2d):
     """Test edge case where ALL parameters don't require gradients."""
 
@@ -670,8 +668,7 @@ class MultiLinearModel(nn.Module):
         return x
 
 
-@patch("torch.cuda.device_count", lambda: 8)
-@patch("torch.cuda.get_device_name", lambda device: "H100")
+@apply_cuda_patches
 def test_compute_optimal_placement_order_multi_layer(device_mesh_2d):
     """Test placement ordering with multiple layers.
 
