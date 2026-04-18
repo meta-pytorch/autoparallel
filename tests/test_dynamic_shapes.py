@@ -338,6 +338,120 @@ class TestConcretizeArgs:
         assert result[2] == [1, 2, 3]
 
 
+class TestConcretizeGm:
+    """Tests for concretize_gm in optimize_sharding."""
+
+    def test_structure_preserved(self):
+        """Concretized graph has same nodes, ops, targets, edges."""
+        from torch._subclasses import FakeTensorMode
+        from torch.fx import Graph, GraphModule
+        from torch.fx.experimental.symbolic_shapes import (
+            DimDynamic,
+            ShapeEnv,
+            StatelessSymbolicContext,
+        )
+
+        from autoparallel.optimize_sharding import concretize_gm
+
+        shape_env = ShapeEnv()
+        fake_mode = FakeTensorMode(shape_env=shape_env, static_shapes=False)
+
+        real = torch.empty(16, 128, device="meta")
+        sym_ctx = StatelessSymbolicContext(
+            dynamic_sizes=[DimDynamic.DYNAMIC, DimDynamic.STATIC]
+        )
+        sym_t = fake_mode.from_tensor(real, symbolic_context=sym_ctx)
+
+        graph = Graph()
+        x = graph.placeholder("x")
+        x.meta["val"] = sym_t
+        y = graph.call_function(torch.relu, (x,))
+        with fake_mode:
+            y.meta["val"] = torch.relu(sym_t)
+        graph.output(y)
+        gm = GraphModule({}, graph)
+
+        concrete_gm, orig_to_concrete, concrete_to_orig = concretize_gm(gm)
+
+        # Same number of nodes
+        orig_nodes = list(gm.graph.nodes)
+        conc_nodes = list(concrete_gm.graph.nodes)
+        assert len(orig_nodes) == len(conc_nodes)
+
+        # Same ops and targets
+        for orig, conc in zip(orig_nodes, conc_nodes):
+            assert orig.op == conc.op
+            assert orig.target == conc.target
+
+        # Bidirectional mapping is total
+        assert len(orig_to_concrete) == len(orig_nodes)
+        assert len(concrete_to_orig) == len(conc_nodes)
+        for orig, conc in zip(orig_nodes, conc_nodes):
+            assert orig_to_concrete[orig] is conc
+            assert concrete_to_orig[conc] is orig
+
+    def test_symints_concretized(self):
+        """meta['val'] shapes in the concrete graph are plain ints."""
+        from torch._subclasses import FakeTensorMode
+        from torch.fx import Graph, GraphModule
+        from torch.fx.experimental.symbolic_shapes import (
+            DimDynamic,
+            ShapeEnv,
+            StatelessSymbolicContext,
+        )
+
+        from autoparallel.optimize_sharding import concretize_gm
+
+        shape_env = ShapeEnv()
+        fake_mode = FakeTensorMode(shape_env=shape_env, static_shapes=False)
+
+        real = torch.empty(16, 128, device="meta")
+        sym_ctx = StatelessSymbolicContext(
+            dynamic_sizes=[DimDynamic.DYNAMIC, DimDynamic.DYNAMIC]
+        )
+        sym_t = fake_mode.from_tensor(real, symbolic_context=sym_ctx)
+        assert any(isinstance(s, torch.SymInt) for s in sym_t.shape)
+
+        graph = Graph()
+        x = graph.placeholder("x")
+        x.meta["val"] = sym_t
+        graph.output(x)
+        gm = GraphModule({}, graph)
+
+        concrete_gm, _, _ = concretize_gm(gm)
+
+        conc_placeholder = next(
+            n for n in concrete_gm.graph.nodes if n.op == "placeholder"
+        )
+        val = conc_placeholder.meta["val"]
+        assert all(isinstance(s, int) for s in val.shape)
+        assert val.shape == (16, 128)
+
+    def test_non_val_meta_preserved(self):
+        """Non-val metadata (e.g., desc) is preserved in the concrete graph."""
+        from torch._subclasses import FakeTensorMode
+        from torch.fx import Graph, GraphModule
+        from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+        from autoparallel.optimize_sharding import concretize_gm
+
+        fake_mode = FakeTensorMode(shape_env=ShapeEnv(), static_shapes=False)
+
+        graph = Graph()
+        x = graph.placeholder("x")
+        x.meta["val"] = fake_mode.from_tensor(torch.empty(4, 8, device="meta"))
+        x.meta["desc"] = "test_descriptor"
+        x.meta["custom_key"] = 42
+        graph.output(x)
+        gm = GraphModule({}, graph)
+
+        concrete_gm, _, _ = concretize_gm(gm)
+
+        conc_x = next(n for n in concrete_gm.graph.nodes if n.op == "placeholder")
+        assert conc_x.meta["desc"] == "test_descriptor"
+        assert conc_x.meta["custom_key"] == 42
+
+
 class TestProducesTensor:
     """Tests for _produces_tensor in optimize_sharding."""
 

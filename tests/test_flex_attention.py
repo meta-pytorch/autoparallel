@@ -334,7 +334,7 @@ def test_flex_attention_block_mask_sharding_matches_shape(device_mesh_1d):
                     continue
                 if "backward" in node.target.name():
                     continue
-                return autop.sharding_optimizer.strats[node]
+                return autop.sharding_optimizer.get_strategy(node)
         raise AssertionError("flex_attention node not found")
 
     def _block_mask_specs(strat):
@@ -415,7 +415,7 @@ def test_flex_attention_gqa_head_sharding(device_mesh_2d):
         autop.add_input_constraints(input_placements)
         autop.add_output_constraints(output_placements)
 
-        strats = autop.sharding_optimizer.strats
+        opt = autop.sharding_optimizer
         for node in autop.gm.graph.nodes:
             if node.op != "call_function":
                 continue
@@ -424,7 +424,7 @@ def test_flex_attention_gqa_head_sharding(device_mesh_2d):
             if "backward" in node.target.name():
                 continue
 
-            strat = strats[node]
+            strat = opt.get_strategy(node)
             # Q has Hq=8, K/V have Hkv=2. Since 8 % 2 == 0, Shard(1) should
             # be available for both Q and KV inputs.
             has_head_shard = any(
@@ -483,7 +483,7 @@ def test_flex_attention_other_buffers_replicated(device_mesh_1d):
         autop.add_input_constraints(input_placements)
         autop.add_output_constraints(output_placements)
 
-        strats = autop.sharding_optimizer.strats
+        opt = autop.sharding_optimizer
         for node in autop.gm.graph.nodes:
             if node.op != "call_function":
                 continue
@@ -492,7 +492,7 @@ def test_flex_attention_other_buffers_replicated(device_mesh_1d):
             if "backward" in node.target.name():
                 continue
 
-            strat = strats[node]
+            strat = opt.get_strategy(node)
             q_shape = strat.strategies[0].input_specs[0].tensor_meta.shape
             B, H = q_shape[0], q_shape[1]
 

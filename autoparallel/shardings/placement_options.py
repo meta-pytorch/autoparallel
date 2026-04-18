@@ -355,7 +355,7 @@ def get_placement_options(mesh, op, specs, user_args, user_kwargs):
 
 
 def _concretize_tensor_meta(t: torch.Tensor) -> "TensorMeta | None":
-    """Build TensorMeta, concretizing any SymInts in shape/stride to hints.
+    """Build TensorMeta from a tensor's shape/stride/dtype.
 
     Returns None if ANY shape/stride dim has an unbacked SymInt (hint=None),
     which indicates a data-dependent shape that can't be statically sharded.
@@ -363,17 +363,15 @@ def _concretize_tensor_meta(t: torch.Tensor) -> "TensorMeta | None":
     interpreter to skip redistribution for these tensors. This is correct for
     HOP-internal activations (e.g., local_map forward outputs saved for
     backward) whose distribution is managed by the HOP itself.
-    """
-    from autoparallel.optimize_sharding import concretize_symint
 
-    shape = [concretize_symint(s) for s in t.shape]
-    stride = [concretize_symint(s) for s in t.stride()]
-    # If any dim is still a SymInt (unbacked, hint=None), we can't create TensorMeta
-    if any(isinstance(s, torch.SymInt) for s in shape):
+    Note: backed SymInts are already concretized by concretize_gm before the
+    optimizer runs, so this only needs to handle the unbacked case.
+    """
+    if any(isinstance(s, torch.SymInt) for s in t.shape):
         return None
-    if any(isinstance(s, torch.SymInt) for s in stride):
+    if any(isinstance(s, torch.SymInt) for s in t.stride()):
         return None
-    return TensorMeta(torch.Size(shape), tuple(stride), t.dtype)
+    return TensorMeta(torch.Size(t.shape), tuple(t.stride()), t.dtype)
 
 
 def get_local_map_placement_option(
