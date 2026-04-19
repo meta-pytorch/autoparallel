@@ -168,9 +168,12 @@ def test_optimization_finds_fsdp_and_ddp_1d(device_mesh_1d, high_mem, model_type
         assert p.input_specs[1].placements == (Replicate(),)
 
     # bwd grad weight
+    # For mm: [N, B*S] @ [B*S, K] → batch dim is at position 1 for input 0
+    # For einsum: bsn,bsk->nk → batch dim is at position 0 for both inputs
+    bwd_grad_weight_shard = (Shard(0),) if is_einsum else (Shard(1),)
     for node in bwd_linear_grad_weight_nodes:
         p = sharding_placement[node]
-        assert p.input_specs[0].placements == (Shard(1),)
+        assert p.input_specs[0].placements == bwd_grad_weight_shard
         assert p.output_specs.placements == (Partial("sum"),)
         assert p.input_specs[1].placements == (Shard(0),)
 
