@@ -26,6 +26,7 @@ from autoparallel.cost_models.nccl_cost_model import (
     NCCLTopoConfig,
     _compute_algo_bw,
     _compute_algo_latency,
+    _depth_scaled_ring_correction,
     _eligible_algos,
     _eligible_protos,
     _interp_clamped,
@@ -1325,3 +1326,49 @@ class TestAGRSMultiNodeEmpirical:
         cost = nccl_allgather_cost(n_bytes, topo, config)
         assert cost > 0
         assert cost < float("inf")
+
+
+# ---- Ring correction monotonicity tests ----
+
+
+class TestRingCorrectionMonotonicity:
+    """Ensure depth-scaled Ring correction table is clamped for monotonicity."""
+
+    @pytest.mark.parametrize("n_nodes", [8, 16, 32])
+    def test_table_entries_do_not_jump_more_than_2x(self, n_nodes):
+        table = _depth_scaled_ring_correction(n_nodes)
+        for i in range(1, len(table)):
+            assert table[i] <= 2.0 * table[i - 1] + 1e-12, (
+                f"n_nodes={n_nodes}: table[{i}]={table[i]:.6f} > "
+                f"2 * table[{i-1}]={2*table[i-1]:.6f}"
+            )
+
+    @pytest.mark.parametrize("n_nodes", [8, 16, 32])
+    def test_allgather_cost_monotonic(self, n_nodes):
+        """cost(2N) >= cost(N) for Ring allgather across the LL->LL128 region."""
+        config = h100_topo_config(num_nodes=n_nodes, gpus_per_node=8)
+        topo = derive_mesh_dim_topo(config, (n_nodes * 8,), 0)
+        prev_cost = 0.0
+        for exp in range(14, 28):
+            n_bytes = 1 << exp
+            cost = nccl_collective_time(NCCLFunc.ALLGATHER, n_bytes, topo, config)
+            assert cost >= prev_cost - 1e-6, (
+                f"n_nodes={n_nodes}: cost({n_bytes}) = {cost:.2f} < "
+                f"cost({n_bytes // 2}) = {prev_cost:.2f}"
+            )
+            prev_cost = cost
+
+    @pytest.mark.parametrize("n_nodes", [8, 16, 32])
+    def test_reduce_scatter_cost_monotonic(self, n_nodes):
+        """cost(2N) >= cost(N) for Ring reduce-scatter."""
+        config = h100_topo_config(num_nodes=n_nodes, gpus_per_node=8)
+        topo = derive_mesh_dim_topo(config, (n_nodes * 8,), 0)
+        prev_cost = 0.0
+        for exp in range(14, 28):
+            n_bytes = 1 << exp
+            cost = nccl_collective_time(NCCLFunc.REDUCESCATTER, n_bytes, topo, config)
+            assert cost >= prev_cost - 1e-6, (
+                f"n_nodes={n_nodes}: cost({n_bytes}) = {cost:.2f} < "
+                f"cost({n_bytes // 2}) = {prev_cost:.2f}"
+            )
+            prev_cost = cost
