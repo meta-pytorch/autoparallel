@@ -24,6 +24,7 @@ Two layers:
 
 from __future__ import annotations
 
+import functools
 import math
 from dataclasses import dataclass
 from enum import Enum
@@ -565,17 +566,16 @@ def _nccl_algo_time(
     # AG benchmarks at 2/4/8 nodes.
     if algo == NCCLAlgo.RING and topo.n_nodes > 1:
         log_per_gpu = _log2i((n_bytes // topo.n_ranks) >> 6)
-        if 0 <= log_per_gpu < 24:
-            corr = _RING_CORRECTION_FACTOR[log_per_gpu]
+        if topo.n_nodes > 4:
+            table = _depth_scaled_ring_correction(topo.n_nodes)
+        else:
+            table = _RING_CORRECTION_FACTOR
+        if 0 <= log_per_gpu < len(table):
+            corr = table[log_per_gpu]
         elif log_per_gpu < 0:
-            corr = _RING_CORRECTION_FACTOR[0]
+            corr = table[0]
         else:
             corr = 1.0
-        # Deeper pipelines (8+ nodes) ramp more slowly; amplify correction.
-        # Exponent fitted from 8-node H100 AG benchmarks: factor^1.2 matches
-        # the measured BW deficit at 8 nodes across logSize 11-18.
-        if topo.n_nodes > 4 and corr < 1.0:
-            corr **= 1.0 + 0.2 * (_log2i(topo.n_nodes) - 2)
         bw *= corr
 
     # Ring plateau effect for multi-node Simple allreduce (lines 597-599)
@@ -673,6 +673,29 @@ _RING_CORRECTION_FACTOR = (
     1.00,
     1.00,
 )
+
+
+@functools.cache
+def _depth_scaled_ring_correction(n_nodes: int) -> tuple[float, ...]:
+    """Ring correction table with depth-scaled exponent, clamped for monotonicity.
+
+    For 8+ nodes the raw correction factors are raised to an exponent > 1 to
+    model deeper pipeline ramp. This can make adjacent entries jump by more
+    than 2x, which would cause the BW term to decrease when the message size
+    doubles. We clamp each entry to at most 2x the previous entry so that
+    the Ring BW correction does not grow by more than 2x per log-size step
+    after depth scaling.
+    """
+    exp = 1.0 + 0.2 * (_log2i(n_nodes) - 2)
+    table = list(_RING_CORRECTION_FACTOR)
+    for i, corr in enumerate(table):
+        if corr < 1.0:
+            corr **= exp
+        if i > 0:
+            corr = min(corr, 2.0 * table[i - 1])
+        table[i] = corr
+    return tuple(table)
+
 
 # Per-node synchronization overhead (us) for multi-node Ring.
 # NCCL's Ring latency model (nsteps * per_step_lat) assumes each step has
