@@ -319,8 +319,10 @@ def test_flex_attention_block_mask_sharding_matches_shape(device_mesh_1d):
 
     def _get_flex_attn_strat(model):
         x = _make_input(mesh, DIM)
-        shapes, dtypes, input_placements, treespec = _extract_input_info((x,), mesh)
-        input_fn = _make_input_fn(shapes, dtypes, treespec)
+        shapes, dtypes, input_placements, treespec, devices = _extract_input_info(
+            (x,), mesh
+        )
+        input_fn = _make_input_fn(shapes, dtypes, treespec, devices)
         output_placements = _flatten_out_shardings(_out_shardings(mesh))
 
         with AutoParallel(model, input_fn, mesh, compile=False) as autop:
@@ -407,8 +409,10 @@ def test_flex_attention_gqa_head_sharding(device_mesh_2d):
         model = FlexAttnGQAModel(DIM, N_HEADS, n_kv_heads)
 
     x = _make_input(mesh, DIM)
-    shapes, dtypes, input_placements, treespec = _extract_input_info((x,), mesh)
-    input_fn = _make_input_fn(shapes, dtypes, treespec)
+    shapes, dtypes, input_placements, treespec, devices = _extract_input_info(
+        (x,), mesh
+    )
+    input_fn = _make_input_fn(shapes, dtypes, treespec, devices)
     output_placements = _flatten_out_shardings(_out_shardings(mesh))
 
     with AutoParallel(model, input_fn, mesh, compile=False) as autop:
@@ -475,8 +479,10 @@ def test_flex_attention_other_buffers_replicated(device_mesh_1d):
     )
 
     x = _make_input(mesh, DIM)
-    shapes, dtypes, input_placements, treespec = _extract_input_info((x,), mesh)
-    input_fn = _make_input_fn(shapes, dtypes, treespec)
+    shapes, dtypes, input_placements, treespec, devices = _extract_input_info(
+        (x,), mesh
+    )
+    input_fn = _make_input_fn(shapes, dtypes, treespec, devices)
     output_placements = _flatten_out_shardings(_out_shardings(mesh))
 
     with AutoParallel(model, input_fn, mesh, compile=False) as autop:
