@@ -893,8 +893,8 @@ def test_dynamic_apply_placement_ffn(device_mesh_1d):
     with AutoParallel(model, input_fn, device_mesh_1d, dynamic=True) as autop:
         autop.add_input_constraints([placement])
         autop.add_output_constraints([placement])
-        autop.optimize_placement(verbose=False)
-        parallel_model = autop.apply_placement()
+        sharding_placement = autop.optimize_placement(verbose=False)
+        parallel_model = autop.apply_placement(sharding_placement)
 
     assert parallel_model is not None
 
@@ -919,8 +919,8 @@ def test_dynamic_apply_placement_transformer(device_mesh_2d):
     ) as autop:
         autop.add_input_constraints([placement])
         autop.add_output_constraints([placement])
-        autop.optimize_placement(verbose=False)
-        parallel_model = autop.apply_placement()
+        sharding_placement = autop.optimize_placement(verbose=False)
+        parallel_model = autop.apply_placement(sharding_placement)
 
     assert parallel_model is not None
 
@@ -1029,8 +1029,8 @@ def test_dynamic_apply_placement_view_heavy(device_mesh_2d):
     ) as autop:
         autop.add_input_constraints([placement])
         autop.add_output_constraints([placement])
-        autop.optimize_placement(verbose=False)
-        parallel_model = autop.apply_placement()
+        sharding_placement = autop.optimize_placement(verbose=False)
+        parallel_model = autop.apply_placement(sharding_placement)
 
     assert parallel_model is not None
 
@@ -1057,8 +1057,8 @@ def test_dynamic_apply_placement_factory_op(device_mesh_1d):
     ) as autop:
         autop.add_input_constraints([placement])
         autop.add_output_constraints([placement])
-        autop.optimize_placement(verbose=False)
-        parallel_model = autop.apply_placement()
+        sharding_placement = autop.optimize_placement(verbose=False)
+        parallel_model = autop.apply_placement(sharding_placement)
 
     assert parallel_model is not None
 
@@ -1082,7 +1082,7 @@ def test_dynamic_vs_static_parity_view_heavy(device_mesh_2d):
         autop_s.add_input_constraints([placement])
         autop_s.add_output_constraints([placement])
         static_placement = autop_s.optimize_placement(verbose=False)
-        autop_s.apply_placement()
+        autop_s.apply_placement(static_placement)
 
     # Dynamic
     with torch.device("meta"):
@@ -1091,7 +1091,7 @@ def test_dynamic_vs_static_parity_view_heavy(device_mesh_2d):
         autop_d.add_input_constraints([placement])
         autop_d.add_output_constraints([placement])
         dynamic_placement = autop_d.optimize_placement(verbose=False)
-        autop_d.apply_placement()
+        autop_d.apply_placement(dynamic_placement)
 
     # Compare param placements — these must match exactly since they
     # determine the model's weight distribution.

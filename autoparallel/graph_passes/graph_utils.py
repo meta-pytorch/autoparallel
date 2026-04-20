@@ -256,25 +256,36 @@ def _batch_dims(n: int) -> str:
     return "".join(chr(97 + i) for i in range(n))
 
 
-def _is_canonical_flatten(input_shape, view_args):
-    """Check that view_args represent [*batch, K] -> [prod(batch), K]."""
-    if len(view_args) != 2:
+def _is_view(node):
+    return node.target == torch.ops.aten.view.default
+
+
+def _is_canonical_flatten_shape(input_shape, output_shape):
+    """Check shapes represent [*batch, K] -> [prod(batch), K].
+
+    Verifies both that the last dim is preserved and that the first output
+    dim equals the product of all batch dims.
+    """
+    if len(output_shape) != 2:
         return False
     expected_flat = 1
     for d in input_shape[:-1]:
         expected_flat *= d
-    return view_args[0] == expected_flat and view_args[1] == input_shape[-1]
+    return output_shape[0] == expected_flat and output_shape[-1] == input_shape[-1]
 
 
-def _is_canonical_unflatten(input_shape, view_args):
-    """Check that view_args represent [prod(batch), N] -> [*batch, N]."""
-    if len(view_args) < 3:
+def _is_canonical_unflatten_shape(input_shape, output_shape):
+    """Check shapes represent [prod(batch), N] -> [*batch, N].
+
+    Verifies both that the last dim is preserved and that the product of
+    output batch dims equals the first input dim.
+    """
+    if len(output_shape) < 3:
         return False
-    batch_dims = view_args[:-1]
     expected_flat = 1
-    for d in batch_dims:
+    for d in output_shape[:-1]:
         expected_flat *= d
-    return expected_flat == input_shape[0] and view_args[-1] == input_shape[-1]
+    return expected_flat == input_shape[0] and output_shape[-1] == input_shape[-1]
 
 
 def _match_forward_linear(mm_node):
@@ -286,29 +297,24 @@ def _match_forward_linear(mm_node):
     Returns (inputs, replaced_node, equation) or None.
     """
     first_input, second_input = mm_node.all_input_nodes
-    if first_input.target != torch.ops.aten.view.default:
+    if not _is_view(first_input):
         return None
     view_input = first_input.all_input_nodes[0]
     input_shape = view_input.meta["val"].shape
     if input_shape.numel() == 0 or len(input_shape) < 3:
         return None
-    # Verify the input view is a canonical flatten [*batch, K] -> [prod(batch), K]
-    flatten_args = first_input.args[1]
-    if not _is_canonical_flatten(input_shape, flatten_args):
+    view_output_shape = first_input.meta["val"].shape
+    if not _is_canonical_flatten_shape(input_shape, view_output_shape):
         return None
     users = list(mm_node.users)
-    if not (
-        len(users) == 1
-        and users[0].target == torch.ops.aten.view.default
-        and second_input.meta["val"].ndim == 2
-    ):
+    if len(users) != 1 or second_input.meta["val"].ndim != 2:
+        return None
+    if not _is_view(users[0]):
         return None
     output_view = users[0]
     output_shape = output_view.meta["val"].shape
-    # Verify the output view is a canonical unflatten [prod(batch), N] -> [*batch, N]
-    unflatten_args = output_view.args[1]
     mm_shape = mm_node.meta["val"].shape
-    if not _is_canonical_unflatten(mm_shape, unflatten_args):
+    if not _is_canonical_unflatten_shape(mm_shape, output_shape):
         return None
     # Verify batch dims match between input and output
     if input_shape[:-1] != output_shape[:-1]:
@@ -335,12 +341,12 @@ def _match_backward_linear(mm_node):
     Returns (inputs, replaced_node, equation) or None.
     """
     first_input, second_input = mm_node.all_input_nodes
-    if second_input.target != torch.ops.aten.view.default:
+    if not _is_view(second_input):
         return None
     if first_input.target != torch.ops.aten.permute.default:
         return None
     first_view = first_input.all_input_nodes[0]
-    if first_view.target != torch.ops.aten.view.default:
+    if not _is_view(first_view):
         return None
     # Verify the input permute is [1, 0] (transpose)
     perm_dims = list(first_input.args[1])
@@ -348,10 +354,14 @@ def _match_backward_linear(mm_node):
         return None
     orig_first = first_view.all_input_nodes[0]
     orig_second = second_input.all_input_nodes[0]
-    # Verify both views are canonical flattenings
-    if not _is_canonical_flatten(orig_first.meta["val"].shape, first_view.args[1]):
+    # Verify both views are canonical flattenings using shapes
+    first_view_in = orig_first.meta["val"].shape
+    first_view_out = first_view.meta["val"].shape
+    if not _is_canonical_flatten_shape(first_view_in, first_view_out):
         return None
-    if not _is_canonical_flatten(orig_second.meta["val"].shape, second_input.args[1]):
+    second_view_in = orig_second.meta["val"].shape
+    second_view_out = second_input.meta["val"].shape
+    if not _is_canonical_flatten_shape(second_view_in, second_view_out):
         return None
     users = list(mm_node.users)
     if not (
@@ -365,7 +375,7 @@ def _match_backward_linear(mm_node):
     if out_perm_dims != [1, 0]:
         return None
     # Verify batch dims match
-    if orig_first.meta["val"].shape[:-1] != orig_second.meta["val"].shape[:-1]:
+    if first_view_in[:-1] != second_view_in[:-1]:
         return None
     ndim = orig_first.meta["val"].ndim
     dims = _batch_dims(ndim - 1)
