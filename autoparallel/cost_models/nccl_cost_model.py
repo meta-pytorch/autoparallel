@@ -25,6 +25,7 @@ Two layers:
 from __future__ import annotations
 
 import functools
+import logging
 import math
 from dataclasses import dataclass
 from enum import Enum
@@ -32,6 +33,8 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from torch.distributed.tensor import DeviceMesh
+
+logger = logging.getLogger(__name__)
 
 
 class GpuArch(Enum):
@@ -1215,23 +1218,76 @@ def nccl_reduce_scatter_cost(
     return nccl_collective_time(NCCLFunc.REDUCESCATTER, n_bytes, topo, config)
 
 
+# Ordered from most specific to least specific to avoid substring
+# false matches (e.g. "B200" matching inside "GB200").
+_CANONICAL_GPUS_PER_NODE = (
+    ("GB200", 72),
+    ("B200", 72),
+    ("H200", 8),
+    ("H100", 8),
+    ("A100", 8),
+)
+
+
 def detect_nccl_topo_config(mesh: "DeviceMesh") -> NCCLTopoConfig | None:
     """Auto-detect GPU architecture and build an NCCLTopoConfig from the mesh.
 
-    Returns None if the GPU is unrecognized (caller falls back to PyTorch model).
+    Uses canonical per-architecture defaults (e.g. 8 GPUs/node for H100,
+    72 for GB200). If the mesh size is not divisible by the canonical
+    gpus_per_node, returns None so the caller falls back to the PyTorch
+    default model. For non-standard topologies, pass an explicit
+    NCCLTopoConfig instead.
+
+    Returns None if the GPU is unrecognized or the mesh is incompatible.
     """
     import torch
 
-    device_name = torch.cuda.get_device_name(0)
+    try:
+        device_name = torch.cuda.get_device_name(0)
+    except (RuntimeError, AssertionError):
+        logger.info(
+            "No CUDA device available for NCCL cost model detection. "
+            "Falling back to default cost model."
+        )
+        return None
+
     total_gpus = mesh.size()
-    gpus_per_node = torch.cuda.device_count()
+
+    gpus_per_node = None
+    matched_name = None
+    for gpu_name, canonical_ppn in _CANONICAL_GPUS_PER_NODE:
+        if gpu_name in device_name:
+            gpus_per_node = canonical_ppn
+            matched_name = gpu_name
+            break
+
+    if gpus_per_node is None:
+        logger.warning(
+            "Unrecognized GPU '%s' for NCCL cost model. "
+            "Falling back to default cost model. "
+            "Pass an explicit NCCLTopoConfig for this hardware.",
+            device_name,
+        )
+        return None
+
+    if total_gpus % gpus_per_node != 0:
+        logger.warning(
+            "Mesh size %d is not divisible by canonical %d GPUs/node for %s. "
+            "NCCL topology may be inaccurate; falling back to default cost "
+            "model. Pass an explicit NCCLTopoConfig for non-standard setups.",
+            total_gpus,
+            gpus_per_node,
+            device_name,
+        )
+        return None
+
     num_nodes = total_gpus // gpus_per_node
 
-    if "A100" in device_name:
+    if matched_name == "A100":
         return a100_topo_config(num_nodes=num_nodes, gpus_per_node=gpus_per_node)
-    elif "H100" in device_name or "H200" in device_name:
+    elif matched_name in ("H100", "H200"):
         return h100_topo_config(num_nodes=num_nodes, gpus_per_node=gpus_per_node)
-    elif "B200" in device_name or "GB200" in device_name:
+    elif matched_name in ("B200", "GB200"):
         return gb200_topo_config(num_nodes=num_nodes, gpus_per_node=gpus_per_node)
     return None
 
