@@ -15,29 +15,33 @@ from torch.utils.flop_counter import FlopCounterMode, register_flop_formula
 
 @register_flop_formula(torch.ops.aten.einsum, get_raw=True)
 def einsum_flop(equation, tensors, out=None, **kwargs) -> int:
-    # from torch.distributed.tensor._ops._einsum_strategy import EinsumDims
     assert len(tensors) == 2
     a_shape, b_shape = [x.shape for x in tensors]
 
-    # parse einop equation and extract dims
-    # TODO: generalize
-    # input_dims, output_dim = EinsumDims.parse_equation(equation)
-    # edims = EinsumDims.parse_dims(input_dims, output_dim)
-
-    if len(a_shape) == 3 and len(b_shape) == 3:
-        b, m, k = a_shape
-        b1, n, k2 = b_shape
-        assert b == b1
-        assert m == n
-        flop = (b * m) * k * k2 * 2
-    elif len(a_shape) == 3 and len(b_shape) == 2:
-        b, m, k = a_shape
+    if len(b_shape) == 2 and len(a_shape) >= 3:
+        # Forward linear: "{batch}k,kn->{batch}n"
+        # a: [*batch, K], b: [K, N]
+        batch_size = 1
+        for d in a_shape[:-1]:
+            batch_size *= d
+        k = a_shape[-1]
         k2, n = b_shape
-        assert k == k2
-        flop = b * m * n * k * 2
+        assert k == k2, f"Contracting dim mismatch: {k} vs {k2}"
+        return batch_size * n * k * 2
+    elif len(a_shape) == len(b_shape) and len(a_shape) >= 3:
+        # Backward gradient-weight: "{batch}n,{batch}k->kn"
+        # a: [*batch, N], b: [*batch, K]
+        assert (
+            a_shape[:-1] == b_shape[:-1]
+        ), f"Batch dims mismatch: {a_shape[:-1]} vs {b_shape[:-1]}"
+        batch_size = 1
+        for d in a_shape[:-1]:
+            batch_size *= d
+        n = a_shape[-1]
+        k = b_shape[-1]
+        return batch_size * n * k * 2
     else:
         raise NotImplementedError(f"Unsupported einsum shapes: {a_shape} {b_shape}")
-    return flop
 
 
 @dataclass

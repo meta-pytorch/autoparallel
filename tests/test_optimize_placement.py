@@ -125,22 +125,41 @@ def test_optimization_finds_fsdp_and_ddp_1d(device_mesh_1d, high_mem, model_type
     mm_nodes = autop.gm.graph.find_nodes(
         op="call_function", target=torch.ops.aten.mm.default
     )
-    len_mm_nodes = {"ffn_with_multiple_input_output": 5, "transformer_block": 18}[
-        model_type
-    ]
-    len_fwd_mm_nodes = {"ffn_with_multiple_input_output": 2, "transformer_block": 6}[
-        model_type
-    ]
-    assert len(mm_nodes) == len_mm_nodes
-    fwd_mm_nodes = mm_nodes[0:len_fwd_mm_nodes]
-    bwd_mm_grad_weight_nodes = mm_nodes[len_fwd_mm_nodes::2]
-    bwd_mm_grad_input_nodes = mm_nodes[(len_fwd_mm_nodes + 1) :: 2]
+    einsum_nodes = autop.gm.graph.find_nodes(
+        op="call_function", target=torch.ops.aten.einsum.default
+    )
+    linear_nodes = mm_nodes + einsum_nodes
+    is_einsum = len(einsum_nodes) > 0
+
+    if is_einsum:
+        len_linear_nodes = {
+            "ffn_with_multiple_input_output": 5,
+            "transformer_block": 18,
+        }[model_type]
+        len_fwd_linear_nodes = {
+            "ffn_with_multiple_input_output": 2,
+            "transformer_block": 6,
+        }[model_type]
+    else:
+        len_linear_nodes = {
+            "ffn_with_multiple_input_output": 5,
+            "transformer_block": 18,
+        }[model_type]
+        len_fwd_linear_nodes = {
+            "ffn_with_multiple_input_output": 2,
+            "transformer_block": 6,
+        }[model_type]
+
+    assert len(linear_nodes) == len_linear_nodes
+    fwd_linear_nodes = linear_nodes[0:len_fwd_linear_nodes]
+    bwd_linear_grad_weight_nodes = linear_nodes[len_fwd_linear_nodes::2]
+    bwd_linear_grad_input_nodes = linear_nodes[(len_fwd_linear_nodes + 1) :: 2]
 
     # and check that matmuls have full replication on weights during fwd,
     # which maps to DDP / FSDP
 
     # fwd
-    for node in fwd_mm_nodes:
+    for node in fwd_linear_nodes:
         p = sharding_placement[node]
         # input and output are sharded on batch
         assert p.input_specs[0].placements == (Shard(0),)
@@ -149,14 +168,17 @@ def test_optimization_finds_fsdp_and_ddp_1d(device_mesh_1d, high_mem, model_type
         assert p.input_specs[1].placements == (Replicate(),)
 
     # bwd grad weight
-    for node in bwd_mm_grad_weight_nodes:
+    # For mm: [N, B*S] @ [B*S, K] → batch dim is at position 1 for input 0
+    # For einsum: bsn,bsk->nk → batch dim is at position 0 for both inputs
+    bwd_grad_weight_shard = (Shard(0),) if is_einsum else (Shard(1),)
+    for node in bwd_linear_grad_weight_nodes:
         p = sharding_placement[node]
-        assert p.input_specs[0].placements == (Shard(1),)
+        assert p.input_specs[0].placements == bwd_grad_weight_shard
         assert p.output_specs.placements == (Partial("sum"),)
         assert p.input_specs[1].placements == (Shard(0),)
 
     # bwd grad inputs
-    for node in bwd_mm_grad_input_nodes:
+    for node in bwd_linear_grad_input_nodes:
         p = sharding_placement[node]
         assert p.input_specs[0].placements == (Shard(0),)
         assert p.output_specs.placements == (Shard(0),)

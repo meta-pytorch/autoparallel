@@ -125,8 +125,17 @@ def _is_inside_checkpointed_fn(node):
 # ---------------------------------------------------------------------------
 
 
+def _find_linear_nodes(graph):
+    """Find mm or einsum nodes (depending on whether einsum fusion is enabled)."""
+    mm_nodes = graph.find_nodes(op="call_function", target=torch.ops.aten.mm.default)
+    einsum_nodes = graph.find_nodes(
+        op="call_function", target=torch.ops.aten.einsum.default
+    )
+    return mm_nodes + einsum_nodes
+
+
 def test_user_ac_recompute_tags_on_targeted_ops(device_mesh_1d):
-    """SDPA ops get MUST_RECOMPUTE and mm ops get MUST_SAVE from user policy."""
+    """SDPA ops get MUST_RECOMPUTE and mm/einsum ops get MUST_SAVE from user policy."""
     context_fn = functools.partial(
         create_selective_checkpoint_contexts, _must_save_policy
     )
@@ -141,9 +150,9 @@ def test_user_ac_recompute_tags_on_targeted_ops(device_mesh_1d):
 
     gm = _build_joint_graph(model, input_fn, device_mesh_1d)
 
-    mm_nodes = gm.graph.find_nodes(op="call_function", target=torch.ops.aten.mm.default)
-    assert len(mm_nodes) > 0
-    for n in mm_nodes:
+    linear_nodes = _find_linear_nodes(gm.graph)
+    assert len(linear_nodes) > 0
+    for n in linear_nodes:
         if n.meta.get("partitioner_tag", "") == "is_backward":
             continue
         if _is_inside_checkpointed_fn(n):
@@ -334,6 +343,7 @@ def test_ac_joint_pass_apply_ac_policy_saves_mm_and_sdpa(device_mesh_1d):
 
     save_list = {
         torch.ops.aten.mm.default,
+        torch.ops.aten.einsum.default,
         torch.ops.aten._scaled_dot_product_efficient_attention.default,
         torch.ops.aten._scaled_dot_product_flash_attention.default,
         torch.ops.aten._scaled_dot_product_cudnn_attention.default,
