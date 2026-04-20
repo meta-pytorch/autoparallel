@@ -3,11 +3,10 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
-from unittest.mock import patch
-
 import pytest
 import torch
 import torch.nn.functional as F
+from conftest import apply_cuda_patches
 from torch import nn
 from torch._functorch._aot_autograd.fx_utils import get_param_nodes
 from torch.distributed.tensor import DTensor
@@ -93,8 +92,7 @@ def _make_model_and_input_fn(
     return model_fn, input_fn
 
 
-@patch("torch.cuda.device_count", lambda: 8)
-@patch("torch.cuda.get_device_name", lambda device: "H100")
+@apply_cuda_patches
 @pytest.mark.parametrize(
     "model_type", ["ffn_with_multiple_input_output", "transformer_block"]
 )
@@ -235,8 +233,7 @@ _expected_node_placements_transformer_block = [
 ]
 
 
-@patch("torch.cuda.device_count", lambda: 8)
-@patch("torch.cuda.get_device_name", lambda device: "H100")
+@apply_cuda_patches
 @pytest.mark.parametrize(
     "model_type,expected_param_placements,expected_node_placements",
     [
@@ -406,8 +403,7 @@ class LocalMapTransformerBlock(nn.Module):
         return o
 
 
-@patch("torch.cuda.device_count", lambda: 8)
-@patch("torch.cuda.get_device_name", lambda device: "H100")
+@apply_cuda_patches
 def test_local_map_placement_respected(device_mesh_2d, device="cuda"):
     bs = 8 * device_mesh_2d.shape[0]
     dim1 = 6144
@@ -472,8 +468,7 @@ def test_local_map_placement_respected(device_mesh_2d, device="cuda"):
     assert grad_k_spec.placements == grad_v_spec.placements == (Shard(0), Replicate())
 
 
-@patch("torch.cuda.device_count", lambda: 8)
-@patch("torch.cuda.get_device_name", lambda device: "H100")
+@apply_cuda_patches
 def test_get_attr_nodes(device_mesh_1d):
     """Test that get_attr nodes (module attributes like constant tensors) are handled correctly."""
     dim1 = 256
@@ -521,8 +516,7 @@ def test_get_attr_nodes(device_mesh_1d):
         ), f"Expected get_attr node to be Replicate(), got {spec.output_specs.placements}"
 
 
-@patch("torch.cuda.device_count", lambda: 8)
-@patch("torch.cuda.get_device_name", lambda device: "H100")
+@apply_cuda_patches
 def test_parameter_memory_constraint_indivisible_param(device_mesh_2d):
     """Parameter whose size is >= world_size but not divisible by it
     should not make the memory constraint infeasible."""
@@ -563,8 +557,7 @@ def test_parameter_memory_constraint_indivisible_param(device_mesh_2d):
         assert node in sharding_placement
 
 
-@patch("torch.cuda.device_count", lambda: 8)
-@patch("torch.cuda.get_device_name", lambda device: "H100")
+@apply_cuda_patches
 def test_world_size_larger_than_parameter(device_mesh_1d):
     # make a parameter which is smaller than the world size
     dim: int = device_mesh_1d.shape[0] // 2

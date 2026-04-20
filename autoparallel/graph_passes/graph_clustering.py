@@ -95,6 +95,7 @@ def _hash_node(node, strategies, input_pickler):
         tuple(
             _prepare_op_strategy(strategies[s], output_only=True)
             for s in node.all_input_nodes
+            if s in strategies
         ),
     )
     return sha256_hash(input_pickler.dumps(key))
@@ -128,6 +129,10 @@ def get_identical_regions(
     t = time.time()
     for node in graph.nodes:
         if node.op == "placeholder":
+            continue
+        if node not in strategies:
+            # Shape-computation nodes (sym_size, operator.mul, etc.) and
+            # HOP submodule get_attr nodes are not in strategies.
             continue
 
         duplicates = hash_to_duplicates[_hash_node(node, strategies, input_pickler)]

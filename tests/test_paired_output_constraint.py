@@ -61,7 +61,11 @@ def _setup_with_grad_placement_removed(mesh, remove_placement_str):
     opt.prob = pulp.LpProblem("AutoParallel", pulp.LpMinimize)
     opt.add_default_constraints()
 
-    return autop, opt, param_node, grad_node
+    # Map concrete-graph nodes to original-graph nodes so they can be
+    # used with the solution dict (which is keyed by original nodes).
+    orig_param = opt._concrete_to_orig[param_node]
+    orig_grad = opt._concrete_to_orig[grad_node]
+    return autop, opt, param_node, grad_node, orig_param, orig_grad
 
 
 # Placement to remove in all tests — must exist in both param and grad for
@@ -78,7 +82,7 @@ def test_disable_constraints_added_for_unmatched_placements(device_mesh_2d):
     Without the fix, no disable constraints are generated and the solver
     can freely choose the unmatched placement.
     """
-    autop, opt, param_node, grad_node = _setup_with_grad_placement_removed(
+    autop, opt, param_node, grad_node, _, _ = _setup_with_grad_placement_removed(
         device_mesh_2d, _REMOVED_PLACEMENT
     )
     try:
@@ -99,7 +103,7 @@ def test_disable_constraints_added_for_unmatched_placements(device_mesh_2d):
 def test_unmatched_decision_vars_are_zero_in_solution(device_mesh_2d):
     """After solving, every decision variable for the unmatched param
     placement must be zero."""
-    autop, opt, param_node, grad_node = _setup_with_grad_placement_removed(
+    autop, opt, param_node, grad_node, _, _ = _setup_with_grad_placement_removed(
         device_mesh_2d, _REMOVED_PLACEMENT
     )
     try:
@@ -133,7 +137,7 @@ def test_unmatched_decision_vars_are_zero_in_solution(device_mesh_2d):
 @patch("torch.cuda.get_device_name", lambda device: "H100")
 def test_chosen_param_placement_matches_grad(device_mesh_2d):
     """The param's chosen placement must exist in the grad's strategy list."""
-    autop, opt, param_node, grad_node = _setup_with_grad_placement_removed(
+    autop, opt, _, grad_node, orig_param, _ = _setup_with_grad_placement_removed(
         device_mesh_2d, _REMOVED_PLACEMENT
     )
     try:
@@ -145,7 +149,7 @@ def test_chosen_param_placement_matches_grad(device_mesh_2d):
         grad_placements = {
             str(s.output_specs.placements) for s in opt.strats[grad_node].strategies
         }
-        chosen = str(solution[param_node].output_specs.placements)
+        chosen = str(solution[orig_param].output_specs.placements)
         assert (
             chosen in grad_placements
         ), f"Param chose {chosen} which is not in grad placements {grad_placements}"

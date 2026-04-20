@@ -125,6 +125,34 @@ class JointGraphResult:
     traced_inputs: list[Any]
 
 
+def _make_inputs_dynamic(
+    inputs: tuple[Any, ...], fake_mode: FakeTensorMode
+) -> tuple[Any, ...]:
+    """Convert concrete FakeTensors to symbolic ones with all-dynamic dims.
+
+    The ShapeEnv will automatically concretize non-batch dimensions as they
+    interact with concrete parameter shapes during tracing.
+    """
+    from torch.fx.experimental.symbolic_shapes import (
+        DimDynamic,
+        StatelessSymbolicContext,
+    )
+    from torch.utils._pytree import tree_map_only
+
+    def to_symbolic(t: torch.Tensor) -> torch.Tensor:
+        sym_ctx: StatelessSymbolicContext = StatelessSymbolicContext(
+            dynamic_sizes=[DimDynamic.DYNAMIC] * t.ndim,
+        )
+        meta = torch.empty(
+            t.shape, dtype=t.dtype, device="meta", requires_grad=t.requires_grad
+        )
+        sym = fake_mode.from_tensor(meta, symbolic_context=sym_ctx)
+        with fake_mode:
+            return sym.to(t.device)
+
+    return tree_map_only(torch.Tensor, to_symbolic, inputs)
+
+
 def build_joint_graph(
     model: torch.nn.Module,
     input_fn: Callable,
@@ -138,6 +166,9 @@ def build_joint_graph(
         raw_inputs = input_fn()
 
     formatted_inputs = raw_inputs if isinstance(raw_inputs, tuple) else (raw_inputs,)
+
+    if fake_mode.shape_env is not None:
+        formatted_inputs = _make_inputs_dynamic(formatted_inputs, fake_mode)
 
     traced_inputs = list(formatted_inputs)
 
@@ -604,6 +635,7 @@ def auto_parallel(
     mp_policy: Optional[MixedPrecisionPolicy] = None,
     compile: bool = True,
     parameter_memory_budget: Optional[tuple[Optional[float], Optional[float]]] = None,
+    dynamic: bool = False,
 ) -> torch.nn.Module:
     """
     Parallelize a model with automatic sharding optimization.
@@ -630,6 +662,8 @@ def auto_parallel(
         compile: Whether to use torch.compile (default: True).
         parameter_memory_budget: Optional (low, high) bounds for parameter memory.
             Each bound is a float multiplier or None for unbounded.
+        dynamic: If True, trace with symbolic batch dimensions so the parallel
+            model accepts arbitrary batch sizes at runtime.
 
     Returns:
         Parallelized module. Call to_empty(device="cuda") and init_weights()
@@ -685,6 +719,7 @@ def auto_parallel(
         compile=compile,
         # enable_ac=True,
         enable_ac=False,
+        dynamic=dynamic,
     ) as autop:
         # Add constraints
         autop.add_input_constraints(input_placements)

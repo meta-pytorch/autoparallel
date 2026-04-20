@@ -700,9 +700,9 @@ def _token_combine(routed_output, input_splits, output_splits, axis_name):
 
 # @torch.library.custom_op("autoparallel::local_mapped_region", mutates_args=())
 def local_mapped_region(
+    x: torch.Tensor,
     selected_experts_indices: torch.Tensor,
     top_scores: torch.Tensor,
-    x: torch.Tensor,
     experts_w1: torch.Tensor,
     experts_w3: torch.Tensor,
     experts_w2: torch.Tensor,
@@ -956,6 +956,8 @@ def _moe_forward(
     #     (Shard(0), Shard(0)),
     #     (Shard(0), Shard(0)),
     # )
+    # Dynamo reorders captured variables (lifted freevars) before explicit
+    # arguments, so x must come first in the input order and placements.
     reordered_placements = (
         (Shard(0), Shard(0)),
         (Shard(0), Shard(0)),
@@ -969,8 +971,6 @@ def _moe_forward(
         None,
     )
 
-    # assert False, f"{x.shape}, {selected_experts_indices.shape}, {top_scores.shape}, {out.shape}"
-    # [selected_experts_indices, top_scores_1, rms_norm_2, v_2, v_4, v_3, out]
     out, num_tokens_per_expert = local_map(
         local_mapped_region,
         out_placements=(
@@ -982,9 +982,9 @@ def _moe_forward(
         in_grad_placements=None,
         device_mesh=mesh,
     )(
+        x,
         selected_experts_indices,
         top_scores,
-        x,
         experts_w1,
         experts_w3,
         experts_w2,

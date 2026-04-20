@@ -108,7 +108,9 @@ def test_clustering_high_coverage(device_mesh_2d):
         autop.add_output_constraints([out_sharding])
 
         stats = _clustering_stats(
-            autop.gm.graph, autop.sharding_optimizer.strats, n_layers
+            autop.sharding_optimizer.graph,
+            autop.sharding_optimizer.strats,
+            n_layers,
         )
 
     # Every layer should have the same total node count
@@ -141,7 +143,7 @@ def test_clustering_no_forward_backward_mixing(device_mesh_2d):
         autop.add_output_constraints([out_sharding])
 
         clusters = get_identical_regions(
-            autop.gm.graph, autop.sharding_optimizer.strats
+            autop.sharding_optimizer.graph, autop.sharding_optimizer.strats
         )
 
     for i, group in enumerate(clusters):
