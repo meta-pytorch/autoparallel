@@ -60,7 +60,7 @@ from .tracing import (
     move_to_fake,
 )
 
-_APPLY_VIEW_MM_VIEW_PATTERN = False
+_APPLY_VIEW_MM_VIEW_PATTERN = True
 
 logger = logging.getLogger(__name__)
 

@@ -112,3 +112,155 @@ def test_no_match_shape_mismatch():
 
     assert _count_ops(gm, torch.ops.aten.einsum.default) == 0
     assert _count_ops(gm, torch.ops.aten.mm.default) == 1
+
+
+# --- False-positive rejection tests ---
+
+
+def test_no_match_non_canonical_flatten():
+    """Input with fewer than 3 dims should not be matched."""
+    K, N = 4, 8
+
+    def f(x, w):
+        flat = torch.ops.aten.view.default(x, [6, K])
+        out = torch.ops.aten.mm.default(flat, w)
+        return torch.ops.aten.view.default(out, [2, 3, N])
+
+    x = torch.randn(6, K)
+    w = torch.randn(K, N)
+    gm = make_fx(f, tracing_mode="fake")(x, w)
+
+    _replace_view_mm_view_with_einsum(gm)
+
+    assert _count_ops(gm, torch.ops.aten.einsum.default) == 0
+    assert _count_ops(gm, torch.ops.aten.mm.default) == 1
+
+
+def test_no_match_unflatten_reorders_batch_dims():
+    """Canonical flatten but unflatten reorders batch dims: must be rejected.
+
+    Input [2, 3, 4] flattens to [6, 4] (canonical), but the output view
+    unflattens to [3, 2, N] instead of [2, 3, N]. This would produce a
+    semantically wrong einsum.
+    """
+    B, S, K, N = 2, 3, 4, 8
+
+    def f(x, w):
+        flat = torch.ops.aten.view.default(x, [B * S, K])
+        out = torch.ops.aten.mm.default(flat, w)
+        return torch.ops.aten.view.default(out, [S, B, N])
+
+    x = torch.randn(B, S, K)
+    w = torch.randn(K, N)
+    gm = make_fx(f, tracing_mode="fake")(x, w)
+
+    _replace_view_mm_view_with_einsum(gm)
+
+    assert _count_ops(gm, torch.ops.aten.einsum.default) == 0
+    assert _count_ops(gm, torch.ops.aten.mm.default) == 1
+
+
+def test_no_match_wrong_permute_order():
+    """Backward pattern with non-[1,0] permute must be rejected."""
+    B, S, K = 2, 8, 16
+
+    def f(grad_out, x):
+        flat_grad = torch.ops.aten.view.default(grad_out, [B * S, K])
+        # Wrong permute -- [0, 1] is identity, not transpose
+        perm_grad = torch.ops.aten.permute.default(flat_grad, [0, 1])
+        flat_x = torch.ops.aten.view.default(x, [B * S, K])
+        out = torch.ops.aten.mm.default(perm_grad, flat_x)
+        return torch.ops.aten.permute.default(out, [1, 0])
+
+    grad_out = torch.randn(B, S, K)
+    x = torch.randn(B, S, K)
+    gm = make_fx(f, tracing_mode="fake")(grad_out, x)
+
+    _replace_view_mm_view_with_einsum(gm)
+
+    assert _count_ops(gm, torch.ops.aten.einsum.default) == 0
+    assert _count_ops(gm, torch.ops.aten.mm.default) == 1
+
+
+def test_no_match_2d_input():
+    """2D input (no batch dims) should not be matched."""
+    K, N = 16, 32
+
+    def f(x, w):
+        flat = torch.ops.aten.view.default(x, [K, K])
+        out = torch.ops.aten.mm.default(flat, w)
+        return torch.ops.aten.view.default(out, [K, N])
+
+    x = torch.randn(K, K)
+    w = torch.randn(K, N)
+    gm = make_fx(f, tracing_mode="fake")(x, w)
+
+    _replace_view_mm_view_with_einsum(gm)
+
+    assert _count_ops(gm, torch.ops.aten.einsum.default) == 0
+    assert _count_ops(gm, torch.ops.aten.mm.default) == 1
+
+
+# --- Numerical equivalence tests ---
+
+
+def test_forward_numerical_equivalence_3d():
+    """Einsum replacement produces the same numerical result as view-mm-view."""
+    B, S, K, N = 2, 8, 16, 32
+    x = torch.randn(B, S, K)
+    w = torch.randn(K, N)
+
+    def f(x, w):
+        flat = torch.ops.aten.view.default(x, [B * S, K])
+        out = torch.ops.aten.mm.default(flat, w)
+        return torch.ops.aten.view.default(out, [B, S, N])
+
+    expected = f(x, w)
+
+    gm = make_fx(f, tracing_mode="fake")(x, w)
+    _replace_view_mm_view_with_einsum(gm)
+    actual = gm(x, w)
+
+    torch.testing.assert_close(actual, expected)
+
+
+def test_forward_numerical_equivalence_4d():
+    """Einsum replacement produces the same result for 4D input."""
+    B, S, T, K, N = 2, 4, 3, 16, 32
+    x = torch.randn(B, S, T, K)
+    w = torch.randn(K, N)
+
+    def f(x, w):
+        flat = torch.ops.aten.view.default(x, [B * S * T, K])
+        out = torch.ops.aten.mm.default(flat, w)
+        return torch.ops.aten.view.default(out, [B, S, T, N])
+
+    expected = f(x, w)
+
+    gm = make_fx(f, tracing_mode="fake")(x, w)
+    _replace_view_mm_view_with_einsum(gm)
+    actual = gm(x, w)
+
+    torch.testing.assert_close(actual, expected)
+
+
+def test_backward_numerical_equivalence():
+    """Einsum replacement for the backward gradient-weight pattern."""
+    B, S, K, N = 2, 8, 16, 32
+    grad_out = torch.randn(B, S, N)
+    x = torch.randn(B, S, K)
+
+    def f(grad_out, x):
+        flat_grad = torch.ops.aten.view.default(grad_out, [B * S, N])
+        perm_grad = torch.ops.aten.permute.default(flat_grad, [1, 0])
+        flat_x = torch.ops.aten.view.default(x, [B * S, K])
+        out = torch.ops.aten.mm.default(perm_grad, flat_x)
+        return torch.ops.aten.permute.default(out, [1, 0])
+
+    expected = f(grad_out, x)
+
+    gm = make_fx(f, tracing_mode="fake")(grad_out, x)
+    _replace_view_mm_view_with_einsum(gm)
+    actual = gm(grad_out, x)
+
+    torch.testing.assert_close(actual, expected)

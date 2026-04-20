@@ -256,8 +256,32 @@ def _batch_dims(n: int) -> str:
     return "".join(chr(97 + i) for i in range(n))
 
 
+def _is_canonical_flatten(input_shape, view_args):
+    """Check that view_args represent [*batch, K] -> [prod(batch), K]."""
+    if len(view_args) != 2:
+        return False
+    expected_flat = 1
+    for d in input_shape[:-1]:
+        expected_flat *= d
+    return view_args[0] == expected_flat and view_args[1] == input_shape[-1]
+
+
+def _is_canonical_unflatten(input_shape, view_args):
+    """Check that view_args represent [prod(batch), N] -> [*batch, N]."""
+    if len(view_args) < 3:
+        return False
+    batch_dims = view_args[:-1]
+    expected_flat = 1
+    for d in batch_dims:
+        expected_flat *= d
+    return expected_flat == input_shape[0] and view_args[-1] == input_shape[-1]
+
+
 def _match_forward_linear(mm_node):
     """Match the forward pattern: view -> mm -> view.
+
+    Verifies canonical flatten/unflatten shapes:
+      input [*batch, K] -> view [prod(batch), K] -> mm [prod(batch), N] -> view [*batch, N]
 
     Returns (inputs, replaced_node, equation) or None.
     """
@@ -265,23 +289,48 @@ def _match_forward_linear(mm_node):
     if first_input.target != torch.ops.aten.view.default:
         return None
     view_input = first_input.all_input_nodes[0]
+    input_shape = view_input.meta["val"].shape
+    if input_shape.numel() == 0 or len(input_shape) < 3:
+        return None
+    # Verify the input view is a canonical flatten [*batch, K] -> [prod(batch), K]
+    flatten_args = first_input.args[1]
+    if not _is_canonical_flatten(input_shape, flatten_args):
+        return None
     users = list(mm_node.users)
     if not (
         len(users) == 1
         and users[0].target == torch.ops.aten.view.default
-        and view_input.meta["val"].shape[:-1] == users[0].meta["val"].shape[:-1]
         and second_input.meta["val"].ndim == 2
     ):
         return None
-    ndim = view_input.meta["val"].ndim
-    assert 1 < ndim <= 26, "Only support up to 26D for now"
+    output_view = users[0]
+    output_shape = output_view.meta["val"].shape
+    # Verify the output view is a canonical unflatten [prod(batch), N] -> [*batch, N]
+    unflatten_args = output_view.args[1]
+    mm_shape = mm_node.meta["val"].shape
+    if not _is_canonical_unflatten(mm_shape, unflatten_args):
+        return None
+    # Verify batch dims match between input and output
+    if input_shape[:-1] != output_shape[:-1]:
+        return None
+    # Verify weight shape is [K, N] matching the flatten dimensions
+    weight_shape = second_input.meta["val"].shape
+    if weight_shape[0] != input_shape[-1] or weight_shape[1] != output_shape[-1]:
+        return None
+    ndim = len(input_shape)
     dims = _batch_dims(ndim - 1)
     equation = f"{dims}k,kn->{dims}n"
-    return [view_input, second_input], users[0], equation
+    return [view_input, second_input], output_view, equation
 
 
 def _match_backward_linear(mm_node):
     """Match the backward pattern: view -> permute -> mm -> permute.
+
+    The backward of einsum "{batch}k,kn->{batch}n" produces a gradient-weight
+    computation: permute(view(grad, [flat, N]), [1,0]) @ view(x, [flat, K]) -> [N, K],
+    followed by permute([N, K], [1, 0]) -> [K, N].
+
+    Verifies canonical flatten shapes and [1,0] permute orders.
 
     Returns (inputs, replaced_node, equation) or None.
     """
@@ -290,20 +339,35 @@ def _match_backward_linear(mm_node):
         return None
     if first_input.target != torch.ops.aten.permute.default:
         return None
-    if first_input.all_input_nodes[0].target != torch.ops.aten.view.default:
+    first_view = first_input.all_input_nodes[0]
+    if first_view.target != torch.ops.aten.view.default:
         return None
-    orig_first = first_input.all_input_nodes[0].all_input_nodes[0]
+    # Verify the input permute is [1, 0] (transpose)
+    perm_dims = list(first_input.args[1])
+    if perm_dims != [1, 0]:
+        return None
+    orig_first = first_view.all_input_nodes[0]
     orig_second = second_input.all_input_nodes[0]
+    # Verify both views are canonical flattenings
+    if not _is_canonical_flatten(orig_first.meta["val"].shape, first_view.args[1]):
+        return None
+    if not _is_canonical_flatten(orig_second.meta["val"].shape, second_input.args[1]):
+        return None
     users = list(mm_node.users)
     if not (
         len(users) == 1
         and users[0].target == torch.ops.aten.permute.default
-        and orig_first.meta["val"].shape[:-1] == orig_second.meta["val"].shape[:-1]
         and mm_node.meta["val"].ndim == 2
     ):
         return None
+    # Verify the output permute is [1, 0]
+    out_perm_dims = list(users[0].args[1])
+    if out_perm_dims != [1, 0]:
+        return None
+    # Verify batch dims match
+    if orig_first.meta["val"].shape[:-1] != orig_second.meta["val"].shape[:-1]:
+        return None
     ndim = orig_first.meta["val"].ndim
-    assert 1 < ndim <= 26, "Only support up to 26D for now"
     dims = _batch_dims(ndim - 1)
     equation = f"{dims}n,{dims}k->kn"
     return [orig_first, orig_second], users[0], equation
@@ -322,8 +386,13 @@ def _replace_view_mm_view_with_einsum(gm):
                 args=(equation, inputs),
             )
             new_node.meta.update(replaced_node.meta)
+            # Preserve the mm node's seq_nr so that forward/backward
+            # einsum pairs remain matched by autograd's sequence numbering.
+            if "seq_nr" in node.meta:
+                new_node.meta["seq_nr"] = node.meta["seq_nr"]
             replaced_node.replace_all_uses_with(new_node)
     gm.graph.eliminate_dead_code()
+    gm.graph.lint()
     gm.recompile()
 
 
