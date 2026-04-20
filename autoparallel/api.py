@@ -203,7 +203,7 @@ class AutoParallel:
         reshard_after_forward: bool = True,
         dynamic: bool = False,
         numerics_logger: NumericsLogger | None = None,
-        cost_model: Any = None,
+        cost_model: Any = "nccl",
         repeated_subgraphs: bool = False,
     ):
         self.stack = ExitStack()
