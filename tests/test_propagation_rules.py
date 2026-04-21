@@ -3,19 +3,24 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+import pytest
 import torch
 from torch import nn
 from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor._dtensor_spec import DTensorSpec, TensorMeta
 from torch.distributed.tensor._op_schema import OpSchema, OpSpec, OpStrategy
-from torch.distributed.tensor.placement_types import (
-    _StridedShard,
-    Replicate,
-    Shard,
-)
+from torch.distributed.tensor.placement_types import Replicate, Shard, _StridedShard
 
 from autoparallel.api import AutoParallel
+from autoparallel.shardings import dtensor_sharding_helpers
 from autoparallel.shardings.dtensor_sharding_helpers import get_op_strategy
+
+
+@pytest.fixture
+def enable_single_dim_mm_family(monkeypatch):
+    """Opt-in toggle: route mm-family ops through upstream single-dim path."""
+    monkeypatch.setattr(dtensor_sharding_helpers, "ENABLE_SINGLE_DIM_MM_FAMILY", True)
+    yield
 
 
 def test_permute_layernorm_stride_handling(device_mesh_1d):
@@ -200,7 +205,9 @@ def _mk_input_strategy(mesh, shape, placements):
     return OpStrategy([OpSpec(output_specs=spec, input_specs=(spec,))])
 
 
-def test_mm_strategy_enumerates_strided_shard(device_mesh_2d):
+def test_mm_strategy_enumerates_strided_shard(
+    device_mesh_2d, enable_single_dim_mm_family
+):
     """mm with a _StridedShard-bearing input must yield strategies that carry
     _StridedShard on the output. This is the capability that lets AP represent
     batch-on-mesh0 + seq-on-mesh1 through a view -> mm -> view decomposition
@@ -246,7 +253,9 @@ def test_mm_strategy_enumerates_strided_shard(device_mesh_2d):
     )
 
 
-def test_mm_strategy_plain_shard_still_present(device_mesh_2d):
+def test_mm_strategy_plain_shard_still_present(
+    device_mesh_2d, enable_single_dim_mm_family
+):
     """Regression: enabling _StridedShard variants must not drop the plain
     Shard strategies. The solver still needs those for cases where the upstream
     chain hasn't introduced any _StridedShard.
@@ -264,7 +273,10 @@ def test_mm_strategy_plain_shard_still_present(device_mesh_2d):
     result = get_op_strategy(torch.ops.aten.mm.default, schema)
 
     has_plain_shard = any(
-        any(isinstance(p, Shard) and not isinstance(p, _StridedShard) for p in s.output_spec.placements)
+        any(
+            isinstance(p, Shard) and not isinstance(p, _StridedShard)
+            for p in s.output_spec.placements
+        )
         for s in result.strategies
     )
     assert has_plain_shard, (
@@ -273,7 +285,9 @@ def test_mm_strategy_plain_shard_still_present(device_mesh_2d):
     )
 
 
-def test_mm_strategy_backward_grad_weight_strided(device_mesh_2d):
+def test_mm_strategy_backward_grad_weight_strided(
+    device_mesh_2d, enable_single_dim_mm_family
+):
     """Backward grad-weight mm form: grad_out @ input where both operands
     carry _StridedShard on the contracting dim (the flattened batch*seq).
 
@@ -318,12 +332,10 @@ def test_mm_strategy_backward_grad_weight_strided(device_mesh_2d):
         out = op_spec.output_spec.placements
         # Contracting-dim strided pair produces Partial output.
         has_strided_in1 = any(
-            isinstance(p, _StridedShard) and p.split_factor == split_factor
-            for p in in1
+            isinstance(p, _StridedShard) and p.split_factor == split_factor for p in in1
         )
         has_strided_in2 = any(
-            isinstance(p, _StridedShard) and p.split_factor == split_factor
-            for p in in2
+            isinstance(p, _StridedShard) and p.split_factor == split_factor for p in in2
         )
         has_partial = any(p.is_partial() for p in out)
         if has_strided_in1 and has_strided_in2 and has_partial:

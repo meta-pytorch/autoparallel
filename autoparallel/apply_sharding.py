@@ -19,16 +19,12 @@ from torch._inductor.decomposition import select_decomp_table
 from torch._subclasses.fake_tensor import FakeTensor, unset_fake_temporarily
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor._dtensor_spec import DTensorSpec, ShardOrderEntry
-from torch.distributed.tensor.placement_types import (  # noqa
-    _StridedShard,
-    Partial,
-    Replicate,
-    Shard,
-)
+from torch.distributed.tensor.placement_types import Partial, Replicate, Shard  # noqa
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.utils._pytree import tree_flatten, tree_map_only
 
 from .graph_passes.graph_utils import all_input_nodes, cleanup_graph
+from .shardings.dtensor_sharding_helpers import is_shard_like
 from .shardings.ordered_sharding import (
     compute_optimal_placement_order_for_parameters,
     ordered_redistribute_local_tensor,
@@ -61,10 +57,10 @@ def _localize_shape_arg(node, shape_arg, output_spec):
     """
     global_shape = _concretize_shape(node.meta["val"].shape)
     local_shape = list(global_shape)
-    # _StridedShard.is_shard() returns False, so check both. Split_factor only
-    # affects layout, not local shape.
+    # is_shard_like covers _StridedShard, whose .is_shard() returns False even
+    # though it shards the dim (same local shape; split_factor affects layout only).
     for mesh_size, placement in zip(output_spec.mesh.shape, output_spec.placements):
-        if placement.is_shard() or isinstance(placement, _StridedShard):
+        if is_shard_like(placement):
             local_shape[placement.dim] = local_shape[placement.dim] // mesh_size
     # Restore SymInt values from the interpreter (already local)
     for i, s in enumerate(shape_arg):

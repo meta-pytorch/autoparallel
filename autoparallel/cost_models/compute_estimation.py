@@ -283,7 +283,7 @@ def _get_device_gmem_bandwidth():
 
 
 def _get_sharded_shape_stride(spec):
-    from torch.distributed.tensor.placement_types import _StridedShard
+    from autoparallel.shardings.dtensor_sharding_helpers import is_shard_like
 
     mesh = spec.mesh
     tensor_shape = spec.tensor_meta.shape
@@ -294,11 +294,10 @@ def _get_sharded_shape_stride(spec):
     # running DTensor
     new_tensor_shape = list(tensor_shape)
     new_tensor_stride = list(spec.tensor_meta.stride)
-    # Note: _StridedShard.is_shard() returns False, so we check both. _StridedShard
-    # shards the dim by mesh_size (same local shape as Shard); split_factor only
-    # affects data layout, not shape.
+    # is_shard_like covers _StridedShard, which shards the dim by mesh_size
+    # (same local shape as Shard); split_factor affects data layout only.
     for mesh_size, placement in zip(mesh.shape, placements):
-        if placement.is_shard() or isinstance(placement, _StridedShard):
+        if is_shard_like(placement):
             dim = placement.dim
             new_tensor_shape[dim] = (new_tensor_shape[dim] + mesh_size - 1) // mesh_size
             if dim - 1 > 0:
