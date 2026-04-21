@@ -194,7 +194,7 @@ def multiple_process_run(rank, world_size, tmp_dir, model, sharding_map):
             # reconstruct sharding_placement based on sharding_map instead
             # sharding_placement = autop.optimize_placement()
             sharding_placement = {}
-            new_strats = autop.sharding_optimizer.strats
+            opt = autop.sharding_optimizer
             for node in autop.gm.graph.nodes:
                 fqn = node.name
                 if fqn in sharding_map:
@@ -204,7 +204,7 @@ def multiple_process_run(rank, world_size, tmp_dir, model, sharding_map):
                     # specs carry stale tensor_meta from the original mesh/batch
                     # configuration; pull correct metadata from the new graph's
                     # sharding strategies.
-                    new_node_strat = new_strats[node]
+                    new_node_strat = opt.get_strategy(node)
                     ref_spec = new_node_strat.strategies[0]
 
                     for i, input_spec in enumerate(adjusted_value.input_specs):

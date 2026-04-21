@@ -3,11 +3,10 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
-from unittest.mock import patch
-
 import pytest
 import torch
 import torch.nn.functional as F
+from conftest import apply_cuda_patches
 from torch import nn
 from torch._functorch._aot_autograd.fx_utils import get_param_nodes
 from torch.distributed.tensor import DTensor
@@ -93,8 +92,7 @@ def _make_model_and_input_fn(
     return model_fn, input_fn
 
 
-@patch("torch.cuda.device_count", lambda: 8)
-@patch("torch.cuda.get_device_name", lambda device: "H100")
+@apply_cuda_patches
 @pytest.mark.parametrize(
     "model_type", ["ffn_with_multiple_input_output", "transformer_block"]
 )
@@ -125,22 +123,41 @@ def test_optimization_finds_fsdp_and_ddp_1d(device_mesh_1d, high_mem, model_type
     mm_nodes = autop.gm.graph.find_nodes(
         op="call_function", target=torch.ops.aten.mm.default
     )
-    len_mm_nodes = {"ffn_with_multiple_input_output": 5, "transformer_block": 18}[
-        model_type
-    ]
-    len_fwd_mm_nodes = {"ffn_with_multiple_input_output": 2, "transformer_block": 6}[
-        model_type
-    ]
-    assert len(mm_nodes) == len_mm_nodes
-    fwd_mm_nodes = mm_nodes[0:len_fwd_mm_nodes]
-    bwd_mm_grad_weight_nodes = mm_nodes[len_fwd_mm_nodes::2]
-    bwd_mm_grad_input_nodes = mm_nodes[(len_fwd_mm_nodes + 1) :: 2]
+    einsum_nodes = autop.gm.graph.find_nodes(
+        op="call_function", target=torch.ops.aten.einsum.default
+    )
+    linear_nodes = mm_nodes + einsum_nodes
+    is_einsum = len(einsum_nodes) > 0
+
+    if is_einsum:
+        len_linear_nodes = {
+            "ffn_with_multiple_input_output": 5,
+            "transformer_block": 18,
+        }[model_type]
+        len_fwd_linear_nodes = {
+            "ffn_with_multiple_input_output": 2,
+            "transformer_block": 6,
+        }[model_type]
+    else:
+        len_linear_nodes = {
+            "ffn_with_multiple_input_output": 5,
+            "transformer_block": 18,
+        }[model_type]
+        len_fwd_linear_nodes = {
+            "ffn_with_multiple_input_output": 2,
+            "transformer_block": 6,
+        }[model_type]
+
+    assert len(linear_nodes) == len_linear_nodes
+    fwd_linear_nodes = linear_nodes[0:len_fwd_linear_nodes]
+    bwd_linear_grad_weight_nodes = linear_nodes[len_fwd_linear_nodes::2]
+    bwd_linear_grad_input_nodes = linear_nodes[(len_fwd_linear_nodes + 1) :: 2]
 
     # and check that matmuls have full replication on weights during fwd,
     # which maps to DDP / FSDP
 
     # fwd
-    for node in fwd_mm_nodes:
+    for node in fwd_linear_nodes:
         p = sharding_placement[node]
         # input and output are sharded on batch
         assert p.input_specs[0].placements == (Shard(0),)
@@ -149,14 +166,17 @@ def test_optimization_finds_fsdp_and_ddp_1d(device_mesh_1d, high_mem, model_type
         assert p.input_specs[1].placements == (Replicate(),)
 
     # bwd grad weight
-    for node in bwd_mm_grad_weight_nodes:
+    # For mm: [N, B*S] @ [B*S, K] → batch dim is at position 1 for input 0
+    # For einsum: bsn,bsk->nk → batch dim is at position 0 for both inputs
+    bwd_grad_weight_shard = (Shard(0),) if is_einsum else (Shard(1),)
+    for node in bwd_linear_grad_weight_nodes:
         p = sharding_placement[node]
-        assert p.input_specs[0].placements == (Shard(1),)
+        assert p.input_specs[0].placements == bwd_grad_weight_shard
         assert p.output_specs.placements == (Partial("sum"),)
         assert p.input_specs[1].placements == (Shard(0),)
 
     # bwd grad inputs
-    for node in bwd_mm_grad_input_nodes:
+    for node in bwd_linear_grad_input_nodes:
         p = sharding_placement[node]
         assert p.input_specs[0].placements == (Shard(0),)
         assert p.output_specs.placements == (Shard(0),)
@@ -213,8 +233,7 @@ _expected_node_placements_transformer_block = [
 ]
 
 
-@patch("torch.cuda.device_count", lambda: 8)
-@patch("torch.cuda.get_device_name", lambda device: "H100")
+@apply_cuda_patches
 @pytest.mark.parametrize(
     "model_type,expected_param_placements,expected_node_placements",
     [
@@ -384,8 +403,7 @@ class LocalMapTransformerBlock(nn.Module):
         return o
 
 
-@patch("torch.cuda.device_count", lambda: 8)
-@patch("torch.cuda.get_device_name", lambda device: "H100")
+@apply_cuda_patches
 def test_local_map_placement_respected(device_mesh_2d, device="cuda"):
     bs = 8 * device_mesh_2d.shape[0]
     dim1 = 6144
@@ -450,8 +468,7 @@ def test_local_map_placement_respected(device_mesh_2d, device="cuda"):
     assert grad_k_spec.placements == grad_v_spec.placements == (Shard(0), Replicate())
 
 
-@patch("torch.cuda.device_count", lambda: 8)
-@patch("torch.cuda.get_device_name", lambda device: "H100")
+@apply_cuda_patches
 def test_get_attr_nodes(device_mesh_1d):
     """Test that get_attr nodes (module attributes like constant tensors) are handled correctly."""
     dim1 = 256
@@ -499,8 +516,7 @@ def test_get_attr_nodes(device_mesh_1d):
         ), f"Expected get_attr node to be Replicate(), got {spec.output_specs.placements}"
 
 
-@patch("torch.cuda.device_count", lambda: 8)
-@patch("torch.cuda.get_device_name", lambda device: "H100")
+@apply_cuda_patches
 def test_parameter_memory_constraint_indivisible_param(device_mesh_2d):
     """Parameter whose size is >= world_size but not divisible by it
     should not make the memory constraint infeasible."""
@@ -541,8 +557,7 @@ def test_parameter_memory_constraint_indivisible_param(device_mesh_2d):
         assert node in sharding_placement
 
 
-@patch("torch.cuda.device_count", lambda: 8)
-@patch("torch.cuda.get_device_name", lambda device: "H100")
+@apply_cuda_patches
 def test_world_size_larger_than_parameter(device_mesh_1d):
     # make a parameter which is smaller than the world size
     dim: int = device_mesh_1d.shape[0] // 2

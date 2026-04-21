@@ -5,11 +5,10 @@
 
 """Tests for build_param_derived_set and build_terminal_derived_set."""
 
-from unittest.mock import patch
-
 import pytest
 import torch
 import torch.fx
+from conftest import apply_cuda_patches
 from torch._functorch._aot_autograd.descriptors import (
     GradAOTOutput,
     ParamAOTInput,
@@ -260,8 +259,7 @@ class FFN(torch.nn.Module):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-@patch("torch.cuda.device_count", lambda: 8)
-@patch("torch.cuda.get_device_name", lambda device: "H100")
+@apply_cuda_patches
 def test_apply_prefetch_discount(device_mesh_2d):
     from autoparallel.api import AutoParallel
 

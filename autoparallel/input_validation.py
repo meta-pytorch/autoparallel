@@ -9,26 +9,42 @@ import torch
 from torch.distributed.tensor import DeviceMesh
 
 
-def _compute_expected_inputs(traced_inputs, input_constraints, mesh):
+def _get_expected_dim_value(exp):
+    """Return a concrete expected dim value when a symbolic dim collapsed to one."""
+    if not isinstance(exp, torch.SymInt):
+        return exp
+    expr = exp.node.expr
+    if expr.is_number:
+        return int(expr)
+    return None
+
+
+def _compute_expected_inputs(traced_inputs, input_placements, mesh):
     """Compute expected runtime inputs by applying sharding to traced global shapes.
 
-    Returns a list of meta tensors (for tensor inputs) or raw values (for non-tensor inputs).
-    """
-    from torch.distributed.tensor.placement_types import Replicate, Shard
+    traced_inputs may contain pytree structures (dicts, nested tuples, etc.).
+    We flatten them to tensor leaves before applying sharding, since the compiled
+    graph operates on flat tensor args.
 
-    default_placement = (Shard(0),) + (Replicate(),) * (mesh.ndim - 1)
+    Args:
+        traced_inputs: The inputs used during tracing (may contain pytrees).
+        input_placements: A placement tuple for each tensor leaf, as determined
+            by the solver's solution.
+        mesh: The device mesh.
+
+    Returns a flat list of meta tensors (for tensor inputs) or raw values
+    (for non-tensor inputs).
+    """
+    import torch.utils._pytree as pytree
+    from torch.distributed.tensor.placement_types import Shard
+
+    flat_inputs, _ = pytree.tree_flatten(traced_inputs)
 
     result = []
     tensor_idx = 0
-    for inp in traced_inputs:
+    for inp in flat_inputs:
         if isinstance(inp, torch.Tensor):
-            if input_constraints is None:
-                placements = default_placement
-            else:
-                placements = input_constraints[tensor_idx]
-                if placements is None:
-                    placements = default_placement
-
+            placements = input_placements[tensor_idx]
             local_shape = list(inp.shape)
             for mesh_dim, placement in enumerate(placements):
                 if isinstance(placement, Shard):
@@ -42,7 +58,11 @@ def _compute_expected_inputs(traced_inputs, input_constraints, mesh):
 
 
 def _check_forward_args(args, expected_inputs):
-    """Validate that forward() args match the shapes/dtypes used during tracing."""
+    """Validate that forward() args match the shapes/dtypes used during tracing.
+
+    When dynamic shapes are enabled, dimensions that are SymInt in the expected
+    shape accept any size. Concrete dimensions are checked exactly.
+    """
     if len(args) != len(expected_inputs):
         raise ValueError(
             f"AutoParallel: expected {len(expected_inputs)} arguments "
@@ -55,11 +75,20 @@ def _check_forward_args(args, expected_inputs):
                     f"AutoParallel: argument {i} should be a Tensor "
                     f"but got {type(arg).__name__}"
                 )
-            if arg.shape != expected.shape:
+            if len(arg.shape) != len(expected.shape):
                 raise ValueError(
-                    f"AutoParallel: argument {i} has shape {tuple(arg.shape)} "
-                    f"but expected {tuple(expected.shape)}"
+                    f"AutoParallel: argument {i} has {len(arg.shape)} dims "
+                    f"but expected {len(expected.shape)} dims"
                 )
+            for dim, (actual, exp) in enumerate(zip(arg.shape, expected.shape)):
+                expected_dim = _get_expected_dim_value(exp)
+                if expected_dim is None:
+                    continue
+                if actual != expected_dim:
+                    raise ValueError(
+                        f"AutoParallel: argument {i} has shape {tuple(arg.shape)} "
+                        f"but expected {tuple(expected.shape)}"
+                    )
             if arg.dtype != expected.dtype:
                 raise ValueError(
                     f"AutoParallel: argument {i} has dtype {arg.dtype} "
@@ -75,7 +104,13 @@ def _check_forward_args(args, expected_inputs):
 
 def _extract_input_info(
     sample_inputs: Any, mesh: DeviceMesh
-) -> tuple[list[tuple[int, ...]], list[torch.dtype], list[tuple[Any, ...]], Any]:
+) -> tuple[
+    list[tuple[int, ...]],
+    list[torch.dtype],
+    list[tuple[Any, ...]],
+    Any,
+    list[torch.device],
+]:
     """
     Extract tensor metadata and placements from sample inputs (supports pytrees).
 
@@ -89,6 +124,7 @@ def _extract_input_info(
         - List of dtypes
         - List of placement tuples for each tensor leaf
         - TreeSpec for reconstructing the pytree structure
+        - List of devices for each tensor leaf
     """
     import torch.utils._pytree as pytree
     from torch.distributed.tensor import DTensor
@@ -99,6 +135,7 @@ def _extract_input_info(
     shapes = []
     dtypes = []
     input_placements = []
+    devices = []
 
     for inp in flat_inputs:
         if isinstance(inp, DTensor):
@@ -106,25 +143,28 @@ def _extract_input_info(
             shapes.append(tuple(inp.shape))
             dtypes.append(inp.dtype)
             input_placements.append(tuple(inp.placements))
+            devices.append(inp.device)
         elif isinstance(inp, torch.Tensor):
             shapes.append(tuple(inp.shape))
             dtypes.append(inp.dtype)
             input_placements.append(tuple(Replicate() for _ in range(mesh.ndim)))
+            devices.append(inp.device)
         else:
             raise TypeError(
                 f"sample_inputs leaves must be Tensor or DTensor, got {type(inp)}"
             )
 
-    return shapes, dtypes, input_placements, treespec
+    return shapes, dtypes, input_placements, treespec, devices
 
 
 def _make_input_fn(
     shapes: list[tuple[int, ...]],
     dtypes: list[torch.dtype],
     treespec: Any,
+    devices: list[torch.device],
 ) -> Callable[[], tuple[Any, ...]]:
     """
-    Create an input_fn that creates tensors with the given shapes/dtypes.
+    Create an input_fn that creates tensors with the given shapes/dtypes/devices.
 
     The returned function should be called inside FakeTensorMode.
     It creates new tensors (which will be fake tensors when called in FakeTensorMode).
@@ -137,8 +177,8 @@ def _make_input_fn(
     def input_fn() -> tuple[Any, ...]:
         # Create tensors inside FakeTensorMode - they'll be fake tensors
         tensors = [
-            torch.empty(shape, dtype=dtype, device="cuda")
-            for shape, dtype in zip(shapes, dtypes)
+            torch.empty(shape, dtype=dtype, device=device)
+            for shape, dtype, device in zip(shapes, dtypes, devices)
         ]
         result = pytree.tree_unflatten(tensors, treespec)
 

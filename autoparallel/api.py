@@ -60,7 +60,7 @@ from .tracing import (
     move_to_fake,
 )
 
-_APPLY_VIEW_MM_VIEW_PATTERN = False
+_APPLY_VIEW_MM_VIEW_PATTERN = True
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +125,34 @@ class JointGraphResult:
     traced_inputs: list[Any]
 
 
+def _make_inputs_dynamic(
+    inputs: tuple[Any, ...], fake_mode: FakeTensorMode
+) -> tuple[Any, ...]:
+    """Convert concrete FakeTensors to symbolic ones with all-dynamic dims.
+
+    The ShapeEnv will automatically concretize non-batch dimensions as they
+    interact with concrete parameter shapes during tracing.
+    """
+    from torch.fx.experimental.symbolic_shapes import (
+        DimDynamic,
+        StatelessSymbolicContext,
+    )
+    from torch.utils._pytree import tree_map_only
+
+    def to_symbolic(t: torch.Tensor) -> torch.Tensor:
+        sym_ctx: StatelessSymbolicContext = StatelessSymbolicContext(
+            dynamic_sizes=[DimDynamic.DYNAMIC] * t.ndim,
+        )
+        meta = torch.empty(
+            t.shape, dtype=t.dtype, device="meta", requires_grad=t.requires_grad
+        )
+        sym = fake_mode.from_tensor(meta, symbolic_context=sym_ctx)
+        with fake_mode:
+            return sym.to(t.device)
+
+    return tree_map_only(torch.Tensor, to_symbolic, inputs)
+
+
 def build_joint_graph(
     model: torch.nn.Module,
     input_fn: Callable,
@@ -138,6 +166,9 @@ def build_joint_graph(
         raw_inputs = input_fn()
 
     formatted_inputs = raw_inputs if isinstance(raw_inputs, tuple) else (raw_inputs,)
+
+    if fake_mode.shape_env is not None:
+        formatted_inputs = _make_inputs_dynamic(formatted_inputs, fake_mode)
 
     traced_inputs = list(formatted_inputs)
 
@@ -203,7 +234,7 @@ class AutoParallel:
         reshard_after_forward: bool = True,
         dynamic: bool = False,
         numerics_logger: NumericsLogger | None = None,
-        cost_model: Any = None,
+        cost_model: Any = "nccl",
         repeated_subgraphs: bool = False,
     ):
         self.stack = ExitStack()
@@ -404,8 +435,6 @@ class AutoParallel:
         t0 = time.perf_counter()
         self._assert_entered()
 
-        if sharding_placement is None:
-            sharding_placement = self.sharding_placement
         # TODO: what kind of updates do we have to do?
         #  - graph obvs
         #  - flat_args / updated_flat_args
@@ -485,8 +514,7 @@ class AutoParallel:
             sharded_buffer_dict,
         )
 
-    def apply_placement(self, sharding_placement=None):
-
+    def apply_placement(self, sharding_placement):
         sharded_param_dict, sharded_buffer_dict = self._apply_placement_common(
             sharding_placement
         )
@@ -546,12 +574,28 @@ class AutoParallel:
         graph_param_fqns = list(self.joint_with_descriptors.params_spec)
         graph_buffer_fqns = list(self.joint_with_descriptors.buffers_spec)
 
+        # Extract solved input placements from the solution dict.
+        # This is the ground truth for what the compiled graph expects.
+        from torch._functorch._aot_autograd.fx_utils import (
+            get_plain_input_and_grad_nodes,
+        )
+
+        input_nodes = get_plain_input_and_grad_nodes(self.gm.graph)
+        solved_input_placements = []
+        for desc in sorted(input_nodes, key=lambda d: d.idx):
+            node, _grad_node = input_nodes[desc]
+            strategy = sharding_placement[node]
+            solved_input_placements.append(tuple(strategy.output_specs.placements))
+
         expected_inputs = _compute_expected_inputs(
-            self._traced_inputs, self.input_constraints, self.mesh
+            self._traced_inputs, solved_input_placements, self.mesh
         )
 
         def forward(self, *args):
-            _check_forward_args(args, expected_inputs)
+            # Flatten pytree args (e.g. dicts, nested structures) to tensor
+            # leaves, matching how Dynamo flattened the inputs during tracing.
+            flat_args, _ = torch.utils._pytree.tree_flatten(args)
+            _check_forward_args(flat_args, expected_inputs)
             # NB: don't close over the parameters/buffers, as the user may
             # reassign the module!
             # Use the exact param/buffer FQNs that the compiled graph
@@ -559,7 +603,7 @@ class AutoParallel:
             params = [
                 self.get_parameter(fqn).to_local() for fqn in graph_param_fqns
             ] + [self.get_buffer(fqn).to_local() for fqn in graph_buffer_fqns]
-            boxed_args = [*params, *args]
+            boxed_args = [*params, *flat_args]
             del params
             if torch.is_grad_enabled():
                 # NB: don't do self.parallel_model_fn work around Dynamo bug
@@ -591,6 +635,7 @@ def auto_parallel(
     mp_policy: Optional[MixedPrecisionPolicy] = None,
     compile: bool = True,
     parameter_memory_budget: Optional[tuple[Optional[float], Optional[float]]] = None,
+    dynamic: bool = False,
 ) -> torch.nn.Module:
     """
     Parallelize a model with automatic sharding optimization.
@@ -617,6 +662,8 @@ def auto_parallel(
         compile: Whether to use torch.compile (default: True).
         parameter_memory_budget: Optional (low, high) bounds for parameter memory.
             Each bound is a float multiplier or None for unbounded.
+        dynamic: If True, trace with symbolic batch dimensions so the parallel
+            model accepts arbitrary batch sizes at runtime.
 
     Returns:
         Parallelized module. Call to_empty(device="cuda") and init_weights()
@@ -652,14 +699,16 @@ def auto_parallel(
         raw_inputs = sample_inputs
 
     # Extract metadata and placements (does not materialize tensors)
-    shapes, dtypes, input_placements, treespec = _extract_input_info(raw_inputs, mesh)
+    shapes, dtypes, input_placements, treespec, devices = _extract_input_info(
+        raw_inputs, mesh
+    )
 
     # Flatten out_shardings to list
     output_placements = _flatten_out_shardings(out_shardings)
 
     # Create input_fn that will be called inside FakeTensorMode
     # It creates fresh tensors (which become fake tensors inside FakeTensorMode)
-    input_fn = _make_input_fn(shapes, dtypes, treespec)
+    input_fn = _make_input_fn(shapes, dtypes, treespec, devices=devices)
 
     # Use AutoParallel context manager
     with AutoParallel(
@@ -670,6 +719,7 @@ def auto_parallel(
         compile=compile,
         # enable_ac=True,
         enable_ac=False,
+        dynamic=dynamic,
     ) as autop:
         # Add constraints
         autop.add_input_constraints(input_placements)

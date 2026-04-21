@@ -24,6 +24,8 @@ Two layers:
 
 from __future__ import annotations
 
+import functools
+import logging
 import math
 from dataclasses import dataclass
 from enum import Enum
@@ -31,6 +33,8 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from torch.distributed.tensor import DeviceMesh
+
+logger = logging.getLogger(__name__)
 
 
 class GpuArch(Enum):
@@ -565,17 +569,16 @@ def _nccl_algo_time(
     # AG benchmarks at 2/4/8 nodes.
     if algo == NCCLAlgo.RING and topo.n_nodes > 1:
         log_per_gpu = _log2i((n_bytes // topo.n_ranks) >> 6)
-        if 0 <= log_per_gpu < 24:
-            corr = _RING_CORRECTION_FACTOR[log_per_gpu]
+        if topo.n_nodes > 4:
+            table = _depth_scaled_ring_correction(topo.n_nodes)
+        else:
+            table = _RING_CORRECTION_FACTOR
+        if 0 <= log_per_gpu < len(table):
+            corr = table[log_per_gpu]
         elif log_per_gpu < 0:
-            corr = _RING_CORRECTION_FACTOR[0]
+            corr = table[0]
         else:
             corr = 1.0
-        # Deeper pipelines (8+ nodes) ramp more slowly; amplify correction.
-        # Exponent fitted from 8-node H100 AG benchmarks: factor^1.2 matches
-        # the measured BW deficit at 8 nodes across logSize 11-18.
-        if topo.n_nodes > 4 and corr < 1.0:
-            corr **= 1.0 + 0.2 * (_log2i(topo.n_nodes) - 2)
         bw *= corr
 
     # Ring plateau effect for multi-node Simple allreduce (lines 597-599)
@@ -673,6 +676,29 @@ _RING_CORRECTION_FACTOR = (
     1.00,
     1.00,
 )
+
+
+@functools.cache
+def _depth_scaled_ring_correction(n_nodes: int) -> tuple[float, ...]:
+    """Ring correction table with depth-scaled exponent, clamped for monotonicity.
+
+    For 8+ nodes the raw correction factors are raised to an exponent > 1 to
+    model deeper pipeline ramp. This can make adjacent entries jump by more
+    than 2x, which would cause the BW term to decrease when the message size
+    doubles. We clamp each entry to at most 2x the previous entry so that
+    the Ring BW correction does not grow by more than 2x per log-size step
+    after depth scaling.
+    """
+    exp = 1.0 + 0.2 * (_log2i(n_nodes) - 2)
+    table = list(_RING_CORRECTION_FACTOR)
+    for i, corr in enumerate(table):
+        if corr < 1.0:
+            corr **= exp
+        if i > 0:
+            corr = min(corr, 2.0 * table[i - 1])
+        table[i] = corr
+    return tuple(table)
+
 
 # Per-node synchronization overhead (us) for multi-node Ring.
 # NCCL's Ring latency model (nsteps * per_step_lat) assumes each step has
@@ -1192,23 +1218,76 @@ def nccl_reduce_scatter_cost(
     return nccl_collective_time(NCCLFunc.REDUCESCATTER, n_bytes, topo, config)
 
 
+# Ordered from most specific to least specific to avoid substring
+# false matches (e.g. "B200" matching inside "GB200").
+_CANONICAL_GPUS_PER_NODE = (
+    ("GB200", 72),
+    ("B200", 72),
+    ("H200", 8),
+    ("H100", 8),
+    ("A100", 8),
+)
+
+
 def detect_nccl_topo_config(mesh: "DeviceMesh") -> NCCLTopoConfig | None:
     """Auto-detect GPU architecture and build an NCCLTopoConfig from the mesh.
 
-    Returns None if the GPU is unrecognized (caller falls back to PyTorch model).
+    Uses canonical per-architecture defaults (e.g. 8 GPUs/node for H100,
+    72 for GB200). If the mesh size is not divisible by the canonical
+    gpus_per_node, returns None so the caller falls back to the PyTorch
+    default model. For non-standard topologies, pass an explicit
+    NCCLTopoConfig instead.
+
+    Returns None if the GPU is unrecognized or the mesh is incompatible.
     """
     import torch
 
-    device_name = torch.cuda.get_device_name(0)
+    try:
+        device_name = torch.cuda.get_device_name(0)
+    except (RuntimeError, AssertionError):
+        logger.info(
+            "No CUDA device available for NCCL cost model detection. "
+            "Falling back to default cost model."
+        )
+        return None
+
     total_gpus = mesh.size()
-    gpus_per_node = torch.cuda.device_count()
+
+    gpus_per_node = None
+    matched_name = None
+    for gpu_name, canonical_ppn in _CANONICAL_GPUS_PER_NODE:
+        if gpu_name in device_name:
+            gpus_per_node = canonical_ppn
+            matched_name = gpu_name
+            break
+
+    if gpus_per_node is None:
+        logger.warning(
+            "Unrecognized GPU '%s' for NCCL cost model. "
+            "Falling back to default cost model. "
+            "Pass an explicit NCCLTopoConfig for this hardware.",
+            device_name,
+        )
+        return None
+
+    if total_gpus % gpus_per_node != 0:
+        logger.warning(
+            "Mesh size %d is not divisible by canonical %d GPUs/node for %s. "
+            "NCCL topology may be inaccurate; falling back to default cost "
+            "model. Pass an explicit NCCLTopoConfig for non-standard setups.",
+            total_gpus,
+            gpus_per_node,
+            device_name,
+        )
+        return None
+
     num_nodes = total_gpus // gpus_per_node
 
-    if "A100" in device_name:
+    if matched_name == "A100":
         return a100_topo_config(num_nodes=num_nodes, gpus_per_node=gpus_per_node)
-    elif "H100" in device_name or "H200" in device_name:
+    elif matched_name in ("H100", "H200"):
         return h100_topo_config(num_nodes=num_nodes, gpus_per_node=gpus_per_node)
-    elif "B200" in device_name or "GB200" in device_name:
+    elif matched_name in ("B200", "GB200"):
         return gb200_topo_config(num_nodes=num_nodes, gpus_per_node=gpus_per_node)
     return None
 
