@@ -27,7 +27,12 @@ from torch.distributed.tensor.debug import (
     _clear_fast_path_sharding_prop_cache,
     _clear_python_sharding_prop_cache,
 )
-from torch.distributed.tensor.placement_types import Placement, Replicate, Shard
+from torch.distributed.tensor.placement_types import (
+    _StridedShard,
+    Placement,
+    Replicate,
+    Shard,
+)
 
 try:
     from torch.utils._cxx_pytree import tree_leaves
@@ -41,6 +46,22 @@ aten = torch.ops.aten
 
 # reference to existing sharding_propagator DTensor upstream
 propagator = DTensor._op_dispatcher.sharding_propagator
+
+# Ops where AP prefers the single-dim strategy path over the legacy
+# register_op_strategy path, because the single-dim path with
+# _ShardingPlaceholder expansion lets AP enumerate _StridedShard variants
+# (see _try_single_dim_strategy). Enabling this for mm-family ops closes the
+# strategy-space gap on view -> mm -> view decompositions where input tensors
+# carry _StridedShard from upstream flatten ops.
+_PREFER_SINGLE_DIM_OPS: frozenset = frozenset(
+    {
+        aten.mm.default,
+        aten.addmm.default,
+        aten.bmm.default,
+        aten.baddbmm.default,
+        aten._scaled_mm.default,
+    }
+)
 
 enable_implicit_replication = False
 _current_stack = None
@@ -294,11 +315,39 @@ def _try_single_dim_strategy(
     strategies = _insert_single_dim_replication_strategy(
         strategies, num_outputs, num_inputs
     )
+    # Candidate split_factors drawn from upstream input strategies. Each distinct
+    # split_factor seen on any OpSpec across any input becomes an additional
+    # _StridedShard variant for every _ShardingPlaceholder slot. This matches the
+    # provenance from flatten ops: the upstream view rule emits _StridedShard with
+    # a split_factor determined by the flattened dim sizes. Bounded this way, the
+    # enumeration stays small (empirically 1-2 sfs per mm node).
+    candidate_sfs: set[int] = set()
+    for arg in op_schema.args_strategy:
+        for op_spec in arg.strategies:
+            for p in op_spec.output_spec.placements:
+                if isinstance(p, _StridedShard):
+                    candidate_sfs.add(p.split_factor)
+
     resolved: list[list[Placement | None]] = []
     for s in strategies:
+        has_placeholder = any(isinstance(p, _ShardingPlaceholder) for p in s)
+        if not has_placeholder:
+            resolved.append(list(s))
+            continue
+        # Plain Shard variant (original behavior).
         resolved.append(
             [Shard(p.dim) if isinstance(p, _ShardingPlaceholder) else p for p in s]
         )
+        # One _StridedShard variant per candidate split_factor.
+        for sf in candidate_sfs:
+            resolved.append(
+                [
+                    _StridedShard(p.dim, split_factor=sf)
+                    if isinstance(p, _ShardingPlaceholder)
+                    else p
+                    for p in s
+                ]
+            )
 
     result = expand_to_full_mesh_op_strategy(
         mesh,
@@ -324,6 +373,16 @@ def _try_single_dim_strategy(
 
 def get_op_strategy(op: torch._ops.OpOverload, op_schema: OpSchema) -> StrategyType:
     global enable_implicit_replication, _current_stack
+
+    # For mm-family ops, prefer the single-dim path so _StridedShard variants
+    # get enumerated (see _PREFER_SINGLE_DIM_OPS doc).
+    if (
+        op in _PREFER_SINGLE_DIM_OPS
+        and op in propagator.op_single_dim_strategy_funcs
+    ):
+        single_dim_result = _try_single_dim_strategy(op, op_schema)
+        if single_dim_result is not None:
+            return single_dim_result
 
     if op not in propagator.op_strategy_funcs:
         # Check single-dim strategies (newer upstream DTensor registration path)
