@@ -27,7 +27,12 @@ from torch.distributed.tensor.debug import (
     _clear_fast_path_sharding_prop_cache,
     _clear_python_sharding_prop_cache,
 )
-from torch.distributed.tensor.placement_types import Placement, Replicate, Shard
+from torch.distributed.tensor.placement_types import (
+    Placement,
+    Replicate,
+    Shard,
+    _StridedShard,
+)
 
 try:
     from torch.utils._cxx_pytree import tree_leaves
@@ -41,6 +46,40 @@ aten = torch.ops.aten
 
 # reference to existing sharding_propagator DTensor upstream
 propagator = DTensor._op_dispatcher.sharding_propagator
+
+
+def is_shard_like(p: Placement) -> bool:
+    """Whether placement shards a tensor dim. True for Shard and _StridedShard.
+
+    DTensor's Placement.is_shard() returns False for _StridedShard because the
+    latter subclasses StridedShard (a sibling of Shard) rather than Shard. Code
+    that conceptually asks "is this dim sharded?" should use this helper so
+    strategies carrying _StridedShard aren't silently treated as unsharded.
+    """
+    return p.is_shard() or isinstance(p, _StridedShard)
+
+
+# Ops where AP can route to the single-dim strategy path (with _StridedShard
+# variant enumeration in _try_single_dim_strategy) instead of the legacy
+# register_op_strategy path. Gated by ENABLE_SINGLE_DIM_MM_FAMILY so the new
+# behavior is opt-in; legacy _mm_like_strategy remains the default.
+_PREFER_SINGLE_DIM_OPS: frozenset = frozenset(
+    {
+        aten.mm.default,
+        aten.addmm.default,
+        aten.bmm.default,
+        aten.baddbmm.default,
+        aten._scaled_mm.default,
+    }
+)
+
+# When True, route mm/addmm/bmm/baddbmm/_scaled_mm through the upstream
+# single-dim strategy path, which emits _StridedShard variants from observed
+# input split_factors. Benchmark on LLaMA3-8B shows this is cheaper on solver
+# time and objective vs. the legacy _mm_like_strategy path (see
+# PLAN_dtensor_native_linear.md). Default False to keep default behavior
+# unchanged; flip True at AP entry points or in user code to opt in.
+ENABLE_SINGLE_DIM_MM_FAMILY: bool = False
 
 enable_implicit_replication = False
 _current_stack = None
@@ -263,9 +302,11 @@ def _try_single_dim_strategy(
             return arg.strategies[0].output_spec
         if isinstance(arg, TupleStrategy):
             return [
-                child.strategies[0].output_spec
-                if isinstance(child, OpStrategy)
-                else child
+                (
+                    child.strategies[0].output_spec
+                    if isinstance(child, OpStrategy)
+                    else child
+                )
                 for child in arg.children
             ]
         return arg
@@ -294,11 +335,43 @@ def _try_single_dim_strategy(
     strategies = _insert_single_dim_replication_strategy(
         strategies, num_outputs, num_inputs
     )
+    # Candidate split_factors drawn from upstream input strategies. Each distinct
+    # split_factor seen on any OpSpec across any input becomes an additional
+    # _StridedShard variant for every _ShardingPlaceholder slot. This matches the
+    # provenance from flatten ops: the upstream view rule emits _StridedShard with
+    # a split_factor determined by the flattened dim sizes. Bounded this way, the
+    # enumeration stays small (empirically 1-2 sfs per mm node).
+    candidate_sfs: set[int] = set()
+    for arg in op_schema.args_strategy:
+        for op_spec in arg.strategies:
+            for p in op_spec.output_spec.placements:
+                if isinstance(p, _StridedShard):
+                    candidate_sfs.add(p.split_factor)
+
     resolved: list[list[Placement | None]] = []
     for s in strategies:
+        has_placeholder = any(isinstance(p, _ShardingPlaceholder) for p in s)
+        if not has_placeholder:
+            # No placeholders, so every element is already Placement | None.
+            # The list comprehension narrows the element type for mypy.
+            resolved.append([p for p in s if not isinstance(p, _ShardingPlaceholder)])
+            continue
+        # Plain Shard variant (original behavior).
         resolved.append(
             [Shard(p.dim) if isinstance(p, _ShardingPlaceholder) else p for p in s]
         )
+        # One _StridedShard variant per candidate split_factor.
+        for sf in candidate_sfs:
+            resolved.append(
+                [
+                    (
+                        _StridedShard(p.dim, split_factor=sf)
+                        if isinstance(p, _ShardingPlaceholder)
+                        else p
+                    )
+                    for p in s
+                ]
+            )
 
     result = expand_to_full_mesh_op_strategy(
         mesh,
@@ -324,6 +397,17 @@ def _try_single_dim_strategy(
 
 def get_op_strategy(op: torch._ops.OpOverload, op_schema: OpSchema) -> StrategyType:
     global enable_implicit_replication, _current_stack
+
+    # Opt-in: route mm-family ops through the single-dim path so _StridedShard
+    # variants get enumerated (see _PREFER_SINGLE_DIM_OPS / ENABLE_SINGLE_DIM_MM_FAMILY).
+    if (
+        ENABLE_SINGLE_DIM_MM_FAMILY
+        and op in _PREFER_SINGLE_DIM_OPS
+        and op in propagator.op_single_dim_strategy_funcs
+    ):
+        single_dim_result = _try_single_dim_strategy(op, op_schema)
+        if single_dim_result is not None:
+            return single_dim_result
 
     if op not in propagator.op_strategy_funcs:
         # Check single-dim strategies (newer upstream DTensor registration path)

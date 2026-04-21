@@ -29,7 +29,11 @@ from torch.utils._pytree import tree_flatten, tree_map_only
 
 from autoparallel.shardings.propagation_rules import generate_dummy_redistribute_costs
 
-from .dtensor_sharding_helpers import get_op_strategy, with_implicit_strategies
+from .dtensor_sharding_helpers import (
+    get_op_strategy,
+    is_shard_like,
+    with_implicit_strategies,
+)
 from .propagation_rules import _op_rules, remove_invalid_configs
 
 logger = logging.getLogger(__name__)
@@ -286,9 +290,11 @@ def get_placement_options(mesh, op, specs, user_args, user_kwargs):
             op,
             tuple(_fingerprint_arg(s) for s in specs),
             tuple(_fingerprint_arg(a) for a in user_args),
-            tuple(_fingerprint_arg(v) for v in user_kwargs.values())
-            if user_kwargs
-            else (),
+            (
+                tuple(_fingerprint_arg(v) for v in user_kwargs.values())
+                if user_kwargs
+                else ()
+            ),
         )
         hash(cache_key)  # fail fast if key contains unhashable types (e.g. SymInts)
     except TypeError:
@@ -557,7 +563,7 @@ def get_flex_attention_placement_option(mesh, specs, user_args, node):
         dim_to_ref = {0: B, 1: H}
         adjusted = []
         for mesh_dim, p in enumerate(placement):
-            if p.is_shard() and p.dim in dim_to_ref:
+            if is_shard_like(p) and p.dim in dim_to_ref:
                 t_size = t.shape[p.dim]
                 ref_size = dim_to_ref[p.dim]
                 mesh_dim_size = mesh.shape[mesh_dim]

@@ -47,7 +47,7 @@ from torch.distributed.tensor.placement_types import (
 
 # need to import this to have the dtype_cast registered
 from ..cast_parametrization import dtype_cast  # noqa
-from .dtensor_sharding_helpers import get_op_strategy
+from .dtensor_sharding_helpers import get_op_strategy, is_shard_like
 
 logger = logging.getLogger(__name__)
 
@@ -174,7 +174,7 @@ def remove_invalid_configs(out_strat, mesh):
                 continue
             shape = list(spec.tensor_meta.shape)
             for mesh_shape, plc in zip(mesh.shape, spec.placements):
-                if plc.is_shard():
+                if is_shard_like(plc):
                     dim = plc.dim
                     if shape[dim] % mesh_shape == 0:
                         shape[dim] //= mesh_shape
@@ -549,7 +549,7 @@ def native_layer_norm_rule(mesh, op_schema):
     for strategy in output_strategy.strategies:
         is_valid = True
         for plc in strategy.input_specs[0].placements:
-            if plc.is_shard() and plc.dim >= axis:
+            if is_shard_like(plc) and plc.dim >= axis:
                 is_valid = False
                 break
         if is_valid:
@@ -623,7 +623,7 @@ def native_layer_norm_backward_rule(mesh, op_schema):
         is_valid = True
         input_spec = strategy.input_specs[1]
         for plc in input_spec.placements:
-            if plc.is_shard() and plc.dim >= axis:
+            if is_shard_like(plc) and plc.dim >= axis:
                 is_valid = False
                 break
         if is_valid:
@@ -699,7 +699,7 @@ def constant_pad_nd_rule(mesh, op_schema):
     for idx, strat in enumerate(out_strat.strategies):
         remove_this = False
         for plc in strat.output_specs.placements:
-            if plc.is_shard() and plc.dim in dims_to_remove:
+            if is_shard_like(plc) and plc.dim in dims_to_remove:
                 to_remove.append(idx)
                 remove_this = True
                 break

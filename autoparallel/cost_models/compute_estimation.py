@@ -283,6 +283,8 @@ def _get_device_gmem_bandwidth():
 
 
 def _get_sharded_shape_stride(spec):
+    from autoparallel.shardings.dtensor_sharding_helpers import is_shard_like
+
     mesh = spec.mesh
     tensor_shape = spec.tensor_meta.shape
     # TODO: take dtype into account as well
@@ -292,8 +294,10 @@ def _get_sharded_shape_stride(spec):
     # running DTensor
     new_tensor_shape = list(tensor_shape)
     new_tensor_stride = list(spec.tensor_meta.stride)
+    # is_shard_like covers _StridedShard, which shards the dim by mesh_size
+    # (same local shape as Shard); split_factor affects data layout only.
     for mesh_size, placement in zip(mesh.shape, placements):
-        if placement.is_shard():
+        if is_shard_like(placement):
             dim = placement.dim
             new_tensor_shape[dim] = (new_tensor_shape[dim] + mesh_size - 1) // mesh_size
             if dim - 1 > 0:
