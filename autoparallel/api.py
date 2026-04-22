@@ -235,7 +235,7 @@ class AutoParallel:
         dynamic: bool = False,
         numerics_logger: NumericsLogger | None = None,
         cost_model: Any = "nccl",
-        repeated_subgraphs: bool = False,
+        repeated_subgraphs: bool = True,
     ):
         self.stack = ExitStack()
         self.fake_mode = (
