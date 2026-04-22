@@ -1351,15 +1351,29 @@ def test_uneven_sharding_optimize_and_apply(device_mesh_2d):
 @apply_cuda_patches
 def test_uneven_sharding_parallel_graph_has_pad_ops(device_mesh_2d):
     """The parallel graph should contain pad + slice ops for uneven sharding."""
-    dim1 = 100
-    dim2 = 400
+    # Use a single linear to have precise control over which dim is sharded.
+    # nn.Linear(100, 400) has weight [400, 100]. Forcing Shard(0) on TP
+    # means the output dim (400) is sharded: 400 % 8 = 0 (even, no pad).
+    # Instead, use nn.Linear(400, 100) with weight [100, 400]. Force Shard(1)
+    # to shard dim 1 (size 400): 400 % 8 = 0 (also even).
+    # To get uneven: use dim=100 with TP=8: 100 % 8 = 4.
+    # nn.Linear(100, 50) has weight [50, 100]. Force Shard(1) on TP=8:
+    # shards dim 1 (100), which is the contracting dim → requires all-gather.
+
+    class SingleLinear(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.w = nn.Linear(100, 50, bias=False)
+
+        def forward(self, x):
+            return self.w(x)
 
     with torch.device("meta"):
-        model = FFN(dim1, dim2)
+        model = SingleLinear()
 
     def input_fn():
         bs = 8 * device_mesh_2d.shape[0]
-        return torch.randn(bs, dim1, device="cuda")
+        return torch.randn(bs, 100, device="cuda", requires_grad=True)
 
     placement = (Shard(0), Replicate())
 
@@ -1369,7 +1383,8 @@ def test_uneven_sharding_parallel_graph_has_pad_ops(device_mesh_2d):
         autop.add_input_constraints([placement])
         autop.add_output_constraints([placement])
 
-        # Force Shard(1) on TP for w1 [400, 100]: 100 % 8 = 4
+        # Force Shard(1) on TP for w [50, 100]: shards contracting dim
+        # 100 % 8 = 4, uneven → requires all-gather with pad/unpad
         param_nodes = get_param_nodes(autop.sharding_optimizer.graph)
         autop.sharding_optimizer.add_node_constraint(
             param_nodes[0], placement=(Replicate(), Shard(1))

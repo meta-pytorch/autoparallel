@@ -386,20 +386,23 @@ def _make_local_args(gm, sharding_placement):
         ).redistribute(mesh, tgt_spec.placements)
         local = sharded.to_local()
 
-        # For dynamic shapes, re-create with fresh SymInts
+        # For dynamic shapes, re-create with fresh SymInts.
+        # A dim is DYNAMIC if it's genuinely symbolic (a free SymInt variable
+        # like the batch dim, not a guarded model constant like hidden_dim
+        # whose expr collapsed to a number), or if uneven sharding causes
+        # rank-varying local sizes.
         if isinstance(tensor, FakeTensor) and tensor.fake_mode.shape_env is not None:
             dynamic_sizes = [
                 DimDynamic.DYNAMIC
-                if isinstance(s, torch.SymInt)
+                if (isinstance(s, torch.SymInt) and not s.node.expr.is_number)
                 or _has_rank_varying_size(i, tensor.shape, tgt_spec)
                 else DimDynamic.STATIC
                 for i, s in enumerate(tensor.shape)
             ]
-            # Create a real meta tensor, not a FakeTensor. Inside an active
-            # fake_mode context, torch.empty produces a FakeTensor with
-            # concrete shapes, and from_tensor would return it from the memo
-            # cache ignoring symbolic_context. unset_fake_temporarily ensures
-            # we get a real tensor that from_tensor will properly symbolize.
+            # Use unset_fake_temporarily so torch.empty creates a real meta
+            # tensor. Inside the active fake mode, torch.empty would produce
+            # a FakeTensor that from_tensor returns from cache, ignoring
+            # symbolic_context.
             with unset_fake_temporarily():
                 real = torch.empty(
                     _concretize_shape(local.shape),
