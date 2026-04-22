@@ -81,4 +81,5 @@ jobs:
         pip install --quiet .
         python examples/example_dcp.py
         torchrun --standalone --nproc-per-node 4 examples/example_ds3_local_map.py
-        torchrun --standalone --nproc_per_node=4 examples/example_ds3_pp.py --use-loss-fn --fake-evaluate
+        # Skipped: graph PP is being moved out of AutoParallel shortly.
+        # torchrun --standalone --nproc_per_node=4 examples/example_ds3_pp.py --use-loss-fn --fake-evaluate
