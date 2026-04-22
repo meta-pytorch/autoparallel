@@ -4,7 +4,6 @@
 # LICENSE file in the root directory of this source tree.
 
 import copy
-import functools
 import logging
 import time
 from contextlib import ExitStack, contextmanager
@@ -17,7 +16,6 @@ from torch._functorch.aot_autograd import (
     aot_compile_joint_with_descriptors,
     aot_export_joint_with_descriptors,
 )
-from torch._inductor.compile_fx import compile_fx_inner
 from torch._logging import trace_structured
 from torch._subclasses import FakeTensorMode
 from torch.distributed.fsdp import MixedPrecisionPolicy
@@ -27,10 +25,7 @@ from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
 from .apply_sharding import apply_sharding_to_model
 from .cast_parametrization import apply_dtype_cast, canonicalize_mp, set_dtype_cast
-from .graph_passes.activation_checkpointing import (
-    ac_joint_pass,
-    mark_fsdp_all_gather_recomputation,
-)
+from .graph_passes.activation_checkpointing import mark_fsdp_all_gather_recomputation
 from .graph_passes.graph_utils import (
     _add_alias,
     _replace_view_mm_view_with_einsum,
@@ -48,11 +43,7 @@ from .input_validation import (
 )
 from .module_construction import make_parallel_module
 from .optimize_sharding import ShardingOptimizer
-from .shardings.placement_options import (
-    NumericsLogger,
-    _get_device_from_mesh,
-    debug_boxed_nop_preserve_node_meta,
-)
+from .shardings.placement_options import _get_device_from_mesh
 from .tracing import (
     _add_unused_params_and_buffers,
     _get_decomp_table,
@@ -66,28 +57,6 @@ logger = logging.getLogger(__name__)
 
 
 def _boxed_nop_preserve_node_meta(fx_g, example_inputs):
-    if torch._inductor.config.aten_distributed_optimizations.enable_overlap_scheduling:
-        from torch._inductor.fx_passes.overlap_scheduling import (
-            schedule_overlap_bucketing_from_inductor_configs,
-        )
-
-        # disable flags which are inductor-specific
-        with torch._inductor.config.patch(
-            {
-                "aten_distributed_optimizations.insert_overlap_deps": False,
-                "aten_distributed_optimizations.enable_fusion_regions": False,
-            }
-        ):
-            schedule_overlap_bucketing_from_inductor_configs(fx_g)
-
-    # Replace aten.view with aten.reshape for eager execution. Graph passes
-    # (sharding redistributions, collective bucketing) can produce non-contiguous
-    # tensors that break aten.view's contiguity requirement. Inductor handles this
-    # in compile_fx; we need to do it here for the compile=False path.
-    from torch._inductor.fx_passes.post_grad import view_to_reshape
-
-    view_to_reshape(fx_g)
-
     def run(args):
         with torch.fx.traceback.preserve_node_meta():
             return torch.fx.Interpreter(fx_g).boxed_run(args)
@@ -172,9 +141,11 @@ def build_joint_graph(
 
     traced_inputs = list(formatted_inputs)
 
-    with set_dtype_cast(
-        True
-    ), enable_local_map_wrapping(), torch._dynamo.utils._disable_saved_tensors_hooks_during_tracing():
+    with (
+        set_dtype_cast(True),
+        enable_local_map_wrapping(),
+        torch._dynamo.utils._disable_saved_tensors_hooks_during_tracing(),
+    ):
         torch_ir_with_fqn = _dynamo_graph_capture_for_export(model)(*formatted_inputs)
         _restore_state_dict(model, torch_ir_with_fqn)
         _add_unused_params_and_buffers(model, torch_ir_with_fqn)
@@ -227,13 +198,8 @@ class AutoParallel:
         input_fn,
         mesh: DeviceMesh,
         mp_policy: Optional[MixedPrecisionPolicy] = None,
-        compile: bool = False,
-        enable_ac: bool = True,
-        # None means 'auto'
-        ac_stage_size_in_GiB: Optional[Union[float, str]] = "auto",
         reshard_after_forward: bool = True,
         dynamic: bool = False,
-        numerics_logger: NumericsLogger | None = None,
         cost_model: Any = "nccl",
         repeated_subgraphs: bool = True,
     ):
@@ -258,16 +224,7 @@ class AutoParallel:
         self.model = move_to_fake(model, self.fake_mode, device)
         self.input_fn = input_fn
         self.mesh = mesh
-        if compile:
-            self.compiler_fn = compile_fx_inner
-        elif numerics_logger:
-            self.compiler_fn = functools.partial(
-                debug_boxed_nop_preserve_node_meta, numerics_logger=numerics_logger
-            )
-        else:
-            self.compiler_fn = _boxed_nop_preserve_node_meta  # type: ignore[assignment]
-        self.enable_ac = enable_ac
-        self.ac_stage_size_in_GiB = ac_stage_size_in_GiB
+        self.compiler_fn = _boxed_nop_preserve_node_meta  # type: ignore[assignment]
         self.reshard_after_forward = reshard_after_forward
 
         if dynamic:
@@ -483,11 +440,16 @@ class AutoParallel:
         )
         t_trace = time.perf_counter()
 
+        # Replace aten.view with aten.reshape unconditionally. Graph passes
+        # (sharding redistributions, collective bucketing) can produce
+        # non-contiguous tensors that break aten.view's contiguity requirement.
+        from torch._inductor.fx_passes.post_grad import view_to_reshape
+
+        view_to_reshape(parallel_gm)
+
         mark_fsdp_all_gather_recomputation(
             parallel_gm.graph, self.reshard_after_forward
         )
-        if self.enable_ac:
-            ac_joint_pass(parallel_gm.graph, self.ac_stage_size_in_GiB)
         t_ac = time.perf_counter()
         # now rename input/param/tangent/output/grad_param/grad_input nodes following
         # our convention
@@ -633,7 +595,6 @@ def auto_parallel(
     out_shardings: Any,
     *,
     mp_policy: Optional[MixedPrecisionPolicy] = None,
-    compile: bool = True,
     parameter_memory_budget: Optional[tuple[Optional[float], Optional[float]]] = None,
     dynamic: bool = False,
 ) -> torch.nn.Module:
@@ -642,6 +603,10 @@ def auto_parallel(
 
     This is a simplified API that wraps the full AutoParallel context manager.
     For more control, use the AutoParallel class directly.
+
+    The returned module runs eagerly. For compiled execution, use
+    ``torch.compile(module, backend=autoparallel_backend())`` to compile with
+    AP-optimized Inductor passes (activation checkpointing, overlap scheduling).
 
     Args:
         model: Model to parallelize. Can be on meta device for large models.
@@ -659,7 +624,6 @@ def auto_parallel(
                 - Tuple output: ((Shard(0),), (Shard(0),))
                 - Dict output: {"logits": (Shard(0),), "loss": (Replicate(),)}
         mp_policy: Optional mixed precision policy.
-        compile: Whether to use torch.compile (default: True).
         parameter_memory_budget: Optional (low, high) bounds for parameter memory.
             Each bound is a float multiplier or None for unbounded.
         dynamic: If True, trace with symbolic batch dimensions so the parallel
@@ -716,9 +680,6 @@ def auto_parallel(
         input_fn,
         mesh,
         mp_policy=mp_policy,
-        compile=compile,
-        # enable_ac=True,
-        enable_ac=False,
         dynamic=dynamic,
     ) as autop:
         # Add constraints

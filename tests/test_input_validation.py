@@ -105,7 +105,6 @@ def test_forward_input_validation_integration(device_mesh_1d):
         device_mesh_1d,
         sample_inputs=(x,),
         out_shardings=(Shard(0),),
-        compile=False,
     )
 
     with pytest.raises(ValueError, match="shape"):
@@ -216,7 +215,6 @@ def test_dict_input_integration(device_mesh_1d):
         device_mesh_1d,
         sample_inputs=sample_inputs,
         out_shardings=(Shard(0),),
-        compile=False,
     )
     parallel_mod.to_empty(device="cuda")
     parallel_mod.init_weights()

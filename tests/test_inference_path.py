@@ -45,7 +45,7 @@ def _auto_parallel_with_internals(model, mesh, sample_inputs, out_shardings):
     output_placements = _flatten_out_shardings(out_shardings)
     input_fn = _make_input_fn(shapes, dtypes, treespec, devices)
 
-    with AutoParallel(model, input_fn, mesh, compile=False) as autop:
+    with AutoParallel(model, input_fn, mesh) as autop:
         autop.add_input_constraints(input_placements)
         autop.add_output_constraints(output_placements)
         sharding_placement = autop.optimize_placement(verbose=False)
@@ -185,7 +185,6 @@ def test_inference_fn_produces_output(device_mesh_1d):
         device_mesh_1d,
         sample_inputs=(x,),
         out_shardings=(Shard(0),),
-        compile=False,
     )
     parallel_model.to_empty(device="cuda")
     nn.init.ones_(parallel_model.linear.weight)
@@ -209,7 +208,6 @@ def test_training_and_inference_same_output(device_mesh_1d):
         device_mesh_1d,
         sample_inputs=(x,),
         out_shardings=(Shard(0),),
-        compile=False,
     )
     parallel_model.to_empty(device="cuda")
     nn.init.ones_(parallel_model.linear.weight)
@@ -238,7 +236,6 @@ def test_inference_no_grad_on_output(device_mesh_1d):
         device_mesh_1d,
         sample_inputs=(x,),
         out_shardings=(Shard(0),),
-        compile=False,
     )
     parallel_model.to_empty(device="cuda")
     nn.init.ones_(parallel_model.linear.weight)
@@ -262,7 +259,6 @@ def test_multi_output_inference(device_mesh_1d):
         device_mesh_1d,
         sample_inputs=(x,),
         out_shardings=((Shard(0),), (Shard(0),)),
-        compile=False,
     )
     parallel_model.to_empty(device="cuda")
     nn.init.ones_(parallel_model.a.weight)
