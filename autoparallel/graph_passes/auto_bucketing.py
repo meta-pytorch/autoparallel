@@ -146,7 +146,7 @@ def configure_inductor_for_autobucketing(mode: str = "aten"):
     # allow configuring inductor comms optimizations from torchtitan commandline
     if mode == "aten":
         torch._inductor.config.aten_distributed_optimizations.enable_overlap_scheduling = (
-            True
+            torch.cuda.is_available() # Disable overlap scheduling for non-CUDA devices
         )
         torch._inductor.config.aten_distributed_optimizations.collective_bucketing = (
             True

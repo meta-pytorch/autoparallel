@@ -97,7 +97,7 @@ def benchmark_comm_func(
     estimate: bool,
 ) -> float:
     rank = c10d.distributed_c10d.get_rank()
-    device = torch.device(f"cuda:{rank:d}")
+    device = torch.device(rank)
 
     if comm_func_name == "torch.ops._c10d_functional.all_gather_into_tensor.default":
         input_args = {"input_tensor": tensor_input, "output_tensor": tensor_output}
@@ -118,17 +118,17 @@ def benchmark_comm_func(
             comm_func(**input_args)
         comm_time = cm.estimated_time
     else:
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         comm_func(**input_args, group=process_group)
 
         nruns = 2
         comm_time = 0
         for _ in range(nruns):
             c10d.barrier()
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
 
-            start_evt = torch.cuda.Event(enable_timing=True)
-            end_evt = torch.cuda.Event(enable_timing=True)
+            start_evt = torch.Event(enable_timing=True)
+            end_evt = torch.Event(enable_timing=True)
             start_evt.record()
             comm_func(**input_args, group=process_group)
             end_evt.record()
@@ -381,15 +381,15 @@ def benchmark_extern_node(
             args, kwargs = pytree.tree_unflatten(flat_args, args_property)
             func(*args, **kwargs)
             num_iters = 3
-            start_event = torch.cuda.Event(enable_timing=True)
-            end_event = torch.cuda.Event(enable_timing=True)
+            start_event = torch.Event(enable_timing=True)
+            end_event = torch.Event(enable_timing=True)
             cpu_start = time.time()
-            start_event.record(torch.cuda.current_stream())
+            start_event.record(torch.accelerator.current_stream())
             for _ in range(num_iters):
                 func(*args, **kwargs)
-            end_event.record(torch.cuda.current_stream())
+            end_event.record(torch.accelerator.current_stream())
             cpu_end = time.time()
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             cpu_time = cpu_end - cpu_start
             total_op_time = start_event.elapsed_time(end_event) - cpu_time
             mean_op_time = total_op_time / num_iters
