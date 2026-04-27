@@ -249,9 +249,12 @@ def _run_auto_parallel(model, mesh, dim=DIM, compile=False):
         mesh,
         sample_inputs=(x,),
         out_shardings=_out_shardings(mesh),
-        compile=compile,
     )
     assert parallel_model is not None
+    if compile:
+        from autoparallel.compile import autoparallel_backend
+
+        parallel_model = torch.compile(parallel_model, backend=autoparallel_backend())
     return parallel_model
 
 
@@ -325,7 +328,7 @@ def test_flex_attention_block_mask_sharding_matches_shape(device_mesh_1d):
         input_fn = _make_input_fn(shapes, dtypes, treespec, devices)
         output_placements = _flatten_out_shardings(_out_shardings(mesh))
 
-        with AutoParallel(model, input_fn, mesh, compile=False) as autop:
+        with AutoParallel(model, input_fn, mesh) as autop:
             autop.add_input_constraints(input_placements)
             autop.add_output_constraints(output_placements)
 
@@ -415,7 +418,7 @@ def test_flex_attention_gqa_head_sharding(device_mesh_2d):
     input_fn = _make_input_fn(shapes, dtypes, treespec, devices)
     output_placements = _flatten_out_shardings(_out_shardings(mesh))
 
-    with AutoParallel(model, input_fn, mesh, compile=False) as autop:
+    with AutoParallel(model, input_fn, mesh) as autop:
         autop.add_input_constraints(input_placements)
         autop.add_output_constraints(output_placements)
 
@@ -485,7 +488,7 @@ def test_flex_attention_other_buffers_replicated(device_mesh_1d):
     input_fn = _make_input_fn(shapes, dtypes, treespec, devices)
     output_placements = _flatten_out_shardings(_out_shardings(mesh))
 
-    with AutoParallel(model, input_fn, mesh, compile=False) as autop:
+    with AutoParallel(model, input_fn, mesh) as autop:
         autop.add_input_constraints(input_placements)
         autop.add_output_constraints(output_placements)
 
@@ -516,14 +519,14 @@ def test_flex_attention_other_buffers_replicated(device_mesh_1d):
 
 
 def test_flex_attention_compile(device_mesh_1d):
-    """Smoke test with compile=True to verify the parallel graph is compilable."""
+    """Smoke test that the parallel graph is compilable with torch.compile."""
     with torch.device("meta"):
         model = FlexAttnModel(DIM, N_HEADS)
     _run_auto_parallel(model, device_mesh_1d, compile=True)
 
 
 def test_flex_attention_gqa_compile(device_mesh_1d):
-    """Smoke test GQA with compile=True."""
+    """Smoke test GQA is compilable with torch.compile."""
     n_kv_heads = 2
     with torch.device("meta"):
         model = FlexAttnGQAModel(DIM, N_HEADS, n_kv_heads)

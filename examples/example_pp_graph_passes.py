@@ -269,7 +269,6 @@ def run_all_graph_pass_tests(
         tracing_input_fn,
         mesh,
         dynamic=True,
-        compile=False,
         reshard_after_forward=False,
     ) as autop:
         autop.add_parameter_memory_constraint(low=None, high=None)

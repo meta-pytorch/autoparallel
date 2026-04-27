@@ -15,6 +15,7 @@ from torch.testing._internal.distributed.fake_pg import FakeStore
 from torch.utils.checkpoint import create_selective_checkpoint_contexts
 
 from autoparallel.api import AutoParallel
+from autoparallel.compile import autoparallel_backend
 
 logging.basicConfig(level=logging.DEBUG)
 
@@ -122,7 +123,7 @@ with torch.device("meta"):
 mp_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
 # mp_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16)
 
-with AutoParallel(model, input_fn, mesh, mp_policy, compile=True) as autop:
+with AutoParallel(model, input_fn, mesh, mp_policy) as autop:
     autop.add_parameter_memory_constraint(low=None, high=None)
 
     x_sharding = (Shard(0),) + (Replicate(),) * (mesh.ndim - 1)
@@ -137,6 +138,11 @@ with AutoParallel(model, input_fn, mesh, mp_policy, compile=True) as autop:
 
 parallel_mod.to_empty(device="cuda")
 parallel_mod.init_weights()
+
+# Compile with AutoParallel-optimized Inductor passes
+parallel_mod = torch.compile(
+    parallel_mod, backend=autoparallel_backend(enable_ac=False)
+)
 
 # now let's run it
 x = (torch.rand(bs // mesh.shape[0], seq_len, dim1, device="cuda"),)
