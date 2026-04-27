@@ -1272,7 +1272,7 @@ def micro_pipeline_tp_pass(
             "name": "asynctp_pre_graph",
             "encoding": "string",
         },
-        payload_fn=lambda: graph.owning_module.print_readable(
+        payload_fn=lambda: graph.owning_module.print_readable(  # type: ignore[union-attr]
             print_output=False, include_stride=True
         ),
     )
@@ -1323,7 +1323,7 @@ def micro_pipeline_tp_pass(
             "name": "asynctp_post_graph",
             "encoding": "string",
         },
-        payload_fn=lambda: graph.owning_module.print_readable(
+        payload_fn=lambda: graph.owning_module.print_readable(  # type: ignore[union-attr]
             print_output=False, include_stride=True
         ),
     )
