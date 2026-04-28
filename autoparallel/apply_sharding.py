@@ -58,7 +58,8 @@ def _localize_shape_arg(node, shape_arg, output_spec):
     local_shape = list(global_shape)
     for mesh_size, placement in zip(output_spec.mesh.shape, output_spec.placements):
         if placement.is_shard():
-            local_shape[placement.dim] = local_shape[placement.dim] // mesh_size
+            dim = placement.dim
+            local_shape[dim] = (local_shape[dim] + mesh_size - 1) // mesh_size
     # Restore SymInt values from the interpreter (already local)
     for i, s in enumerate(shape_arg):
         if isinstance(s, torch.SymInt):
@@ -329,6 +330,23 @@ def _has_symbolic_shapes(gm):
     return False
 
 
+def _has_rank_varying_size(dim_idx, global_shape, spec):
+    """Check if different ranks can have different local sizes for a tensor dim.
+
+    Returns True when a Shard placement on dim_idx doesn't evenly divide the
+    (effective) dim size, meaning some ranks get ceil(size/mesh) elements and
+    others get fewer. Only meaningful for concrete (non-SymInt) dims — SymInt
+    dims are already marked DYNAMIC by the caller.
+    """
+    size = global_shape[dim_idx]
+    for mesh_size, placement in zip(spec.mesh.shape, spec.placements):
+        if placement.is_shard() and placement.dim == dim_idx:
+            if size % mesh_size != 0:
+                return True
+            size = size // mesh_size
+    return False
+
+
 def _make_local_args(gm, sharding_placement):
     """Create local tensors for each placeholder via DTensor redistribute.
 
@@ -368,18 +386,30 @@ def _make_local_args(gm, sharding_placement):
         ).redistribute(mesh, tgt_spec.placements)
         local = sharded.to_local()
 
-        # For dynamic shapes, re-create with fresh SymInts
+        # For dynamic shapes, re-create with fresh SymInts.
+        # A dim is DYNAMIC if it's genuinely symbolic (a free SymInt variable
+        # like the batch dim, not a guarded model constant like hidden_dim
+        # whose expr collapsed to a number), or if uneven sharding causes
+        # rank-varying local sizes.
         if isinstance(tensor, FakeTensor) and tensor.fake_mode.shape_env is not None:
             dynamic_sizes = [
-                DimDynamic.DYNAMIC if isinstance(s, torch.SymInt) else DimDynamic.STATIC
-                for s in tensor.shape
+                DimDynamic.DYNAMIC
+                if (isinstance(s, torch.SymInt) and not s.node.expr.is_number)
+                or _has_rank_varying_size(i, tensor.shape, tgt_spec)
+                else DimDynamic.STATIC
+                for i, s in enumerate(tensor.shape)
             ]
-            real = torch.empty(
-                _concretize_shape(local.shape),
-                dtype=local.dtype,
-                device="meta",
-                requires_grad=tensor.requires_grad,
-            )
+            # Use unset_fake_temporarily so torch.empty creates a real meta
+            # tensor. Inside the active fake mode, torch.empty would produce
+            # a FakeTensor that from_tensor returns from cache, ignoring
+            # symbolic_context.
+            with unset_fake_temporarily():
+                real = torch.empty(
+                    _concretize_shape(local.shape),
+                    dtype=local.dtype,
+                    device="meta",
+                    requires_grad=tensor.requires_grad,
+                )
             sym_ctx = StatelessSymbolicContext(dynamic_sizes=dynamic_sizes)
             local = tensor.fake_mode.from_tensor(real, symbolic_context=sym_ctx)
             with tensor.fake_mode:

@@ -137,9 +137,7 @@ def run_test(fake_evaluate: bool, rng_seed: Optional[int], logs_dir: str):
     numerics_logger = None
     if rng_seed is not None:
         numerics_logger = NumericsLogger(logs_dir)
-    with AutoParallel(
-        model, input_fn, mesh, dynamic=True, numerics_logger=None
-    ) as autop:
+    with AutoParallel(model, input_fn, mesh, dynamic=True) as autop:
         autop.add_parameter_memory_constraint(low=None, high=None)
 
         # x_sharding = (Shard(0), Replicate())

@@ -44,7 +44,6 @@ def test_auto_parallel_basic(device_mesh_1d):
         device_mesh_1d,
         sample_inputs=(x,),
         out_shardings=(Shard(0),),
-        compile=False,
     )
 
     # Verify model was created
@@ -96,7 +95,6 @@ def test_auto_parallel_tuple_inputs(device_mesh_1d):
         device_mesh_1d,
         sample_inputs=(x, y),
         out_shardings=(Shard(0),),
-        compile=False,
     )
 
     assert parallel_model is not None
@@ -132,7 +130,6 @@ def test_auto_parallel_multiple_outputs(device_mesh_1d):
         device_mesh_1d,
         sample_inputs=(x,),
         out_shardings=((Shard(0),), (Shard(0),)),
-        compile=False,
     )
 
     assert parallel_model is not None
@@ -163,7 +160,6 @@ def test_auto_parallel_replicated_input(device_mesh_1d):
         device_mesh_1d,
         sample_inputs=(x,),
         out_shardings=(Shard(0),),  # Shard output for valid solution
-        compile=False,
     )
 
     assert parallel_model is not None
@@ -200,7 +196,6 @@ def test_auto_parallel_callable_inputs(device_mesh_1d):
         device_mesh_1d,
         sample_inputs=sample_inputs,
         out_shardings=(Shard(0),),
-        compile=False,
     )
 
     assert parallel_model is not None
@@ -241,7 +236,6 @@ def test_auto_parallel_with_mp_policy(device_mesh_1d):
         sample_inputs=(x,),
         out_shardings=(Shard(0),),
         mp_policy=mp_policy,
-        compile=False,
     )
 
     assert parallel_model is not None

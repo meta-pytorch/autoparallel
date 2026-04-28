@@ -57,15 +57,15 @@ class TestRemoveInvalidConfigs:
 
     def test_2d_mesh_second_shard_indivisible(self, device_mesh_2d):
         # 2D mesh: (32, 8). shape=(256, 10).
-        # Shard(0) on mesh dim 0: 256/32=8, OK
-        # Shard(1) on mesh dim 1: 10/8, not divisible → removed
+        # Shard(0) on mesh dim 0: 256/32=8, OK (even)
+        # Shard(1) on mesh dim 1: 10/8, not divisible but 10>=8 → kept (uneven)
         tm = _make_tensor_meta((256, 10))
         spec = DTensorSpec(device_mesh_2d, (Shard(0), Shard(1)), tensor_meta=tm)
         strat = OpStrategy(
             [OpSpec(spec, input_specs=[spec], redistribute_cost=[[0.0]])]
         )
         result = remove_invalid_configs(strat, device_mesh_2d)
-        assert len(result.strategies) == 0
+        assert len(result.strategies) == 1
 
     def test_none_output_spec_skipped(self, device_mesh_1d):
         tm = _make_tensor_meta((256,))
@@ -88,6 +88,36 @@ class TestRemoveInvalidConfigs:
             ]
         )
         result = remove_invalid_configs(strat, device_mesh_1d)
+        assert len(result.strategies) == 1
+
+    def test_uneven_shard_kept_when_nonempty(self, device_mesh_2d):
+        # shape=10 on mesh dim 1 (size 8): 10 >= 8, uneven but valid
+        tm = _make_tensor_meta((256, 10))
+        spec = DTensorSpec(device_mesh_2d, (Shard(0), Shard(1)), tensor_meta=tm)
+        strat = OpStrategy(
+            [OpSpec(spec, input_specs=[spec], redistribute_cost=[[0.0]])]
+        )
+        result = remove_invalid_configs(strat, device_mesh_2d)
+        assert len(result.strategies) == 1
+
+    def test_uneven_shard_rejected_when_empty(self, device_mesh_1d):
+        # shape=100 on mesh dim 0 (size 256): 100 < 256, would create empty shards
+        tm = _make_tensor_meta((100, 64))
+        spec = DTensorSpec(device_mesh_1d, (Shard(0),), tensor_meta=tm)
+        strat = OpStrategy(
+            [OpSpec(spec, input_specs=[spec], redistribute_cost=[[0.0]])]
+        )
+        result = remove_invalid_configs(strat, device_mesh_1d)
+        assert len(result.strategies) == 0
+
+    def test_uneven_shard_just_above_mesh(self, device_mesh_2d):
+        # shape=257 on mesh dim 0 (size 32): 257 >= 32, valid
+        tm = _make_tensor_meta((257, 64))
+        spec = DTensorSpec(device_mesh_2d, (Shard(0), Replicate()), tensor_meta=tm)
+        strat = OpStrategy(
+            [OpSpec(spec, input_specs=[spec], redistribute_cost=[[0.0]])]
+        )
+        result = remove_invalid_configs(strat, device_mesh_2d)
         assert len(result.strategies) == 1
 
 

@@ -12,6 +12,7 @@ from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
 from autoparallel.api import AutoParallel, auto_parallel
+from autoparallel.compile import autoparallel_backend
 
 
 def test_from_meta_model(device_mesh_1d):
@@ -78,11 +79,14 @@ def test_fx_graph_annotate(device_mesh_1d):
     with torch.device("meta"):
         model = Model(dim)
 
-    with fx_traceback.preserve_node_meta(), AutoParallel(
-        model,
-        input_fn,
-        device_mesh_1d,
-    ) as autop:
+    with (
+        fx_traceback.preserve_node_meta(),
+        AutoParallel(
+            model,
+            input_fn,
+            device_mesh_1d,
+        ) as autop,
+    ):
         x_sharding = (Shard(0),)
         autop.add_input_constraints([x_sharding])
         autop.add_output_constraints([x_sharding])
@@ -169,11 +173,14 @@ def test_fx_graph_annotate_overlap_pass(device_mesh_1d):
     with torch.device("meta"):
         model = Model()
 
-    with fx_traceback.preserve_node_meta(), AutoParallel(
-        model,
-        input_fn,
-        device_mesh_1d,
-    ) as autop:
+    with (
+        fx_traceback.preserve_node_meta(),
+        AutoParallel(
+            model,
+            input_fn,
+            device_mesh_1d,
+        ) as autop,
+    ):
         autop.add_input_constraints(
             [
                 (Replicate(),),
@@ -239,7 +246,7 @@ def test_fx_graph_annotate_overlap_pass(device_mesh_1d):
 
 
 def test_inference_mode_compilation(device_mesh_1d):
-    """Test that inference mode (no gradients) works with compile=True.
+    """Test that inference mode (no gradients) works with torch.compile.
 
     This test verifies the fix for the bug where updated_flat_args was incorrectly
     formatted as a tuple for inference mode, causing compilation to fail.
@@ -268,8 +275,7 @@ def test_inference_mode_compilation(device_mesh_1d):
     for param in model.parameters():
         param.requires_grad = False
 
-    # Test with compile=True - this should succeed with the fix
-    with AutoParallel(model, input_fn, device_mesh_1d, None, compile=True) as autop:
+    with AutoParallel(model, input_fn, device_mesh_1d, None) as autop:
         autop.add_parameter_memory_constraint(low=None, high=device_mesh_1d.ndim)
 
         # R -> S(0)
@@ -279,8 +285,6 @@ def test_inference_mode_compilation(device_mesh_1d):
         sharding_placement = autop.optimize_placement()
         parallel_mod = autop.apply_placement(sharding_placement)
 
-        # Verify the model was created
-        assert parallel_mod is not None
         assert hasattr(autop, "parallel_gm")
 
         # Verify graph has expected structure (forward-only, no backward pass)
@@ -289,6 +293,10 @@ def test_inference_mode_compilation(device_mesh_1d):
         ]
         # Should only have 2 placeholders: weight and input (no tangents for inference)
         assert len(placeholders) == 2
+
+    parallel_mod = torch.compile(parallel_mod, backend=autoparallel_backend())
+
+    assert parallel_mod is not None
 
 
 def test_moduledict_preservation(device_mesh_1d):
@@ -329,7 +337,6 @@ def test_moduledict_preservation(device_mesh_1d):
         device_mesh_1d,
         sample_inputs=(x,),
         out_shardings=(Shard(0),),
-        compile=False,
     )
 
     # Verify that the parallel_mod preserves the ModuleDict structure
@@ -420,7 +427,6 @@ def test_unused_parameters_captured(device_mesh_1d):
         device_mesh_1d,
         sample_inputs=(x,),
         out_shardings=(Shard(0),),
-        compile=False,
     )
 
     param_names = {name for name, _ in parallel_mod.named_parameters()}
@@ -482,7 +488,6 @@ def test_aliased_submodule(device_mesh_1d):
         device_mesh_1d,
         sample_inputs=(x,),
         out_shardings=(Shard(0),),
-        compile=False,
     )
 
     # Module alias should be re-established on the parallel model
@@ -527,7 +532,6 @@ def test_parallel_model_isinstance(device_mesh_1d):
         device_mesh_1d,
         sample_inputs=(x,),
         out_shardings=(Shard(0),),
-        compile=False,
     )
     assert isinstance(parallel_mod, Model)
 
@@ -564,7 +568,6 @@ def test_user_method_accessible(device_mesh_1d):
         device_mesh_1d,
         sample_inputs=(x,),
         out_shardings=(Shard(0),),
-        compile=False,
     )
     assert hasattr(parallel_mod, "get_num_params")
     assert parallel_mod.get_num_params() > 0
@@ -610,7 +613,6 @@ def test_user_ema_update(device_mesh_1d):
         device_mesh_1d,
         sample_inputs=(x,),
         out_shardings=(Shard(0),),
-        compile=False,
     )
     parallel_mod.to_empty(device="cuda")
     parallel_mod.init_weights()
@@ -667,7 +669,6 @@ def test_user_reset_buffers(device_mesh_1d):
         device_mesh_1d,
         sample_inputs=(x,),
         out_shardings=(Shard(0),),
-        compile=False,
     )
     parallel_mod.to_empty(device="cuda")
     parallel_mod.init_weights()
@@ -715,7 +716,6 @@ def test_user_classmethod_and_property(device_mesh_1d):
         device_mesh_1d,
         sample_inputs=(x,),
         out_shardings=(Shard(0),),
-        compile=False,
     )
     assert parallel_mod.hidden_dim == dim * 4
     assert hasattr(type(parallel_mod), "from_config")
@@ -753,133 +753,7 @@ def test_inherited_user_model(device_mesh_1d):
         device_mesh_1d,
         sample_inputs=(x,),
         out_shardings=(Shard(0),),
-        compile=False,
     )
     assert isinstance(parallel_mod, Model)
     assert isinstance(parallel_mod, BaseModel)
     assert parallel_mod.get_num_params() > 0
-
-
-# Tests for overlap scheduling in compile=False path
-
-
-def test_overlap_scheduling_called_when_enabled(device_mesh_1d):
-    """Test that schedule_overlap_bucketing_from_inductor_configs is called
-    when compile=False and enable_overlap_scheduling=True.
-    """
-    from unittest.mock import patch
-
-    dim = 128
-
-    class Model(nn.Module):
-        def __init__(self, dim):
-            super().__init__()
-            self.linear = nn.Linear(dim, dim)
-
-        def forward(self, x):
-            return self.linear(x)
-
-    def input_fn():
-        b = 512
-        return (torch.rand(b, dim, device="cuda"),)
-
-    with torch.device("meta"):
-        model = Model(dim)
-
-    overlap_bucketing_called = []
-
-    with patch(
-        "torch._inductor.fx_passes.overlap_scheduling.schedule_overlap_bucketing_from_inductor_configs",
-        side_effect=lambda fx_g: overlap_bucketing_called.append(fx_g) or fx_g,
-    ), torch._inductor.config.patch(
-        {"aten_distributed_optimizations.enable_overlap_scheduling": True}
-    ):
-        with AutoParallel(
-            model,
-            input_fn,
-            device_mesh_1d,
-            compile=False,
-        ) as autop:
-            autop.add_input_constraints([(Shard(0),)])
-            sharding_placement = autop.optimize_placement()
-            _ = autop.apply_placement(sharding_placement)
-
-    assert (
-        len(overlap_bucketing_called) > 0
-    ), "schedule_overlap_bucketing_from_inductor_configs should be called"
-
-    for fx_g in overlap_bucketing_called:
-        assert isinstance(fx_g, torch.fx.GraphModule)
-
-
-def test_overlap_scheduling_not_called_when_disabled(device_mesh_1d):
-    """Test that overlap scheduling is skipped when enable_overlap_scheduling=False (default)."""
-    from unittest.mock import patch
-
-    dim = 128
-
-    class Model(nn.Module):
-        def __init__(self, dim):
-            super().__init__()
-            self.linear = nn.Linear(dim, dim)
-
-        def forward(self, x):
-            return self.linear(x)
-
-    def input_fn():
-        b = 512
-        return (torch.rand(b, dim, device="cuda"),)
-
-    with torch.device("meta"):
-        model = Model(dim)
-
-    overlap_bucketing_called = []
-
-    with patch(
-        "torch._inductor.fx_passes.overlap_scheduling.schedule_overlap_bucketing_from_inductor_configs",
-        side_effect=lambda fx_g: overlap_bucketing_called.append(fx_g) or fx_g,
-    ):
-        with AutoParallel(
-            model,
-            input_fn,
-            device_mesh_1d,
-            compile=False,
-        ) as autop:
-            autop.add_input_constraints([(Shard(0),)])
-            sharding_placement = autop.optimize_placement()
-            _ = autop.apply_placement(sharding_placement)
-
-    assert (
-        len(overlap_bucketing_called) == 0
-    ), "schedule_overlap_bucketing_from_inductor_configs should NOT be called by default"
-
-
-def test_compile_true_uses_compile_fx_inner(device_mesh_1d):
-    """When compile=True, the compiler_fn should be compile_fx_inner."""
-    dim = 128
-
-    class Model(nn.Module):
-        def __init__(self, dim):
-            super().__init__()
-            self.linear = nn.Linear(dim, dim)
-
-        def forward(self, x):
-            return self.linear(x)
-
-    def input_fn():
-        b = 512
-        return (torch.rand(b, dim, device="cuda"),)
-
-    with torch.device("meta"):
-        model = Model(dim)
-
-    from torch._inductor.compile_fx import compile_fx_inner
-
-    autop = AutoParallel(
-        model,
-        input_fn,
-        device_mesh_1d,
-        compile=True,
-    )
-
-    assert autop.compiler_fn is compile_fx_inner

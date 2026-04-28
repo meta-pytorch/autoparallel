@@ -508,7 +508,8 @@ def _post_fwd_common(
 
     stage.fwd_cache[mb_index] = (output_tuple, saved_intermediates)  # type: ignore[assignment]
 
-    stage._validate_fwd_outputs(output_tuple)
+    if hasattr(stage, "_validate_fwd_outputs"):
+        stage._validate_fwd_outputs(output_tuple)
 
     schedule._maybe_compute_loss(stage, output, ctx.target_mbs, mb_index)
 
