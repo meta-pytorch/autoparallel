@@ -78,6 +78,11 @@ def _extract_shape_dtype(node: torch.fx.Node) -> tuple[list | None, str | None]:
     """Extract shape and dtype from the node's fake tensor value."""
     val = node.meta.get("val")
     if val is None:
+        # Fall back to tensor_meta (available on loaded optimizers where
+        # val was stripped during save)
+        tm = node.meta.get("tensor_meta")
+        if tm is not None:
+            return list(tm.shape), str(tm.dtype).removeprefix("torch.")
         return None, None
     if isinstance(val, torch.Tensor):
         return list(val.shape), str(val.dtype).removeprefix("torch.")

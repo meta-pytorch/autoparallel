@@ -89,6 +89,69 @@ def _node_total_cost(n):
     return _node_total_comm(n) + n.get("compute_cost", 0)
 
 
+def _placement_tooltip(placement, shape, dtype, mesh):
+    """Build a human-readable tooltip for a placement chip."""
+    if not placement or not mesh:
+        return ""
+    dim_names = mesh.get("dim_names") or [f"dim{i}" for i in range(len(mesh["shape"]))]
+    mesh_shape = mesh["shape"]
+
+    # Parse placement parts
+    parts = []
+    i = 0
+    p = placement.strip()
+    while i < len(p):
+        if p[i] == "S" and i + 1 < len(p) and p[i + 1] == "(":
+            end = p.index(")", i)
+            parts.append(p[i : end + 1])
+            i = end + 1
+        elif p[i] == "R":
+            parts.append("R")
+            i += 1
+        elif p[i] == "P" and i + 1 < len(p) and p[i + 1] == "(":
+            end = p.index(")", i)
+            parts.append(p[i : end + 1])
+            i = end + 1
+        else:
+            i += 1
+
+    if not parts or not shape:
+        return placement
+
+    lines = []
+    local_shape = list(shape)
+    for mesh_dim, (part, dname, msize) in enumerate(
+        zip(parts, dim_names, mesh_shape)
+    ):
+        if part == "R":
+            lines.append(f"{dname}: Replicate ({msize} copies)")
+        elif part.startswith("S("):
+            shard_dim = int(part[2:-1])
+            lines.append(f"{dname}: Shard dim {shard_dim} ({msize} ways)")
+            if shard_dim < len(local_shape):
+                local_shape[shard_dim] = local_shape[shard_dim] // msize
+        elif part.startswith("P("):
+            lines.append(f"{dname}: Partial ({msize}-way reduction pending)")
+
+    shape_str = "\u00d7".join(str(s) for s in shape)
+    local_str = "\u00d7".join(str(s) for s in local_shape)
+    lines.insert(0, f"Global: {dtype}[{shape_str}]")
+    lines.append(f"Local: {dtype}[{local_str}]")
+    return "\n".join(lines)
+
+
+def _placement_chip_html(placement, bg, color, shape, dtype, mesh):
+    """Build a placement chip span with an optional tooltip child."""
+    tooltip = _placement_tooltip(placement, shape, dtype, mesh)
+    tooltip_span = ""
+    if tooltip:
+        tooltip_span = f'<span class="chip-tooltip">{_esc(tooltip)}</span>'
+    return (
+        f'<span class="placement-chip" style="background:{bg};color:{color}">'
+        f'{_esc(placement)}{tooltip_span}</span>'
+    )
+
+
 def _esc(s):
     return (
         str(s)
@@ -211,7 +274,7 @@ def _tree_node_stats(tree_node):
     }
 
 
-def _render_tree_block(tree_node, cluster_counts, depth=0):
+def _render_tree_block(tree_node, cluster_counts, mesh, depth=0):
     """Recursively render a module tree node as nested HTML blocks."""
     stats = _tree_node_stats(tree_node)
     if stats["num_nodes"] == 0:
@@ -245,12 +308,14 @@ def _render_tree_block(tree_node, cluster_counts, depth=0):
             else '<span class="phase-badge phase-fwd">fwd</span>'
         )
 
+        chip = _placement_chip_html(placement, n["_bg"], n["_color"], n.get("shape"), dtype, mesh)
+
         detail_rows += (
             f'<tr class="{row_class}" data-phase="{phase}">'
             f'<td style="font-family:monospace">{_esc(n["name"])}{cluster_html}</td>'
             f'<td>{phase_badge}</td>'
             f'<td>{_esc(dtype)}[{shape_str}]</td>'
-            f'<td><span class="placement-chip" style="background:{n["_bg"]};color:{n["_color"]}">{_esc(placement)}</span></td>'
+            f'<td>{chip}</td>'
             f'<td class="{cost_class}" style="font-family:monospace">{comm:.1f}</td>'
             f'<td style="font-family:monospace">{compute:.1f}</td>'
             f'</tr>'
@@ -292,14 +357,9 @@ def _render_tree_block(tree_node, cluster_counts, depth=0):
     if has_children:
         if has_detail:
             html += '<div style="margin-top:10px"></div>'
-        # Render children sorted by cost (descending)
-        sorted_children = sorted(
-            tree_node.children.values(),
-            key=lambda c: sum(n["_total_comm"] + n.get("compute_cost", 0) for n in c.all_nodes()),
-            reverse=True,
-        )
-        for child in sorted_children:
-            html += _render_tree_block(child, cluster_counts, depth + 1)
+        # Render children in execution order (dict preserves insertion order)
+        for child in tree_node.children.values():
+            html += _render_tree_block(child, cluster_counts, mesh, depth + 1)
 
     html += '</div></div>'
     return html
@@ -397,6 +457,28 @@ def generate_visualization_html(data: dict) -> str:
     if dim_names:
         mesh_desc += f" ({', '.join(dim_names)})"
 
+    # Per-layer cost breakdown (for repeated architectures)
+    import re as _re
+
+    layer_costs = {}  # layer_idx -> {"comm": float, "compute": float, "num_nodes": int}
+    non_layer_cost = {"comm": 0.0, "compute": 0.0, "num_nodes": 0, "name": "non-layer"}
+    for n in display_nodes:
+        mp = n.get("module_path", "")
+        m = _re.search(r"layers\.(\d+)", mp)
+        comm = n["_total_comm"]
+        compute = n.get("compute_cost", 0)
+        if m:
+            idx = int(m.group(1))
+            if idx not in layer_costs:
+                layer_costs[idx] = {"comm": 0.0, "compute": 0.0, "num_nodes": 0}
+            layer_costs[idx]["comm"] += comm
+            layer_costs[idx]["compute"] += compute
+            layer_costs[idx]["num_nodes"] += 1
+        else:
+            non_layer_cost["comm"] += comm
+            non_layer_cost["compute"] += compute
+            non_layer_cost["num_nodes"] += 1
+
     total_cost = summary["total"] or 1
     comm_pct = summary["comm"] / total_cost * 100
     compute_pct = summary["compute"] / total_cost * 100
@@ -406,69 +488,72 @@ def generate_visualization_html(data: dict) -> str:
     html = f'''<!DOCTYPE html>
 <html><head><meta charset="UTF-8">
 <style>
-* {{ margin: 0; padding: 0; box-sizing: border-box; }}
-body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f8fafc; color: #1e293b; }}
-.container {{ max-width: 1200px; margin: 0 auto; padding: 20px; }}
-h1 {{ font-size: 24px; font-weight: 700; margin-bottom: 4px; }}
-.subtitle {{ color: #64748b; font-size: 14px; margin-bottom: 20px; }}
-.stats-row {{ display: flex; gap: 12px; margin-bottom: 20px; flex-wrap: wrap; }}
-.stat-card {{ background: white; border: 1px solid #e2e8f0; border-radius: 8px; padding: 14px 18px; flex: 1; min-width: 140px; }}
-.stat-label {{ font-size: 11px; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.5px; }}
-.stat-value {{ font-size: 22px; font-weight: 700; margin-top: 2px; }}
-.stat-detail {{ font-size: 12px; color: #64748b; margin-top: 2px; }}
-.controls {{ display: flex; gap: 12px; margin-bottom: 16px; flex-wrap: wrap; align-items: center; }}
-.control-group {{ display: flex; gap: 4px; align-items: center; }}
-.control-label {{ font-size: 11px; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.5px; margin-right: 4px; }}
-.tabs {{ display: flex; gap: 0; border-bottom: 2px solid #e2e8f0; margin-bottom: 20px; }}
-.tab {{ padding: 10px 20px; cursor: pointer; font-size: 14px; font-weight: 500; color: #64748b; border-bottom: 2px solid transparent; margin-bottom: -2px; transition: all 0.2s; }}
-.tab:hover {{ color: #3b82f6; }}
-.tab.active {{ color: #3b82f6; border-bottom-color: #3b82f6; }}
-.tab-content {{ display: none; }}
-.tab-content.active {{ display: block; }}
-.card {{ background: white; border: 1px solid #e2e8f0; border-radius: 8px; padding: 18px; margin-bottom: 16px; }}
-.card-title {{ font-size: 14px; font-weight: 600; margin-bottom: 12px; }}
-.func-block {{ border-radius: 8px; padding: 14px; margin-bottom: 10px; border-left: 4px solid; cursor: pointer; transition: box-shadow 0.2s; }}
-.func-block:hover {{ box-shadow: 0 2px 8px rgba(0,0,0,0.08); }}
-.func-name {{ font-weight: 600; font-size: 14px; }}
-.func-meta {{ font-size: 12px; color: #64748b; margin-top: 4px; }}
-.collective-badge {{ display: inline-block; background: #FEE2E2; color: #DC2626; font-size: 11px; padding: 2px 8px; border-radius: 10px; margin: 2px 2px; font-weight: 500; }}
-.strategy-badge {{ display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 500; color: white; }}
-.cluster-badge {{ display: inline-block; padding: 1px 6px; border-radius: 8px; font-size: 10px; font-weight: 600; color: #6B7280; background: #F1F5F9; margin-left: 4px; }}
-.func-details {{ display: none; margin-top: 10px; padding-top: 10px; border-top: 1px solid rgba(0,0,0,0.1); font-size: 12px; }}
-.func-block.expanded > .func-details {{ display: block; }}
-.cost-bar-container {{ margin-bottom: 10px; }}
-.cost-bar-label {{ font-size: 12px; margin-bottom: 3px; display: flex; justify-content: space-between; }}
-.cost-bar {{ height: 24px; border-radius: 4px; display: flex; overflow: hidden; background: #f1f5f9; }}
-.cost-bar-segment {{ height: 100%; display: flex; align-items: center; justify-content: center; font-size: 10px; color: white; font-weight: 500; min-width: 2px; }}
-table {{ width: 100%; border-collapse: collapse; font-size: 12px; }}
-th {{ text-align: left; padding: 8px 10px; background: #f8fafc; border-bottom: 2px solid #e2e8f0; font-weight: 600; color: #64748b; text-transform: uppercase; font-size: 11px; letter-spacing: 0.3px; position: sticky; top: 0; }}
-td {{ padding: 7px 10px; border-bottom: 1px solid #f1f5f9; }}
-tr:hover td {{ background: #f8fafc; }}
-.placement-chip {{ display: inline-block; padding: 2px 8px; border-radius: 4px; font-family: monospace; font-size: 11px; font-weight: 500; }}
-.cost-high {{ color: #DC2626; font-weight: 600; }}
-.cost-med {{ color: #F59E0B; }}
-.cost-low {{ color: #64748b; }}
-.filter-bar {{ display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; align-items: center; }}
-.filter-btn {{ padding: 4px 12px; border-radius: 16px; border: 1px solid #e2e8f0; background: white; cursor: pointer; font-size: 12px; transition: all 0.15s; }}
-.filter-btn:hover {{ border-color: #3b82f6; }}
-.filter-btn.active {{ background: #3b82f6; color: white; border-color: #3b82f6; }}
-.search-box {{ padding: 5px 12px; border-radius: 16px; border: 1px solid #e2e8f0; font-size: 12px; width: 220px; outline: none; transition: border-color 0.15s; }}
-.search-box:focus {{ border-color: #3b82f6; }}
-.table-scroll {{ max-height: 600px; overflow-y: auto; }}
-th.sortable {{ cursor: pointer; user-select: none; }}
-th.sortable:hover {{ color: #3b82f6; }}
-th.sort-asc::after {{ content: " \\25B2"; font-size: 9px; }}
-th.sort-desc::after {{ content: " \\25BC"; font-size: 9px; }}
-.legend {{ display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 16px; }}
-.legend-item {{ display: flex; align-items: center; gap: 6px; font-size: 12px; }}
-.legend-dot {{ width: 12px; height: 12px; border-radius: 3px; }}
-tr.linked-row {{ opacity: 0.45; }}
-tr.linked-row td {{ font-style: italic; }}
-tr.arch-bwd {{ opacity: 0.6; }}
-.phase-badge {{ display: inline-block; padding: 1px 6px; border-radius: 8px; font-size: 10px; font-weight: 600; }}
-.phase-fwd {{ color: #10B981; background: #ECFDF5; }}
-.phase-bwd {{ color: #6B7280; background: #F1F5F9; }}
+.ap-viz {{ margin: 0; padding: 0; box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f8fafc; color: #1e293b; }}
+.ap-viz *, .ap-viz *::before, .ap-viz *::after {{ box-sizing: border-box; }}
+.ap-viz .container {{ max-width: 1200px; margin: 0 auto; padding: 20px; }}
+.ap-viz h1 {{ font-size: 24px; font-weight: 700; margin: 0 0 4px 0; color: #1e293b; }}
+.ap-viz .subtitle {{ color: #64748b; font-size: 14px; margin-bottom: 20px; }}
+.ap-viz .stats-row {{ display: flex; gap: 12px; margin-bottom: 20px; flex-wrap: wrap; }}
+.ap-viz .stat-card {{ background: white; border: 1px solid #e2e8f0; border-radius: 8px; padding: 14px 18px; flex: 1; min-width: 140px; color: #1e293b; }}
+.ap-viz .stat-label {{ font-size: 11px; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.5px; }}
+.ap-viz .stat-value {{ font-size: 22px; font-weight: 700; margin-top: 2px; }}
+.ap-viz .stat-detail {{ font-size: 12px; color: #64748b; margin-top: 2px; }}
+.ap-viz .controls {{ display: flex; gap: 12px; margin-bottom: 16px; flex-wrap: wrap; align-items: center; }}
+.ap-viz .control-group {{ display: flex; gap: 4px; align-items: center; }}
+.ap-viz .control-label {{ font-size: 11px; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.5px; margin-right: 4px; }}
+.ap-viz .tabs {{ display: flex; gap: 0; border-bottom: 2px solid #e2e8f0; margin-bottom: 20px; }}
+.ap-viz .tab {{ padding: 10px 20px; cursor: pointer; font-size: 14px; font-weight: 500; color: #64748b; border-bottom: 2px solid transparent; margin-bottom: -2px; transition: all 0.2s; background: transparent; }}
+.ap-viz .tab:hover {{ color: #3b82f6; }}
+.ap-viz .tab.active {{ color: #3b82f6; border-bottom-color: #3b82f6; }}
+.ap-viz .tab-content {{ display: none; }}
+.ap-viz .tab-content.active {{ display: block; }}
+.ap-viz .card {{ background: white; border: 1px solid #e2e8f0; border-radius: 8px; padding: 18px; margin-bottom: 16px; color: #1e293b; }}
+.ap-viz .card-title {{ font-size: 14px; font-weight: 600; margin-bottom: 12px; color: #1e293b; }}
+.ap-viz .func-block {{ border-radius: 8px; padding: 14px; margin-bottom: 10px; border-left: 4px solid; cursor: pointer; transition: box-shadow 0.2s; }}
+.ap-viz .func-block:hover {{ box-shadow: 0 2px 8px rgba(0,0,0,0.08); }}
+.ap-viz .func-name {{ font-weight: 600; font-size: 14px; color: #1e293b; }}
+.ap-viz .func-meta {{ font-size: 12px; color: #64748b; margin-top: 4px; }}
+.ap-viz .collective-badge {{ display: inline-block; background: #FEE2E2; color: #DC2626; font-size: 11px; padding: 2px 8px; border-radius: 10px; margin: 2px 2px; font-weight: 500; }}
+.ap-viz .strategy-badge {{ display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 500; color: white; }}
+.ap-viz .cluster-badge {{ display: inline-block; padding: 1px 6px; border-radius: 8px; font-size: 10px; font-weight: 600; color: #6B7280; background: #F1F5F9; margin-left: 4px; }}
+.ap-viz .func-details {{ display: none; margin-top: 10px; padding-top: 10px; border-top: 1px solid rgba(0,0,0,0.1); font-size: 12px; }}
+.ap-viz .func-block.expanded > .func-details {{ display: block; }}
+.ap-viz .cost-bar-container {{ margin-bottom: 10px; }}
+.ap-viz .cost-bar-label {{ font-size: 12px; margin-bottom: 3px; display: flex; justify-content: space-between; color: #1e293b; }}
+.ap-viz .cost-bar {{ height: 24px; border-radius: 4px; display: flex; overflow: hidden; background: #f1f5f9; }}
+.ap-viz .cost-bar-segment {{ height: 100%; display: flex; align-items: center; justify-content: center; font-size: 10px; color: white; font-weight: 500; min-width: 2px; }}
+.ap-viz table {{ width: 100%; border-collapse: collapse; font-size: 12px; color: #1e293b; }}
+.ap-viz th {{ text-align: left; padding: 8px 10px; background: #f8fafc; border-bottom: 2px solid #e2e8f0; font-weight: 600; color: #64748b; text-transform: uppercase; font-size: 11px; letter-spacing: 0.3px; position: sticky; top: 0; }}
+.ap-viz td {{ padding: 7px 10px; border-bottom: 1px solid #f1f5f9; background: white; }}
+.ap-viz tr:hover td {{ background: #f8fafc; }}
+.ap-viz .placement-chip {{ display: inline-block; padding: 2px 8px; border-radius: 4px; font-family: monospace; font-size: 11px; font-weight: 500; position: relative; cursor: default; }}
+.ap-viz .placement-chip .chip-tooltip {{ display: none; position: absolute; left: 0; top: 100%; margin-top: 4px; background: #1e293b; color: white; padding: 6px 10px; border-radius: 6px; font-size: 11px; font-family: monospace; white-space: pre; z-index: 1000; pointer-events: none; box-shadow: 0 2px 8px rgba(0,0,0,0.2); }}
+.ap-viz .placement-chip:hover .chip-tooltip {{ display: block; }}
+.ap-viz .cost-high {{ color: #DC2626; font-weight: 600; }}
+.ap-viz .cost-med {{ color: #F59E0B; }}
+.ap-viz .cost-low {{ color: #64748b; }}
+.ap-viz .filter-bar {{ display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; align-items: center; }}
+.ap-viz .filter-btn {{ padding: 4px 12px; border-radius: 16px; border: 1px solid #e2e8f0; background: white; color: #1e293b; cursor: pointer; font-size: 12px; transition: all 0.15s; }}
+.ap-viz .filter-btn:hover {{ border-color: #3b82f6; }}
+.ap-viz .filter-btn.active {{ background: #3b82f6; color: white; border-color: #3b82f6; }}
+.ap-viz .search-box {{ padding: 5px 12px; border-radius: 16px; border: 1px solid #e2e8f0; background: white; color: #1e293b; font-size: 12px; width: 220px; outline: none; transition: border-color 0.15s; }}
+.ap-viz .search-box:focus {{ border-color: #3b82f6; }}
+.ap-viz .table-scroll {{ max-height: 600px; overflow-y: auto; }}
+.ap-viz th.sortable {{ cursor: pointer; user-select: none; }}
+.ap-viz th.sortable:hover {{ color: #3b82f6; }}
+.ap-viz th.sort-asc::after {{ content: " \\25B2"; font-size: 9px; }}
+.ap-viz th.sort-desc::after {{ content: " \\25BC"; font-size: 9px; }}
+.ap-viz .legend {{ display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 16px; }}
+.ap-viz .legend-item {{ display: flex; align-items: center; gap: 6px; font-size: 12px; color: #1e293b; }}
+.ap-viz .legend-dot {{ width: 12px; height: 12px; border-radius: 3px; }}
+.ap-viz tr.linked-row {{ opacity: 0.45; display: none; }}
+.ap-viz tr.linked-row td {{ font-style: italic; }}
+.ap-viz tr.arch-bwd {{ opacity: 0.6; }}
+.ap-viz .phase-badge {{ display: inline-block; padding: 1px 6px; border-radius: 8px; font-size: 10px; font-weight: 600; }}
+.ap-viz .phase-fwd {{ color: #10B981; background: #ECFDF5; }}
+.ap-viz .phase-bwd {{ color: #6B7280; background: #F1F5F9; }}
 </style></head><body>
+<div class="ap-viz">
 <div class="container">
 <h1>AutoParallel Strategy Visualizer</h1>
 <div class="subtitle">Mesh: {_esc(mesh_desc)} &middot; {len(compute_nodes)} nodes &middot; {len(redist_nodes)} redistributions'''
@@ -544,23 +629,19 @@ tr.arch-bwd {{ opacity: 0.6; }}
 
     # ===== ARCHITECTURE TAB =====
     html += '''
-<div id="tab-arch" class="tab-content active">
+<div data-tab="arch" class="tab-content active">
 <div class="card"><div class="card-title">Computation Blocks by Module</div>'''
 
-    # Render top-level tree children sorted by cost
-    sorted_top = sorted(
-        module_tree.children.values(),
-        key=lambda c: sum(n["_total_comm"] + n.get("compute_cost", 0) for n in c.all_nodes()),
-        reverse=True,
-    )
-    for child in sorted_top:
-        html += _render_tree_block(child, cluster_counts, depth=0)
+    # Render top-level tree children in execution order (dict preserves
+    # insertion order from graph traversal)
+    for child in module_tree.children.values():
+        html += _render_tree_block(child, cluster_counts, mesh, depth=0)
 
     html += '</div></div>'
 
     # ===== COST BREAKDOWN TAB =====
     html += f'''
-<div id="tab-cost" class="tab-content">
+<div data-tab="cost" class="tab-content">
 <div class="card"><div class="card-title">Cost Distribution</div>
 <div class="cost-bar-container">
   <div class="cost-bar-label"><span>Overall Breakdown</span></div>
@@ -569,8 +650,46 @@ tr.arch-bwd {{ opacity: 0.6; }}
     <div class="cost-bar-segment" style="width:{compute_pct}%;background:#10B981">Compute {compute_pct:.0f}%</div>
     <div class="cost-bar-segment" style="width:{trans_pct}%;background:#F59E0B">{trans_pct:.0f}%</div>
   </div>
-</div></div>
+</div></div>'''
 
+    # Per-layer cost breakdown (only if layers exist)
+    if layer_costs:
+        all_layer_entries = [(f"Layer {idx}", lc) for idx, lc in sorted(layer_costs.items())]
+        if non_layer_cost["num_nodes"] > 0:
+            all_layer_entries.append(("Non-layer ops", non_layer_cost))
+        layer_max = max((lc["comm"] + lc["compute"]) for _, lc in all_layer_entries) or 1
+
+        # Check if all layers have the same cost (clustered)
+        layer_vals = list(layer_costs.values())
+        all_same = len(layer_vals) > 1 and all(
+            abs(lc["comm"] - layer_vals[0]["comm"]) < 0.01
+            and abs(lc["compute"] - layer_vals[0]["compute"]) < 0.01
+            for lc in layer_vals[1:]
+        )
+        layer_note = ""
+        if all_same and has_clusters:
+            per_layer_total = layer_vals[0]["comm"] + layer_vals[0]["compute"]
+            layer_note = f'<p style="font-size:12px;color:#64748b;margin-bottom:10px">All {len(layer_vals)} layers have identical costs ({per_layer_total:.0f} per layer = {per_layer_total * len(layer_vals):.0f} total)</p>'
+
+        html += f'''
+<div class="card"><div class="card-title">Cost by Layer</div>
+{layer_note}'''
+        for name, lc in all_layer_entries:
+            total = lc["comm"] + lc["compute"]
+            if total == 0:
+                continue
+            comm_w = lc["comm"] / layer_max * 100
+            comp_w = lc["compute"] / layer_max * 100
+            html += f'''<div class="cost-bar-container">
+  <div class="cost-bar-label"><span style="font-weight:600">{_esc(name)}</span><span style="color:#64748b">{lc["num_nodes"]} ops &middot; comm: {lc["comm"]:.0f} &middot; compute: {lc["compute"]:.0f}</span></div>
+  <div class="cost-bar">
+    <div class="cost-bar-segment" style="width:{comm_w}%;background:#DC2626"></div>
+    <div class="cost-bar-segment" style="width:{comp_w}%;background:#10B981"></div>
+  </div>
+</div>'''
+        html += '</div>'
+
+    html += '''
 <div class="card"><div class="card-title">Top Costly Operations</div>'''
 
     if top_costly:
@@ -610,11 +729,11 @@ tr.arch-bwd {{ opacity: 0.6; }}
 
     # ===== ALL NODES TAB =====
     html += '''
-<div id="tab-detail" class="tab-content">
+<div data-tab="detail" class="tab-content">
 <div class="card">
 <div class="card-title">All Nodes</div>
 <div class="filter-bar">
-  <input type="text" class="search-box" placeholder="Search nodes..." oninput="searchNodes(this.value)">
+  <input type="text" class="search-box" placeholder="Search nodes..." oninput="searchNodes(this)">
   <button class="filter-btn active" onclick="filterNodes('all', this)">All</button>
   <button class="filter-btn" onclick="filterNodes('placeholder', this)">Params</button>
   <button class="filter-btn" onclick="filterNodes('forward', this)">Forward</button>
@@ -622,7 +741,7 @@ tr.arch-bwd {{ opacity: 0.6; }}
   <button class="filter-btn" onclick="filterNodes('redist', this)">Has Redistribution</button>
 </div>
 <div class="table-scroll">
-<table id="node-table"><thead>
+<table data-role="node-table"><thead>
 <tr><th class="sortable" onclick="sortTable(0, 'str', this)">Name</th><th class="sortable" onclick="sortTable(1, 'str', this)">Op</th><th class="sortable" onclick="sortTable(2, 'str', this)">Phase</th><th>Shape</th><th class="sortable" onclick="sortTable(4, 'str', this)">Placement</th><th class="sortable" onclick="sortTable(5, 'num', this)">Comm</th><th class="sortable" onclick="sortTable(6, 'num', this)">Compute</th><th>Redistribution</th><th class="sortable" onclick="sortTable(8, 'str', this)">Module</th></tr>
 </thead><tbody>'''
 
@@ -658,12 +777,14 @@ tr.arch-bwd {{ opacity: 0.6; }}
             f'data-linked="{1 if is_linked else 0}"'
         )
 
+        chip = _placement_chip_html(placement, n['_bg'], n['_color'], n.get("shape"), dtype, mesh)
+
         html += f'''<tr class="{row_class}" {data_attrs}>
   <td style="font-family:monospace;font-size:11px">{_esc(n["name"])}{cluster_html}</td>
   <td style="font-size:11px">{_esc(op_name)}</td>
   <td style="font-size:11px">{phase}</td>
   <td style="font-size:11px">{_esc(dtype)}[{shape_str}]</td>
-  <td><span class="placement-chip" style="background:{n['_bg']};color:{n['_color']}">{_esc(placement)}</span></td>
+  <td>{chip}</td>
   <td class="{cost_class}" style="font-family:monospace">{comm:.1f}</td>
   <td style="font-family:monospace">{compute:.1f}</td>
   <td>{coll_html}</td>
@@ -673,20 +794,24 @@ tr.arch-bwd {{ opacity: 0.6; }}
     html += '''</tbody></table></div></div></div>
 
 <script>
+function _root(el) { return el.closest('.ap-viz'); }
+
 function switchTab(id, btn) {
-  document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
-  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-  document.getElementById('tab-' + id).classList.add('active');
+  var r = _root(btn);
+  r.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+  r.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  r.querySelector('.tab-content[data-tab="' + id + '"]').classList.add('active');
   btn.classList.add('active');
 }
 
 var clustersCollapsed = true;
 
 function toggleClusters(btn) {
+  var r = _root(btn);
   clustersCollapsed = !clustersCollapsed;
   btn.textContent = clustersCollapsed ? 'Single Layer' : 'All Layers';
   btn.classList.toggle('active', clustersCollapsed);
-  document.querySelectorAll('.node-row').forEach(row => {
+  r.querySelectorAll('.node-row').forEach(row => {
     if (row.dataset.linked === '1') {
       row.style.display = clustersCollapsed ? 'none' : '';
     }
@@ -694,19 +819,19 @@ function toggleClusters(btn) {
 }
 
 function filterPhase(phase, btn) {
-  document.querySelectorAll('.control-group:first-child .filter-btn').forEach(b => b.classList.remove('active'));
+  var r = _root(btn);
+  r.querySelectorAll('.control-group:first-child .filter-btn').forEach(b => b.classList.remove('active'));
   btn.classList.add('active');
-  document.querySelectorAll('.node-row').forEach(row => {
+  r.querySelectorAll('.node-row').forEach(row => {
     if (phase === 'all') { row.style.display = (clustersCollapsed && row.dataset.linked === '1') ? 'none' : ''; return; }
     var match = row.dataset.phase === phase;
     row.style.display = (!match || (clustersCollapsed && row.dataset.linked === '1')) ? 'none' : '';
   });
-  // Filter architecture rows and hide blocks with no matching phase
-  document.querySelectorAll('.arch-row').forEach(row => {
+  r.querySelectorAll('.arch-row').forEach(row => {
     if (phase === 'all') { row.style.display = ''; return; }
     row.style.display = row.dataset.phase === phase ? '' : 'none';
   });
-  document.querySelectorAll('.func-block').forEach(block => {
+  r.querySelectorAll('.func-block').forEach(block => {
     if (phase === 'all') { block.style.display = ''; return; }
     var phases = block.dataset.phases || '';
     block.style.display = phases.indexOf(phase) >= 0 ? '' : 'none';
@@ -715,13 +840,13 @@ function filterPhase(phase, btn) {
 
 var currentSearch = '';
 
-function searchNodes(query) {
-  currentSearch = query.toLowerCase();
-  applyNodeFilters();
+function searchNodes(el) {
+  currentSearch = el.value.toLowerCase();
+  _applyNodeFilters(_root(el));
 }
 
-function applyNodeFilters() {
-  document.querySelectorAll('.node-row').forEach(row => {
+function _applyNodeFilters(r) {
+  r.querySelectorAll('.node-row').forEach(row => {
     if (clustersCollapsed && row.dataset.linked === '1') { row.style.display = 'none'; return; }
     var text = row.textContent.toLowerCase();
     row.style.display = (currentSearch === '' || text.indexOf(currentSearch) >= 0) ? '' : 'none';
@@ -729,9 +854,10 @@ function applyNodeFilters() {
 }
 
 function filterNodes(type, btn) {
-  document.querySelectorAll('#tab-detail .filter-btn').forEach(b => b.classList.remove('active'));
+  var r = _root(btn);
+  r.querySelectorAll('.filter-bar .filter-btn').forEach(b => b.classList.remove('active'));
   btn.classList.add('active');
-  document.querySelectorAll('.node-row').forEach(row => {
+  r.querySelectorAll('.node-row').forEach(row => {
     var show = true;
     if (type === 'placeholder') show = row.dataset.op === 'placeholder';
     else if (type === 'forward') show = row.dataset.phase === 'forward';
@@ -748,11 +874,10 @@ function filterNodes(type, btn) {
 var sortState = {col: -1, dir: 'asc'};
 
 function sortTable(colIdx, type, th) {
-  var table = document.getElementById('node-table');
+  var table = _root(th).querySelector('table[data-role="node-table"]');
   var tbody = table.tBodies[0];
   var rows = Array.from(tbody.querySelectorAll('tr.node-row'));
 
-  // Toggle direction if same column
   if (sortState.col === colIdx) {
     sortState.dir = sortState.dir === 'asc' ? 'desc' : 'asc';
   } else {
@@ -760,7 +885,6 @@ function sortTable(colIdx, type, th) {
     sortState.dir = 'asc';
   }
 
-  // Update header classes
   table.querySelectorAll('th').forEach(h => h.classList.remove('sort-asc', 'sort-desc'));
   th.classList.add('sort-' + sortState.dir);
 
@@ -776,14 +900,7 @@ function sortTable(colIdx, type, th) {
 
   rows.forEach(function(row) { tbody.appendChild(row); });
 }
-
-// Initial state: hide linked rows if clusters exist
-if (clustersCollapsed) {
-  document.querySelectorAll('.node-row[data-linked="1"]').forEach(row => {
-    row.style.display = 'none';
-  });
-}
 </script>
-</div></body></html>'''
+</div></div></body></html>'''
 
     return html
