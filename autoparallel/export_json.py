@@ -39,6 +39,10 @@ def _extract_source_info(node: torch.fx.Node) -> dict | None:
 
 def _extract_module_path(node: torch.fx.Node) -> str | None:
     """Extract the deepest nn.Module path from node metadata."""
+    # Check for pre-computed string (set by save() for serialized graphs)
+    mp = node.meta.get("module_path")
+    if mp is not None:
+        return mp
     stack = node.meta.get("nn_module_stack") or node.meta.get("fwd_nn_module_stack")
     if not stack:
         return None
@@ -50,6 +54,10 @@ def _extract_module_path(node: torch.fx.Node) -> str | None:
 
 def _get_phase(node: torch.fx.Node) -> str:
     """Determine whether a node belongs to the forward or backward pass."""
+    # Check for pre-computed phase (set by save() for serialized graphs)
+    phase = node.meta.get("phase")
+    if phase is not None:
+        return phase
     if node.op == "placeholder":
         return "backward" if node.name.startswith("tangents") else "forward"
     if "nn_module_stack" in node.meta:

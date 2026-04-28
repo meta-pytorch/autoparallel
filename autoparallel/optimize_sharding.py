@@ -69,6 +69,7 @@ The solver finds the globally optimal sharding strategy that minimizes total
 runtime cost while satisfying all constraints.
 """
 
+import json
 import logging
 import math
 import operator
@@ -218,6 +219,61 @@ def _assert_has_tensor_meta(spec_or_specs, node, label):
         ), f"{node} {label} doesn't have a tensor_meta"
 
 
+class _MeshPlaceholder:
+    """Lightweight stand-in for DeviceMesh when loading without a process group.
+
+    Provides the attributes used by get_json() and add_node_constraint()
+    without requiring distributed initialization.
+    """
+
+    def __init__(self, shape, dim_names):
+        self.shape = tuple(shape)
+        self.mesh_dim_names = tuple(dim_names) if dim_names else None
+        self.ndim = len(shape)
+
+
+def _resolve_target(target_str):
+    """Resolve a serialized target string back to the callable."""
+    if target_str == "<built-in function getitem>":
+        return operator.getitem
+    parts = target_str.split(".")
+    if len(parts) >= 2:
+        try:
+            obj = getattr(torch.ops, parts[0])
+            for p in parts[1:]:
+                obj = getattr(obj, p)
+            return obj
+        except AttributeError:
+            pass
+    return torch.ops.aten.alias.default
+
+
+def _patch_op_overload_pickle():
+    """Temporarily add pickle support to OpOverload so FX graphs with custom
+    ops can be serialized. Returns a context manager that removes the patch
+    on exit."""
+    import contextlib
+
+    @contextlib.contextmanager
+    def _patch():
+        had_reduce = hasattr(torch._ops.OpOverload, "__reduce__")
+        old_reduce = getattr(torch._ops.OpOverload, "__reduce__", None)
+
+        def _reduce(self):
+            return (_resolve_target, (str(self),))
+
+        torch._ops.OpOverload.__reduce__ = _reduce
+        try:
+            yield
+        finally:
+            if had_reduce:
+                torch._ops.OpOverload.__reduce__ = old_reduce
+            else:
+                del torch._ops.OpOverload.__reduce__
+
+    return _patch()
+
+
 def _get_layer_index(node):
     """Extract the repeated-layer index from a node's module stack metadata.
 
@@ -313,6 +369,7 @@ class ShardingOptimizer:
         self.graph = concrete_gm.graph
         self.mesh = mesh
         self.rescale_grad_comm_cost_for_mp = rescale_grad_comm_cost_for_mp
+        self._constraint_log: list[tuple[str, dict]] = []
         self._name_counters: dict[str, int] = {}
         t0 = time.perf_counter()
         self.strats = self.build_sharding_metadata()
@@ -1003,6 +1060,8 @@ class ShardingOptimizer:
 
     def _to_orig_solution(self, solution):
         """Translate a solution from concrete-graph nodes to original-graph nodes."""
+        if not self._concrete_to_orig:
+            return solution
         return {self._concrete_to_orig[node]: spec for node, spec in solution.items()}
 
     def _to_concrete_solution(self, solution):
@@ -1227,6 +1286,293 @@ class ShardingOptimizer:
         """
         node = self._normalize_node(node)
         return self.strats[node]
+
+    # ---- Serialization ----
+
+    def save(self, path):
+        """Save the full optimizer state for later interactive exploration.
+
+        The saved file contains everything needed to rebuild the ILP and
+        re-solve without the original model code, DeviceMesh, or process group.
+        Can be called before or after solving — if unsolved, the loaded
+        optimizer can be solved in a notebook via get_solution() or resolve().
+        """
+        import copy
+
+        # Convert selected_keys to node-name-based representation (if solved)
+        selected_keys_by_name = None
+        if hasattr(self, "selected_keys"):
+            selected_keys_by_name = {}
+            for key in self.selected_keys:
+                node_idx, argi, out_idx, inp_idx = key
+                node_name = self.nodes[node_idx].name
+                selected_keys_by_name.setdefault(node_name, []).append(
+                    (argi, out_idx, inp_idx)
+                )
+
+        # Re-key strats by node name
+        strats_by_name = {node.name: strat for node, strat in self.strats.items()}
+
+        # Save decision var costs keyed by node name (not index, since
+        # node ordering can change after graph pickling).
+        dv_costs = {}
+        for key, dv in self.decision_vars.items():
+            node_idx, argi, out_idx, inp_idx = key
+            name_key = (self.nodes[node_idx].name, argi, out_idx, inp_idx)
+            dv_costs[name_key] = {
+                "cost": dv.cost,
+                "compute_cost": dv.compute_cost,
+                "comm_cost": dv.comm_cost,
+                "sharding_transition_cost": dv.sharding_transition_cost,
+            }
+
+        # Deepcopy the graph and keep only picklable metadata that we need.
+        # - desc: needed by add_forward_backward_consistency_constraints
+        # - partitioner_tag: needed by _build_decision_vars
+        # - stack_trace: used by export_json for source info
+        # - tensor_meta: used by export_json for shape/dtype
+        # - module_path: extracted from nn_module_stack (which contains
+        #   unpicklable class refs) as a plain string
+        # - is_gradient_acc, seq_nr: preserved for completeness
+        _SAVE_META_KEYS = {
+            "desc",
+            "partitioner_tag",
+            "stack_trace",
+            "tensor_meta",
+            "module_path",
+            "phase",
+            "is_gradient_acc",
+            "seq_nr",
+        }
+
+        # Extract module paths from nn_module_stack before deepcopy strips it
+        from autoparallel.export_json import _extract_module_path, _get_phase
+
+        module_paths = {}
+        phases = {}
+        for node in self.graph.nodes:
+            mp = _extract_module_path(node)
+            if mp is not None:
+                module_paths[node.name] = mp
+            if node.op not in ("placeholder", "output"):
+                phases[node.name] = _get_phase(node)
+
+        graph_copy = copy.deepcopy(self.graph)
+        for node in graph_copy.nodes:
+            meta = {k: v for k, v in node.meta.items() if k in _SAVE_META_KEYS}
+            if node.name in module_paths:
+                meta["module_path"] = module_paths[node.name]
+            if node.name in phases:
+                meta["phase"] = phases[node.name]
+            node.meta = meta
+
+        save_dict = {
+            "version": 1,
+            "graph": graph_copy,
+            "mesh_shape": list(self.mesh.shape),
+            "mesh_dim_names": (
+                list(self.mesh.mesh_dim_names) if self.mesh.mesh_dim_names else None
+            ),
+            "rescale_grad_comm_cost_for_mp": self.rescale_grad_comm_cost_for_mp,
+            "strats_by_name": strats_by_name,
+            "dv_costs": dv_costs,
+            "cluster_links_by_name": {
+                (self.nodes[lk[0]].name, lk[1], lk[2], lk[3]): (
+                    self.nodes[rk[0]].name,
+                    rk[1],
+                    rk[2],
+                    rk[3],
+                )
+                for lk, rk in self.cluster_links.items()
+            },
+            "constraint_log": self._constraint_log,
+            "selected_keys_by_name": selected_keys_by_name,
+        }
+        with _patch_op_overload_pickle():
+            torch.save(save_dict, path)
+
+    @classmethod
+    def load(cls, path):
+        """Load optimizer state saved with save().
+
+        Returns a fully functional ShardingOptimizer that supports get_json(),
+        get_log(), add_node_constraint(), resolve(), diff_solutions(), etc.
+        No live DeviceMesh or process group is needed.
+        """
+        # Ensure custom ops are registered before loading
+        import autoparallel.cast_parametrization  # noqa: F401
+
+        with _patch_op_overload_pickle():
+            save_dict = torch.load(path, weights_only=False)
+        assert save_dict["version"] == 1, f"Unsupported version: {save_dict['version']}"
+
+        graph = save_dict["graph"]
+        strats_by_name = save_dict["strats_by_name"]
+
+        # Build node-name lookup from the graph
+        nodes_by_name = {node.name: node for node in graph.nodes}
+
+        # Reconstruct strats keyed by Node objects (preserving graph order)
+        strats = {}
+        for node in graph.nodes:
+            if node.name in strats_by_name:
+                strats[node] = strats_by_name[node.name]
+
+        # Create optimizer without calling __init__
+        opt = cls.__new__(cls)
+        opt.gm = None
+        opt.graph = graph
+        opt._orig_to_concrete = {}
+        opt._concrete_to_orig = {}
+        opt.strats = strats
+        opt.nodes = list(strats.keys())
+        opt.node_map = {node: i for i, node in enumerate(opt.nodes)}
+        opt.rescale_grad_comm_cost_for_mp = save_dict["rescale_grad_comm_cost_for_mp"]
+        opt._constraint_log = []
+        opt._name_counters = {}
+
+        # Reconstruct cluster_links by resolving node names to indices
+        opt.cluster_links = {}
+        for name_lk, name_rk in save_dict["cluster_links_by_name"].items():
+            lk_node = nodes_by_name[name_lk[0]]
+            rk_node = nodes_by_name[name_rk[0]]
+            lk = (opt.node_map[lk_node], name_lk[1], name_lk[2], name_lk[3])
+            rk = (opt.node_map[rk_node], name_rk[1], name_rk[2], name_rk[3])
+            opt.cluster_links[lk] = rk
+        opt._cluster_linked_node_idxs = {key[0] for key in opt.cluster_links}
+
+        # Mesh placeholder — provides shape/dim_names for get_json() and ndim
+        # for add_node_constraint() default placement, without needing a PG
+        opt.mesh = _MeshPlaceholder(
+            save_dict["mesh_shape"], save_dict["mesh_dim_names"]
+        )
+
+        # Rebuild PuLP variables and decision vars from saved costs.
+        opt.pulp_variables = opt._create_pulp_variables()
+        dv_costs = save_dict["dv_costs"]
+        opt.decision_vars = {}
+        for name_key, costs in dv_costs.items():
+            node_name, argi, out_idx, inp_idx = name_key
+            node = nodes_by_name[node_name]
+            node_idx = opt.node_map[node]
+            key = (node_idx, argi, out_idx, inp_idx)
+            strategy = opt.strats[node].strategies[out_idx]
+            opt.decision_vars[key] = DecisionVar(
+                var=opt.pulp_variables[key],
+                cost=costs["cost"],
+                compute_cost=costs["compute_cost"],
+                comm_cost=costs["comm_cost"],
+                sharding_transition_cost=costs["sharding_transition_cost"],
+                strategy=strategy,
+                output_spec=strategy.output_specs,
+                input_spec=(
+                    strategy.input_specs[argi]
+                    if argi < len(strategy.input_specs)
+                    else None
+                ),
+            )
+
+        opt._root_to_linked = defaultdict(list)
+        for linked_key, root_key in opt.cluster_links.items():
+            opt._root_to_linked[root_key].append(linked_key)
+
+        opt.prob = pulp.LpProblem("AutoParallel", pulp.LpMinimize)
+        opt.add_default_constraints()
+
+        # Replay user constraints
+        for method_name, kwargs in save_dict["constraint_log"]:
+            method = getattr(opt, method_name)
+            # Resolve node names back to node objects
+            if "node_name" in kwargs:
+                kwargs = dict(kwargs)
+                node_name = kwargs.pop("node_name")
+                kwargs["node"] = nodes_by_name[node_name]
+            method(**kwargs)
+
+        # Set objective and restore solution if one was saved
+        opt._set_objective()
+        if save_dict["selected_keys_by_name"] is not None:
+            opt._restore_solution(save_dict["selected_keys_by_name"], nodes_by_name)
+
+        return opt
+
+    def _restore_solution(self, selected_keys_by_name, nodes_by_name):
+        """Restore selected_keys and PuLP variable values from a saved solution."""
+        self.selected_keys = []
+        for node_name, key_parts in selected_keys_by_name.items():
+            node = nodes_by_name[node_name]
+            node_idx = self.node_map[node]
+            for argi, out_idx, inp_idx in key_parts:
+                self.selected_keys.append((node_idx, argi, out_idx, inp_idx))
+
+        # Set PuLP variable values to match
+        for key, dv in self.decision_vars.items():
+            dv.var.varValue = 1.0 if key in set(self.selected_keys) else 0.0
+
+        # Expand cluster links
+        for root_key in list(self.selected_keys):
+            self.selected_keys.extend(self._root_to_linked.get(root_key, []))
+
+    def save_solution(self, path):
+        """Save the current solution as a lightweight JSON file.
+
+        The saved file can be loaded by another optimizer via load_solution()
+        to apply the same placements without re-solving.
+        """
+        from torch.distributed.tensor._op_schema import _pretty_print_spec
+
+        placements = {}
+        solution = self._extract_and_validate_solution()
+        for node, strategy in solution.items():
+            placements[node.name] = _pretty_print_spec(strategy.output_specs)
+
+        save_dict = {
+            "version": 1,
+            "mesh_shape": list(self.mesh.shape),
+            "mesh_dim_names": (
+                list(self.mesh.mesh_dim_names) if self.mesh.mesh_dim_names else None
+            ),
+            "placements": placements,
+        }
+        with open(path, "w") as f:
+            json.dump(save_dict, f, indent=2)
+
+    def load_solution(self, path):
+        """Load a solution from a JSON file and return a dict[Node, OpSpec].
+
+        Matches saved placement strings against the strategies in self.strats.
+        The returned dict can be passed directly to apply_placement().
+        """
+        from torch.distributed.tensor._op_schema import _pretty_print_spec
+
+        with open(path) as f:
+            save_dict = json.load(f)
+
+        assert save_dict["version"] == 1
+
+        nodes_by_name = {node.name: node for node in self.nodes}
+        solution = {}
+        for node_name, placement_str in save_dict["placements"].items():
+            if node_name not in nodes_by_name:
+                raise RuntimeError(
+                    f"Node '{node_name}' from saved solution not found in current graph. "
+                    "The model may have changed since the solution was saved."
+                )
+            node = nodes_by_name[node_name]
+            strat = self.strats[node]
+            matched = None
+            for s in strat.strategies:
+                if _pretty_print_spec(s.output_specs) == placement_str:
+                    matched = s
+                    break
+            if matched is None:
+                raise RuntimeError(
+                    f"Placement '{placement_str}' for node '{node_name}' not found "
+                    f"in available strategies. The model or mesh may have changed."
+                )
+            solution[node] = matched
+
+        return solution
 
     def print_costs_for_node(self, node, arg=0, **kwargs):
         from tabulate import tabulate  # type: ignore
@@ -1508,6 +1854,15 @@ class ShardingOptimizer:
 
         Σ_{params} (size_ratio * x_{param}) ≤ memory_limit
         """
+        self._constraint_log.append(
+            (
+                "add_parameter_memory_constraint",
+                {
+                    "memory_factor_low": memory_factor_low,
+                    "memory_factor_high": memory_factor_high,
+                },
+            )
+        )
         param_nodes: list[torch.fx.Node] = get_param_nodes(self.graph)
         elms: list[pulp.LpAffineExpression] = []
         budget_low: float = 0.0
@@ -1541,6 +1896,16 @@ class ShardingOptimizer:
         against the first DTensorSpec element in the tuple.
         """
         node = self._normalize_node(node)
+        self._constraint_log.append(
+            (
+                "add_node_constraint",
+                {
+                    "node_name": node.name,
+                    "placement": placement,
+                    "constraint_name": constraint_name,
+                },
+            )
+        )
         assert node in self.strats, (node, self.strats.keys())
         strat = self.strats[node]
         if placement is None:
@@ -1608,6 +1973,9 @@ class ShardingOptimizer:
         """USER (Category 5a): Force specific placements for input nodes.
         The corresponding gradient inputs are automatically constrained via
         add_forward_backward_consistency_constraints()."""
+        self._constraint_log.append(
+            ("add_sharded_input_constraint", {"input_placements": input_placements})
+        )
         self._add_io_placement_constraints(
             nodes_dict=get_plain_input_and_grad_nodes(self.graph),
             placements=input_placements,
@@ -1628,6 +1996,9 @@ class ShardingOptimizer:
         """USER (Category 5a): Force specific placements for output nodes.
         The corresponding tangent/gradient nodes are automatically constrained via
         add_forward_backward_consistency_constraints()."""
+        self._constraint_log.append(
+            ("add_sharded_output_constraint", {"output_placements": output_placements})
+        )
         self._add_io_placement_constraints(
             nodes_dict=get_plain_output_and_tangent_nodes(self.graph),
             placements=output_placements,
