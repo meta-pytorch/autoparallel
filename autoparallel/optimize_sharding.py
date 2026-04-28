@@ -261,7 +261,7 @@ class ShardingOptimizer:
         self.prob = pulp.LpProblem("AutoParallel", pulp.LpMinimize)
         self.add_default_constraints()
         t3 = time.perf_counter()
-        n_unique_vars = len(set(id(v) for v in self.pulp_variables.values()))
+        n_unique_vars = len(self.pulp_variables)
         n_constraints = len(self.prob.constraints)
         logger.debug(
             "ILP construction took %.3fs "
@@ -395,31 +395,35 @@ class ShardingOptimizer:
         """Create PuLP binary variables for all decision points, resolving
         cluster links so that identical nodes share the same variable.
 
-        Returns a dict mapping every (node_idx, argi, out_idx, inp_idx) key
-        to its PuLP variable.
+        Returns a dict mapping root (node_idx, argi, out_idx, inp_idx) keys
+        to their PuLP variables. Linked keys are not stored; use
+        _get_pulp_variable() to resolve them through cluster_links.
         """
-        # Map each key to its canonical root key
-        root_for_key = {}
+        cluster_linked_node_idxs = {key[0] for key in self.cluster_links}
+
+        pulp_variables = {}
         for node, _ in self.strats.items():
             if node.op == "output":
                 continue
             node_idx = self.node_map[node]
+            if node_idx in cluster_linked_node_idxs:
+                continue
             for argi, out_idx, inp_idx in self.walk_over_options(node):
                 key = (node_idx, argi, out_idx, inp_idx)
-                root_for_key[key] = self.cluster_links.get(key, key)
+                root_node = self.nodes[node_idx]
+                pulp_variables[key] = pulp.LpVariable(
+                    f"n={root_node},s={node_idx},arg={argi},"
+                    f"output_p={out_idx},input_p={inp_idx}",
+                    cat=pulp.LpBinary,
+                )
 
-        # Create one PuLP variable per unique root
-        root_variables: dict[tuple, pulp.LpVariable] = {}
-        for root_key in set(root_for_key.values()):
-            root_node_idx, argi, out_idx, inp_idx = root_key
-            root_node = self.nodes[root_node_idx]
-            root_variables[root_key] = pulp.LpVariable(
-                f"n={root_node},s={root_node_idx},arg={argi},"
-                f"output_p={out_idx},input_p={inp_idx}",
-                cat=pulp.LpBinary,
-            )
+        return pulp_variables
 
-        return {key: root_variables[root] for key, root in root_for_key.items()}
+    def _get_pulp_variable(self, key):
+        """Look up the PuLP variable for a key, resolving through
+        cluster_links if the key belongs to a linked node."""
+        root_key = self.cluster_links.get(key, key)
+        return self.pulp_variables[root_key]
 
     def _compute_edge_costs(
         self,
@@ -484,76 +488,79 @@ class ShardingOptimizer:
             (self.node_map[node], node, strat) for node, strat in self.strats.items()
         ]
 
-        # Two passes: root nodes first (so their entries exist), then linked nodes.
-        for is_linked_pass in (False, True):
-            for node_idx, node, op_strategy in strats_items:
-                if node.op == "output":
-                    continue
-                is_linked = node_idx in self._cluster_linked_node_idxs
-                if is_linked != is_linked_pass:
-                    continue
+        # Build DVs for root nodes only (not cluster-linked).
+        for node_idx, node, op_strategy in strats_items:
+            if node.op == "output":
+                continue
+            if node_idx in self._cluster_linked_node_idxs:
+                continue
 
-                num_args = len(op_strategy.strategies[0].input_specs)
+            num_args = len(op_strategy.strategies[0].input_specs)
 
-                for out_idx, output_strategy in enumerate(op_strategy.strategies):
-                    if is_linked:
-                        root_key = self.cluster_links[(node_idx, 0, out_idx, 0)]
-                        per_arg_compute = decision_vars[root_key].compute_cost
-                    else:
-                        tc0 = time.perf_counter()
-                        compute_cost = estimate_strategy_runtime_cost(
-                            node, output_strategy
+            for out_idx, output_strategy in enumerate(op_strategy.strategies):
+                tc0 = time.perf_counter()
+                compute_cost = estimate_strategy_runtime_cost(node, output_strategy)
+                tc1 = time.perf_counter()
+                t_compute += tc1 - tc0
+                per_arg_compute = compute_cost / num_args
+
+                for argi, redist_costs in enumerate(output_strategy.redistribute_cost):
+                    for inp_idx, default_comm_cost in enumerate(redist_costs):
+                        key = (node_idx, argi, out_idx, inp_idx)
+
+                        all_input_nodes = self._all_input_nodes(node)
+                        producer_strategy = (
+                            self.strats[all_input_nodes[argi]]
+                            if all_input_nodes
+                            else None
                         )
-                        tc1 = time.perf_counter()
-                        t_compute += tc1 - tc0
-                        per_arg_compute = compute_cost / num_args
+                        te0 = time.perf_counter()
+                        comm_cost, transition_cost = self._compute_edge_costs(
+                            node,
+                            output_strategy,
+                            argi,
+                            inp_idx,
+                            default_comm_cost,
+                            producer_strategy,
+                            grad_param_nodes,
+                        )
+                        te1 = time.perf_counter()
+                        t_edge += te1 - te0
 
-                    for argi, redist_costs in enumerate(
-                        output_strategy.redistribute_cost
-                    ):
-                        for inp_idx, default_comm_cost in enumerate(redist_costs):
-                            key = (node_idx, argi, out_idx, inp_idx)
+                        redist_costs[inp_idx] = comm_cost
 
-                            if is_linked:
-                                root_key = self.cluster_links[key]
-                                root_dv = decision_vars[root_key]
-                                comm_cost = root_dv.comm_cost
-                                transition_cost = root_dv.sharding_transition_cost
-                                n_cluster_copied += 1
-                            else:
-                                all_input_nodes = self._all_input_nodes(node)
-                                producer_strategy = (
-                                    self.strats[all_input_nodes[argi]]
-                                    if all_input_nodes
-                                    else None
-                                )
-                                te0 = time.perf_counter()
-                                comm_cost, transition_cost = self._compute_edge_costs(
-                                    node,
-                                    output_strategy,
-                                    argi,
-                                    inp_idx,
-                                    default_comm_cost,
-                                    producer_strategy,
-                                    grad_param_nodes,
-                                )
-                                te1 = time.perf_counter()
-                                t_edge += te1 - te0
+                        decision_vars[key] = DecisionVar(
+                            var=self.pulp_variables[key],
+                            cost=comm_cost + per_arg_compute + transition_cost,
+                            compute_cost=per_arg_compute,
+                            comm_cost=comm_cost,
+                            sharding_transition_cost=transition_cost,
+                            strategy=output_strategy,
+                            output_spec=output_strategy.output_specs,
+                            input_spec=output_strategy.input_specs[argi],
+                        )
+                        n_vars += 1
 
-                            redist_costs[inp_idx] = comm_cost
-
-                            if not is_linked:
-                                decision_vars[key] = DecisionVar(
-                                    var=self.pulp_variables[key],
-                                    cost=comm_cost + per_arg_compute + transition_cost,
-                                    compute_cost=per_arg_compute,
-                                    comm_cost=comm_cost,
-                                    sharding_transition_cost=transition_cost,
-                                    strategy=output_strategy,
-                                    output_spec=output_strategy.output_specs,
-                                    input_spec=output_strategy.input_specs[argi],
-                                )
-                            n_vars += 1
+        # Batch-copy redistribute_cost from root strats to linked strats.
+        # The root pass above updated redistribute_cost in place with
+        # edge-computed costs; linked strats need the same values for
+        # _compute_solution_cost and other readers.
+        linked_node_to_root_node: dict[int, int] = {}
+        for linked_key, root_key in self.cluster_links.items():
+            linked_node_to_root_node[linked_key[0]] = root_key[0]
+        for linked_node_idx, root_node_idx in linked_node_to_root_node.items():
+            linked_node = self.nodes[linked_node_idx]
+            root_node = self.nodes[root_node_idx]
+            linked_op = self.strats[linked_node]
+            root_op = self.strats[root_node]
+            for out_idx in range(len(root_op.strategies)):
+                root_spec = root_op.strategies[out_idx]
+                linked_spec = linked_op.strategies[out_idx]
+                linked_spec.redistribute_cost = [
+                    list(costs) for costs in root_spec.redistribute_cost
+                ]
+        n_cluster_copied = len(self.cluster_links)
+        n_vars += n_cluster_copied
 
         self._root_to_linked: dict[tuple, list[tuple]] = defaultdict(list)
         for linked_key, root_key in self.cluster_links.items():
@@ -580,7 +587,7 @@ class ShardingOptimizer:
         node_idx, argi, out_idx, _ = key
         strategy = self.strats[self.nodes[node_idx]].strategies[out_idx]
         return DecisionVar(
-            var=self.pulp_variables[key],
+            var=self._get_pulp_variable(key),
             cost=root_dv.cost,
             compute_cost=root_dv.compute_cost,
             comm_cost=root_dv.comm_cost,
@@ -1312,7 +1319,7 @@ class ShardingOptimizer:
         vars_per_arg = {}
         for argi, out_idx, inp_idx in self.walk_over_options(node):
             if out_idx in output_constraint_indices:
-                var = self.pulp_variables[(node_idx, argi, out_idx, inp_idx)]
+                var = self._get_pulp_variable((node_idx, argi, out_idx, inp_idx))
                 vars_per_arg.setdefault(argi, []).append(var)
         names = []
         for eqs in vars_per_arg.values():
@@ -1340,7 +1347,7 @@ class ShardingOptimizer:
                 # This placement exists in node_a but not in node_b.
                 # Disable it: force sum of its decision variables to 0.
                 v_a = [
-                    self.pulp_variables[(idx_a, 0, out_idx, inp_idx)]
+                    self._get_pulp_variable((idx_a, 0, out_idx, inp_idx))
                     for inp_idx in range(num_inp_a)
                 ]
                 self.prob += (
@@ -1350,11 +1357,11 @@ class ShardingOptimizer:
                 continue
             out_idx_b = strat_b.index(sp)
             v_a = [
-                self.pulp_variables[(idx_a, 0, out_idx, inp_idx)]
+                self._get_pulp_variable((idx_a, 0, out_idx, inp_idx))
                 for inp_idx in range(num_inp_a)
             ]
             v_b = [
-                self.pulp_variables[(idx_b, 0, out_idx_b, inp_idx)]
+                self._get_pulp_variable((idx_b, 0, out_idx_b, inp_idx))
                 for inp_idx in range(num_inp_b)
             ]
             self.prob += (
