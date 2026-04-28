@@ -1310,9 +1310,7 @@ def test_uneven_sharding_optimize_and_apply(device_mesh_2d):
 
     placement = (Shard(0), Replicate())
 
-    with AutoParallel(
-        model, input_fn, device_mesh_2d, dynamic=True, compile=False
-    ) as autop:
+    with AutoParallel(model, input_fn, device_mesh_2d, dynamic=True) as autop:
         autop.add_input_constraints([placement])
         autop.add_output_constraints([placement])
 
@@ -1369,9 +1367,7 @@ def test_uneven_sharding_parallel_graph_has_pad_ops(device_mesh_2d):
 
     placement = (Shard(0), Replicate())
 
-    with AutoParallel(
-        model, input_fn, device_mesh_2d, dynamic=True, compile=False
-    ) as autop:
+    with AutoParallel(model, input_fn, device_mesh_2d, dynamic=True) as autop:
         autop.add_input_constraints([placement])
         autop.add_output_constraints([placement])
 
