@@ -237,12 +237,27 @@ DEVICE_LIMITS: Tuple[DeviceLimit, ...] = (
             torch.int8: 5033.2,
         },
     ),
+    # Intel Max 1550
+    DeviceLimit(
+        "Max 1550",
+        # Assuming 1600 MHz and torch.xpu.get_device_properties("xpu").max_compute_units=448
+        "https://www.intel.com/content/www/us/en/docs/oneapi/optimization-guide-gpu/2025-0/intel-xe-gpu-architecture.html",
+        sm=(-1, -1),
+        gmem_bandwidth=3.3 * (1024**4),
+        gemm_tflops={
+            torch.float64: 46,
+            torch.float32: 46,
+            torch.float16: 367,
+            torch.bfloat16: 367,
+            torch.int8: 734,
+        },
+    ),
 )
 
 
 def _get_device_limit():
     device = None
-    device_name = torch.cuda.get_device_name(device)
+    device_name = torch.get_device_module().get_device_name(device)
 
     # Find matching device limit
     device_limit = None
@@ -501,13 +516,13 @@ def benchmark_fn(fn, *args, **kwargs):
         fn(*args, **kwargs)
 
     num_iters = 10
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
-    start_event.record(torch.cuda.current_stream())
+    start_event = torch.Event(enable_timing=True)
+    end_event = torch.Event(enable_timing=True)
+    start_event.record(torch.accelerator.current_stream())
     for _ in range(num_iters):
         fn(*args, **kwargs)
-    end_event.record(torch.cuda.current_stream())
-    torch.cuda.synchronize()
+    end_event.record(torch.accelerator.current_stream())
+    torch.accelerator.synchronize()
     total_op_time = start_event.elapsed_time(end_event)
     mean_op_time_ms = total_op_time / num_iters
     mean_op_time_us = mean_op_time_ms * 1e3
