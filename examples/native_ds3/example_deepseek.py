@@ -350,6 +350,7 @@ if __name__ == "__main__":
     from torch.testing._internal.distributed.fake_pg import FakeStore
 
     from autoparallel.api import AutoParallel
+    from autoparallel.compile import autoparallel_backend
 
     # Model configuration
     world_size = 256
@@ -404,7 +405,7 @@ if __name__ == "__main__":
         param_dtype=torch.bfloat16, reduce_dtype=torch.float32
     )
 
-    with AutoParallel(model, input_fn, mesh, mp_policy, compile=True) as autop:
+    with AutoParallel(model, input_fn, mesh, mp_policy) as autop:
         assert any(n.meta.get("nn_module_stack") for n in autop.gm.graph.nodes)
         assert any(n.meta.get("fwd_nn_module_stack") for n in autop.gm.graph.nodes)
         autop.add_parameter_memory_constraint(low=None, high=None)
@@ -423,6 +424,9 @@ if __name__ == "__main__":
 
     parallel_mod.to_empty(device="cuda")
     parallel_mod.init_weights(init_std=0.02, buffer_device="cuda")
+
+    # Compile with AutoParallel-optimized Inductor passes
+    parallel_mod = torch.compile(parallel_mod, backend=autoparallel_backend())
 
     # now let's run it
     x = (torch.rand(bs // mesh.shape[0], 1, seq_len, dim, device="cuda"),)

@@ -116,6 +116,7 @@ class aten_autobucketing_config:
 def aten_autobucketing_reordering_pass(
     gm: torch.fx.Graph, configs: "aten_autobucketing_config"
 ) -> torch.fx.GraphModule:
+    assert gm.owning_module is not None
     new_gm = schedule_overlap_bucketing(
         gm.owning_module,
         collective_bucketing=configs.collective_bucketing,

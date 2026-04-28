@@ -281,8 +281,8 @@ def test_user_ac_policy_fn_applied_to_getitem(device_mesh_1d):
 
 
 def _build_parallel_graph(model_cls, mesh, *, context_fn=None):
-    """Run the full AutoParallel pipeline (with enable_ac=False) and return
-    the parallel graph for ac_joint_pass testing."""
+    """Run the full AutoParallel pipeline and return the parallel graph for
+    ac_joint_pass testing."""
     nheads, dim, ffn_dim = 8, 128, 512
     bs = 8 * mesh.shape[0]
     seq_len = 32
@@ -296,7 +296,7 @@ def _build_parallel_graph(model_cls, mesh, *, context_fn=None):
         else:
             model = model_cls(nheads, dim, ffn_dim)
 
-    with AutoParallel(model, input_fn, mesh, enable_ac=False) as autop:
+    with AutoParallel(model, input_fn, mesh) as autop:
         x_sharding = (Shard(0),)
         autop.add_input_constraints([x_sharding])
         autop.add_output_constraints([x_sharding])
@@ -322,11 +322,20 @@ def test_ac_joint_pass_marks_recomputable_nodes(device_mesh_1d):
         if _has_tag_is_backward(n):
             continue
         recompute = n.meta.get("recompute")
-        if recompute is not None:
-            assert recompute in (
-                CheckpointPolicy.PREFER_RECOMPUTE,
-                CheckpointPolicy.MUST_SAVE,
-            ), f"{n} has unexpected recompute={recompute}"
+        if recompute is None:
+            continue
+        # All-gather nodes are tagged MUST_RECOMPUTE by
+        # mark_fsdp_all_gather_recomputation (runs unconditionally in AP);
+        # skip them so we only assert on tags set by ac_joint_pass.
+        if recompute == CheckpointPolicy.MUST_RECOMPUTE:
+            assert (
+                "all_gather" in n.name
+            ), f"{n} has MUST_RECOMPUTE but is not an all-gather node"
+            continue
+        assert recompute in (
+            CheckpointPolicy.PREFER_RECOMPUTE,
+            CheckpointPolicy.MUST_SAVE,
+        ), f"{n} has unexpected recompute={recompute}"
 
 
 def test_ac_joint_pass_apply_ac_policy_saves_mm_and_sdpa(device_mesh_1d):
@@ -427,6 +436,273 @@ def test_ac_joint_pass_stages_recomputation(device_mesh_1d):
     assert (
         len(must_save_nodes) > 0
     ), "Expected staging to insert MUST_SAVE nodes with tiny stage size"
+
+
+# ---------------------------------------------------------------------------
+# Family 2b: AC tag survival through torch.compile round-trip
+# ---------------------------------------------------------------------------
+
+
+def _build_parallel_module(model_cls, mesh, *, context_fn=None):
+    """Run the full AutoParallel pipeline and return the parallel module
+    (not just the graph) so it can be compiled with torch.compile."""
+    nheads, dim, ffn_dim = 8, 128, 512
+    bs = 8 * mesh.shape[0]
+    seq_len = 32
+
+    def input_fn():
+        return torch.rand(bs, seq_len, dim, device="cuda")
+
+    with torch.device("meta"):
+        if context_fn is not None:
+            model = model_cls(nheads, dim, ffn_dim, context_fn)
+        else:
+            model = model_cls(nheads, dim, ffn_dim)
+
+    x_sharding = (Shard(0),) + (Replicate(),) * (mesh.ndim - 1)
+    with AutoParallel(model, input_fn, mesh) as autop:
+        autop.add_input_constraints([x_sharding])
+        autop.add_output_constraints([x_sharding])
+        sharding_placement = autop.optimize_placement()
+        parallel_mod = autop.apply_placement(sharding_placement)
+
+    return parallel_mod, bs, seq_len, dim
+
+
+def _compile_and_capture_joint_graph(parallel_mod, x, *, joint_custom_pass=None):
+    """Compile the module with aot_eager and capture the fresh joint graph
+    that AOTAutograd creates.  Returns the captured FX GraphModule."""
+    import torch._dynamo
+    import torch._functorch.config
+
+    captured = []
+
+    def capture_pass(fx_g, joint_inputs):
+        if joint_custom_pass is not None:
+            fx_g = joint_custom_pass(fx_g, joint_inputs)
+        captured.append(fx_g)
+        return fx_g
+
+    try:
+        with torch._functorch.config.patch({"joint_custom_pass": capture_pass}):
+            compiled = torch.compile(parallel_mod, backend="aot_eager")
+            compiled(x)
+    finally:
+        torch._dynamo.reset()
+
+    assert len(captured) >= 1, "joint_custom_pass was never called"
+    return captured[0]
+
+
+def _materialize_parallel_module(parallel_mod):
+    """Move a meta-device parallel module to CUDA and initialize weights."""
+    parallel_mod.to_empty(device="cuda")
+    for p in parallel_mod.parameters():
+        torch.nn.init.ones_(p)
+
+
+def test_fsdp_recompute_tags_survive_compile_roundtrip(device_mesh_2d):
+    """Recomputation tags on collective nodes (set by
+    mark_fsdp_all_gather_recomputation before AP's partitioner) survive
+    into the fresh joint graph that torch.compile's AOTAutograd creates,
+    via the preserve_node_meta mechanism."""
+
+    parallel_mod, bs, seq_len, dim = _build_parallel_module(
+        AttentionBlockNoAC, device_mesh_2d
+    )
+    _materialize_parallel_module(parallel_mod)
+
+    local_bs = bs // device_mesh_2d.shape[0]
+    x = torch.rand(local_bs, seq_len, dim, device="cuda")
+
+    fresh_gm = _compile_and_capture_joint_graph(parallel_mod, x)
+
+    # Find collective nodes that have recompute tags (could be all-gather
+    # with MUST_RECOMPUTE or all-reduce with MUST_SAVE depending on the
+    # sharding strategy chosen by the optimizer).
+    tagged_collectives = [
+        n
+        for n in fresh_gm.graph.nodes
+        if n.op == "call_function" and n.meta.get("recompute") is not None
+    ]
+    assert (
+        len(tagged_collectives) > 0
+    ), "Expected nodes with recompute tags in the fresh joint graph"
+
+    for n in tagged_collectives:
+        assert n.meta.get("recompute") in (
+            CheckpointPolicy.MUST_RECOMPUTE,
+            CheckpointPolicy.MUST_SAVE,
+        ), f"{n} has unexpected recompute={n.meta.get('recompute')}"
+
+
+def test_ac_and_fsdp_tags_coexist_in_compile_roundtrip(device_mesh_2d):
+    """The autoparallel_backend() production flow: FSDP tags survived from AP's
+    graph coexist with AC tags freshly applied by ac_joint_pass via
+    joint_custom_pass."""
+    from torch._functorch.partitioners import _has_tag_is_backward
+
+    from autoparallel.graph_passes.activation_checkpointing import ac_joint_pass
+
+    parallel_mod, bs, seq_len, dim = _build_parallel_module(
+        AttentionBlockNoAC, device_mesh_2d
+    )
+    _materialize_parallel_module(parallel_mod)
+
+    local_bs = bs // device_mesh_2d.shape[0]
+    x = torch.rand(local_bs, seq_len, dim, device="cuda")
+
+    def ac_pass(fx_g, joint_inputs):
+        ac_joint_pass(fx_g.graph, ac_stage_size_in_GiB=None)
+        return fx_g
+
+    fresh_gm = _compile_and_capture_joint_graph(
+        parallel_mod, x, joint_custom_pass=ac_pass
+    )
+
+    # FSDP tags survived
+    tagged_collectives = [
+        n
+        for n in fresh_gm.graph.nodes
+        if n.op == "call_function"
+        and n.meta.get("recompute") is not None
+        and "_c10d_functional" in str(n.target)
+    ]
+    assert (
+        len(tagged_collectives) > 0
+    ), "Expected collective nodes with FSDP recompute tags to survive"
+
+    # AC tags applied on fresh graph: mm and SDPA nodes should be MUST_SAVE
+    fwd_must_save = 0
+    for n in fresh_gm.graph.nodes:
+        if n.op != "call_function" or _has_tag_is_backward(n):
+            continue
+        recompute = n.meta.get("recompute")
+        if recompute == CheckpointPolicy.MUST_SAVE:
+            fwd_must_save += 1
+
+    assert fwd_must_save > 0, "Expected forward nodes with MUST_SAVE from ac_joint_pass"
+
+    # Specifically check that some mm or SDPA forward nodes are MUST_SAVE
+    sdpa_targets = {
+        torch.ops.aten._scaled_dot_product_efficient_attention.default,
+        torch.ops.aten._scaled_dot_product_flash_attention.default,
+        torch.ops.aten._scaled_dot_product_cudnn_attention.default,
+    }
+    mm_sdpa_must_save = [
+        n
+        for n in fresh_gm.graph.nodes
+        if n.op == "call_function"
+        and not _has_tag_is_backward(n)
+        and (n.target == torch.ops.aten.mm.default or n.target in sdpa_targets)
+        and n.meta.get("recompute") == CheckpointPolicy.MUST_SAVE
+    ]
+    assert (
+        len(mm_sdpa_must_save) > 0
+    ), "Expected some forward mm/SDPA nodes with MUST_SAVE from ac_joint_pass"
+
+
+def test_user_ac_tags_survive_compile_roundtrip(device_mesh_2d):
+    """User-annotated AC tags (from torch.utils.checkpoint.checkpoint with a
+    selective policy) survive through the torch.compile round-trip via
+    preserve_node_meta."""
+
+    context_fn = functools.partial(
+        create_selective_checkpoint_contexts, _must_save_policy
+    )
+    parallel_mod, bs, seq_len, dim = _build_parallel_module(
+        AttentionBlockWithUserAC, device_mesh_2d, context_fn=context_fn
+    )
+    _materialize_parallel_module(parallel_mod)
+
+    local_bs = bs // device_mesh_2d.shape[0]
+    x = torch.rand(local_bs, seq_len, dim, device="cuda")
+
+    # Capture fresh graph without additional AC pass — we're testing survival
+    # of user-annotated tags, not AP's ac_joint_pass
+    fresh_gm = _compile_and_capture_joint_graph(parallel_mod, x)
+
+    # User policy sets MUST_SAVE on mm/einsum nodes inside checkpoint region
+    linear_nodes = _find_linear_nodes(fresh_gm.graph)
+    fwd_must_save_linear = [
+        n for n in linear_nodes if n.meta.get("recompute") == CheckpointPolicy.MUST_SAVE
+    ]
+    assert len(fwd_must_save_linear) > 0, (
+        "Expected mm/einsum nodes with MUST_SAVE from user AC policy to "
+        "survive the torch.compile round-trip"
+    )
+
+    # FSDP collective tags also survived
+    tagged_collectives = [
+        n
+        for n in fresh_gm.graph.nodes
+        if n.op == "call_function"
+        and n.meta.get("recompute")
+        in (
+            CheckpointPolicy.MUST_RECOMPUTE,
+            CheckpointPolicy.MUST_SAVE,
+        )
+        and "_c10d_functional" in str(n.target)
+    ]
+    assert (
+        len(tagged_collectives) > 0
+    ), "Expected collective nodes with FSDP recompute tags to survive"
+
+
+class MLPBlockWithUserAC(nn.Module):
+    """MLP-only model with user AC — no SDPA, no RNG ops."""
+
+    def __init__(self, nheads, dim, ffn_dim):
+        super().__init__()
+        self.w1 = nn.Linear(dim, ffn_dim, bias=False)
+        self.w2 = nn.Linear(ffn_dim, dim, bias=False)
+        self.w3 = nn.Linear(dim, ffn_dim, bias=False)
+        self.w4 = nn.Linear(ffn_dim, dim, bias=False)
+
+    def _mlp(self, x):
+        return self.w2(torch.nn.functional.relu(self.w1(x)))
+
+    def forward(self, x):
+        o = torch.utils.checkpoint.checkpoint(self._mlp, x, use_reentrant=False)
+        o = o + x
+        o = self.w4(torch.nn.functional.relu(self.w3(o)))
+        return o + x
+
+
+def test_user_ac_tags_survive_compile_roundtrip_no_rng(device_mesh_2d):
+    """User-annotated AC tags from torch.utils.checkpoint.checkpoint survive
+    the torch.compile round-trip.  Uses an MLP-only model (no SDPA) to avoid
+    the torch.Generator issue (pytorch/pytorch#179649)."""
+
+    parallel_mod, bs, seq_len, dim = _build_parallel_module(
+        MLPBlockWithUserAC, device_mesh_2d
+    )
+    _materialize_parallel_module(parallel_mod)
+
+    local_bs = bs // device_mesh_2d.shape[0]
+    x = torch.rand(local_bs, seq_len, dim, device="cuda")
+
+    fresh_gm = _compile_and_capture_joint_graph(parallel_mod, x)
+
+    from torch._functorch.partitioners import _has_tag_is_backward
+
+    # User checkpoint wraps _mlp which contains mm (from w1, w2 linears).
+    # The default checkpoint policy tags all ops inside the region with
+    # PREFER_RECOMPUTE.  These tags should survive into the fresh graph.
+    fwd_mm_nodes = [
+        n
+        for n in fresh_gm.graph.nodes
+        if n.op == "call_function"
+        and n.target == torch.ops.aten.mm.default
+        and not _has_tag_is_backward(n)
+    ]
+    assert len(fwd_mm_nodes) > 0, "Expected forward mm nodes"
+
+    tagged_mm = [n for n in fwd_mm_nodes if n.meta.get("recompute") is not None]
+    assert len(tagged_mm) > 0, (
+        "Expected some forward mm nodes with user AC recompute tags to "
+        "survive the torch.compile round-trip"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -611,9 +887,10 @@ def test_local_map_custom_metadata_propagation(device_mesh_3d):
     with torch.device("meta"):
         model = Block(nheads, dim, ffn_dim)
 
-    with fx_traceback.preserve_node_meta(), AutoParallel(
-        model, input_fn, mesh, compile=True
-    ) as autop:
+    with (
+        fx_traceback.preserve_node_meta(),
+        AutoParallel(model, input_fn, mesh) as autop,
+    ):
         autop.add_parameter_memory_constraint(low=None, high=None)
         x_sharding = (Shard(0),) + (Replicate(),) * (mesh.ndim - 1)
         autop.add_input_constraints([x_sharding])

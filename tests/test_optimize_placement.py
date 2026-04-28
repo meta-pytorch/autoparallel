@@ -334,7 +334,6 @@ def test_in_graph_tensor_ctor(device_mesh_1d):
         device_mesh_1d,
         sample_inputs=(x,),
         out_shardings=(Shard(0),),
-        compile=False,
     )
     parallel_mod.to_empty(device="cuda")
     parallel_mod.init_weights()

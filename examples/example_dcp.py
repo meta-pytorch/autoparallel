@@ -24,6 +24,7 @@ from torch.distributed.tensor.placement_types import Replicate, Shard
 from torch.testing._internal.distributed.fake_pg import FakeStore
 
 from autoparallel.api import AutoParallel
+from autoparallel.compile import autoparallel_backend
 
 
 def master_print(*args, **kwargs):
@@ -122,7 +123,7 @@ def prepare_autoparallel_model(fake_world_size):
             print(f"global input shape: {(bs, seq_len, dim1)}")
             return torch.rand(bs, seq_len, dim1, device="cuda")
 
-        with AutoParallel(model, input_fn, mesh, mp_policy, compile=True) as autop:
+        with AutoParallel(model, input_fn, mesh, mp_policy) as autop:
             assert any(n.meta.get("nn_module_stack") for n in autop.gm.graph.nodes)
             assert any(n.meta.get("fwd_nn_module_stack") for n in autop.gm.graph.nodes)
             autop.add_parameter_memory_constraint(low=None, high=None)
@@ -181,7 +182,7 @@ def multiple_process_run(rank, world_size, tmp_dir, model, sharding_map):
             param.data.zero_()
         new_optimizer = torch.optim.Adam(new_model.parameters())
 
-        with AutoParallel(model, input_fn, mesh, mp_policy, compile=True) as autop:
+        with AutoParallel(model, input_fn, mesh, mp_policy) as autop:
             assert any(n.meta.get("nn_module_stack") for n in autop.gm.graph.nodes)
             assert any(n.meta.get("fwd_nn_module_stack") for n in autop.gm.graph.nodes)
             autop.add_parameter_memory_constraint(low=None, high=None)
@@ -229,6 +230,8 @@ def multiple_process_run(rank, world_size, tmp_dir, model, sharding_map):
 
         parallel_mod.to_empty(device="cuda")
         parallel_mod.init_weights()
+
+        parallel_mod = torch.compile(parallel_mod, backend=autoparallel_backend())
 
         # Use smaller learning rate and gradient clipping for numerical stability
         optimizer = torch.optim.Adam(parallel_mod.parameters(), lr=2e-5)

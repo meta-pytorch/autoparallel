@@ -1039,9 +1039,7 @@ def test_dynamic_apply_placement_transformer(device_mesh_2d):
         model = TransformerBlock(nheads, dim1, dim2)
 
     placement = (Shard(0), Replicate())
-    with AutoParallel(
-        model, input_fn, device_mesh_2d, dynamic=True, compile=False
-    ) as autop:
+    with AutoParallel(model, input_fn, device_mesh_2d, dynamic=True) as autop:
         autop.add_input_constraints([placement])
         autop.add_output_constraints([placement])
         sharding_placement = autop.optimize_placement(verbose=False)
@@ -1065,9 +1063,7 @@ def test_dynamic_joint_graph_has_symbolic_shapes(device_mesh_2d):
         model = TransformerBlock(nheads, dim1, dim2)
 
     placement = (Shard(0), Replicate())
-    with AutoParallel(
-        model, input_fn, device_mesh_2d, dynamic=True, compile=False
-    ) as autop:
+    with AutoParallel(model, input_fn, device_mesh_2d, dynamic=True) as autop:
         autop.add_input_constraints([placement])
         autop.add_output_constraints([placement])
 
@@ -1149,9 +1145,7 @@ def test_dynamic_apply_placement_view_heavy(device_mesh_2d):
         model = ViewHeavyModel(dim, nheads)
 
     placement = (Shard(0), Replicate())
-    with AutoParallel(
-        model, input_fn, device_mesh_2d, dynamic=True, compile=False
-    ) as autop:
+    with AutoParallel(model, input_fn, device_mesh_2d, dynamic=True) as autop:
         autop.add_input_constraints([placement])
         autop.add_output_constraints([placement])
         sharding_placement = autop.optimize_placement(verbose=False)
@@ -1177,9 +1171,7 @@ def test_dynamic_apply_placement_factory_op(device_mesh_1d):
         model = FactoryOpModel(dim)
 
     placement = (Shard(0),)
-    with AutoParallel(
-        model, input_fn, device_mesh_1d, dynamic=True, compile=False
-    ) as autop:
+    with AutoParallel(model, input_fn, device_mesh_1d, dynamic=True) as autop:
         autop.add_input_constraints([placement])
         autop.add_output_constraints([placement])
         sharding_placement = autop.optimize_placement(verbose=False)

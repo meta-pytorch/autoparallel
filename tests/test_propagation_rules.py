@@ -9,6 +9,7 @@ from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor.placement_types import Shard
 
 from autoparallel.api import AutoParallel
+from autoparallel.compile import autoparallel_backend
 
 
 def test_permute_layernorm_stride_handling(device_mesh_1d):
@@ -54,9 +55,7 @@ def test_permute_layernorm_stride_handling(device_mesh_1d):
     )
 
     # This should not raise an AssertionError about tensor_meta stride mismatch.
-    with AutoParallel(
-        model, input_fn, device_mesh_1d, mp_policy, compile=True
-    ) as autop:
+    with AutoParallel(model, input_fn, device_mesh_1d, mp_policy) as autop:
         x_sharding = (Shard(0),)
         y_sharding = (Shard(0),)
 
@@ -76,6 +75,8 @@ def test_permute_layernorm_stride_handling(device_mesh_1d):
             torch.nn.init.ones_(param)
         elif "bias" in name:
             torch.nn.init.zeros_(param)
+
+    parallel_mod = torch.compile(parallel_mod, backend=autoparallel_backend())
 
     # Test forward pass execution works
     local_batch_size = batch_size // torch.distributed.get_world_size()
@@ -116,9 +117,7 @@ def test_iota(device_mesh_1d):
         param_dtype=torch.float32, reduce_dtype=torch.float32
     )
 
-    with AutoParallel(
-        model, input_fn, device_mesh_1d, mp_policy, compile=True
-    ) as autop:
+    with AutoParallel(model, input_fn, device_mesh_1d, mp_policy) as autop:
         autop.add_input_constraints([(Shard(0),)])
         autop.add_output_constraints([(Shard(0),)])
         sharding_placement = autop.optimize_placement()
@@ -126,6 +125,8 @@ def test_iota(device_mesh_1d):
 
     parallel_mod.to_empty(device="cuda")
     torch.nn.init.ones_(parallel_mod.embed.weight)
+
+    parallel_mod = torch.compile(parallel_mod, backend=autoparallel_backend())
 
     local_batch = batch_size // torch.distributed.get_world_size()
     x = torch.ones(local_batch, seq_len, dim, device="cuda")
@@ -175,9 +176,7 @@ def test_index_put(device_mesh_1d):
         param_dtype=torch.bfloat16, reduce_dtype=torch.float32
     )
 
-    with AutoParallel(
-        model, input_fn, device_mesh_1d, mp_policy, compile=True
-    ) as autop:
+    with AutoParallel(model, input_fn, device_mesh_1d, mp_policy) as autop:
         autop.add_input_constraints([(Shard(0),)])
         sharding_placement = autop.optimize_placement()
         autop.apply_placement(sharding_placement)

@@ -14,6 +14,7 @@ from torch.testing._internal.distributed.fake_pg import FakeStore
 
 from autoparallel._testing.models.llama3 import Transformer, TransformerModelArgs
 from autoparallel.api import AutoParallel
+from autoparallel.compile import autoparallel_backend
 from autoparallel.graph_passes.auto_bucketing import (
     aten_autobucketing_config,
     aten_autobucketing_reordering_pass,
@@ -216,9 +217,7 @@ def add_tp_constraints(autop):
 
 
 # parallelize the model
-with AutoParallel(
-    model, input_fn, mesh, mp_policy, compile=True, repeated_subgraphs=True
-) as autop:
+with AutoParallel(model, input_fn, mesh, mp_policy, repeated_subgraphs=True) as autop:
     autop.add_parameter_memory_constraint(low=None, high=None)
 
     x_sharding = (Shard(0),) + (Replicate(),) * (mesh.ndim - 1)
@@ -262,6 +261,9 @@ with AutoParallel(
 # run weight init on our sharded DTensor params
 parallel_mod.to_empty(device="cuda")
 parallel_mod.init_weights()
+
+# Compile with AutoParallel-optimized Inductor passes
+parallel_mod = torch.compile(parallel_mod, backend=autoparallel_backend())
 
 # now let's run it
 x = (
