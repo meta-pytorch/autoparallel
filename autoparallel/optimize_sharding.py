@@ -1066,6 +1066,8 @@ class ShardingOptimizer:
 
     def _to_concrete_solution(self, solution):
         """Translate a solution from original-graph nodes to concrete-graph nodes."""
+        if not self._orig_to_concrete:
+            return solution
         return {self._orig_to_concrete[node]: spec for node, spec in solution.items()}
 
     def get_solution(self, verbose=False):
@@ -1180,8 +1182,14 @@ class ShardingOptimizer:
             if out_idx is None:
                 continue
 
-            compute_cost = estimate_strategy_runtime_cost(node, strategy)
-            total_compute += compute_cost
+            node_idx = self.node_map[node]
+
+            # Use pre-computed costs from decision vars instead of
+            # estimate_strategy_runtime_cost, which needs node.meta["val"]
+            # (absent on loaded optimizers).
+            dv = self._resolve_decision_var((node_idx, 0, out_idx, 0))
+            num_args = max(len(strategy.input_specs), 1)
+            total_compute += dv.compute_cost * num_args
 
             input_nodes = self._all_input_nodes(node)
             for argi, pred in enumerate(input_nodes):
@@ -1299,6 +1307,8 @@ class ShardingOptimizer:
         """
         import copy
 
+        t0 = time.perf_counter()
+
         # Convert selected_keys to node-name-based representation (if solved)
         selected_keys_by_name = None
         if hasattr(self, "selected_keys"):
@@ -1310,11 +1320,17 @@ class ShardingOptimizer:
                     (argi, out_idx, inp_idx)
                 )
 
-        # Re-key strats by node name
-        strats_by_name = {node.name: strat for node, strat in self.strats.items()}
+        # Re-key strats by node name, saving only root nodes (non-linked).
+        # Linked nodes share identical strats with their root and are
+        # reconstructed on load from cluster_links.
+        linked_node_names = {self.nodes[lk[0]].name for lk in self.cluster_links}
+        strats_by_name = {
+            node.name: strat
+            for node, strat in self.strats.items()
+            if node.name not in linked_node_names
+        }
 
-        # Save decision var costs keyed by node name (not index, since
-        # node ordering can change after graph pickling).
+        # Save decision var costs for root nodes only.
         dv_costs = {}
         for key, dv in self.decision_vars.items():
             node_idx, argi, out_idx, inp_idx = key
@@ -1388,8 +1404,16 @@ class ShardingOptimizer:
             "constraint_log": self._constraint_log,
             "selected_keys_by_name": selected_keys_by_name,
         }
+        t1 = time.perf_counter()
+        logger.debug("save: prepared save_dict in %.3fs", t1 - t0)
         with _patch_op_overload_pickle():
             torch.save(save_dict, path)
+        logger.debug(
+            "save: wrote %s in %.3fs (total %.3fs)",
+            path,
+            time.perf_counter() - t1,
+            time.perf_counter() - t0,
+        )
 
     @classmethod
     def load(cls, path):
@@ -1402,21 +1426,32 @@ class ShardingOptimizer:
         # Ensure custom ops are registered before loading
         import autoparallel.cast_parametrization  # noqa: F401
 
+        t0 = time.perf_counter()
         with _patch_op_overload_pickle():
             save_dict = torch.load(path, weights_only=False)
+        t1 = time.perf_counter()
+        logger.debug("load: torch.load took %.3fs", t1 - t0)
         assert save_dict["version"] == 1, f"Unsupported version: {save_dict['version']}"
 
         graph = save_dict["graph"]
         strats_by_name = save_dict["strats_by_name"]
+        cluster_links_by_name = save_dict["cluster_links_by_name"]
 
         # Build node-name lookup from the graph
         nodes_by_name = {node.name: node for node in graph.nodes}
 
-        # Reconstruct strats keyed by Node objects (preserving graph order)
+        # Build linked_node_name -> root_node_name mapping (node-level)
+        linked_to_root_name = {}
+        for name_lk, name_rk in cluster_links_by_name.items():
+            linked_to_root_name.setdefault(name_lk[0], name_rk[0])
+
+        # Reconstruct strats: root strats are saved, linked strats copied
         strats = {}
         for node in graph.nodes:
             if node.name in strats_by_name:
                 strats[node] = strats_by_name[node.name]
+            elif node.name in linked_to_root_name:
+                strats[node] = strats_by_name[linked_to_root_name[node.name]]
 
         # Create optimizer without calling __init__
         opt = cls.__new__(cls)
@@ -1448,7 +1483,14 @@ class ShardingOptimizer:
         )
 
         # Rebuild PuLP variables and decision vars from saved costs.
+        t2 = time.perf_counter()
         opt.pulp_variables = opt._create_pulp_variables()
+        t3 = time.perf_counter()
+        logger.debug(
+            "load: _create_pulp_variables took %.3fs (%d vars)",
+            t3 - t2,
+            len(opt.pulp_variables),
+        )
         dv_costs = save_dict["dv_costs"]
         opt.decision_vars = {}
         for name_key, costs in dv_costs.items():
@@ -1471,6 +1513,12 @@ class ShardingOptimizer:
                     else None
                 ),
             )
+        t4 = time.perf_counter()
+        logger.debug(
+            "load: decision_vars rebuild took %.3fs (%d entries)",
+            t4 - t3,
+            len(opt.decision_vars),
+        )
 
         opt._root_to_linked = defaultdict(list)
         for linked_key, root_key in opt.cluster_links.items():
@@ -1478,6 +1526,8 @@ class ShardingOptimizer:
 
         opt.prob = pulp.LpProblem("AutoParallel", pulp.LpMinimize)
         opt.add_default_constraints()
+        t5 = time.perf_counter()
+        logger.debug("load: add_default_constraints took %.3fs", t5 - t4)
 
         # Replay user constraints
         for method_name, kwargs in save_dict["constraint_log"]:
@@ -1488,11 +1538,16 @@ class ShardingOptimizer:
                 node_name = kwargs.pop("node_name")
                 kwargs["node"] = nodes_by_name[node_name]
             method(**kwargs)
+        t6 = time.perf_counter()
+        logger.debug("load: constraint replay took %.3fs", t6 - t5)
 
         # Set objective and restore solution if one was saved
         opt._set_objective()
+        t7 = time.perf_counter()
+        logger.debug("load: _set_objective took %.3fs", t7 - t6)
         if save_dict["selected_keys_by_name"] is not None:
             opt._restore_solution(save_dict["selected_keys_by_name"], nodes_by_name)
+        logger.debug("load: total %.3fs", time.perf_counter() - t0)
 
         return opt
 
@@ -1505,9 +1560,12 @@ class ShardingOptimizer:
             for argi, out_idx, inp_idx in key_parts:
                 self.selected_keys.append((node_idx, argi, out_idx, inp_idx))
 
-        # Set PuLP variable values to match
-        for key, dv in self.decision_vars.items():
-            dv.var.varValue = 1.0 if key in set(self.selected_keys) else 0.0
+        # Set PuLP variable values: selected = 1.0, all others default to 0.0
+        selected_set = set(self.selected_keys)
+        for key in selected_set:
+            dv = self.decision_vars.get(key)
+            if dv is not None:
+                dv.var.varValue = 1.0
 
         # Expand cluster links
         for root_key in list(self.selected_keys):

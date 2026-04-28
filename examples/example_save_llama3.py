@@ -15,7 +15,9 @@ from torch.testing._internal.distributed.fake_pg import FakeStore
 from autoparallel._testing.models.llama3 import Transformer, TransformerModelArgs
 from autoparallel.api import AutoParallel
 
-logging.basicConfig(level=logging.WARNING)
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger("autoparallel")
+logger.setLevel(logging.DEBUG)
 
 world_size = 64
 fake_store = FakeStore()
@@ -67,11 +69,14 @@ with AutoParallel(model, input_fn, mesh, mp_policy) as autop:
     autop.add_output_constraints([(Shard(0), Shard(2))])
 
     sharding_placement = autop.optimize_placement(verbose=False)
+    print(f"Tracing + optimization took {time.time() - t0:.1f}s")
 
     # Save the full optimizer state
+    t_save = time.time()
     autop.sharding_optimizer.save("llama3_8b.ap")
-    print(f"Saved optimizer state to llama3_8b.ap ({time.time() - t0:.1f}s)")
+    print(f"Saved optimizer state to llama3_8b.ap ({time.time() - t_save:.1f}s)")
 
     # Also save a lightweight solution file
     autop.sharding_optimizer.save_solution("llama3_8b_solution.json")
     print("Saved solution to llama3_8b_solution.json")
+    print(f"Total time: {time.time() - t0:.1f}s")
