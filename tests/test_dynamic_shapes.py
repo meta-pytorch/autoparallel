@@ -721,6 +721,131 @@ class TestLocalizeShapeArg:
         assert result[0] == 4
         assert result[1] == 64
 
+    def test_uneven_shard_uses_ceiling_division(self):
+        """Uneven shard dim uses ceiling division: 10 / 3 → 4."""
+        from torch._subclasses import FakeTensorMode
+
+        from autoparallel.apply_sharding import _localize_shape_arg
+
+        fake_mode = FakeTensorMode()
+        node = self._make_node_with_shape((10, 128), fake_mode)
+        spec = self._make_output_spec([Shard(0)], (3,))
+
+        result = _localize_shape_arg(node, [10, 128], spec)
+
+        assert result[0] == 4  # ceil(10 / 3) = 4
+        assert result[1] == 128
+
+
+class TestHasRankVaryingSize:
+    """Tests for _has_rank_varying_size in apply_sharding."""
+
+    def _make_spec(self, placements, mesh_shape):
+        from torch.distributed._tensor.placement_types import DTensorSpec
+
+        class FakeMesh:
+            def __init__(self, shape):
+                self._shape = shape
+                self.ndim = len(shape)
+
+            @property
+            def shape(self):
+                return self._shape
+
+        return DTensorSpec(mesh=FakeMesh(mesh_shape), placements=tuple(placements))
+
+    def test_even_shard_not_varying(self):
+        from autoparallel.apply_sharding import _has_rank_varying_size
+
+        spec = self._make_spec([Shard(0)], (8,))
+        assert not _has_rank_varying_size(0, (256, 128), spec)
+        assert not _has_rank_varying_size(1, (256, 128), spec)
+
+    def test_uneven_shard_is_varying(self):
+        from autoparallel.apply_sharding import _has_rank_varying_size
+
+        spec = self._make_spec([Shard(0)], (3,))
+        assert _has_rank_varying_size(0, (10, 128), spec)
+        assert not _has_rank_varying_size(1, (10, 128), spec)
+
+    def test_replicate_not_varying(self):
+        from autoparallel.apply_sharding import _has_rank_varying_size
+
+        spec = self._make_spec([Replicate()], (8,))
+        assert not _has_rank_varying_size(0, (10, 128), spec)
+
+    def test_2d_mesh_uneven_on_second_dim(self):
+        from autoparallel.apply_sharding import _has_rank_varying_size
+
+        # Shard(0) on mesh dim 0 (size 32): 4096/32=128 → even
+        # Shard(1) on mesh dim 1 (size 6): 4096/6 → uneven
+        spec = self._make_spec([Shard(0), Shard(1)], (32, 6))
+        assert not _has_rank_varying_size(0, (4096, 4096), spec)
+        assert _has_rank_varying_size(1, (4096, 4096), spec)
+
+    def test_uneven_param_dim_becomes_symbolic_in_make_local_args(self):
+        """When a parameter is unevenly sharded, its local dim should be
+        symbolic so all ranks can share the same graph."""
+        from unittest.mock import patch
+
+        from torch._subclasses import FakeTensorMode
+        from torch.distributed.device_mesh import DeviceMesh
+        from torch.distributed.tensor._dtensor_spec import DTensorSpec, TensorMeta
+        from torch.distributed.tensor.placement_types import Replicate
+        from torch.fx import Graph, GraphModule
+        from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+        from autoparallel.apply_sharding import _make_local_args
+
+        shape_env = ShapeEnv()
+        fake_mode = FakeTensorMode(shape_env=shape_env, static_shapes=False)
+
+        # Parameter: concrete [400, 100], will be unevenly sharded on dim 0
+        with fake_mode:
+            param_tensor = torch.empty(400, 100, device="cpu")
+
+        graph = Graph()
+        p = graph.placeholder("param")
+        p.meta["val"] = param_tensor
+        graph.output((p,))
+        gm = GraphModule(torch.nn.Module(), graph)
+
+        mesh = DeviceMesh("cpu", torch.arange(7).reshape(1, 7))
+        spec = DTensorSpec(
+            mesh=mesh,
+            placements=(Replicate(), Shard(0)),
+            tensor_meta=TensorMeta(torch.Size([400, 100]), (100, 1), torch.float32),
+        )
+        sharding_placement = {
+            p: type("P", (), {"input_specs": (spec,)})(),
+        }
+
+        # Swap ShapeEnv (as apply_sharding_to_model does)
+        fake_mode.shape_env = ShapeEnv()
+
+        # The blocker: _make_local_args is called inside `with fake_mode:`
+        # (from _apply_placement_common in api.py). from_tensor doesn't create
+        # SymInts when the mode context was entered before the ShapeEnv swap.
+        with fake_mode:
+            with patch(
+                "autoparallel.apply_sharding.DTensor.from_local",
+                side_effect=lambda local, mesh, placements: type(
+                    "DummyDTensor",
+                    (),
+                    {
+                        "redistribute": lambda self, mesh, placements: self,
+                        "to_local": lambda self: local,
+                    },
+                )(),
+            ):
+                (local_param,) = _make_local_args(gm, sharding_placement)
+
+        # dim 0 is unevenly sharded (400 % 7 != 0) so it should be symbolic
+        assert any(isinstance(s, torch.SymInt) for s in local_param.shape), (
+            f"Uneven param dim should be symbolic but got concrete shape "
+            f"{local_param.shape}"
+        )
+
 
 class TestCheckForwardArgsMultiInput:
     """Tests for _check_forward_args with multiple inputs."""
@@ -1119,3 +1244,172 @@ def test_dynamic_vs_static_parity_view_heavy(device_mesh_2d):
         assert (
             target in d_targets
         ), f"Op {target} in static graph ({count}x) missing from dynamic"
+
+
+# ===== Uneven sharding integration tests =====
+
+
+@apply_cuda_patches
+def test_uneven_sharding_optimizer_includes_uneven_placements(device_mesh_2d):
+    """The optimizer should include Shard placements for dims that don't evenly
+    divide the mesh size, as long as the local shard is non-empty."""
+    # dim1=100, TP=8: 100 % 8 = 4, uneven but non-empty (ceil(100/8)=13)
+    dim1 = 100
+    dim2 = 400
+
+    with torch.device("meta"):
+        model = FFN(dim1, dim2)
+
+    def input_fn():
+        bs = 8 * device_mesh_2d.shape[0]
+        return torch.randn(bs, dim1, device="cuda")
+
+    placement = (Shard(0), Replicate())
+
+    with AutoParallel(model, input_fn, device_mesh_2d, dynamic=True) as autop:
+        autop.add_input_constraints([placement])
+        autop.add_output_constraints([placement])
+
+        # Check that Shard(1) on TP dim is available for w1 [dim2, dim1]
+        # dim2=400, TP=8: 400 % 8 = 0 (even, always available)
+        # dim1=100, TP=8: 100 % 8 = 4 (uneven, should now be available)
+        param_nodes = get_param_nodes(autop.sharding_optimizer.graph)
+        w1_strat = autop.sharding_optimizer.strats[param_nodes[0]]
+        w1_shape = param_nodes[0].meta["val"].shape
+
+        tp_shard_placements = set()
+        for s in w1_strat.strategies:
+            tp_placement = s.output_specs.placements[1]
+            if tp_placement.is_shard():
+                tp_shard_placements.add(tp_placement.dim)
+
+        # Both Shard(0) and Shard(1) should be available on TP
+        assert 0 in tp_shard_placements, (
+            f"Shard(0) on TP missing for w1 {w1_shape} "
+            f"(available: {tp_shard_placements})"
+        )
+        assert 1 in tp_shard_placements, (
+            f"Shard(1) on TP missing for w1 {w1_shape} — "
+            f"uneven sharding not enabled? "
+            f"(available: {tp_shard_placements})"
+        )
+
+
+@apply_cuda_patches
+def test_uneven_sharding_optimize_and_apply(device_mesh_2d):
+    """Full pipeline: optimize + apply_placement with forced uneven sharding."""
+    dim1 = 100
+    dim2 = 400
+
+    with torch.device("meta"):
+        model = FFN(dim1, dim2)
+
+    def input_fn():
+        bs = 8 * device_mesh_2d.shape[0]
+        return torch.randn(bs, dim1, device="cuda")
+
+    placement = (Shard(0), Replicate())
+
+    with AutoParallel(model, input_fn, device_mesh_2d, dynamic=True) as autop:
+        autop.add_input_constraints([placement])
+        autop.add_output_constraints([placement])
+
+        # Force an uneven shard: w1 is [400, 100], Shard(1) on TP=8
+        # 100 % 8 = 4, so local size is ceil(100/8)=13 for most ranks
+        param_nodes = get_param_nodes(autop.sharding_optimizer.graph)
+        autop.sharding_optimizer.add_node_constraint(
+            param_nodes[0], placement=(Replicate(), Shard(1))
+        )
+
+        sharding_placement = autop.optimize_placement(verbose=False)
+        autop.apply_placement(sharding_placement)
+
+    # Verify the parallel graph has symbolic dims for the uneven param
+    pgm = autop.joint_with_descriptors.graph_module
+    param_placeholder = next(
+        n for n in pgm.graph.nodes if n.op == "placeholder" and n.name == "primals_1"
+    )
+    val = param_placeholder.meta["val"]
+    # The unevenly-sharded dim should be symbolic
+    has_symbolic = any(isinstance(s, torch.SymInt) for s in val.shape)
+    assert has_symbolic, (
+        f"Unevenly-sharded param should have symbolic dims but got "
+        f"concrete shape {val.shape}"
+    )
+
+
+@apply_cuda_patches
+def test_uneven_sharding_parallel_graph_has_pad_ops(device_mesh_2d):
+    """The parallel graph should contain pad + slice ops for uneven sharding."""
+    # Use a single linear to have precise control over which dim is sharded.
+    # nn.Linear(100, 400) has weight [400, 100]. Forcing Shard(0) on TP
+    # means the output dim (400) is sharded: 400 % 8 = 0 (even, no pad).
+    # Instead, use nn.Linear(400, 100) with weight [100, 400]. Force Shard(1)
+    # to shard dim 1 (size 400): 400 % 8 = 0 (also even).
+    # To get uneven: use dim=100 with TP=8: 100 % 8 = 4.
+    # nn.Linear(100, 50) has weight [50, 100]. Force Shard(1) on TP=8:
+    # shards dim 1 (100), which is the contracting dim → requires all-gather.
+
+    class SingleLinear(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.w = nn.Linear(100, 50, bias=False)
+
+        def forward(self, x):
+            return self.w(x)
+
+    with torch.device("meta"):
+        model = SingleLinear()
+
+    def input_fn():
+        bs = 8 * device_mesh_2d.shape[0]
+        return torch.randn(bs, 100, device="cuda", requires_grad=True)
+
+    placement = (Shard(0), Replicate())
+
+    with AutoParallel(model, input_fn, device_mesh_2d, dynamic=True) as autop:
+        autop.add_input_constraints([placement])
+        autop.add_output_constraints([placement])
+
+        # Force Shard(1) on TP for w [50, 100]: shards contracting dim
+        # 100 % 8 = 4, uneven → requires all-gather with pad/unpad
+        param_nodes = get_param_nodes(autop.sharding_optimizer.graph)
+        autop.sharding_optimizer.add_node_constraint(
+            param_nodes[0], placement=(Replicate(), Shard(1))
+        )
+
+        sharding_placement = autop.optimize_placement(verbose=False)
+        autop.apply_placement(sharding_placement)
+
+    pgm = autop.joint_with_descriptors.graph_module
+
+    # Check for pad op (constant_pad_nd) in the parallel graph
+    pad_ops = [
+        n
+        for n in pgm.graph.nodes
+        if n.op == "call_function"
+        and n.target == torch.ops.aten.constant_pad_nd.default
+    ]
+    assert (
+        len(pad_ops) > 0
+    ), "Expected constant_pad_nd ops for uneven sharding but found none"
+
+    # Check for slice/narrow op (unpad after all-gather)
+    slice_ops = [
+        n
+        for n in pgm.graph.nodes
+        if n.op == "call_function"
+        and n.target in (torch.ops.aten.slice.Tensor, torch.ops.aten.narrow.default)
+    ]
+    assert (
+        len(slice_ops) > 0
+    ), "Expected slice/narrow ops for unpadding after all-gather but found none"
+
+    # The pad op should have a symbolic pad size argument
+    pad_node = pad_ops[0]
+    pad_args = pad_node.args[1]  # the pad list
+    has_symbolic_pad = any(isinstance(a, torch.fx.Node) for a in pad_args)
+    assert has_symbolic_pad, (
+        f"Pad size should be symbolic (FX Node) for rank-independent graph, "
+        f"but got concrete pad args: {pad_args}"
+    )

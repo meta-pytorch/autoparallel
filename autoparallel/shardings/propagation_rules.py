@@ -176,8 +176,8 @@ def remove_invalid_configs(out_strat, mesh):
             for mesh_shape, plc in zip(mesh.shape, spec.placements):
                 if plc.is_shard():
                     dim = plc.dim
-                    if shape[dim] % mesh_shape == 0:
-                        shape[dim] //= mesh_shape
+                    if shape[dim] >= mesh_shape:
+                        shape[dim] = (shape[dim] + mesh_shape - 1) // mesh_shape
                     else:
                         is_valid = False
                         break

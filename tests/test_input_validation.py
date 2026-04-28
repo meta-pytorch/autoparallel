@@ -78,6 +78,20 @@ def test_compute_expected_inputs_replicated(device_mesh_1d):
     assert result[0].shape == (512, 128)
 
 
+def test_compute_expected_inputs_uneven(device_mesh_2d):
+    """Uneven shard uses ceiling division for expected local shape."""
+    mesh = device_mesh_2d
+    tp_size = mesh.size(1)  # 8
+
+    traced = [torch.empty(10, 128, device="meta")]
+    placements = [(Replicate(), Shard(0))]
+
+    result = _compute_expected_inputs(traced, placements, mesh)
+    assert len(result) == 1
+    expected_dim0 = (10 + tp_size - 1) // tp_size  # ceil(10/8) = 2
+    assert result[0].shape == (expected_dim0, 128)
+
+
 def test_forward_input_validation_integration(device_mesh_1d):
     """Integration test: AutoParallelModule.forward rejects invalid inputs."""
     dim = 128
