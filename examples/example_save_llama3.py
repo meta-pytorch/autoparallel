@@ -60,9 +60,7 @@ with torch.device("meta"):
 mp_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
 
 t0 = time.time()
-with AutoParallel(
-    model, input_fn, mesh, mp_policy, compile=True, repeated_subgraphs=True
-) as autop:
+with AutoParallel(model, input_fn, mesh, mp_policy) as autop:
     autop.add_parameter_memory_constraint(low=None, high=None)
     x_sharding = (Shard(0),) + (Replicate(),) * (mesh.ndim - 1)
     autop.add_input_constraints([x_sharding])
