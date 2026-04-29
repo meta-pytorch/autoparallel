@@ -43,6 +43,11 @@ def _extract_module_path(node: torch.fx.Node) -> str | None:
     mp = node.meta.get("module_path")
     if mp is not None:
         return mp
+    if node.op == "placeholder":
+        desc = node.meta.get("desc")
+        target = getattr(desc, "target", None)
+        if isinstance(target, str) and target:
+            return target
     stack = node.meta.get("nn_module_stack") or node.meta.get("fwd_nn_module_stack")
     if not stack:
         return None
@@ -198,8 +203,9 @@ def export_sharding_json(
             dv = dvs.get(argi)
             dst_placement = _pretty_print(dv.input_spec) if dv is not None else None
             comm_cost = dv.comm_cost if dv is not None else 0.0
+            transition_cost = dv.sharding_transition_cost if dv is not None else 0.0
             node_comm += comm_cost
-            node_transition += dv.sharding_transition_cost if dv is not None else 0.0
+            node_transition += transition_cost
 
             inputs.append(
                 {
@@ -207,6 +213,7 @@ def export_sharding_json(
                     "src_placement": src_placement,
                     "dst_placement": dst_placement,
                     "comm_cost": comm_cost,
+                    "transition_cost": transition_cost,
                 }
             )
 
@@ -223,7 +230,22 @@ def export_sharding_json(
             "placement": placement,
             "inputs": inputs,
             "compute_cost": compute_cost,
+            "transition_cost": node_transition,
         }
+
+        # For placeholder nodes, classify as param/buffer/input/tangent
+        # using the AOT desc metadata.
+        if node.op == "placeholder":
+            desc = node.meta.get("desc")
+            desc_name = type(desc).__name__ if desc is not None else None
+            if desc_name == "ParamAOTInput":
+                entry["placeholder_kind"] = "param"
+            elif desc_name == "BufferAOTInput":
+                entry["placeholder_kind"] = "buffer"
+            elif desc_name == "TangentAOTInput":
+                entry["placeholder_kind"] = "tangent"
+            elif desc_name == "PlainAOTInput":
+                entry["placeholder_kind"] = "input"
 
         if dtype is not None:
             entry["dtype"] = dtype
