@@ -1337,17 +1337,25 @@ class ShardingOptimizer:
             if node.name not in linked_node_names
         }
 
-        # Save decision var costs for root nodes only.
-        dv_costs = {}
-        for key, dv in self.decision_vars.items():
+        # Save decision var costs as compact numpy arrays. Indices use int32,
+        # costs use float64 to preserve full precision (matching the in-memory
+        # representation used by the ILP solver).
+        import numpy as np
+
+        save_node_names = [n.name for n in self.nodes]
+        save_node_to_idx = {name: i for i, name in enumerate(save_node_names)}
+        n_dvs = len(self.decision_vars)
+        dv_costs_keys = np.empty((n_dvs, 4), dtype=np.int32)
+        dv_costs_vals = np.empty((n_dvs, 3), dtype=np.float64)
+        for row_idx, (key, dv) in enumerate(self.decision_vars.items()):
             node_idx, argi, out_idx, inp_idx = key
-            name_key = (self.nodes[node_idx].name, argi, out_idx, inp_idx)
-            dv_costs[name_key] = {
-                "cost": dv.cost,
-                "compute_cost": dv.compute_cost,
-                "comm_cost": dv.comm_cost,
-                "sharding_transition_cost": dv.sharding_transition_cost,
-            }
+            save_node_idx = save_node_to_idx[self.nodes[node_idx].name]
+            dv_costs_keys[row_idx] = (save_node_idx, argi, out_idx, inp_idx)
+            dv_costs_vals[row_idx] = (
+                dv.compute_cost,
+                dv.comm_cost,
+                dv.sharding_transition_cost,
+            )
 
         # Deepcopy the graph and keep only picklable metadata that we need.
         # - desc: needed by add_forward_backward_consistency_constraints
@@ -1398,14 +1406,11 @@ class ShardingOptimizer:
             ),
             "rescale_grad_comm_cost_for_mp": self.rescale_grad_comm_cost_for_mp,
             "strats_by_name": strats_by_name,
-            "dv_costs": dv_costs,
-            "cluster_links_by_name": {
-                (self.nodes[lk[0]].name, lk[1], lk[2], lk[3]): (
-                    self.nodes[rk[0]].name,
-                    rk[1],
-                    rk[2],
-                    rk[3],
-                )
+            "dv_costs_node_names": save_node_names,
+            "dv_costs_keys": dv_costs_keys,
+            "dv_costs_vals": dv_costs_vals,
+            "cluster_links_node_by_name": {
+                self.nodes[lk[0]].name: self.nodes[rk[0]].name
                 for lk, rk in self.cluster_links.items()
             },
             "constraint_log": self._constraint_log,
@@ -1442,15 +1447,13 @@ class ShardingOptimizer:
 
         graph = save_dict["graph"]
         strats_by_name = save_dict["strats_by_name"]
-        cluster_links_by_name = save_dict["cluster_links_by_name"]
+        cluster_links_node_by_name = save_dict["cluster_links_node_by_name"]
 
         # Build node-name lookup from the graph
         nodes_by_name = {node.name: node for node in graph.nodes}
 
-        # Build linked_node_name -> root_node_name mapping (node-level)
-        linked_to_root_name = {}
-        for name_lk, name_rk in cluster_links_by_name.items():
-            linked_to_root_name.setdefault(name_lk[0], name_rk[0])
+        # Build linked_node_name -> root_node_name mapping (already node-level)
+        linked_to_root_name = dict(cluster_links_node_by_name)
 
         # Reconstruct strats: root strats are saved, linked strats copied
         strats = {}
@@ -1473,14 +1476,23 @@ class ShardingOptimizer:
         opt._constraint_log = []
         opt._name_counters = {}
 
-        # Reconstruct cluster_links by resolving node names to indices
+        # Reconstruct cluster_links by expanding the node-level mapping over
+        # all (argi, out_idx, inp_idx) combinations. By construction in
+        # create_cluster_links, the argi/out_idx/inp_idx are identical
+        # between linked and root keys.
         opt.cluster_links = {}
-        for name_lk, name_rk in save_dict["cluster_links_by_name"].items():
-            lk_node = nodes_by_name[name_lk[0]]
-            rk_node = nodes_by_name[name_rk[0]]
-            lk = (opt.node_map[lk_node], name_lk[1], name_lk[2], name_lk[3])
-            rk = (opt.node_map[rk_node], name_rk[1], name_rk[2], name_rk[3])
-            opt.cluster_links[lk] = rk
+        for linked_name, root_name in cluster_links_node_by_name.items():
+            linked_node = nodes_by_name[linked_name]
+            root_node = nodes_by_name[root_name]
+            linked_idx = opt.node_map[linked_node]
+            root_idx = opt.node_map[root_node]
+            for argi, out_idx, inp_idx in opt.walk_over_options(linked_node):
+                opt.cluster_links[(linked_idx, argi, out_idx, inp_idx)] = (
+                    root_idx,
+                    argi,
+                    out_idx,
+                    inp_idx,
+                )
         opt._cluster_linked_node_idxs = {key[0] for key in opt.cluster_links}
 
         # Mesh placeholder — provides shape/dim_names for get_json() and ndim
@@ -1498,20 +1510,29 @@ class ShardingOptimizer:
             t3 - t2,
             len(opt.pulp_variables),
         )
-        dv_costs = save_dict["dv_costs"]
+        # Reconstruct decision_vars from compact tensors.
+        # Keys: int32 [num_dvs, 4] = [node_idx, argi, out_idx, inp_idx]
+        # Vals: float32 [num_dvs, 3] = [compute, comm, transition]
+        save_node_names = save_dict["dv_costs_node_names"]
+        keys_t = save_dict["dv_costs_keys"].tolist()
+        vals_t = save_dict["dv_costs_vals"].tolist()
         opt.decision_vars = {}
-        for name_key, costs in dv_costs.items():
-            node_name, argi, out_idx, inp_idx = name_key
+        for (save_node_idx, argi, out_idx, inp_idx), (
+            compute_cost,
+            comm_cost,
+            transition_cost,
+        ) in zip(keys_t, vals_t):
+            node_name = save_node_names[save_node_idx]
             node = nodes_by_name[node_name]
             node_idx = opt.node_map[node]
             key = (node_idx, argi, out_idx, inp_idx)
             strategy = opt.strats[node].strategies[out_idx]
             opt.decision_vars[key] = DecisionVar(
                 var=opt.pulp_variables[key],
-                cost=costs["cost"],
-                compute_cost=costs["compute_cost"],
-                comm_cost=costs["comm_cost"],
-                sharding_transition_cost=costs["sharding_transition_cost"],
+                cost=compute_cost + comm_cost + transition_cost,
+                compute_cost=compute_cost,
+                comm_cost=comm_cost,
+                sharding_transition_cost=transition_cost,
                 strategy=strategy,
                 output_spec=strategy.output_specs,
                 input_spec=(

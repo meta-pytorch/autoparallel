@@ -69,16 +69,82 @@ _STRATEGY_BGS = {
 _MODULE_PATH_PREFIXES = ("L['self'].", "_export_root.")
 
 
+def _parse_placement_dims(p):
+    """Parse a placement string into a list of per-mesh-dim placements.
+
+    Returns a list of strings like ['R', 'S(0)', 'P(sum)'].
+    """
+    if not p:
+        return []
+    parts = []
+    i = 0
+    s = p.strip()
+    while i < len(s):
+        if s[i] == "S" and i + 1 < len(s) and s[i + 1] == "(":
+            end = s.index(")", i)
+            parts.append(s[i : end + 1])
+            i = end + 1
+        elif s[i] == "P" and i + 1 < len(s) and s[i + 1] == "(":
+            end = s.index(")", i)
+            parts.append(s[i : end + 1])
+            i = end + 1
+        elif s[i] == "R":
+            parts.append("R")
+            i += 1
+        else:
+            i += 1
+    return parts
+
+
+def _classify_dim_transition(src_dim, dst_dim):
+    """Classify what happens on a single mesh dim from src to dst.
+
+    Returns (collective_name, is_free) where collective_name is None
+    if no communication happens.
+    """
+    if src_dim == dst_dim:
+        return None, True
+    if src_dim == "R" and dst_dim.startswith("S("):
+        return None, True  # local slicing
+    if src_dim.startswith("S(") and dst_dim == "R":
+        return "AllGather", False
+    if src_dim.startswith("P(") and dst_dim == "R":
+        return "AllReduce", False
+    if src_dim.startswith("P(") and dst_dim.startswith("S("):
+        return "ReduceScatter", False
+    if src_dim.startswith("S(") and dst_dim.startswith("S("):
+        return "AllToAll", False
+    return "Redistribute", False
+
+
 def _infer_collective(src, dst):
+    """Infer the collective(s) for a placement transition by analyzing
+    each mesh dimension independently."""
     if not src or not dst or src == dst:
         return None
-    if "P(sum)" in src and "S(" in dst:
-        return "ReduceScatter"
-    if "S(" in src and "R" in dst and "P" not in dst:
-        return "AllGather"
-    if "P(sum)" in src and "R" in dst:
-        return "AllReduce"
-    return "Redistribute"
+    src_dims = _parse_placement_dims(src)
+    dst_dims = _parse_placement_dims(dst)
+    if len(src_dims) != len(dst_dims) or not src_dims:
+        # Fall back to the simple heuristic for unparseable placements
+        if "P(sum)" in src and "S(" in dst:
+            return "ReduceScatter"
+        if "P(sum)" in src and "R" in dst:
+            return "AllReduce"
+        if "S(" in src and "R" in dst and "P" not in dst:
+            return "AllGather"
+        return "Redistribute"
+
+    collectives = []
+    for sd, dd in zip(src_dims, dst_dims):
+        coll, _ = _classify_dim_transition(sd, dd)
+        if coll is not None:
+            collectives.append(coll)
+
+    if not collectives:
+        return None  # all transitions are free (no comm)
+    if len(collectives) == 1:
+        return collectives[0]
+    return "+".join(collectives)
 
 
 def _node_total_comm(n):
@@ -87,6 +153,13 @@ def _node_total_comm(n):
 
 def _node_total_cost(n):
     return _node_total_comm(n) + n.get("compute_cost", 0)
+
+
+def _fmt_us(us):
+    """Format microseconds as a human-readable string."""
+    if us >= 1000:
+        return f"{us / 1000:.1f}ms"
+    return f"{us:.0f}\u00b5s"
 
 
 def _placement_tooltip(placement, shape, dtype, mesh):
@@ -462,6 +535,8 @@ def generate_visualization_html(data: dict) -> str:
 
     layer_costs = {}  # layer_idx -> {"comm": float, "compute": float, "num_nodes": int}
     non_layer_cost = {"comm": 0.0, "compute": 0.0, "num_nodes": 0, "name": "non-layer"}
+    # Detailed per-layer collective breakdown
+    layer_collectives = {}  # layer_idx -> list of (module_suffix, coll_type, cost)
     for n in display_nodes:
         mp = n.get("module_path", "")
         m = _re.search(r"layers\.(\d+)", mp)
@@ -471,9 +546,17 @@ def generate_visualization_html(data: dict) -> str:
             idx = int(m.group(1))
             if idx not in layer_costs:
                 layer_costs[idx] = {"comm": 0.0, "compute": 0.0, "num_nodes": 0}
+                layer_collectives[idx] = []
             layer_costs[idx]["comm"] += comm
             layer_costs[idx]["compute"] += compute
             layer_costs[idx]["num_nodes"] += 1
+            # Collect per-edge collectives for this node (skip zero-cost)
+            for coll_name, coll_type, cfrom, cto, ccost in n["_collectives"]:
+                if ccost <= 0:
+                    continue
+                # Extract module suffix after layers.N.
+                suffix = _re.sub(r".*layers\.\d+\.?", "", _strip_module_prefix(mp))
+                layer_collectives[idx].append((suffix or mp, coll_type, ccost))
         else:
             non_layer_cost["comm"] += comm
             non_layer_cost["compute"] += compute
@@ -654,11 +737,6 @@ def generate_visualization_html(data: dict) -> str:
 
     # Per-layer cost breakdown (only if layers exist)
     if layer_costs:
-        all_layer_entries = [(f"Layer {idx}", lc) for idx, lc in sorted(layer_costs.items())]
-        if non_layer_cost["num_nodes"] > 0:
-            all_layer_entries.append(("Non-layer ops", non_layer_cost))
-        layer_max = max((lc["comm"] + lc["compute"]) for _, lc in all_layer_entries) or 1
-
         # Check if all layers have the same cost (clustered)
         layer_vals = list(layer_costs.values())
         all_same = len(layer_vals) > 1 and all(
@@ -666,27 +744,83 @@ def generate_visualization_html(data: dict) -> str:
             and abs(lc["compute"] - layer_vals[0]["compute"]) < 0.01
             for lc in layer_vals[1:]
         )
-        layer_note = ""
+
+        # Use a representative layer for the detailed breakdown
+        repr_idx = sorted(layer_costs.keys())[0]
+        repr_costs = layer_costs[repr_idx]
+        repr_colls = layer_collectives.get(repr_idx, [])
+
+        # Aggregate collectives by (module, type)
+        coll_groups = {}
+        for suffix, coll_type, ccost in repr_colls:
+            key = (coll_type, suffix)
+            if key not in coll_groups:
+                coll_groups[key] = {"cost": 0.0, "count": 0}
+            coll_groups[key]["cost"] += ccost
+            coll_groups[key]["count"] += 1
+
+        # Sort by cost descending
+        sorted_colls = sorted(coll_groups.items(), key=lambda x: -x[1]["cost"])
+
+        layer_title = "Cost by Layer"
         if all_same and has_clusters:
-            per_layer_total = layer_vals[0]["comm"] + layer_vals[0]["compute"]
-            layer_note = f'<p style="font-size:12px;color:#64748b;margin-bottom:10px">All {len(layer_vals)} layers have identical costs ({per_layer_total:.0f} per layer = {per_layer_total * len(layer_vals):.0f} total)</p>'
+            n_layers = len(layer_vals)
+            per_layer_total = repr_costs["comm"] + repr_costs["compute"]
+            layer_title += f' (all {n_layers} layers identical, showing layer {repr_idx})'
 
         html += f'''
-<div class="card"><div class="card-title">Cost by Layer</div>
-{layer_note}'''
-        for name, lc in all_layer_entries:
-            total = lc["comm"] + lc["compute"]
-            if total == 0:
-                continue
-            comm_w = lc["comm"] / layer_max * 100
-            comp_w = lc["compute"] / layer_max * 100
-            html += f'''<div class="cost-bar-container">
-  <div class="cost-bar-label"><span style="font-weight:600">{_esc(name)}</span><span style="color:#64748b">{lc["num_nodes"]} ops &middot; comm: {lc["comm"]:.0f} &middot; compute: {lc["compute"]:.0f}</span></div>
+<div class="card"><div class="card-title">{_esc(layer_title)}</div>'''
+
+        # Compute bar: full width reference
+        bar_max = repr_costs["compute"] or 1
+
+        html += f'''<div class="cost-bar-container">
+  <div class="cost-bar-label"><span style="font-weight:600">Compute</span><span style="color:#64748b">{_fmt_us(repr_costs["compute"])}</span></div>
   <div class="cost-bar">
-    <div class="cost-bar-segment" style="width:{comm_w}%;background:#DC2626"></div>
-    <div class="cost-bar-segment" style="width:{comp_w}%;background:#10B981"></div>
+    <div class="cost-bar-segment" style="width:100%;background:#10B981"></div>
   </div>
 </div>'''
+
+        # Individual collective bars, scaled relative to compute
+        for (coll_type, suffix), info in sorted_colls:
+            if info["cost"] == 0:
+                continue
+            w = min(info["cost"] / bar_max * 100, 100)
+            label = f'{coll_type}'
+            if suffix:
+                label += f' ({suffix})'
+            html += f'''<div class="cost-bar-container">
+  <div class="cost-bar-label"><span>{_esc(label)}</span><span style="color:#64748b">{_fmt_us(info["cost"])}</span></div>
+  <div class="cost-bar">
+    <div class="cost-bar-segment" style="width:{w}%;background:#DC2626"></div>
+  </div>
+</div>'''
+
+        # Summary line
+        total_comm = repr_costs["comm"]
+        total_compute = repr_costs["compute"]
+        total = total_comm + total_compute
+        if total > 0:
+            comm_frac = total_comm / total * 100
+            n_layers = len(layer_costs)
+            html += f'<p style="font-size:12px;color:#64748b;margin-top:8px">Per layer: compute={_fmt_us(total_compute)}, comm={_fmt_us(total_comm)} ({comm_frac:.0f}% of layer cost)'
+            if n_layers > 1:
+                html += f' &middot; {n_layers} layers total: {_fmt_us(total * n_layers)}'
+            html += '</p>'
+
+        # Non-layer ops
+        if non_layer_cost["num_nodes"] > 0:
+            nl_total = non_layer_cost["comm"] + non_layer_cost["compute"]
+            if nl_total > 0:
+                nl_w = min(nl_total / bar_max * 100, 100)
+                html += f'''<div class="cost-bar-container" style="margin-top:12px">
+  <div class="cost-bar-label"><span style="font-weight:600">Non-layer ops</span><span style="color:#64748b">{non_layer_cost["num_nodes"]} ops &middot; {_fmt_us(nl_total)}</span></div>
+  <div class="cost-bar">
+    <div class="cost-bar-segment" style="width:{min(non_layer_cost["comm"] / bar_max * 100, 100)}%;background:#DC2626"></div>
+    <div class="cost-bar-segment" style="width:{min(non_layer_cost["compute"] / bar_max * 100, 100)}%;background:#10B981"></div>
+  </div>
+</div>'''
+
         html += '</div>'
 
     html += '''
