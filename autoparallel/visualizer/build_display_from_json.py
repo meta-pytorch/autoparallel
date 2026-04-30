@@ -10,6 +10,8 @@ Supports cluster collapsing for multi-layer models, phase filtering,
 redistribution highlighting, and hierarchical module tree view.
 """
 
+import json
+
 
 def _classify_placement(placement):
     if not placement:
@@ -1191,6 +1193,339 @@ def _build_strategy_overview_html(non_param_nodes, layer_costs):
     return html
 
 
+def _build_estimated_trace_html(non_param_nodes):
+    nodes = [
+        n
+        for n in non_param_nodes
+        if n.get("op") not in {"placeholder", "output"}
+    ]
+    if not nodes:
+        return (
+            '<div class="card"><div class="card-title">Estimated Execution Trace</div>'
+            '<div style="font-size:12px;color:#64748b">No execution nodes available.</div></div>'
+        )
+
+    def collective_kind(inp):
+        return _infer_collective(inp.get("src_placement"), inp.get("dst_placement"))
+
+    def stage_label(n):
+        mp = _strip_module_prefix(n.get("module_path", "") or "")
+        if ".attention." in mp:
+            return "attention"
+        if ".feed_forward." in mp:
+            return "feed_forward"
+        if "norm" in mp:
+            return "norm"
+        if "tok_embeddings" in mp:
+            return "embedding"
+        if mp.startswith("output"):
+            return "output"
+        return "other"
+
+    def node_label(n):
+        mp = _strip_module_prefix(n.get("module_path", "") or "")
+        if mp:
+            return mp
+        return n.get("name", "")
+
+    lanes = [
+        {"id": "fwd", "label": "Forward Compute", "items": []},
+        {"id": "comm", "label": "Redistribution Stream", "items": []},
+        {"id": "bwd", "label": "Backward Compute", "items": []},
+    ]
+    lane_map = {lane["id"]: lane for lane in lanes}
+    nodes_by_name = {n["name"]: n for n in nodes}
+    compute_clock = {"forward": 0.0, "backward": 0.0}
+    comm_clock = 0.0
+    ready_time = {}
+
+    ordered_nodes = sorted(
+        nodes,
+        key=lambda n: (0 if n.get("phase") == "forward" else 1, n.get("name", "")),
+    )
+
+    for n in ordered_nodes:
+        phase = n.get("phase") or "forward"
+        lane_id = "fwd" if phase == "forward" else "bwd"
+        input_ready = 0.0
+        comm_end_times = []
+        for idx, inp in enumerate(n.get("inputs", [])):
+            pred = nodes_by_name.get(inp.get("name"))
+            pred_ready = ready_time.get(inp.get("name"), 0.0)
+            input_ready = max(input_ready, pred_ready)
+            comm = inp.get("comm_cost", 0.0)
+            trans = inp.get("transition_cost", 0.0)
+            total = comm + trans
+            coll = collective_kind(inp)
+            if total <= 0 or not coll:
+                continue
+            start = max(comm_clock, pred_ready)
+            end = start + total
+            comm_clock = end
+            comm_end_times.append(end)
+            lane_map["comm"]["items"].append(
+                {
+                    "label": node_label(n),
+                    "short": f'arg{idx}',
+                    "stage": stage_label(n),
+                    "start": start,
+                    "dur": total,
+                    "kind": "comm",
+                    "subtitle": (
+                        f'{coll} · {inp.get("src_placement") or "?"} → '
+                        f'{inp.get("dst_placement") or "?"}'
+                    ),
+                }
+            )
+
+        start = max(compute_clock[phase], input_ready, max(comm_end_times, default=0.0))
+        dur = n.get("compute_cost", 0.0)
+        end = start + dur
+        ready_time[n["name"]] = max(end, max(comm_end_times, default=0.0), input_ready)
+        compute_clock[phase] = end
+        if dur <= 0:
+            continue
+        lane_map[lane_id]["items"].append(
+            {
+                "label": node_label(n),
+                "short": node_label(n).split(".")[-1],
+                "stage": stage_label(n),
+                "start": start,
+                "dur": dur,
+                "kind": "compute",
+                "subtitle": (
+                    f'{n.get("placement", "")} · compute {_fmt_us(n.get("compute_cost", 0))}'
+                ),
+            }
+        )
+
+    total_span = max(
+        max((ready_time.values()), default=0.0),
+        comm_clock,
+        1.0,
+    )
+
+    def stage_color(stage):
+        return {
+            "embedding": "#0EA5E9",
+            "attention": "#8B5CF6",
+            "feed_forward": "#F59E0B",
+            "norm": "#14B8A6",
+            "output": "#EC4899",
+            "other": "#64748B",
+        }.get(stage, "#64748B")
+
+    ticks = []
+    for i in range(9):
+        frac = i / 8
+        ticks.append(
+            {
+                "left": frac * 100,
+                "label": _fmt_us(total_span * frac),
+            }
+        )
+
+    html = (
+        '<div class="card"><div class="card-title">Estimated Execution Trace</div>'
+        '<div class="overview-note">Synthetic global timeline from exported cost estimates. '
+        'Redistributions run on a separate communication lane, and compute waits for required incoming layout changes.</div>'
+        '<div class="trace-controls">'
+        '<button class="filter-btn" onclick="adjustTraceZoom(this, -0.25)">-</button>'
+        '<button class="filter-btn active" onclick="resetTraceZoom(this)">100%</button>'
+        '<button class="filter-btn" onclick="adjustTraceZoom(this, 0.25)">+</button>'
+        f'<span class="overview-note" style="margin:0">Total span: {_fmt_us(total_span)}</span>'
+        '</div>'
+        '<div class="trace-scroll">'
+        '<div class="trace-axis-row"><div class="trace-lane-label"></div>'
+        '<div class="trace-scalable trace-axis">'
+    )
+    for tick in ticks:
+        html += (
+            f'<div class="trace-tick" style="left:{tick["left"]}%">'
+            f'<div class="trace-tick-line"></div><div class="trace-tick-label">{_esc(tick["label"])}</div></div>'
+        )
+    html += '</div></div>'
+
+    for lane in lanes:
+        html += (
+            f'<div class="trace-lane"><div class="trace-lane-label">{_esc(lane["label"])}</div>'
+            '<div class="trace-scalable trace-lane-body">'
+        )
+        for item in lane["items"]:
+            left = item["start"] / total_span * 100
+            width = max(item["dur"] / total_span * 100, 0.6)
+            html += (
+                f'<div class="trace-item trace-{item["kind"]}" '
+                f'style="left:{left}%;width:{width}%;background:{stage_color(item["stage"])}" '
+                f'title="{_esc(item["label"])}&#10;{_esc(item["subtitle"])}">'
+                f'<span class="trace-item-label">{_esc(item["short"])}</span>'
+                '</div>'
+            )
+        html += '</div></div>'
+
+    html += '</div></div>'
+    return html
+
+
+def _perfetto_trace_payload(non_param_nodes):
+    nodes = [
+        n
+        for n in non_param_nodes
+        if n.get("op") not in {"placeholder", "output"}
+    ]
+    if not nodes:
+        return None
+
+    def collective_kind(inp):
+        return _infer_collective(inp.get("src_placement"), inp.get("dst_placement"))
+
+    def node_label(n):
+        mp = _strip_module_prefix(n.get("module_path", "") or "")
+        if mp:
+            return mp
+        return n.get("name", "")
+
+    launch_overhead = 1.0
+    min_marker_dur = 0.001
+    comm_tid = "stream:redistribution"
+    trace_events = []
+    curr_time = {0: 0.0, comm_tid: 0.0}
+
+    for node_idx, n in enumerate(nodes):
+        phase = n.get("phase") or "forward"
+        path = _strip_module_prefix(n.get("module_path", "") or "")
+        redistribution_end_times = []
+
+        for inp_idx, inp in enumerate(n.get("inputs", [])):
+            pred_name = inp.get("name")
+            comm_cost = float(inp.get("comm_cost", 0.0) or 0.0)
+            transition_cost = float(inp.get("transition_cost", 0.0) or 0.0)
+            total = comm_cost + transition_cost
+            coll = collective_kind(inp)
+            if total <= 0 or not coll:
+                continue
+
+            src = inp.get("src_placement") or "?"
+            dst = inp.get("dst_placement") or n.get("placement", "") or "?"
+            curr_time[comm_tid] = max(curr_time[0], curr_time[comm_tid])
+            start = curr_time[comm_tid]
+            end = start + total
+            curr_time[comm_tid] += total + launch_overhead
+            curr_time[0] += launch_overhead
+            redistribution_end_times.append(end)
+
+            trace_events.append(
+                {
+                    "ph": "X",
+                    "cat": "redistribution",
+                    "name": f"{src} -> {dst}",
+                    "pid": 0,
+                    "tid": comm_tid,
+                    "ts": start,
+                    "dur": total,
+                    "args": {
+                        "order": node_idx,
+                        "path": path,
+                        "target_node": n.get("name", ""),
+                        "input": pred_name or "",
+                        "input_index": inp_idx,
+                        "phase": phase,
+                        "collective": coll,
+                        "src_placement": src,
+                        "dst_placement": dst,
+                        "comm_cost_us": comm_cost,
+                        "transition_cost_us": transition_cost,
+                    },
+                }
+            )
+
+        curr_time[0] = max(curr_time[0], max(redistribution_end_times, default=0.0))
+        start = curr_time[0]
+        dur = float(n.get("compute_cost", 0.0) or 0.0)
+        marker_only = dur <= 0 and bool(redistribution_end_times)
+        event_dur = dur if dur > 0 else min_marker_dur if marker_only else 0.0
+        curr_time[0] += dur + launch_overhead
+
+        if event_dur <= 0:
+            continue
+
+        trace_events.append(
+            {
+                "ph": "X",
+                "cat": "compute",
+                "name": n.get("op", "") or n.get("name", ""),
+                "pid": 0,
+                "tid": 0,
+                "ts": start,
+                "dur": event_dur,
+                "args": {
+                    "order": node_idx,
+                    "path": path,
+                    "node": n.get("name", ""),
+                    "phase": phase,
+                    "module_path": path,
+                    "op": n.get("op", ""),
+                    "placement": n.get("placement", ""),
+                    "compute_cost_us": dur,
+                    "marker_only": marker_only,
+                    "inputs": [inp.get("name", "") for inp in n.get("inputs", [])],
+                },
+            }
+        )
+
+    if not trace_events:
+        return None
+
+    total_span = max(
+        max(curr_time.values(), default=0.0),
+        0.0,
+    )
+    return {
+        "traceEvents": trace_events,
+        "traceName": "autoparallel_perfetto_trace.json",
+        "displayTimeUnit": "us",
+        "metadata": {
+            "source": "autoparallel.visualizer.build_display_from_json",
+            "total_span_us": total_span,
+            "num_events": len(trace_events),
+        },
+    }
+
+
+def _build_perfetto_tab_html(non_param_nodes):
+    trace = _perfetto_trace_payload(non_param_nodes)
+    if trace is None:
+        return (
+            '<div class="card"><div class="card-title">Perfetto Trace</div>'
+            '<div style="font-size:12px;color:#64748b">No execution nodes available.</div></div>'
+        )
+
+    trace_json = json.dumps(trace, separators=(",", ":"))
+    trace_json_script = trace_json.replace("</", "<\\/")
+    total_span = trace.get("metadata", {}).get("total_span_us", 0.0)
+    num_events = trace.get("metadata", {}).get("num_events", 0)
+
+    return f"""<div class="card"><div class="card-title">Perfetto Trace</div>
+<div class="overview-note">Synthetic Perfetto-compatible timeline derived from exported compute and redistribution costs. Redistributions use dedicated streams keyed by <span class="notation-code">src -&gt; dst</span>.</div>
+<div class="trace-controls" style="justify-content:space-between;flex-wrap:wrap">
+  <div style="display:flex;gap:12px;flex-wrap:wrap">
+    <span class="overview-note" style="margin:0">Events: {num_events}</span>
+    <span class="overview-note" style="margin:0">Total span: {_fmt_us(total_span)}</span>
+  </div>
+  <div style="display:flex;gap:8px;flex-wrap:wrap">
+    <button class="filter-btn" onclick="loadPerfettoTrace(this)">Load trace</button>
+    <button class="filter-btn" onclick="downloadPerfettoTrace(this)">Download trace</button>
+    <a class="filter-btn" href="https://ui.perfetto.dev" target="_blank" rel="noopener noreferrer" style="text-decoration:none">Open Perfetto</a>
+  </div>
+</div>
+<div class="perfetto-status" style="display:none"></div>
+<div class="card" style="padding:0;overflow:hidden">
+  <iframe class="perfetto-frame" data-src="https://ui.perfetto.dev" width="100%" height="800px" loading="lazy" referrerpolicy="strict-origin-when-cross-origin"></iframe>
+</div>
+<script type="application/json" class="perfetto-trace-data">{trace_json_script}</script>
+</div>"""
+
+
 def generate_visualization_html(data: dict) -> str:
     """Generate interactive HTML visualization from the JSON export dict.
 
@@ -1404,6 +1739,21 @@ def generate_visualization_html(data: dict) -> str:
 .ap-viz .notation-body {{ padding: 0 14px 12px 14px; display: grid; gap: 6px; font-size: 12px; color: #475569; }}
 .ap-viz .notation-code {{ display: inline-block; font-family: monospace; background: #f8fafc; border: 1px solid #e2e8f0; padding: 1px 6px; border-radius: 4px; color: #1e293b; }}
 .ap-viz .ascii-dump {{ margin-top: 14px; padding: 14px; background: #0f172a; color: #e2e8f0; border-radius: 8px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 11px; line-height: 1.45; overflow-x: auto; white-space: pre; }}
+.ap-viz .trace-controls {{ display: flex; gap: 8px; align-items: center; margin-bottom: 12px; }}
+.ap-viz .trace-scroll {{ overflow-x: auto; padding-bottom: 4px; }}
+.ap-viz .trace-wrap {{ display: grid; gap: 10px; }}
+.ap-viz .trace-lane {{ display: grid; grid-template-columns: 140px 1fr; gap: 12px; align-items: center; }}
+.ap-viz .trace-lane-label {{ font-size: 12px; font-weight: 600; color: #334155; }}
+.ap-viz .trace-scalable {{ min-width: 1200px; }}
+.ap-viz .trace-axis {{ position: relative; height: 30px; border-bottom: 1px solid #e2e8f0; margin-bottom: 2px; }}
+.ap-viz .trace-axis-row {{ display: grid; grid-template-columns: 140px 1fr; gap: 12px; align-items: end; margin-bottom: 4px; }}
+.ap-viz .trace-tick {{ position: absolute; top: 0; transform: translateX(-50%); }}
+.ap-viz .trace-tick-line {{ height: 16px; border-left: 1px solid #cbd5e1; }}
+.ap-viz .trace-tick-label {{ font-size: 10px; color: #64748b; margin-top: 2px; white-space: nowrap; }}
+.ap-viz .trace-lane-body {{ position: relative; height: 40px; background: linear-gradient(to right, #f8fafc, #eef2ff); border: 1px solid #e2e8f0; border-radius: 8px; overflow: hidden; }}
+.ap-viz .trace-item {{ position: absolute; top: 7px; height: 24px; border-radius: 6px; box-shadow: inset 0 0 0 1px rgba(255,255,255,0.35); opacity: 0.95; overflow: hidden; }}
+.ap-viz .trace-comm {{ box-shadow: inset 0 0 0 1px rgba(255,255,255,0.4), 0 0 0 1px rgba(220,38,38,0.15); }}
+.ap-viz .trace-item-label {{ display: block; font-size: 10px; line-height: 24px; color: white; padding: 0 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
 .ap-viz .overview-note {{ font-size: 12px; color: #64748b; margin-bottom: 14px; }}
 .ap-viz .overview-section-title {{ font-size: 13px; font-weight: 700; color: #334155; margin: 18px 0 10px 0; }}
 .ap-viz .overview-stage-card {{ border: 1px solid #e2e8f0; border-radius: 8px; padding: 14px; margin-bottom: 12px; background: #fff; }}
@@ -1431,6 +1781,9 @@ def generate_visualization_html(data: dict) -> str:
 .ap-viz .overview-details {{ margin-top: 10px; border: 1px solid #e2e8f0; border-radius: 8px; background: #f8fafc; }}
 .ap-viz .overview-details > summary {{ cursor: pointer; padding: 8px 10px; font-size: 12px; font-weight: 600; color: #334155; }}
 .ap-viz .overview-details-body {{ padding: 0 10px 10px 10px; }}
+.ap-viz .perfetto-frame {{ display: block; border: 0; background: #fff; }}
+.ap-viz .perfetto-status {{ margin-bottom: 12px; padding: 10px 12px; border-radius: 8px; border: 1px solid #e2e8f0; font-size: 12px; color: #475569; background: #f8fafc; }}
+.ap-viz .perfetto-status.error {{ color: #B91C1C; background: #FEF2F2; border-color: #FECACA; }}
 .ap-viz .param-tree table {{ width: 100%; }}
 .ap-viz .param-tree td {{ vertical-align: top; }}
 .ap-viz .param-module-row td {{ background: #f8fafc; font-weight: 600; color: #334155; }}
@@ -1534,6 +1887,8 @@ def generate_visualization_html(data: dict) -> str:
 <div class="tabs">
   <div class="tab" onclick="switchTab('params', this)">Parameters</div>
   <div class="tab" onclick="switchTab('overview', this)">Execution Overview</div>
+  <div class="tab" onclick="switchTab('trace', this)">Trace</div>
+  <div class="tab" onclick="switchTab('perfetto', this)">Perfetto</div>
   <div class="tab active" onclick="switchTab('arch', this)">Architecture</div>
   <div class="tab" onclick="switchTab('cost', this)">Cost Breakdown</div>
   <div class="tab" onclick="switchTab('detail', this)">All Nodes</div>
@@ -1556,6 +1911,18 @@ def generate_visualization_html(data: dict) -> str:
     html += '''
 <div data-tab="overview" class="tab-content">'''
     html += _build_strategy_overview_html(architecture_nodes, layer_costs)
+    html += '</div>'
+
+    # ===== TRACE TAB =====
+    html += '''
+<div data-tab="trace" class="tab-content">'''
+    html += _build_estimated_trace_html(architecture_nodes)
+    html += '</div>'
+
+    # ===== PERFETTO TAB =====
+    html += '''
+<div data-tab="perfetto" class="tab-content">'''
+    html += _build_perfetto_tab_html(architecture_nodes)
     html += '</div>'
 
     # ===== ARCHITECTURE TAB =====
@@ -1823,10 +2190,16 @@ function _root(el) { return el.closest('.ap-viz'); }
 
 function switchTab(id, btn) {
   var r = _root(btn);
+  if (id !== 'perfetto') {
+    _cancelPerfettoLoad(r.querySelector('.tab-content[data-tab="perfetto"]'));
+  }
   r.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
   r.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
   r.querySelector('.tab-content[data-tab="' + id + '"]').classList.add('active');
   btn.classList.add('active');
+  if (id === 'perfetto') {
+    loadPerfettoTrace(btn);
+  }
 }
 
 var filterState = {
@@ -1931,6 +2304,156 @@ function sortTable(colIdx, type, th) {
 document.querySelectorAll('.ap-viz').forEach(function(root) {
   applyFilters(root);
 });
+
+function _traceRoot(el) {
+  return _root(el);
+}
+
+function _getTraceScale(r) {
+  if (!r._traceScale) r._traceScale = 1;
+  return r._traceScale;
+}
+
+function _applyTraceScale(r) {
+  var scale = _getTraceScale(r);
+  r.querySelectorAll('.trace-scalable').forEach(function(el) {
+    el.style.minWidth = (1200 * scale) + 'px';
+  });
+  var resetBtn = r.querySelector('.trace-controls .filter-btn.active');
+  if (resetBtn) resetBtn.textContent = Math.round(scale * 100) + '%';
+}
+
+function adjustTraceZoom(btn, delta) {
+  var r = _traceRoot(btn);
+  r._traceScale = Math.max(0.5, Math.min(4.0, _getTraceScale(r) + delta));
+  _applyTraceScale(r);
+}
+
+function resetTraceZoom(btn) {
+  var r = _traceRoot(btn);
+  r._traceScale = 1;
+  _applyTraceScale(r);
+}
+
+function _perfettoTabRoot(el) {
+  return _root(el).querySelector('.tab-content[data-tab="perfetto"]');
+}
+
+function _perfettoStatus(tab) {
+  return tab ? tab.querySelector('.perfetto-status') : null;
+}
+
+function _setPerfettoStatus(tab, message, isError) {
+  var status = _perfettoStatus(tab);
+  if (!status) return;
+  if (!message) {
+    status.style.display = 'none';
+    status.textContent = '';
+    status.classList.remove('error');
+    return;
+  }
+  status.style.display = 'block';
+  status.textContent = message;
+  status.classList.toggle('error', !!isError);
+}
+
+function _cancelPerfettoLoad(tab) {
+  if (!tab || !tab._perfettoLoadState) return;
+  var state = tab._perfettoLoadState;
+  if (state.interval) clearInterval(state.interval);
+  if (state.timeout) clearTimeout(state.timeout);
+  if (state.onMessage) window.removeEventListener('message', state.onMessage);
+  tab._perfettoLoadState = null;
+  var frame = tab.querySelector('.perfetto-frame');
+  if (frame && frame.dataset.loading === '1') frame.dataset.loading = '0';
+}
+
+function _perfettoTraceText(tab) {
+  var script = tab ? tab.querySelector('.perfetto-trace-data') : null;
+  return script ? script.textContent : '';
+}
+
+function _perfettoArrayBuffer(traceText) {
+  var encoded = new TextEncoder().encode(traceText);
+  return encoded.buffer;
+}
+
+function _ensurePerfettoFrame(frame) {
+  if (frame && !frame.getAttribute('src')) {
+    frame.setAttribute('src', frame.dataset.src || 'https://ui.perfetto.dev');
+  }
+}
+
+function downloadPerfettoTrace(btn) {
+  var tab = _perfettoTabRoot(btn);
+  var traceText = _perfettoTraceText(tab);
+  if (!traceText) return;
+  var blob = new Blob([traceText], {type: 'application/json'});
+  var url = URL.createObjectURL(blob);
+  var link = document.createElement('a');
+  link.href = url;
+  link.download = 'autoparallel_perfetto_trace.json';
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(function() { URL.revokeObjectURL(url); }, 0);
+}
+
+function loadPerfettoTrace(btn) {
+  var tab = _perfettoTabRoot(btn);
+  var frame = tab ? tab.querySelector('.perfetto-frame') : null;
+  if (!frame || frame.dataset.loaded === '1' || frame.dataset.loading === '1') return;
+  var traceText = _perfettoTraceText(tab);
+  if (!traceText) return;
+
+  _cancelPerfettoLoad(tab);
+  _setPerfettoStatus(tab, 'Loading Perfetto trace...', false);
+  frame.dataset.loading = '1';
+  _ensurePerfettoFrame(frame);
+  var handle = frame.contentWindow;
+  var targetOrigin = 'https://ui.perfetto.dev';
+  var traceArrayBuffer = _perfettoArrayBuffer(traceText);
+  var interval = setInterval(function() {
+    handle.postMessage('PING', targetOrigin);
+  }, 50);
+
+  function onMessage(evt) {
+    if (evt.source !== handle || evt.origin !== targetOrigin || evt.data !== 'PONG') return;
+    clearInterval(interval);
+    clearTimeout(timeout);
+    window.removeEventListener('message', onMessage);
+    tab._perfettoLoadState = null;
+    handle.postMessage({
+      perfetto: {
+        buffer: traceArrayBuffer,
+        title: 'AutoParallel Trace',
+      }
+    }, targetOrigin);
+    frame.dataset.loaded = '1';
+    frame.dataset.loading = '0';
+    _setPerfettoStatus(tab, '', false);
+  }
+
+  var timeout = setTimeout(function() {
+    clearInterval(interval);
+    window.removeEventListener('message', onMessage);
+    tab._perfettoLoadState = null;
+    frame.dataset.loading = '0';
+    _setPerfettoStatus(
+      tab,
+      'Perfetto did not respond. You can use "Open Perfetto" to launch it in a new tab or download the trace JSON.',
+      true
+    );
+  }, 10000);
+
+  tab._perfettoLoadState = {
+    interval: interval,
+    timeout: timeout,
+    onMessage: onMessage,
+  };
+  window.addEventListener('message', onMessage);
+}
+
 </script>
 </div></div></body></html>'''
 
