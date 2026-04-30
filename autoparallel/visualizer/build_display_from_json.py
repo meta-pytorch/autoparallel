@@ -1379,22 +1379,84 @@ def _perfetto_trace_payload(non_param_nodes):
     def collective_kind(inp):
         return _infer_collective(inp.get("src_placement"), inp.get("dst_placement"))
 
-    def node_label(n):
-        mp = _strip_module_prefix(n.get("module_path", "") or "")
-        if mp:
-            return mp
-        return n.get("name", "")
+    def strategy_name(n):
+        return n.get("_strategy") or _classify_placement(n.get("placement", ""))
+
+    def compute_tid_for_phase(phase):
+        return "forward" if phase == "forward" else "backward"
+
+    def _module_prefixes(path):
+        if not path:
+            return []
+        parts = path.split(".")
+        if len(parts) <= 1:
+            return [path]
+        return [".".join(parts[:i]) for i in range(1, len(parts))]
+
+    def _path_prefixes(path):
+        prefixes = _module_prefixes(path)
+        if path:
+            prefixes.append(path)
+        return prefixes
+
+    redist_by_target = {}
+
+    metadata_events = [
+        {
+            "ph": "M",
+            "pid": "compute",
+            "name": "process_name",
+            "args": {"name": "Compute"},
+        },
+        {
+            "ph": "M",
+            "pid": "compute",
+            "tid": "forward",
+            "name": "thread_name",
+            "args": {"name": "Forward"},
+        },
+        {
+            "ph": "M",
+            "pid": "compute",
+            "tid": "backward",
+            "name": "thread_name",
+            "args": {"name": "Backward"},
+        },
+        {
+            "ph": "M",
+            "pid": "communication",
+            "name": "process_name",
+            "args": {"name": "Communication"},
+        },
+        {
+            "ph": "M",
+            "pid": "communication",
+            "tid": "redistribution",
+            "name": "thread_name",
+            "args": {"name": "Redistribution"},
+        },
+    ]
 
     launch_overhead = 1.0
     min_marker_dur = 0.001
-    comm_tid = "stream:redistribution"
+    module_scope_margin = 0.001
+    module_gap_tolerance = 2 * launch_overhead
+    comm_tid = "redistribution"
     trace_events = []
+    compute_events = []
     curr_time = {0: 0.0, comm_tid: 0.0}
+    module_runs = {"forward": {}, "backward": {}}
+    phase_start = {"forward": None, "backward": None}
+    phase_end = {"forward": 0.0, "backward": 0.0}
+    flow_id = 0
 
     for node_idx, n in enumerate(nodes):
         phase = n.get("phase") or "forward"
+        compute_tid = compute_tid_for_phase(phase)
         path = _strip_module_prefix(n.get("module_path", "") or "")
         redistribution_end_times = []
+        event_start = None
+        event_end = None
 
         for inp_idx, inp in enumerate(n.get("inputs", [])):
             pred_name = inp.get("name")
@@ -1419,7 +1481,7 @@ def _perfetto_trace_payload(non_param_nodes):
                     "ph": "X",
                     "cat": "redistribution",
                     "name": f"{src} -> {dst}",
-                    "pid": 0,
+                    "pid": "communication",
                     "tid": comm_tid,
                     "ts": start,
                     "dur": total,
@@ -1431,50 +1493,182 @@ def _perfetto_trace_payload(non_param_nodes):
                         "input_index": inp_idx,
                         "phase": phase,
                         "collective": coll,
+                        "collective_type": coll,
                         "src_placement": src,
                         "dst_placement": dst,
                         "comm_cost_us": comm_cost,
                         "transition_cost_us": transition_cost,
+                        "strategy": strategy_name(n),
+                        "cluster_id": n.get("cluster_id"),
                     },
+                }
+            )
+            redist_by_target.setdefault((phase, n.get("name", "")), []).append(
+                {"start": start, "end": end, "path": path}
+            )
+            event_start = start if event_start is None else min(event_start, start)
+            event_end = max(event_end or 0.0, end)
+
+            flow = flow_id
+            flow_id += 1
+            trace_events.append(
+                {
+                    "ph": "s",
+                    "pid": "communication",
+                    "tid": comm_tid,
+                    "ts": start,
+                    "id": flow,
+                    "cat": "dependency",
+                    "name": pred_name or "",
+                }
+            )
+            trace_events.append(
+                {
+                    "ph": "f",
+                    "pid": "compute",
+                    "tid": compute_tid,
+                    "ts": max(end, curr_time[0]),
+                    "id": flow,
+                    "cat": "dependency",
+                    "name": n.get("name", ""),
                 }
             )
 
         curr_time[0] = max(curr_time[0], max(redistribution_end_times, default=0.0))
         start = curr_time[0]
         dur = float(n.get("compute_cost", 0.0) or 0.0)
-        marker_only = dur <= 0 and bool(redistribution_end_times)
-        event_dur = dur if dur > 0 else min_marker_dur if marker_only else 0.0
+        marker_only = dur <= 0
+        event_dur = dur if dur > 0 else min_marker_dur
         curr_time[0] += dur + launch_overhead
 
-        if event_dur <= 0:
-            continue
+        compute_event = {
+            "ph": "X",
+            "cat": "compute",
+            "name": n.get("op", "") or n.get("name", ""),
+            "pid": "compute",
+            "tid": compute_tid,
+            "ts": start,
+            "dur": event_dur,
+            "args": {
+                "order": node_idx,
+                "path": path,
+                "node": n.get("name", ""),
+                "phase": phase,
+                "module_path": path,
+                "op": n.get("op", ""),
+                "shape": n.get("shape"),
+                "dtype": n.get("dtype"),
+                "placement": n.get("placement", ""),
+                "strategy": strategy_name(n),
+                "cluster_id": n.get("cluster_id"),
+                "compute_cost_us": dur,
+                "marker_only": marker_only,
+                "inputs": [inp.get("name", "") for inp in n.get("inputs", [])],
+            },
+        }
+        compute_events.append(compute_event)
+        event_start = start if event_start is None else min(event_start, start)
+        event_end = max(event_end or 0.0, start + event_dur)
 
-        trace_events.append(
-            {
-                "ph": "X",
-                "cat": "compute",
-                "name": n.get("op", "") or n.get("name", ""),
-                "pid": 0,
-                "tid": 0,
-                "ts": start,
-                "dur": event_dur,
-                "args": {
-                    "order": node_idx,
-                    "path": path,
-                    "node": n.get("name", ""),
-                    "phase": phase,
-                    "module_path": path,
-                    "op": n.get("op", ""),
-                    "placement": n.get("placement", ""),
-                    "compute_cost_us": dur,
-                    "marker_only": marker_only,
-                    "inputs": [inp.get("name", "") for inp in n.get("inputs", [])],
-                },
-            }
-        )
+        if phase_start[phase] is None:
+            phase_start[phase] = event_start
+        phase_end[phase] = max(phase_end[phase], event_end)
 
-    if not trace_events:
+        module_end = max(event_end, max(redistribution_end_times, default=0.0))
+        active_paths = set()
+        for prefix in _path_prefixes(path):
+            active_paths.add(prefix)
+            runs = module_runs[phase].setdefault(prefix, [])
+            if runs and event_start <= runs[-1]["end"] + module_gap_tolerance:
+                runs[-1]["end"] = max(runs[-1]["end"], module_end)
+            else:
+                runs.append({"start": event_start, "end": module_end})
+
+        for redist_event in redist_by_target.get((phase, n.get("name", "")), []):
+            redist_path = redist_event.get("path", "")
+            if not redist_path:
+                continue
+            redist_end = redist_event["end"]
+            for prefix in _path_prefixes(redist_path):
+                if prefix in active_paths:
+                    continue
+                runs = module_runs[phase].setdefault(prefix, [])
+                if runs and redist_event["start"] <= runs[-1]["end"] + module_gap_tolerance:
+                    runs[-1]["end"] = max(runs[-1]["end"], redist_end)
+                else:
+                    runs.append({"start": redist_event["start"], "end": redist_end})
+
+    if not trace_events and not compute_events:
         return None
+
+    for phase in ("forward", "backward"):
+        phase_pid = "compute"
+        phase_tid = compute_tid_for_phase(phase)
+        if phase_start[phase] is not None:
+            trace_events.append(
+                {
+                    "ph": "i",
+                    "s": "g",
+                    "pid": phase_pid,
+                    "tid": phase_tid,
+                    "ts": phase_start[phase],
+                    "name": f"{phase}_start",
+                }
+            )
+            trace_events.append(
+                {
+                    "ph": "i",
+                    "s": "g",
+                    "pid": phase_pid,
+                    "tid": phase_tid,
+                    "ts": phase_end[phase],
+                    "name": f"{phase}_end",
+                }
+            )
+
+        sorted_prefixes = sorted(
+            module_runs[phase],
+            key=lambda prefix: (prefix.count("."), prefix),
+        )
+        for prefix in sorted_prefixes:
+            for run_idx, run in enumerate(module_runs[phase][prefix]):
+                trace_events.append(
+                    {
+                        "ph": "X",
+                        "cat": "module",
+                        "name": prefix,
+                        "pid": phase_pid,
+                        "tid": phase_tid,
+                        "ts": max(0.0, run["start"] - module_scope_margin),
+                        "dur": max(
+                            run["end"] - run["start"] + 2 * module_scope_margin,
+                            min_marker_dur,
+                        ),
+                        "args": {
+                            "path": prefix,
+                            "phase": phase,
+                            "run_index": run_idx,
+                            "scope": "module",
+                        },
+                    }
+                )
+
+    trace_events.extend(compute_events)
+    trace_events = metadata_events + sorted(
+        trace_events,
+        key=lambda event: (
+            0 if event["ph"] == "M" else 1,
+            event.get("ts", 0.0),
+            {"i": 0, "X": 1, "s": 2, "f": 3}.get(event["ph"], 4),
+            {"module": 0, "compute": 1, "redistribution": 2, "dependency": 3}.get(
+                event.get("cat", ""),
+                4,
+            ),
+            str(event.get("pid", "")),
+            str(event.get("tid", "")),
+            event.get("name", ""),
+        ),
+    )
 
     total_span = max(
         max(curr_time.values(), default=0.0),

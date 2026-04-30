@@ -37,8 +37,8 @@ def _extract_source_info(node: torch.fx.Node) -> dict | None:
     return {"file": file, "line": int(line), "func": func, "code": code.strip()}
 
 
-def _extract_module_path(node: torch.fx.Node) -> str | None:
-    """Extract the deepest nn.Module path from node metadata."""
+def _extract_module_path_direct(node: torch.fx.Node) -> str | None:
+    """Extract the deepest nn.Module path directly from node metadata."""
     # Check for pre-computed string (set by save() for serialized graphs)
     mp = node.meta.get("module_path")
     if mp is not None:
@@ -57,12 +57,79 @@ def _extract_module_path(node: torch.fx.Node) -> str | None:
     return last_value[0] if last_value else None
 
 
+def _common_module_prefix(paths: list[str]) -> str | None:
+    normalized = []
+    for path in paths:
+        if not path:
+            continue
+        parts = path.split(".")
+        if parts and parts[-1] in {"weight", "bias"}:
+            parts = parts[:-1]
+        if parts:
+            normalized.append(parts)
+    if not normalized:
+        return None
+
+    prefix = list(normalized[0])
+    for parts in normalized[1:]:
+        limit = min(len(prefix), len(parts))
+        i = 0
+        while i < limit and prefix[i] == parts[i]:
+            i += 1
+        prefix = prefix[:i]
+        if not prefix:
+            return None
+
+    if not prefix:
+        return None
+    if prefix == ["L['self']"] or prefix == ["_export_root"]:
+        return None
+    return ".".join(prefix)
+
+
+def _extract_module_path(node: torch.fx.Node) -> str | None:
+    """Extract the deepest nn.Module path from node metadata.
+
+    Falls back to a conservative one-hop inference from neighboring nodes
+    when backward/helper nodes have lost their original module stack.
+    """
+    direct = _extract_module_path_direct(node)
+    if direct is not None:
+        return direct
+
+    neighbor_paths = []
+    for inp in node.all_input_nodes:
+        mp = _extract_module_path_direct(inp)
+        if mp is not None:
+            neighbor_paths.append(mp)
+    for user in node.users:
+        mp = _extract_module_path_direct(user)
+        if mp is not None:
+            neighbor_paths.append(mp)
+
+    return _common_module_prefix(neighbor_paths)
+
+
 def _get_phase(node: torch.fx.Node) -> str:
     """Determine whether a node belongs to the forward or backward pass."""
     # Check for pre-computed phase (set by save() for serialized graphs)
     phase = node.meta.get("phase")
     if phase is not None:
         return phase
+
+    desc = node.meta.get("desc")
+    desc_name = type(desc).__name__ if desc is not None else None
+    if desc_name in {"ParamAOTInput", "BufferAOTInput", "PlainAOTInput"}:
+        return "forward"
+    if desc_name == "TangentAOTInput":
+        return "backward"
+
+    partitioner_tag = node.meta.get("partitioner_tag")
+    if partitioner_tag == "is_forward":
+        return "forward"
+    if partitioner_tag == "is_backward":
+        return "backward"
+
     if node.op == "placeholder":
         return "backward" if node.name.startswith("tangents") else "forward"
     if "nn_module_stack" in node.meta:
