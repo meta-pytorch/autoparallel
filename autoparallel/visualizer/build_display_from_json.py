@@ -1441,6 +1441,7 @@ def _perfetto_trace_payload(non_param_nodes):
     min_marker_dur = 0.001
     module_scope_margin = 0.001
     module_gap_tolerance = 2 * launch_overhead
+    module_end_epsilon = 1e-5
     comm_tid = "redistribution"
     trace_events = []
     compute_events = []
@@ -1598,6 +1599,25 @@ def _perfetto_trace_payload(non_param_nodes):
                 else:
                     runs.append({"start": redist_event["start"], "end": redist_end})
 
+    for phase in ("forward", "backward"):
+        phase_runs = module_runs[phase]
+        for prefix, runs in phase_runs.items():
+            ancestors = []
+            parts = prefix.split(".")
+            for i in range(1, len(parts)):
+                ancestor = ".".join(parts[:i])
+                if ancestor in phase_runs:
+                    ancestors.append(ancestor)
+            if not ancestors:
+                continue
+            for run in runs:
+                for ancestor in ancestors:
+                    for parent_run in phase_runs[ancestor]:
+                        if parent_run["start"] <= run["start"] <= parent_run["end"] + module_end_epsilon:
+                            if parent_run["end"] < run["end"] <= parent_run["end"] + module_end_epsilon:
+                                run["end"] = parent_run["end"]
+                            break
+
     if not trace_events and not compute_events:
         return None
 
@@ -1653,6 +1673,80 @@ def _perfetto_trace_payload(non_param_nodes):
                     }
                 )
 
+    deduped_trace_events = []
+    for event in trace_events:
+        if event.get("ph") != "X" or event.get("cat") != "module":
+            deduped_trace_events.append(event)
+            continue
+        path = event.get("args", {}).get("path", "")
+        event_ts = float(event.get("ts", 0.0) or 0.0)
+        event_dur = float(event.get("dur", 0.0) or 0.0)
+        event_end = event_ts + event_dur
+        keep = True
+        if path and "." in path:
+            parts = path.split(".")
+            ancestors = {".".join(parts[:i]) for i in range(1, len(parts))}
+            for other in trace_events:
+                if other is event:
+                    continue
+                if (
+                    other.get("ph") != "X"
+                    or other.get("cat") != "module"
+                    or other.get("pid") != event.get("pid")
+                    or other.get("tid") != event.get("tid")
+                ):
+                    continue
+                other_path = other.get("args", {}).get("path", "")
+                if other_path not in ancestors:
+                    continue
+                other_ts = float(other.get("ts", 0.0) or 0.0)
+                other_dur = float(other.get("dur", 0.0) or 0.0)
+                other_end = other_ts + other_dur
+                if (
+                    abs(other_ts - event_ts) <= module_end_epsilon
+                    and abs(other_end - event_end) <= module_end_epsilon
+                ):
+                    keep = False
+                    break
+        if keep:
+            deduped_trace_events.append(event)
+    trace_events = deduped_trace_events
+
+    for phase in ("forward", "backward"):
+        phase_module_events = [
+            event
+            for event in trace_events
+            if event.get("ph") == "X"
+            and event.get("cat") == "module"
+            and event.get("pid") == "compute"
+            and event.get("tid") == compute_tid_for_phase(phase)
+        ]
+        phase_module_events.sort(
+            key=lambda event: (
+                event.get("args", {}).get("path", "").count("."),
+                event.get("args", {}).get("path", ""),
+                float(event.get("ts", 0.0) or 0.0),
+            )
+        )
+        for event in phase_module_events:
+            path = event.get("args", {}).get("path", "")
+            if not path or "." not in path:
+                continue
+            event_ts = float(event.get("ts", 0.0) or 0.0)
+            event_end = event_ts + float(event.get("dur", 0.0) or 0.0)
+            parts = path.split(".")
+            ancestors = [".".join(parts[:i]) for i in range(1, len(parts))]
+            for parent in phase_module_events:
+                parent_path = parent.get("args", {}).get("path", "")
+                if parent_path not in ancestors:
+                    continue
+                parent_ts = float(parent.get("ts", 0.0) or 0.0)
+                parent_end = parent_ts + float(parent.get("dur", 0.0) or 0.0)
+                if parent_ts <= event_ts <= parent_end + module_end_epsilon:
+                    if parent_end < event_end <= parent_end + module_end_epsilon:
+                        event["dur"] = max(parent_end - event_ts, min_marker_dur)
+                        event_end = parent_end
+
     trace_events.extend(compute_events)
     trace_events = metadata_events + sorted(
         trace_events,
@@ -1687,24 +1781,26 @@ def _perfetto_trace_payload(non_param_nodes):
 
 
 def _build_perfetto_tab_html(non_param_nodes):
-    trace = _perfetto_trace_payload(non_param_nodes)
-    if trace is None:
+    if not non_param_nodes:
         return (
             '<div class="card"><div class="card-title">Perfetto Trace</div>'
             '<div style="font-size:12px;color:#64748b">No execution nodes available.</div></div>'
         )
 
-    trace_json = json.dumps(trace, separators=(",", ":"))
-    trace_json_script = trace_json.replace("</", "<\\/")
-    total_span = trace.get("metadata", {}).get("total_span_us", 0.0)
-    num_events = trace.get("metadata", {}).get("num_events", 0)
+    full_trace = _perfetto_trace_payload(non_param_nodes)
+    full_total_span = full_trace.get("metadata", {}).get("total_span_us", 0.0) if full_trace else 0.0
+    full_num_events = full_trace.get("metadata", {}).get("num_events", 0) if full_trace else 0
+    nodes_json = json.dumps(non_param_nodes, separators=(",", ":")).replace("</", "<\\/")
 
     return f"""<div class="card"><div class="card-title">Perfetto Trace</div>
 <div class="overview-note">Synthetic Perfetto-compatible timeline derived from exported compute and redistribution costs. Redistributions use dedicated streams keyed by <span class="notation-code">src -&gt; dst</span>.</div>
 <div class="trace-controls" style="justify-content:space-between;flex-wrap:wrap">
   <div style="display:flex;gap:12px;flex-wrap:wrap">
-    <span class="overview-note" style="margin:0">Events: {num_events}</span>
-    <span class="overview-note" style="margin:0">Total span: {_fmt_us(total_span)}</span>
+    <span class="control-label" style="margin-right:0">Trace mode</span>
+    <button class="filter-btn" data-filter-group="perfetto-mode" data-filter-value="representative" onclick="setPerfettoMode('representative', this)">Representative</button>
+    <button class="filter-btn active" data-filter-group="perfetto-mode" data-filter-value="full" onclick="setPerfettoMode('full', this)">Full</button>
+    <span class="overview-note perfetto-events" style="margin:0">Events: {full_num_events}</span>
+    <span class="overview-note perfetto-span" style="margin:0">Total span: {_fmt_us(full_total_span)}</span>
   </div>
   <div style="display:flex;gap:8px;flex-wrap:wrap">
     <button class="filter-btn" onclick="loadPerfettoTrace(this)">Load trace</button>
@@ -1716,7 +1812,7 @@ def _build_perfetto_tab_html(non_param_nodes):
 <div class="card" style="padding:0;overflow:hidden">
   <iframe class="perfetto-frame" data-src="https://ui.perfetto.dev" width="100%" height="800px" loading="lazy" referrerpolicy="strict-origin-when-cross-origin"></iframe>
 </div>
-<script type="application/json" class="perfetto-trace-data">{trace_json_script}</script>
+<script type="application/json" class="perfetto-node-data">{nodes_json}</script>
 </div>"""
 
 
@@ -1781,6 +1877,11 @@ def generate_visualization_html(data: dict) -> str:
     architecture_nodes = [
         n
         for n in display_nodes
+        if n.get("placeholder_kind") not in {"param", "buffer"}
+    ]
+    perfetto_nodes = [
+        n
+        for n in compute_nodes
         if n.get("placeholder_kind") not in {"param", "buffer"}
     ]
     strategy_counts = {}
@@ -2116,7 +2217,7 @@ def generate_visualization_html(data: dict) -> str:
     # ===== PERFETTO TAB =====
     html += '''
 <div data-tab="perfetto" class="tab-content">'''
-    html += _build_perfetto_tab_html(architecture_nodes)
+    html += _build_perfetto_tab_html(perfetto_nodes)
     html += '</div>'
 
     # ===== ARCHITECTURE TAB =====
@@ -2554,17 +2655,486 @@ function _setPerfettoStatus(tab, message, isError) {
 function _cancelPerfettoLoad(tab) {
   if (!tab || !tab._perfettoLoadState) return;
   var state = tab._perfettoLoadState;
+  state.cancelled = true;
   if (state.interval) clearInterval(state.interval);
   if (state.timeout) clearTimeout(state.timeout);
   if (state.onMessage) window.removeEventListener('message', state.onMessage);
+  if (state.frame && state.onFrameLoad) state.frame.removeEventListener('load', state.onFrameLoad);
   tab._perfettoLoadState = null;
   var frame = tab.querySelector('.perfetto-frame');
   if (frame && frame.dataset.loading === '1') frame.dataset.loading = '0';
 }
 
+function _perfettoNodeData(tab) {
+  var script = tab ? tab.querySelector('.perfetto-node-data') : null;
+  if (!script) return [];
+  if (!tab._perfettoNodeDataCache) {
+    tab._perfettoNodeDataCache = JSON.parse(script.textContent);
+  }
+  return tab._perfettoNodeDataCache;
+}
+
+function _perfettoMode(tab) {
+  return tab && tab.dataset.perfettoMode ? tab.dataset.perfettoMode : 'full';
+}
+
+function _perfettoNodesForMode(nodes, mode) {
+  if (mode !== 'representative') return nodes;
+  return nodes.filter(function(n) { return !('cluster_root' in n); });
+}
+
+function _perfettoClassifyPlacement(placement) {
+  if (!placement) return 'unknown';
+  var p = placement.trim();
+  if (p === 'RR' || p === 'R') return 'replicated';
+  var parts = [];
+  for (var i = 0; i < p.length;) {
+    if (p[i] === 'S' && i + 1 < p.length && p[i + 1] === '(') {
+      var endS = p.indexOf(')', i);
+      parts.push(p.slice(i, endS + 1));
+      i = endS + 1;
+    } else if (p[i] === 'P' && i + 1 < p.length && p[i + 1] === '(') {
+      var endP = p.indexOf(')', i);
+      parts.push(p.slice(i, endP + 1));
+      i = endP + 1;
+    } else if (p[i] === 'R') {
+      parts.push('R');
+      i += 1;
+    } else {
+      i += 1;
+    }
+  }
+  if (parts.length === 2) {
+    var d0 = parts[0], d1 = parts[1];
+    if (d0[0] === 'S' && d1 === 'R') return 'fsdp';
+    if (d0 === 'R' && d1[0] === 'S') return 'tp';
+    if (d0[0] === 'S' && d1[0] === 'S') return 'fsdp+tp';
+    if (d0[0] === 'P' || d1[0] === 'P') return 'partial';
+  }
+  return 'other';
+}
+
+function _perfettoInferCollective(src, dst) {
+  if (!src || !dst || src === dst) return null;
+  function dims(p) {
+    var out = [];
+    for (var i = 0; i < p.length;) {
+      if (p[i] === 'S' && i + 1 < p.length && p[i + 1] === '(') {
+        var endS = p.indexOf(')', i);
+        out.push(p.slice(i, endS + 1));
+        i = endS + 1;
+      } else if (p[i] === 'P' && i + 1 < p.length && p[i + 1] === '(') {
+        var endP = p.indexOf(')', i);
+        out.push(p.slice(i, endP + 1));
+        i = endP + 1;
+      } else if (p[i] === 'R') {
+        out.push('R');
+        i += 1;
+      } else {
+        i += 1;
+      }
+    }
+    return out;
+  }
+  var srcDims = dims(src);
+  var dstDims = dims(dst);
+  if (!srcDims.length || srcDims.length !== dstDims.length) {
+    if (src.indexOf('P(sum)') >= 0 && dst.indexOf('S(') >= 0) return 'ReduceScatter';
+    if (src.indexOf('P(sum)') >= 0 && dst.indexOf('R') >= 0) return 'AllReduce';
+    if (src.indexOf('S(') >= 0 && dst.indexOf('R') >= 0 && dst.indexOf('P') < 0) return 'AllGather';
+    return 'Redistribute';
+  }
+  var collectives = [];
+  for (var i = 0; i < srcDims.length; i++) {
+    var sd = srcDims[i], dd = dstDims[i], coll = null;
+    if (sd === dd || (sd === 'R' && dd.indexOf('S(') === 0)) {
+      coll = null;
+    } else if (sd.indexOf('S(') === 0 && dd === 'R') {
+      coll = 'AllGather';
+    } else if (sd.indexOf('P(') === 0 && dd === 'R') {
+      coll = 'AllReduce';
+    } else if (sd.indexOf('P(') === 0 && dd.indexOf('S(') === 0) {
+      coll = 'ReduceScatter';
+    } else if (sd.indexOf('S(') === 0 && dd.indexOf('S(') === 0) {
+      coll = 'AllToAll';
+    } else {
+      coll = 'Redistribute';
+    }
+    if (coll) collectives.push(coll);
+  }
+  if (!collectives.length) return null;
+  if (collectives.length === 1) return collectives[0];
+  return collectives.join('+');
+}
+
+function _perfettoStripModulePrefix(path) {
+  if (!path) return '';
+  if (path.indexOf("L['self'].") === 0) return path.slice("L['self'].".length);
+  if (path.indexOf('_export_root.') === 0) return path.slice('_export_root.'.length);
+  return path;
+}
+
+function _perfettoBuildTrace(nodes, mode) {
+  nodes = _perfettoNodesForMode(nodes, mode).filter(function(n) {
+    return n.op !== 'placeholder' && n.op !== 'output' && (!n.placeholder_kind || (n.placeholder_kind !== 'param' && n.placeholder_kind !== 'buffer'));
+  });
+  if (!nodes.length) return null;
+
+  function computeTidForPhase(phase) {
+    return phase === 'backward' ? 'backward' : 'forward';
+  }
+  function modulePrefixes(path) {
+    if (!path) return [];
+    var parts = path.split('.');
+    if (parts.length <= 1) return [path];
+    var prefixes = [];
+    for (var i = 1; i < parts.length; i++) prefixes.push(parts.slice(0, i).join('.'));
+    return prefixes;
+  }
+  function pathPrefixes(path) {
+    var prefixes = modulePrefixes(path);
+    if (path) prefixes.push(path);
+    return prefixes;
+  }
+
+  var metadataEvents = [
+    {ph: 'M', pid: 'compute', name: 'process_name', args: {name: 'Compute'}},
+    {ph: 'M', pid: 'compute', tid: 'forward', name: 'thread_name', args: {name: 'Forward'}},
+    {ph: 'M', pid: 'compute', tid: 'backward', name: 'thread_name', args: {name: 'Backward'}},
+    {ph: 'M', pid: 'communication', name: 'process_name', args: {name: 'Communication'}},
+    {ph: 'M', pid: 'communication', tid: 'redistribution', name: 'thread_name', args: {name: 'Redistribution'}},
+  ];
+
+  var launchOverhead = 1.0;
+  var minMarkerDur = 0.001;
+  var moduleScopeMargin = 0.001;
+  var moduleGapTolerance = 2 * launchOverhead;
+  var moduleEndEpsilon = 1e-5;
+  var commTid = 'redistribution';
+  var traceEvents = [];
+  var computeEvents = [];
+  var currTime = {0: 0.0, redistribution: 0.0};
+  var moduleRuns = {forward: {}, backward: {}};
+  var phaseStart = {forward: null, backward: null};
+  var phaseEnd = {forward: 0.0, backward: 0.0};
+  var redistByTarget = {};
+
+  nodes.forEach(function(n, nodeIdx) {
+    var phase = n.phase || 'forward';
+    var computeTid = computeTidForPhase(phase);
+    var path = _perfettoStripModulePrefix(n.module_path || '');
+    var redistributionEndTimes = [];
+    var eventStart = null;
+    var eventEnd = null;
+
+    (n.inputs || []).forEach(function(inp, inpIdx) {
+      var commCost = Number(inp.comm_cost || 0.0);
+      var transitionCost = Number(inp.transition_cost || 0.0);
+      var total = commCost + transitionCost;
+      var coll = _perfettoInferCollective(inp.src_placement, inp.dst_placement);
+      if (!(total > 0) || !coll) return;
+      var src = inp.src_placement || '?';
+      var dst = inp.dst_placement || n.placement || '?';
+      currTime[commTid] = Math.max(currTime[0], currTime[commTid]);
+      var start = currTime[commTid];
+      var end = start + total;
+      currTime[commTid] += total + launchOverhead;
+      currTime[0] += launchOverhead;
+      redistributionEndTimes.push(end);
+      traceEvents.push({
+        ph: 'X',
+        cat: 'redistribution',
+        name: src + ' -> ' + dst,
+        pid: 'communication',
+        tid: commTid,
+        ts: start,
+        dur: total,
+        args: {
+          order: nodeIdx,
+          path: path,
+          target_node: n.name || '',
+          input: inp.name || '',
+          input_index: inpIdx,
+          phase: phase,
+          collective: coll,
+          collective_type: coll,
+          src_placement: src,
+          dst_placement: dst,
+          comm_cost_us: commCost,
+          transition_cost_us: transitionCost,
+          strategy: _perfettoClassifyPlacement(n.placement || ''),
+          cluster_id: n.cluster_id,
+        }
+      });
+      var key = phase + '::' + (n.name || '');
+      redistByTarget[key] = redistByTarget[key] || [];
+      redistByTarget[key].push({start: start, end: end, path: path});
+      eventStart = eventStart === null ? start : Math.min(eventStart, start);
+      eventEnd = Math.max(eventEnd || 0.0, end);
+    });
+
+    currTime[0] = Math.max(currTime[0], redistributionEndTimes.length ? Math.max.apply(null, redistributionEndTimes) : 0.0);
+    var start = currTime[0];
+    var dur = Number(n.compute_cost || 0.0);
+    var markerOnly = dur <= 0;
+    var eventDur = dur > 0 ? dur : minMarkerDur;
+    currTime[0] += dur + launchOverhead;
+
+    computeEvents.push({
+      ph: 'X',
+      cat: 'compute',
+      name: n.op || n.name || '',
+      pid: 'compute',
+      tid: computeTid,
+      ts: start,
+      dur: eventDur,
+      args: {
+        order: nodeIdx,
+        path: path,
+        node: n.name || '',
+        phase: phase,
+        module_path: path,
+        op: n.op || '',
+        shape: n.shape,
+        dtype: n.dtype,
+        placement: n.placement || '',
+        strategy: _perfettoClassifyPlacement(n.placement || ''),
+        cluster_id: n.cluster_id,
+        compute_cost_us: dur,
+        marker_only: markerOnly,
+        inputs: (n.inputs || []).map(function(inp) { return inp.name || ''; }),
+      }
+    });
+
+    eventStart = eventStart === null ? start : Math.min(eventStart, start);
+    eventEnd = Math.max(eventEnd || 0.0, start + eventDur);
+    if (phaseStart[phase] === null) phaseStart[phase] = eventStart;
+    phaseEnd[phase] = Math.max(phaseEnd[phase], eventEnd);
+
+    var moduleEnd = Math.max(eventEnd, redistributionEndTimes.length ? Math.max.apply(null, redistributionEndTimes) : 0.0);
+    var activePaths = {};
+    pathPrefixes(path).forEach(function(prefix) {
+      activePaths[prefix] = true;
+      moduleRuns[phase][prefix] = moduleRuns[phase][prefix] || [];
+      var runs = moduleRuns[phase][prefix];
+      if (runs.length && eventStart <= runs[runs.length - 1].end + moduleGapTolerance) {
+        runs[runs.length - 1].end = Math.max(runs[runs.length - 1].end, moduleEnd);
+      } else {
+        runs.push({start: eventStart, end: moduleEnd});
+      }
+    });
+
+    (redistByTarget[phase + '::' + (n.name || '')] || []).forEach(function(redistEvent) {
+      var redistPath = redistEvent.path || '';
+      if (!redistPath) return;
+      var redistEnd = redistEvent.end;
+      pathPrefixes(redistPath).forEach(function(prefix) {
+        if (activePaths[prefix]) return;
+        moduleRuns[phase][prefix] = moduleRuns[phase][prefix] || [];
+        var runs = moduleRuns[phase][prefix];
+        if (runs.length && redistEvent.start <= runs[runs.length - 1].end + moduleGapTolerance) {
+          runs[runs.length - 1].end = Math.max(runs[runs.length - 1].end, redistEnd);
+        } else {
+          runs.push({start: redistEvent.start, end: redistEnd});
+        }
+      });
+    });
+  });
+
+  ['forward', 'backward'].forEach(function(phase) {
+    var phaseRuns = moduleRuns[phase];
+    Object.keys(phaseRuns).forEach(function(prefix) {
+      var ancestors = [];
+      var parts = prefix.split('.');
+      for (var i = 1; i < parts.length; i++) {
+        var ancestor = parts.slice(0, i).join('.');
+        if (phaseRuns[ancestor]) ancestors.push(ancestor);
+      }
+      if (!ancestors.length) return;
+      phaseRuns[prefix].forEach(function(run) {
+        ancestors.forEach(function(ancestor) {
+          phaseRuns[ancestor].forEach(function(parentRun) {
+            if (parentRun.start <= run.start && run.start <= parentRun.end + moduleEndEpsilon) {
+              if (parentRun.end < run.end && run.end <= parentRun.end + moduleEndEpsilon) {
+                run.end = parentRun.end;
+              }
+            }
+          });
+        });
+      });
+    });
+  });
+
+  if (!traceEvents.length && !computeEvents.length) return null;
+
+  ['forward', 'backward'].forEach(function(phase) {
+    var phasePid = 'compute';
+    var phaseTid = computeTidForPhase(phase);
+    if (phaseStart[phase] !== null) {
+      traceEvents.push({ph: 'i', s: 'g', pid: phasePid, tid: phaseTid, ts: phaseStart[phase], name: phase + '_start'});
+      traceEvents.push({ph: 'i', s: 'g', pid: phasePid, tid: phaseTid, ts: phaseEnd[phase], name: phase + '_end'});
+    }
+    Object.keys(moduleRuns[phase]).sort(function(a, b) {
+      var da = (a.match(/\./g) || []).length;
+      var db = (b.match(/\./g) || []).length;
+      return da - db || a.localeCompare(b);
+    }).forEach(function(prefix) {
+      moduleRuns[phase][prefix].forEach(function(run, runIdx) {
+        traceEvents.push({
+          ph: 'X',
+          cat: 'module',
+          name: prefix,
+          pid: phasePid,
+          tid: phaseTid,
+          ts: Math.max(0.0, run.start - moduleScopeMargin),
+          dur: Math.max(run.end - run.start + 2 * moduleScopeMargin, minMarkerDur),
+          args: {
+            path: prefix,
+            phase: phase,
+            run_index: runIdx,
+            scope: 'module',
+          }
+        });
+      });
+    });
+  });
+
+  traceEvents = traceEvents.filter(function(event, _, allEvents) {
+    if (event.ph !== 'X' || event.cat !== 'module') return true;
+    var path = (event.args && event.args.path) || '';
+    if (!path || path.indexOf('.') < 0) return true;
+    var eventTs = Number(event.ts || 0.0);
+    var eventEnd = eventTs + Number(event.dur || 0.0);
+    var parts = path.split('.');
+    var ancestors = [];
+    for (var i = 1; i < parts.length; i++) ancestors.push(parts.slice(0, i).join('.'));
+    for (var j = 0; j < allEvents.length; j++) {
+      var other = allEvents[j];
+      if (other === event) continue;
+      if (other.ph !== 'X' || other.cat !== 'module' || other.pid !== event.pid || other.tid !== event.tid) continue;
+      var otherPath = (other.args && other.args.path) || '';
+      if (ancestors.indexOf(otherPath) < 0) continue;
+      var otherTs = Number(other.ts || 0.0);
+      var otherEnd = otherTs + Number(other.dur || 0.0);
+      if (Math.abs(otherTs - eventTs) <= moduleEndEpsilon && Math.abs(otherEnd - eventEnd) <= moduleEndEpsilon) {
+        return false;
+      }
+    }
+    return true;
+  });
+
+  ['forward', 'backward'].forEach(function(phase) {
+    var phaseTid = computeTidForPhase(phase);
+    var phaseModuleEvents = traceEvents.filter(function(event) {
+      return event.ph === 'X'
+        && event.cat === 'module'
+        && event.pid === 'compute'
+        && event.tid === phaseTid;
+    }).sort(function(a, b) {
+      var ap = (a.args && a.args.path) || '';
+      var bp = (b.args && b.args.path) || '';
+      var ad = (ap.match(/\./g) || []).length;
+      var bd = (bp.match(/\./g) || []).length;
+      return ad - bd || ap.localeCompare(bp) || (a.ts || 0) - (b.ts || 0);
+    });
+    phaseModuleEvents.forEach(function(event) {
+      var path = (event.args && event.args.path) || '';
+      if (!path || path.indexOf('.') < 0) return;
+      var eventTs = Number(event.ts || 0.0);
+      var eventEnd = eventTs + Number(event.dur || 0.0);
+      var parts = path.split('.');
+      var ancestors = [];
+      for (var i = 1; i < parts.length; i++) ancestors.push(parts.slice(0, i).join('.'));
+      phaseModuleEvents.forEach(function(parent) {
+        var parentPath = (parent.args && parent.args.path) || '';
+        if (ancestors.indexOf(parentPath) < 0) return;
+        var parentTs = Number(parent.ts || 0.0);
+        var parentEnd = parentTs + Number(parent.dur || 0.0);
+        if (parentTs <= eventTs && eventTs <= parentEnd + moduleEndEpsilon) {
+          if (parentEnd < eventEnd && eventEnd <= parentEnd + moduleEndEpsilon) {
+            event.dur = Math.max(parentEnd - eventTs, minMarkerDur);
+            eventEnd = parentEnd;
+          }
+        }
+      });
+    });
+  });
+
+  traceEvents = metadataEvents.concat(traceEvents.concat(computeEvents).sort(function(a, b) {
+    function phRank(ev) {
+      return {i: 0, X: 1, s: 2, f: 3}[ev.ph] !== undefined ? {i: 0, X: 1, s: 2, f: 3}[ev.ph] : 4;
+    }
+    function catRank(ev) {
+      return {module: 0, compute: 1, redistribution: 2, dependency: 3}[ev.cat] !== undefined ? {module: 0, compute: 1, redistribution: 2, dependency: 3}[ev.cat] : 4;
+    }
+    return (a.ts || 0) - (b.ts || 0)
+      || phRank(a) - phRank(b)
+      || catRank(a) - catRank(b)
+      || String(a.pid || '').localeCompare(String(b.pid || ''))
+      || String(a.tid || '').localeCompare(String(b.tid || ''))
+      || String(a.name || '').localeCompare(String(b.name || ''));
+  }));
+
+  var totalSpan = Math.max(currTime[0] || 0.0, currTime[commTid] || 0.0, 0.0);
+  return {
+    traceEvents: traceEvents,
+    traceName: 'autoparallel_perfetto_trace.json',
+    displayTimeUnit: 'us',
+    metadata: {
+      source: 'autoparallel.visualizer.build_display_from_json',
+      total_span_us: totalSpan,
+      num_events: traceEvents.length,
+      mode: mode,
+    }
+  };
+}
+
+function _fmtUsJs(us) {
+  if (us >= 1000) return (us / 1000).toFixed(1) + 'ms';
+  return Math.round(us) + 'µs';
+}
+
+function _updatePerfettoSummary(tab) {
+  if (!tab) return;
+  var trace = _perfettoBuildTrace(_perfettoNodeData(tab), _perfettoMode(tab));
+  if (!trace) return;
+  var eventsEl = tab.querySelector('.perfetto-events');
+  var spanEl = tab.querySelector('.perfetto-span');
+  if (eventsEl) eventsEl.textContent = 'Events: ' + ((trace.metadata && trace.metadata.num_events) || 0);
+  if (spanEl) spanEl.textContent = 'Total span: ' + _fmtUsJs((trace.metadata && trace.metadata.total_span_us) || 0);
+  tab._perfettoTraceMeta = trace.metadata || {};
+}
+
+function setPerfettoMode(mode, btn) {
+  var tab = _perfettoTabRoot(btn);
+  if (!tab) return;
+  tab.dataset.perfettoMode = mode;
+  _root(btn).querySelectorAll('[data-filter-group="perfetto-mode"]').forEach(function(b) {
+    b.classList.toggle('active', b === btn);
+  });
+  _updatePerfettoSummary(tab);
+  var frame = tab.querySelector('.perfetto-frame');
+  var wasLoaded = frame && frame.dataset.loaded === '1';
+  var wasLoading = frame && frame.dataset.loading === '1';
+  _cancelPerfettoLoad(tab);
+  if (frame) {
+    frame.dataset.loaded = '0';
+    frame.dataset.loading = '0';
+  }
+  _setPerfettoStatus(tab, '', false);
+  if (wasLoaded && _perfettoSendTraceToFrame(tab, frame)) {
+    return;
+  }
+  if (wasLoaded || wasLoading) {
+    loadPerfettoTrace(btn);
+  }
+}
+
 function _perfettoTraceText(tab) {
-  var script = tab ? tab.querySelector('.perfetto-trace-data') : null;
-  return script ? script.textContent : '';
+  var trace = _perfettoBuildTrace(_perfettoNodeData(tab), _perfettoMode(tab));
+  if (!trace) return '';
+  tab._perfettoTraceMeta = trace.metadata || {};
+  return JSON.stringify(trace);
 }
 
 function _perfettoArrayBuffer(traceText) {
@@ -2574,8 +3144,39 @@ function _perfettoArrayBuffer(traceText) {
 
 function _ensurePerfettoFrame(frame) {
   if (frame && !frame.getAttribute('src')) {
+    frame.dataset.ready = '0';
     frame.setAttribute('src', frame.dataset.src || 'https://ui.perfetto.dev');
   }
+}
+
+function _perfettoSafePostMessage(handle, payload, targetOrigin) {
+  if (!handle) return false;
+  try {
+    handle.postMessage(payload, targetOrigin);
+    return true;
+  } catch (err) {
+    return false;
+  }
+}
+
+function _perfettoSendTraceToFrame(tab, frame) {
+  if (!tab || !frame) return false;
+  var traceText = _perfettoTraceText(tab);
+  if (!traceText) return false;
+  var mode = _perfettoMode(tab);
+  if (!_perfettoSafePostMessage(frame.contentWindow, {
+    perfetto: {
+      buffer: _perfettoArrayBuffer(traceText),
+      title: 'AutoParallel Trace (' + mode + ')',
+    }
+  }, 'https://ui.perfetto.dev')) {
+    return false;
+  }
+  frame.dataset.loaded = '1';
+  frame.dataset.loading = '0';
+  frame.dataset.ready = '1';
+  _setPerfettoStatus(tab, '', false);
+  return true;
 }
 
 function downloadPerfettoTrace(btn) {
@@ -2601,52 +3202,104 @@ function loadPerfettoTrace(btn) {
   if (!traceText) return;
 
   _cancelPerfettoLoad(tab);
+  tab._perfettoLoadSeq = (tab._perfettoLoadSeq || 0) + 1;
+  var mode = _perfettoMode(tab);
   _setPerfettoStatus(tab, 'Loading Perfetto trace...', false);
   frame.dataset.loading = '1';
-  _ensurePerfettoFrame(frame);
-  var handle = frame.contentWindow;
   var targetOrigin = 'https://ui.perfetto.dev';
   var traceArrayBuffer = _perfettoArrayBuffer(traceText);
-  var interval = setInterval(function() {
-    handle.postMessage('PING', targetOrigin);
-  }, 50);
+  var state = {
+    id: tab._perfettoLoadSeq,
+    interval: null,
+    timeout: null,
+    onMessage: null,
+    onFrameLoad: null,
+    frame: frame,
+    cancelled: false,
+    pingStarted: false,
+    traceSent: false,
+  };
 
-  function onMessage(evt) {
+  function isCurrent() {
+    return !state.cancelled && tab._perfettoLoadState === state && tab._perfettoLoadSeq === state.id;
+  }
+
+  function cleanup() {
+    state.cancelled = true;
+    if (state.interval) clearInterval(state.interval);
+    if (state.timeout) clearTimeout(state.timeout);
+    if (state.onMessage) window.removeEventListener('message', state.onMessage);
+    if (state.frame && state.onFrameLoad) state.frame.removeEventListener('load', state.onFrameLoad);
+    if (tab._perfettoLoadState === state) tab._perfettoLoadState = null;
+  }
+
+  function startPingLoop() {
+    if (!isCurrent() || state.pingStarted || frame.dataset.loading !== '1') return;
+    state.pingStarted = true;
+    frame.dataset.ready = '1';
+    var handle = frame.contentWindow;
+    _perfettoSafePostMessage(handle, 'PING', targetOrigin);
+    state.interval = setInterval(function() {
+      if (!isCurrent()) {
+        if (state.interval) clearInterval(state.interval);
+        state.interval = null;
+        return;
+      }
+      _perfettoSafePostMessage(handle, 'PING', targetOrigin);
+    }, 100);
+  }
+
+  state.onFrameLoad = function() {
+    startPingLoop();
+  };
+  frame.addEventListener('load', state.onFrameLoad);
+  _ensurePerfettoFrame(frame);
+  if (frame.dataset.ready === '1' || frame.getAttribute('src')) {
+    if (frame.dataset.ready === '1') startPingLoop();
+  }
+
+  state.onMessage = function(evt) {
+    if (!isCurrent()) return;
+    var handle = frame.contentWindow;
     if (evt.source !== handle || evt.origin !== targetOrigin || evt.data !== 'PONG') return;
-    clearInterval(interval);
-    clearTimeout(timeout);
-    window.removeEventListener('message', onMessage);
-    tab._perfettoLoadState = null;
-    handle.postMessage({
+    if (state.traceSent) return;
+    if (state.interval) {
+      clearInterval(state.interval);
+      state.interval = null;
+    }
+    if (!_perfettoSafePostMessage(handle, {
       perfetto: {
         buffer: traceArrayBuffer,
-        title: 'AutoParallel Trace',
+        title: 'AutoParallel Trace (' + mode + ')',
       }
-    }, targetOrigin);
+    }, targetOrigin)) {
+      state.pingStarted = false;
+      startPingLoop();
+      return;
+    }
+    state.traceSent = true;
+    cleanup();
     frame.dataset.loaded = '1';
     frame.dataset.loading = '0';
     _setPerfettoStatus(tab, '', false);
-  }
+  };
 
-  var timeout = setTimeout(function() {
-    clearInterval(interval);
-    window.removeEventListener('message', onMessage);
-    tab._perfettoLoadState = null;
+  state.timeout = setTimeout(function() {
+    if (!isCurrent() || state.traceSent) return;
+    cleanup();
     frame.dataset.loading = '0';
     _setPerfettoStatus(
       tab,
       'Perfetto did not respond. You can use "Open Perfetto" to launch it in a new tab or download the trace JSON.',
       true
     );
-  }, 10000);
+  }, 30000);
 
-  tab._perfettoLoadState = {
-    interval: interval,
-    timeout: timeout,
-    onMessage: onMessage,
-  };
-  window.addEventListener('message', onMessage);
+  tab._perfettoLoadState = state;
+  window.addEventListener('message', state.onMessage);
+  if (frame.dataset.ready === '1') startPingLoop();
 }
+
 
 </script>
 </div></div></body></html>'''
