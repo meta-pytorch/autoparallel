@@ -13,8 +13,6 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 from torch import nn
-
-# from torchtitan.distributed.expert_parallel import expert_parallel
 from torch.distributed.tensor import DeviceMesh, DTensor
 from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
 from torch.nn.attention import SDPBackend, sdpa_kernel
@@ -1010,60 +1008,45 @@ def _moe_forward(
     return out, num_tokens_per_expert
 
 
-@dataclass
-class MoEArgs:
-    num_experts: int = 8
-    num_shared_experts: int = 1
-
-    # router
-    score_func: Literal["softmax", "sigmoid"] = "sigmoid"
-    route_norm: bool = False
-    route_scale: float = 1.0
-    score_before_experts: bool = True
-
-    # token-choice
-    top_k: int = 1
-    use_grouped_mm: bool = True  # grouped mm or for-loop for the experts computation
-    load_balance_coeff: float | None = 1e-3
-
-    _debug_force_load_balance: bool = False
-    # if True, we force each experts get same amount of token via round-robin
-    mesh: Optional[DeviceMesh] = None
-
-
 class MoE(nn.Module):
-    def __init__(self, moe_args: MoEArgs, dim: int, hidden_dim: int):
+    def __init__(
+        self,
+        dim: int,
+        hidden_dim: int,
+        num_experts: int,
+        top_k: int,
+        shared_experts_hidden_dim: int,
+        score_func: Literal["softmax", "sigmoid"] = "sigmoid",
+        route_norm: bool = False,
+        route_scale: float = 1.0,
+        score_before_experts: bool = True,
+        use_grouped_mm: bool = True,
+        load_balance_coeff: float | None = 1e-3,
+        mesh: DeviceMesh | None = None,
+    ):
         super().__init__()
 
-        num_experts = moe_args.num_experts
-        self.mesh = moe_args.mesh
+        self.mesh = mesh
         self.axis_name = "ep"
         self.experts = GroupedExperts(
             dim=dim,
             hidden_dim=hidden_dim,
             num_experts=num_experts,
-            use_grouped_mm=moe_args.use_grouped_mm,
+            use_grouped_mm=use_grouped_mm,
         )
         self.router = TokenChoiceTopKRouter(
             dim=dim,
             num_experts=num_experts,
-            top_k=moe_args.top_k,
-            score_func=moe_args.score_func,
-            route_norm=moe_args.route_norm,
-            route_scale=moe_args.route_scale,
+            top_k=top_k,
+            score_func=score_func,
+            route_norm=route_norm,
+            route_scale=route_scale,
         )
-        self.reorderer = TokenReorderer(num_experts=num_experts, top_k=moe_args.top_k)
-        assert moe_args.num_shared_experts > 0
-        self.shared_experts = FeedForward(
-            dim=dim, hidden_dim=hidden_dim * moe_args.num_shared_experts
-        )
-        self.score_before_experts = moe_args.score_before_experts
+        self.reorderer = TokenReorderer(num_experts=num_experts, top_k=top_k)
+        self.shared_experts = FeedForward(dim=dim, hidden_dim=shared_experts_hidden_dim)
+        self.score_before_experts = score_before_experts
 
-        # define fields for auxiliary-loss-free load balancing (https://arxiv.org/abs/2408.15664)
-        # NOTE: tokens_per_expert is accumulated in the model forward pass.
-        #       expert_bias is updated outside the model in an optimizer step pre hook
-        #       to work with gradient accumulation.
-        self.load_balance_coeff = moe_args.load_balance_coeff
+        self.load_balance_coeff = load_balance_coeff
         if self.load_balance_coeff is not None:
             assert self.load_balance_coeff > 0.0
             self.register_buffer(
@@ -1185,92 +1168,202 @@ def build_attention(
     return ScaledDotProductAttention(attn_mask_type)
 
 
-# Reference: https://github.com/deepseek-ai/DeepSeek-V3/blob/main/inference/model.py
 @dataclass
-class DeepSeekV3ModelArgs:
-    """
-    Data class for defining model arguments and hyperparameters.
-
-    Attributes:
-        max_batch_size (int): Maximum batch size.
-        max_seq_len (int): Maximum sequence length.
-        vocab_size (int): Vocabulary size.
-        dim (int): Model dimension.
-        inter_dim (int): Intermediate dimension for MLP layers.
-        moe_inter_dim (int): Intermediate dimension for MoE layers.
-        n_layers (int): Number of transformer layers.
-        n_dense_layers (int): Number of dense layers in the model.
-        n_heads (int): Number of attention heads.
-        norm_eps (float): Epsilon value used for RMSNorm.
-        moe_args (MoEArgs): MoE configuration.
-        n_expert_groups (int): Number of expert groups.
-        n_limited_groups (int): Number of limited groups for MoE routing.
-        q_lora_rank (int): LoRA rank for query projections.
-        kv_lora_rank (int): LoRA rank for key-value projections.
-        qk_nope_head_dim (int): Dimension for query-key projections without positional embeddings.
-        qk_rope_head_dim (int): Dimension for query-key projections with rotary embeddings.
-        v_head_dim (int): Dimension for value projections.
-        use_flex_attn (bool): Whether to use FlexAttention.
-        attn_mask_type (str): Type of attention mask.
-        original_seq_len (int): Original sequence length.
-        rope_theta (float): Base for rotary positional encoding.
-        rope_factor (float): Scaling factor for extended sequence lengths.
-        beta_fast (int): Fast beta correction factor.
-        beta_slow (int): Slow beta correction factor.
-    """
-
-    max_batch_size: int = 8
+class RoPEConfig:
+    dim: int = 64
     max_seq_len: int = 4096 * 4
-    vocab_size: int = 102400
-    dim: int = 2048
-    inter_dim: int = 10944
-    moe_inter_dim: int = 1408
-    n_layers: int = 27
-    n_dense_layers: int = 1
+    theta: float = 10000.0
+    rope_factor: float = 40.0
+    beta_fast: float = 32.0
+    beta_slow: float = 1.0
+    original_seq_len: int = 4096
+
+
+@dataclass
+class NormConfig:
+    eps: float = 1e-5
+
+
+@dataclass
+class LinearConfig:
+    in_features: int = 0
+    out_features: int = 0
+
+
+@dataclass
+class SDPAConfig:
+    pass
+
+
+@dataclass
+class AttentionConfig:
     n_heads: int = 16
-    norm_eps: float = 1e-5  # eps used for RMSNorm
-
-    # MoE
-    moe_args: MoEArgs = field(default_factory=MoEArgs)
-    # TODO: node-limited routing is not supported yet
-    n_expert_groups: int = 1
-    n_limited_groups: int = 1
-
-    # Multi-Head Latent Attention (MLA)
     q_lora_rank: int = 0
     kv_lora_rank: int = 512
     qk_nope_head_dim: int = 128
     qk_rope_head_dim: int = 64
     v_head_dim: int = 128
-    use_flex_attn: bool = False
-    attn_mask_type: str = "causal"
-
-    # yarn
-    original_seq_len: int = 4096
-    rope_theta: float = 10000.0
-    rope_factor: float = 40
-    beta_fast: int = 32
-    beta_slow: int = 1
     mscale: float = 1.0
+    mask_type: str = "causal"
+    inner_attention: SDPAConfig = field(default_factory=SDPAConfig)
 
 
-# Adapted from https://github.com/DeepSeek-ai/DeepSeek-V3/blob/main/inference/model.py#L294
-def precompute_freqs_cis(args: DeepSeekV3ModelArgs) -> torch.Tensor:
+@dataclass
+class TokenDispatcherConfig:
+    score_before_experts: bool = True
+
+
+@dataclass
+class ExpertsConfig:
+    hidden_dim: int = 1408
+    use_grouped_mm: bool = True
+    token_dispatcher: TokenDispatcherConfig = field(
+        default_factory=TokenDispatcherConfig
+    )
+
+
+@dataclass
+class RouterConfig:
+    top_k: int = 1
+    score_func: str = "sigmoid"
+    route_norm: bool = False
+    route_scale: float = 1.0
+
+
+@dataclass
+class FeedForwardConfig:
+    w1: LinearConfig = field(default_factory=LinearConfig)
+
+
+@dataclass
+class MoEConfig:
+    num_experts: int = 8
+    experts: ExpertsConfig = field(default_factory=ExpertsConfig)
+    router: RouterConfig = field(default_factory=RouterConfig)
+    load_balance_coeff: float | None = 1e-3
+    shared_experts: FeedForwardConfig = field(default_factory=FeedForwardConfig)
+
+
+@dataclass
+class LayerConfig:
+    attention: AttentionConfig = field(default_factory=AttentionConfig)
+    attention_norm: NormConfig = field(default_factory=NormConfig)
+    ffn_norm: NormConfig = field(default_factory=NormConfig)
+    feed_forward: FeedForwardConfig | None = None
+    moe: MoEConfig | None = None
+
+
+@dataclass
+class DeepSeekV3Config:
+    """Hierarchical config for DeepSeekV3Model.
+
+    Attribute paths are compatible with torchtitan's DeepSeekV3Model.Config,
+    so either config type can be passed to DeepSeekV3Model.
     """
-    Precomputes frequency-based complex exponential values for rotary positional embeddings.
 
-    Args:
-        args (DeepSeekV3ModelArgs): Model arguments containing positional embedding parameters.
+    dim: int = 2048
+    vocab_size: int = 102400
+    rope: RoPEConfig = field(default_factory=RoPEConfig)
+    norm: NormConfig = field(default_factory=NormConfig)
+    layers: list = field(default_factory=list)
 
-    Returns:
-        torch.Tensor: Precomputed complex exponential values for positional embeddings.
-    """
-    dim = args.qk_rope_head_dim
-    seqlen = args.max_seq_len
-    beta_fast = args.beta_fast
-    beta_slow = args.beta_slow
-    base = args.rope_theta
-    factor = args.rope_factor
+
+def make_dsv3_config(
+    dim: int = 256,
+    vocab_size: int = 2048,
+    n_layers: int = 6,
+    n_dense_layers: int = 1,
+    n_heads: int = 16,
+    q_lora_rank: int = 0,
+    kv_lora_rank: int = 512,
+    qk_nope_head_dim: int = 128,
+    qk_rope_head_dim: int = 64,
+    v_head_dim: int = 128,
+    mscale: float = 0.70,
+    dense_hidden_dim: int = 1024,
+    moe_hidden_dim: int = 256,
+    num_experts: int = 8,
+    num_shared_experts: int = 2,
+    top_k: int = 3,
+    score_func: str = "softmax",
+    route_norm: bool = False,
+    score_before_experts: bool = False,
+    max_seq_len: int = 4096 * 4,
+    rope_theta: float = 10000.0,
+    rope_factor: float = 40.0,
+    beta_fast: float = 32.0,
+    beta_slow: float = 1.0,
+    original_seq_len: int = 4096,
+    load_balance_coeff: float | None = 1e-3,
+) -> DeepSeekV3Config:
+    layers = []
+    for layer_id in range(n_layers):
+        attn = AttentionConfig(
+            n_heads=n_heads,
+            q_lora_rank=q_lora_rank,
+            kv_lora_rank=kv_lora_rank,
+            qk_nope_head_dim=qk_nope_head_dim,
+            qk_rope_head_dim=qk_rope_head_dim,
+            v_head_dim=v_head_dim,
+            mscale=mscale,
+        )
+        if layer_id < n_dense_layers:
+            ff = FeedForwardConfig(w1=LinearConfig(out_features=dense_hidden_dim))
+            moe = None
+        else:
+            ff = None
+            moe = MoEConfig(
+                num_experts=num_experts,
+                experts=ExpertsConfig(
+                    hidden_dim=moe_hidden_dim,
+                    token_dispatcher=TokenDispatcherConfig(
+                        score_before_experts=score_before_experts,
+                    ),
+                ),
+                router=RouterConfig(
+                    top_k=top_k,
+                    score_func=score_func,
+                    route_norm=route_norm,
+                ),
+                load_balance_coeff=load_balance_coeff,
+                shared_experts=FeedForwardConfig(
+                    w1=LinearConfig(
+                        out_features=moe_hidden_dim * num_shared_experts,
+                    ),
+                ),
+            )
+        layers.append(
+            LayerConfig(
+                attention=attn,
+                feed_forward=ff,
+                moe=moe,
+            )
+        )
+
+    return DeepSeekV3Config(
+        dim=dim,
+        vocab_size=vocab_size,
+        rope=RoPEConfig(
+            dim=qk_rope_head_dim,
+            max_seq_len=max_seq_len,
+            theta=rope_theta,
+            rope_factor=rope_factor,
+            beta_fast=beta_fast,
+            beta_slow=beta_slow,
+            original_seq_len=original_seq_len,
+        ),
+        layers=layers,
+    )
+
+
+def precompute_freqs_cis(config) -> torch.Tensor:
+    rope = config.rope
+    dim = rope.dim
+    seqlen = rope.max_seq_len
+    beta_fast = rope.beta_fast
+    beta_slow = rope.beta_slow
+    base = rope.theta
+    factor = rope.rope_factor
 
     def find_correction_dim(
         num_rotations: float, dim: int, base: float, max_seq_len: int
@@ -1336,9 +1429,9 @@ def precompute_freqs_cis(args: DeepSeekV3ModelArgs) -> torch.Tensor:
     freqs = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
 
     # YaRN scaling for extended context. YaRN is used to extend the context length after pre-training.
-    if seqlen > args.original_seq_len:
+    if seqlen > rope.original_seq_len:
         low, high = find_correction_range(
-            beta_fast, beta_slow, dim, base, args.original_seq_len
+            beta_fast, beta_slow, dim, base, rope.original_seq_len
         )
         smooth = 1 - linear_ramp_factor(low, high, dim // 2)
         freqs = freqs / factor * (1 - smooth) + freqs * smooth
@@ -1377,29 +1470,31 @@ class Attention(nn.Module):
     Multi-head attention (MLA) module.
     """
 
-    def __init__(self, model_args: DeepSeekV3ModelArgs):
+    def __init__(self, attn_config, model_config):
         super().__init__()
-        self.dim = model_args.dim
-        self.n_heads = model_args.n_heads
-        self.q_lora_rank = model_args.q_lora_rank
-        self.kv_lora_rank = model_args.kv_lora_rank
-        self.qk_nope_head_dim = model_args.qk_nope_head_dim
-        self.qk_rope_head_dim = model_args.qk_rope_head_dim
-        self.qk_head_dim = model_args.qk_nope_head_dim + model_args.qk_rope_head_dim
-        self.v_head_dim = model_args.v_head_dim
+        self.dim = model_config.dim
+        self.n_heads = attn_config.n_heads
+        self.q_lora_rank = attn_config.q_lora_rank
+        self.kv_lora_rank = attn_config.kv_lora_rank
+        self.qk_nope_head_dim = attn_config.qk_nope_head_dim
+        self.qk_rope_head_dim = attn_config.qk_rope_head_dim
+        self.qk_head_dim = attn_config.qk_nope_head_dim + attn_config.qk_rope_head_dim
+        self.v_head_dim = attn_config.v_head_dim
+
+        norm_eps = model_config.norm.eps
 
         if self.q_lora_rank == 0:
             self.wq = nn.Linear(self.dim, self.n_heads * self.qk_head_dim, bias=False)
         else:
             self.wq_a = nn.Linear(self.dim, self.q_lora_rank, bias=False)
-            self.q_norm = nn.RMSNorm(self.q_lora_rank, eps=model_args.norm_eps)
+            self.q_norm = nn.RMSNorm(self.q_lora_rank, eps=norm_eps)
             self.wq_b = nn.Linear(
                 self.q_lora_rank, self.n_heads * self.qk_head_dim, bias=False
             )
         self.wkv_a = nn.Linear(
             self.dim, self.kv_lora_rank + self.qk_rope_head_dim, bias=False
         )
-        self.kv_norm = nn.RMSNorm(self.kv_lora_rank, eps=model_args.norm_eps)
+        self.kv_norm = nn.RMSNorm(self.kv_lora_rank, eps=norm_eps)
         self.wkv_b = nn.Linear(
             self.kv_lora_rank,
             self.n_heads * (self.qk_nope_head_dim + self.v_head_dim),
@@ -1408,11 +1503,13 @@ class Attention(nn.Module):
         self.wo = nn.Linear(self.n_heads * self.v_head_dim, self.dim, bias=False)
         self.softmax_scale = self.qk_head_dim**-0.5
 
-        if model_args.max_seq_len > model_args.original_seq_len:
-            mscale = 0.1 * model_args.mscale * math.log(model_args.rope_factor) + 1.0
+        rope_cfg = model_config.rope
+        if rope_cfg.max_seq_len > rope_cfg.original_seq_len:
+            mscale = 0.1 * attn_config.mscale * math.log(rope_cfg.rope_factor) + 1.0
             self.softmax_scale = self.softmax_scale * mscale * mscale
 
-        self.sdpa = build_attention(model_args.use_flex_attn, model_args.attn_mask_type)
+        use_flex_attn = "FlexAttention" in type(attn_config.inner_attention).__name__
+        self.sdpa = build_attention(use_flex_attn, attn_config.mask_type)
 
     def forward(
         self,
@@ -1501,22 +1598,39 @@ class TransformerBlock(nn.Module):
     Transformer block with attention and feed-forward layers.
     """
 
-    def __init__(self, layer_id: int, model_args: DeepSeekV3ModelArgs):
-
+    def __init__(
+        self,
+        layer_id: int,
+        layer_config,
+        model_config,
+        mesh: DeviceMesh | None = None,
+    ):
         super().__init__()
-        self.attention = Attention(model_args)
-        self.attention_norm = nn.RMSNorm(model_args.dim, eps=model_args.norm_eps)
-        self.ffn_norm = nn.RMSNorm(model_args.dim, eps=model_args.norm_eps)
+        dim = model_config.dim
+        self.attention = Attention(layer_config.attention, model_config)
+        self.attention_norm = nn.RMSNorm(dim, eps=layer_config.attention_norm.eps)
+        self.ffn_norm = nn.RMSNorm(dim, eps=layer_config.ffn_norm.eps)
 
-        self.moe_enabled = layer_id >= model_args.n_dense_layers
+        self.moe_enabled = layer_config.moe is not None
         if self.moe_enabled:
+            moe_cfg = layer_config.moe
             self.moe = MoE(
-                model_args.moe_args,
-                dim=model_args.dim,
-                hidden_dim=model_args.moe_inter_dim,
+                dim=dim,
+                hidden_dim=moe_cfg.experts.hidden_dim,
+                num_experts=moe_cfg.num_experts,
+                top_k=moe_cfg.router.top_k,
+                shared_experts_hidden_dim=moe_cfg.shared_experts.w1.out_features,
+                score_func=moe_cfg.router.score_func,
+                route_norm=moe_cfg.router.route_norm,
+                route_scale=moe_cfg.router.route_scale,
+                score_before_experts=moe_cfg.experts.token_dispatcher.score_before_experts,
+                use_grouped_mm=moe_cfg.experts.use_grouped_mm,
+                load_balance_coeff=moe_cfg.load_balance_coeff,
+                mesh=mesh,
             )
         else:
-            self.feed_forward = FeedForward(model_args.dim, model_args.inter_dim)
+            ff_cfg = layer_config.feed_forward
+            self.feed_forward = FeedForward(dim, ff_cfg.w1.out_features)
 
         self.weight_init_std = 0.02 / (2 * (layer_id + 1)) ** 0.5
         self.layer_id = layer_id
@@ -1554,28 +1668,30 @@ class DeepSeekV3Model(nn.Module):
     DeepSeek-V3 Transformer model with attention and feed-forward layers.
     """
 
-    def __init__(self, model_args: DeepSeekV3ModelArgs):
+    def __init__(self, config, mesh: DeviceMesh | None = None):
         # Explicitly call nn.Module.__init__ to avoid MRO issues when this class
         # is used with multiple inheritance (e.g., with ModelProtocol in torchtitan)
         nn.Module.__init__(self)
-        self.max_seq_len = model_args.max_seq_len
-        self.tok_embeddings = nn.Embedding(model_args.vocab_size, model_args.dim)
+        self.max_seq_len = config.rope.max_seq_len
+        self.tok_embeddings = nn.Embedding(config.vocab_size, config.dim)
         self.register_buffer(
-            "freqs_cis", precompute_freqs_cis(model_args), persistent=False
+            "freqs_cis", precompute_freqs_cis(config), persistent=False
         )
 
         self.layers = torch.nn.ModuleDict()
-        for layer_id in range(model_args.n_layers):
-            self.layers[str(layer_id)] = TransformerBlock(layer_id, model_args)
+        for layer_id, layer_config in enumerate(config.layers):
+            self.layers[str(layer_id)] = TransformerBlock(
+                layer_id, layer_config, config, mesh
+            )
 
-        self.norm = nn.RMSNorm(model_args.dim)
+        self.norm = nn.RMSNorm(config.dim)
         self.output = nn.Linear(
-            model_args.dim,
-            model_args.vocab_size,
+            config.dim,
+            config.vocab_size,
             dtype=torch.get_default_dtype(),
             bias=False,
         )
-        self.model_args = model_args
+        self.model_args = config
 
     def init_weights(
         self, buffer_device: torch.device | None = None, seed: int | None = None
@@ -1613,12 +1729,6 @@ class DeepSeekV3Model(nn.Module):
         h = self.norm(h) if self.norm is not None else h
         output = self.output(h) if self.output is not None else h
         return output
-
-
-def dsv3_loss_fn(pred: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-    return torch.nn.functional.cross_entropy(
-        pred.flatten(0, 1).float(), labels.flatten(0, 1)
-    )
 
 
 def _init_weights_tok_embeddings(self: DeepSeekV3Model, seed: int | None = None):
