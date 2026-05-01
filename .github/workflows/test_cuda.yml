@@ -56,8 +56,6 @@ jobs:
         run_timed python examples/example_autoparallel.py
         run_timed python examples/example_llama3.py
         run_timed python examples/example_local_map.py
-        # TODO(#436): Re-enable once OpStrategy.__str__ handles None specs in PyTorch.
-        # run_timed python examples/example_pp_graph_passes.py
         echo "========== Timings =========="
         cat /tmp/timings.txt
 
@@ -83,5 +81,3 @@ jobs:
         python examples/example_dcp.py
         # TODO(#436): Re-enable once OpStrategy.__str__ handles None specs in PyTorch.
         # torchrun --standalone --nproc-per-node 4 examples/example_ds3_local_map.py
-        # Skipped: graph PP is being moved out of AutoParallel shortly.
-        # torchrun --standalone --nproc_per_node=4 examples/example_ds3_pp.py --use-loss-fn --fake-evaluate

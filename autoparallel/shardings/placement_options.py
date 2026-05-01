@@ -789,63 +789,6 @@ class NumericsLogger:
             with open(path, "a") as f:
                 f.write(f"[{prefix}] hash={hash_tensor(t)}, norm={torch.norm(t)}\n")
 
-    def log_pp_model_weights(self, orig_mod, stage_mods, num_world_stages, should_log):
-        path = self.dir / "pp_weights.log"
-
-        torch.distributed.barrier()
-        # First print the params of every stage
-        for i in range(num_world_stages):
-            if should_log and i in stage_mods:
-                param_logs = []
-                real_params = dict(stage_mods[i].named_parameters())
-                for name, _ in orig_mod.named_parameters():
-                    if name not in real_params:
-                        continue
-                    param = real_params[name]
-                    param_logs.append(f"{name=} hash={hash_tensor(param)}")
-                with open(path, "a") as f:
-                    f.write("\n".join(param_logs) + "\n")
-            torch.distributed.barrier()
-
-        # Then print the buffers of every stage
-        for i in range(num_world_stages):
-            if should_log and i in stage_mods:
-                buffer_logs = []
-                real_buffers = dict(stage_mods[i].named_buffers())
-                for name, _ in orig_mod.named_buffers():
-                    if name not in real_buffers:
-                        continue
-                    buffer = real_buffers[name]
-                    buffer_logs.append(f"{name=} hash={hash_tensor(buffer)}")
-                with open(path, "a") as f:
-                    f.write("\n".join(buffer_logs) + "\n")
-            torch.distributed.barrier()
-
-        if self.rank == 0:
-            logger.info(f"Weight hashes written to {path}")
-
-    def log_pp_grads(self, orig_mod, stage_mods, num_world_stages, should_log):
-        path = self.dir / "diff.log"
-
-        for i in range(num_world_stages):
-            if should_log and i in stage_mods:
-                grad_logs = []
-                real_params = dict(stage_mods[i].named_parameters())
-                for name, _ in orig_mod.named_parameters():
-                    if name not in real_params:
-                        continue
-                    grad = real_params[name].grad
-                    if grad is None:
-                        grad_logs.append(f"[grad {name}] None")
-                    else:
-                        grad = grad.to_local()
-                        grad_logs.append(
-                            f"[grad {name}] hash={hash_tensor(grad)}, norm={torch.norm(grad)}"
-                        )
-                with open(path, "a") as f:
-                    f.write("\n".join(grad_logs) + "\n")
-            torch.distributed.barrier()
-
 
 def debug_boxed_nop_preserve_node_meta(fx_g, example_inputs, numerics_logger):
     from torch._inductor.fx_passes.post_grad import view_to_reshape
