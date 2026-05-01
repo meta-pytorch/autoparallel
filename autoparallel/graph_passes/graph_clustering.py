@@ -60,6 +60,9 @@ def _print_output_specs(op_strategy):
         output_specs = s.output_specs
         if isinstance(output_specs, DTensorSpec):
             output_specs = [output_specs]
+        if output_specs is None:
+            output.append("(None)")
+            continue
         for output_spec in output_specs:
             if output_spec is None:
                 output_placements.append("(None)")
@@ -71,17 +74,12 @@ def _print_output_specs(op_strategy):
 
 
 def _prepare_op_strategy(op_strategy, output_only=False):
-    # hasing op_strategy is expensive, so we hash the string representation
-    # instead, which is much cheaper and is a reasonable proxy for the
-    # clustering
-    # NOTE: ideally, we woulnd't need to pass the op_strategy at all,
-    # as we would expect that if two nodes have identical inputs, they would
-    # also have identical op_strategy. This is actually not the case for
-    # view ops, which propagate the input shardings to the output.
-    # So we also add the strategy for a node as a hash key to avoid
-    # clustering nodes that look the same but have different strategies
     if output_only:
         return _print_output_specs(op_strategy)
+    if isinstance(op_strategy, OpStrategy):
+        # Avoid OpStrategy.__str__ which calls mesh_shape, crashing when
+        # strategies contain None specs (local_map, getitem nodes).
+        return ", ".join(str(s) for s in op_strategy.strategies)
     return str(op_strategy)
 
 

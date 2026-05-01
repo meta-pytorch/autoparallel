@@ -8,11 +8,17 @@ from collections import Counter
 
 import torch
 from torch.distributed.fsdp import MixedPrecisionPolicy
+from torch.distributed.tensor._dtensor_spec import DTensorSpec
+from torch.distributed.tensor._op_schema import OpSpec, OpStrategy
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
 from autoparallel._testing.models.llama3 import Transformer, TransformerModelArgs
 from autoparallel.api import AutoParallel
-from autoparallel.graph_passes.graph_clustering import get_identical_regions
+from autoparallel.graph_passes.graph_clustering import (
+    _prepare_op_strategy,
+    _print_output_specs,
+    get_identical_regions,
+)
 
 
 def _get_layer_index(node):
@@ -151,3 +157,27 @@ def test_clustering_no_forward_backward_mixing(device_mesh_2d):
             tags = set(n.meta.get("partitioner_tag") for n in region)
             tags.discard(None)
             assert len(tags) <= 1, f"Cluster group {i}, region {j} mixes phases: {tags}"
+
+
+def test_prepare_op_strategy_none_specs(device_mesh_1d):
+    """_prepare_op_strategy must not crash on strategies with None specs.
+
+    Regression test for #436: getitem nodes have output_specs=None and
+    input_specs=(None,); local_map nodes have tuples containing None entries.
+    """
+    mesh = device_mesh_1d
+    real_spec = DTensorSpec(mesh=mesh, placements=(Replicate(),))
+
+    # getitem on a non-tensor output: output_specs=None, input_specs=(None,)
+    getitem_strategy = OpStrategy([OpSpec(output_specs=None, input_specs=(None,))])
+    assert isinstance(_prepare_op_strategy(getitem_strategy), str)
+    assert isinstance(_prepare_op_strategy(getitem_strategy, output_only=True), str)
+    assert isinstance(_print_output_specs(getitem_strategy), str)
+
+    # local_map: tuple with mixed real specs and None entries
+    local_map_strategy = OpStrategy(
+        [OpSpec(output_specs=(real_spec, None), input_specs=(None, real_spec))]
+    )
+    assert isinstance(_prepare_op_strategy(local_map_strategy), str)
+    assert isinstance(_prepare_op_strategy(local_map_strategy, output_only=True), str)
+    assert isinstance(_print_output_specs(local_map_strategy), str)
