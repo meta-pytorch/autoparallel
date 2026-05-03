@@ -449,9 +449,6 @@ class AutoParallel:
         view_to_reshape(parallel_gm)
         functionalize_fresh_index_put_mutations(parallel_gm)
 
-        mark_fsdp_all_gather_recomputation(
-            parallel_gm.graph, self.reshard_after_forward
-        )
         t_ac = time.perf_counter()
         # now rename input/param/tangent/output/grad_param/grad_input nodes following
         # our convention
@@ -481,6 +478,10 @@ class AutoParallel:
     def apply_placement(self, sharding_placement):
         sharded_param_dict, sharded_buffer_dict = self._apply_placement_common(
             sharding_placement
+        )
+
+        mark_fsdp_all_gather_recomputation(
+            self.parallel_gm.graph, self.reshard_after_forward
         )
 
         self.parallel_model_fn = parallel_model_fn = aot_compile_joint_with_descriptors(
