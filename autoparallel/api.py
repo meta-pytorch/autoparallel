@@ -32,6 +32,7 @@ from .graph_passes.graph_utils import (
     assert_has_no_collectives,
     cleanup_graph,
     fix_scatter_on_aliased_inputs,
+    functionalize_fresh_index_put_mutations,
     update_joint_with_descriptors,
 )
 from .input_validation import (
@@ -446,6 +447,7 @@ class AutoParallel:
         from torch._inductor.fx_passes.post_grad import view_to_reshape
 
         view_to_reshape(parallel_gm)
+        functionalize_fresh_index_put_mutations(parallel_gm)
 
         mark_fsdp_all_gather_recomputation(
             parallel_gm.graph, self.reshard_after_forward
