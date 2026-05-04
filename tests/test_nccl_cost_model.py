@@ -653,8 +653,8 @@ class TestMonotonicity:
         times = [nccl_collective_time(func, s, topo, config) for s in sizes]
         for i in range(1, len(times)):
             assert times[i] >= times[i - 1], (
-                f"Cost decreased from {sizes[i-1]} to {sizes[i]}: "
-                f"{times[i-1]} > {times[i]}"
+                f"Cost decreased from {sizes[i - 1]} to {sizes[i]}: "
+                f"{times[i - 1]} > {times[i]}"
             )
 
     @pytest.mark.parametrize(
@@ -810,8 +810,8 @@ class TestAllToAllCost:
         times = [nccl_all_to_all_cost(s, topo, config) for s in sizes]
         for i in range(1, len(times)):
             assert times[i] >= times[i - 1], (
-                f"AllToAll cost decreased from {sizes[i-1]} to {sizes[i]}: "
-                f"{times[i-1]} > {times[i]}"
+                f"AllToAll cost decreased from {sizes[i - 1]} to {sizes[i]}: "
+                f"{times[i - 1]} > {times[i]}"
             )
 
     def test_more_expensive_than_allgather(self):
@@ -1210,8 +1210,8 @@ class TestARMultiNodeEmpirical:
         times = [nccl_allreduce_cost(s, topo, config) for s in sizes]
         for i in range(1, len(times)):
             assert times[i] >= times[i - 1], (
-                f"Cost decreased from {sizes[i-1]} to {sizes[i]}: "
-                f"{times[i-1]} > {times[i]}"
+                f"Cost decreased from {sizes[i - 1]} to {sizes[i]}: "
+                f"{times[i - 1]} > {times[i]}"
             )
 
     def test_ramp_tables_shape(self):
@@ -1246,8 +1246,8 @@ class TestARMultiNodeEmpirical:
         times = [nccl_allreduce_cost(s, topo, config) for s in sizes]
         for i in range(1, len(times)):
             assert times[i] >= times[i - 1], (
-                f"Cost decreased from {sizes[i-1]} to {sizes[i]}: "
-                f"{times[i-1]} > {times[i]}"
+                f"Cost decreased from {sizes[i - 1]} to {sizes[i]}: "
+                f"{times[i - 1]} > {times[i]}"
             )
 
     def test_blackwell_bw_scales(self):
@@ -1308,8 +1308,8 @@ class TestAGRSMultiNodeEmpirical:
         times = [nccl_allgather_cost(s, topo, config) for s in sizes]
         for i in range(1, len(times)):
             assert times[i] >= times[i - 1], (
-                f"Cost decreased from {sizes[i-1]} to {sizes[i]}: "
-                f"{times[i-1]} > {times[i]}"
+                f"Cost decreased from {sizes[i - 1]} to {sizes[i]}: "
+                f"{times[i - 1]} > {times[i]}"
             )
 
     def test_ramp_table_shape(self):
@@ -1340,7 +1340,7 @@ class TestRingCorrectionMonotonicity:
         for i in range(1, len(table)):
             assert table[i] <= 2.0 * table[i - 1] + 1e-12, (
                 f"n_nodes={n_nodes}: table[{i}]={table[i]:.6f} > "
-                f"2 * table[{i-1}]={2*table[i-1]:.6f}"
+                f"2 * table[{i - 1}]={2 * table[i - 1]:.6f}"
             )
 
     @pytest.mark.parametrize("n_nodes", [8, 16, 32])
