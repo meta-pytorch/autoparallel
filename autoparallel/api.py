@@ -185,7 +185,268 @@ def build_joint_graph(
     )
 
 
-class AutoParallel:
+def build_user_backward_graph(model, input_fn, fake_mode):
+    """Build graph from a model whose forward() contains backward().
+
+    Uses trace_autograd_ops=True to capture autograd.grad nodes,
+    then infers GradAOTOutput descriptors. The returned graph has
+    descriptors on all placeholder and output nodes, compatible with
+    ShardingOptimizer.
+    """
+    from torch._dynamo.functional_export import dynamo_graph_capture_for_export
+
+    from .tracing import annotate_user_backward_descriptors
+
+    t0 = time.perf_counter()
+    # TODO: apply decomp_table via make_fx after dynamo capture to decompose
+    # autograd.grad nodes into aten ops, matching build_joint_graph behavior.
+    # decomp_table = _get_decomp_table()
+
+    with fake_mode:
+        raw_inputs = input_fn()
+
+    formatted_inputs = raw_inputs if isinstance(raw_inputs, tuple) else (raw_inputs,)
+
+    if fake_mode.shape_env is not None:
+        formatted_inputs = _make_inputs_dynamic(formatted_inputs, fake_mode)
+
+    traced_inputs = list(formatted_inputs)
+
+    prev_trace_autograd = torch._dynamo.config.trace_autograd_ops
+    torch._dynamo.config.trace_autograd_ops = True
+    try:
+        with (
+            set_dtype_cast(True),
+            enable_local_map_wrapping(),
+            torch._dynamo.utils._disable_saved_tensors_hooks_during_tracing(),
+        ):
+            gm = dynamo_graph_capture_for_export(model)(*formatted_inputs)
+            _restore_state_dict(model, gm)
+            _add_unused_params_and_buffers(model, gm)
+    finally:
+        torch._dynamo.config.trace_autograd_ops = prev_trace_autograd
+
+    # Annotate descriptors based on autograd.grad node analysis
+    annotate_user_backward_descriptors(gm, model)
+
+    assert_has_no_collectives(gm)
+    cleanup_graph(gm)
+    if _APPLY_VIEW_MM_VIEW_PATTERN:
+        _replace_view_mm_view_with_einsum(gm)
+    _add_alias(gm, version="v2")
+
+    trace_structured(
+        "artifact",
+        metadata_fn=lambda: {
+            "name": "autoparallel_user_backward_graph",
+            "encoding": "string",
+        },
+        payload_fn=lambda: gm.print_readable(
+            print_output=False, include_stride=True, include_device=True
+        ),
+    )
+
+    logger.info("User-backward graph tracing took %.3fs", time.perf_counter() - t0)
+    return gm, traced_inputs
+
+
+class AutoParallelBase:
+    """Low-level API that accepts an FX graph with descriptors and a mesh.
+
+    Provides sharding optimization (ILP) and application. The graph must have
+    ``meta["desc"]`` set on all placeholder and output nodes (ParamAOTInput,
+    BufferAOTInput, PlainAOTInput, GradAOTOutput, PlainAOTOutput, etc.).
+
+    For the higher-level API that traces a model, use ``AutoParallel`` instead.
+    """
+
+    def __init__(
+        self,
+        gm,
+        mesh,
+        *,
+        reshard_after_forward=True,
+        cost_model="nccl",
+        repeated_subgraphs=True,
+        rescale_grad_comm_cost_for_mp=1.0,
+    ):
+        self.gm = gm
+        self.mesh = mesh
+        self.reshard_after_forward = reshard_after_forward
+
+        from .cost_models.collective_runtime_estimation import (
+            get_nccl_topo_config,
+            set_nccl_topo_config,
+        )
+        from .cost_models.nccl_cost_model import NCCLTopoConfig, detect_nccl_topo_config
+
+        self._prev_nccl_config = get_nccl_topo_config()
+        if isinstance(cost_model, NCCLTopoConfig):
+            set_nccl_topo_config(cost_model)
+        elif cost_model == "nccl":
+            set_nccl_topo_config(detect_nccl_topo_config(mesh))
+        else:
+            set_nccl_topo_config(None)
+
+        self.sharding_optimizer = ShardingOptimizer(
+            gm,
+            mesh,
+            rescale_grad_comm_cost_for_mp,
+            repeated_subgraphs=repeated_subgraphs,
+        )
+
+        self.input_constraints = None
+        self.output_constraints = None
+
+    def add_parameter_memory_constraint(self, low=None, high=None):
+        if low is None:
+            low = 0.0
+        if high is None:
+            high = 1.0 / self.mesh.size()
+        assert low <= high, f"low should be <= high, got low{low}, high={high}"
+        self.sharding_optimizer.add_parameter_memory_constraint(low, high)
+
+    def add_input_constraints(self, constraints):
+        assert self.input_constraints is None, "Input constraints have already been set"
+        self.sharding_optimizer.add_sharded_input_constraint(constraints)
+        self.input_constraints = constraints
+
+    def add_output_constraints(self, constraints):
+        assert (
+            self.output_constraints is None
+        ), "Output constraints have already been set"
+        self.sharding_optimizer.add_sharded_output_constraint(constraints)
+        self.output_constraints = constraints
+
+    def optimize_placement(self, verbose=True):
+        self.sharding_placement = self.sharding_optimizer.get_solution(verbose=False)
+
+        if verbose:
+            logger.info(self.sharding_optimizer.get_log(verbose=True))
+
+        trace_structured(
+            "artifact",
+            metadata_fn=lambda: {
+                "name": "autoparallel_sharding_optimizer_log",
+                "encoding": "string",
+            },
+            payload_fn=lambda: self.sharding_optimizer.get_log(
+                verbose=True, colored=False
+            ),
+        )
+
+        if self.sharding_optimizer.prob.status == -1:
+            raise RuntimeError(
+                "The sharding optimizer could not find a feasible solution. "
+                "This typically means the user-specified constraints are "
+                "contradictory or the device mesh is too small for the requested "
+                "sharding. Check the WARNING log for the list of violated "
+                "constraints, and consider relaxing input/output constraints or "
+                "using a larger mesh."
+            )
+
+        return self.sharding_placement
+
+    def apply_sharding(
+        self, sharding_placement, *, params_spec=None, buffers_spec=None
+    ):
+        """Apply sharding to the graph, returning the parallelized graph and sharded dicts.
+
+        If params_spec/buffers_spec are not provided, they are derived from
+        graph node descriptors.
+        """
+        from torch._functorch._aot_autograd.fx_utils import (
+            get_named_buffer_nodes,
+            get_named_param_nodes,
+        )
+        from torch._subclasses.fake_tensor import unset_fake_temporarily
+
+        t0 = time.perf_counter()
+
+        if params_spec is None:
+            params_spec = get_named_param_nodes(self.gm.graph)
+        if buffers_spec is None:
+            buffers_spec = get_named_buffer_nodes(self.gm.graph)
+
+        with unset_fake_temporarily():
+            mesh = self.mesh
+            if mesh.ndim != 1:
+                mesh._flatten()
+
+        # Extract fake_mode from graph placeholder nodes
+        fake_mode = None
+        for node in self.gm.graph.nodes:
+            if node.op == "placeholder":
+                val = node.meta.get("val")
+                if hasattr(val, "fake_mode"):
+                    fake_mode = val.fake_mode
+                    break
+
+        if fake_mode is not None:
+            ctx = fake_mode
+        else:
+            from contextlib import nullcontext
+
+            ctx = nullcontext()
+
+        with ctx:
+            (
+                parallel_gm,
+                sharded_param_dict,
+                sharded_buffer_dict,
+            ) = apply_sharding_to_model(
+                self.gm,
+                sharding_placement,
+                params_spec,
+                buffers_spec,
+            )
+        t_apply = time.perf_counter()
+
+        cleanup_graph(parallel_gm, aggressive=True)
+        t_cleanup = time.perf_counter()
+
+        trace_structured(
+            "artifact",
+            metadata_fn=lambda: {
+                "name": "autoparallel_parallel_graph",
+                "encoding": "string",
+            },
+            payload_fn=lambda: parallel_gm.print_readable(
+                print_output=False, include_stride=True, include_device=True
+            ),
+        )
+        t_trace = time.perf_counter()
+
+        from torch._inductor.fx_passes.post_grad import view_to_reshape
+
+        view_to_reshape(parallel_gm)
+
+        mark_fsdp_all_gather_recomputation(
+            parallel_gm.graph, self.reshard_after_forward
+        )
+        t_ac = time.perf_counter()
+
+        fix_scatter_on_aliased_inputs(parallel_gm.graph)
+
+        logger.info(
+            "Apply placements took %.3fs "
+            "(apply_sharding=%.3fs, cleanup=%.3fs, trace=%.3fs, ac=%.3fs)",
+            time.perf_counter() - t0,
+            t_apply - t0,
+            t_cleanup - t_apply,
+            t_trace - t_cleanup,
+            t_ac - t_trace,
+        )
+        self.parallel_gm = parallel_gm
+        return parallel_gm, sharded_param_dict, sharded_buffer_dict
+
+    def _restore_nccl_config(self):
+        from .cost_models.collective_runtime_estimation import set_nccl_topo_config
+
+        set_nccl_topo_config(self._prev_nccl_config)
+
+
+class AutoParallel(AutoParallelBase):
     """
     Args:
         mesh: Defines placement options.
@@ -203,11 +464,11 @@ class AutoParallel:
         cost_model: Any = "nccl",
         repeated_subgraphs: bool = True,
     ):
+        # Don't call super().__init__ yet — gm isn't built until __enter__
         self.stack = ExitStack()
         self.fake_mode = (
             FakeTensorMode()
         )  # TODO: maybe need to reuse the model's fake mode
-        # self.fake_mode.allow_scalar_outputs = True
         device = _get_device_from_mesh(mesh)
         if mp_policy is not None:
             mp_policy = canonicalize_mp(mp_policy)
@@ -243,23 +504,6 @@ class AutoParallel:
         # won't be called (Python only calls __exit__ if __enter__
         # succeeds), so we must unwind the stack ourselves.
         try:
-            from .cost_models.collective_runtime_estimation import (
-                get_nccl_topo_config,
-                set_nccl_topo_config,
-            )
-            from .cost_models.nccl_cost_model import (
-                NCCLTopoConfig,
-                detect_nccl_topo_config,
-            )
-
-            self._prev_nccl_config = get_nccl_topo_config()
-            if isinstance(self.cost_model, NCCLTopoConfig):
-                set_nccl_topo_config(self.cost_model)
-            elif self.cost_model == "nccl":
-                set_nccl_topo_config(detect_nccl_topo_config(self.mesh))
-            else:
-                set_nccl_topo_config(None)
-
             self.stack.enter_context(self.mesh)
 
             self.build_model_graph()
@@ -277,17 +521,17 @@ class AutoParallel:
                     # Tiebreak, favoring performing the comms in the largest
                     # dtype
                     rescale_grad_comm_cost_for_mp *= 1.1
-            sharding_optimizer = ShardingOptimizer(
+
+            # Initialize the base class now that gm is available
+            AutoParallelBase.__init__(
+                self,
                 self.gm,
                 self.mesh,
-                rescale_grad_comm_cost_for_mp,
+                reshard_after_forward=self.reshard_after_forward,
+                cost_model=self.cost_model,
                 repeated_subgraphs=self.repeated_subgraphs,
+                rescale_grad_comm_cost_for_mp=rescale_grad_comm_cost_for_mp,
             )
-
-            self.sharding_optimizer = sharding_optimizer
-
-            self.input_constraints = None
-            self.output_constraints = None
 
             self.active = True
 
@@ -299,9 +543,7 @@ class AutoParallel:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        from .cost_models.collective_runtime_estimation import set_nccl_topo_config
-
-        set_nccl_topo_config(self._prev_nccl_config)
+        self._restore_nccl_config()
         torch._inductor.config.comprehensive_padding = (
             self.old_inductor_comprehensive_padding
         )
@@ -326,155 +568,35 @@ class AutoParallel:
         self.joint_with_descriptors = result.joint_with_descriptors
         self._traced_inputs = result.traced_inputs
 
-    # TODO: Specify what the low/high meaning is (percentage?)
+    # Override base constraint methods to add _assert_entered checks
     def add_parameter_memory_constraint(self, low=None, high=None):
         self._assert_entered()
-
-        # by default, divide the parameters by the world size
-        if low is None:
-            low = 0.0
-        if high is None:
-            high = 1.0 / self.mesh.size()
-
-        assert low <= high, f"low should be <= high, got low{low}, high={high}"
-
-        self.sharding_optimizer.add_parameter_memory_constraint(low, high)
+        super().add_parameter_memory_constraint(low, high)
 
     def add_input_constraints(self, constraints):
         self._assert_entered()
-
-        assert self.input_constraints is None, "Input constraints have already been set"
-        self.sharding_optimizer.add_sharded_input_constraint(constraints)
-        self.input_constraints = constraints
+        super().add_input_constraints(constraints)
 
     def add_output_constraints(self, constraints):
         self._assert_entered()
-
-        assert (
-            self.output_constraints is None
-        ), "Output constraints have already been set"
-        # forces sharding of fwd output to be S(0) on first dimension and R on others
-        self.sharding_optimizer.add_sharded_output_constraint(constraints)
-        self.output_constraints = constraints
+        super().add_output_constraints(constraints)
 
     def optimize_placement(self, verbose=True):
         self._assert_entered()
-
-        self.sharding_placement = self.sharding_optimizer.get_solution(verbose=False)
-
-        if verbose:
-            logger.info(self.sharding_optimizer.get_log(verbose=True))
-
-        trace_structured(
-            "artifact",
-            metadata_fn=lambda: {
-                "name": "autoparallel_sharding_optimizer_log",
-                "encoding": "string",
-            },
-            payload_fn=lambda: self.sharding_optimizer.get_log(
-                verbose=True, colored=False
-            ),
-        )
-
-        if self.sharding_optimizer.prob.status == -1:
-            raise RuntimeError(
-                "The sharding optimizer could not find a feasible solution. "
-                "This typically means the user-specified constraints are "
-                "contradictory or the device mesh is too small for the requested "
-                "sharding. Check the WARNING log for the list of violated "
-                "constraints, and consider relaxing input/output constraints or "
-                "using a larger mesh."
-            )
-
-        return self.sharding_placement
+        return super().optimize_placement(verbose)
 
     def _apply_placement_common(self, sharding_placement):
-        t0 = time.perf_counter()
         self._assert_entered()
-
-        # TODO: what kind of updates do we have to do?
-        #  - graph obvs
-        #  - flat_args / updated_flat_args
-        # OTHER THINGS
-        #  - subclass_meta
-        #  - wrappers
-        #    - contains another instance of subclass info in self
-        #    - quite a lot of use of runtime_metadata
-        #
-        from torch._subclasses.fake_tensor import unset_fake_temporarily
-
-        with unset_fake_temporarily():
-            # creates a new mesh and caches it internally
-            # we don't need to keep a reference to it
-            # TODO: remove ndim == 1 special case once
-            # DeviceMesh._flatten is fixed
-            mesh = self.mesh
-            if mesh.ndim != 1:
-                mesh._flatten()
-        with self.fake_mode:
-            (
-                parallel_gm,
-                sharded_param_dict,
-                sharded_buffer_dict,
-            ) = apply_sharding_to_model(
-                self.gm,
-                sharding_placement,
-                self.joint_with_descriptors.params_spec,
-                self.joint_with_descriptors.buffers_spec,
-            )
-        t_apply = time.perf_counter()
-        # clean it up by removing the added aliases from previous pass
-        # as well as redundant views
-        cleanup_graph(parallel_gm, aggressive=True)
-        t_cleanup = time.perf_counter()
-
-        trace_structured(
-            "artifact",
-            metadata_fn=lambda: {
-                "name": "autoparallel_parallel_graph",
-                "encoding": "string",
-            },
-            payload_fn=lambda: parallel_gm.print_readable(
-                print_output=False, include_stride=True, include_device=True
-            ),
+        parallel_gm, sharded_param_dict, sharded_buffer_dict = self.apply_sharding(
+            sharding_placement,
+            params_spec=self.joint_with_descriptors.params_spec,
+            buffers_spec=self.joint_with_descriptors.buffers_spec,
         )
-        t_trace = time.perf_counter()
-
-        # Replace aten.view with aten.reshape unconditionally. Graph passes
-        # (sharding redistributions, collective bucketing) can produce
-        # non-contiguous tensors that break aten.view's contiguity requirement.
-        from torch._inductor.fx_passes.post_grad import view_to_reshape
-
-        view_to_reshape(parallel_gm)
-
-        mark_fsdp_all_gather_recomputation(
-            parallel_gm.graph, self.reshard_after_forward
-        )
-        t_ac = time.perf_counter()
-        # now rename input/param/tangent/output/grad_param/grad_input nodes following
-        # our convention
-        # apply_node_renaming(
-        #    parallel_gm, self.params_len, self.buffer_len, self.metadata
-        # )
-        self.parallel_gm = parallel_gm
         update_joint_with_descriptors(self.joint_with_descriptors, parallel_gm)
-        fix_scatter_on_aliased_inputs(parallel_gm.graph)
         # Allow DCE to remove unused wait_tensor nodes in the backward graph.
         # Pushed onto self.stack so it's restored in AutoParallel.__exit__.
         self.stack.enter_context(_suppress_wait_tensor_side_effect())
-        logger.info(
-            "Apply placements took %.3fs "
-            "(apply_sharding=%.3fs, cleanup=%.3fs, trace=%.3fs, ac=%.3fs)",
-            time.perf_counter() - t0,
-            t_apply - t0,
-            t_cleanup - t_apply,
-            t_trace - t_cleanup,
-            t_ac - t_trace,
-        )
-        return (
-            sharded_param_dict,
-            sharded_buffer_dict,
-        )
+        return sharded_param_dict, sharded_buffer_dict
 
     def apply_placement(self, sharding_placement):
         sharded_param_dict, sharded_buffer_dict = self._apply_placement_common(
@@ -693,6 +815,139 @@ def auto_parallel(
         # Optimize and apply
         sharding_placement = autop.optimize_placement(verbose=False)
         parallel_model = autop.apply_placement(sharding_placement)
+
+    return parallel_model
+
+
+class AutoParallelBackward(AutoParallel):
+    """Parallelize a model whose forward() contains backward().
+
+    Similar to ``AutoParallel`` but for models that call ``loss.backward()``
+    inside ``forward()``. The backward is traced as part of the graph via
+    ``torch.autograd.grad`` nodes. The graph is compiled as a single unit
+    (no fwd/bwd split).
+
+    Usage::
+
+        with AutoParallelBackward(model, input_fn, mesh) as ap:
+            ap.add_input_constraints(...)
+            ap.add_output_constraints(...)
+            placement = ap.optimize_placement()
+            parallel_model = ap.apply_placement(placement)
+    """
+
+    def build_model_graph(self):
+        self.gm, self._traced_inputs = build_user_backward_graph(
+            self.model, self.input_fn, self.fake_mode
+        )
+
+    def apply_placement(self, sharding_placement):
+        self._assert_entered()
+        parallel_gm, sharded_param_dict, sharded_buffer_dict = self.apply_sharding(
+            sharding_placement
+        )
+        self.stack.enter_context(_suppress_wait_tensor_side_effect())
+
+        # Compile the full fwd+bwd graph as a single unit (no fwd/bwd split)
+        compiler_fn = self.compiler_fn
+        example_inputs = [
+            n.meta["val"] for n in parallel_gm.graph.nodes if n.op == "placeholder"
+        ]
+        compiled_fn = compiler_fn(parallel_gm, example_inputs)
+
+        from torch._functorch._aot_autograd.fx_utils import (
+            get_named_buffer_nodes,
+            get_named_param_nodes,
+            get_plain_input_and_grad_nodes,
+        )
+
+        graph_param_fqns = list(get_named_param_nodes(self.gm.graph))
+        graph_buffer_fqns = list(get_named_buffer_nodes(self.gm.graph))
+
+        input_nodes = get_plain_input_and_grad_nodes(self.gm.graph)
+        solved_input_placements = []
+        for desc in sorted(input_nodes, key=lambda d: d.idx):
+            node, _grad_node = input_nodes[desc]
+            strategy = sharding_placement[node]
+            solved_input_placements.append(tuple(strategy.output_specs.placements))
+
+        expected_inputs = _compute_expected_inputs(
+            self._traced_inputs, solved_input_placements, self.mesh
+        )
+
+        def forward(self, *args):
+            flat_args, _ = torch.utils._pytree.tree_flatten(args)
+            _check_forward_args(flat_args, expected_inputs)
+            params = [
+                self.get_parameter(fqn).to_local() for fqn in graph_param_fqns
+            ] + [self.get_buffer(fqn).to_local() for fqn in graph_buffer_fqns]
+            boxed_args = [*params, *flat_args]
+            del params
+            return compiled_fn(boxed_args)
+
+        self.parallel_model = make_parallel_module(
+            self.model,
+            sharded_param_dict,
+            sharded_buffer_dict,
+            forward_fn=forward,
+        )
+        return self.parallel_model
+
+
+def auto_parallel_with_backward(
+    model,
+    mesh,
+    sample_inputs,
+    out_shardings,
+    *,
+    mp_policy=None,
+    parameter_memory_budget=None,
+    dynamic=False,
+):
+    """Parallelize a model whose forward() contains backward().
+
+    This is a simplified API that wraps ``AutoParallelBackward``.
+    For more control, use ``AutoParallelBackward`` directly.
+
+    Args:
+        model: Model whose forward() includes backward(). Can be on meta device.
+        mesh: Device mesh defining the distributed topology.
+        sample_inputs: Sample inputs for tracing (same format as auto_parallel).
+        out_shardings: Output sharding specification for non-gradient outputs.
+        mp_policy: Optional mixed precision policy.
+        parameter_memory_budget: Optional (low, high) bounds for parameter memory.
+        dynamic: If True, trace with symbolic batch dimensions.
+
+    Returns:
+        Parallelized module. Call to_empty(device="cuda") and init_weights()
+        before use.
+    """
+    if callable(sample_inputs):
+        raw_inputs = sample_inputs()
+    else:
+        raw_inputs = sample_inputs
+
+    shapes, dtypes, input_placements, treespec, devices = _extract_input_info(
+        raw_inputs, mesh
+    )
+    output_placements = _flatten_out_shardings(out_shardings)
+    input_fn = _make_input_fn(shapes, dtypes, treespec, devices=devices)
+
+    with AutoParallelBackward(
+        model,
+        input_fn,
+        mesh,
+        mp_policy=mp_policy,
+        dynamic=dynamic,
+    ) as ap:
+        ap.add_input_constraints(input_placements)
+        if parameter_memory_budget is not None:
+            ap.add_parameter_memory_constraint(
+                low=parameter_memory_budget[0], high=parameter_memory_budget[1]
+            )
+        ap.add_output_constraints(output_placements)
+        sharding_placement = ap.optimize_placement(verbose=False)
+        parallel_model = ap.apply_placement(sharding_placement)
 
     return parallel_model
 

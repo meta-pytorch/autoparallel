@@ -4,9 +4,17 @@
 # LICENSE file in the root directory of this source tree.
 
 import copy
+import operator
 from contextlib import contextmanager
 
 import torch
+from torch._functorch._aot_autograd.descriptors import (
+    BufferAOTInput,
+    GradAOTOutput,
+    ParamAOTInput,
+    PlainAOTInput,
+    PlainAOTOutput,
+)
 from torch._inductor.decomposition import select_decomp_table
 from torch._subclasses import FakeTensorMode
 
@@ -135,3 +143,139 @@ def _add_unused_params_and_buffers(model, graph_module):
 
     if added:
         graph_module.recompile()
+
+
+def infer_grad_param_mapping(gm):
+    """Analyze autograd.grad nodes to map gradient outputs to parameter placeholders.
+
+    In a dynamo-captured graph with trace_autograd_ops=True, backward() is lowered
+    to torch.autograd.grad() calls. This function walks those nodes to determine
+    which outputs of the graph are gradients of which parameters.
+
+    Returns: dict mapping output_position (int) -> placeholder_node
+    """
+    # Find the output node and its args
+    output_node = None
+    for n in gm.graph.nodes:
+        if n.op == "output":
+            output_node = n
+            break
+    assert output_node is not None
+
+    # output_node.args[0] is the tuple of output values
+    output_args = output_node.args[0]
+
+    # Build a map from node -> output position
+    node_to_output_pos = {}
+    for i, arg in enumerate(output_args):
+        if isinstance(arg, torch.fx.Node):
+            node_to_output_pos[arg] = i
+
+    # Find all autograd.grad call nodes
+    grad_nodes = []
+    for n in gm.graph.nodes:
+        if n.op == "call_function" and n.target is torch.autograd.grad:
+            grad_nodes.append(n)
+
+    # For each grad node, trace its getitem users to output positions
+    # autograd.grad(outputs, inputs, ...) returns a tuple of grads
+    # args[0] = outputs (loss), args[1] = inputs (params to diff w.r.t.)
+    mapping = {}
+    for grad_node in grad_nodes:
+        # args[1] is the sequence of tensors to differentiate with respect to
+        wrt_tensors = grad_node.args[1]
+        if isinstance(wrt_tensors, torch.fx.Node):
+            # Single tensor, not a list — wrap for uniform handling
+            wrt_tensors = [wrt_tensors]
+
+        for user in grad_node.users:
+            if user.op == "call_function" and user.target is operator.getitem:
+                idx = user.args[1]
+                if idx < len(wrt_tensors):
+                    param_node = wrt_tensors[idx]
+                    # Trace this getitem through to the output
+                    # The grad value might go through empty_like → copy_ pattern
+                    # or directly to output
+                    out_pos = _trace_to_output(user, node_to_output_pos)
+                    if out_pos is not None and param_node.op == "placeholder":
+                        mapping[out_pos] = param_node
+
+    return mapping
+
+
+def _trace_to_output(node, node_to_output_pos):
+    """Trace a node through copy_ chains to find its output position."""
+    # Direct case: node itself is in the output
+    if node in node_to_output_pos:
+        return node_to_output_pos[node]
+
+    # Follow through empty_like → copy_ pattern:
+    # grad_getitem → used by copy_(empty_like_result, grad_getitem) → empty_like_result in output
+    for user in node.users:
+        if user.op == "call_function" and user.target is torch.ops.aten.copy_.default:
+            # copy_(dst, src) — if our node is the src (args[1]), the dst might be in output
+            if user.args[1] is node:
+                dst = user.args[0]
+                if isinstance(dst, torch.fx.Node) and dst in node_to_output_pos:
+                    return node_to_output_pos[dst]
+
+    # Also check if any user is directly in output
+    for user in node.users:
+        if user in node_to_output_pos:
+            return node_to_output_pos[user]
+
+    return None
+
+
+def annotate_user_backward_descriptors(gm, model):
+    """Set meta["desc"] on all placeholder and output nodes for a user-backward graph.
+
+    This produces the same descriptor structure that aot_export_joint_with_descriptors
+    would produce, enabling reuse of ShardingOptimizer including
+    forward_backward_consistency_constraints.
+    """
+    # Build FQN maps from the model
+    param_fqns = set(dict(model.named_parameters()))
+    buffer_fqns = set(dict(model.named_buffers()))
+
+    # Get the grad→param mapping
+    grad_mapping = infer_grad_param_mapping(gm)
+
+    # Annotate placeholders
+    plain_input_idx = 0
+    for n in gm.graph.nodes:
+        if n.op != "placeholder":
+            continue
+
+        target = n.target
+        if target in param_fqns:
+            n.meta["desc"] = ParamAOTInput(target=target)
+        elif target in buffer_fqns:
+            n.meta["desc"] = BufferAOTInput(target=target)
+        else:
+            n.meta["desc"] = PlainAOTInput(idx=plain_input_idx)
+            plain_input_idx += 1
+
+    # Annotate outputs
+    output_node = None
+    for n in gm.graph.nodes:
+        if n.op == "output":
+            output_node = n
+            break
+    assert output_node is not None
+
+    output_args = output_node.args[0]
+    plain_output_idx = 0
+    for i, arg in enumerate(output_args):
+        if i in grad_mapping:
+            param_node = grad_mapping[i]
+            # Get the descriptor we just set on the param placeholder
+            param_desc = param_node.meta["desc"]
+            desc = GradAOTOutput(grad_of=param_desc)
+        else:
+            desc = PlainAOTOutput(idx=plain_output_idx)
+            plain_output_idx += 1
+
+        # Set desc on the output arg node if it's a node
+        if isinstance(arg, torch.fx.Node):
+            arg.meta["desc"] = desc
