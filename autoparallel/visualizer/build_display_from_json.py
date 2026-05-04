@@ -935,7 +935,28 @@ def _stage_summary(nodes, all_nodes_by_name):
     }
 
 
-def _build_strategy_overview_html(non_param_nodes, layer_costs):
+def _find_repeated_layer_container(tree_node):
+    """Find a subtree whose children are numbered layers (e.g., 0, 1, 2, ...).
+
+    Returns (container_node, full_dotted_name, first_layer_id) or None.
+    With cluster deduplication, not all layer indices may be present, so
+    we only require ≥2 numeric children.
+    """
+    for name, child in tree_node.children.items():
+        child_items = list(child.children.items())
+        numeric_keys = [n for n, _ in child_items if n.isdigit()]
+        if len(numeric_keys) >= 2:
+            first_id = min(int(n) for n in numeric_keys)
+            return child, name, first_id
+        result = _find_repeated_layer_container(child)
+        if result is not None:
+            container, inner_name, first_id = result
+            full_name = f"{name}.{inner_name}" if name else inner_name
+            return container, full_name, first_id
+    return None
+
+
+def _build_strategy_overview_html(non_param_nodes, layer_costs, module_tree):
     import re as _re
 
     nodes = [
@@ -954,31 +975,57 @@ def _build_strategy_overview_html(non_param_nodes, layer_costs):
         for idx in layer_indices[1:]
     )
 
+    # Discover stage structure from module tree
+    layer_info = _find_repeated_layer_container(module_tree)
+
+    if layer_info is not None:
+        layer_container, container_name, first_layer_id = layer_info
+        repr_layer_key = str(repr_idx if repr_idx is not None else first_layer_id)
+        repr_layer_node = layer_container.children.get(repr_layer_key)
+        layer_stage_children = list(repr_layer_node.children.items()) if repr_layer_node else []
+        layer_prefix = f"{container_name}.{repr_layer_key}."
+    else:
+        layer_stage_children = []
+        container_name = None
+        layer_prefix = None
+
+    # Pre/post stages: top-level module_tree children excluding the layer container
+    pre_stages = []
+    post_stages = []
+    seen_layer_container = False
+    for name, child in module_tree.children.items():
+        if layer_info is not None and child is layer_info[0]:
+            seen_layer_container = True
+            continue
+        if not seen_layer_container:
+            pre_stages.append(name)
+        else:
+            post_stages.append(name)
+
+    ordered_layer = [name for name, _ in layer_stage_children]
+    if ordered_layer:
+        ordered_layer.append("layer_other")
+
+    def _make_label(name):
+        return name.replace("_", " ").title()
+
+    stage_labels = {name: _make_label(name) for name in pre_stages}
+    for name in ordered_layer:
+        stage_labels[name] = "Other Layer Ops" if name == "layer_other" else _make_label(name)
+    stage_labels.update({name: _make_label(name) for name in post_stages})
+    stage_labels["other"] = "Other Ops"
+
     def stage_key(n):
         mp = _strip_module_prefix(n.get("module_path", "") or "")
-        if repr_idx is not None:
-            if mp.startswith(f"layers.{repr_idx}.attention."):
-                return "attention"
-            if mp.startswith(f"layers.{repr_idx}.feed_forward."):
-                return "feed_forward"
-            if mp == f"layers.{repr_idx}.attention_norm.weight" or mp.startswith(
-                f"layers.{repr_idx}.attention_norm"
-            ):
-                return "attention_norm"
-            if mp == f"layers.{repr_idx}.ffn_norm.weight" or mp.startswith(
-                f"layers.{repr_idx}.ffn_norm"
-            ):
-                return "ffn_norm"
-            if mp.startswith(f"layers.{repr_idx}."):
-                return "layer_other"
-        if mp.startswith("tok_embeddings"):
-            return "tok_embeddings"
-        if mp == "freqs_cis" or mp.startswith("freqs_cis"):
-            return "freqs_cis"
-        if mp == "norm.weight" or mp.startswith("norm."):
-            return "norm"
-        if mp.startswith("output"):
-            return "output"
+        if layer_prefix is not None and mp.startswith(layer_prefix):
+            suffix = mp[len(layer_prefix):]
+            for child_name, _ in layer_stage_children:
+                if suffix == child_name or suffix.startswith(child_name + "."):
+                    return child_name
+            return "layer_other"
+        for name in pre_stages + post_stages:
+            if mp == name or mp.startswith(name + "."):
+                return name
         return "other"
 
     grouped = {}
@@ -986,22 +1033,8 @@ def _build_strategy_overview_html(non_param_nodes, layer_costs):
         key = stage_key(n)
         grouped.setdefault(key, []).append(n)
 
-    stage_labels = {
-        "tok_embeddings": "Token Embeddings",
-        "freqs_cis": "RoPE / freqs_cis",
-        "attention_norm": "Attention Norm",
-        "attention": "Attention",
-        "ffn_norm": "FFN Norm",
-        "feed_forward": "Feed-Forward",
-        "layer_other": "Other Layer Ops",
-        "norm": "Final Norm",
-        "output": "Output Head",
-        "other": "Other Ops",
-    }
-
-    ordered_pre = ["tok_embeddings", "freqs_cis"]
-    ordered_layer = ["attention_norm", "attention", "ffn_norm", "feed_forward", "layer_other"]
-    ordered_post = ["norm", "output", "other"]
+    ordered_pre = pre_stages
+    ordered_post = post_stages + ["other"]
 
     def stage_block_html(key):
         summary = _stage_summary(grouped.get(key, []), all_nodes_by_name)
@@ -1143,7 +1176,7 @@ def _build_strategy_overview_html(non_param_nodes, layer_costs):
 <div class="overview-stage-card">
   <div class="overview-stage-header">
     <div>
-      <div class="overview-stage-name">{_esc(stage_labels[key])}</div>
+      <div class="overview-stage-name">{_esc(stage_labels.get(key, key))}</div>
       <div class="overview-stage-sub">{summary["num_nodes"]} ops &middot; total {_fmt_us(summary["total"])}</div>
     </div>
     <div class="overview-stage-costs">
@@ -1180,7 +1213,7 @@ def _build_strategy_overview_html(non_param_nodes, layer_costs):
 
     if repr_idx is not None:
         html += (
-            f'<div class="overview-section-title">Representative Transformer Layer'
+            f'<div class="overview-section-title">Representative Layer'
             f'{f" &times;{layer_count}" if layer_count > 1 else ""}</div>'
         )
         html += "".join(stage_block_html(key) for key in ordered_layer if grouped.get(key))
@@ -1192,179 +1225,6 @@ def _build_strategy_overview_html(non_param_nodes, layer_costs):
     html += '</div>'
     return html
 
-
-def _build_estimated_trace_html(non_param_nodes):
-    nodes = [
-        n
-        for n in non_param_nodes
-        if n.get("op") not in {"placeholder", "output"}
-    ]
-    if not nodes:
-        return (
-            '<div class="card"><div class="card-title">Estimated Execution Trace</div>'
-            '<div style="font-size:12px;color:#64748b">No execution nodes available.</div></div>'
-        )
-
-    def collective_kind(inp):
-        return _infer_collective(inp.get("src_placement"), inp.get("dst_placement"))
-
-    def stage_label(n):
-        mp = _strip_module_prefix(n.get("module_path", "") or "")
-        if ".attention." in mp:
-            return "attention"
-        if ".feed_forward." in mp:
-            return "feed_forward"
-        if "norm" in mp:
-            return "norm"
-        if "tok_embeddings" in mp:
-            return "embedding"
-        if mp.startswith("output"):
-            return "output"
-        return "other"
-
-    def node_label(n):
-        mp = _strip_module_prefix(n.get("module_path", "") or "")
-        if mp:
-            return mp
-        return n.get("name", "")
-
-    lanes = [
-        {"id": "fwd", "label": "Forward Compute", "items": []},
-        {"id": "comm", "label": "Redistribution Stream", "items": []},
-        {"id": "bwd", "label": "Backward Compute", "items": []},
-    ]
-    lane_map = {lane["id"]: lane for lane in lanes}
-    nodes_by_name = {n["name"]: n for n in nodes}
-    compute_clock = {"forward": 0.0, "backward": 0.0}
-    comm_clock = 0.0
-    ready_time = {}
-
-    ordered_nodes = sorted(
-        nodes,
-        key=lambda n: (0 if n.get("phase") == "forward" else 1, n.get("name", "")),
-    )
-
-    for n in ordered_nodes:
-        phase = n.get("phase") or "forward"
-        lane_id = "fwd" if phase == "forward" else "bwd"
-        input_ready = 0.0
-        comm_end_times = []
-        for idx, inp in enumerate(n.get("inputs", [])):
-            pred = nodes_by_name.get(inp.get("name"))
-            pred_ready = ready_time.get(inp.get("name"), 0.0)
-            input_ready = max(input_ready, pred_ready)
-            comm = inp.get("comm_cost", 0.0)
-            trans = inp.get("transition_cost", 0.0)
-            total = comm + trans
-            coll = collective_kind(inp)
-            if total <= 0 or not coll:
-                continue
-            start = max(comm_clock, pred_ready)
-            end = start + total
-            comm_clock = end
-            comm_end_times.append(end)
-            lane_map["comm"]["items"].append(
-                {
-                    "label": node_label(n),
-                    "short": f'arg{idx}',
-                    "stage": stage_label(n),
-                    "start": start,
-                    "dur": total,
-                    "kind": "comm",
-                    "subtitle": (
-                        f'{coll} · {inp.get("src_placement") or "?"} → '
-                        f'{inp.get("dst_placement") or "?"}'
-                    ),
-                }
-            )
-
-        start = max(compute_clock[phase], input_ready, max(comm_end_times, default=0.0))
-        dur = n.get("compute_cost", 0.0)
-        end = start + dur
-        ready_time[n["name"]] = max(end, max(comm_end_times, default=0.0), input_ready)
-        compute_clock[phase] = end
-        if dur <= 0:
-            continue
-        lane_map[lane_id]["items"].append(
-            {
-                "label": node_label(n),
-                "short": node_label(n).split(".")[-1],
-                "stage": stage_label(n),
-                "start": start,
-                "dur": dur,
-                "kind": "compute",
-                "subtitle": (
-                    f'{n.get("placement", "")} · compute {_fmt_us(n.get("compute_cost", 0))}'
-                ),
-            }
-        )
-
-    total_span = max(
-        max((ready_time.values()), default=0.0),
-        comm_clock,
-        1.0,
-    )
-
-    def stage_color(stage):
-        return {
-            "embedding": "#0EA5E9",
-            "attention": "#8B5CF6",
-            "feed_forward": "#F59E0B",
-            "norm": "#14B8A6",
-            "output": "#EC4899",
-            "other": "#64748B",
-        }.get(stage, "#64748B")
-
-    ticks = []
-    for i in range(9):
-        frac = i / 8
-        ticks.append(
-            {
-                "left": frac * 100,
-                "label": _fmt_us(total_span * frac),
-            }
-        )
-
-    html = (
-        '<div class="card"><div class="card-title">Estimated Execution Trace</div>'
-        '<div class="overview-note">Synthetic global timeline from exported cost estimates. '
-        'Redistributions run on a separate communication lane, and compute waits for required incoming layout changes.</div>'
-        '<div class="trace-controls">'
-        '<button class="filter-btn" onclick="adjustTraceZoom(this, -0.25)">-</button>'
-        '<button class="filter-btn active" onclick="resetTraceZoom(this)">100%</button>'
-        '<button class="filter-btn" onclick="adjustTraceZoom(this, 0.25)">+</button>'
-        f'<span class="overview-note" style="margin:0">Total span: {_fmt_us(total_span)}</span>'
-        '</div>'
-        '<div class="trace-scroll">'
-        '<div class="trace-axis-row"><div class="trace-lane-label"></div>'
-        '<div class="trace-scalable trace-axis">'
-    )
-    for tick in ticks:
-        html += (
-            f'<div class="trace-tick" style="left:{tick["left"]}%">'
-            f'<div class="trace-tick-line"></div><div class="trace-tick-label">{_esc(tick["label"])}</div></div>'
-        )
-    html += '</div></div>'
-
-    for lane in lanes:
-        html += (
-            f'<div class="trace-lane"><div class="trace-lane-label">{_esc(lane["label"])}</div>'
-            '<div class="trace-scalable trace-lane-body">'
-        )
-        for item in lane["items"]:
-            left = item["start"] / total_span * 100
-            width = max(item["dur"] / total_span * 100, 0.6)
-            html += (
-                f'<div class="trace-item trace-{item["kind"]}" '
-                f'style="left:{left}%;width:{width}%;background:{stage_color(item["stage"])}" '
-                f'title="{_esc(item["label"])}&#10;{_esc(item["subtitle"])}">'
-                f'<span class="trace-item-label">{_esc(item["short"])}</span>'
-                '</div>'
-            )
-        html += '</div></div>'
-
-    html += '</div></div>'
-    return html
 
 
 def _perfetto_trace_payload(non_param_nodes):
@@ -1960,7 +1820,16 @@ def generate_visualization_html(data: dict) -> str:
     # Per-layer cost breakdown (for repeated architectures)
     import re as _re
 
-    layer_costs = {}  # layer_idx -> {"comm": float, "compute": float, "transition": float, "num_nodes": int}
+    layer_container_info = _find_repeated_layer_container(module_tree)
+    if layer_container_info is not None:
+        _lc_name = layer_container_info[1]
+        _layer_pattern = _re.compile(rf"{_re.escape(_lc_name)}\.(\d+)")
+        _layer_suffix_pattern = _re.compile(rf".*{_re.escape(_lc_name)}\.\d+\.?")
+    else:
+        _layer_pattern = None
+        _layer_suffix_pattern = None
+
+    layer_costs = {}
     non_layer_cost = {
         "comm": 0.0,
         "compute": 0.0,
@@ -1968,11 +1837,10 @@ def generate_visualization_html(data: dict) -> str:
         "num_nodes": 0,
         "name": "non-layer",
     }
-    # Detailed per-layer collective breakdown
-    layer_collectives = {}  # layer_idx -> list of (module_suffix, coll_type, cost)
+    layer_collectives = {}
     for n in architecture_nodes:
         mp = n.get("module_path", "")
-        m = _re.search(r"layers\.(\d+)", mp)
+        m = _layer_pattern.search(mp) if _layer_pattern else None
         comm = n["_total_comm"]
         compute = n.get("compute_cost", 0)
         transition = n["_total_transition"]
@@ -1995,7 +1863,7 @@ def generate_visualization_html(data: dict) -> str:
                 if ccost <= 0:
                     continue
                 # Extract module suffix after layers.N.
-                suffix = _re.sub(r".*layers\.\d+\.?", "", _strip_module_prefix(mp))
+                suffix = _layer_suffix_pattern.sub("", _strip_module_prefix(mp))
                 layer_collectives[idx].append((suffix or mp, coll_type, ccost))
         else:
             non_layer_cost["comm"] += comm
@@ -2076,21 +1944,7 @@ def generate_visualization_html(data: dict) -> str:
 .ap-viz .notation-body {{ padding: 0 14px 12px 14px; display: grid; gap: 6px; font-size: 12px; color: #475569; }}
 .ap-viz .notation-code {{ display: inline-block; font-family: monospace; background: #f8fafc; border: 1px solid #e2e8f0; padding: 1px 6px; border-radius: 4px; color: #1e293b; }}
 .ap-viz .ascii-dump {{ margin-top: 14px; padding: 14px; background: #0f172a; color: #e2e8f0; border-radius: 8px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 11px; line-height: 1.45; overflow-x: auto; white-space: pre; }}
-.ap-viz .trace-controls {{ display: flex; gap: 8px; align-items: center; margin-bottom: 12px; }}
-.ap-viz .trace-scroll {{ overflow-x: auto; padding-bottom: 4px; }}
-.ap-viz .trace-wrap {{ display: grid; gap: 10px; }}
-.ap-viz .trace-lane {{ display: grid; grid-template-columns: 140px 1fr; gap: 12px; align-items: center; }}
-.ap-viz .trace-lane-label {{ font-size: 12px; font-weight: 600; color: #334155; }}
-.ap-viz .trace-scalable {{ min-width: 1200px; }}
-.ap-viz .trace-axis {{ position: relative; height: 30px; border-bottom: 1px solid #e2e8f0; margin-bottom: 2px; }}
-.ap-viz .trace-axis-row {{ display: grid; grid-template-columns: 140px 1fr; gap: 12px; align-items: end; margin-bottom: 4px; }}
-.ap-viz .trace-tick {{ position: absolute; top: 0; transform: translateX(-50%); }}
-.ap-viz .trace-tick-line {{ height: 16px; border-left: 1px solid #cbd5e1; }}
-.ap-viz .trace-tick-label {{ font-size: 10px; color: #64748b; margin-top: 2px; white-space: nowrap; }}
-.ap-viz .trace-lane-body {{ position: relative; height: 40px; background: linear-gradient(to right, #f8fafc, #eef2ff); border: 1px solid #e2e8f0; border-radius: 8px; overflow: hidden; }}
-.ap-viz .trace-item {{ position: absolute; top: 7px; height: 24px; border-radius: 6px; box-shadow: inset 0 0 0 1px rgba(255,255,255,0.35); opacity: 0.95; overflow: hidden; }}
-.ap-viz .trace-comm {{ box-shadow: inset 0 0 0 1px rgba(255,255,255,0.4), 0 0 0 1px rgba(220,38,38,0.15); }}
-.ap-viz .trace-item-label {{ display: block; font-size: 10px; line-height: 24px; color: white; padding: 0 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
+
 .ap-viz .overview-note {{ font-size: 12px; color: #64748b; margin-bottom: 14px; }}
 .ap-viz .overview-section-title {{ font-size: 13px; font-weight: 700; color: #334155; margin: 18px 0 10px 0; }}
 .ap-viz .overview-stage-card {{ border: 1px solid #e2e8f0; border-radius: 8px; padding: 14px; margin-bottom: 12px; background: #fff; }}
@@ -2140,6 +1994,7 @@ def generate_visualization_html(data: dict) -> str:
 .ap-viz .phase-bwd {{ color: #6B7280; background: #F1F5F9; }}
 .ap-viz .zero-cost-group {{ opacity: 0.72; }}
 .ap-viz .zero-cost-group:not(.expanded) > .func-details {{ display: none; }}
+.ap-viz .func-block.search-expanded > .func-details {{ display: block; }}
 </style></head><body>
 <div class="ap-viz">
 <div class="container">
@@ -2224,7 +2079,6 @@ def generate_visualization_html(data: dict) -> str:
 <div class="tabs">
   <div class="tab" onclick="switchTab('params', this)">Parameters</div>
   <div class="tab" onclick="switchTab('overview', this)">Execution Overview</div>
-  <div class="tab" onclick="switchTab('trace', this)">Trace</div>
   <div class="tab" onclick="switchTab('perfetto', this)">Perfetto</div>
   <div class="tab active" onclick="switchTab('arch', this)">Architecture</div>
   <div class="tab" onclick="switchTab('cost', this)">Cost Breakdown</div>
@@ -2247,13 +2101,7 @@ def generate_visualization_html(data: dict) -> str:
     # ===== EXECUTION OVERVIEW TAB =====
     html += '''
 <div data-tab="overview" class="tab-content">'''
-    html += _build_strategy_overview_html(architecture_nodes, layer_costs)
-    html += '</div>'
-
-    # ===== TRACE TAB =====
-    html += '''
-<div data-tab="trace" class="tab-content">'''
-    html += _build_estimated_trace_html(architecture_nodes)
+    html += _build_strategy_overview_html(architecture_nodes, layer_costs, module_tree)
     html += '</div>'
 
     # ===== PERFETTO TAB =====
@@ -2265,7 +2113,10 @@ def generate_visualization_html(data: dict) -> str:
     # ===== ARCHITECTURE TAB =====
     html += '''
 <div data-tab="arch" class="tab-content active">
-<div class="card"><div class="card-title">Computation Blocks by Module</div>'''
+<div class="card"><div class="card-title">Computation Blocks by Module</div>
+<div class="filter-bar">
+  <input type="text" class="search-box" placeholder="Search modules..." oninput="setArchSearch(this)">
+</div>'''
 
     # Render top-level tree children in execution order (dict preserves
     # insertion order from graph traversal)
@@ -2543,6 +2394,7 @@ var filterState = {
   phase: 'all',
   nodeType: 'all',
   searchText: '',
+  archSearchText: '',
   representativeLayersOnly: true,
 };
 
@@ -2561,6 +2413,15 @@ function setFilterState(key, value, btn) {
 function setSearch(el) {
   filterState.searchText = el.value.toLowerCase();
   applyFilters(_root(el));
+}
+
+function setArchSearch(el) {
+  filterState.archSearchText = el.value.toLowerCase();
+  var r = _root(el);
+  r.querySelectorAll('.func-block.search-expanded').forEach(function(b) {
+    b.classList.remove('search-expanded');
+  });
+  applyFilters(r);
 }
 
 function toggleRepresentativeLayers(btn) {
@@ -2591,8 +2452,13 @@ function applyFilters(r) {
     row.style.display = show ? '' : 'none';
   });
 
+  var archText = filterState.archSearchText;
+
   r.querySelectorAll('.arch-row').forEach(function(row) {
     var show = filterState.phase === 'all' || row.dataset.phase === filterState.phase;
+    if (show && archText) {
+      show = row.textContent.toLowerCase().indexOf(archText) >= 0;
+    }
     row.style.display = show ? '' : 'none';
   });
 
@@ -2602,8 +2468,28 @@ function applyFilters(r) {
       var phases = block.dataset.phases || '';
       show = phases.indexOf(filterState.phase) >= 0;
     }
+    if (show && archText) {
+      show = block.textContent.toLowerCase().indexOf(archText) >= 0;
+    }
     block.style.display = show ? '' : 'none';
   });
+
+  if (archText) {
+    // Ensure parents of visible blocks are visible and expanded
+    r.querySelectorAll('.func-block').forEach(function(block) {
+      if (block.style.display !== 'none') {
+        block.classList.add('search-expanded');
+        var parent = block.parentElement;
+        while (parent) {
+          if (parent.classList && parent.classList.contains('func-block')) {
+            parent.style.display = '';
+            parent.classList.add('search-expanded');
+          }
+          parent = parent.parentElement;
+        }
+      }
+    });
+  }
 }
 
 var sortState = {col: -1, dir: 'asc'};
@@ -2641,36 +2527,6 @@ function sortTable(colIdx, type, th) {
 document.querySelectorAll('.ap-viz').forEach(function(root) {
   applyFilters(root);
 });
-
-function _traceRoot(el) {
-  return _root(el);
-}
-
-function _getTraceScale(r) {
-  if (!r._traceScale) r._traceScale = 1;
-  return r._traceScale;
-}
-
-function _applyTraceScale(r) {
-  var scale = _getTraceScale(r);
-  r.querySelectorAll('.trace-scalable').forEach(function(el) {
-    el.style.minWidth = (1200 * scale) + 'px';
-  });
-  var resetBtn = r.querySelector('.trace-controls .filter-btn.active');
-  if (resetBtn) resetBtn.textContent = Math.round(scale * 100) + '%';
-}
-
-function adjustTraceZoom(btn, delta) {
-  var r = _traceRoot(btn);
-  r._traceScale = Math.max(0.5, Math.min(4.0, _getTraceScale(r) + delta));
-  _applyTraceScale(r);
-}
-
-function resetTraceZoom(btn) {
-  var r = _traceRoot(btn);
-  r._traceScale = 1;
-  _applyTraceScale(r);
-}
 
 function _perfettoTabRoot(el) {
   return _root(el).querySelector('.tab-content[data-tab="perfetto"]');
@@ -3233,27 +3089,6 @@ function _perfettoSafePostMessage(handle, payload, targetOrigin) {
   } catch (err) {
     return false;
   }
-}
-
-function _perfettoSendTraceToFrame(tab, frame) {
-  if (!tab || !frame) return false;
-  var traceText = _perfettoTraceText(tab);
-  if (!traceText) return false;
-  var mode = _perfettoMode(tab);
-  if (!_perfettoSafePostMessage(frame.contentWindow, {
-    perfetto: {
-      buffer: _perfettoArrayBuffer(traceText),
-      title: 'AutoParallel Trace (' + mode + ')',
-      keepApiOpen: true,
-    }
-  }, 'https://ui.perfetto.dev')) {
-    return false;
-  }
-  frame.dataset.loaded = '1';
-  frame.dataset.loading = '0';
-  frame.dataset.ready = '1';
-  _setPerfettoStatus(tab, '', false);
-  return true;
 }
 
 function downloadPerfettoTrace(btn) {
