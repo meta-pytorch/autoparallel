@@ -9,6 +9,7 @@ These tests build minimal FX graphs that mimic the FSDP all-gather pattern
 without running the full AutoParallel pipeline.
 """
 
+import pytest
 import torch
 import torch.fx
 from torch.utils.checkpoint import CheckpointPolicy
@@ -19,6 +20,7 @@ from autoparallel.graph_passes.activation_checkpointing import (
     force_save_fsdp_all_gather,
     mark_fsdp_all_gather_recomputation,
 )
+from autoparallel.graph_passes.autobucketing_inductor import bucket_utils
 
 # ---------------------------------------------------------------------------
 # Helpers for building minimal FSDP-like graphs
@@ -76,6 +78,22 @@ def _build_simple_fsdp_graph() -> torch.fx.Graph:
     out = _add_mm(graph, wait, activation)
     _add_output(graph, [out])
     return graph
+
+
+class _SchedulerNode:
+    def __init__(self, name):
+        self.name = name
+
+    def get_name(self):
+        return self.name
+
+
+class _FusedSchedulerNode(_SchedulerNode):
+    pass
+
+
+class _GroupedSchedulerNode(_SchedulerNode):
+    pass
 
 
 # ---------------------------------------------------------------------------
@@ -224,3 +242,30 @@ def test_no_tags_without_fsdp_pattern():
     for node in graph.nodes:
         assert "recompute" not in node.meta
         assert "ac_graph_id" not in node.meta
+
+
+# ---------------------------------------------------------------------------
+# Tests for autobucketing scheduler helpers
+# ---------------------------------------------------------------------------
+
+
+def test_get_op_idx():
+    assert bucket_utils.get_op_idx(_SchedulerNode("op142")) == 142
+
+
+def test_get_op_idx_rejects_non_op_name():
+    with pytest.raises(KeyError, match="Expected op name"):
+        bucket_utils.get_op_idx(_SchedulerNode("buf142"))
+
+
+def test_get_op_idx_rejects_fused_and_grouped_snodes(monkeypatch):
+    monkeypatch.setattr(
+        bucket_utils.scheduler, "FusedSchedulerNode", _FusedSchedulerNode
+    )
+    monkeypatch.setattr(
+        bucket_utils.scheduler, "GroupedSchedulerNode", _GroupedSchedulerNode
+    )
+
+    for node_cls in (_FusedSchedulerNode, _GroupedSchedulerNode):
+        with pytest.raises(TypeError, match="Expected an unfused scheduler node"):
+            bucket_utils.get_op_idx(node_cls("op142"))
