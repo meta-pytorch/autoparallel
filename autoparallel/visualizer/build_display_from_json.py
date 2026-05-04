@@ -1439,7 +1439,7 @@ def _perfetto_trace_payload(non_param_nodes):
 
     launch_overhead = 1.0
     min_marker_dur = 0.001
-    module_scope_margin = 0.001
+    module_scope_margin = 0.01
     module_gap_tolerance = 2 * launch_overhead
     module_end_epsilon = 1e-5
     comm_tid = "redistribution"
@@ -1747,22 +1747,64 @@ def _perfetto_trace_payload(non_param_nodes):
                         event["dur"] = max(parent_end - event_ts, min_marker_dur)
                         event_end = parent_end
 
+    # Convert module X events to B/E (begin/end) pairs.  X events cannot
+    # overlap on the same (pid, tid) track, but nested module scopes
+    # inherently do.  B/E uses a stack model designed for exactly this.
+    # Tiny depth-based epsilon offsets ensure correct ordering even under
+    # an unstable sort: deeper B events start slightly later (nest inside),
+    # deeper E events end slightly earlier (close before parents).
+    be_epsilon = 0.001
+    be_events = []
+    for event in trace_events:
+        if event.get("ph") == "X" and event.get("cat") == "module":
+            ts = float(event["ts"])
+            dur = float(event["dur"])
+            depth = event.get("args", {}).get("path", "").count(".")
+            b_event = {
+                k: v for k, v in event.items() if k != "dur"
+            }
+            b_event["ph"] = "B"
+            b_event["ts"] = ts + depth * be_epsilon
+            be_events.append(b_event)
+            be_events.append(
+                {
+                    "ph": "E",
+                    "cat": "module",
+                    "name": event["name"],
+                    "pid": event["pid"],
+                    "tid": event["tid"],
+                    "ts": ts + dur - depth * be_epsilon,
+                    "args": event.get("args", {}),
+                }
+            )
+        else:
+            be_events.append(event)
+    trace_events = be_events
+
     trace_events.extend(compute_events)
-    trace_events = metadata_events + sorted(
-        trace_events,
-        key=lambda event: (
-            0 if event["ph"] == "M" else 1,
-            event.get("ts", 0.0),
-            {"i": 0, "X": 1, "s": 2, "f": 3}.get(event["ph"], 4),
-            {"module": 0, "compute": 1, "redistribution": 2, "dependency": 3}.get(
-                event.get("cat", ""),
-                4,
-            ),
-            str(event.get("pid", "")),
-            str(event.get("tid", "")),
-            event.get("name", ""),
-        ),
-    )
+
+    def _sort_key(event):
+        if event["ph"] == "M":
+            return (0, 0.0, 0, 0, 0, "", "", "")
+        ts = event.get("ts", 0.0)
+        ph = event["ph"]
+        # B before other events at the same ts (opens scope), E after (closes)
+        # Within B at same ts: shallowest first (ascending depth)
+        # Within E at same ts: deepest first (descending depth)
+        depth = event.get("args", {}).get("path", "").count(".") if event.get("cat") == "module" else 0
+        if ph == "B":
+            ph_rank, depth_key = 1, depth
+        elif ph == "E":
+            ph_rank, depth_key = 6, -depth
+        else:
+            ph_rank = {"i": 2, "X": 3, "s": 4, "f": 5}.get(ph, 5)
+            depth_key = 0
+        cat_rank = {"module": 0, "compute": 1, "redistribution": 2, "dependency": 3}.get(
+            event.get("cat", ""), 4,
+        )
+        return (1, ts, ph_rank, depth_key, cat_rank, str(event.get("pid", "")), str(event.get("tid", "")), event.get("name", ""))
+
+    trace_events = metadata_events + sorted(trace_events, key=_sort_key)
 
     total_span = max(
         max(curr_time.values(), default=0.0),
@@ -2807,7 +2849,7 @@ function _perfettoBuildTrace(nodes, mode) {
 
   var launchOverhead = 1.0;
   var minMarkerDur = 0.001;
-  var moduleScopeMargin = 0.001;
+  var moduleScopeMargin = 0.01;
   var moduleGapTolerance = 2 * launchOverhead;
   var moduleEndEpsilon = 1e-5;
   var commTid = 'redistribution';
@@ -3060,16 +3102,53 @@ function _perfettoBuildTrace(nodes, mode) {
     });
   });
 
-  traceEvents = metadataEvents.concat(traceEvents.concat(computeEvents).sort(function(a, b) {
-    function phRank(ev) {
-      return {i: 0, X: 1, s: 2, f: 3}[ev.ph] !== undefined ? {i: 0, X: 1, s: 2, f: 3}[ev.ph] : 4;
+  // Convert module X events to B/E pairs for proper nesting.
+  // Depth-based epsilon offsets ensure correct ordering under unstable sort.
+  var beEpsilon = 0.001;
+  var beEvents = [];
+  traceEvents.forEach(function(event) {
+    if (event.ph === 'X' && event.cat === 'module') {
+      var ts = Number(event.ts);
+      var dur = Number(event.dur);
+      var path = (event.args && event.args.path) || '';
+      var depth = (path.match(/\./g) || []).length;
+      var bEvent = {};
+      Object.keys(event).forEach(function(k) { if (k !== 'dur') bEvent[k] = event[k]; });
+      bEvent.ph = 'B';
+      bEvent.ts = ts + depth * beEpsilon;
+      beEvents.push(bEvent);
+      beEvents.push({ph: 'E', cat: 'module', name: event.name, pid: event.pid, tid: event.tid, ts: ts + dur - depth * beEpsilon, args: event.args || {}});
+    } else {
+      beEvents.push(event);
     }
+  });
+  traceEvents = beEvents;
+
+  traceEvents = metadataEvents.concat(traceEvents.concat(computeEvents).sort(function(a, b) {
+    if (a.ph === 'M' && b.ph !== 'M') return -1;
+    if (a.ph !== 'M' && b.ph === 'M') return 1;
+    if (a.ph === 'M' && b.ph === 'M') return 0;
+    var tsDiff = (a.ts || 0) - (b.ts || 0);
+    if (tsDiff !== 0) return tsDiff;
+    function phRank(ev) {
+      if (ev.ph === 'B') return 1;
+      if (ev.ph === 'E') return 6;
+      return {i: 2, X: 3, s: 4, f: 5}[ev.ph] !== undefined ? {i: 2, X: 3, s: 4, f: 5}[ev.ph] : 5;
+    }
+    var phDiff = phRank(a) - phRank(b);
+    if (phDiff !== 0) return phDiff;
+    function depthKey(ev) {
+      if (ev.cat !== 'module') return 0;
+      var path = (ev.args && ev.args.path) || '';
+      var d = (path.match(/\./g) || []).length;
+      return ev.ph === 'B' ? d : (ev.ph === 'E' ? -d : 0);
+    }
+    var depthDiff = depthKey(a) - depthKey(b);
+    if (depthDiff !== 0) return depthDiff;
     function catRank(ev) {
       return {module: 0, compute: 1, redistribution: 2, dependency: 3}[ev.cat] !== undefined ? {module: 0, compute: 1, redistribution: 2, dependency: 3}[ev.cat] : 4;
     }
-    return (a.ts || 0) - (b.ts || 0)
-      || phRank(a) - phRank(b)
-      || catRank(a) - catRank(b)
+    return catRank(a) - catRank(b)
       || String(a.pid || '').localeCompare(String(b.pid || ''))
       || String(a.tid || '').localeCompare(String(b.tid || ''))
       || String(a.name || '').localeCompare(String(b.name || ''));
@@ -3122,9 +3201,6 @@ function setPerfettoMode(mode, btn) {
     frame.dataset.loading = '0';
   }
   _setPerfettoStatus(tab, '', false);
-  if (wasLoaded && _perfettoSendTraceToFrame(tab, frame)) {
-    return;
-  }
   if (wasLoaded || wasLoading) {
     loadPerfettoTrace(btn);
   }
@@ -3168,6 +3244,7 @@ function _perfettoSendTraceToFrame(tab, frame) {
     perfetto: {
       buffer: _perfettoArrayBuffer(traceText),
       title: 'AutoParallel Trace (' + mode + ')',
+      keepApiOpen: true,
     }
   }, 'https://ui.perfetto.dev')) {
     return false;
@@ -3271,6 +3348,7 @@ function loadPerfettoTrace(btn) {
       perfetto: {
         buffer: traceArrayBuffer,
         title: 'AutoParallel Trace (' + mode + ')',
+        keepApiOpen: true,
       }
     }, targetOrigin)) {
       state.pingStarted = false;
