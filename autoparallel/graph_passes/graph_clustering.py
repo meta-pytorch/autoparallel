@@ -106,19 +106,31 @@ def _extend_with_sibling_getitems(
     node_to_duplicates: dict[Node, IdenticalNodes],
     strategies: dict[Node, OpStrategy],
     topological_ranking: dict[Node, int],
-) -> None:
+) -> set[Node]:
     """Extend region groups with unclaimed getitem siblings of clustered nodes.
 
     The backward-BFS expansion only reaches getitem users that happen to be on
     the main data path.  Sibling tuple projections (e.g. logsumexp, RNG state
     from SDPA) are left orphaned even though their producer is already aligned
-    across regions.  This post-pass recovers them.
+    across regions.  This post-pass recovers them in two ways:
+
+    1. If a getitem's producer is already in a region, find matching unclaimed
+       getitems across all other regions and append them in-place.
+    2. If a getitem's producer is NOT in any region but its duplicate getitems
+       (from node_to_duplicates) ARE clustered, create a small bridge group
+       that links the orphan to a clustered sibling. This handles the case
+       where the BFS created N-1 regions out of N identical layers.
+
+    Returns the set of bridge root nodes — already-clustered nodes that are
+    reused as the root region of a bridge group and therefore intentionally
+    appear in two groups.
     """
     claimed: set[Node] = set()
     for region_group in region_groups:
         for region in region_group:
             claimed.update(region)
 
+    # Case 1: extend existing regions with unclaimed getitem siblings.
     for region_group in region_groups:
         root_region = region_group[0]
         num_regions = len(region_group)
@@ -172,6 +184,58 @@ def _extend_with_sibling_getitems(
 
         for region in region_group:
             region.sort(key=lambda n: topological_ranking[n])
+
+    # Case 2: create bridge groups for orphaned getitems whose duplicates
+    # are already clustered. Each bridge group pairs one clustered sibling
+    # (as the root region) with the orphan, so create_cluster_links maps
+    # the orphan's decision variables to the root's.
+    bridge_roots: set[Node] = set()
+    seen_dup_groups: set[int] = set()
+    for node in strategies:
+        if node.target is not operator.getitem:
+            continue
+        if node in claimed:
+            continue
+        if node not in node_to_duplicates:
+            continue
+        dups = node_to_duplicates[node]
+        group_id = id(dups)
+        if group_id in seen_dup_groups:
+            continue
+        seen_dup_groups.add(group_id)
+
+        if len(dups) < 2:
+            continue
+        if not all(d in strategies for d in dups):
+            continue
+
+        # Find one claimed duplicate to serve as the root.
+        root = None
+        for d in dups:
+            if d in claimed:
+                root = d
+                break
+        if root is None:
+            continue
+
+        # Create a bridge group: [[root], [orphan1], [orphan2], ...]
+        bridge = [[root]]
+        for d in dups:
+            if d not in claimed:
+                bridge.append([d])
+                claimed.add(d)
+        if len(bridge) < 2:
+            continue
+        bridge.sort(key=lambda r: topological_ranking[r[0]])
+        # Ensure the root is first (create_cluster_links uses region[0]
+        # as the root).
+        root_idx = next(i for i, r in enumerate(bridge) if r[0] is root)
+        if root_idx != 0:
+            bridge[0], bridge[root_idx] = bridge[root_idx], bridge[0]
+        region_groups.append(bridge)
+        bridge_roots.add(root)
+
+    return bridge_roots
 
 
 def get_identical_regions(
@@ -258,6 +322,7 @@ def get_identical_regions(
     # overlap.
     t = time.time()
     seen_nodes: set[Node] = set()
+    expanded_groups: list[list[Region]] = []
     for region_group in region_groups:
         # NOTE: this seems like it's missing in the original implementation
         # from PyTorch. Given that fully_expand_region_group doesn't check
@@ -277,12 +342,13 @@ def get_identical_regions(
         # sort topologically
         for region in region_group:
             region.sort(key=lambda n: topological_ranking[n])
+        expanded_groups.append(region_group)
 
     region_groups = [
-        region_group for region_group in region_groups if len(region_group[0]) > 1
+        region_group for region_group in expanded_groups if len(region_group[0]) > 1
     ]
 
-    _extend_with_sibling_getitems(
+    bridge_roots = _extend_with_sibling_getitems(
         region_groups, node_to_duplicates, strategies, topological_ranking
     )
 
@@ -292,12 +358,14 @@ def get_identical_regions(
     region_groups.sort(key=lambda rg: topological_ranking[rg[0][0]])
     logger.debug(f"Expanded regions in {time.time() - t} s")
 
-    # sanity check that we don't have duplicate nodes
+    # sanity check that we don't have duplicate nodes.
+    # Bridge roots are already-clustered nodes reused as root regions in
+    # bridge groups (case 2 above); they intentionally appear in two groups.
     seen_nodes.clear()
     for region_group in region_groups:
         for region in region_group:
             for node in region:
-                if node in seen_nodes:
+                if node in seen_nodes and node not in bridge_roots:
                     raise RuntimeError(f"Duplicate node {node} in region group")
                 seen_nodes.add(node)
     return region_groups
