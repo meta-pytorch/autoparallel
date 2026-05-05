@@ -1091,6 +1091,12 @@ class AutoParallelBackward(AutoParallel):
             elif isinstance(desc, PlainAOTInput):
                 placeholder_sources.append(("input", plain_idx))
                 plain_idx += 1
+            else:
+                raise RuntimeError(
+                    f"Unexpected placeholder descriptor type {type(desc).__name__} "
+                    f"on node {n.name}. AutoParallelBackward only supports "
+                    f"ParamAOTInput, BufferAOTInput, and PlainAOTInput."
+                )
 
         def forward(self, *args):
             all_graph_args = dynamo_flatten(*args)
