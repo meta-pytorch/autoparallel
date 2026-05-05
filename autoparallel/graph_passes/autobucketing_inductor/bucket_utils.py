@@ -27,6 +27,21 @@ def get_data_size(size):
     return reduce(lambda x, y: x * y, size)
 
 
+def get_op_idx(snode: "scheduler.BaseSchedulerNode") -> int:
+    if isinstance(
+        snode,
+        (
+            scheduler.FusedSchedulerNode,
+            scheduler.GroupedSchedulerNode,
+        ),
+    ):
+        raise TypeError(f"Expected an unfused scheduler node, got {type(snode)}")
+    op_name = snode.get_name()
+    if not op_name.startswith("op"):
+        raise KeyError(f"Expected op name to start with 'op', got {op_name}")
+    return int(op_name[2:])
+
+
 def _find_recursive_deps_of_snode(
     snode: "scheduler.BaseSchedulerNode",
     collected_node_set: OrderedSet["scheduler.BaseSchedulerNode"],

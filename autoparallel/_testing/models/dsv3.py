@@ -5,7 +5,7 @@
 
 import math
 from dataclasses import dataclass, field
-from typing import Callable, ClassVar, Literal, Optional, Tuple, Union
+from typing import Callable, ClassVar, Literal, Optional, Tuple
 
 import torch
 import torch.fx.traceback as fx_traceback
@@ -1621,78 +1621,7 @@ def dsv3_loss_fn(pred: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     )
 
 
-########################
-# Pipeline stuff start #
-########################
-
-
-class DeepSeekV3StageI(nn.Module):
-    def __init__(self, layers, model_args):
-        super().__init__()
-        self.layers = layers
-        self.register_buffer(
-            "freqs_cis", precompute_freqs_cis(model_args), persistent=False
-        )
-        self.model_args = model_args
-
-    def forward(self, h):
-        # intermediate stages only have layers
-        for layer in self.layers.values():
-            h = layer(h, self.freqs_cis)
-        return h
-
-    def init_weights(
-        self, buffer_device: torch.device | None = None, seed: int | None = None
-    ) -> None:
-        _init_weights_layers(self, buffer_device, seed)
-
-
-class DeepSeekV3Stage0(DeepSeekV3StageI):
-    def __init__(self, embed, layers, model_args):
-        super().__init__(layers, model_args)
-        self.tok_embeddings = embed
-
-    def forward(self, tokens):
-        # torch.Size([1024, 1024])
-        h = self.tok_embeddings(tokens) if self.tok_embeddings is not None else tokens
-        # torch.Size([1024, 1024, 2048])
-        return super().forward(h)
-
-    def init_weights(
-        self, buffer_device: torch.device | None = None, seed: int | None = None
-    ) -> None:
-        _init_weights_tok_embeddings(self, seed)
-        super().init_weights(buffer_device, seed)
-
-
-class DeepSeekV3StageN(DeepSeekV3StageI):
-    def __init__(self, layers, norm, output, model_args):
-        super().__init__(layers, model_args)
-        self.norm = norm
-        self.output = output
-        self.model_args = model_args
-
-    def forward(self, h):
-        h = super().forward(h)
-        h = self.norm(h) if self.norm is not None else h
-        output = self.output(h) if self.output is not None else h
-        return output
-
-    def init_weights(
-        self, buffer_device: torch.device | None = None, seed: int | None = None
-    ) -> None:
-        super().init_weights(buffer_device, seed)
-        _init_weights_norm_and_output(self)
-
-
-######################
-# Pipeline stuff end #
-######################
-
-
-def _init_weights_tok_embeddings(
-    self: Union[DeepSeekV3Model, DeepSeekV3Stage0], seed: int | None = None
-):
+def _init_weights_tok_embeddings(self: DeepSeekV3Model, seed: int | None = None):
     if seed is not None:
         torch.manual_seed(seed)
     if self.tok_embeddings is not None:
@@ -1700,7 +1629,7 @@ def _init_weights_tok_embeddings(
 
 
 def _init_weights_layers(
-    self: Union[DeepSeekV3Model, DeepSeekV3StageI],
+    self: DeepSeekV3Model,
     buffer_device: torch.device | None,
     seed: int | None = None,
 ):
@@ -1716,7 +1645,7 @@ def _init_weights_layers(
             layer.init_weights(buffer_device)  # type: ignore[arg-type]
 
 
-def _init_weights_norm_and_output(self: Union[DeepSeekV3Model, DeepSeekV3StageN]):
+def _init_weights_norm_and_output(self: DeepSeekV3Model):
     if self.norm is not None:
         self.norm.reset_parameters()
     if self.output is not None:
