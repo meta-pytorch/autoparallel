@@ -315,6 +315,75 @@ def view_rule(mesh, op_schema):
     return OpStrategy(strats)
 
 
+@register_rule(torch.ops.aten.view.dtype)
+def view_dtype_rule(mesh, op_schema):
+    """view(dtype=...) reinterprets the last dim's bytes as a different dtype.
+
+    Shape changes only on the last dim (e.g. [N, 8] uint8 -> [N, 1] int64).
+    Sharding on any non-last dim is preserved; sharding on the last dim is
+    banned since the byte layout changes.
+    """
+    op_spec = op_schema.args_schema[0]
+    target_dtype = op_schema.args_schema[1]
+    in_meta = op_spec.strategies[0].output_specs.tensor_meta
+    in_tensor = _build_meta_tensor(in_meta)
+    out_tensor = torch.ops.aten.view.dtype(in_tensor, target_dtype)
+    out_meta = _gen_tensor_meta(out_tensor)
+    last_dim = in_tensor.ndim - 1
+
+    strats = []
+    for strat in op_spec.strategies:
+        input_specs = strat.output_specs
+        if any(p.is_shard(last_dim) for p in input_specs.placements):
+            continue
+        output_spec = DTensorSpec(mesh, input_specs.placements, tensor_meta=out_meta)
+        redistribute_costs = [generate_redistribute_costs(op_spec, input_specs)]
+        s = OpSpec(output_spec, input_specs=(input_specs,))
+        s.redistribute_cost = redistribute_costs
+        strats.append(s)
+    return OpStrategy(strats)
+
+
+@register_rule(torch.ops.aten.select.int)
+def select_int_rule(mesh, op_schema):
+    """Wrapper around DTensor's select_int_strategy that fixes two issues:
+
+    1. Negative dim/index: DTensor doesn't handle negative values.
+       We normalize them before delegating.
+
+    2. Shared output/input specs: DTensor sets ``output_specs = input_specs``
+       (same object) when the selected dim is not sharded. Then
+       ``propagate_tensor_meta`` overwrites the shared spec's tensor_meta,
+       corrupting the input node's strategy. We copy the shared spec.
+    """
+    import dataclasses
+
+    from torch.distributed.tensor._op_schema import OpSchema
+
+    input_strategy, dim, index = op_schema.args_schema
+    ndim = input_strategy.ndim
+    if isinstance(dim, int) and dim < 0:
+        dim = dim + ndim
+    if isinstance(index, int) and index < 0:
+        index = index + input_strategy.shape[dim]
+    if dim != op_schema.args_schema[1] or index != op_schema.args_schema[2]:
+        op_schema = OpSchema(
+            op_schema.op,
+            (input_strategy, dim, index),
+            op_schema.kwargs_schema,
+            op_schema.schema_info,
+        )
+
+    out_strat = get_op_strategy(torch.ops.aten.select.int, op_schema)
+    for s in out_strat.strategies:
+        if s.output_specs is not None and s.input_specs is not None:
+            for ispec in s.input_specs:
+                if ispec is not None and ispec is s.output_specs:
+                    s.output_specs = dataclasses.replace(s.output_specs)
+                    break
+    return out_strat
+
+
 @register_rule(torch.ops.aten.alias.default)
 def alias_rule(mesh, op_schema):
     op_spec = op_schema.args_schema[0]
