@@ -185,14 +185,95 @@ def build_joint_graph(
     )
 
 
+def _add_unused_params_as_placeholders(gm, model):
+    """Add unused model params/buffers as placeholder nodes in the graph.
+
+    The public dynamo_graph_capture_for_export only captures params used in
+    forward() as placeholders. Unused params must still appear so they end up
+    in sharded_param_dict and get fresh DTensor params in make_parallel_module
+    (avoiding weakref issues from orphan submodule copying).
+
+    Note: this is the public-API counterpart of tracing._add_unused_params_and_buffers,
+    which adds get_attr nodes for the private _dynamo_graph_capture_for_export path.
+    The two exist because the private API captures params as get_attr (module attributes)
+    while the public API captures them as placeholder (side-effect-tracked inputs).
+    """
+    from .tracing import _fqn_to_dynamo_target
+
+    existing_targets = {n.target for n in gm.graph.nodes if n.op == "placeholder"}
+
+    # Get dynamo's fake mode from existing placeholders
+    dynamo_fake_mode = None
+    for n in gm.graph.nodes:
+        if n.op == "placeholder":
+            val = n.meta.get("val")
+            if hasattr(val, "fake_mode"):
+                dynamo_fake_mode = val.fake_mode
+                break
+
+    # Find insertion point: after all existing placeholders
+    insert_before = None
+    for n in gm.graph.nodes:
+        if n.op != "placeholder":
+            insert_before = n
+            break
+
+    for fqn, param in model.named_parameters():
+        target = _fqn_to_dynamo_target(fqn, "parameters")
+        if target not in existing_targets:
+            with gm.graph.inserting_before(insert_before):
+                node = gm.graph.placeholder(fqn.replace(".", "_"))
+                node.target = target
+                # Create val in dynamo's fake mode to avoid mixing fake modes.
+                # Preserve requires_grad to match the original parameter.
+                if dynamo_fake_mode is not None:
+                    with dynamo_fake_mode:
+                        val = torch.empty_strided(
+                            param.shape,
+                            param.stride(),
+                            dtype=param.dtype,
+                            device=param.device,
+                        )
+                        if param.requires_grad:
+                            val.requires_grad_(True)
+                        node.meta["val"] = val
+                else:
+                    node.meta["val"] = param
+                node.meta["tensor_dict"] = {"_dynamo_static_input_type": "unguarded"}
+
+    for fqn, buf in model.named_buffers():
+        target = _fqn_to_dynamo_target(fqn, "buffers")
+        if target not in existing_targets:
+            with gm.graph.inserting_before(insert_before):
+                node = gm.graph.placeholder(fqn.replace(".", "_"))
+                node.target = target
+                if dynamo_fake_mode is not None:
+                    with dynamo_fake_mode:
+                        node.meta["val"] = torch.empty_strided(
+                            buf.shape, buf.stride(), dtype=buf.dtype, device=buf.device
+                        )
+                else:
+                    node.meta["val"] = buf
+                node.meta["tensor_dict"] = {"_dynamo_static_input_type": "unguarded"}
+
+    gm.recompile()
+
+
 def _copy_descriptors(source_gm, target_gm):
     """Copy meta["desc"] from source graph placeholder/output nodes to target graph."""
     from .apply_sharding import rename_placeholder_node
 
-    for n1, n2 in zip(
-        (n for n in source_gm.graph.nodes if n.op in ("placeholder", "output")),
-        (n for n in target_gm.graph.nodes if n.op in ("placeholder", "output")),
-    ):
+    source_nodes = [
+        n for n in source_gm.graph.nodes if n.op in ("placeholder", "output")
+    ]
+    target_nodes = [
+        n for n in target_gm.graph.nodes if n.op in ("placeholder", "output")
+    ]
+    assert len(source_nodes) == len(
+        target_nodes
+    ), f"Placeholder/output count mismatch: {len(source_nodes)} vs {len(target_nodes)}"
+
+    for n1, n2 in zip(source_nodes, target_nodes):
         n2.meta["desc"] = n1.meta["desc"]
         if n2.op == "placeholder":
             # Sanitize the target for use as a Python identifier (dots -> underscores).
@@ -226,8 +307,6 @@ def build_user_backward_graph(model, input_fn, fake_mode):
     if fake_mode.shape_env is not None:
         formatted_inputs = _make_inputs_dynamic(formatted_inputs, fake_mode)
 
-    traced_inputs = list(formatted_inputs)
-
     prev_trace_autograd = torch._dynamo.config.trace_autograd_ops
     torch._dynamo.config.trace_autograd_ops = True
     try:
@@ -237,6 +316,12 @@ def build_user_backward_graph(model, input_fn, fake_mode):
             torch._dynamo.utils._disable_saved_tensors_hooks_during_tracing(),
         ):
             gm = dynamo_graph_capture_for_export(model)(*formatted_inputs)
+
+            # Add unused params/buffers as placeholders. The public API only
+            # captures params that are actually used in forward via side-effect
+            # tracking. Unused params must still appear in the graph so they
+            # end up in sharded_param_dict (avoiding weakref issues in to_empty).
+            _add_unused_params_as_placeholders(gm, model)
 
             # Annotate descriptors while model.named_parameters() is still
             # available (the public API captures params as placeholders via
@@ -283,6 +368,22 @@ def build_user_backward_graph(model, input_fn, fake_mode):
 
     # Copy descriptors from the pre-decomposition graph to the decomposed one
     _copy_descriptors(gm, decomposed_gm)
+
+    # Save the input mapping function and original placeholder metadata
+    # before replacing gm. dynamo_bytecode_flatten maps user args to graph
+    # placeholder args (handling param lifting, closure tensor extraction,
+    # and non-tensor arg elimination). The placeholder descriptors tell us
+    # which positions are PlainAOTInput (user inputs) vs ParamAOTInput (params).
+    #
+    # Note: dynamo_bytecode_flatten is a callable that replays dynamo's capture
+    # logic. It doesn't reference the graph itself at runtime — it only uses
+    # the captured bytecode and input processor, so it remains valid after
+    # gm is replaced by the decomposed graph.
+    dynamo_bytecode_flatten = gm._dynamo_bytecode_flatten
+    dynamo_graph_placeholder_descs = [
+        n.meta.get("desc") for n in gm.graph.nodes if n.op == "placeholder"
+    ]
+
     gm = decomposed_gm
 
     assert_has_no_collectives(gm)
@@ -303,7 +404,20 @@ def build_user_backward_graph(model, input_fn, fake_mode):
     )
 
     logger.info("User-backward graph tracing took %.3fs", time.perf_counter() - t0)
-    return gm, traced_inputs
+
+    # Build traced_inputs from the graph's PlainAOTInput placeholders, not from
+    # the raw input_fn() return. Dynamo may lift closure tensors to extra
+    # placeholders, eliminate unused inputs, or drop non-tensor args — so the
+    # graph's placeholders are the ground truth for what the compiled model expects.
+    from torch._functorch._aot_autograd.descriptors import PlainAOTInput
+
+    traced_inputs = [
+        n.meta["val"]
+        for n in gm.graph.nodes
+        if n.op == "placeholder" and isinstance(n.meta.get("desc"), PlainAOTInput)
+    ]
+
+    return gm, traced_inputs, dynamo_bytecode_flatten, dynamo_graph_placeholder_descs
 
 
 class AutoParallelBase:
@@ -893,9 +1007,12 @@ class AutoParallelBackward(AutoParallel):
     """
 
     def build_model_graph(self):
-        self.gm, self._traced_inputs = build_user_backward_graph(
-            self.model, self.input_fn, self.fake_mode
-        )
+        (
+            self.gm,
+            self._traced_inputs,
+            self._dynamo_bytecode_flatten,
+            self._dynamo_graph_placeholder_descs,
+        ) = build_user_backward_graph(self.model, self.input_fn, self.fake_mode)
         # Push dynamo's FakeTensorMode onto the stack so that
         # ShardingOptimizer's cost model runs under fake mode
         # (matching the forward-only path where aot_export pushes it).
@@ -921,13 +1038,8 @@ class AutoParallelBackward(AutoParallel):
         compiled_fn = compiler_fn(parallel_gm, example_inputs)
 
         from torch._functorch._aot_autograd.fx_utils import (
-            get_named_buffer_nodes,
-            get_named_param_nodes,
             get_plain_input_and_grad_nodes,
         )
-
-        graph_param_fqns = list(get_named_param_nodes(self.gm.graph))
-        graph_buffer_fqns = list(get_named_buffer_nodes(self.gm.graph))
 
         input_nodes = get_plain_input_and_grad_nodes(self.gm.graph)
         solved_input_placements = []
@@ -940,14 +1052,59 @@ class AutoParallelBackward(AutoParallel):
             self._traced_inputs, solved_input_placements, self.mesh
         )
 
+        # Capture the dynamo input mapper to convert user args to graph args.
+        # _dynamo_bytecode_flatten returns args in dynamo capture order
+        # (params and user inputs interleaved). We need to extract just the
+        # user inputs (PlainAOTInput) in their descriptor index order.
+        dynamo_flatten = self._dynamo_bytecode_flatten
+        from torch._functorch._aot_autograd.descriptors import PlainAOTInput
+
+        # Build a mapping: position in dynamo_flatten output -> PlainAOTInput idx
+        # by matching against the original (pre-decomposition) graph's placeholders.
+        plain_input_positions = [
+            i
+            for i, desc in enumerate(self._dynamo_graph_placeholder_descs)
+            if isinstance(desc, PlainAOTInput)
+        ]
+
+        # Build a mapping from placeholder position to source (param vs user input).
+        # The compiled graph expects args in the original interleaved order
+        # (params and user inputs mixed), not params-first.
+        # Use desc.target directly instead of consuming from FQN iterators,
+        # to avoid silent mismatches if descriptor types don't align with
+        # get_named_param_nodes/get_named_buffer_nodes ordering.
+        from torch._functorch._aot_autograd.descriptors import (
+            BufferAOTInput,
+            ParamAOTInput,
+        )
+
+        placeholder_sources = []  # ('param', fqn) or ('buffer', fqn) or ('input', idx)
+        plain_idx = 0
+        for n in self.gm.graph.nodes:
+            if n.op != "placeholder":
+                continue
+            desc = n.meta.get("desc")
+            if isinstance(desc, ParamAOTInput):
+                placeholder_sources.append(("param", desc.target))
+            elif isinstance(desc, BufferAOTInput):
+                placeholder_sources.append(("buffer", desc.target))
+            elif isinstance(desc, PlainAOTInput):
+                placeholder_sources.append(("input", plain_idx))
+                plain_idx += 1
+
         def forward(self, *args):
-            flat_args, _ = torch.utils._pytree.tree_flatten(args)
+            all_graph_args = dynamo_flatten(*args)
+            flat_args = [all_graph_args[i] for i in plain_input_positions]
             _check_forward_args(flat_args, expected_inputs)
-            params = [
-                self.get_parameter(fqn).to_local() for fqn in graph_param_fqns
-            ] + [self.get_buffer(fqn).to_local() for fqn in graph_buffer_fqns]
-            boxed_args = [*params, *flat_args]
-            del params
+            # Build args in the interleaved order the compiled graph expects
+            boxed_args = []
+            for source_type, source_key in placeholder_sources:
+                if source_type == "param":
+                    boxed_args.append(self.get_parameter(source_key).to_local())
+                elif source_type == "buffer":
+                    boxed_args.append(self.get_buffer(source_key).to_local())
+                else:
+                    boxed_args.append(flat_args[source_key])
             return compiled_fn(boxed_args)
 
         self.parallel_model = make_parallel_module(
