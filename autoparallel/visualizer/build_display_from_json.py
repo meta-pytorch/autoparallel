@@ -13,60 +13,17 @@ redistribution highlighting, and hierarchical module tree view.
 import json
 
 
-def _classify_placement(placement):
+def _placement_style(placement):
+    """Return (bg_color, text_color) for a placement chip."""
     if not placement:
-        return "unknown"
+        return "#F9FAFB", "#D1D5DB"
     p = placement.strip()
-    if p in ("RR", "R"):
-        return "replicated"
-    parts = []
-    i = 0
-    while i < len(p):
-        if p[i] == "S" and i + 1 < len(p) and p[i + 1] == "(":
-            end = p.index(")", i)
-            parts.append(p[i : end + 1])
-            i = end + 1
-        elif p[i] == "R":
-            parts.append("R")
-            i += 1
-        elif p[i] == "P" and i + 1 < len(p) and p[i + 1] == "(":
-            end = p.index(")", i)
-            parts.append(p[i : end + 1])
-            i = end + 1
-        else:
-            i += 1
-    if len(parts) == 2:
-        d0, d1 = parts
-        if d0.startswith("S") and d1 == "R":
-            return "fsdp"
-        if d0 == "R" and d1.startswith("S"):
-            return "tp"
-        if d0.startswith("S") and d1.startswith("S"):
-            return "fsdp+tp"
-        if d0.startswith("P") or d1.startswith("P"):
-            return "partial"
-    return "other"
+    if "P(" in p:
+        return "#FFFBEB", "#F59E0B"  # amber — partial
+    if "S(" in p:
+        return "#EFF6FF", "#3B82F6"  # blue — sharded
+    return "#F9FAFB", "#6B7280"  # gray — replicated
 
-
-_STRATEGY_COLORS = {
-    "fsdp": "#3B82F6",
-    "tp": "#10B981",
-    "fsdp+tp": "#8B5CF6",
-    "replicated": "#6B7280",
-    "partial": "#F59E0B",
-    "other": "#EC4899",
-    "unknown": "#D1D5DB",
-}
-
-_STRATEGY_BGS = {
-    "fsdp": "#EFF6FF",
-    "tp": "#ECFDF5",
-    "fsdp+tp": "#F5F3FF",
-    "replicated": "#F9FAFB",
-    "partial": "#FFFBEB",
-    "other": "#FDF2F8",
-    "unknown": "#F9FAFB",
-}
 
 _MODULE_PATH_PREFIXES = ("L['self'].", "_export_root.")
 
@@ -338,40 +295,64 @@ def _prune_tree(node, min_group_size):
             node.invalidate_cache()
 
 
+_PLACEMENT_CATEGORIES = [
+    ("sharded", "#3B82F6", "#EFF6FF"),
+    ("replicated", "#6B7280", "#F9FAFB"),
+    ("partial", "#F59E0B", "#FFFBEB"),
+]
+
+
+def _placement_category(placement):
+    """Classify a placement string into a coarse category."""
+    if not placement:
+        return "replicated"
+    p = placement.strip()
+    if "P(" in p:
+        return "partial"
+    if "S(" in p:
+        return "sharded"
+    return "replicated"
+
+
+def _placement_distribution(nodes):
+    """Compute coarse placement distribution with exact-string details."""
+    counts = {"sharded": 0, "replicated": 0, "partial": 0}
+    details = {"sharded": {}, "replicated": {}, "partial": {}}
+    for n in nodes:
+        p = n.get("placement", "")
+        cat = _placement_category(p)
+        counts[cat] += 1
+        key = p or "(none)"
+        details[cat][key] = details[cat].get(key, 0) + 1
+    total = sum(counts.values())
+    dominant = max(counts, key=counts.get) if total else "replicated"
+    color_map = {c[0]: c[1] for c in _PLACEMENT_CATEGORIES}
+    return {
+        "dist_counts": counts,
+        "dist_details": details,
+        "dist_total": total,
+        "dominant_color": color_map[dominant],
+    }
+
+
 def _tree_node_stats(tree_node):
     """Compute summary stats for a tree node (all descendants)."""
     all_n = tree_node.all_nodes()
     comm = sum(n["_total_comm"] for n in all_n)
     compute = sum(n.get("compute_cost", 0) for n in all_n)
     transition = sum(n["_total_transition"] for n in all_n)
-    # Pick the dominant strategy by cost (not count): the strategy with the
-    # most expensive nodes wins, so a layer with one massive ReduceScatter
-    # doesn't appear as "REPLICATED" just because most nodes are replicated.
-    cost_by_strat = {}
-    for n in all_n:
-        c = n["_total_comm"] + n.get("compute_cost", 0) + n["_total_transition"]
-        cost_by_strat[n["_strategy"]] = cost_by_strat.get(n["_strategy"], 0) + c
-    if cost_by_strat and max(cost_by_strat.values()) > 0:
-        dominant = max(cost_by_strat, key=cost_by_strat.get)
-    elif all_n:
-        # Fall back to count when all costs are zero
-        strategies = [n["_strategy"] for n in all_n]
-        dominant = max(set(strategies), key=strategies.count)
-    else:
-        dominant = "unknown"
     all_colls = []
     for n in all_n:
         all_colls.extend(n["_collectives"])
-    return {
+    result = {
         "num_nodes": len(all_n),
         "comm_cost": comm,
         "compute_cost": compute,
         "transition_cost": transition,
-        "dominant": dominant,
-        "color": _STRATEGY_COLORS.get(dominant, "#D1D5DB"),
-        "bg": _STRATEGY_BGS.get(dominant, "#F9FAFB"),
         "collectives": all_colls,
     }
+    result.update(_placement_distribution(all_n))
+    return result
 
 
 def _summarize_collectives(collectives):
@@ -383,7 +364,7 @@ def _summarize_collectives(collectives):
     return sorted(grouped.items(), key=lambda item: (-item[1]["cost"], item[0]))
 
 
-def _render_tree_block(tree_node, cluster_counts, mesh, depth=0):
+def _render_tree_block(tree_node, cluster_counts, mesh, depth=0, total_cost=1, comm_threshold=0):
     """Recursively render a module tree node as nested HTML blocks."""
     stats = _tree_node_stats(tree_node)
     if stats["num_nodes"] == 0:
@@ -467,41 +448,77 @@ def _render_tree_block(tree_node, cluster_counts, mesh, depth=0):
     # Compute which phases this block contains
     all_phases = set(n.get("phase", "") for n in tree_node.all_nodes())
     phases_attr = " ".join(sorted(all_phases))
-    total_cost = (
+    block_cost = (
         stats["comm_cost"] + stats["compute_cost"] + stats["transition_cost"]
     )
-    zero_cost_attr = "1" if total_cost == 0 else "0"
-    zero_cost_class = " zero-cost-group" if total_cost == 0 else ""
+    zero_cost_attr = "1" if block_cost == 0 else "0"
+    zero_cost_class = " zero-cost-group" if block_cost == 0 else ""
+    hotspot_class = " cost-hotspot" if stats["comm_cost"] >= comm_threshold > 0 else ""
+
+    # Build placement distribution bar
+    dist_bar = ""
+    if stats["dist_total"] > 0:
+        segments = []
+        for cat, color, bg in _PLACEMENT_CATEGORIES:
+            cnt = stats["dist_counts"][cat]
+            if cnt == 0:
+                continue
+            pct = cnt * 100.0 / stats["dist_total"]
+            exact = stats["dist_details"][cat]
+            tip_parts = [f"{p} \u00d7{c}" for p, c in sorted(exact.items(), key=lambda x: -x[1])]
+            tip = f"{cat.title()}: {', '.join(tip_parts)}"
+            segments.append(
+                f'<div class="placement-bar-seg" style="width:{pct:.1f}%;background:{color}" title="{_esc(tip)}"></div>'
+            )
+        dist_bar = f'<div class="placement-bar">{"".join(segments)}</div>'
+
+    # Build cost distribution bar (comm / compute / transition)
+    cost_bar = ""
+    if block_cost > 0:
+        comm_w = stats["comm_cost"] * 100 / block_cost
+        comp_w = stats["compute_cost"] * 100 / block_cost
+        trans_w = stats["transition_cost"] * 100 / block_cost
+        cost_bar = (
+            '<div class="cost-bar" style="height:6px;margin-top:4px">'
+            f'<div class="cost-bar-segment" style="width:{comm_w:.1f}%;background:#DC2626" title="comm: {_fmt_us(stats["comm_cost"])}"></div>'
+            f'<div class="cost-bar-segment" style="width:{comp_w:.1f}%;background:#10B981" title="compute: {_fmt_us(stats["compute_cost"])}"></div>'
+            f'<div class="cost-bar-segment" style="width:{trans_w:.1f}%;background:#F59E0B" title="trans: {_fmt_us(stats["transition_cost"])}"></div>'
+            '</div>'
+        )
+
+    # Percentages relative to global total
+    def _pct(v):
+        return f" ({v * 100 / total_cost:.0f}%)" if total_cost > 0 else ""
 
     html = f'''
-<div class="func-block{zero_cost_class}" style="background:{stats['bg']};border-color:{stats['color']};margin-left:{indent}px"
+<div class="func-block{zero_cost_class}{hotspot_class}" style="margin-left:{indent}px;border-left-color:{stats['dominant_color']}"
      data-phases="{phases_attr}"
      data-zero-cost="{zero_cost_attr}"
      onclick="event.stopPropagation(); this.classList.toggle('expanded')">
   <div style="display:flex;justify-content:space-between;align-items:center">
     <div>
       <span class="func-name">{_esc(tree_node.name)}</span>
-      <span class="strategy-badge" style="background:{stats['color']}">{stats['dominant'].upper()}</span>
       {f'<span style="font-size:11px;color:#94a3b8;margin-left:4px">&#9660;</span>' if has_children else ''}
     </div>
     <div style="text-align:right;font-size:12px;color:#64748b">
-      {stats['num_nodes']} ops &middot; comm: {_fmt_us(stats['comm_cost'])} &middot; compute: {_fmt_us(stats['compute_cost'])} &middot; trans: {_fmt_us(stats['transition_cost'])}
+      {stats['num_nodes']} ops &middot; comm: {_fmt_us(stats['comm_cost'])}{_pct(stats['comm_cost'])} &middot; compute: {_fmt_us(stats['compute_cost'])}{_pct(stats['compute_cost'])} &middot; trans: {_fmt_us(stats['transition_cost'])}{_pct(stats['transition_cost'])}
     </div>
   </div>
+  {dist_bar}
+  {cost_bar}
   <div class="func-meta">{coll_html if coll_html else "No redistributions"}</div>
   <div class="func-details">'''
 
+    if has_children:
+        for child in tree_node.children.values():
+            html += _render_tree_block(child, cluster_counts, mesh, depth + 1, total_cost, comm_threshold)
+
     if has_detail:
+        if has_children:
+            html += '<div style="margin-top:10px"></div>'
         html += f'''
     <table><tr><th>Node</th><th>Phase</th><th>Shape</th><th>Placement</th><th>Comm</th><th>Compute</th><th>Trans</th></tr>
     {detail_rows}</table>'''
-
-    if has_children:
-        if has_detail:
-            html += '<div style="margin-top:10px"></div>'
-        # Render children in execution order (dict preserves insertion order)
-        for child in tree_node.children.values():
-            html += _render_tree_block(child, cluster_counts, mesh, depth + 1)
 
     html += '</div></div>'
     return html
@@ -519,6 +536,35 @@ def _flatten_tree_for_costs(tree_node, result=None, prefix=""):
     for child in tree_node.children.values():
         _flatten_tree_for_costs(child, result, full_name)
     return result
+
+
+def _treemap_data(tree_node, prefix=""):
+    """Flatten module tree into leaf-level items for a flat treemap."""
+    full_name = f"{prefix}.{tree_node.name}" if prefix else (tree_node.name or "root")
+    items = []
+    if tree_node.children:
+        for child in tree_node.children.values():
+            items.extend(_treemap_data(child, full_name))
+        # Own nodes at this level (not in any child)
+        if tree_node.own_nodes:
+            own_comm = sum(n["_total_comm"] for n in tree_node.own_nodes)
+            own_compute = sum(n.get("compute_cost", 0) for n in tree_node.own_nodes)
+            own_trans = sum(n["_total_transition"] for n in tree_node.own_nodes)
+            total = own_comm + own_compute + own_trans
+            if total > 0:
+                items.append({
+                    "name": full_name, "comm": own_comm,
+                    "compute": own_compute, "transition": own_trans,
+                })
+    else:
+        stats = _tree_node_stats(tree_node)
+        total = stats["comm_cost"] + stats["compute_cost"] + stats["transition_cost"]
+        if total > 0:
+            items.append({
+                "name": full_name, "comm": stats["comm_cost"],
+                "compute": stats["compute_cost"], "transition": stats["transition_cost"],
+            })
+    return items
 
 
 def _build_param_tree_html(param_nodes, mesh):
@@ -858,6 +904,7 @@ def _key_ops_for_stage(nodes):
         inputs_desc, output_desc = input_output_summary(n)
         result.append(
             {
+                "name": n["name"],
                 "label": label,
                 "placement": n.get("placement", ""),
                 "inputs": inputs_desc,
@@ -887,6 +934,7 @@ def _redistributions_for_stage(nodes, stage_names, all_nodes_by_name):
                 continue
             events.append(
                 {
+                    "name": n["name"],
                     "target": label,
                     "collective": coll or "Transition",
                     "src": inp.get("src_placement") or "?",
@@ -1047,14 +1095,9 @@ def _build_strategy_overview_html(non_param_nodes, layer_costs, module_tree):
 
         placement_html = ""
         for placement, _ in summary["placements"]:
-            strat = _classify_placement(placement)
+            bg, color = _placement_style(placement)
             placement_html += _placement_chip_html(
-                placement,
-                _STRATEGY_BGS.get(strat, "#F9FAFB"),
-                _STRATEGY_COLORS.get(strat, "#D1D5DB"),
-                None,
-                "",
-                None,
+                placement, bg, color, None, "", None,
             )
             placement_html += " "
         if not placement_html:
@@ -1071,35 +1114,20 @@ def _build_strategy_overview_html(non_param_nodes, layer_costs, module_tree):
 
         key_ops_html = ""
         for op in summary["key_ops"]:
-            strat = _classify_placement(op["placement"])
+            bg, color = _placement_style(op["placement"])
             chip = _placement_chip_html(
-                op["placement"],
-                _STRATEGY_BGS.get(strat, "#F9FAFB"),
-                _STRATEGY_COLORS.get(strat, "#D1D5DB"),
-                None,
-                "",
-                None,
+                op["placement"], bg, color, None, "", None,
             )
             input_lines = ""
             for entry in op["inputs"]:
-                src_strat = _classify_placement(entry["src"])
+                src_bg, src_color = _placement_style(entry["src"])
                 src_chip = _placement_chip_html(
-                    entry["src"],
-                    _STRATEGY_BGS.get(src_strat, "#F9FAFB"),
-                    _STRATEGY_COLORS.get(src_strat, "#D1D5DB"),
-                    None,
-                    "",
-                    None,
+                    entry["src"], src_bg, src_color, None, "", None,
                 )
                 if entry["changed"]:
-                    dst_strat = _classify_placement(entry["dst"])
+                    dst_bg, dst_color = _placement_style(entry["dst"])
                     dst_chip = _placement_chip_html(
-                        entry["dst"],
-                        _STRATEGY_BGS.get(dst_strat, "#F9FAFB"),
-                        _STRATEGY_COLORS.get(dst_strat, "#D1D5DB"),
-                        None,
-                        "",
-                        None,
+                        entry["dst"], dst_bg, dst_color, None, "", None,
                     )
                     values_html = (
                         f'{src_chip}<span class="overview-placement-arrow">&rarr;</span>'
@@ -1122,7 +1150,7 @@ def _build_strategy_overview_html(non_param_nodes, layer_costs, module_tree):
                 )
             key_ops_html += (
                 '<div class="overview-list-row overview-keyop-row">'
-                f'<div class="overview-list-label">{_esc(op["label"])}</div>'
+                f'<div class="overview-list-label"><a href="#" class="node-link" onclick="jumpToNode(\'{_esc(op["name"])}\', this); return false">{_esc(op["label"])}</a></div>'
                 '<div class="overview-placement-flow">'
                 f'{input_lines}'
                 '<div class="overview-placement-row">'
@@ -1145,7 +1173,7 @@ def _build_strategy_overview_html(non_param_nodes, layer_costs, module_tree):
         for event in redist_events[:5]:
             redist_html += (
                 '<div class="overview-list-row">'
-                f'<div class="overview-list-label">{_esc(event["target"])}</div>'
+                f'<div class="overview-list-label"><a href="#" class="node-link" onclick="jumpToNode(\'{_esc(event["name"])}\', this); return false">{_esc(event["target"])}</a></div>'
                 f'<div class="overview-list-meta">{_esc(event["src"])} &rarr; {_esc(event["dst"])}</div>'
                 f'<div class="overview-list-meta">{_esc(event["collective"])} &middot; '
                 f'comm {_fmt_us(event["comm"])} &middot; trans {_fmt_us(event["transition"])}</div>'
@@ -1156,7 +1184,7 @@ def _build_strategy_overview_html(non_param_nodes, layer_costs, module_tree):
             for event in redist_events:
                 full_redist_html += (
                     '<div class="overview-list-row">'
-                    f'<div class="overview-list-label">{_esc(event["target"])}</div>'
+                    f'<div class="overview-list-label"><a href="#" class="node-link" onclick="jumpToNode(\'{_esc(event["name"])}\', this); return false">{_esc(event["target"])}</a></div>'
                     f'<div class="overview-list-meta">{_esc(event["src"])} &rarr; {_esc(event["dst"])}</div>'
                     f'<div class="overview-list-meta">{_esc(event["collective"])} &middot; '
                     f'comm {_fmt_us(event["comm"])} &middot; trans {_fmt_us(event["transition"])}</div>'
@@ -1239,9 +1267,6 @@ def _perfetto_trace_payload(non_param_nodes):
     def collective_kind(inp):
         return _infer_collective(inp.get("src_placement"), inp.get("dst_placement"))
 
-    def strategy_name(n):
-        return n.get("_strategy") or _classify_placement(n.get("placement", ""))
-
     def compute_tid_for_phase(phase):
         return "forward" if phase == "forward" else "backward"
 
@@ -1284,13 +1309,7 @@ def _perfetto_trace_payload(non_param_nodes):
         },
         {
             "ph": "M",
-            "pid": "communication",
-            "name": "process_name",
-            "args": {"name": "Communication"},
-        },
-        {
-            "ph": "M",
-            "pid": "communication",
+            "pid": "compute",
             "tid": "redistribution",
             "name": "thread_name",
             "args": {"name": "Redistribution"},
@@ -1342,7 +1361,7 @@ def _perfetto_trace_payload(non_param_nodes):
                     "ph": "X",
                     "cat": "redistribution",
                     "name": f"{src} -> {dst}",
-                    "pid": "communication",
+                    "pid": "compute",
                     "tid": comm_tid,
                     "ts": start,
                     "dur": total,
@@ -1359,7 +1378,7 @@ def _perfetto_trace_payload(non_param_nodes):
                         "dst_placement": dst,
                         "comm_cost_us": comm_cost,
                         "transition_cost_us": transition_cost,
-                        "strategy": strategy_name(n),
+
                         "cluster_id": n.get("cluster_id"),
                     },
                 }
@@ -1375,7 +1394,7 @@ def _perfetto_trace_payload(non_param_nodes):
             trace_events.append(
                 {
                     "ph": "s",
-                    "pid": "communication",
+                    "pid": "compute",
                     "tid": comm_tid,
                     "ts": start,
                     "id": flow,
@@ -1420,7 +1439,6 @@ def _perfetto_trace_payload(non_param_nodes):
                 "shape": n.get("shape"),
                 "dtype": n.get("dtype"),
                 "placement": n.get("placement", ""),
-                "strategy": strategy_name(n),
                 "cluster_id": n.get("cluster_id"),
                 "compute_cost_us": dur,
                 "marker_only": marker_only,
@@ -1735,9 +1753,7 @@ def generate_visualization_html(data: dict) -> str:
     # Precompute per-node derived fields
     for n in nodes:
         placement = n.get("placement", "")
-        n["_strategy"] = _classify_placement(placement)
-        n["_color"] = _STRATEGY_COLORS.get(n["_strategy"], "#D1D5DB")
-        n["_bg"] = _STRATEGY_BGS.get(n["_strategy"], "#F9FAFB")
+        n["_bg"], n["_color"] = _placement_style(placement)
         n["_total_comm"] = _node_total_comm(n)
         n["_total_transition"] = _node_total_transition(n)
         # Collectives on input edges
@@ -1786,22 +1802,9 @@ def generate_visualization_html(data: dict) -> str:
         for n in compute_nodes
         if n.get("placeholder_kind") not in {"param", "buffer"}
     ]
-    strategy_counts = {}
-    for n in architecture_nodes:
-        s = n["_strategy"]
-        strategy_counts[s] = strategy_counts.get(s, 0) + 1
 
     # Build hierarchical module tree
     module_tree = _build_module_tree(architecture_nodes)
-
-    # Flat list for cost-by-module view
-    module_cost_list = _flatten_tree_for_costs(module_tree)
-    module_cost_list.sort(
-        key=lambda x: (
-            x[1]["comm_cost"] + x[1]["compute_cost"] + x[1]["transition_cost"]
-        ),
-        reverse=True,
-    )
 
     # Top costly nodes
     costly = sorted(architecture_nodes, key=_node_total_cost, reverse=True)
@@ -1817,33 +1820,20 @@ def generate_visualization_html(data: dict) -> str:
     if dim_names:
         mesh_desc += f" ({', '.join(dim_names)})"
 
-    # Per-layer cost breakdown (for repeated architectures)
+    # Per-layer cost breakdown (for Execution Overview)
     import re as _re
 
     layer_container_info = _find_repeated_layer_container(module_tree)
     if layer_container_info is not None:
         _lc_name = layer_container_info[1]
         _layer_pattern = _re.compile(rf"{_re.escape(_lc_name)}\.(\d+)")
-        _layer_suffix_pattern = _re.compile(rf".*{_re.escape(_lc_name)}\.\d+\.?")
     else:
         _layer_pattern = None
-        _layer_suffix_pattern = None
 
     layer_costs = {}
-    non_layer_cost = {
-        "comm": 0.0,
-        "compute": 0.0,
-        "transition": 0.0,
-        "num_nodes": 0,
-        "name": "non-layer",
-    }
-    layer_collectives = {}
     for n in architecture_nodes:
         mp = n.get("module_path", "")
         m = _layer_pattern.search(mp) if _layer_pattern else None
-        comm = n["_total_comm"]
-        compute = n.get("compute_cost", 0)
-        transition = n["_total_transition"]
         if m:
             idx = int(m.group(1))
             if idx not in layer_costs:
@@ -1853,23 +1843,10 @@ def generate_visualization_html(data: dict) -> str:
                     "transition": 0.0,
                     "num_nodes": 0,
                 }
-                layer_collectives[idx] = []
-            layer_costs[idx]["comm"] += comm
-            layer_costs[idx]["compute"] += compute
-            layer_costs[idx]["transition"] += transition
+            layer_costs[idx]["comm"] += n["_total_comm"]
+            layer_costs[idx]["compute"] += n.get("compute_cost", 0)
+            layer_costs[idx]["transition"] += n["_total_transition"]
             layer_costs[idx]["num_nodes"] += 1
-            # Collect per-edge collectives for this node (skip zero-cost)
-            for coll_name, coll_type, cfrom, cto, ccost in n["_collectives"]:
-                if ccost <= 0:
-                    continue
-                # Extract module suffix after layers.N.
-                suffix = _layer_suffix_pattern.sub("", _strip_module_prefix(mp))
-                layer_collectives[idx].append((suffix or mp, coll_type, ccost))
-        else:
-            non_layer_cost["comm"] += comm
-            non_layer_cost["compute"] += compute
-            non_layer_cost["transition"] += transition
-            non_layer_cost["num_nodes"] += 1
 
     total_cost = summary["total"] or 1
     comm_pct = summary["comm"] / total_cost * 100
@@ -1901,12 +1878,14 @@ def generate_visualization_html(data: dict) -> str:
 .ap-viz .tab-content.active {{ display: block; }}
 .ap-viz .card {{ background: white; border: 1px solid #e2e8f0; border-radius: 8px; padding: 18px; margin-bottom: 16px; color: #1e293b; }}
 .ap-viz .card-title {{ font-size: 14px; font-weight: 600; margin-bottom: 12px; color: #1e293b; }}
-.ap-viz .func-block {{ border-radius: 8px; padding: 14px; margin-bottom: 10px; border-left: 4px solid; cursor: pointer; transition: box-shadow 0.2s; }}
+.ap-viz .func-block {{ border-radius: 8px; padding: 14px; margin-bottom: 10px; border-left: 4px solid #cbd5e1; cursor: pointer; transition: box-shadow 0.2s; }}
 .ap-viz .func-block:hover {{ box-shadow: 0 2px 8px rgba(0,0,0,0.08); }}
 .ap-viz .func-name {{ font-weight: 600; font-size: 14px; color: #1e293b; }}
 .ap-viz .func-meta {{ font-size: 12px; color: #64748b; margin-top: 4px; }}
+.ap-viz .placement-bar {{ height: 6px; border-radius: 3px; display: flex; overflow: hidden; margin-top: 6px; background: #f1f5f9; }}
+.ap-viz .placement-bar-seg {{ height: 100%; min-width: 2px; }}
 .ap-viz .collective-badge {{ display: inline-block; background: #FEE2E2; color: #DC2626; font-size: 11px; padding: 2px 8px; border-radius: 10px; margin: 2px 2px; font-weight: 500; }}
-.ap-viz .strategy-badge {{ display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 500; color: white; }}
+
 .ap-viz .cluster-badge {{ display: inline-block; padding: 1px 6px; border-radius: 8px; font-size: 10px; font-weight: 600; color: #6B7280; background: #F1F5F9; margin-left: 4px; }}
 .ap-viz .func-details {{ display: none; margin-top: 10px; padding-top: 10px; border-top: 1px solid rgba(0,0,0,0.1); font-size: 12px; }}
 .ap-viz .func-block.expanded > .func-details {{ display: block; }}
@@ -1914,8 +1893,12 @@ def generate_visualization_html(data: dict) -> str:
 .ap-viz .cost-bar-label {{ font-size: 12px; margin-bottom: 3px; display: flex; justify-content: space-between; color: #1e293b; }}
 .ap-viz .cost-bar {{ height: 24px; border-radius: 4px; display: flex; overflow: hidden; background: #f1f5f9; }}
 .ap-viz .cost-bar-segment {{ height: 100%; display: flex; align-items: center; justify-content: center; font-size: 10px; color: white; font-weight: 500; min-width: 2px; }}
+.ap-viz .treemap-container {{ position: relative; height: 400px; background: #f8fafc; border-radius: 8px; overflow: hidden; }}
+.ap-viz .treemap-cell {{ position: absolute; overflow: hidden; cursor: pointer; border: 1px solid white; transition: opacity 0.15s; display: flex; align-items: center; justify-content: center; box-sizing: border-box; }}
+.ap-viz .treemap-cell:hover {{ opacity: 0.85; }}
+.ap-viz .treemap-cell span {{ font-size: 11px; color: white; font-weight: 500; text-shadow: 0 1px 2px rgba(0,0,0,0.5); pointer-events: none; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 0 4px; }}
 .ap-viz table {{ width: 100%; border-collapse: collapse; font-size: 12px; color: #1e293b; }}
-.ap-viz th {{ text-align: left; padding: 8px 10px; background: #f8fafc; border-bottom: 2px solid #e2e8f0; font-weight: 600; color: #64748b; text-transform: uppercase; font-size: 11px; letter-spacing: 0.3px; position: sticky; top: 0; }}
+.ap-viz th {{ text-align: left; padding: 8px 10px; background: #f8fafc; border-bottom: 2px solid #e2e8f0; font-weight: 600; color: #64748b; text-transform: uppercase; font-size: 11px; letter-spacing: 0.3px; position: sticky; top: 0; z-index: 2; }}
 .ap-viz td {{ padding: 7px 10px; border-bottom: 1px solid #f1f5f9; background: white; }}
 .ap-viz tr:hover td {{ background: #f8fafc; }}
 .ap-viz .placement-chip {{ display: inline-block; padding: 2px 8px; border-radius: 4px; font-family: monospace; font-size: 11px; font-weight: 500; position: relative; cursor: default; }}
@@ -1935,9 +1918,7 @@ def generate_visualization_html(data: dict) -> str:
 .ap-viz th.sortable:hover {{ color: #3b82f6; }}
 .ap-viz th.sort-asc::after {{ content: " \\25B2"; font-size: 9px; }}
 .ap-viz th.sort-desc::after {{ content: " \\25BC"; font-size: 9px; }}
-.ap-viz .legend {{ display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 16px; }}
-.ap-viz .legend-item {{ display: flex; align-items: center; gap: 6px; font-size: 12px; color: #1e293b; }}
-.ap-viz .legend-dot {{ width: 12px; height: 12px; border-radius: 3px; }}
+
 .ap-viz .notation-box {{ margin: -6px 0 16px 0; border: 1px solid #e2e8f0; border-radius: 8px; background: white; }}
 .ap-viz .notation-summary {{ list-style: none; cursor: pointer; padding: 10px 14px; font-size: 12px; font-weight: 600; color: #334155; }}
 .ap-viz .notation-summary::-webkit-details-marker {{ display: none; }}
@@ -1994,6 +1975,11 @@ def generate_visualization_html(data: dict) -> str:
 .ap-viz .phase-bwd {{ color: #6B7280; background: #F1F5F9; }}
 .ap-viz .zero-cost-group {{ opacity: 0.72; }}
 .ap-viz .zero-cost-group:not(.expanded) > .func-details {{ display: none; }}
+.ap-viz .cost-hotspot {{ border-left-color: #DC2626 !important; background: #FEF2F2; }}
+.ap-viz .node-link {{ color: #3B82F6; text-decoration: none; cursor: pointer; }}
+.ap-viz .node-link:hover {{ text-decoration: underline; }}
+@keyframes nodeHighlight {{ from {{ background: #FEF08A; }} to {{ background: transparent; }} }}
+.ap-viz .node-highlight {{ animation: nodeHighlight 1.5s ease-out; }}
 .ap-viz .func-block.search-expanded > .func-details {{ display: block; }}
 </style></head><body>
 <div class="ap-viz">
@@ -2037,14 +2023,6 @@ def generate_visualization_html(data: dict) -> str:
   </div>
 </div>
 
-<div class="legend">'''
-
-    for strat in ("fsdp", "tp", "fsdp+tp", "partial", "replicated", "other"):
-        count = strategy_counts.get(strat, 0)
-        if count > 0:
-            html += f'<div class="legend-item"><div class="legend-dot" style="background:{_STRATEGY_COLORS[strat]}"></div>{strat.upper()} ({count})</div>'
-
-    html += '''</div>
 <details class="notation-box">
   <summary class="notation-summary">Placement notation</summary>
   <div class="notation-body">
@@ -2077,12 +2055,12 @@ def generate_visualization_html(data: dict) -> str:
     # Tabs
     html += '''
 <div class="tabs">
-  <div class="tab" onclick="switchTab('params', this)">Parameters</div>
-  <div class="tab" onclick="switchTab('overview', this)">Execution Overview</div>
-  <div class="tab" onclick="switchTab('perfetto', this)">Perfetto</div>
-  <div class="tab active" onclick="switchTab('arch', this)">Architecture</div>
-  <div class="tab" onclick="switchTab('cost', this)">Cost Breakdown</div>
-  <div class="tab" onclick="switchTab('detail', this)">All Nodes</div>
+  <div class="tab" data-tab-id="params" onclick="switchTab('params', this)">Parameters</div>
+  <div class="tab" data-tab-id="overview" onclick="switchTab('overview', this)">Execution Overview</div>
+  <div class="tab" data-tab-id="perfetto" onclick="switchTab('perfetto', this)">Perfetto</div>
+  <div class="tab" data-tab-id="arch" onclick="switchTab('arch', this)">Architecture</div>
+  <div class="tab active" data-tab-id="cost" onclick="switchTab('cost', this)">Cost Breakdown</div>
+  <div class="tab" data-tab-id="detail" onclick="switchTab('detail', this)">All Nodes</div>
 </div>'''
 
     # ===== PARAMETERS TAB =====
@@ -2112,22 +2090,27 @@ def generate_visualization_html(data: dict) -> str:
 
     # ===== ARCHITECTURE TAB =====
     html += '''
-<div data-tab="arch" class="tab-content active">
+<div data-tab="arch" class="tab-content">
 <div class="card"><div class="card-title">Computation Blocks by Module</div>
 <div class="filter-bar">
   <input type="text" class="search-box" placeholder="Search modules..." oninput="setArchSearch(this)">
+  <button class="filter-btn" onclick="archExpandAll(this)">Expand All</button>
+  <button class="filter-btn" onclick="archCollapseAll(this)">Collapse All</button>
 </div>'''
 
     # Render top-level tree children in execution order (dict preserves
     # insertion order from graph traversal)
+    flat_costs = _flatten_tree_for_costs(module_tree)
+    comm_costs = sorted([s["comm_cost"] for _, s in flat_costs if s["comm_cost"] > 0])
+    comm_threshold = comm_costs[int(len(comm_costs) * 0.9)] if len(comm_costs) >= 5 else 0
     for child in module_tree.children.values():
-        html += _render_tree_block(child, cluster_counts, mesh, depth=0)
+        html += _render_tree_block(child, cluster_counts, mesh, depth=0, total_cost=total_cost, comm_threshold=comm_threshold)
 
     html += '</div></div>'
 
     # ===== COST BREAKDOWN TAB =====
     html += f'''
-<div data-tab="cost" class="tab-content">
+<div data-tab="cost" class="tab-content active">
 <div class="card"><div class="card-title">Cost Distribution</div>
 <div class="cost-bar-container">
   <div class="cost-bar-label"><span>Cost Breakdown</span></div>
@@ -2138,115 +2121,72 @@ def generate_visualization_html(data: dict) -> str:
   </div>
 </div></div>'''
 
-    # Per-layer cost breakdown (only if layers exist)
-    if layer_costs:
-        # Check if all layers have the same cost (clustered)
-        layer_vals = list(layer_costs.values())
-        all_same = len(layer_vals) > 1 and all(
-            abs(lc["comm"] - layer_vals[0]["comm"]) < 0.01
-            and abs(lc["compute"] - layer_vals[0]["compute"]) < 0.01
-            and abs(lc["transition"] - layer_vals[0]["transition"]) < 0.01
-            for lc in layer_vals[1:]
+    # Communication hotspots — group by (module, collective, src, dst) per phase
+    hotspot_by_phase = {"forward": {}, "backward": {}}
+    phase_totals = {"forward": 0.0, "backward": 0.0}
+    for n in architecture_nodes:
+        module = _strip_module_prefix(n.get("module_path", "") or n.get("name", ""))
+        # Use top-level module as the grouping scope
+        module_prefix = module.split(".")[0] if module else ""
+        phase = n.get("phase", "forward")
+        cid = n.get("cluster_id")
+        instances = (cluster_counts.get(cid, 0) + 1) if cid is not None else 1
+        for inp_name, coll_type, src_p, dst_p, ccost in n["_collectives"]:
+            if ccost <= 0:
+                continue
+            cost = ccost * instances
+            phase_totals[phase] = phase_totals.get(phase, 0) + cost
+            groups = hotspot_by_phase.get(phase, hotspot_by_phase["forward"])
+            key = (module_prefix, coll_type, src_p, dst_p)
+            if key not in groups:
+                groups[key] = {
+                    "coll": coll_type, "src": src_p, "dst": dst_p,
+                    "module": module_prefix,
+                    "total_cost": 0.0, "count": 0,
+                }
+            groups[key]["total_cost"] += cost
+            groups[key]["count"] += instances
+
+    def _hotspot_table_html(hotspots):
+        if not hotspots:
+            return '<p style="font-size:12px;color:#94a3b8">No communication costs.</p>'
+        rows = ""
+        for h in hotspots:
+            module_esc = _esc(h["module"]) if h["module"] else "(root)"
+            rows += (
+                f'<tr>'
+                f'<td style="font-size:12px;font-weight:500">'
+                f'<a href="#" class="node-link" onclick="jumpToArch(\'{_esc(h["module"])}\', this); return false">{module_esc}</a></td>'
+                f'<td><span class="collective-badge">{_esc(h["coll"])}</span></td>'
+                f'<td style="font-family:monospace;font-size:11px">{_esc(h["src"])} &rarr; {_esc(h["dst"])}</td>'
+                f'<td style="text-align:center">&times;{h["count"]}</td>'
+                f'<td style="font-family:monospace;font-weight:600;color:#DC2626">{_fmt_us(h["total_cost"])}</td>'
+                f'</tr>'
+            )
+        return (
+            '<div class="table-scroll" style="max-height:300px">'
+            '<table><thead><tr>'
+            '<th>Module</th><th>Collective</th><th>Placement Change</th><th>Occurrences</th><th>Total Comm</th>'
+            f'</tr></thead><tbody>{rows}</tbody></table></div>'
         )
 
-        # Use a representative layer for the detailed breakdown
-        repr_idx = sorted(layer_costs.keys())[0]
-        repr_costs = layer_costs[repr_idx]
-        repr_colls = layer_collectives.get(repr_idx, [])
+    fwd_hotspots = sorted(hotspot_by_phase["forward"].values(), key=lambda h: -h["total_cost"])[:15]
+    bwd_hotspots = sorted(hotspot_by_phase["backward"].values(), key=lambda h: -h["total_cost"])[:15]
 
-        # Aggregate collectives by (module, type)
-        coll_groups = {}
-        for suffix, coll_type, ccost in repr_colls:
-            key = (coll_type, suffix)
-            if key not in coll_groups:
-                coll_groups[key] = {"cost": 0.0, "count": 0}
-            coll_groups[key]["cost"] += ccost
-            coll_groups[key]["count"] += 1
+    fwd_total = phase_totals["forward"]
+    bwd_total = phase_totals["backward"]
+    fwd_shown = sum(h["total_cost"] for h in fwd_hotspots)
+    bwd_shown = sum(h["total_cost"] for h in bwd_hotspots)
+    fwd_note = "" if fwd_shown >= fwd_total * 0.99 else f" (top 15 shown, {_fmt_us(fwd_total)} total)"
+    bwd_note = "" if bwd_shown >= bwd_total * 0.99 else f" (top 15 shown, {_fmt_us(bwd_total)} total)"
 
-        # Sort by cost descending
-        sorted_colls = sorted(coll_groups.items(), key=lambda x: -x[1]["cost"])
-
-        layer_title = "Cost by Layer"
-        if all_same and has_clusters:
-            n_layers = len(layer_vals)
-            layer_title += f' (all {n_layers} layers identical, showing layer {repr_idx})'
-
-        html += f'''
-<div class="card"><div class="card-title">{_esc(layer_title)}</div>'''
-
-        # Compute bar: full width reference
-        bar_max = (
-            repr_costs["compute"]
-            + repr_costs["comm"]
-            + repr_costs["transition"]
-        ) or 1
-
-        html += f'''<div class="cost-bar-container">
-  <div class="cost-bar-label"><span style="font-weight:600">Compute</span><span style="color:#64748b">{_fmt_us(repr_costs["compute"])}</span></div>
-  <div class="cost-bar">
-    <div class="cost-bar-segment" style="width:{repr_costs["compute"] / bar_max * 100}%;background:#10B981"></div>
-  </div>
-</div>'''
-
-        if repr_costs["transition"] > 0:
-            html += f'''<div class="cost-bar-container">
-  <div class="cost-bar-label"><span style="font-weight:600">Transitions</span><span style="color:#64748b">{_fmt_us(repr_costs["transition"])}</span></div>
-  <div class="cost-bar">
-    <div class="cost-bar-segment" style="width:{repr_costs["transition"] / bar_max * 100}%;background:#F59E0B"></div>
-  </div>
-</div>'''
-
-        # Individual collective bars, scaled relative to compute
-        for (coll_type, suffix), info in sorted_colls:
-            if info["cost"] == 0:
-                continue
-            w = min(info["cost"] / bar_max * 100, 100)
-            label = f'{coll_type}'
-            if suffix:
-                label += f' ({suffix})'
-            html += f'''<div class="cost-bar-container">
-  <div class="cost-bar-label"><span>{_esc(label)}</span><span style="color:#64748b">{_fmt_us(info["cost"])}</span></div>
-  <div class="cost-bar">
-    <div class="cost-bar-segment" style="width:{w}%;background:#DC2626"></div>
-  </div>
-</div>'''
-
-        # Summary line
-        total_comm = repr_costs["comm"]
-        total_compute = repr_costs["compute"]
-        total_transition = repr_costs["transition"]
-        total = total_comm + total_compute + total_transition
-        if total > 0:
-            comm_frac = total_comm / total * 100
-            n_layers = len(layer_costs)
-            html += (
-                f'<p style="font-size:12px;color:#64748b;margin-top:8px">'
-                f'Per layer: compute={_fmt_us(total_compute)}, '
-                f'comm={_fmt_us(total_comm)}, trans={_fmt_us(total_transition)} '
-                f'({comm_frac:.0f}% communication)'
-            )
-            if n_layers > 1:
-                html += f' &middot; {n_layers} layers total: {_fmt_us(total * n_layers)}'
-            html += '</p>'
-
-        # Non-layer ops
-        if non_layer_cost["num_nodes"] > 0:
-            nl_total = (
-                non_layer_cost["comm"]
-                + non_layer_cost["compute"]
-                + non_layer_cost["transition"]
-            )
-            if nl_total > 0:
-                html += f'''<div class="cost-bar-container" style="margin-top:12px">
-  <div class="cost-bar-label"><span style="font-weight:600">Non-layer ops</span><span style="color:#64748b">{non_layer_cost["num_nodes"]} ops &middot; {_fmt_us(nl_total)}</span></div>
-  <div class="cost-bar">
-    <div class="cost-bar-segment" style="width:{min(non_layer_cost["comm"] / bar_max * 100, 100)}%;background:#DC2626"></div>
-    <div class="cost-bar-segment" style="width:{min(non_layer_cost["compute"] / bar_max * 100, 100)}%;background:#10B981"></div>
-    <div class="cost-bar-segment" style="width:{min(non_layer_cost["transition"] / bar_max * 100, 100)}%;background:#F59E0B"></div>
-  </div>
-</div>'''
-
-        html += '</div>'
+    html += f'''
+<div class="card"><div class="card-title">Communication Hotspots — Forward <span style="font-weight:400;color:#64748b">{_fmt_us(fwd_total)}{fwd_note}</span></div>'''
+    html += _hotspot_table_html(fwd_hotspots)
+    html += f'''</div>
+<div class="card"><div class="card-title">Communication Hotspots — Backward <span style="font-weight:400;color:#64748b">{_fmt_us(bwd_total)}{bwd_note}</span></div>'''
+    html += _hotspot_table_html(bwd_hotspots)
+    html += '</div>'
 
     html += '''
 <div class="card"><div class="card-title">Top Costly Operations</div>'''
@@ -2261,7 +2201,7 @@ def generate_visualization_html(data: dict) -> str:
             src = n.get("source")
             src_label = f'{src["func"]}: {src["code"]}' if src else n.get("op", "")
             html += f'''<div class="cost-bar-container">
-  <div class="cost-bar-label"><span style="font-family:monospace">{_esc(n["name"])}</span><span style="color:#64748b">{_esc(src_label)} &middot; total: {_fmt_us(total)}</span></div>
+  <div class="cost-bar-label"><span style="font-family:monospace"><a href="#" class="node-link" onclick="jumpToNode('{_esc(n["name"])}', this); return false">{_esc(n["name"])}</a></span><span style="color:#64748b">{_esc(src_label)} &middot; total: {_fmt_us(total)}</span></div>
   <div class="cost-bar">
     <div class="cost-bar-segment" style="width:{comm_w}%;background:#DC2626" title="comm: {_fmt_us(n['_total_comm'])}"></div>
     <div class="cost-bar-segment" style="width:{comp_w}%;background:#10B981" title="compute: {_fmt_us(n.get('compute_cost', 0))}"></div>
@@ -2269,35 +2209,164 @@ def generate_visualization_html(data: dict) -> str:
   </div>
 </div>'''
 
-    # Cost by module
-    html += '</div><div class="card"><div class="card-title">Cost by Module</div>'
-    func_max = (
-        max(
-            (
-                s["comm_cost"] + s["compute_cost"] + s["transition_cost"]
-                for _, s in module_cost_list
-            )
-        )
-        if module_cost_list
-        else 1
-    )
-    for mname, stats in module_cost_list:
-        total = (
-            stats["comm_cost"] + stats["compute_cost"] + stats["transition_cost"]
-        )
-        if total == 0:
-            continue
-        comm_w = stats["comm_cost"] / func_max * 100
-        comp_w = stats["compute_cost"] / func_max * 100
-        trans_w = stats["transition_cost"] / func_max * 100
-        html += f'''<div class="cost-bar-container">
-  <div class="cost-bar-label"><span style="font-weight:600">{_esc(mname)}</span><span style="color:#64748b">{stats["num_nodes"]} ops &middot; total: {_fmt_us(total)}</span></div>
-  <div class="cost-bar">
-    <div class="cost-bar-segment" style="width:{comm_w}%;background:#DC2626"></div>
-    <div class="cost-bar-segment" style="width:{comp_w}%;background:#10B981"></div>
-    <div class="cost-bar-segment" style="width:{trans_w}%;background:#F59E0B"></div>
-  </div>
-</div>'''
+    # Cost by module — flat treemap with comm/compute mode toggle
+    treemap_items = _treemap_data(module_tree)
+    treemap_json = json.dumps(treemap_items)
+    html += f'''</div><div class="card"><div class="card-title">Cost by Module</div>
+<div class="filter-bar">
+  <button class="filter-btn active" onclick="setTreemapMode('comm', this)">Communication</button>
+  <button class="filter-btn" onclick="setTreemapMode('compute', this)">Compute</button>
+</div>
+<div class="treemap-container" id="treemap-container"></div>
+<script>
+function _tmFmtUs(us) {{ return us >= 1000 ? (us/1000).toFixed(1)+'ms' : Math.round(us)+'\\u00b5s'; }}
+
+function _tmSquarify(items, rect) {{
+  if (!items.length) return;
+  var total = 0;
+  for (var i = 0; i < items.length; i++) total += items[i].value;
+  if (total === 0) return;
+  _tmLayout(items, 0, rect, total, rect.w * rect.h);
+}}
+
+function _tmLayout(items, start, rect, total, area) {{
+  if (start >= items.length) return;
+  if (items.length - start === 1) {{
+    items[start]._x = rect.x; items[start]._y = rect.y;
+    items[start]._w = rect.w; items[start]._h = rect.h;
+    return;
+  }}
+  var short = Math.min(rect.w, rect.h);
+  var rowSum = 0, bestRatio = Infinity, end = start;
+  for (var i = start; i < items.length; i++) {{
+    rowSum += items[i].value;
+    var frac = rowSum / total * area;
+    var rowLen = frac / short;
+    var last = items[i].value / total * area / rowLen;
+    var ratio = Math.max(rowLen / last, last / rowLen);
+    if (ratio > bestRatio) break;
+    bestRatio = ratio;
+    end = i;
+  }}
+  rowSum = 0;
+  for (var i = start; i <= end; i++) rowSum += items[i].value;
+  var stripFrac = rowSum / total;
+  var pos = 0;
+  for (var i = start; i <= end; i++) {{
+    var itemFrac = items[i].value / rowSum;
+    if (rect.w >= rect.h) {{
+      var sw = rect.w * stripFrac;
+      items[i]._x = rect.x; items[i]._y = rect.y + rect.h * pos;
+      items[i]._w = sw; items[i]._h = rect.h * itemFrac;
+    }} else {{
+      var sh = rect.h * stripFrac;
+      items[i]._x = rect.x + rect.w * pos; items[i]._y = rect.y;
+      items[i]._w = rect.w * itemFrac; items[i]._h = sh;
+    }}
+    pos += itemFrac;
+  }}
+  if (end + 1 < items.length) {{
+    var rem;
+    if (rect.w >= rect.h) {{
+      rem = {{x: rect.x + rect.w * stripFrac, y: rect.y, w: rect.w * (1 - stripFrac), h: rect.h}};
+    }} else {{
+      rem = {{x: rect.x, y: rect.y + rect.h * stripFrac, w: rect.w, h: rect.h * (1 - stripFrac)}};
+    }}
+    _tmLayout(items, end + 1, rem, total - rowSum, rem.w * rem.h);
+  }}
+}}
+
+var _treemapInited = false;
+var _treemapMode = 'comm';
+var _treemapItems = {treemap_json};
+function setTreemapMode(mode, btn) {{
+  _treemapMode = mode;
+  btn.parentElement.querySelectorAll('.filter-btn').forEach(function(b) {{ b.classList.remove('active'); }});
+  btn.classList.add('active');
+  if (_treemapInited) _treemapRender();
+}}
+function initTreemap() {{
+  if (_treemapInited) return;
+  _treemapInited = true;
+  _treemapRender();
+}}
+function _treemapRender() {{
+  var container = document.getElementById('treemap-container');
+  container.innerHTML = '';
+  var mode = _treemapMode;
+
+  // Copy items and assign .value based on mode
+  var items = [];
+  for (var i = 0; i < _treemapItems.length; i++) {{
+    var d = _treemapItems[i];
+    var v = (mode === 'comm') ? d.comm : d.compute;
+    if (v > 0) items.push({{name: d.name, comm: d.comm, compute: d.compute, transition: d.transition, value: v}});
+  }}
+  items.sort(function(a, b) {{ return b.value - a.value; }});
+
+  if (!items.length) {{
+    container.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:#94a3b8;font-size:14px">No ' + mode + ' cost</div>';
+    return;
+  }}
+
+  var rect = {{x: 0, y: 0, w: container.offsetWidth, h: container.offsetHeight}};
+  _tmSquarify(items, rect);
+  var totalValue = 0;
+  for (var i = 0; i < items.length; i++) totalValue += items[i].value;
+
+  for (var i = 0; i < items.length; i++) {{
+    var d = items[i];
+    if (!d._w || !d._h) continue;
+
+    // Intensity: selected cost / total cost of this module
+    var t = d.comm + d.compute + d.transition;
+    var intensity = t > 0 ? d.value / t : 0;
+    var r, g, b;
+    if (mode === 'comm') {{
+      r = Math.round(255 - intensity * (255 - 0xDC));
+      g = Math.round(255 - intensity * (255 - 0x26));
+      b = Math.round(255 - intensity * (255 - 0x26));
+    }} else {{
+      r = Math.round(255 - intensity * (255 - 0x10));
+      g = Math.round(255 - intensity * (255 - 0xB9));
+      b = Math.round(255 - intensity * (255 - 0x81));
+    }}
+    var txtColor = intensity > 0.4 ? '#fff' : '#1e293b';
+
+    var cell = document.createElement('div');
+    cell.className = 'treemap-cell';
+    cell.style.left = d._x + 'px'; cell.style.top = d._y + 'px';
+    cell.style.width = d._w + 'px'; cell.style.height = d._h + 'px';
+    cell.style.background = 'rgb(' + r + ',' + g + ',' + b + ')';
+
+    var pct = (d.value / totalValue * 100).toFixed(1);
+    cell.title = d.name + '\\ncomm: ' + _tmFmtUs(d.comm) + '  compute: ' + _tmFmtUs(d.compute) + '  trans: ' + _tmFmtUs(d.transition) + '\\n' + pct + '% of total ' + mode;
+
+    if (d._w > 50 && d._h > 20) {{
+      var span = document.createElement('span');
+      span.textContent = d.name;
+      span.style.color = txtColor;
+      span.style.textShadow = 'none';
+      cell.appendChild(span);
+    }}
+    // Mini stacked cost bar at bottom
+    if (d._w > 20 && d._h > 16 && t > 0) {{
+      var bar = document.createElement('div');
+      bar.style.cssText = 'position:absolute;bottom:0;left:0;right:0;height:4px;display:flex;pointer-events:none';
+      bar.innerHTML = '<div style="width:'+(d.comm/t*100)+'%;background:#DC2626;height:100%"></div>'
+        + '<div style="width:'+(d.compute/t*100)+'%;background:#10B981;height:100%"></div>'
+        + '<div style="width:'+(d.transition/t*100)+'%;background:#F59E0B;height:100%"></div>';
+      cell.appendChild(bar);
+    }}
+    (function(name) {{
+      cell.addEventListener('click', function() {{
+        jumpToArch(name, cell);
+      }});
+    }})(d.name);
+    container.appendChild(cell);
+  }}
+}}
+</script>'''
 
     html += '</div></div>'
 
@@ -2353,7 +2422,8 @@ def generate_visualization_html(data: dict) -> str:
             f'data-comm="{comm}" '
             f'data-redist="{1 if n["_collectives"] else 0}" '
             f'data-linked="{1 if is_linked else 0}" '
-            f'data-placeholder-kind="{_esc(placeholder_kind)}"'
+            f'data-placeholder-kind="{_esc(placeholder_kind)}" '
+            f'data-node-name="{_esc(n["name"])}"'
         )
 
         chip = _placement_chip_html(placement, n['_bg'], n['_color'], n.get("shape"), dtype, mesh)
@@ -2388,6 +2458,9 @@ function switchTab(id, btn) {
   if (id === 'perfetto') {
     loadPerfettoTrace(btn);
   }
+  if (id === 'cost' && typeof initTreemap === 'function') {
+    initTreemap();
+  }
 }
 
 var filterState = {
@@ -2421,6 +2494,61 @@ function setArchSearch(el) {
   r.querySelectorAll('.func-block.search-expanded').forEach(function(b) {
     b.classList.remove('search-expanded');
   });
+  applyFilters(r);
+}
+
+function archExpandAll(btn) {
+  _root(btn).querySelectorAll('.func-block').forEach(function(b) { b.classList.add('expanded'); });
+}
+function archCollapseAll(btn) {
+  _root(btn).querySelectorAll('.func-block').forEach(function(b) {
+    b.classList.remove('expanded');
+    b.classList.remove('search-expanded');
+  });
+}
+
+function jumpToNode(name, el) {
+  var r = _root(el);
+  // Switch to All Nodes tab
+  var tabBtn = r.querySelector('.tab[data-tab-id="detail"]');
+  if (tabBtn) switchTab('detail', tabBtn);
+  // Reset filters so the row is visible
+  filterState.nodeType = 'all';
+  filterState.searchText = '';
+  filterState.representativeLayersOnly = false;
+  r.querySelectorAll('[data-filter-group="nodeType"]').forEach(function(b) {
+    b.classList.toggle('active', b.textContent.trim() === 'All');
+  });
+  var clusterBtn = r.querySelector('#btn-cluster-collapse');
+  if (clusterBtn) {
+    clusterBtn.textContent = 'All Repeated Layers';
+    clusterBtn.classList.remove('active');
+  }
+  var searchBox = r.querySelector('.tab-content[data-tab="detail"] .search-box');
+  if (searchBox) searchBox.value = '';
+  applyFilters(r);
+  // Find and highlight the row
+  var row = r.querySelector('tr[data-node-name="' + name.replace(/'/g, "\\'") + '"]');
+  if (row) {
+    row.style.display = '';
+    row.scrollIntoView({behavior: 'smooth', block: 'center'});
+    row.classList.remove('node-highlight');
+    void row.offsetWidth;
+    row.classList.add('node-highlight');
+  }
+}
+
+function jumpToArch(moduleName, el) {
+  var r = _root(el);
+  var tabBtn = r.querySelector('.tab[data-tab-id="arch"]');
+  if (tabBtn) switchTab('arch', tabBtn);
+  // Clear previous search state
+  r.querySelectorAll('.func-block.search-expanded').forEach(function(b) {
+    b.classList.remove('search-expanded');
+  });
+  filterState.archSearchText = moduleName.toLowerCase();
+  var searchBox = r.querySelector('.tab-content[data-tab="arch"] .search-box');
+  if (searchBox) searchBox.value = moduleName;
   applyFilters(r);
 }
 
@@ -2581,37 +2709,6 @@ function _perfettoNodesForMode(nodes, mode) {
   return nodes.filter(function(n) { return !('cluster_root' in n); });
 }
 
-function _perfettoClassifyPlacement(placement) {
-  if (!placement) return 'unknown';
-  var p = placement.trim();
-  if (p === 'RR' || p === 'R') return 'replicated';
-  var parts = [];
-  for (var i = 0; i < p.length;) {
-    if (p[i] === 'S' && i + 1 < p.length && p[i + 1] === '(') {
-      var endS = p.indexOf(')', i);
-      parts.push(p.slice(i, endS + 1));
-      i = endS + 1;
-    } else if (p[i] === 'P' && i + 1 < p.length && p[i + 1] === '(') {
-      var endP = p.indexOf(')', i);
-      parts.push(p.slice(i, endP + 1));
-      i = endP + 1;
-    } else if (p[i] === 'R') {
-      parts.push('R');
-      i += 1;
-    } else {
-      i += 1;
-    }
-  }
-  if (parts.length === 2) {
-    var d0 = parts[0], d1 = parts[1];
-    if (d0[0] === 'S' && d1 === 'R') return 'fsdp';
-    if (d0 === 'R' && d1[0] === 'S') return 'tp';
-    if (d0[0] === 'S' && d1[0] === 'S') return 'fsdp+tp';
-    if (d0[0] === 'P' || d1[0] === 'P') return 'partial';
-  }
-  return 'other';
-}
-
 function _perfettoInferCollective(src, dst) {
   if (!src || !dst || src === dst) return null;
   function dims(p) {
@@ -2699,8 +2796,7 @@ function _perfettoBuildTrace(nodes, mode) {
     {ph: 'M', pid: 'compute', name: 'process_name', args: {name: 'Compute'}},
     {ph: 'M', pid: 'compute', tid: 'forward', name: 'thread_name', args: {name: 'Forward'}},
     {ph: 'M', pid: 'compute', tid: 'backward', name: 'thread_name', args: {name: 'Backward'}},
-    {ph: 'M', pid: 'communication', name: 'process_name', args: {name: 'Communication'}},
-    {ph: 'M', pid: 'communication', tid: 'redistribution', name: 'thread_name', args: {name: 'Redistribution'}},
+    {ph: 'M', pid: 'compute', tid: 'redistribution', name: 'thread_name', args: {name: 'Redistribution'}},
   ];
 
   var launchOverhead = 1.0;
@@ -2743,7 +2839,7 @@ function _perfettoBuildTrace(nodes, mode) {
         ph: 'X',
         cat: 'redistribution',
         name: src + ' -> ' + dst,
-        pid: 'communication',
+        pid: 'compute',
         tid: commTid,
         ts: start,
         dur: total,
@@ -2760,7 +2856,6 @@ function _perfettoBuildTrace(nodes, mode) {
           dst_placement: dst,
           comm_cost_us: commCost,
           transition_cost_us: transitionCost,
-          strategy: _perfettoClassifyPlacement(n.placement || ''),
           cluster_id: n.cluster_id,
         }
       });
@@ -2796,7 +2891,6 @@ function _perfettoBuildTrace(nodes, mode) {
         shape: n.shape,
         dtype: n.dtype,
         placement: n.placement || '',
-        strategy: _perfettoClassifyPlacement(n.placement || ''),
         cluster_id: n.cluster_id,
         compute_cost_us: dur,
         marker_only: markerOnly,
@@ -3214,6 +3308,7 @@ function loadPerfettoTrace(btn) {
 }
 
 
+if (typeof initTreemap === 'function') initTreemap();
 </script>
 </div></div></body></html>'''
 
