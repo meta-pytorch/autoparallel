@@ -227,6 +227,20 @@ def _trace_to_output(node, node_to_output_pos):
     return None
 
 
+def _fqn_to_dynamo_target(fqn, kind="parameters"):
+    """Convert a model FQN to the dynamo placeholder target name.
+
+    E.g. 'body.0.weight' with kind='parameters'
+    -> 'L_self_modules_body_modules_0_parameters_weight_'
+    """
+    parts = fqn.split(".")
+    result = "L_self"
+    for part in parts[:-1]:
+        result += f"_modules_{part}"
+    result += f"_{kind}_{parts[-1]}_"
+    return result
+
+
 def annotate_user_backward_descriptors(gm, model):
     """Set meta["desc"] on all placeholder and output nodes for a user-backward graph.
 
@@ -234,9 +248,19 @@ def annotate_user_backward_descriptors(gm, model):
     would produce, enabling reuse of ShardingOptimizer including
     forward_backward_consistency_constraints.
     """
-    # Build FQN maps from the model
-    param_fqns = set(dict(model.named_parameters()))
-    buffer_fqns = set(dict(model.named_buffers()))
+    # Build target -> fqn maps using the dynamo naming convention.
+    # Dynamo's public graph capture (dynamo_graph_capture_for_export) uses
+    # mangled names like L_self_modules_X_parameters_Y_ for placeholders,
+    # not the model FQNs directly.
+    param_target_to_fqn = {}
+    for fqn in dict(model.named_parameters()):
+        target = _fqn_to_dynamo_target(fqn, "parameters")
+        param_target_to_fqn[target] = fqn
+
+    buffer_target_to_fqn = {}
+    for fqn in dict(model.named_buffers()):
+        target = _fqn_to_dynamo_target(fqn, "buffers")
+        buffer_target_to_fqn[target] = fqn
 
     # Get the grad→param mapping
     grad_mapping = infer_grad_param_mapping(gm)
@@ -248,10 +272,16 @@ def annotate_user_backward_descriptors(gm, model):
             continue
 
         target = n.target
-        if target in param_fqns:
-            n.meta["desc"] = ParamAOTInput(target=target)
-        elif target in buffer_fqns:
-            n.meta["desc"] = BufferAOTInput(target=target)
+        if target in param_target_to_fqn:
+            fqn = param_target_to_fqn[target]
+            n.meta["desc"] = ParamAOTInput(target=fqn)
+            # Also rename the placeholder target to the FQN for consistency
+            # with the private _dynamo_graph_capture_for_export convention
+            n.target = fqn
+        elif target in buffer_target_to_fqn:
+            fqn = buffer_target_to_fqn[target]
+            n.meta["desc"] = BufferAOTInput(target=fqn)
+            n.target = fqn
         else:
             n.meta["desc"] = PlainAOTInput(idx=plain_input_idx)
             plain_input_idx += 1
@@ -265,6 +295,7 @@ def annotate_user_backward_descriptors(gm, model):
     assert output_node is not None
 
     output_args = output_node.args[0]
+    output_descs = []
     plain_output_idx = 0
     for i, arg in enumerate(output_args):
         if i in grad_mapping:
@@ -276,6 +307,12 @@ def annotate_user_backward_descriptors(gm, model):
             desc = PlainAOTOutput(idx=plain_output_idx)
             plain_output_idx += 1
 
-        # Set desc on the output arg node if it's a node
+        output_descs.append(desc)
+        # Also set desc on the output arg node if it's a node
         if isinstance(arg, torch.fx.Node):
             arg.meta["desc"] = desc
+
+    # Set the list of output descriptors on the output node itself,
+    # matching the convention used by aot_export_joint_with_descriptors.
+    # ShardingOptimizer reads output_node.meta["desc"] as a list.
+    output_node.meta["desc"] = output_descs

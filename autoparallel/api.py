@@ -185,22 +185,38 @@ def build_joint_graph(
     )
 
 
+def _copy_descriptors(source_gm, target_gm):
+    """Copy meta["desc"] from source graph placeholder/output nodes to target graph."""
+    from .apply_sharding import rename_placeholder_node
+
+    for n1, n2 in zip(
+        (n for n in source_gm.graph.nodes if n.op in ("placeholder", "output")),
+        (n for n in target_gm.graph.nodes if n.op in ("placeholder", "output")),
+    ):
+        n2.meta["desc"] = n1.meta["desc"]
+        if n2.op == "placeholder":
+            # Sanitize the target for use as a Python identifier (dots -> underscores).
+            # rename_placeholder_node sets both name and target to the given string.
+            safe_name = n1.target.replace(".", "_")
+            rename_placeholder_node(target_gm, n2, safe_name)
+    target_gm.recompile()
+
+
 def build_user_backward_graph(model, input_fn, fake_mode):
     """Build graph from a model whose forward() contains backward().
 
     Uses trace_autograd_ops=True to capture autograd.grad nodes,
-    then infers GradAOTOutput descriptors. The returned graph has
-    descriptors on all placeholder and output nodes, compatible with
-    ShardingOptimizer.
+    then infers GradAOTOutput descriptors. The graph is then decomposed
+    via make_fx with decomposition table to lower autograd.grad into
+    aten ops that ShardingOptimizer can handle.
     """
     from torch._dynamo.functional_export import dynamo_graph_capture_for_export
+    from torch.fx.experimental.proxy_tensor import make_fx
 
     from .tracing import annotate_user_backward_descriptors
 
     t0 = time.perf_counter()
-    # TODO: apply decomp_table via make_fx after dynamo capture to decompose
-    # autograd.grad nodes into aten ops, matching build_joint_graph behavior.
-    # decomp_table = _get_decomp_table()
+    decomp_table = _get_decomp_table()
 
     with fake_mode:
         raw_inputs = input_fn()
@@ -221,13 +237,53 @@ def build_user_backward_graph(model, input_fn, fake_mode):
             torch._dynamo.utils._disable_saved_tensors_hooks_during_tracing(),
         ):
             gm = dynamo_graph_capture_for_export(model)(*formatted_inputs)
-            _restore_state_dict(model, gm)
-            _add_unused_params_and_buffers(model, gm)
+
+            # Annotate descriptors while model.named_parameters() is still
+            # available (the public API captures params as placeholders via
+            # side-effect tracking, so no _restore_state_dict is needed).
+            annotate_user_backward_descriptors(gm, model)
     finally:
         torch._dynamo.config.trace_autograd_ops = prev_trace_autograd
 
-    # Annotate descriptors based on autograd.grad node analysis
-    annotate_user_backward_descriptors(gm, model)
+    # Decompose autograd.grad and other high-level ops into aten ops via make_fx.
+    # ShardingOptimizer needs aten ops to compute DTensor propagation rules.
+    # We bypass the custom dynamo codegen (process_inputs) by using
+    # Interpreter.run with enable_io_processing=False.
+    example_inputs = [n.meta["val"] for n in gm.graph.nodes if n.op == "placeholder"]
+
+    # Extract dynamo's internal fake mode from placeholder tensors.
+    # dynamo_graph_capture_for_export creates its own FakeTensorMode
+    # internally, so placeholder meta["val"] tensors belong to that mode,
+    # not to the user's fake_mode.
+    dynamo_fake_mode = example_inputs[0].fake_mode
+
+    interp = torch.fx.Interpreter(gm)
+
+    def _run_without_io_processing(*args):
+        return interp.run(*args, enable_io_processing=False)
+
+    with torch.fx.traceback.preserve_node_meta(), dynamo_fake_mode:
+        # Pass 1: decompose autograd.grad into backward formula ops
+        decomposed_gm = make_fx(
+            _run_without_io_processing,
+            decomposition_table=decomp_table,
+            tracing_mode="fake",
+        )(*example_inputs)
+
+        # Pass 2: decompose backward formula ops (nll_loss_backward,
+        # slice_backward, etc.) into primitive aten ops. The first pass
+        # executes autograd.grad at the Python level, producing backward
+        # formula ops that aren't intercepted by the decomposition layer.
+        interp2 = torch.fx.Interpreter(decomposed_gm)
+        decomposed_gm = make_fx(
+            interp2.run,
+            decomposition_table=decomp_table,
+            tracing_mode="fake",
+        )(*example_inputs)
+
+    # Copy descriptors from the pre-decomposition graph to the decomposed one
+    _copy_descriptors(gm, decomposed_gm)
+    gm = decomposed_gm
 
     assert_has_no_collectives(gm)
     cleanup_graph(gm)
@@ -840,6 +896,15 @@ class AutoParallelBackward(AutoParallel):
         self.gm, self._traced_inputs = build_user_backward_graph(
             self.model, self.input_fn, self.fake_mode
         )
+        # Push dynamo's FakeTensorMode onto the stack so that
+        # ShardingOptimizer's cost model runs under fake mode
+        # (matching the forward-only path where aot_export pushes it).
+        for n in self.gm.graph.nodes:
+            if n.op == "placeholder":
+                val = n.meta.get("val")
+                if hasattr(val, "fake_mode"):
+                    self.stack.enter_context(val.fake_mode)
+                    break
 
     def apply_placement(self, sharding_placement):
         self._assert_entered()
@@ -930,7 +995,9 @@ def auto_parallel_with_backward(
     shapes, dtypes, input_placements, treespec, devices = _extract_input_info(
         raw_inputs, mesh
     )
-    output_placements = _flatten_out_shardings(out_shardings)
+    output_placements = (
+        _flatten_out_shardings(out_shardings) if out_shardings is not None else None
+    )
     input_fn = _make_input_fn(shapes, dtypes, treespec, devices=devices)
 
     with AutoParallelBackward(
@@ -945,7 +1012,8 @@ def auto_parallel_with_backward(
             ap.add_parameter_memory_constraint(
                 low=parameter_memory_budget[0], high=parameter_memory_budget[1]
             )
-        ap.add_output_constraints(output_placements)
+        if output_placements is not None:
+            ap.add_output_constraints(output_placements)
         sharding_placement = ap.optimize_placement(verbose=False)
         parallel_model = ap.apply_placement(sharding_placement)
 
