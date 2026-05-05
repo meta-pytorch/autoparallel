@@ -25,57 +25,6 @@ from pathlib import Path
 
 import torch
 
-# Module-level reference so JS kernel.execute() can call back.
-_active_explorer: WhatIfExplorer | None = None
-
-
-def _parse_placement_string(s: str, ndim: int):
-    """Parse a placement string like 'S(0)R' into a tuple of Placement objects.
-
-    Handles standard placements (R, S(dim), P(sum)) and extended forms
-    like MaskP(sum, None, 0) produced by _pretty_print_spec.
-    """
-    from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
-
-    placements: list = []
-    i = 0
-    while i < len(s):
-        if s[i] == "R" and (i + 1 >= len(s) or s[i + 1] != "e"):
-            # 'R' but not start of 'Replicate' or similar
-            placements.append(Replicate())
-            i += 1
-        elif s[i] == "S" and i + 1 < len(s) and s[i + 1] == "(":
-            end = s.index(")", i)
-            dim = int(s[i + 2 : end])
-            placements.append(Shard(dim))
-            i = end + 1
-        elif s[i] == "P" and i + 1 < len(s) and s[i + 1] == "(":
-            end = s.index(")", i)
-            placements.append(Partial())
-            i = end + 1
-        elif s[i:].startswith("MaskP("):
-            # MaskP(sum, None, 0) — find the matching closing paren
-            depth = 0
-            j = i
-            while j < len(s):
-                if s[j] == "(":
-                    depth += 1
-                elif s[j] == ")":
-                    depth -= 1
-                    if depth == 0:
-                        break
-                j += 1
-            # For constraint purposes, treat MaskP as Partial
-            placements.append(Partial())
-            i = j + 1
-        else:
-            i += 1
-    if len(placements) != ndim:
-        raise ValueError(
-            f"Parsed {len(placements)} placements from '{s}', expected {ndim}"
-        )
-    return tuple(placements)
-
 
 def _spec_to_str(spec) -> str:
     """Convert an OpSpec's output_specs to a short placement string."""
@@ -92,7 +41,12 @@ def _spec_to_str(spec) -> str:
 
 
 class WhatIfExplorer:
-    """Interactive sharding what-if explorer for Jupyter notebooks."""
+    """Interactive sharding what-if explorer for Jupyter notebooks.
+
+    Uses ipywidgets for controls (node selection, placement dropdown,
+    pin/unpin/reset buttons) and renders the module tree + cost cards
+    as HTML inside a widgets.HTML widget.
+    """
 
     def __init__(self, path_or_optimizer):
         from autoparallel.optimize_sharding import ShardingOptimizer
@@ -105,7 +59,6 @@ class WhatIfExplorer:
         self.baseline_solution = self.optimizer.get_solution()
         self.current_solution = dict(self.baseline_solution)
         self.pinned: dict[str, list[str]] = {}  # node_name -> constraint names
-        self._display_handle = None
         self._error: str | None = None
 
         # Pre-compute node name -> available placements for dropdowns
@@ -113,8 +66,6 @@ class WhatIfExplorer:
         for node in self.optimizer.nodes:
             strat = self.optimizer.get_strategy(node)
             if not hasattr(strat, "strategies"):
-                # Tuple-output nodes (e.g. SDPA) have a tuple of OpStrategy;
-                # skip them for now — they can't be individually pinned.
                 continue
             options = []
             for spec in strat.strategies:
@@ -128,18 +79,176 @@ class WhatIfExplorer:
         for node, spec in self.baseline_solution.items():
             self._baseline_placements[node.name] = _spec_to_str(spec.output_specs)
 
+        # Sorted node names for the combobox
+        self._node_names = sorted(self._placement_options.keys())
+
+        # ipywidgets (created lazily in show())
+        self._widgets_created = False
+
     def show(self):
         """Render the explorer widget in the current notebook cell."""
-        from IPython.display import HTML, display
+        import ipywidgets as widgets
+        from IPython.display import display
 
-        global _active_explorer
-        _active_explorer = self
+        if not self._widgets_created:
+            self._create_widgets()
 
-        html = self._render()
-        self._display_handle = display(HTML(html), display_id=True)
+        self._refresh_html()
+        display(self._root_widget)
 
-    def _on_pin(self, node_name: str, placement_str: str):
-        """Pin a node to a specific placement, re-solve, and update display."""
+    def _create_widgets(self):
+        import ipywidgets as widgets
+
+        # Node selector — Dropdown with module_path prefix for grouping
+        node_labels = []
+        for name in self._node_names:
+            node = self._find_node(name)
+            path = node.meta.get("module_path", "")
+            if not path:
+                nn_stack = node.meta.get(
+                    "nn_module_stack", node.meta.get("fwd_nn_module_stack")
+                )
+                if nn_stack:
+                    path = ".".join(n for n, _ in nn_stack.values())
+            prefix = path.split(".")[-1] + "/" if path else ""
+            node_labels.append((f"{prefix}{name}", name))
+
+        self._node_dropdown = widgets.Dropdown(
+            options=[("-- select node --", "")] + node_labels,
+            value="",
+            description="Node:",
+            layout=widgets.Layout(width="400px"),
+            style={"description_width": "50px"},
+        )
+
+        # Search filter — narrows the node dropdown options
+        self._search_box = widgets.Text(
+            placeholder="Filter nodes...",
+            layout=widgets.Layout(width="200px"),
+        )
+
+        # Placement dropdown — updates when node changes
+        self._placement_dropdown = widgets.Dropdown(
+            options=[],
+            description="Placement:",
+            disabled=True,
+            layout=widgets.Layout(width="300px"),
+            style={"description_width": "80px"},
+        )
+
+        # Buttons
+        self._pin_btn = widgets.Button(
+            description="Pin",
+            button_style="primary",
+            disabled=True,
+            layout=widgets.Layout(width="70px"),
+        )
+        self._unpin_btn = widgets.Button(
+            description="Unpin",
+            button_style="warning",
+            disabled=True,
+            layout=widgets.Layout(width="80px"),
+        )
+        self._reset_btn = widgets.Button(
+            description="Reset All",
+            button_style="danger",
+            disabled=True,
+            layout=widgets.Layout(width="100px"),
+        )
+
+        # Status label
+        self._status_label = widgets.HTML(
+            value=self._status_html(),
+            layout=widgets.Layout(margin="0 0 0 12px"),
+        )
+
+        # HTML display for module tree + cost cards + diff
+        self._html_widget = widgets.HTML(value="")
+
+        # Store full label list for filtering
+        self._all_node_labels = node_labels
+
+        # Wire callbacks
+        self._node_dropdown.observe(self._on_node_selected, names="value")
+        self._search_box.observe(self._on_search_changed, names="value")
+        self._pin_btn.on_click(self._on_pin_click)
+        self._unpin_btn.on_click(self._on_unpin_click)
+        self._reset_btn.on_click(self._on_reset_click)
+
+        # Layout
+        search_row = widgets.HBox(
+            [self._search_box, self._node_dropdown],
+            layout=widgets.Layout(gap="6px"),
+        )
+        action_row = widgets.HBox(
+            [
+                self._placement_dropdown,
+                self._pin_btn,
+                self._unpin_btn,
+                self._reset_btn,
+                self._status_label,
+            ],
+            layout=widgets.Layout(gap="6px", align_items="center"),
+        )
+
+        self._root_widget = widgets.VBox(
+            [search_row, action_row, self._html_widget],
+            layout=widgets.Layout(width="100%"),
+        )
+        self._widgets_created = True
+
+    # -- Widget callbacks --
+
+    def _on_search_changed(self, change):
+        query = change["new"].lower()
+        if not query:
+            filtered = self._all_node_labels
+        else:
+            filtered = [
+                (label, name) for label, name in self._all_node_labels
+                if query in name.lower() or query in label.lower()
+            ]
+        old_value = self._node_dropdown.value
+        self._node_dropdown.options = [("-- select node --", "")] + filtered
+        # Preserve selection if it's still in the filtered list
+        if old_value and any(name == old_value for _, name in filtered):
+            self._node_dropdown.value = old_value
+
+    def _on_node_selected(self, change):
+        node_name = change["new"]
+        if node_name in self._placement_options:
+            options = self._placement_options[node_name]
+            current = self._current_placements().get(node_name, options[0])
+            self._placement_dropdown.options = options
+            self._placement_dropdown.value = current if current in options else options[0]
+            self._placement_dropdown.disabled = False
+            self._pin_btn.disabled = False
+            self._unpin_btn.disabled = node_name not in self.pinned
+        else:
+            self._placement_dropdown.options = []
+            self._placement_dropdown.disabled = True
+            self._pin_btn.disabled = True
+            self._unpin_btn.disabled = True
+
+    def _on_pin_click(self, _btn):
+        node_name = self._node_dropdown.value
+        placement_str = self._placement_dropdown.value
+        if not node_name or not placement_str:
+            return
+        self._do_pin(node_name, placement_str)
+
+    def _on_unpin_click(self, _btn):
+        node_name = self._node_dropdown.value
+        if not node_name:
+            return
+        self._do_unpin(node_name)
+
+    def _on_reset_click(self, _btn):
+        self._do_reset()
+
+    # -- Core logic --
+
+    def _do_pin(self, node_name: str, placement_str: str):
         self._error = None
         # Remove existing pin on this node
         if node_name in self.pinned:
@@ -147,8 +256,6 @@ class WhatIfExplorer:
             del self.pinned[node_name]
 
         node = self._find_node(node_name)
-        # Match placement_str against strategies directly (avoids parsing
-        # extended placement types like MaskP).
         strat = self.optimizer.get_strategy(node)
         matching_indices = []
         for i, spec in enumerate(strat.strategies):
@@ -156,7 +263,7 @@ class WhatIfExplorer:
                 matching_indices.append(i)
         if not matching_indices:
             self._error = f"Placement '{placement_str}' not available for '{node_name}'"
-            self._update_display()
+            self._refresh_display()
             return
         names = self.optimizer._add_node_constraint(
             node,
@@ -166,28 +273,30 @@ class WhatIfExplorer:
         self.pinned[node_name] = names
         try:
             self.current_solution = self.optimizer.resolve()
-        except RuntimeError as e:
-            # Infeasible — revert the constraint
+        except RuntimeError:
             self.optimizer.remove_constraints(names)
             del self.pinned[node_name]
-            self._error = f"Infeasible: pinning '{node_name}' to '{placement_str}' conflicts with other constraints"
-        self._update_display()
+            self._error = (
+                f"Infeasible: pinning '{node_name}' to '{placement_str}' "
+                f"conflicts with other constraints"
+            )
+        self._refresh_display()
 
-    def _on_unpin(self, node_name: str):
-        """Remove the pin on a node, re-solve, and update display."""
+    def _do_unpin(self, node_name: str):
+        self._error = None
         if node_name not in self.pinned:
             return
         self.optimizer.remove_constraints(self.pinned.pop(node_name))
         self.current_solution = self.optimizer.resolve()
-        self._update_display()
+        self._refresh_display()
 
-    def _on_reset(self):
-        """Remove all pins, re-solve, and update display."""
+    def _do_reset(self):
+        self._error = None
         for names in self.pinned.values():
             self.optimizer.remove_constraints(names)
         self.pinned.clear()
         self.current_solution = self.optimizer.resolve()
-        self._update_display()
+        self._refresh_display()
 
     def _find_node(self, name: str) -> torch.fx.Node:
         for n in self.optimizer.nodes:
@@ -195,11 +304,35 @@ class WhatIfExplorer:
                 return n
         raise KeyError(f"Node {name!r} not found in optimizer")
 
-    def _update_display(self):
-        from IPython.display import HTML
+    def _refresh_display(self):
+        """Update all widget state after a pin/unpin/reset."""
+        if not self._widgets_created:
+            return
+        self._refresh_html()
+        self._reset_btn.disabled = len(self.pinned) == 0
+        self._status_label.value = self._status_html()
+        # Update unpin button state for current node
+        node_name = self._node_dropdown.value
+        self._unpin_btn.disabled = node_name not in self.pinned
+        # Update placement dropdown to reflect new current placement
+        if node_name in self._placement_options:
+            current = self._current_placements().get(node_name)
+            options = self._placement_options[node_name]
+            if current in options:
+                self._placement_dropdown.value = current
 
-        if self._display_handle is not None:
-            self._display_handle.update(HTML(self._render()))
+    def _refresh_html(self):
+        """Re-render the HTML display widget."""
+        self._html_widget.value = self._render()
+
+    def _status_html(self) -> str:
+        n = len(self.pinned)
+        if n == 0:
+            return '<span style="color:#64748b;font-size:12px">No pins active</span>'
+        return (
+            f'<span style="color:#1d4ed8;font-size:12px;font-weight:600">'
+            f"{n} pin(s) active</span>"
+        )
 
     # -- Cost helpers --
 
@@ -228,7 +361,6 @@ class WhatIfExplorer:
         """Build module_path -> [node_name] mapping."""
         tree: dict[str, list[str]] = defaultdict(list)
         for node in self.optimizer.nodes:
-            # Try to get module_path from meta
             path = node.meta.get("module_path", "")
             if not path:
                 nn_stack = node.meta.get(
@@ -258,12 +390,11 @@ class WhatIfExplorer:
                 f'color:#991b1b;font-size:13px">{html_lib.escape(self._error)}</div>'
             )
         parts.append(self._render_header(cost_base, cost_curr, changed))
-        parts.append(self._render_controls())
         parts.append(self._render_module_tree(module_tree, curr_placements, changed))
         if changed:
             parts.append(self._render_diff_panel(changed, curr_placements))
         parts.append("</div>")
-        parts.append(self._js())
+        parts.append(self._collapse_js())
         return "\n".join(parts)
 
     def _css(self) -> str:
@@ -288,23 +419,6 @@ class WhatIfExplorer:
 .ap-whatif .cost-delta.better { color: #16a34a; }
 .ap-whatif .cost-delta.worse { color: #dc2626; }
 .ap-whatif .cost-delta.neutral { color: #64748b; }
-.ap-whatif .controls {
-  display: flex; gap: 8px; align-items: center; margin-bottom: 12px; flex-wrap: wrap;
-}
-.ap-whatif .btn {
-  padding: 5px 14px; border-radius: 6px; border: 1px solid #e2e8f0;
-  background: white; cursor: pointer; font-size: 12px; font-weight: 500;
-}
-.ap-whatif .btn:hover { border-color: #3b82f6; color: #3b82f6; }
-.ap-whatif .btn-danger { color: #dc2626; border-color: #fca5a5; }
-.ap-whatif .btn-danger:hover { background: #fef2f2; }
-.ap-whatif .pin-count {
-  font-size: 12px; color: #64748b; margin-left: 4px;
-}
-.ap-whatif .search-box {
-  padding: 5px 10px; border: 1px solid #e2e8f0; border-radius: 6px;
-  font-size: 12px; width: 200px;
-}
 .ap-whatif .module-group {
   background: white; border: 1px solid #e2e8f0; border-radius: 8px;
   margin-bottom: 8px; overflow: hidden;
@@ -334,24 +448,13 @@ class WhatIfExplorer:
   font-family: monospace; font-size: 11px; min-width: 180px;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
+.ap-whatif .node-placement {
+  font-family: monospace; font-size: 11px; min-width: 80px;
+}
 .ap-whatif .node-baseline {
   font-family: monospace; font-size: 11px; color: #94a3b8; min-width: 80px;
+  text-decoration: line-through;
 }
-.ap-whatif .node-dropdown select {
-  font-family: monospace; font-size: 11px; padding: 2px 4px;
-  border: 1px solid #e2e8f0; border-radius: 4px; background: white;
-}
-.ap-whatif .node-dropdown select.pinned-select {
-  border-color: #3b82f6; background: #eff6ff;
-}
-.ap-whatif .node-dropdown select.changed-select {
-  border-color: #f59e0b; background: #fffbeb;
-}
-.ap-whatif .unpin-btn {
-  font-size: 10px; color: #dc2626; cursor: pointer; border: none;
-  background: none; padding: 2px 4px;
-}
-.ap-whatif .unpin-btn:hover { text-decoration: underline; }
 .ap-whatif .pin-badge {
   font-size: 9px; background: #dbeafe; color: #1d4ed8; padding: 1px 5px;
   border-radius: 6px; font-weight: 600;
@@ -419,15 +522,6 @@ class WhatIfExplorer:
   {summary}
 </div>"""
 
-    def _render_controls(self) -> str:
-        disabled = ' style="opacity:0.4;pointer-events:none"' if not self.pinned else ""
-        return f"""<div class="controls">
-  <input class="search-box" type="text" placeholder="Search nodes..."
-    oninput="apWhatifSearch(this.closest('.ap-whatif'), this.value)">
-  <button class="btn btn-danger" onclick="apWhatifReset(this)"{disabled}>Reset All</button>
-  <span class="pin-count">{len(self.pinned)} pin(s) active</span>
-</div>"""
-
     def _render_module_tree(
         self,
         module_tree: dict[str, list[str]],
@@ -447,7 +541,6 @@ class WhatIfExplorer:
             mod_changed = sum(1 for n in node_names if n in changed)
             mod_pinned = sum(1 for n in node_names if n in self.pinned)
 
-            # Module header
             badge = ""
             if mod_changed:
                 badge = f'<span class="changed-badge">{mod_changed} changed</span>'
@@ -473,7 +566,6 @@ class WhatIfExplorer:
                 current_pl = curr_placements.get(node_name, baseline_pl)
                 is_changed = node_name in changed
                 is_pinned = node_name in self.pinned
-                options = self._placement_options.get(node_name, [])
 
                 row_cls = "node-row"
                 if is_pinned:
@@ -481,43 +573,21 @@ class WhatIfExplorer:
                 elif is_changed:
                     row_cls += " changed"
 
-                select_cls = (
-                    "pinned-select"
-                    if is_pinned
-                    else ("changed-select" if is_changed else "")
-                )
-
-                # Build options HTML
-                opts_html = ""
-                for opt in options:
-                    selected = " selected" if opt == current_pl else ""
-                    label = opt
-                    if opt == baseline_pl and opt != current_pl:
-                        label += " (baseline)"
-                    opts_html += f'<option value="{html_lib.escape(opt)}"{selected}>{html_lib.escape(label)}</option>'
-
                 esc_name = html_lib.escape(node_name)
+                pin_html = ' <span class="pin-badge">PIN</span>' if is_pinned else ""
 
-                unpin_html = ""
-                if is_pinned:
-                    unpin_html = f'<button class="unpin-btn" onclick="apWhatifUnpin(this, \'{esc_name}\')">unpin</button>'
-
-                pin_html = f'<span class="pin-badge">PIN</span>' if is_pinned else ""
-
-                baseline_display = (
-                    f'<span class="node-baseline">{html_lib.escape(baseline_pl)}</span>'
-                    if is_changed
-                    else ""
-                )
+                if is_changed:
+                    placement_html = (
+                        f'<span class="node-baseline">{html_lib.escape(baseline_pl)}</span>'
+                        f' <span class="node-placement" style="color:#92400e">{html_lib.escape(current_pl)}</span>'
+                    )
+                else:
+                    placement_html = f'<span class="node-placement">{html_lib.escape(current_pl)}</span>'
 
                 parts.append(
                     f'<div class="{row_cls}" data-node="{esc_name}">'
                     f'<span class="node-name" title="{esc_name}">{esc_name}</span>'
-                    f"{baseline_display}"
-                    f'<span class="node-dropdown">'
-                    f'<select class="{select_cls}" onchange="apWhatifPin(this, \'{esc_name}\', this.value)">'
-                    f"{opts_html}</select></span>"
-                    f"{pin_html}{unpin_html}"
+                    f"{placement_html}{pin_html}"
                     f"</div>"
                 )
 
@@ -528,7 +598,6 @@ class WhatIfExplorer:
     def _render_diff_panel(
         self, changed: set[str], curr_placements: dict[str, str]
     ) -> str:
-        # Group changes by (old -> new)
         groups: dict[tuple[str, str], list[str]] = defaultdict(list)
         for name in changed:
             old = self._baseline_placements.get(name, "?")
@@ -550,38 +619,11 @@ class WhatIfExplorer:
   {"".join(rows)}
 </div>"""
 
-    def _js(self) -> str:
+    def _collapse_js(self) -> str:
+        """Minimal JS for module group collapse/expand — no Python callback needed."""
         return """<script>
 (function() {
-  function exec(code) {
-    if (typeof IPython !== 'undefined' && IPython.Jupyter) {
-      IPython.Jupyter.kernel.execute(code);
-    } else if (typeof google !== 'undefined' && google.colab) {
-      google.colab.kernel.invokeFunction('notebook.execute', [code]);
-    }
-  }
-  window.apWhatifPin = function(el, nodeName, placement) {
-    exec('from autoparallel.visualizer.whatif_explorer import _active_explorer; _active_explorer._on_pin("' + nodeName + '", "' + placement + '")');
-  };
-  window.apWhatifUnpin = function(el, nodeName) {
-    exec('from autoparallel.visualizer.whatif_explorer import _active_explorer; _active_explorer._on_unpin("' + nodeName + '")');
-  };
-  window.apWhatifReset = function(el) {
-    exec('from autoparallel.visualizer.whatif_explorer import _active_explorer; _active_explorer._on_reset()');
-  };
-  window.apWhatifSearch = function(root, query) {
-    var q = query.toLowerCase();
-    root.querySelectorAll('.module-group').forEach(function(g) {
-      var rows = g.querySelectorAll('.node-row');
-      var anyVisible = false;
-      rows.forEach(function(r) {
-        var name = r.dataset.node || '';
-        var show = !q || name.toLowerCase().indexOf(q) >= 0;
-        r.style.display = show ? '' : 'none';
-        if (show) anyVisible = true;
-      });
-      g.style.display = anyVisible ? '' : 'none';
-    });
-  };
+  // Collapse/expand is handled via onclick in the HTML directly.
+  // This script block is reserved for any future client-side-only interactions.
 })();
 </script>"""
