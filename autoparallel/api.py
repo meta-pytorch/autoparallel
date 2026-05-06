@@ -11,7 +11,10 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional, Union
 
 import torch
-from torch._dynamo.functional_export import _dynamo_graph_capture_for_export
+from torch._dynamo.functional_export import (
+    _dynamo_graph_capture_for_export,
+    dynamo_graph_capture_for_export,
+)
 from torch._functorch.aot_autograd import (
     aot_compile_joint_with_descriptors,
     aot_export_joint_with_descriptors,
@@ -138,6 +141,32 @@ def _post_trace_graph_passes(gm, artifact_name):
     )
 
 
+def _prepare_inputs(input_fn, fake_mode):
+    """Prepare inputs for graph tracing: call input_fn, format, optionally make dynamic."""
+    with fake_mode:
+        raw_inputs = input_fn()
+    formatted_inputs = raw_inputs if isinstance(raw_inputs, tuple) else (raw_inputs,)
+    if fake_mode.shape_env is not None:
+        formatted_inputs = _make_inputs_dynamic(formatted_inputs, fake_mode)
+    return formatted_inputs
+
+
+def _tracing_context():
+    """Context managers used during dynamo graph capture."""
+    from contextlib import contextmanager
+
+    @contextmanager
+    def ctx():
+        with (
+            set_dtype_cast(True),
+            enable_local_map_wrapping(),
+            torch._dynamo.utils._disable_saved_tensors_hooks_during_tracing(),
+        ):
+            yield
+
+    return ctx()
+
+
 def build_joint_graph(
     model: torch.nn.Module,
     input_fn: Callable,
@@ -146,30 +175,16 @@ def build_joint_graph(
 ) -> JointGraphResult:
     t0 = time.perf_counter()
     decomp_table = _get_decomp_table()
-
-    with fake_mode:
-        raw_inputs = input_fn()
-
-    formatted_inputs = raw_inputs if isinstance(raw_inputs, tuple) else (raw_inputs,)
-
-    if fake_mode.shape_env is not None:
-        formatted_inputs = _make_inputs_dynamic(formatted_inputs, fake_mode)
-
+    formatted_inputs = _prepare_inputs(input_fn, fake_mode)
     traced_inputs = list(formatted_inputs)
 
-    with (
-        set_dtype_cast(True),
-        enable_local_map_wrapping(),
-        torch._dynamo.utils._disable_saved_tensors_hooks_during_tracing(),
-    ):
-        torch_ir_with_fqn = _dynamo_graph_capture_for_export(model)(*formatted_inputs)
-        _restore_state_dict(model, torch_ir_with_fqn)
-        _add_unused_params_and_buffers(model, torch_ir_with_fqn)
-        # TODO Can't use fake mode here because it clashes with the user level
-        # fake mode. Ideally dynamo should reuse the user level fake mode.
+    with _tracing_context():
+        gm = _dynamo_graph_capture_for_export(model)(*formatted_inputs)
+        _restore_state_dict(model, gm)
+        _add_unused_params_and_buffers(model, gm)
         joint_with_descriptors = aot_export_joint_with_descriptors(
             stack,
-            torch_ir_with_fqn,
+            gm,
             formatted_inputs,
             decompositions=decomp_table,
         )
@@ -193,30 +208,18 @@ def build_user_backward_graph(model, input_fn, fake_mode):
     then traced via 2-pass make_fx to decompose autograd.grad and
     backward formula ops into primitive aten ops.
     """
-    from torch._dynamo.functional_export import dynamo_graph_capture_for_export
     from torch._functorch._aot_autograd.descriptors import PlainAOTInput, PlainAOTOutput
     from torch._functorch.aot_autograd import prepare_aot_module_simplified
     from torch.fx.experimental.proxy_tensor import make_fx
 
     t0 = time.perf_counter()
     decomp_table = _get_decomp_table()
-
-    with fake_mode:
-        raw_inputs = input_fn()
-
-    formatted_inputs = raw_inputs if isinstance(raw_inputs, tuple) else (raw_inputs,)
-
-    if fake_mode.shape_env is not None:
-        formatted_inputs = _make_inputs_dynamic(formatted_inputs, fake_mode)
+    formatted_inputs = _prepare_inputs(input_fn, fake_mode)
 
     prev_trace_autograd = torch._dynamo.config.trace_autograd_ops
     torch._dynamo.config.trace_autograd_ops = True
     try:
-        with (
-            set_dtype_cast(True),
-            enable_local_map_wrapping(),
-            torch._dynamo.utils._disable_saved_tensors_hooks_during_tracing(),
-        ):
+        with _tracing_context():
             gm = dynamo_graph_capture_for_export(model)(*formatted_inputs)
     finally:
         torch._dynamo.config.trace_autograd_ops = prev_trace_autograd
