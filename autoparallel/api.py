@@ -122,6 +122,22 @@ def _make_inputs_dynamic(
     return tree_map_only(torch.Tensor, to_symbolic, inputs)
 
 
+def _post_trace_graph_passes(gm, artifact_name):
+    """Common graph passes after tracing: collectives check, cleanup, view pattern, aliases, logging."""
+    assert_has_no_collectives(gm)
+    cleanup_graph(gm)
+    if _APPLY_VIEW_MM_VIEW_PATTERN:
+        _replace_view_mm_view_with_einsum(gm)
+    _add_alias(gm, version="v2")
+    trace_structured(
+        "artifact",
+        metadata_fn=lambda: {"name": artifact_name, "encoding": "string"},
+        payload_fn=lambda: gm.print_readable(
+            print_output=False, include_stride=True, include_device=True
+        ),
+    )
+
+
 def build_joint_graph(
     model: torch.nn.Module,
     input_fn: Callable,
@@ -158,24 +174,7 @@ def build_joint_graph(
             decompositions=decomp_table,
         )
     gm = joint_with_descriptors.graph_module
-    assert_has_no_collectives(gm)
-
-    cleanup_graph(gm)
-    if _APPLY_VIEW_MM_VIEW_PATTERN:
-        _replace_view_mm_view_with_einsum(gm)
-    # now add aliases nodes to the graph to
-    # give more room for optimizations
-    _add_alias(gm, version="v2")
-    trace_structured(
-        "artifact",
-        metadata_fn=lambda: {
-            "name": "autoparallel_joint_graph",
-            "encoding": "string",
-        },
-        payload_fn=lambda: gm.print_readable(
-            print_output=False, include_stride=True, include_device=True
-        ),
-    )
+    _post_trace_graph_passes(gm, "autoparallel_joint_graph")
 
     logger.info("Graph tracing took %.3fs", time.perf_counter() - t0)
     return JointGraphResult(
@@ -314,22 +313,7 @@ def build_user_backward_graph(model, input_fn, fake_mode):
             )
             n.meta["desc"] = [PlainAOTOutput(idx=i) for i in range(len(output_args))]
 
-    assert_has_no_collectives(gm)
-    cleanup_graph(gm)
-    if _APPLY_VIEW_MM_VIEW_PATTERN:
-        _replace_view_mm_view_with_einsum(gm)
-    _add_alias(gm, version="v2")
-
-    trace_structured(
-        "artifact",
-        metadata_fn=lambda: {
-            "name": "autoparallel_user_backward_graph",
-            "encoding": "string",
-        },
-        payload_fn=lambda: gm.print_readable(
-            print_output=False, include_stride=True, include_device=True
-        ),
-    )
+    _post_trace_graph_passes(gm, "autoparallel_user_backward_graph")
 
     logger.info("User-backward graph tracing took %.3fs", time.perf_counter() - t0)
 
