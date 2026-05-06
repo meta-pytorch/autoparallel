@@ -10,6 +10,14 @@ to minimize total cost across the entire graph simultaneously.
 This document explains what goes into that cost, how constraints shape
 the solution, and how to interpret and debug the optimizer's decisions.
 
+This is an explanation-oriented document for users who already have a
+basic working mental model of AutoParallel. If you are new to the
+project, start with:
+
+- [Getting Started](getting_started.md)
+- [Basic Concepts](basic_concepts.md)
+- [API Walkthrough](api_walkthrough.md)
+
 ## The three cost components
 
 Every candidate strategy has a cost that is the sum of three components:
@@ -333,5 +341,13 @@ size, sequence length, and hardware topology.
 
 ## Further reading
 
+- [Getting Started](getting_started.md) — first-use setup and recommended
+  workflow
+- [API Walkthrough](api_walkthrough.md) — end-to-end usage of the simple
+  and full APIs
+- [Troubleshooting](troubleshooting.md) — common failure modes and
+  debugging steps
 - [adaptive_sharding.md](adaptive_sharding.md) — detailed analysis of
   the sequence-parallel vs column-parallel tradeoff for LLaMA3
+- [local_map_and_moe.md](local_map_and_moe.md) — advanced composition
+  for MoE and custom communication patterns
