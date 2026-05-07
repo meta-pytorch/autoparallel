@@ -478,10 +478,18 @@ def test_unused_parameter_full_pipeline(device_mesh_1d):
     parallel_mod.to_empty(device="cuda")
     parallel_mod.init_weights()
 
-    # Training forward
+    # Training forward + backward
     inp = torch.rand(local_batch_size, dim, device="cuda")
     out = parallel_mod(inp)
     assert out.shape == (local_batch_size, dim)
+    out.sum().backward()
+
+    # Used params should have gradients
+    assert parallel_mod.used_linear.weight.grad is not None
+    assert parallel_mod.used_linear.bias.grad is not None
+    # Unused params should have no gradient (not None with zeros — actually None)
+    assert parallel_mod.unused_linear.weight.grad is None
+    assert parallel_mod.unused_linear.bias.grad is None
 
     # Inference forward (exercises extract_forward_graph / deepcopy path)
     with torch.no_grad():
