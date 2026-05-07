@@ -299,7 +299,7 @@ class ShardingOptimizer:
                 if isinstance(val, torch.Tensor):
                     strats[node] = _create_all_options(self.mesh, val.shape, tensor=val)
                 elif node.op == "placeholder":
-                    # Non-tensor placeholders (e.g. unused parameters):
+                    # Non-tensor placeholders (e.g. baked-in booleans/strings):
                     # keep them in strats with empty-shape replicate options
                     # so the constraint system can reference them.
                     strats[node] = _create_all_options(self.mesh, ())

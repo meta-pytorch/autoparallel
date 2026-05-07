@@ -364,8 +364,8 @@ def _make_local_args(gm, sharding_placement):
     for node in gm.graph.find_nodes(op="placeholder"):
         val = node.meta.get("val")
         if not isinstance(val, torch.Tensor):
-            # Non-tensor placeholders (e.g. unused params): pass through
-            # the original value so the interpreter gets the right arg count.
+            # Non-tensor placeholders (e.g. baked-in booleans/strings):
+            # pass through the original value so the arg count stays aligned.
             local_args.append(val)
             continue
         tensor = val
