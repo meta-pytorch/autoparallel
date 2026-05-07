@@ -264,3 +264,44 @@ def test_backward_numerical_equivalence():
     actual = gm(grad_out, x)
 
     torch.testing.assert_close(actual, expected)
+
+
+def test_extract_forward_deepcopy_with_tensor_constants():
+    """extract_forward_graph must deepcopy a graph module that has real (non-fake)
+    tensor constants even when FakeTensorMode is active.
+
+    Models that use lift_fresh_copy (e.g. for random ops or constant tensors)
+    produce get_attr nodes pointing to real cuda tensors on the graph module.
+    copy.deepcopy of such a graph module fails under FakeTensorMode because
+    the mode intercepts storage cloning (aten.set_.source_Storage) and rejects
+    the device mismatch between the cloned real storage and the fake wrapper.
+    """
+    from torch._subclasses import FakeTensorMode
+
+    from autoparallel.graph_passes.extract_forward import extract_forward_graph
+
+    # Build a minimal joint-like graph: one primal placeholder, one get_attr
+    # for a real tensor constant, a mul, and a nested output.
+    gm = torch.fx.GraphModule({}, torch.fx.Graph())
+    graph = gm.graph
+
+    # Register a real cuda tensor as a graph module attribute
+    gm._tensor_constant0 = torch.tensor([1.0, 2.0], device="cuda")
+
+    x = graph.placeholder("primals_1")
+    x.meta["val"] = torch.randn(4, 2, device="cuda")
+    const = graph.get_attr("_tensor_constant0")
+    const.meta["val"] = gm._tensor_constant0
+    mul = graph.call_function(torch.ops.aten.mul.Tensor, (x, const))
+    mul.meta["val"] = torch.randn(4, 2, device="cuda")
+    # Joint-style nested output: ((fwd_outs,), (bwd_outs,))
+    graph.output(((mul,), (mul,)))
+    gm.recompile()
+
+    # This should succeed even under FakeTensorMode
+    with FakeTensorMode():
+        result = extract_forward_graph(gm, num_fwd_outputs=1, num_primals=1)
+
+    # The real tensor constant should survive the deepcopy
+    assert hasattr(result, "_tensor_constant0")
+    assert result._tensor_constant0.device.type == "cuda"

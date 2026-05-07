@@ -440,6 +440,56 @@ def test_unused_parameters_captured(device_mesh_1d):
     ), f"unused_linear.bias not found in parallel model params: {param_names}"
 
 
+def test_unused_parameter_full_pipeline(device_mesh_1d):
+    """Unused parameters must not break the full pipeline including inference."""
+    dim = 128
+
+    class Model(nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            self.used_linear = nn.Linear(dim, dim)
+            self.unused_linear = nn.Linear(dim, dim)
+
+        def forward(self, x):
+            return self.used_linear(x)
+
+        def init_weights(self):
+            nn.init.ones_(self.used_linear.weight)
+            nn.init.zeros_(self.used_linear.bias)
+            nn.init.ones_(self.unused_linear.weight)
+            nn.init.zeros_(self.unused_linear.bias)
+
+    with torch.device("meta"):
+        model = Model(dim)
+
+    batch_size = 512
+    local_batch_size = batch_size // device_mesh_1d.size()
+    x = DTensor.from_local(
+        torch.rand(local_batch_size, dim, device="cuda"),
+        device_mesh_1d,
+        [Shard(0)],
+    )
+    parallel_mod = auto_parallel(
+        model,
+        device_mesh_1d,
+        sample_inputs=(x,),
+        out_shardings=(Shard(0),),
+    )
+    parallel_mod.to_empty(device="cuda")
+    parallel_mod.init_weights()
+
+    # Training forward
+    inp = torch.rand(local_batch_size, dim, device="cuda")
+    out = parallel_mod(inp)
+    assert out.shape == (local_batch_size, dim)
+
+    # Inference forward (exercises extract_forward_graph / deepcopy path)
+    with torch.no_grad():
+        out_infer = parallel_mod(inp)
+    assert out_infer.shape == out.shape
+    torch.testing.assert_close(out_infer, out)
+
+
 def test_aliased_submodule(device_mesh_1d):
     """Test that aliased submodules (two module attrs pointing to the same object) work.
 

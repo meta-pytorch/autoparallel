@@ -494,7 +494,10 @@ class AutoParallel:
 
         fw_metadata = self.joint_with_descriptors._aot_state.fw_metadata
         num_fwd_outputs = fw_metadata.num_forward_returns
-        fwd_only_gm = extract_forward_graph(self.parallel_gm, num_fwd_outputs)
+        num_primals = len(fw_metadata.input_info)
+        fwd_only_gm = extract_forward_graph(
+            self.parallel_gm, num_fwd_outputs, num_primals
+        )
         compiler_fn = self.compiler_fn
         aot_config = self.joint_with_descriptors._aot_state.aot_config
         out_spec = self.joint_with_descriptors.out_spec
@@ -528,8 +531,6 @@ class AutoParallel:
             _inference_fn_cache = inference_fn
             return _inference_fn_cache
 
-        # TODO: this probably belongs in the AOTAutograd API
-        # TODO: pytree handling
         # Capture the exact FQNs the compiled graph expects as primals.
         # This avoids issues with aliased params/buffers where identity-based
         # dedup can break after init_weights reassigns tensors.
