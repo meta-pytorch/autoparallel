@@ -499,34 +499,26 @@ class AutoParallel:
         aot_config = self.joint_with_descriptors._aot_state.aot_config
         out_spec = self.joint_with_descriptors.out_spec
 
-        _inference_fn_cache = None
+        # Build inference function eagerly so that Dynamo doesn't try
+        # to trace into compiler_fn / RuntimeWrapper.post_compile (both
+        # on its skip list, causing graph breaks under fullgraph=True).
+        _fwd_example_inputs = [
+            n.meta["val"] for n in fwd_only_gm.graph.nodes if n.op == "placeholder"
+        ]
+        _compiled_fwd = compiler_fn(fwd_only_gm, _fwd_example_inputs)
 
-        def _get_inference_fn():
-            nonlocal _inference_fn_cache
-            if _inference_fn_cache is not None:
-                return _inference_fn_cache
-            example_inputs = [
-                n.meta["val"] for n in fwd_only_gm.graph.nodes if n.op == "placeholder"
-            ]
-            compiled = compiler_fn(fwd_only_gm, example_inputs)
+        from torch._functorch._aot_autograd.runtime_wrappers import RuntimeWrapper
 
-            # Wrap with RuntimeWrapper to handle mutation write-back
-            # (e.g. buffer updates like BatchNorm running stats), output
-            # alias handling, and intermediate base stripping.
-            from torch._functorch._aot_autograd.runtime_wrappers import RuntimeWrapper
+        _wrapped_fwd = RuntimeWrapper(
+            indices_of_inps_to_detach=[],
+            trace_joint=False,
+            disable_amp=False,
+        ).post_compile(_compiled_fwd, aot_config, runtime_metadata=fw_metadata)
 
-            wrapped = RuntimeWrapper(
-                indices_of_inps_to_detach=[],
-                trace_joint=False,
-                disable_amp=False,
-            ).post_compile(compiled, aot_config, runtime_metadata=fw_metadata)
-
-            def inference_fn(args):
-                flat_outs = wrapped(args)
-                return torch.utils._pytree.tree_unflatten(flat_outs, out_spec)
-
-            _inference_fn_cache = inference_fn
-            return _inference_fn_cache
+        @torch._dynamo.nonstrict_trace
+        def _inference_fn(args):
+            flat_outs = _wrapped_fwd(args)
+            return torch.utils._pytree.tree_unflatten(flat_outs, out_spec)
 
         # TODO: this probably belongs in the AOTAutograd API
         # TODO: pytree handling
@@ -571,7 +563,7 @@ class AutoParallel:
                 # NB: don't do self.parallel_model_fn work around Dynamo bug
                 out = parallel_model_fn(boxed_args)
             else:
-                out = _get_inference_fn()(boxed_args)
+                out = _inference_fn(boxed_args)
             return out
 
         self.parallel_model = make_parallel_module(

@@ -757,3 +757,75 @@ def test_inherited_user_model(device_mesh_1d):
     assert isinstance(parallel_mod, Model)
     assert isinstance(parallel_mod, BaseModel)
     assert parallel_mod.get_num_params() > 0
+
+
+def _make_simple_parallel_mod(device_mesh_1d):
+    dim = 128
+    batch_size = 512
+    local_batch_size = batch_size // device_mesh_1d.size()
+
+    class SimpleLinear(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = nn.Linear(dim, dim)
+
+        def forward(self, x):
+            return self.linear(x)
+
+    with torch.device("meta"):
+        model = SimpleLinear()
+
+    x = DTensor.from_local(
+        torch.randn(local_batch_size, dim, device="cuda"),
+        device_mesh_1d,
+        [Shard(0)],
+    )
+
+    parallel_mod = auto_parallel(
+        model, device_mesh_1d, sample_inputs=(x,), out_shardings=(Shard(0),)
+    )
+    parallel_mod.to_empty(device="cuda")
+    return parallel_mod, local_batch_size, dim
+
+
+def test_compile_fullgraph_training(device_mesh_1d):
+    """torch.compile(fullgraph=True) works in training mode (grad enabled)."""
+    parallel_mod, bs, dim = _make_simple_parallel_mod(device_mesh_1d)
+    torch._dynamo.reset()
+    compiled = torch.compile(parallel_mod, fullgraph=True)
+    x = torch.randn(bs, dim, device="cuda")
+    out = compiled(x)
+    assert out.shape == (bs, dim)
+
+
+def test_compile_fullgraph_inference(device_mesh_1d):
+    """torch.compile(fullgraph=True) works in inference mode (no_grad)."""
+    parallel_mod, bs, dim = _make_simple_parallel_mod(device_mesh_1d)
+    torch._dynamo.reset()
+    compiled = torch.compile(parallel_mod, fullgraph=True)
+    with torch.no_grad():
+        x = torch.randn(bs, dim, device="cuda")
+        out = compiled(x)
+    assert out.shape == (bs, dim)
+
+
+def test_compile_no_recompilation(device_mesh_1d):
+    """Repeated forward calls don't trigger recompilation in either mode."""
+    parallel_mod, bs, dim = _make_simple_parallel_mod(device_mesh_1d)
+    torch._dynamo.reset()
+    compiled = torch.compile(parallel_mod)
+
+    # Warm up both paths (each triggers one compilation)
+    compiled(torch.randn(bs, dim, device="cuda"))
+    with torch.no_grad():
+        compiled(torch.randn(bs, dim, device="cuda"))
+
+    # Subsequent calls in either mode must not recompile
+    torch._dynamo.config.error_on_recompile = True
+    try:
+        for _ in range(3):
+            compiled(torch.randn(bs, dim, device="cuda"))
+            with torch.no_grad():
+                compiled(torch.randn(bs, dim, device="cuda"))
+    finally:
+        torch._dynamo.config.error_on_recompile = False
