@@ -531,3 +531,29 @@ def test_flex_attention_gqa_compile(device_mesh_1d):
     with torch.device("meta"):
         model = FlexAttnGQAModel(DIM, N_HEADS, n_kv_heads)
     _run_auto_parallel(model, device_mesh_1d, compile=True)
+
+
+def test_flex_attention_compile_no_recompilation(device_mesh_1d):
+    """flex_attention parallel module doesn't recompile on repeated calls."""
+    with torch.device("meta"):
+        model = FlexAttnModel(DIM, N_HEADS)
+    parallel_mod = _run_auto_parallel(model, device_mesh_1d)
+    parallel_mod.to_empty(device="cuda")
+
+    torch._dynamo.reset()
+    compiled = torch.compile(parallel_mod)
+
+    x = torch.randn(LOCAL_BS, SEQLEN, DIM, device="cuda")
+
+    # Warm up both grad modes
+    compiled(x)
+    with torch.no_grad():
+        compiled(x)
+
+    torch._dynamo.config.error_on_recompile = True
+    try:
+        compiled(x)
+        with torch.no_grad():
+            compiled(x)
+    finally:
+        torch._dynamo.config.error_on_recompile = False
