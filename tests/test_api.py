@@ -809,11 +809,11 @@ def test_compile_fullgraph_inference(device_mesh_1d):
     assert out.shape == (bs, dim)
 
 
-def test_compile_no_recompilation(device_mesh_1d):
-    """Repeated forward calls don't trigger recompilation in either mode."""
+def test_compile_fullgraph_no_recompilation(device_mesh_1d):
+    """Repeated fullgraph calls in both grad modes don't recompile."""
     parallel_mod, bs, dim = _make_simple_parallel_mod(device_mesh_1d)
     torch._dynamo.reset()
-    compiled = torch.compile(parallel_mod)
+    compiled = torch.compile(parallel_mod, fullgraph=True)
 
     # Warm up both paths (each triggers one compilation)
     compiled(torch.randn(bs, dim, device="cuda"))

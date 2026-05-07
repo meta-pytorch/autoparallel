@@ -541,7 +541,7 @@ def test_flex_attention_compile_no_recompilation(device_mesh_1d):
     parallel_mod.to_empty(device="cuda")
 
     torch._dynamo.reset()
-    compiled = torch.compile(parallel_mod)
+    compiled = torch.compile(parallel_mod, fullgraph=True)
 
     x = torch.randn(LOCAL_BS, SEQLEN, DIM, device="cuda")
 
