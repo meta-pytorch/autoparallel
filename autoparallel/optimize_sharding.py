@@ -298,11 +298,10 @@ class ShardingOptimizer:
                 val = node.meta.get("val")
                 if isinstance(val, torch.Tensor):
                     strats[node] = _create_all_options(self.mesh, val.shape, tensor=val)
-                else:
-                    # Non-tensor placeholders: unused parameters (e.g.
-                    # teacher-only params) or GraphModule submodules used by
-                    # HOPs. Keep them in strats with empty-shape replicate
-                    # options so the constraint system can reference them.
+                elif node.op == "placeholder":
+                    # Non-tensor placeholders (e.g. unused parameters):
+                    # keep them in strats with empty-shape replicate options
+                    # so the constraint system can reference them.
                     strats[node] = _create_all_options(self.mesh, ())
             elif node.op == "call_function":
                 if not _produces_tensor(node.meta.get("val")):
@@ -359,17 +358,14 @@ class ShardingOptimizer:
     def _all_input_nodes(self, node):
         """Variant of node.all_input_nodes that preserves duplicate nodes.
 
-        Filters out nodes not in self.strats, and non-tensor get_attr nodes
-        (HOP submodule bodies) which are in strats but should not appear as
-        numbered args for redistribute_cost indexing.
+        Filters out nodes not in self.strats:
+        - get_attr: HOP submodule nodes (GraphModules)
+        - call_function producing non-tensors: shape-computation nodes
+          (sym_size, operator.mul, etc.)
         """
         result = []
         for x in all_input_nodes(node):
             if x in self.strats:
-                if x.op == "get_attr" and not isinstance(
-                    x.meta.get("val"), torch.Tensor
-                ):
-                    continue
                 result.append(x)
             elif x.op != "get_attr":
                 val = x.meta.get("val")
