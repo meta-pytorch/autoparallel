@@ -557,3 +557,39 @@ def test_flex_attention_compile_no_recompilation(device_mesh_1d):
             compiled(x)
     finally:
         torch._dynamo.config.error_on_recompile = False
+
+
+def test_flex_attention_block_mask_compile_no_recompilation(device_mesh_1d):
+    """flex_attention with block_mask doesn't recompile on repeated calls."""
+    model = FlexAttnBlockMaskModel(DIM, N_HEADS, SEQLEN)
+    model = model.to("meta")
+    parallel_mod = _run_auto_parallel(model, device_mesh_1d)
+    parallel_mod.to_empty(device="cuda")
+
+    # Reinitialize block_mask buffers: to_empty zeroes them out, which
+    # gives the Triton kernel invalid indices (0 blocks to attend to).
+    fresh_mask = FlexAttnBlockMaskModel(DIM, N_HEADS, SEQLEN).block_mask
+    for name, buf in parallel_mod.named_buffers():
+        if "block_mask" not in name:
+            continue
+        field = name.split("block_mask_")[-1]
+        src = getattr(fresh_mask, field)
+        buf.copy_(src)
+
+    torch._dynamo.reset()
+    compiled = torch.compile(parallel_mod, fullgraph=True)
+
+    x = torch.randn(LOCAL_BS, SEQLEN, DIM, device="cuda")
+
+    # Warm up both grad modes
+    compiled(x)
+    with torch.no_grad():
+        compiled(x)
+
+    torch._dynamo.config.error_on_recompile = True
+    try:
+        compiled(x)
+        with torch.no_grad():
+            compiled(x)
+    finally:
+        torch._dynamo.config.error_on_recompile = False
