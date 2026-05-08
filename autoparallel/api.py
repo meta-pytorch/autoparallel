@@ -389,7 +389,12 @@ class AutoParallel:
 
         return self.sharding_placement
 
-    def _apply_placement_common(self, sharding_placement):
+    def _apply_placement_common(
+        self,
+        sharding_placement,
+        *,
+        decompose_after_sharding=True,
+    ):
         t0 = time.perf_counter()
         self._assert_entered()
 
@@ -422,6 +427,7 @@ class AutoParallel:
                 sharding_placement,
                 self.joint_with_descriptors.params_spec,
                 self.joint_with_descriptors.buffers_spec,
+                decompose_after_sharding=decompose_after_sharding,
             )
         t_apply = time.perf_counter()
         # clean it up by removing the added aliases from previous pass
@@ -475,9 +481,15 @@ class AutoParallel:
             sharded_buffer_dict,
         )
 
-    def apply_placement(self, sharding_placement):
+    def apply_placement(
+        self,
+        sharding_placement,
+        *,
+        decompose_after_sharding=True,
+    ):
         sharded_param_dict, sharded_buffer_dict = self._apply_placement_common(
-            sharding_placement
+            sharding_placement,
+            decompose_after_sharding=decompose_after_sharding,
         )
 
         mark_fsdp_all_gather_recomputation(

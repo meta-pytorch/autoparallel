@@ -13,7 +13,7 @@ concurrency:
 
 jobs:
   test-torchtitan:
-    name: Test TorchTitan Integration (cuda12.6-py3.12)
+    name: Test TorchTitan Integration (cuda13.0-py3.12)
     uses: pytorch/test-infra/.github/workflows/linux_job_v2.yml@main
     strategy:
       fail-fast: true
@@ -21,9 +21,9 @@ jobs:
         include:
           - name: 12xlargegpu
             runs-on: linux.g5.12xlarge.nvidia.gpu
-            torch-spec: '--pre torch --index-url https://download.pytorch.org/whl/nightly/cu126'
+            torch-spec: '--pre torch --index-url https://download.pytorch.org/whl/nightly/cu130'
             gpu-arch-type: "cuda"
-            gpu-arch-version: "12.6"
+            gpu-arch-version: "13.0"
     with:
       timeout: 60
       runner: ${{ matrix.runs-on }}
@@ -38,24 +38,16 @@ jobs:
         pip install --quiet -r requirements-test.txt
         # For some reason the spec above isnt working
         pip uninstall -y torch
-        pip install --no-input --quiet --pre torch --index-url https://download.pytorch.org/whl/nightly/cu126
+        pip install --no-input --quiet --pre torch --index-url https://download.pytorch.org/whl/nightly/cu130
         pip install --quiet .
 
         # Clone TorchTitan
         git clone https://github.com/pytorch/torchtitan.git
         cd torchtitan
+        git fetch origin pull/3308/head:remove-moe-for-loop-fallback
+        git checkout remove-moe-for-loop-fallback
         pip install --quiet -r requirements.txt
 
-        # Run TorchTitan training with AutoParallel
-        NGPU=4 ./run_train.sh \
-          --module autoparallel.llama3 \
-          --config autoparallel_llama3_debugmodel \
-          --parallelism.tensor_parallel_degree 4
-
-        # TODO: Re-enable deepseek_v3 test once torchtitan experiment is fixed
-        # (deepseek_v3 experiment is also disabled in torchtitan's own CI)
-        # NGPU=4 ./run_train.sh \
-        #   --module autoparallel.deepseek_v3 \
-        #   --config autoparallel_deepseek_v3_debugmodel \
-        #   --parallelism.data_parallel_shard_degree 4 \
-        #   --parallelism.expert_parallel_degree 4
+        # Check that AutoParallel and TorchTitan DeepSeek V3 produce matching
+        # distributed loss and gradient norms for the same 4-GPU debug shape.
+        torchrun --standalone --nproc-per-node 4 ../tests/torchtitan_dsv3_equivalence.py
