@@ -917,6 +917,280 @@ class TestCheckForwardArgsMultiInput:
             _check_forward_args([torch.randn(4, 8), torch.randn(4, 8)], expected)
 
 
+class TestDynamicDimsParameter:
+    """Tests for _check_forward_args with explicit dynamic_dims.
+
+    These exercise the code path used when torch.compile concretizes SymInts
+    from a foreign ShapeEnv, making isinstance(exp, torch.SymInt) unreliable.
+    The dynamic_dims set provides a compile-resistant way to mark dims as dynamic.
+    """
+
+    def test_dynamic_dim_accepts_any_size(self):
+        """dynamic_dims skips validation even when expected shape is concrete."""
+        from autoparallel.input_validation import _check_forward_args
+
+        # Concrete meta tensor (no SymInts) — simulates what torch.compile sees
+        expected = [torch.empty(4, 200, device="meta")]
+        dynamic_dims = {(0, 1)}
+
+        # dim 1 differs but is marked dynamic → should pass
+        _check_forward_args([torch.randn(4, 150)], expected, dynamic_dims)
+        _check_forward_args([torch.randn(4, 1)], expected, dynamic_dims)
+        _check_forward_args([torch.randn(4, 999)], expected, dynamic_dims)
+
+    def test_static_dim_still_enforced(self):
+        """Dims not in dynamic_dims are still checked exactly."""
+        from autoparallel.input_validation import _check_forward_args
+
+        expected = [torch.empty(4, 200, device="meta")]
+        dynamic_dims = {(0, 1)}
+
+        with pytest.raises(ValueError, match="has shape"):
+            _check_forward_args([torch.randn(5, 200)], expected, dynamic_dims)
+
+    def test_multiple_dynamic_dims_same_tensor(self):
+        """Multiple dims on the same tensor can be dynamic."""
+        from autoparallel.input_validation import _check_forward_args
+
+        expected = [torch.empty(4, 8, 200, device="meta")]
+        dynamic_dims = {(0, 0), (0, 2)}
+
+        _check_forward_args([torch.randn(7, 8, 150)], expected, dynamic_dims)
+
+        # dim 1 is static
+        with pytest.raises(ValueError, match="has shape"):
+            _check_forward_args([torch.randn(7, 16, 150)], expected, dynamic_dims)
+
+    def test_dynamic_dims_across_multiple_args(self):
+        """dynamic_dims correctly indexes across multiple arguments."""
+        from autoparallel.input_validation import _check_forward_args
+
+        expected = [
+            torch.empty(4, 128, device="meta"),
+            torch.empty(4, 64, device="meta"),
+        ]
+        # arg 0 dim 0 and arg 1 dim 0 are dynamic
+        dynamic_dims = {(0, 0), (1, 0)}
+
+        _check_forward_args(
+            [torch.randn(32, 128), torch.randn(16, 64)], expected, dynamic_dims
+        )
+
+        # arg 1 dim 1 is static
+        with pytest.raises(ValueError, match="has shape"):
+            _check_forward_args(
+                [torch.randn(32, 128), torch.randn(16, 999)], expected, dynamic_dims
+            )
+
+    def test_empty_dynamic_dims_enforces_all(self):
+        """Empty dynamic_dims means all dims are checked (backward compat)."""
+        from autoparallel.input_validation import _check_forward_args
+
+        expected = [torch.empty(4, 8, device="meta")]
+
+        _check_forward_args([torch.randn(4, 8)], expected)
+        _check_forward_args([torch.randn(4, 8)], expected, frozenset())
+
+        with pytest.raises(ValueError, match="has shape"):
+            _check_forward_args([torch.randn(4, 9)], expected)
+
+    def test_compute_expected_inputs_detects_dynamic_dims(self):
+        """_compute_expected_inputs correctly identifies SymInt dims."""
+        from torch._subclasses import FakeTensorMode
+        from torch.fx.experimental.symbolic_shapes import (
+            DimDynamic,
+            ShapeEnv,
+            StatelessSymbolicContext,
+        )
+
+        from autoparallel.input_validation import _compute_expected_inputs
+
+        shape_env = ShapeEnv()
+        fake_mode = FakeTensorMode(shape_env=shape_env, static_shapes=False)
+
+        t1 = fake_mode.from_tensor(
+            torch.empty(16, 128),
+            symbolic_context=StatelessSymbolicContext(
+                dynamic_sizes=[DimDynamic.DYNAMIC, DimDynamic.STATIC]
+            ),
+        )
+        t2 = fake_mode.from_tensor(
+            torch.empty(16, 64, 32),
+            symbolic_context=StatelessSymbolicContext(
+                dynamic_sizes=[
+                    DimDynamic.DYNAMIC,
+                    DimDynamic.STATIC,
+                    DimDynamic.DYNAMIC,
+                ]
+            ),
+        )
+
+        # Use a mock mesh that just returns identity for size
+        class FakeMesh:
+            def size(self, dim=0):
+                return 1
+
+        _, dynamic_dims = _compute_expected_inputs([t1, t2], [(), ()], FakeMesh())
+        assert (0, 0) in dynamic_dims, "t1 dim 0 should be dynamic"
+        assert (0, 1) not in dynamic_dims, "t1 dim 1 should be static"
+        assert (1, 0) in dynamic_dims, "t2 dim 0 should be dynamic"
+        assert (1, 1) not in dynamic_dims, "t2 dim 1 should be static"
+        assert (1, 2) in dynamic_dims, "t2 dim 2 should be dynamic"
+
+    def test_compute_expected_inputs_non_tensor_indexing(self):
+        """Non-tensor inputs don't shift the dynamic_dims arg indices."""
+        from torch._subclasses import FakeTensorMode
+        from torch.fx.experimental.symbolic_shapes import (
+            DimDynamic,
+            ShapeEnv,
+            StatelessSymbolicContext,
+        )
+
+        from autoparallel.input_validation import _compute_expected_inputs
+
+        shape_env = ShapeEnv()
+        fake_mode = FakeTensorMode(shape_env=shape_env, static_shapes=False)
+
+        t1 = fake_mode.from_tensor(
+            torch.empty(16, 128),
+            symbolic_context=StatelessSymbolicContext(
+                dynamic_sizes=[DimDynamic.DYNAMIC, DimDynamic.STATIC]
+            ),
+        )
+
+        class FakeMesh:
+            def size(self, dim=0):
+                return 1
+
+        # Non-tensor followed by tensor: the tensor is result_idx=1
+        _, dynamic_dims = _compute_expected_inputs([42, t1], [()], FakeMesh())
+        assert (1, 0) in dynamic_dims, "tensor at result_idx=1, dim 0 should be dynamic"
+        assert (0, 0) not in dynamic_dims, "result_idx=0 is a non-tensor"
+
+
+class TestDynamicDimsUnderCompile:
+    """Tests that dynamic_dims works correctly inside torch.compile."""
+
+    def test_dynamic_dim_survives_compile(self):
+        """The key bug: inside torch.compile, SymInts become concrete ints.
+        dynamic_dims must still allow different sizes."""
+        from torch._subclasses import FakeTensorMode
+        from torch.fx.experimental.symbolic_shapes import (
+            DimDynamic,
+            ShapeEnv,
+            StatelessSymbolicContext,
+        )
+
+        from autoparallel.input_validation import _check_forward_args
+
+        shape_env = ShapeEnv()
+        fake_mode = FakeTensorMode(shape_env=shape_env, static_shapes=False)
+
+        expected_tensor = fake_mode.from_tensor(
+            torch.empty(1, 1, 256, 200),
+            symbolic_context=StatelessSymbolicContext(
+                dynamic_sizes=[
+                    DimDynamic.STATIC,
+                    DimDynamic.STATIC,
+                    DimDynamic.STATIC,
+                    DimDynamic.DYNAMIC,
+                ]
+            ),
+        )
+
+        # Record dynamic dims while SymInts are still symbolic
+        dynamic_dims = set()
+        for d, s in enumerate(expected_tensor.shape):
+            if isinstance(s, torch.SymInt) and not s.node.expr.is_number:
+                dynamic_dims.add((0, d))
+        assert dynamic_dims == {(0, 3)}
+
+        # Inside torch.compile, SymInt becomes concrete — dynamic_dims saves us
+        torch._dynamo.reset()
+
+        @torch.compile(dynamic=False)
+        def forward(x):
+            _check_forward_args([x], [expected_tensor], dynamic_dims)
+            return x
+
+        forward(torch.randn(1, 1, 256, 200))
+        forward(torch.randn(1, 1, 256, 150))
+
+    def test_static_dim_mismatch_still_caught_under_compile(self):
+        """Static dim mismatches are still caught inside torch.compile."""
+        from torch._subclasses import FakeTensorMode
+        from torch.fx.experimental.symbolic_shapes import (
+            DimDynamic,
+            ShapeEnv,
+            StatelessSymbolicContext,
+        )
+
+        from autoparallel.input_validation import _check_forward_args
+
+        shape_env = ShapeEnv()
+        fake_mode = FakeTensorMode(shape_env=shape_env, static_shapes=False)
+
+        expected_tensor = fake_mode.from_tensor(
+            torch.empty(1, 256, 200),
+            symbolic_context=StatelessSymbolicContext(
+                dynamic_sizes=[
+                    DimDynamic.STATIC,
+                    DimDynamic.STATIC,
+                    DimDynamic.DYNAMIC,
+                ]
+            ),
+        )
+
+        dynamic_dims = {(0, 2)}
+
+        torch._dynamo.reset()
+
+        @torch.compile(dynamic=False)
+        def forward(x):
+            _check_forward_args([x], [expected_tensor], dynamic_dims)
+            return x
+
+        with pytest.raises((ValueError, torch._dynamo.exc.Unsupported)):
+            forward(torch.randn(1, 128, 200))
+
+    def test_without_dynamic_dims_compile_breaks(self):
+        """Without dynamic_dims, torch.compile enforces the tracing-time value
+        for dynamic dims — confirming the original bug."""
+        from torch._subclasses import FakeTensorMode
+        from torch.fx.experimental.symbolic_shapes import (
+            DimDynamic,
+            ShapeEnv,
+            StatelessSymbolicContext,
+        )
+
+        from autoparallel.input_validation import _check_forward_args
+
+        shape_env = ShapeEnv()
+        fake_mode = FakeTensorMode(shape_env=shape_env, static_shapes=False)
+
+        expected_tensor = fake_mode.from_tensor(
+            torch.empty(4, 200),
+            symbolic_context=StatelessSymbolicContext(
+                dynamic_sizes=[DimDynamic.STATIC, DimDynamic.DYNAMIC]
+            ),
+        )
+
+        torch._dynamo.reset()
+
+        @torch.compile(dynamic=False)
+        def forward(x):
+            # No dynamic_dims passed — original buggy path
+            _check_forward_args([x], [expected_tensor])
+            return x
+
+        # Same size works
+        forward(torch.randn(4, 200))
+
+        # Different size on the dynamic dim fails (the original bug)
+        with pytest.raises((ValueError, torch._dynamo.exc.Unsupported)):
+            forward(torch.randn(4, 150))
+
+
 # ============================================================================
 # Integration tests — require fake process group and mesh fixtures
 # ============================================================================
@@ -1103,7 +1377,7 @@ def test_dynamic_check_forward_args_accepts_different_batch(device_mesh_1d):
         autop.add_output_constraints([placement])
         autop.optimize_placement(verbose=False)
 
-        expected = _compute_expected_inputs(
+        expected, dynamic_dims = _compute_expected_inputs(
             autop._traced_inputs, autop.input_constraints, device_mesh_1d
         )
 
@@ -1116,6 +1390,7 @@ def test_dynamic_check_forward_args_accepts_different_batch(device_mesh_1d):
         _check_forward_args(
             [torch.randn(test_bs, dim1)],
             expected,
+            dynamic_dims,
         )
 
     # Wrong non-batch dim should be rejected
@@ -1123,6 +1398,7 @@ def test_dynamic_check_forward_args_accepts_different_batch(device_mesh_1d):
         _check_forward_args(
             [torch.randn(local_bs, dim1 + 1)],
             expected,
+            dynamic_dims,
         )
 
 
