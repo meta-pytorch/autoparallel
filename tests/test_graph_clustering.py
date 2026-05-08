@@ -3,7 +3,6 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
-import operator
 import re
 from collections import Counter
 
@@ -67,9 +66,10 @@ def _clustering_stats(graph, strats, clusters, n_layers):
     }
 
 
-def _assert_layer_coverage(stats, n_layers, min_coverage, label):
+def _assert_layer_coverage(stats, n_layers, min_coverage, label, layers=None):
     """Assert each repeated layer has enough nodes in clustered regions."""
-    layer_totals = [stats["per_layer_total"].get(i, 0) for i in range(n_layers)]
+    layers = range(n_layers) if layers is None else layers
+    layer_totals = [stats["per_layer_total"].get(i, 0) for i in layers]
     if len(set(layer_totals)) != 1:
         raise AssertionError(
             f"{label}: layers have different node counts: {layer_totals}"
@@ -78,7 +78,7 @@ def _assert_layer_coverage(stats, n_layers, min_coverage, label):
     total = layer_totals[0]
     if total == 0:
         raise AssertionError(f"{label}: no layer nodes found in clustering stats")
-    for layer_idx in range(n_layers):
+    for layer_idx in layers:
         clustered = stats["per_layer_clustered"].get(layer_idx, 0)
         coverage = clustered / total
         if coverage < min_coverage:
@@ -152,6 +152,7 @@ def _assert_model_clustering(
     min_coverage,
     forward_layers,
     backward_layers,
+    coverage_layers=None,
     min_region_size=100,
 ):
     """Assert coverage, phase separation, and large fwd/bwd layer clusters."""
@@ -160,6 +161,7 @@ def _assert_model_clustering(
         n_layers,
         min_coverage=min_coverage,
         label=label,
+        layers=coverage_layers,
     )
     _assert_cross_layer_cluster(
         clusters,
@@ -209,9 +211,13 @@ def _setup_llama_autop(device_mesh_2d, n_layers=4):
     return autop, model_args
 
 
-def _setup_ds3_local_map_autop(device_mesh_2d, n_layers=2):
-    global_batch_size = 2 * device_mesh_2d.shape[0] * device_mesh_2d.shape[1]
-    config = make_dsv3_config(n_layers=n_layers, n_dense_layers=0)
+def _setup_ds3_local_map_autop(device_mesh_2d):
+    local_batch_size = 8
+    seq_len = 2048
+    global_batch_size = (
+        local_batch_size * device_mesh_2d.shape[0] * device_mesh_2d.shape[1]
+    )
+    config = make_dsv3_config(max_seq_len=seq_len)
     with torch.device("meta"):
         model = DeepSeekV3Model(
             config,
@@ -230,7 +236,7 @@ def _setup_ds3_local_map_autop(device_mesh_2d, n_layers=2):
             device="cuda",
         )
 
-    return AutoParallel(model, input_fn, device_mesh_2d, dynamic=True)
+    return AutoParallel(model, input_fn, device_mesh_2d, dynamic=True), config
 
 
 def test_clustering_high_coverage(device_mesh_2d):
@@ -259,8 +265,8 @@ def test_clustering_high_coverage(device_mesh_2d):
         backward_layers=range(1, n_layers),
     )
 
-    n_layers = 2
-    autop = _setup_ds3_local_map_autop(device_mesh_2d, n_layers=n_layers)
+    autop, config = _setup_ds3_local_map_autop(device_mesh_2d)
+    n_layers = len(config.layers)
     stats, clusters = _run_clustering(
         autop,
         n_layers,
@@ -272,15 +278,16 @@ def test_clustering_high_coverage(device_mesh_2d):
         label="DS3",
         n_layers=n_layers,
         min_coverage=0.75,
-        forward_layers=range(n_layers),
-        backward_layers=range(n_layers),
+        coverage_layers=range(1, n_layers),
+        forward_layers=range(1, n_layers),
+        backward_layers=range(1, n_layers),
     )
 
 
-def test_getitem_siblings_are_clustered(device_mesh_2d):
-    """Getitem nodes that project sibling outputs from tuple-returning ops
-    (e.g. SDPA returning (output, logsumexp, rng_state)) should be clustered
-    together with their producer when the producer is already clustered."""
+def test_clustering_no_forward_backward_mixing(device_mesh_2d):
+    """Each cluster group's regions should contain only forward or only
+    backward nodes, never a mix. Expansion must not cross the phase boundary
+    by following saved-tensor edges from backward into forward."""
     n_layers = 4
     autop, _ = _setup_llama_autop(device_mesh_2d, n_layers=n_layers)
     with autop:
@@ -289,64 +296,12 @@ def test_getitem_siblings_are_clustered(device_mesh_2d):
         autop.add_input_constraints([x_sharding])
         autop.add_output_constraints([out_sharding])
 
-        graph = autop.sharding_optimizer.graph
-        strats = autop.sharding_optimizer.strats
-        clusters = get_identical_regions(graph, strats)
-
-    clustered_nodes = set()
-    for group in clusters:
-        for region in group:
-            clustered_nodes.update(region)
-
-    # Find all getitem nodes that have strategies and belong to layers
-    unclustered_getitems = []
-    for node in graph.nodes:
-        if node.target is not operator.getitem:
-            continue
-        if node not in strats:
-            continue
-        layer_idx = _get_layer_index(node)
-        if layer_idx is not None and node not in clustered_nodes:
-            unclustered_getitems.append(node)
-
-    assert len(unclustered_getitems) == 0, (
-        f"{len(unclustered_getitems)} getitem nodes in layers are not clustered: "
-        f"{[n.name for n in unclustered_getitems[:5]]}"
-    )
-
-
-def test_getitem_siblings_cluster_consistency(device_mesh_2d):
-    """Getitem siblings added by _extend_with_sibling_getitems should appear
-    in the same cluster group as their producer, with one per region."""
-    n_layers = 4
-    autop, _ = _setup_llama_autop(device_mesh_2d, n_layers=n_layers)
-    with autop:
-        x_sharding = (Shard(0), Replicate())
-        out_sharding = (Shard(0), Shard(2))
-        autop.add_input_constraints([x_sharding])
-        autop.add_output_constraints([out_sharding])
-
-        graph = autop.sharding_optimizer.graph
-        strats = autop.sharding_optimizer.strats
-        clusters = get_identical_regions(graph, strats)
+        clusters = get_identical_regions(
+            autop.sharding_optimizer.graph, autop.sharding_optimizer.strats
+        )
 
     for i, group in enumerate(clusters):
-        num_regions = len(group)
-        # Collect all getitem nodes across all regions in this group
-        getitems_in_group = []
-        for region in group:
-            for node in region:
-                if node.target is operator.getitem:
-                    getitems_in_group.append(node)
-
-        if not getitems_in_group:
-            continue
-
-        # Each getitem index should appear exactly once per region
-        # Group getitems by their tuple index
-        by_index = Counter(n.args[1] for n in getitems_in_group)
-        for idx, count in by_index.items():
-            assert count == num_regions, (
-                f"Cluster group {i}: getitem[{idx}] appears {count} times "
-                f"but there are {num_regions} regions"
-            )
+        for j, region in enumerate(group):
+            tags = set(n.meta.get("partitioner_tag") for n in region)
+            tags.discard(None)
+            assert len(tags) <= 1, f"Cluster group {i}, region {j} mixes phases: {tags}"

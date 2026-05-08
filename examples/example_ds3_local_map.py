@@ -25,7 +25,10 @@ def _seed_dtensor_rng(rng_seed: Optional[int]) -> None:
 
 
 def run_test(fake_evaluate: bool, rng_seed: Optional[int], logs_dir: str):
-    seq_len = 1024
+    # Match TorchTitan's DeepSeek V3 debug model shape. This example is a
+    # regression guard for placement/clustering issues that only appear at the
+    # larger debug shape used by TorchTitan GraphTrainer.
+    seq_len = 2048
     if fake_evaluate:
         world_size = 256
 
@@ -66,11 +69,9 @@ def run_test(fake_evaluate: bool, rng_seed: Optional[int], logs_dir: str):
             mesh_dim_names=("dp", "ep"),
         )
 
-        config = make_dsv3_config(
-            num_experts=4, top_k=2, n_layers=4, n_dense_layers=0, max_seq_len=seq_len
-        )
+        config = make_dsv3_config(max_seq_len=seq_len)
 
-    local_batch_size = 2
+    local_batch_size = 8
     global_batch_size = local_batch_size * mesh.shape[0] * mesh.shape[1]
 
     with torch.device("meta"):
@@ -140,7 +141,7 @@ def run_test(fake_evaluate: bool, rng_seed: Optional[int], logs_dir: str):
                     out.backward(torch.ones_like(out))
         else:
             for i, x in enumerate(microbatches):
-                assert x.shape[0] == 2
+                assert x.shape[0] == local_batch_size
                 out = parallel_mod(x)
                 assert not torch.any(torch.isnan(out)), "Found NaNs in forward output"
                 out.backward(torch.ones_like(out))
