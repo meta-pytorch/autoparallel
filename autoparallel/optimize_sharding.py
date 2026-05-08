@@ -303,6 +303,16 @@ class ShardingOptimizer:
                     # keep them in strats with empty-shape replicate options
                     # so the constraint system can reference them.
                     strats[node] = _create_all_options(self.mesh, ())
+                else:
+                    # Non-tensor get_attr: GraphModule submodules used by
+                    # HOPs — not added to strats, invisible to the ILP.
+                    # _all_input_nodes filters them.
+                    assert node.op == "get_attr"
+                    assert any(
+                        isinstance(u.target, torch._ops.HigherOrderOperator)
+                        or "local_map" in u.name
+                        for u in node.users
+                    ), f"Non-tensor get_attr {node} is not used by a HOP"
             elif node.op == "call_function":
                 if not _produces_tensor(node.meta.get("val")):
                     # Shape-computation nodes (sym_size, operator.mul, etc.)
