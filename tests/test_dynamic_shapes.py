@@ -675,7 +675,7 @@ class TestLocalizeShapeArg:
         assert result[1] == 6144  # dim 1 not sharded
 
     def test_mixed_symint_and_concrete(self):
-        """SymInt args preserved, concrete args divided."""
+        """SymInt args on sharded dims are localized, concrete args divided."""
         from torch._subclasses import FakeTensorMode
         from torch.fx.experimental.symbolic_shapes import (
             DimDynamic,
@@ -690,7 +690,10 @@ class TestLocalizeShapeArg:
         # Output shape: [batch*seq, hidden] — 2 dims
         node = self._make_node_with_shape((256 * 256, 6144), fake_mode)
 
-        # Simulate interpreter producing SymInt for batch*seq, concrete for hidden
+        # Simulate interpreter producing SymInt for batch*seq, concrete for hidden.
+        # With the sym_size globalization fix, SymInts from the interpreter
+        # represent GLOBAL sizes, so _localize_shape_arg divides them on
+        # sharded dims.
         real = torch.empty(2048, device="meta")
         sym_ctx = StatelessSymbolicContext(dynamic_sizes=[DimDynamic.DYNAMIC])
         sym_val = fake_mode.from_tensor(real, symbolic_context=sym_ctx)
@@ -699,9 +702,9 @@ class TestLocalizeShapeArg:
         spec = self._make_output_spec([Shard(0), Shard(1)], (32, 8))
         result = _localize_shape_arg(node, [sym_batch_seq, 6144], spec)
 
-        # SymInt preserved (already local)
+        # SymInt on sharded dim 0 is divided by mesh dim 0 size (32)
         assert isinstance(result[0], torch.SymInt)
-        assert result[0] is sym_batch_seq
+        assert result[0] == (sym_batch_seq + 31) // 32
         # Concrete divided by tp mesh
         assert result[1] == 6144 // 8
 

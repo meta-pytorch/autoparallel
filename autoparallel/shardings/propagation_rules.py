@@ -315,6 +315,52 @@ def view_rule(mesh, op_schema):
     return OpStrategy(strats)
 
 
+@register_rule(torch.ops.aten.slice.Tensor)
+def slice_tensor_rule(mesh, op_schema):
+    """slice(self, dim, start, end) extracts a contiguous sub-range along one dim.
+
+    Sharding on non-sliced dims is always preserved.  Sharding on the sliced dim
+    is only valid when the slice covers the full extent of that dim (i.e. the
+    output size equals the input size on that dim), which happens for no-op
+    slices like ``x[0:seqlen]`` where ``seqlen == x.size(dim)``.
+    """
+    op_spec = op_schema.args_schema[0]
+    dim = op_schema.args_schema[1] if len(op_schema.args_schema) > 1 else 0
+
+    in_meta = op_spec.strategies[0].output_specs.tensor_meta
+    in_tensor = _build_meta_tensor(in_meta)
+
+    # Build the output meta by running the slice on a meta tensor.
+    slice_args = [in_tensor] + [
+        a for a in op_schema.args_schema[1:] if not isinstance(a, OpStrategy)
+    ]
+    out_tensor = torch.ops.aten.slice.Tensor(*slice_args)
+    out_meta = _gen_tensor_meta(out_tensor)
+
+    ndim = in_tensor.ndim
+    if isinstance(dim, int) and dim < 0:
+        dim = ndim + dim
+
+    # Check whether the slice is a full-dim slice (output == input size).
+    full_dim = False
+    try:
+        full_dim = bool(out_tensor.shape[dim] == in_tensor.shape[dim])
+    except Exception:
+        pass
+
+    strats = []
+    for strat in op_spec.strategies:
+        input_specs = strat.output_specs
+        if not full_dim and any(p.is_shard(dim) for p in input_specs.placements):
+            continue
+        output_spec = DTensorSpec(mesh, input_specs.placements, tensor_meta=out_meta)
+        redistribute_costs = [generate_redistribute_costs(op_spec, input_specs)]
+        s = OpSpec(output_spec, input_specs=(input_specs,))
+        s.redistribute_cost = redistribute_costs
+        strats.append(s)
+    return OpStrategy(strats)
+
+
 @register_rule(torch.ops.aten.view.dtype)
 def view_dtype_rule(mesh, op_schema):
     """view(dtype=...) reinterprets the last dim's bytes as a different dtype.

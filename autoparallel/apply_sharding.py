@@ -51,19 +51,23 @@ def _localize_shape_arg(node, shape_arg, output_spec):
 
     Computes the local shape from the global shape in node.meta["val"],
     dividing sharded dims by the corresponding mesh sizes. SymInt values
-    in shape_arg (computed from local tensors via sym_size/mul nodes)
-    are preserved as-is since they are already local.
+    are also localized: sharded dims are divided by mesh_size, non-sharded
+    dims are preserved as-is.
     """
     global_shape = _concretize_shape(node.meta["val"].shape)
     local_shape = list(global_shape)
+    sharded_dims = {}
     for mesh_size, placement in zip(output_spec.mesh.shape, output_spec.placements):
         if placement.is_shard():
             dim = placement.dim
             local_shape[dim] = (local_shape[dim] + mesh_size - 1) // mesh_size
-    # Restore SymInt values from the interpreter (already local)
+            sharded_dims[dim] = mesh_size
     for i, s in enumerate(shape_arg):
         if isinstance(s, torch.SymInt):
-            local_shape[i] = s
+            if i in sharded_dims:
+                local_shape[i] = (s + sharded_dims[i] - 1) // sharded_dims[i]
+            else:
+                local_shape[i] = s
     return local_shape
 
 
@@ -270,6 +274,26 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
         if self._curr_node not in self.sharding_placement:
             # Shape-computation nodes (sym_size, operator.mul, etc.) produce
             # scalars, not tensors — just execute them directly.
+            # Exception: sym_size on a sharded dim must return the global size.
+            # The interpreter runs with local tensors, but the graph was traced
+            # with global shapes.  Returning local sizes would break ops that
+            # combine values from tensors with different placements (e.g. slicing
+            # a Replicate tensor with a size from a Shard tensor).
+            # _localize_shape_arg (for factory/view ops) divides SymInts back to
+            # local on sharded dims, so the net effect is correct everywhere.
+            if self.dynamic and target is torch.ops.aten.sym_size.int:
+                result = super().call_function(target, tuple(args), kwargs)
+                tensor_node = self._curr_node.args[0]
+                if tensor_node in self.sharding_placement:
+                    spec = self.sharding_placement[tensor_node].output_specs
+                    dim = args[1]
+                    if dim < 0:
+                        dim = args[0].ndim + dim
+                    for mesh_dim, placement in enumerate(spec.placements):
+                        if placement.is_shard(dim):
+                            result = result * spec.mesh.shape[mesh_dim]
+                            break
+                return result
             return super().call_function(target, tuple(args), kwargs)
 
         if self._curr_node.target == operator.getitem:
