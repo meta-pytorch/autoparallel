@@ -12,6 +12,13 @@ from torch._inductor.compile_fx import compile_fx
 
 from .graph_passes.activation_checkpointing import ac_joint_pass
 
+_INDUCTOR_OVERLAP_PATCHES = {
+    "aten_distributed_optimizations.enable_overlap_scheduling": True,
+    "aten_distributed_optimizations.collective_bucketing": True,
+    "aten_distributed_optimizations.insert_overlap_deps": True,
+    "aten_distributed_optimizations.max_compute_pre_fetch": 10,
+}
+
 
 def _make_ac_joint_pass(
     ac_stage_size_in_GiB: Optional[Union[float, str]] = "auto",
@@ -44,21 +51,11 @@ def autoparallel_backend(
         overlap_scheduling: Enable comm/compute overlap scheduling.
     """
     functorch_patches = {}
-    inductor_patches = {}
+    inductor_patches = _INDUCTOR_OVERLAP_PATCHES if overlap_scheduling else {}
 
     if enable_ac:
         functorch_patches["joint_custom_pass"] = _make_ac_joint_pass(
             ac_stage_size_in_GiB
-        )
-
-    if overlap_scheduling:
-        inductor_patches.update(
-            {
-                "aten_distributed_optimizations.enable_overlap_scheduling": True,
-                "aten_distributed_optimizations.collective_bucketing": True,
-                "aten_distributed_optimizations.insert_overlap_deps": True,
-                "aten_distributed_optimizations.max_compute_pre_fetch": 10,
-            }
         )
 
     def backend(gm, example_inputs):

@@ -6,11 +6,46 @@
 import torch
 from torch.fx.experimental.proxy_tensor import make_fx
 
-from autoparallel.graph_passes.graph_utils import _replace_view_mm_view_with_einsum
+from autoparallel.graph_passes.graph_utils import (
+    _replace_view_mm_view_with_einsum,
+    functionalize_fresh_index_put_mutations,
+)
 
 
 def _count_ops(gm, target):
     return len(gm.graph.find_nodes(op="call_function", target=target))
+
+
+def test_functionalize_fresh_index_put_mutations():
+    def f(x, idx, src):
+        out = torch.empty_like(x)
+        return torch.ops.aten.index_put_.default(out, [idx], src)
+
+    x = torch.zeros(4, 3)
+    idx = torch.tensor([0, 1, 2, 3])
+    src = torch.randn(4, 3)
+    gm = make_fx(f)(x, idx, src)
+
+    assert _count_ops(gm, torch.ops.aten.index_put_.default) == 1
+
+    assert functionalize_fresh_index_put_mutations(gm)
+
+    assert _count_ops(gm, torch.ops.aten.index_put_.default) == 0
+    assert _count_ops(gm, torch.ops.aten.index_put.default) == 1
+    torch.testing.assert_close(gm(x, idx, src), f(x, idx, src))
+
+
+def test_functionalize_fresh_index_put_mutations_skips_inputs():
+    def f(x, idx, src):
+        return torch.ops.aten.index_put_.default(x, [idx], src)
+
+    x = torch.zeros(4, 3)
+    idx = torch.tensor([0, 2])
+    src = torch.randn(2, 3)
+    gm = make_fx(f)(x, idx, src)
+
+    assert not functionalize_fresh_index_put_mutations(gm)
+    assert _count_ops(gm, torch.ops.aten.index_put_.default) == 1
 
 
 def test_forward_pattern_3d():
