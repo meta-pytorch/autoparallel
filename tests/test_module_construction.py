@@ -254,6 +254,8 @@ def test_buffer_alias_reregistered():
         if fqn not in seen.values()
     )
     assert mod.get_buffer(alias_fqn) is mod.get_buffer(canonical_fqn)
+    assert "freqs_cis" not in mod.state_dict()
+    assert "rope.cache" not in mod.state_dict()
 
 
 def test_module_alias_reestablished():

@@ -79,5 +79,4 @@ jobs:
         pip install --no-input --quiet --pre torch --index-url https://download.pytorch.org/whl/nightly/cu126
         pip install --quiet .
         python examples/example_dcp.py
-        # TODO(#436): Re-enable once OpStrategy.__str__ handles None specs in PyTorch.
-        # torchrun --standalone --nproc-per-node 4 examples/example_ds3_local_map.py
+        torchrun --standalone --nproc-per-node 4 examples/example_ds3_local_map.py

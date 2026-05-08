@@ -199,6 +199,29 @@ _SCATTER_OPS = {
 }
 
 
+def functionalize_fresh_index_put_mutations(gm: torch.fx.GraphModule) -> bool:
+    """Rewrite index_put_ on fresh tensors to the functional index_put form."""
+    changed = False
+    for node in gm.graph.nodes:
+        if (
+            node.op != "call_function"
+            or node.target != torch.ops.aten.index_put_.default
+        ):
+            continue
+        base = node.args[0]
+        if not isinstance(base, torch.fx.Node):
+            continue
+        if base.op == "placeholder" or len(base.users) != 1:
+            continue
+        node.target = torch.ops.aten.index_put.default
+        changed = True
+
+    if changed:
+        gm.graph.lint()
+        gm.recompile()
+    return changed
+
+
 def fix_scatter_on_aliased_inputs(graph: torch.fx.Graph) -> None:
     """Insert clone before scatter ops whose input has zero strides (aliased from expand).
 
