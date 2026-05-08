@@ -544,7 +544,7 @@ class AutoParallel:
             strategy = sharding_placement[node]
             solved_input_placements.append(tuple(strategy.output_specs.placements))
 
-        expected_inputs = _compute_expected_inputs(
+        expected_inputs, dynamic_dims = _compute_expected_inputs(
             self._traced_inputs, solved_input_placements, self.mesh
         )
 
@@ -554,7 +554,7 @@ class AutoParallel:
             flat_args, _ = torch.utils._pytree.tree_flatten(args)
             if len(flat_args) != len(expected_inputs):
                 flat_args, _ = torch.utils._pytree.tree_flatten((args, kwargs))
-            _check_forward_args(flat_args, expected_inputs)
+            _check_forward_args(flat_args, expected_inputs, dynamic_dims)
             # NB: don't close over the parameters/buffers, as the user may
             # reassign the module!
             # Use the exact param/buffer FQNs that the compiled graph
