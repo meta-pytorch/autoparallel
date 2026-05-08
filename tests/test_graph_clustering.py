@@ -11,11 +11,7 @@ import torch
 from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
-from autoparallel._testing.models.dsv3 import (
-    DeepSeekV3Model,
-    DeepSeekV3ModelArgs,
-    MoEArgs,
-)
+from autoparallel._testing.models.dsv3 import DeepSeekV3Model, make_dsv3_config
 from autoparallel._testing.models.llama3 import Transformer, TransformerModelArgs
 from autoparallel.api import AutoParallel
 from autoparallel.graph_passes.graph_clustering import get_identical_regions
@@ -215,14 +211,13 @@ def _setup_llama_autop(device_mesh_2d, n_layers=4):
 
 def _setup_ds3_local_map_autop(device_mesh_2d, n_layers=2):
     global_batch_size = 2 * device_mesh_2d.shape[0] * device_mesh_2d.shape[1]
-    moe_args = MoEArgs(mesh=device_mesh_2d)
-    config = DeepSeekV3ModelArgs(
-        n_layers=n_layers,
-        n_dense_layers=0,
-        moe_args=moe_args,
-    )
+    config = make_dsv3_config(n_layers=n_layers, n_dense_layers=0)
     with torch.device("meta"):
-        model = DeepSeekV3Model(config).bfloat16()
+        model = DeepSeekV3Model(
+            config,
+            mesh=device_mesh_2d,
+            compute_dtype=torch.bfloat16,
+        )
     for module in model.modules():
         if hasattr(module, "axis_name"):
             module.axis_name = device_mesh_2d.mesh_dim_names[1]
@@ -231,7 +226,7 @@ def _setup_ds3_local_map_autop(device_mesh_2d, n_layers=2):
         return torch.randint(
             0,
             config.vocab_size,
-            (global_batch_size, config.max_seq_len),
+            (global_batch_size, config.rope.max_seq_len),
             device="cuda",
         )
 
