@@ -32,6 +32,7 @@ from .graph_passes.graph_utils import (
     assert_has_no_collectives,
     cleanup_graph,
     fix_scatter_on_aliased_inputs,
+    functionalize_fresh_index_put_mutations,
     update_joint_with_descriptors,
 )
 from .input_validation import (
@@ -446,10 +447,8 @@ class AutoParallel:
         from torch._inductor.fx_passes.post_grad import view_to_reshape
 
         view_to_reshape(parallel_gm)
+        functionalize_fresh_index_put_mutations(parallel_gm)
 
-        mark_fsdp_all_gather_recomputation(
-            parallel_gm.graph, self.reshard_after_forward
-        )
         t_ac = time.perf_counter()
         # now rename input/param/tangent/output/grad_param/grad_input nodes following
         # our convention
@@ -479,6 +478,10 @@ class AutoParallel:
     def apply_placement(self, sharding_placement):
         sharded_param_dict, sharded_buffer_dict = self._apply_placement_common(
             sharding_placement
+        )
+
+        mark_fsdp_all_gather_recomputation(
+            self.parallel_gm.graph, self.reshard_after_forward
         )
 
         self.parallel_model_fn = parallel_model_fn = aot_compile_joint_with_descriptors(
@@ -545,10 +548,12 @@ class AutoParallel:
             self._traced_inputs, solved_input_placements, self.mesh
         )
 
-        def forward(self, *args):
+        def forward(self, *args, **kwargs):
             # Flatten pytree args (e.g. dicts, nested structures) to tensor
             # leaves, matching how Dynamo flattened the inputs during tracing.
             flat_args, _ = torch.utils._pytree.tree_flatten(args)
+            if len(flat_args) != len(expected_inputs):
+                flat_args, _ = torch.utils._pytree.tree_flatten((args, kwargs))
             _check_forward_args(flat_args, expected_inputs)
             # NB: don't close over the parameters/buffers, as the user may
             # reassign the module!
