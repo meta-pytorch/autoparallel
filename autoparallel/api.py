@@ -11,10 +11,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional, Union
 
 import torch
-from torch._dynamo.functional_export import (
-    _dynamo_graph_capture_for_export,
-    dynamo_graph_capture_for_export,
-)
+from torch._dynamo.functional_export import _dynamo_graph_capture_for_export
 from torch._functorch.aot_autograd import (
     aot_compile_joint_with_descriptors,
     aot_export_joint_with_descriptors,
@@ -35,6 +32,7 @@ from .graph_passes.graph_utils import (
     assert_has_no_collectives,
     cleanup_graph,
     fix_scatter_on_aliased_inputs,
+    functionalize_fresh_index_put_mutations,
     update_joint_with_descriptors,
 )
 from .input_validation import (
@@ -125,48 +123,6 @@ def _make_inputs_dynamic(
     return tree_map_only(torch.Tensor, to_symbolic, inputs)
 
 
-def _post_trace_graph_passes(gm, artifact_name):
-    """Common graph passes after tracing: collectives check, cleanup, view pattern, aliases, logging."""
-    assert_has_no_collectives(gm)
-    cleanup_graph(gm)
-    if _APPLY_VIEW_MM_VIEW_PATTERN:
-        _replace_view_mm_view_with_einsum(gm)
-    _add_alias(gm, version="v2")
-    trace_structured(
-        "artifact",
-        metadata_fn=lambda: {"name": artifact_name, "encoding": "string"},
-        payload_fn=lambda: gm.print_readable(
-            print_output=False, include_stride=True, include_device=True
-        ),
-    )
-
-
-def _prepare_inputs(input_fn, fake_mode):
-    """Prepare inputs for graph tracing: call input_fn, format, optionally make dynamic."""
-    with fake_mode:
-        raw_inputs = input_fn()
-    formatted_inputs = raw_inputs if isinstance(raw_inputs, tuple) else (raw_inputs,)
-    if fake_mode.shape_env is not None:
-        formatted_inputs = _make_inputs_dynamic(formatted_inputs, fake_mode)
-    return formatted_inputs
-
-
-def _tracing_context():
-    """Context managers used during dynamo graph capture."""
-    from contextlib import contextmanager
-
-    @contextmanager
-    def ctx():
-        with (
-            set_dtype_cast(True),
-            enable_local_map_wrapping(),
-            torch._dynamo.utils._disable_saved_tensors_hooks_during_tracing(),
-        ):
-            yield
-
-    return ctx()
-
-
 def build_joint_graph(
     model: torch.nn.Module,
     input_fn: Callable,
@@ -175,21 +131,52 @@ def build_joint_graph(
 ) -> JointGraphResult:
     t0 = time.perf_counter()
     decomp_table = _get_decomp_table()
-    formatted_inputs = _prepare_inputs(input_fn, fake_mode)
+
+    with fake_mode:
+        raw_inputs = input_fn()
+
+    formatted_inputs = raw_inputs if isinstance(raw_inputs, tuple) else (raw_inputs,)
+
+    if fake_mode.shape_env is not None:
+        formatted_inputs = _make_inputs_dynamic(formatted_inputs, fake_mode)
+
     traced_inputs = list(formatted_inputs)
 
-    with _tracing_context():
-        gm = _dynamo_graph_capture_for_export(model)(*formatted_inputs)
-        _restore_state_dict(model, gm)
-        _add_unused_params_and_buffers(model, gm)
+    with (
+        set_dtype_cast(True),
+        enable_local_map_wrapping(),
+        torch._dynamo.utils._disable_saved_tensors_hooks_during_tracing(),
+    ):
+        torch_ir_with_fqn = _dynamo_graph_capture_for_export(model)(*formatted_inputs)
+        _restore_state_dict(model, torch_ir_with_fqn)
+        _add_unused_params_and_buffers(model, torch_ir_with_fqn)
+        # TODO Can't use fake mode here because it clashes with the user level
+        # fake mode. Ideally dynamo should reuse the user level fake mode.
         joint_with_descriptors = aot_export_joint_with_descriptors(
             stack,
-            gm,
+            torch_ir_with_fqn,
             formatted_inputs,
             decompositions=decomp_table,
         )
     gm = joint_with_descriptors.graph_module
-    _post_trace_graph_passes(gm, "autoparallel_joint_graph")
+    assert_has_no_collectives(gm)
+
+    cleanup_graph(gm)
+    if _APPLY_VIEW_MM_VIEW_PATTERN:
+        _replace_view_mm_view_with_einsum(gm)
+    # now add aliases nodes to the graph to
+    # give more room for optimizations
+    _add_alias(gm, version="v2")
+    trace_structured(
+        "artifact",
+        metadata_fn=lambda: {
+            "name": "autoparallel_joint_graph",
+            "encoding": "string",
+        },
+        payload_fn=lambda: gm.print_readable(
+            print_output=False, include_stride=True, include_device=True
+        ),
+    )
 
     logger.info("Graph tracing took %.3fs", time.perf_counter() - t0)
     return JointGraphResult(
@@ -199,334 +186,7 @@ def build_joint_graph(
     )
 
 
-def build_user_backward_graph(model, input_fn, fake_mode):
-    """Build graph from a model whose forward() contains backward().
-
-    Uses trace_autograd_ops=True to capture autograd.grad nodes, then
-    prepare_aot_module_simplified to get a functional_call with proper
-    descriptors and params-first arg ordering. The functional_call is
-    then traced via 2-pass make_fx to decompose autograd.grad and
-    backward formula ops into primitive aten ops.
-    """
-    from torch._functorch._aot_autograd.descriptors import PlainAOTInput, PlainAOTOutput
-    from torch._functorch.aot_autograd import prepare_aot_module_simplified
-    from torch.fx.experimental.proxy_tensor import make_fx
-
-    t0 = time.perf_counter()
-    decomp_table = _get_decomp_table()
-    formatted_inputs = _prepare_inputs(input_fn, fake_mode)
-
-    prev_trace_autograd = torch._dynamo.config.trace_autograd_ops
-    torch._dynamo.config.trace_autograd_ops = True
-    try:
-        with _tracing_context():
-            gm = dynamo_graph_capture_for_export(model)(*formatted_inputs)
-    finally:
-        torch._dynamo.config.trace_autograd_ops = prev_trace_autograd
-
-    # Use prepare_aot_module_simplified to get:
-    # - functional_call: a callable with args in [params, buffers, inputs] order
-    # - full_args_descs: descriptors matching that order
-    # - fake_flat_args: fake tensors in the same order
-    # This handles param lifting, unused params, and FQN mapping.
-    (
-        functional_call,
-        _params_buffers_flat,
-        _params_spec,
-        _buffers_spec,
-        fake_flat_args,
-        full_args_descs,
-        _aot_config,
-        prep_fake_mode,
-        _shape_env,
-        _in_spec,
-        _out_spec,
-        _act_input_indices,
-    ) = prepare_aot_module_simplified(
-        gm,
-        formatted_inputs,
-        None,
-        decomp_table,
-        False,
-        False,
-        flatten=True,
-        force_non_lazy_backward_lowering=True,
-    )
-
-    # Separate tensor args from non-tensor constants (e.g. string "loss and bwd").
-    # make_fx can only trace tensor args as placeholders. Non-tensor args are
-    # baked into the traced function as constants.
-    tensor_positions = [
-        i for i, a in enumerate(fake_flat_args) if isinstance(a, torch.Tensor)
-    ]
-    non_tensor_args = {
-        i: a for i, a in enumerate(fake_flat_args) if not isinstance(a, torch.Tensor)
-    }
-    tensor_flat_args = [fake_flat_args[i] for i in tensor_positions]
-
-    def _functional_call_tensors_only(*tensor_args):
-        # Reconstruct full args with non-tensor constants injected
-        full_args = list(tensor_args)
-        for pos, val in sorted(non_tensor_args.items()):
-            full_args.insert(pos, val)
-        return functional_call(*full_args)
-
-    # Trace functional_call with make_fx. Since functional_call has args
-    # in [params, buffers, inputs] order, the resulting graph's placeholders
-    # will be in that order too — matching full_args_descs for a straight zip.
-    with torch.fx.traceback.preserve_node_meta(), prep_fake_mode:
-        # Pass 1: decompose autograd.grad into backward formula ops
-        decomposed_gm = make_fx(
-            _functional_call_tensors_only,
-            decomposition_table=decomp_table,
-            tracing_mode="fake",
-        )(*tensor_flat_args)
-
-        # Pass 2: decompose backward formula ops (nll_loss_backward,
-        # slice_backward, etc.) into primitive aten ops.
-        interp2 = torch.fx.Interpreter(decomposed_gm)
-        decomposed_gm = make_fx(
-            interp2.run,
-            decomposition_table=decomp_table,
-            tracing_mode="fake",
-        )(*tensor_flat_args)
-
-    gm = decomposed_gm
-
-    # Assign descriptors to placeholders — straight zip since both are
-    # in [params, buffers, inputs] order. Non-tensor args were filtered
-    # before make_fx, so all placeholders are tensors.
-    placeholder_nodes = [n for n in gm.graph.nodes if n.op == "placeholder"]
-    tensor_descs = [
-        d
-        for d, a in zip(full_args_descs, fake_flat_args)
-        if isinstance(a, torch.Tensor)
-    ]
-    assert len(placeholder_nodes) == len(
-        tensor_descs
-    ), f"Placeholder count {len(placeholder_nodes)} != tensor descriptor count {len(tensor_descs)}"
-    for n, desc in zip(placeholder_nodes, tensor_descs):
-        n.meta["desc"] = desc
-
-    # Set the output descriptor list on the output node
-    for n in gm.graph.nodes:
-        if n.op == "output":
-            output_args = (
-                n.args[0] if isinstance(n.args[0], (list, tuple)) else (n.args[0],)
-            )
-            n.meta["desc"] = [PlainAOTOutput(idx=i) for i in range(len(output_args))]
-
-    _post_trace_graph_passes(gm, "autoparallel_user_backward_graph")
-
-    logger.info("User-backward graph tracing took %.3fs", time.perf_counter() - t0)
-
-    # Build traced_inputs from PlainAOTInput placeholders.
-    traced_inputs = [
-        n.meta["val"]
-        for n in gm.graph.nodes
-        if n.op == "placeholder" and isinstance(n.meta.get("desc"), PlainAOTInput)
-    ]
-
-    return gm, traced_inputs
-
-
-class AutoParallelBase:
-    """Low-level API that accepts an FX graph with descriptors and a mesh.
-
-    Provides sharding optimization (ILP) and application. The graph must have
-    ``meta["desc"]`` set on all placeholder and output nodes (ParamAOTInput,
-    BufferAOTInput, PlainAOTInput, GradAOTOutput, PlainAOTOutput, etc.).
-
-    For the higher-level API that traces a model, use ``AutoParallel`` instead.
-    """
-
-    def __init__(
-        self,
-        gm,
-        mesh,
-        *,
-        reshard_after_forward=True,
-        cost_model="nccl",
-        repeated_subgraphs=True,
-        rescale_grad_comm_cost_for_mp=1.0,
-    ):
-        self.gm = gm
-        self.mesh = mesh
-        self.reshard_after_forward = reshard_after_forward
-
-        from .cost_models.collective_runtime_estimation import (
-            get_nccl_topo_config,
-            set_nccl_topo_config,
-        )
-        from .cost_models.nccl_cost_model import NCCLTopoConfig, detect_nccl_topo_config
-
-        self._prev_nccl_config = get_nccl_topo_config()
-        if isinstance(cost_model, NCCLTopoConfig):
-            set_nccl_topo_config(cost_model)
-        elif cost_model == "nccl":
-            set_nccl_topo_config(detect_nccl_topo_config(mesh))
-        else:
-            set_nccl_topo_config(None)
-
-        self.sharding_optimizer = ShardingOptimizer(
-            gm,
-            mesh,
-            rescale_grad_comm_cost_for_mp,
-            repeated_subgraphs=repeated_subgraphs,
-        )
-
-        self.input_constraints = None
-        self.output_constraints = None
-
-    def add_parameter_memory_constraint(self, low=None, high=None):
-        if low is None:
-            low = 0.0
-        if high is None:
-            high = 1.0 / self.mesh.size()
-        assert low <= high, f"low should be <= high, got low{low}, high={high}"
-        self.sharding_optimizer.add_parameter_memory_constraint(low, high)
-
-    def add_input_constraints(self, constraints):
-        assert self.input_constraints is None, "Input constraints have already been set"
-        self.sharding_optimizer.add_sharded_input_constraint(constraints)
-        self.input_constraints = constraints
-
-    def add_output_constraints(self, constraints):
-        assert (
-            self.output_constraints is None
-        ), "Output constraints have already been set"
-        self.sharding_optimizer.add_sharded_output_constraint(constraints)
-        self.output_constraints = constraints
-
-    def optimize_placement(self, verbose=True):
-        self.sharding_placement = self.sharding_optimizer.get_solution(verbose=False)
-
-        if verbose:
-            logger.info(self.sharding_optimizer.get_log(verbose=True))
-
-        trace_structured(
-            "artifact",
-            metadata_fn=lambda: {
-                "name": "autoparallel_sharding_optimizer_log",
-                "encoding": "string",
-            },
-            payload_fn=lambda: self.sharding_optimizer.get_log(
-                verbose=True, colored=False
-            ),
-        )
-
-        if self.sharding_optimizer.prob.status == -1:
-            raise RuntimeError(
-                "The sharding optimizer could not find a feasible solution. "
-                "This typically means the user-specified constraints are "
-                "contradictory or the device mesh is too small for the requested "
-                "sharding. Check the WARNING log for the list of violated "
-                "constraints, and consider relaxing input/output constraints or "
-                "using a larger mesh."
-            )
-
-        return self.sharding_placement
-
-    def apply_sharding(
-        self, sharding_placement, *, params_spec=None, buffers_spec=None
-    ):
-        """Apply sharding to the graph, returning the parallelized graph and sharded dicts.
-
-        If params_spec/buffers_spec are not provided, they are derived from
-        graph node descriptors.
-        """
-        from torch._functorch._aot_autograd.fx_utils import (
-            get_named_buffer_nodes,
-            get_named_param_nodes,
-        )
-        from torch._subclasses.fake_tensor import unset_fake_temporarily
-
-        t0 = time.perf_counter()
-
-        if params_spec is None:
-            params_spec = get_named_param_nodes(self.gm.graph)
-        if buffers_spec is None:
-            buffers_spec = get_named_buffer_nodes(self.gm.graph)
-
-        with unset_fake_temporarily():
-            mesh = self.mesh
-            if mesh.ndim != 1:
-                mesh._flatten()
-
-        # Extract fake_mode from graph placeholder nodes
-        fake_mode = None
-        for node in self.gm.graph.nodes:
-            if node.op == "placeholder":
-                val = node.meta.get("val")
-                if hasattr(val, "fake_mode"):
-                    fake_mode = val.fake_mode
-                    break
-
-        if fake_mode is not None:
-            ctx = fake_mode
-        else:
-            from contextlib import nullcontext
-
-            ctx = nullcontext()
-
-        with ctx:
-            (
-                parallel_gm,
-                sharded_param_dict,
-                sharded_buffer_dict,
-            ) = apply_sharding_to_model(
-                self.gm,
-                sharding_placement,
-                params_spec,
-                buffers_spec,
-            )
-        t_apply = time.perf_counter()
-
-        cleanup_graph(parallel_gm, aggressive=True)
-        t_cleanup = time.perf_counter()
-
-        trace_structured(
-            "artifact",
-            metadata_fn=lambda: {
-                "name": "autoparallel_parallel_graph",
-                "encoding": "string",
-            },
-            payload_fn=lambda: parallel_gm.print_readable(
-                print_output=False, include_stride=True, include_device=True
-            ),
-        )
-        t_trace = time.perf_counter()
-
-        from torch._inductor.fx_passes.post_grad import view_to_reshape
-
-        view_to_reshape(parallel_gm)
-
-        mark_fsdp_all_gather_recomputation(
-            parallel_gm.graph, self.reshard_after_forward
-        )
-        t_ac = time.perf_counter()
-
-        fix_scatter_on_aliased_inputs(parallel_gm.graph)
-
-        logger.info(
-            "Apply placements took %.3fs "
-            "(apply_sharding=%.3fs, cleanup=%.3fs, trace=%.3fs, ac=%.3fs)",
-            time.perf_counter() - t0,
-            t_apply - t0,
-            t_cleanup - t_apply,
-            t_trace - t_cleanup,
-            t_ac - t_trace,
-        )
-        self.parallel_gm = parallel_gm
-        return parallel_gm, sharded_param_dict, sharded_buffer_dict
-
-    def _restore_nccl_config(self):
-        from .cost_models.collective_runtime_estimation import set_nccl_topo_config
-
-        set_nccl_topo_config(self._prev_nccl_config)
-
-
-class AutoParallel(AutoParallelBase):
+class AutoParallel:
     """
     Args:
         mesh: Defines placement options.
@@ -544,11 +204,11 @@ class AutoParallel(AutoParallelBase):
         cost_model: Any = "nccl",
         repeated_subgraphs: bool = True,
     ):
-        # Don't call super().__init__ yet — gm isn't built until __enter__
         self.stack = ExitStack()
         self.fake_mode = (
             FakeTensorMode()
         )  # TODO: maybe need to reuse the model's fake mode
+        # self.fake_mode.allow_scalar_outputs = True
         device = _get_device_from_mesh(mesh)
         if mp_policy is not None:
             mp_policy = canonicalize_mp(mp_policy)
@@ -584,6 +244,23 @@ class AutoParallel(AutoParallelBase):
         # won't be called (Python only calls __exit__ if __enter__
         # succeeds), so we must unwind the stack ourselves.
         try:
+            from .cost_models.collective_runtime_estimation import (
+                get_nccl_topo_config,
+                set_nccl_topo_config,
+            )
+            from .cost_models.nccl_cost_model import (
+                NCCLTopoConfig,
+                detect_nccl_topo_config,
+            )
+
+            self._prev_nccl_config = get_nccl_topo_config()
+            if isinstance(self.cost_model, NCCLTopoConfig):
+                set_nccl_topo_config(self.cost_model)
+            elif self.cost_model == "nccl":
+                set_nccl_topo_config(detect_nccl_topo_config(self.mesh))
+            else:
+                set_nccl_topo_config(None)
+
             self.stack.enter_context(self.mesh)
 
             self.build_model_graph()
@@ -601,17 +278,17 @@ class AutoParallel(AutoParallelBase):
                     # Tiebreak, favoring performing the comms in the largest
                     # dtype
                     rescale_grad_comm_cost_for_mp *= 1.1
-
-            # Initialize the base class now that gm is available
-            AutoParallelBase.__init__(
-                self,
+            sharding_optimizer = ShardingOptimizer(
                 self.gm,
                 self.mesh,
-                reshard_after_forward=self.reshard_after_forward,
-                cost_model=self.cost_model,
+                rescale_grad_comm_cost_for_mp,
                 repeated_subgraphs=self.repeated_subgraphs,
-                rescale_grad_comm_cost_for_mp=rescale_grad_comm_cost_for_mp,
             )
+
+            self.sharding_optimizer = sharding_optimizer
+
+            self.input_constraints = None
+            self.output_constraints = None
 
             self.active = True
 
@@ -623,7 +300,9 @@ class AutoParallel(AutoParallelBase):
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        self._restore_nccl_config()
+        from .cost_models.collective_runtime_estimation import set_nccl_topo_config
+
+        set_nccl_topo_config(self._prev_nccl_config)
         torch._inductor.config.comprehensive_padding = (
             self.old_inductor_comprehensive_padding
         )
@@ -648,39 +327,161 @@ class AutoParallel(AutoParallelBase):
         self.joint_with_descriptors = result.joint_with_descriptors
         self._traced_inputs = result.traced_inputs
 
-    # Override base constraint methods to add _assert_entered checks
+    # TODO: Specify what the low/high meaning is (percentage?)
     def add_parameter_memory_constraint(self, low=None, high=None):
         self._assert_entered()
-        super().add_parameter_memory_constraint(low, high)
+
+        # by default, divide the parameters by the world size
+        if low is None:
+            low = 0.0
+        if high is None:
+            high = 1.0 / self.mesh.size()
+
+        assert low <= high, f"low should be <= high, got low{low}, high={high}"
+
+        self.sharding_optimizer.add_parameter_memory_constraint(low, high)
 
     def add_input_constraints(self, constraints):
         self._assert_entered()
-        super().add_input_constraints(constraints)
+
+        assert self.input_constraints is None, "Input constraints have already been set"
+        self.sharding_optimizer.add_sharded_input_constraint(constraints)
+        self.input_constraints = constraints
 
     def add_output_constraints(self, constraints):
         self._assert_entered()
-        super().add_output_constraints(constraints)
+
+        assert (
+            self.output_constraints is None
+        ), "Output constraints have already been set"
+        # forces sharding of fwd output to be S(0) on first dimension and R on others
+        self.sharding_optimizer.add_sharded_output_constraint(constraints)
+        self.output_constraints = constraints
 
     def optimize_placement(self, verbose=True):
         self._assert_entered()
-        return super().optimize_placement(verbose)
+
+        self.sharding_placement = self.sharding_optimizer.get_solution(verbose=False)
+
+        if verbose:
+            logger.info(self.sharding_optimizer.get_log(verbose=True))
+
+        trace_structured(
+            "artifact",
+            metadata_fn=lambda: {
+                "name": "autoparallel_sharding_optimizer_log",
+                "encoding": "string",
+            },
+            payload_fn=lambda: self.sharding_optimizer.get_log(
+                verbose=True, colored=False
+            ),
+        )
+
+        if self.sharding_optimizer.prob.status == -1:
+            raise RuntimeError(
+                "The sharding optimizer could not find a feasible solution. "
+                "This typically means the user-specified constraints are "
+                "contradictory or the device mesh is too small for the requested "
+                "sharding. Check the WARNING log for the list of violated "
+                "constraints, and consider relaxing input/output constraints or "
+                "using a larger mesh."
+            )
+
+        return self.sharding_placement
 
     def _apply_placement_common(self, sharding_placement):
+        t0 = time.perf_counter()
         self._assert_entered()
-        parallel_gm, sharded_param_dict, sharded_buffer_dict = self.apply_sharding(
-            sharding_placement,
-            params_spec=self.joint_with_descriptors.params_spec,
-            buffers_spec=self.joint_with_descriptors.buffers_spec,
+
+        # TODO: what kind of updates do we have to do?
+        #  - graph obvs
+        #  - flat_args / updated_flat_args
+        # OTHER THINGS
+        #  - subclass_meta
+        #  - wrappers
+        #    - contains another instance of subclass info in self
+        #    - quite a lot of use of runtime_metadata
+        #
+        from torch._subclasses.fake_tensor import unset_fake_temporarily
+
+        with unset_fake_temporarily():
+            # creates a new mesh and caches it internally
+            # we don't need to keep a reference to it
+            # TODO: remove ndim == 1 special case once
+            # DeviceMesh._flatten is fixed
+            mesh = self.mesh
+            if mesh.ndim != 1:
+                mesh._flatten()
+        with self.fake_mode:
+            (
+                parallel_gm,
+                sharded_param_dict,
+                sharded_buffer_dict,
+            ) = apply_sharding_to_model(
+                self.gm,
+                sharding_placement,
+                self.joint_with_descriptors.params_spec,
+                self.joint_with_descriptors.buffers_spec,
+            )
+        t_apply = time.perf_counter()
+        # clean it up by removing the added aliases from previous pass
+        # as well as redundant views
+        cleanup_graph(parallel_gm, aggressive=True)
+        t_cleanup = time.perf_counter()
+
+        trace_structured(
+            "artifact",
+            metadata_fn=lambda: {
+                "name": "autoparallel_parallel_graph",
+                "encoding": "string",
+            },
+            payload_fn=lambda: parallel_gm.print_readable(
+                print_output=False, include_stride=True, include_device=True
+            ),
         )
+        t_trace = time.perf_counter()
+
+        # Replace aten.view with aten.reshape unconditionally. Graph passes
+        # (sharding redistributions, collective bucketing) can produce
+        # non-contiguous tensors that break aten.view's contiguity requirement.
+        from torch._inductor.fx_passes.post_grad import view_to_reshape
+
+        view_to_reshape(parallel_gm)
+        functionalize_fresh_index_put_mutations(parallel_gm)
+
+        t_ac = time.perf_counter()
+        # now rename input/param/tangent/output/grad_param/grad_input nodes following
+        # our convention
+        # apply_node_renaming(
+        #    parallel_gm, self.params_len, self.buffer_len, self.metadata
+        # )
+        self.parallel_gm = parallel_gm
         update_joint_with_descriptors(self.joint_with_descriptors, parallel_gm)
+        fix_scatter_on_aliased_inputs(parallel_gm.graph)
         # Allow DCE to remove unused wait_tensor nodes in the backward graph.
         # Pushed onto self.stack so it's restored in AutoParallel.__exit__.
         self.stack.enter_context(_suppress_wait_tensor_side_effect())
-        return sharded_param_dict, sharded_buffer_dict
+        logger.info(
+            "Apply placements took %.3fs "
+            "(apply_sharding=%.3fs, cleanup=%.3fs, trace=%.3fs, ac=%.3fs)",
+            time.perf_counter() - t0,
+            t_apply - t0,
+            t_cleanup - t_apply,
+            t_trace - t_cleanup,
+            t_ac - t_trace,
+        )
+        return (
+            sharded_param_dict,
+            sharded_buffer_dict,
+        )
 
     def apply_placement(self, sharding_placement):
         sharded_param_dict, sharded_buffer_dict = self._apply_placement_common(
             sharding_placement
+        )
+
+        mark_fsdp_all_gather_recomputation(
+            self.parallel_gm.graph, self.reshard_after_forward
         )
 
         self.parallel_model_fn = parallel_model_fn = aot_compile_joint_with_descriptors(
@@ -701,34 +502,26 @@ class AutoParallel(AutoParallelBase):
         aot_config = self.joint_with_descriptors._aot_state.aot_config
         out_spec = self.joint_with_descriptors.out_spec
 
-        _inference_fn_cache = None
+        # Build inference function eagerly so that Dynamo doesn't try
+        # to trace into compiler_fn / RuntimeWrapper.post_compile (both
+        # on its skip list, causing graph breaks under fullgraph=True).
+        _fwd_example_inputs = [
+            n.meta["val"] for n in fwd_only_gm.graph.nodes if n.op == "placeholder"
+        ]
+        _compiled_fwd = compiler_fn(fwd_only_gm, _fwd_example_inputs)
 
-        def _get_inference_fn():
-            nonlocal _inference_fn_cache
-            if _inference_fn_cache is not None:
-                return _inference_fn_cache
-            example_inputs = [
-                n.meta["val"] for n in fwd_only_gm.graph.nodes if n.op == "placeholder"
-            ]
-            compiled = compiler_fn(fwd_only_gm, example_inputs)
+        from torch._functorch._aot_autograd.runtime_wrappers import RuntimeWrapper
 
-            # Wrap with RuntimeWrapper to handle mutation write-back
-            # (e.g. buffer updates like BatchNorm running stats), output
-            # alias handling, and intermediate base stripping.
-            from torch._functorch._aot_autograd.runtime_wrappers import RuntimeWrapper
+        _wrapped_fwd = RuntimeWrapper(
+            indices_of_inps_to_detach=[],
+            trace_joint=False,
+            disable_amp=False,
+        ).post_compile(_compiled_fwd, aot_config, runtime_metadata=fw_metadata)
 
-            wrapped = RuntimeWrapper(
-                indices_of_inps_to_detach=[],
-                trace_joint=False,
-                disable_amp=False,
-            ).post_compile(compiled, aot_config, runtime_metadata=fw_metadata)
-
-            def inference_fn(args):
-                flat_outs = wrapped(args)
-                return torch.utils._pytree.tree_unflatten(flat_outs, out_spec)
-
-            _inference_fn_cache = inference_fn
-            return _inference_fn_cache
+        @torch._dynamo.nonstrict_trace
+        def _inference_fn(args):
+            flat_outs = _wrapped_fwd(args)
+            return torch.utils._pytree.tree_unflatten(flat_outs, out_spec)
 
         # TODO: this probably belongs in the AOTAutograd API
         # TODO: pytree handling
@@ -751,15 +544,17 @@ class AutoParallel(AutoParallelBase):
             strategy = sharding_placement[node]
             solved_input_placements.append(tuple(strategy.output_specs.placements))
 
-        expected_inputs = _compute_expected_inputs(
+        expected_inputs, dynamic_dims = _compute_expected_inputs(
             self._traced_inputs, solved_input_placements, self.mesh
         )
 
-        def forward(self, *args):
+        def forward(self, *args, **kwargs):
             # Flatten pytree args (e.g. dicts, nested structures) to tensor
             # leaves, matching how Dynamo flattened the inputs during tracing.
             flat_args, _ = torch.utils._pytree.tree_flatten(args)
-            _check_forward_args(flat_args, expected_inputs)
+            if len(flat_args) != len(expected_inputs):
+                flat_args, _ = torch.utils._pytree.tree_flatten((args, kwargs))
+            _check_forward_args(flat_args, expected_inputs, dynamic_dims)
             # NB: don't close over the parameters/buffers, as the user may
             # reassign the module!
             # Use the exact param/buffer FQNs that the compiled graph
@@ -773,7 +568,7 @@ class AutoParallel(AutoParallelBase):
                 # NB: don't do self.parallel_model_fn work around Dynamo bug
                 out = parallel_model_fn(boxed_args)
             else:
-                out = _get_inference_fn()(boxed_args)
+                out = _inference_fn(boxed_args)
             return out
 
         self.parallel_model = make_parallel_module(
@@ -895,155 +690,6 @@ def auto_parallel(
         # Optimize and apply
         sharding_placement = autop.optimize_placement(verbose=False)
         parallel_model = autop.apply_placement(sharding_placement)
-
-    return parallel_model
-
-
-class AutoParallelBackward(AutoParallel):
-    """Parallelize a model whose forward() contains backward().
-
-    Similar to ``AutoParallel`` but for models that call ``loss.backward()``
-    inside ``forward()``. The backward is traced as part of the graph via
-    ``torch.autograd.grad`` nodes. The graph is compiled as a single unit
-    (no fwd/bwd split).
-
-    Usage::
-
-        with AutoParallelBackward(model, input_fn, mesh) as ap:
-            ap.add_input_constraints(...)
-            ap.add_output_constraints(...)
-            placement = ap.optimize_placement()
-            parallel_model = ap.apply_placement(placement)
-    """
-
-    def build_model_graph(self):
-        self.gm, self._traced_inputs = build_user_backward_graph(
-            self.model, self.input_fn, self.fake_mode
-        )
-        # Push dynamo's FakeTensorMode onto the stack so that
-        # ShardingOptimizer's cost model runs under fake mode
-        # (matching the forward-only path where aot_export pushes it).
-        for n in self.gm.graph.nodes:
-            if n.op == "placeholder":
-                val = n.meta.get("val")
-                if hasattr(val, "fake_mode"):
-                    self.stack.enter_context(val.fake_mode)
-                    break
-
-    def apply_placement(self, sharding_placement):
-        self._assert_entered()
-        parallel_gm, sharded_param_dict, sharded_buffer_dict = self.apply_sharding(
-            sharding_placement
-        )
-        self.stack.enter_context(_suppress_wait_tensor_side_effect())
-
-        # Compile the full fwd+bwd graph as a single unit (no fwd/bwd split)
-        compiler_fn = self.compiler_fn
-        example_inputs = [
-            n.meta["val"] for n in parallel_gm.graph.nodes if n.op == "placeholder"
-        ]
-        compiled_fn = compiler_fn(parallel_gm, example_inputs)
-
-        from torch._functorch._aot_autograd.fx_utils import (
-            get_named_buffer_nodes,
-            get_named_param_nodes,
-            get_plain_input_and_grad_nodes,
-        )
-
-        graph_param_fqns = list(get_named_param_nodes(self.gm.graph))
-        graph_buffer_fqns = list(get_named_buffer_nodes(self.gm.graph))
-
-        input_nodes = get_plain_input_and_grad_nodes(self.gm.graph)
-        solved_input_placements = []
-        for desc in sorted(input_nodes, key=lambda d: d.idx):
-            node, _grad_node = input_nodes[desc]
-            strategy = sharding_placement[node]
-            solved_input_placements.append(tuple(strategy.output_specs.placements))
-
-        expected_inputs = _compute_expected_inputs(
-            self._traced_inputs, solved_input_placements, self.mesh
-        )
-
-        def forward(self, *args):
-            # Flatten user args and keep only tensors — this matches the
-            # PlainAOTInput order since functional_call puts them after params.
-            flat_args, _ = torch.utils._pytree.tree_flatten(args)
-            flat_args = [a for a in flat_args if isinstance(a, torch.Tensor)]
-            _check_forward_args(flat_args, expected_inputs)
-            # Graph is in [params, buffers, inputs] order (from functional_call)
-            params = [
-                self.get_parameter(fqn).to_local() for fqn in graph_param_fqns
-            ] + [self.get_buffer(fqn).to_local() for fqn in graph_buffer_fqns]
-            boxed_args = [*params, *flat_args]
-            del params
-            return compiled_fn(boxed_args)
-
-        self.parallel_model = make_parallel_module(
-            self.model,
-            sharded_param_dict,
-            sharded_buffer_dict,
-            forward_fn=forward,
-        )
-        return self.parallel_model
-
-
-def auto_parallel_with_backward(
-    model,
-    mesh,
-    sample_inputs,
-    out_shardings,
-    *,
-    mp_policy=None,
-    parameter_memory_budget=None,
-    dynamic=False,
-):
-    """Parallelize a model whose forward() contains backward().
-
-    This is a simplified API that wraps ``AutoParallelBackward``.
-    For more control, use ``AutoParallelBackward`` directly.
-
-    Args:
-        model: Model whose forward() includes backward(). Can be on meta device.
-        mesh: Device mesh defining the distributed topology.
-        sample_inputs: Sample inputs for tracing (same format as auto_parallel).
-        out_shardings: Output sharding specification for non-gradient outputs.
-        mp_policy: Optional mixed precision policy.
-        parameter_memory_budget: Optional (low, high) bounds for parameter memory.
-        dynamic: If True, trace with symbolic batch dimensions.
-
-    Returns:
-        Parallelized module. Call to_empty(device="cuda") and init_weights()
-        before use.
-    """
-    if callable(sample_inputs):
-        raw_inputs = sample_inputs()
-    else:
-        raw_inputs = sample_inputs
-
-    shapes, dtypes, input_placements, treespec, devices = _extract_input_info(
-        raw_inputs, mesh
-    )
-    output_placements = (
-        _flatten_out_shardings(out_shardings) if out_shardings is not None else None
-    )
-    input_fn = _make_input_fn(shapes, dtypes, treespec, devices=devices)
-
-    with AutoParallelBackward(
-        model,
-        input_fn,
-        mesh,
-        mp_policy=mp_policy,
-        dynamic=dynamic,
-    ) as ap:
-        ap.add_input_constraints(input_placements)
-        if parameter_memory_budget is not None:
-            ap.add_parameter_memory_constraint(
-                low=parameter_memory_budget[0], high=parameter_memory_budget[1]
-            )
-        if output_placements is not None:
-            ap.add_output_constraints(output_placements)
-        sharding_placement = ap.optimize_placement(verbose=False)
-        parallel_model = ap.apply_placement(sharding_placement)
 
     return parallel_model
 

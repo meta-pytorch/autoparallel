@@ -9,16 +9,6 @@ import torch
 from torch.distributed.tensor import DeviceMesh
 
 
-def _get_expected_dim_value(exp):
-    """Return a concrete expected dim value when a symbolic dim collapsed to one."""
-    if not isinstance(exp, torch.SymInt):
-        return exp
-    expr = exp.node.expr
-    if expr.is_number:
-        return int(expr)
-    return None
-
-
 def _compute_expected_inputs(traced_inputs, input_placements, mesh):
     """Compute expected runtime inputs by applying sharding to traced global shapes.
 
@@ -32,8 +22,11 @@ def _compute_expected_inputs(traced_inputs, input_placements, mesh):
             by the solver's solution.
         mesh: The device mesh.
 
-    Returns a flat list of meta tensors (for tensor inputs) or raw values
-    (for non-tensor inputs).
+    Returns:
+        A tuple of (expected_inputs, dynamic_dims) where expected_inputs is a
+        flat list of meta tensors (for tensor inputs) or raw values (for
+        non-tensor inputs), and dynamic_dims is a set of (arg_index, dim) pairs
+        indicating which dimensions are dynamic and should not be checked.
     """
     import torch.utils._pytree as pytree
     from torch.distributed.tensor.placement_types import Shard
@@ -41,11 +34,16 @@ def _compute_expected_inputs(traced_inputs, input_placements, mesh):
     flat_inputs, _ = pytree.tree_flatten(traced_inputs)
 
     result = []
+    dynamic_dims: set[tuple[int, int]] = set()
+    result_idx = 0
     tensor_idx = 0
     for inp in flat_inputs:
         if isinstance(inp, torch.Tensor):
             placements = input_placements[tensor_idx]
             local_shape = list(inp.shape)
+            for d, s in enumerate(inp.shape):
+                if isinstance(s, torch.SymInt) and not s.node.expr.is_number:
+                    dynamic_dims.add((result_idx, d))
             for mesh_dim, placement in enumerate(placements):
                 if isinstance(placement, Shard):
                     dim = placement.dim
@@ -57,15 +55,21 @@ def _compute_expected_inputs(traced_inputs, input_placements, mesh):
             tensor_idx += 1
         else:
             result.append(inp)
+        result_idx += 1
 
-    return result
+    return result, dynamic_dims
 
 
-def _check_forward_args(args, expected_inputs):
+def _check_forward_args(args, expected_inputs, dynamic_dims=frozenset()):
     """Validate that forward() args match the shapes/dtypes used during tracing.
 
-    When dynamic shapes are enabled, dimensions that are SymInt in the expected
-    shape accept any size. Concrete dimensions are checked exactly.
+    Dynamic dimensions (identified by dynamic_dims) accept any size.
+    Concrete dimensions are checked exactly.
+
+    Args:
+        args: The actual forward arguments (flat list).
+        expected_inputs: Expected shapes from _compute_expected_inputs.
+        dynamic_dims: Set of (arg_index, dim) pairs for dynamic dimensions.
     """
     if len(args) != len(expected_inputs):
         raise ValueError(
@@ -85,10 +89,11 @@ def _check_forward_args(args, expected_inputs):
                     f"but expected {len(expected.shape)} dims"
                 )
             for dim, (actual, exp) in enumerate(zip(arg.shape, expected.shape)):
-                expected_dim = _get_expected_dim_value(exp)
-                if expected_dim is None:
+                if (i, dim) in dynamic_dims:
                     continue
-                if actual != expected_dim:
+                if isinstance(exp, torch.SymInt) and not exp.node.expr.is_number:
+                    continue
+                if actual != exp:
                     raise ValueError(
                         f"AutoParallel: argument {i} has shape {tuple(arg.shape)} "
                         f"but expected {tuple(expected.shape)}"
