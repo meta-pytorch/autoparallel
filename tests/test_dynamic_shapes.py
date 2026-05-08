@@ -1384,8 +1384,8 @@ def test_dynamic_check_forward_args_accepts_different_batch(device_mesh_1d):
             autop._traced_inputs, autop.input_constraints, device_mesh_1d
         )
 
-    # The expected shapes should have SymInt for the batch dim
-    assert isinstance(expected[0].shape[0], torch.SymInt), "batch dim should be SymInt"
+    # The batch dim should be in dynamic_dims
+    assert (0, 0) in dynamic_dims, "batch dim should be dynamic"
 
     # Different batch sizes should be accepted
     local_bs = bs // device_mesh_1d.size()

@@ -6,7 +6,6 @@
 from autoparallel.api import (
     AutoParallel,
     AutoParallelBackward,
-    AutoParallelBase,
     auto_parallel,
     auto_parallel_with_backward,
 )
@@ -18,7 +17,6 @@ __all__ = [
     "auto_parallel_with_backward",
     "AutoParallel",
     "AutoParallelBackward",
-    "AutoParallelBase",
     "autoparallel_backend",
     "with_sharding_constraint",
 ]
