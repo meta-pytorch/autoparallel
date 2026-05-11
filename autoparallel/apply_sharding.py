@@ -362,7 +362,13 @@ def _make_local_args(gm, sharding_placement):
 
     local_args = []
     for node in gm.graph.find_nodes(op="placeholder"):
-        tensor = node.meta["val"]
+        val = node.meta.get("val")
+        if not isinstance(val, torch.Tensor):
+            # Non-tensor placeholders (e.g. baked-in booleans/strings):
+            # pass through the original value so the arg count stays aligned.
+            local_args.append(val)
+            continue
+        tensor = val
         tgt_spec = sharding_placement[node].input_specs[0]
         mesh = tgt_spec.mesh
         curr_placement = (Replicate(),) * mesh.ndim
