@@ -136,7 +136,7 @@ def aten_autobucketing_reordering_pass(
         create_execution_trace(
             new_gm,
             configs.custom_runtime_estimation,
-            f"fake_trace_{configs._counter}.json",
+            file_path=f"fake_trace_{configs._counter}.json",
         )
         configs._counter += 1
     return new_gm
