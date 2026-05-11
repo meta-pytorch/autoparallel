@@ -71,6 +71,15 @@ def _check_forward_args(args, expected_inputs, dynamic_dims=frozenset()):
         expected_inputs: Expected shapes from _compute_expected_inputs.
         dynamic_dims: Set of (arg_index, dim) pairs for dynamic dimensions.
     """
+    # Skip validation during make_fx tracing -- FakeTensors have different
+    # device/repr than the meta tensors used during AutoParallel tracing.
+    if any(
+        a.is_meta or getattr(a, "fake_mode", None) is not None
+        for a in args
+        if isinstance(a, torch.Tensor)
+    ):
+        return
+
     if len(args) != len(expected_inputs):
         raise ValueError(
             f"AutoParallel: expected {len(expected_inputs)} arguments "
