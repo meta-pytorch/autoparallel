@@ -51,3 +51,24 @@ jobs:
         # Check that AutoParallel and TorchTitan DeepSeek V3 produce matching
         # distributed loss and gradient norms for the same 4-GPU debug shape.
         torchrun --standalone --nproc-per-node 4 ../tests/torchtitan_dsv3_equivalence.py
+
+        # Run TorchTitan GraphTrainer AutoParallel integration tests.
+        rm -rf /tmp/graph_trainer_autoparallel_tests
+        mkdir -p /tmp/graph_trainer_autoparallel_tests
+        trap 'rm -rf /tmp/graph_trainer_autoparallel_tests' EXIT
+        python -m torchtitan.experiments.graph_trainer.tests.integration_tests \
+          /tmp/graph_trainer_autoparallel_tests/llama3 \
+          --test_suite graph_trainer_autoparallel \
+          --test_name autoparallel_llama3_fsdp_tp \
+          --gpu_arch_type cuda \
+          --ngpu 4
+        NCCL_NVLS_ENABLE=0 python -m torchtitan.experiments.graph_trainer.tests.integration_tests \
+          /tmp/graph_trainer_autoparallel_tests/deepseek_v3 \
+          --test_suite graph_trainer_autoparallel_h100 \
+          --test_name autoparallel_deepseek_v3_efsdp_ep \
+          --gpu_arch_type cuda \
+          --ngpu 4
+
+        # Run TorchTitan GraphTrainer AutoParallel numerics tests.
+        pytest torchtitan/experiments/graph_trainer/tests/test_numerics.py::TestGraphTrainerAutoParallelNumerics::test_llama3_aot_fx_trace_autoparallel_vs_eager -v
+        NCCL_NVLS_ENABLE=0 pytest torchtitan/experiments/graph_trainer/tests/test_numerics.py::TestGraphTrainerAutoParallelNumerics::test_deepseek_v3_aot_fx_trace_autoparallel_vs_eager -v
