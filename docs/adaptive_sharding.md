@@ -71,14 +71,14 @@ giving `M = 2 × 8192 = 16,384` tokens per DP rank.
 |---|---|---|---|
 | wq, wo | 4,096 | 16,384 > 4,096 | Sequence-parallel |
 | wk, wv | 1,024 | 16,384 > 1,024 | Sequence-parallel |
-| w1, w3 | 14,336 | 16,384 > 14,336 | Sequence-parallel (marginal) |
-| w2 | 4,096 | 16,384 > 4,096 | Sequence-parallel |
+| w1, w3 | 14,336 | 16,384 ≈ 14,336 | Column-parallel |
+| w2 | 4,096 | 16,384 > 4,096 | Row-parallel (TP) |
 
-At this training config, the NCCL cost model favors sequence-parallel
-across the major linear projections. The MLP gate/up projections (w1/w3)
-are close to the crossover — `M` exceeds `N` by only 14%. With a shorter
-sequence (e.g. `seqlen=4096`, `M = 8,192`), the MLP flips to
-column-parallel while attention stays sequence-parallel.
+The attention projections are firmly in sequence-parallel territory
+(`M/N ≥ 4`). The MLP gate/up projections (w1/w3) are near the crossover
+(`M/N = 1.14`), and the solver chooses column-parallel TP. The
+down-projection w2 uses row-parallel TP, pairing naturally with the
+column-parallel w1/w3.
 
 ### LLaMA3-70B
 
@@ -92,36 +92,43 @@ Same training config: `batch_size=2, seqlen=8192`, `M = 16,384`.
 |---|---|---|---|
 | wq, wo | 8,192 | 16,384 > 8,192 | Sequence-parallel |
 | wk, wv | 1,024 | 16,384 > 1,024 | Sequence-parallel |
-| w1, w3 | 28,672 | 16,384 < 28,672 | **Column-parallel** |
-| w2 | 8,192 | 16,384 > 8,192 | Sequence-parallel |
+| w1, w3 | 28,672 | 16,384 < 28,672 | Column-parallel |
+| w2 | 8,192 | 16,384 > 8,192 | Row-parallel (TP) |
 
-The solver discovers a **hybrid strategy**: sequence-parallel for attention
-projections and column-parallel for the MLP gate/up projections. This
-happens because the 70B MLP has a much larger output dimension (28,672 vs
-14,336 for 8B), pushing those layers below the crossover.
+The 70B follows the same hybrid pattern as the 8B: sequence-parallel for
+attention, column-parallel TP for MLP. The MLP is more firmly in
+column-parallel territory (`M/N = 0.57`) compared to the 8B's marginal
+case.
 
 ### Summary
 
 | Model | Attention | MLP (w1/w3) | Notes |
 |---|---|---|---|
-| LLaMA3-8B (seqlen=8K) | Seq-par | Seq-par (marginal) | Near crossover in MLP |
-| LLaMA3-8B (seqlen=4K) | Seq-par | Col-par | Mixed regime |
-| LLaMA3-70B (seqlen=8K) | Seq-par | Col-par | Hybrid attention/MLP |
+| LLaMA3-8B (seqlen=8K) | Seq-par | Col-par (marginal) | M/N = 1.14 for MLP |
+| LLaMA3-70B (seqlen=8K) | Seq-par | Col-par | M/N = 0.57 for MLP |
+
+Both models use the same hybrid strategy: sequence-parallel for attention
+(where `M > N`) and column-parallel TP for MLP (where `M ≈ N` or `M < N`).
+The key insight is that attention projections have relatively small output
+dimensions (4096 or 8192), making it cheaper to all-gather the weight and
+keep activations sequence-sharded. MLP projections have large output
+dimensions (14336 or 28672), making it cheaper to shard the weight on the
+output dimension and replicate the activation across TP ranks.
 
 ## What This Means in Practice
 
 The conventional parallelism recipe applies column-parallel TP uniformly
-across all linear layers. This was designed for large models (70B+) where
-TP is essential for fitting weights in memory, and where the MLP's large
-output dimension makes column-parallel bandwidth-efficient.
+across all linear layers. The solver instead discovers a hybrid strategy
+that uses sequence-parallel for attention and column-parallel TP for MLP.
+This follows naturally from the `M` vs `N` crossover: attention weights
+are small relative to the number of tokens, while MLP weights are large.
 
-For smaller models like LLaMA3-8B at long sequence lengths, the solver
-finds that sequence-parallel can be more efficient — the activation
-all-gather that column-parallel requires becomes the bottleneck when there
-are many tokens per GPU. This is consistent with the possibility that the
-standard 8-way TP configuration used for LLaMA3-8B training was inherited
-from larger-model recipes rather than optimized specifically for the 8B
-scale.
+The hybrid strategy avoids the weight all-gather cost for MLP (where
+weights are 3.5-7x larger than attention weights) while keeping
+activations sequence-sharded for attention (where the per-GPU activation
+is larger than the weight). The w2 down-projection uses row-parallel TP,
+which pairs with the column-parallel w1/w3 to form the standard
+Megatron-style MLP parallelism.
 
 The NCCL cost model surfaces this trade-off because it prices
 communication faithfully enough for the solver to distinguish between
