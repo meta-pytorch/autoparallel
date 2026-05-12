@@ -219,7 +219,11 @@ def _assert_has_tensor_meta(spec_or_specs, node, label):
 
 class ShardingOptimizer:
     def __init__(
-        self, gm, mesh, rescale_grad_comm_cost_for_mp=1.0, repeated_subgraphs=False
+        self,
+        gm,
+        mesh,
+        force_grad_reduce_in_higher_precision=False,
+        repeated_subgraphs=False,
     ):
         self.orig_gm = gm
         # The optimizer works on a concretized copy of the graph where all
@@ -232,7 +236,9 @@ class ShardingOptimizer:
         self.gm = concrete_gm
         self.graph = concrete_gm.graph
         self.mesh = mesh
-        self.rescale_grad_comm_cost_for_mp = rescale_grad_comm_cost_for_mp
+        self.force_grad_reduce_in_higher_precision = (
+            force_grad_reduce_in_higher_precision
+        )
         self._name_counters: dict[str, int] = {}
         t0 = time.perf_counter()
         self.strats = self.build_sharding_metadata()
@@ -439,7 +445,6 @@ class ShardingOptimizer:
         inp_idx,
         default_comm_cost,
         producer_strategy,
-        grad_param_nodes,
     ):
         """Compute communication and sharding transition costs for transitioning
         from input placement inp_idx to the output_strategy's expected input at argi.
@@ -465,9 +470,6 @@ class ShardingOptimizer:
                 if src_spec.placements != tgt_spec.placements:
                     sharding_transition_cost = 1
 
-        if node in grad_param_nodes:
-            comm_cost = comm_cost / self.rescale_grad_comm_cost_for_mp
-
         return comm_cost, sharding_transition_cost
 
     def _build_decision_vars(self):
@@ -476,9 +478,6 @@ class ShardingOptimizer:
         t_pulp_start = time.perf_counter()
         self.pulp_variables = self._create_pulp_variables()
         t_pulp_end = time.perf_counter()
-        grad_param_nodes = set(
-            x[1] for x in get_param_and_grad_nodes(self.graph).values()
-        )
 
         # Precompute which node indices are cluster-linked so we can
         # copy costs from the root instead of recomputing them.
@@ -528,7 +527,6 @@ class ShardingOptimizer:
                             inp_idx,
                             default_comm_cost,
                             producer_strategy,
-                            grad_param_nodes,
                         )
                         te1 = time.perf_counter()
                         t_edge += te1 - te0
@@ -1423,7 +1421,7 @@ class ShardingOptimizer:
         The multi-input producer (e.g., einsum) is excluded — only edges
         between unary nodes in the pre-cast chain are affected.
         """
-        if self.rescale_grad_comm_cost_for_mp <= 1.0:
+        if not self.force_grad_reduce_in_higher_precision:
             return
 
         # Collect pre-cast node indices

@@ -21,35 +21,101 @@ class SimpleLinear(nn.Module):
         return self.linear(x)
 
 
-def _run_and_get_grad_placements(mesh, model_fn, input_fn, mp_policy):
-    """Run AutoParallel and return the placements of backward dtype_cast nodes."""
+class StackedLinear(nn.Module):
+    """Multiple identical linear layers for testing repeated_subgraphs."""
+
+    def __init__(self, dim, n_layers):
+        super().__init__()
+        self.layers = nn.ModuleList(
+            [nn.Linear(dim, dim, bias=False) for _ in range(n_layers)]
+        )
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
+
+def _run_autop(mesh, model_fn, input_fn, mp_policy, repeated_subgraphs=False):
+    """Run AutoParallel and return the solution and optimizer."""
     with torch.device("meta"):
         model = model_fn()
 
-    with AutoParallel(model, input_fn, mesh, mp_policy) as autop:
+    with AutoParallel(
+        model, input_fn, mesh, mp_policy, repeated_subgraphs=repeated_subgraphs
+    ) as autop:
         autop.add_input_constraints([(Shard(0),) * mesh.ndim])
         autop.add_output_constraints([(Shard(0),) * mesh.ndim])
         sharding_placement = autop.optimize_placement(verbose=False)
 
-    # Find backward dtype_cast nodes and their placements
-    dtype_cast_placements = {}
-    for node, spec in sharding_placement.items():
-        if node.target == torch.ops.autoparallel.dtype_cast.default:
-            # Check if this is a backward cast (bf16->f32 or f32->bf16)
-            # by looking at output dtype vs input dtype
-            if "f32" in str(node.meta.get("val", "")) or "f32" in str(node):
-                dtype_cast_placements[node.name] = spec.output_specs.placements
+    return sharding_placement, autop
 
-    return sharding_placement, dtype_cast_placements, autop
+
+def _assert_no_pre_cast_redistribution(sharding_placement, autop):
+    """Assert that no chosen pre-cast decision var has comm_cost > 0.
+
+    This directly validates the solver constraint: no redistribution
+    should occur on unary-chain edges before the dtype_cast node.
+    """
+    from torch._functorch._aot_autograd.fx_utils import get_param_and_grad_nodes
+
+    opt = autop.sharding_optimizer
+
+    for param, grad in get_param_and_grad_nodes(opt.graph).values():
+        if grad is None:
+            continue
+
+        # Build the pre-cast node set (same logic as the constraint)
+        chain = [grad]
+        n = grad
+        while len(n.all_input_nodes) == 1:
+            parent = n.all_input_nodes[0]
+            if len(parent.all_input_nodes) != 1:
+                break
+            chain.append(parent)
+            n = parent
+
+        cast_idx = None
+        for i, node in enumerate(chain):
+            if node.target == torch.ops.autoparallel.dtype_cast.default:
+                cast_idx = i
+                break
+
+        if cast_idx is None:
+            continue
+
+        pre_cast_node_idxs = set()
+        for node in chain[cast_idx:]:
+            if node in opt.node_map:
+                pre_cast_node_idxs.add(opt.node_map[node])
+
+        # Check that no chosen decision var on a pre-cast node has comm_cost > 0
+        for key in opt.selected_keys:
+            node_idx, argi, out_idx, inp_idx = key
+            if node_idx not in pre_cast_node_idxs:
+                continue
+            dv = opt.decision_vars.get(key)
+            if dv is None:
+                continue
+            assert dv.comm_cost == 0, (
+                f"Pre-cast node {opt.nodes[node_idx].name} has chosen decision var "
+                f"with comm_cost={dv.comm_cost} > 0 (strategy {dv.strategy}). "
+                f"Redistribution should not happen before the dtype_cast."
+            )
+
+        # Also check dtype_cast output has Partial (indirect but readable check)
+        dtype_cast_node = chain[cast_idx]
+        spec = sharding_placement.get(dtype_cast_node)
+        if spec is not None:
+            assert any(p.is_partial() for p in spec.output_specs.placements), (
+                f"dtype_cast {dtype_cast_node.name} should have Partial output "
+                f"(no pre-cast reduction), but got {spec.output_specs.placements}"
+            )
 
 
 @apply_cuda_patches
 def test_grad_reduce_dtype_f32_reduces_after_cast(device_mesh_1d):
-    """With reduce_dtype=f32, gradient reductions should happen after dtype_cast.
-
-    The dtype_cast node should preserve P(sum) placement (no redistribution
-    before the cast), so that the reduce-scatter happens in f32.
-    """
+    """With reduce_dtype=f32, gradient reductions should happen after dtype_cast."""
     dim = 1024
     mesh = device_mesh_1d
 
@@ -62,43 +128,39 @@ def test_grad_reduce_dtype_f32_reduces_after_cast(device_mesh_1d):
     mp_policy = MixedPrecisionPolicy(
         param_dtype=torch.bfloat16, reduce_dtype=torch.float32
     )
-    sharding_placement, dtype_cast_placements, autop = _run_and_get_grad_placements(
-        mesh, model_fn, input_fn, mp_policy
+    sharding_placement, autop = _run_autop(mesh, model_fn, input_fn, mp_policy)
+    _assert_no_pre_cast_redistribution(sharding_placement, autop)
+
+
+@apply_cuda_patches
+def test_grad_reduce_dtype_f32_with_repeated_subgraphs(device_mesh_1d):
+    """Same as above but with repeated_subgraphs=True (graph clustering).
+
+    Verifies the constraint works correctly when cluster-linked nodes
+    copy strategies from representative nodes.
+    """
+    dim = 1024
+    mesh = device_mesh_1d
+
+    def model_fn():
+        return StackedLinear(dim, n_layers=4)
+
+    def input_fn():
+        return torch.randn(2048 * mesh.shape[0], dim, device="cuda")
+
+    mp_policy = MixedPrecisionPolicy(
+        param_dtype=torch.bfloat16, reduce_dtype=torch.float32
     )
-
-    # Find backward dtype_cast nodes (those that cast to f32 in the grad chain)
-    from torch._functorch._aot_autograd.fx_utils import get_param_and_grad_nodes
-
-    opt = autop.sharding_optimizer
-    for param, grad in get_param_and_grad_nodes(opt.graph).values():
-        if grad is None:
-            continue
-        # Walk backward from grad to find dtype_cast
-        n = grad
-        while len(n.all_input_nodes) == 1:
-            parent = n.all_input_nodes[0]
-            if parent.target == torch.ops.autoparallel.dtype_cast.default:
-                # The dtype_cast should have Partial in its output placement,
-                # meaning no reduction happened before the cast
-                spec = sharding_placement.get(parent)
-                if spec is not None:
-                    assert any(p.is_partial() for p in spec.output_specs.placements), (
-                        f"dtype_cast {parent.name} should have Partial output "
-                        f"(no pre-cast reduction), but got {spec.output_specs.placements}"
-                    )
-                break
-            if len(parent.all_input_nodes) != 1:
-                break
-            n = parent
+    sharding_placement, autop = _run_autop(
+        mesh, model_fn, input_fn, mp_policy, repeated_subgraphs=True
+    )
+    _assert_no_pre_cast_redistribution(sharding_placement, autop)
 
 
 @apply_cuda_patches
 def test_grad_reduce_dtype_bf16_allows_early_reduction(device_mesh_1d):
     """With reduce_dtype=bf16 (smaller than param_dtype=f32), the constraint
     should NOT fire, and the optimizer is free to reduce before the cast.
-
-    We verify that the constraint doesn't interfere — the optimizer should
-    find a valid solution without any infeasibility.
     """
     dim = 1024
     mesh = device_mesh_1d
@@ -112,8 +174,24 @@ def test_grad_reduce_dtype_bf16_allows_early_reduction(device_mesh_1d):
     mp_policy = MixedPrecisionPolicy(
         param_dtype=torch.float32, reduce_dtype=torch.bfloat16
     )
-    # This should not raise — the constraint only fires for rescale > 1.0
-    sharding_placement, _, _ = _run_and_get_grad_placements(
-        mesh, model_fn, input_fn, mp_policy
+    sharding_placement, _ = _run_autop(mesh, model_fn, input_fn, mp_policy)
+    assert sharding_placement is not None, "Optimizer should find a feasible solution"
+
+
+@apply_cuda_patches
+def test_grad_reduce_dtype_same_dtype_no_constraint(device_mesh_1d):
+    """With reduce_dtype == param_dtype, no special constraint should fire."""
+    dim = 1024
+    mesh = device_mesh_1d
+
+    def model_fn():
+        return SimpleLinear(dim)
+
+    def input_fn():
+        return torch.randn(2048 * mesh.shape[0], dim, device="cuda")
+
+    mp_policy = MixedPrecisionPolicy(
+        param_dtype=torch.float32, reduce_dtype=torch.float32
     )
+    sharding_placement, _ = _run_autop(mesh, model_fn, input_fn, mp_policy)
     assert sharding_placement is not None, "Optimizer should find a feasible solution"
