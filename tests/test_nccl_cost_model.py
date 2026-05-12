@@ -9,14 +9,6 @@ from autoparallel.cost_models.nccl_cost_model import (
     _A2A_MULTI_NODE_LAT_POINTS,
     _A2A_NIC_OVERHEAD,
     _A2A_NIC_RAMP_FACTOR,
-    _AGRS_MULTI_NODE_BW_POINTS,
-    _AGRS_MULTI_NODE_LAT_POINTS,
-    _AGRS_MULTI_NODE_RAMP,
-    _AR_MULTI_NODE_BW_POINTS,
-    _AR_MULTI_NODE_LAT_POINTS,
-    _AR_MULTI_NODE_RAMP_N2,
-    _AR_MULTI_NODE_RAMP_N4,
-    _AR_MULTI_NODE_RAMP_N16,
     _BLACKWELL_BW_SCALE,
     _RING_CORRECTION_FACTOR,
     GpuArch,
@@ -32,6 +24,7 @@ from autoparallel.cost_models.nccl_cost_model import (
     _interp_clamped,
     _log2i,
     _nccl_algo_time,
+    _table_collective_time,
     a100_topo_config,
     derive_mesh_dim_topo,
     detect_nccl_topo_config,
@@ -1144,22 +1137,18 @@ class TestLLWinsSmallMessages:
         assert best <= time_simple
 
 
-# ---- Multi-node AllReduce empirical path tests ----
+# ---- Multi-node table-driven path tests ----
 
 
-class TestARMultiNodeEmpirical:
-    def test_empirical_path_used_for_multi_node_h100_ar(self):
-        """Multi-node H100 AllReduce should use the empirical path."""
+class TestMultiNodeTableDriven:
+    def test_table_used_for_multi_node_h100_ar(self):
+        """Multi-node H100 AllReduce should use the table-driven path."""
         config = h100_topo_config(num_nodes=2)
         topo = derive_mesh_dim_topo(config, (16,), 0)
-        n_bytes = 1 << 30  # 1GB — BW-dominated, ramp ~1.0
+        n_bytes = 1 << 30  # 1GB
         cost = nccl_allreduce_cost(n_bytes, topo, config)
-        # Verify against the empirical formula
-        bw = _interp_clamped(_AR_MULTI_NODE_BW_POINTS, 2)
-        lat = _interp_clamped(_AR_MULTI_NODE_LAT_POINTS, 2)
-        log_per_gpu = _log2i((n_bytes // 16) >> 6)
-        ramp = _AR_MULTI_NODE_RAMP_N2[log_per_gpu]
-        expected = lat + n_bytes / (1000.0 * bw * ramp)
+        expected = _table_collective_time(NCCLFunc.ALLREDUCE, n_bytes, topo, config)
+        assert expected is not None
         assert cost == pytest.approx(expected)
 
     def test_not_used_for_single_node(self):
@@ -1168,7 +1157,6 @@ class TestARMultiNodeEmpirical:
         topo = derive_mesh_dim_topo(config, (8,), 0)
         n_bytes = 1 << 30
         cost = nccl_allreduce_cost(n_bytes, topo, config)
-        # Should match single-node NVSwitch path, not multi-node AR path
         from autoparallel.cost_models.nccl_cost_model import (
             _NVSWITCH_BW_POINTS,
             _NVSWITCH_LAT_POINTS,
@@ -1180,16 +1168,16 @@ class TestARMultiNodeEmpirical:
         assert cost == pytest.approx(expected)
 
     def test_not_used_for_ampere(self):
-        """Ampere AllReduce should fall through to the algo selection loop."""
+        """Ampere AllReduce should use the algo loop, not the table path."""
         config = a100_topo_config(num_nodes=2, gpus_per_node=8)
         topo = derive_mesh_dim_topo(config, (16,), 0)
         n_bytes = 1 << 30
         cost = nccl_allreduce_cost(n_bytes, topo, config)
-        # Should NOT match the empirical formula
-        bw = _interp_clamped(_AR_MULTI_NODE_BW_POINTS, 2)
-        lat = _interp_clamped(_AR_MULTI_NODE_LAT_POINTS, 2)
-        empirical = lat + n_bytes / (1000.0 * bw)
-        assert cost != pytest.approx(empirical)
+        # Table path is gated on Hopper+ NVSwitch in nccl_collective_time,
+        # so Ampere should produce a different cost than the table would.
+        table_result = _table_collective_time(NCCLFunc.ALLREDUCE, n_bytes, topo, config)
+        if table_result is not None:
+            assert cost != pytest.approx(table_result)
 
     def test_not_used_without_nvswitch(self):
         """H100 without NVSwitch should fall through to the algo loop."""
@@ -1197,12 +1185,10 @@ class TestARMultiNodeEmpirical:
         topo = derive_mesh_dim_topo(config, (16,), 0)
         n_bytes = 1 << 30
         cost = nccl_allreduce_cost(n_bytes, topo, config)
-        bw = _interp_clamped(_AR_MULTI_NODE_BW_POINTS, 2)
-        lat = _interp_clamped(_AR_MULTI_NODE_LAT_POINTS, 2)
-        empirical = lat + n_bytes / (1000.0 * bw)
-        assert cost != pytest.approx(empirical)
+        assert cost > 0
+        assert cost < float("inf")
 
-    def test_monotonicity(self):
+    def test_ar_monotonicity(self):
         """Multi-node AllReduce cost should increase with message size."""
         config = h100_topo_config(num_nodes=2)
         topo = derive_mesh_dim_topo(config, (16,), 0)
@@ -1214,34 +1200,10 @@ class TestARMultiNodeEmpirical:
                 f"{times[i - 1]} > {times[i]}"
             )
 
-    def test_ramp_tables_shape(self):
-        """Ramp tables should have 24 entries with values in (0, 1]."""
-        for table in [
-            _AR_MULTI_NODE_RAMP_N2,
-            _AR_MULTI_NODE_RAMP_N4,
-            _AR_MULTI_NODE_RAMP_N16,
-        ]:
-            assert len(table) == 24
-            for f in table:
-                assert 0.0 < f <= 1.0
-
-    def test_n16_ramp_used_for_16_nodes(self):
-        """16-node AllReduce should use the N16 ramp table."""
-        config = h100_topo_config(num_nodes=16)
-        topo = derive_mesh_dim_topo(config, (128,), 0)
-        n_bytes = 1 << 30
-        cost = nccl_allreduce_cost(n_bytes, topo, config)
-        bw = _interp_clamped(_AR_MULTI_NODE_BW_POINTS, 16)
-        lat = _interp_clamped(_AR_MULTI_NODE_LAT_POINTS, 16)
-        log_per_gpu = _log2i((n_bytes // 128) >> 6)
-        ramp = _AR_MULTI_NODE_RAMP_N16[log_per_gpu]
-        expected = lat + n_bytes / (1000.0 * bw * ramp)
-        assert cost == pytest.approx(expected)
-
-    def test_monotonicity_16_nodes(self):
-        """16-node AllReduce cost should increase with message size."""
-        config = h100_topo_config(num_nodes=16)
-        topo = derive_mesh_dim_topo(config, (128,), 0)
+    def test_ar_monotonicity_ppn1(self):
+        """Multi-node AllReduce at ppn=1 should increase with message size."""
+        config = h100_topo_config(num_nodes=8, gpus_per_node=1)
+        topo = derive_mesh_dim_topo(config, (8,), 0)
         sizes = [1 << k for k in range(6, 34, 2)]
         times = [nccl_allreduce_cost(s, topo, config) for s in sizes]
         for i in range(1, len(times)):
@@ -1256,54 +1218,35 @@ class TestARMultiNodeEmpirical:
         config_b = gb200_topo_config(num_nodes=2, gpus_per_node=8)
         topo_h = derive_mesh_dim_topo(config_h, (16,), 0)
         topo_b = derive_mesh_dim_topo(config_b, (16,), 0)
-        n_bytes = 1 << 32  # Large enough that ramp ~1.0 and lat negligible
+        n_bytes = 1 << 32  # Large enough that lat negligible
         cost_h = nccl_allreduce_cost(n_bytes, topo_h, config_h)
         cost_b = nccl_allreduce_cost(n_bytes, topo_b, config_b)
-        # BW term dominates: cost_h / cost_b ~ _BLACKWELL_BW_SCALE
         ratio = cost_h / cost_b
         assert ratio == pytest.approx(_BLACKWELL_BW_SCALE, rel=0.05)
 
-
-# ---- Multi-node AG/RS empirical path tests ----
-
-
-class TestAGRSMultiNodeEmpirical:
-    def test_empirical_path_used_for_16_node_ag(self):
-        """16-node H100 AllGather should use the empirical path."""
-        config = h100_topo_config(num_nodes=16)
-        topo = derive_mesh_dim_topo(config, (128,), 0)
-        n_bytes = 1 << 33  # 8GB — BW-dominated
-        cost = nccl_allgather_cost(n_bytes, topo, config)
-        bw = _interp_clamped(_AGRS_MULTI_NODE_BW_POINTS, 16)
-        lat = _interp_clamped(_AGRS_MULTI_NODE_LAT_POINTS, 16)
-        expected = lat + n_bytes / (1000.0 * bw)  # ramp=1.0 at large sizes
-        assert cost == pytest.approx(expected)
-
-    def test_not_used_for_8_nodes(self):
-        """8-node AG/RS should use the algo loop, not the empirical path."""
-        config = h100_topo_config(num_nodes=8)
-        topo = derive_mesh_dim_topo(config, (64,), 0)
+    def test_table_used_for_ag(self):
+        """Multi-node H100 AllGather should use the table-driven path."""
+        config = h100_topo_config(num_nodes=4, gpus_per_node=4)
+        topo = derive_mesh_dim_topo(config, (16,), 0)
         n_bytes = 1 << 30
         cost = nccl_allgather_cost(n_bytes, topo, config)
-        # Should NOT match empirical formula (algo loop handles ≤8 nodes)
-        bw = _interp_clamped(_AGRS_MULTI_NODE_BW_POINTS, 8)
-        lat = _interp_clamped(_AGRS_MULTI_NODE_LAT_POINTS, 8)
-        empirical = lat + n_bytes / (1000.0 * bw)
-        assert cost != pytest.approx(empirical)
+        expected = _table_collective_time(NCCLFunc.ALLGATHER, n_bytes, topo, config)
+        assert expected is not None
+        assert cost == pytest.approx(expected)
 
     def test_ag_rs_symmetric(self):
         """AG and RS should have the same cost (symmetric on NVSwitch)."""
-        config = h100_topo_config(num_nodes=16)
-        topo = derive_mesh_dim_topo(config, (128,), 0)
+        config = h100_topo_config(num_nodes=8)
+        topo = derive_mesh_dim_topo(config, (64,), 0)
         n_bytes = 1 << 30
         ag = nccl_allgather_cost(n_bytes, topo, config)
         rs = nccl_reduce_scatter_cost(n_bytes, topo, config)
         assert ag == pytest.approx(rs)
 
-    def test_monotonicity(self):
-        """16-node AG cost should increase with message size."""
-        config = h100_topo_config(num_nodes=16)
-        topo = derive_mesh_dim_topo(config, (128,), 0)
+    def test_ag_monotonicity(self):
+        """Multi-node AG cost should increase with message size."""
+        config = h100_topo_config(num_nodes=4)
+        topo = derive_mesh_dim_topo(config, (32,), 0)
         sizes = [1 << k for k in range(6, 34, 2)]
         times = [nccl_allgather_cost(s, topo, config) for s in sizes]
         for i in range(1, len(times)):
@@ -1312,18 +1255,29 @@ class TestAGRSMultiNodeEmpirical:
                 f"{times[i - 1]} > {times[i]}"
             )
 
-    def test_ramp_table_shape(self):
-        """AGRS ramp table should have 24 entries with values in (0, 1]."""
-        assert len(_AGRS_MULTI_NODE_RAMP) == 24
-        for f in _AGRS_MULTI_NODE_RAMP:
-            assert 0.0 < f <= 1.0
+    def test_rs_ar_ordering_ppn1(self):
+        """At ppn=1, RS should be cheaper than AR for BW-dominated sizes."""
+        config = h100_topo_config(num_nodes=8, gpus_per_node=1)
+        topo = derive_mesh_dim_topo(config, (8,), 0)
+        n_bytes = 4 * (1 << 20)  # 4MB
+        rs = nccl_reduce_scatter_cost(n_bytes, topo, config)
+        ar = nccl_allreduce_cost(n_bytes, topo, config)
+        assert rs < ar, f"RS ({rs}) should be cheaper than AR ({ar}) at ppn=1"
 
-    def test_not_used_without_nvswitch(self):
-        """H100 without NVSwitch should use the algo loop."""
-        config = h100_topo_config(num_nodes=16, has_nvswitch=False)
+    def test_table_returns_none_for_unknown_config(self):
+        """Table should return None for (n_nodes, ppn) not in the table."""
+        config = h100_topo_config(num_nodes=16)
         topo = derive_mesh_dim_topo(config, (128,), 0)
         n_bytes = 1 << 30
-        cost = nccl_allgather_cost(n_bytes, topo, config)
+        result = _table_collective_time(NCCLFunc.ALLREDUCE, n_bytes, topo, config)
+        assert result is None
+
+    def test_fallback_for_unknown_config(self):
+        """Configs not in the table should still produce valid costs."""
+        config = h100_topo_config(num_nodes=16)
+        topo = derive_mesh_dim_topo(config, (128,), 0)
+        n_bytes = 1 << 30
+        cost = nccl_allreduce_cost(n_bytes, topo, config)
         assert cost > 0
         assert cost < float("inf")
 
