@@ -269,19 +269,17 @@ class AutoParallel:
             )
             torch._inductor.config.comprehensive_padding = False
 
-            rescale_grad_comm_cost_for_mp = 1.0
-            if self.mp_policy is not None:
-                param_size = self.mp_policy.param_dtype.itemsize
-                reduce_size = self.mp_policy.reduce_dtype.itemsize
-                if param_size != reduce_size:
-                    rescale_grad_comm_cost_for_mp = reduce_size / param_size
-                    # Tiebreak, favoring performing the comms in the largest
-                    # dtype
-                    rescale_grad_comm_cost_for_mp *= 1.1
+            force_grad_reduce_in_higher_precision = (
+                self.mp_policy is not None
+                and self.mp_policy.reduce_dtype is not None
+                and self.mp_policy.param_dtype is not None
+                and self.mp_policy.reduce_dtype.itemsize
+                > self.mp_policy.param_dtype.itemsize
+            )
             sharding_optimizer = ShardingOptimizer(
                 self.gm,
                 self.mesh,
-                rescale_grad_comm_cost_for_mp,
+                force_grad_reduce_in_higher_precision,
                 repeated_subgraphs=self.repeated_subgraphs,
             )
 

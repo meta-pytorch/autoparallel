@@ -219,7 +219,11 @@ def _assert_has_tensor_meta(spec_or_specs, node, label):
 
 class ShardingOptimizer:
     def __init__(
-        self, gm, mesh, rescale_grad_comm_cost_for_mp=1.0, repeated_subgraphs=False
+        self,
+        gm,
+        mesh,
+        force_grad_reduce_in_higher_precision=False,
+        repeated_subgraphs=False,
     ):
         self.orig_gm = gm
         # The optimizer works on a concretized copy of the graph where all
@@ -232,7 +236,9 @@ class ShardingOptimizer:
         self.gm = concrete_gm
         self.graph = concrete_gm.graph
         self.mesh = mesh
-        self.rescale_grad_comm_cost_for_mp = rescale_grad_comm_cost_for_mp
+        self.force_grad_reduce_in_higher_precision = (
+            force_grad_reduce_in_higher_precision
+        )
         self._name_counters: dict[str, int] = {}
         t0 = time.perf_counter()
         self.strats = self.build_sharding_metadata()
@@ -439,7 +445,6 @@ class ShardingOptimizer:
         inp_idx,
         default_comm_cost,
         producer_strategy,
-        grad_param_nodes,
     ):
         """Compute communication and sharding transition costs for transitioning
         from input placement inp_idx to the output_strategy's expected input at argi.
@@ -465,9 +470,6 @@ class ShardingOptimizer:
                 if src_spec.placements != tgt_spec.placements:
                     sharding_transition_cost = 1
 
-        if node in grad_param_nodes:
-            comm_cost = comm_cost / self.rescale_grad_comm_cost_for_mp
-
         return comm_cost, sharding_transition_cost
 
     def _build_decision_vars(self):
@@ -476,9 +478,6 @@ class ShardingOptimizer:
         t_pulp_start = time.perf_counter()
         self.pulp_variables = self._create_pulp_variables()
         t_pulp_end = time.perf_counter()
-        grad_param_nodes = set(
-            x[1] for x in get_param_and_grad_nodes(self.graph).values()
-        )
 
         # Precompute which node indices are cluster-linked so we can
         # copy costs from the root instead of recomputing them.
@@ -528,7 +527,6 @@ class ShardingOptimizer:
                             inp_idx,
                             default_comm_cost,
                             producer_strategy,
-                            grad_param_nodes,
                         )
                         te1 = time.perf_counter()
                         t_edge += te1 - te0
@@ -813,6 +811,7 @@ class ShardingOptimizer:
         self.add_output_input_consistent_constraint()
         self.add_inf_cost_constraint()
         self.add_forward_backward_consistency_constraints()
+        self.add_grad_reduce_dtype_constraints()
 
     # ---- Prefetch overlap ----
 
@@ -1401,6 +1400,72 @@ class ShardingOptimizer:
             self._add_paired_output_constraint(
                 node, tangent_node, "grad_output_constraint"
             )
+
+    def add_grad_reduce_dtype_constraints(self):
+        """Forbid gradient redistribution before the dtype cast.
+
+        When MixedPrecisionPolicy specifies a reduce_dtype larger than
+        param_dtype (e.g., param_dtype=bf16, reduce_dtype=f32), the gradient
+        chain looks like:
+
+            einsum (param_dtype) -> [unary ops] -> dtype_cast -> alias (grad_param)
+
+        We want redistribution to happen after the dtype_cast so that the
+        reduce-scatter runs in reduce_dtype. This is enforced by disabling
+        (forcing to zero) any decision variables on pre-cast edges that
+        would imply a placement change, making redistribution before the
+        cast impossible. Redistribution may still happen after the cast
+        (e.g., at the edge from dtype_cast to the grad_param alias), which
+        is correct since that communication occurs in reduce_dtype.
+
+        The multi-input producer (e.g., einsum) is excluded — only edges
+        between unary nodes in the pre-cast chain are affected.
+        """
+        if not self.force_grad_reduce_in_higher_precision:
+            return
+
+        # Collect pre-cast node indices
+        pre_cast_node_idxs: set[int] = set()
+        for param, grad in get_param_and_grad_nodes(self.graph).values():
+            if grad is None:
+                continue
+
+            # Walk backward from grad through the unary chain, excluding
+            # the first non-unary producer.
+            chain = [grad]
+            n = grad
+            while len(n.all_input_nodes) == 1:
+                parent = n.all_input_nodes[0]
+                if len(parent.all_input_nodes) != 1:
+                    break
+                chain.append(parent)
+                n = parent
+
+            # Find the dtype_cast node in the chain
+            cast_idx = None
+            for i, node in enumerate(chain):
+                if node.target == torch.ops.autoparallel.dtype_cast.default:
+                    cast_idx = i
+                    break
+
+            if cast_idx is None:
+                continue
+
+            # Mark dtype_cast and all pre-cast unary nodes
+            for node in chain[cast_idx:]:
+                if node in self.node_map:
+                    pre_cast_node_idxs.add(self.node_map[node])
+
+        # Disable decision vars on pre-cast edges that imply redistribution
+        for key, dv in self.decision_vars.items():
+            node_idx, argi, out_idx, inp_idx = key
+            if node_idx not in pre_cast_node_idxs:
+                continue
+            if dv.comm_cost > 0:
+                self.prob += (
+                    dv.var == 0,
+                    self._get_next_name("grad_reduce_dtype"),
+                )
 
     def add_parameter_memory_constraint(
         self, memory_factor_low: float, memory_factor_high: float

@@ -2,9 +2,10 @@
 
 With a more faithful communication cost model (the NCCL cost model), the
 solver's choice between sequence-parallel and column-parallel sharding for
-LLaMA3 models is clearly explained by a single ratio: the number of tokens
-per DP rank vs the output dimension of each linear layer. This document
-walks through the trade-off and how it produces different strategies for
+LLaMA3 models is explained by a combination of the forward memory-traffic
+crossover (`M` vs `N`) and backward-pass considerations such as gradient
+reduction costs and residual connection compatibility. This document walks
+through the trade-off and how it produces the solver's strategies for
 LLaMA3-8B and LLaMA3-70B at the same training configuration.
 
 ## Background
@@ -46,15 +47,13 @@ M = N
   less total data.
 
 The crossover point is `M = N`: when the number of tokens per DP rank
-equals the output dimension of the linear layer. This rule is most
-directly relevant for forward projections like wq, wk, wv, wo, w1, and
-w3. The down-projection w2 operates in a row-parallel configuration
-where the trade-off is slightly different, but the same directional
-intuition applies.
-
-This crossover describes the dominant local memory-traffic trade-off for
-individual projections; full-graph solver decisions can also reflect
-redistribution and backward-pass interactions.
+equals the output dimension of the linear layer. This rule describes the
+dominant local memory-traffic trade-off for individual projections.
+However, the full-graph solver also considers backward-pass costs
+(gradient reduction, weight gradient dtype), residual connection layout
+compatibility, and redistribution costs between adjacent ops. These
+additional factors can shift the decision away from what the forward-only
+`M` vs `N` analysis predicts.
 
 ## Impact on LLaMA3 Models
 
@@ -69,16 +68,24 @@ giving `M = 2 × 8192 = 16,384` tokens per DP rank.
 
 | Layer | N | M vs N | Strategy |
 |---|---|---|---|
-| wq, wo | 4,096 | 16,384 > 4,096 | Sequence-parallel |
-| wk, wv | 1,024 | 16,384 > 1,024 | Sequence-parallel |
-| w1, w3 | 14,336 | 16,384 > 14,336 | Sequence-parallel (marginal) |
-| w2 | 4,096 | 16,384 > 4,096 | Sequence-parallel |
+| wq | 4,096 | 16,384 > 4,096 | Column-parallel |
+| wk, wv | 1,024 | 16,384 > 1,024 | Column-parallel |
+| wo | 4,096 | 16,384 > 4,096 | Sequence-parallel |
+| w1, w3 | 14,336 | 16,384 ≈ 14,336 | Column-parallel |
+| w2 | 4,096 | 16,384 > 4,096 | Row-parallel (TP) |
 
-At this training config, the NCCL cost model favors sequence-parallel
-across the major linear projections. The MLP gate/up projections (w1/w3)
-are close to the crossover — `M` exceeds `N` by only 14%. With a shorter
-sequence (e.g. `seqlen=4096`, `M = 8,192`), the MLP flips to
-column-parallel while attention stays sequence-parallel.
+Despite `M > N` for the attention projections (which would favor
+sequence-parallel by the forward-only analysis), the solver chooses
+column-parallel for wq/wk/wv. This is because column-parallel produces
+weight gradients with `P(sum)S(0)` placement — only one reduce-scatter
+dimension — which is cheaper than the `P(sum)P(sum)` gradient from
+sequence-parallel that requires a full 2D reduce-scatter.
+
+The wo projection stays sequence-parallel because its output feeds
+directly into the residual add, which expects `S(0)S(1)` placement.
+Column-parallel wo would produce `S(0)P(sum)`, requiring a costly
+all-reduce before the add. Sequence-parallel wo outputs `S(0)S(1)`,
+matching the residual for free.
 
 ### LLaMA3-70B
 
@@ -90,46 +97,55 @@ Same training config: `batch_size=2, seqlen=8192`, `M = 16,384`.
 
 | Layer | N | M vs N | Strategy |
 |---|---|---|---|
-| wq, wo | 8,192 | 16,384 > 8,192 | Sequence-parallel |
-| wk, wv | 1,024 | 16,384 > 1,024 | Sequence-parallel |
-| w1, w3 | 28,672 | 16,384 < 28,672 | **Column-parallel** |
-| w2 | 8,192 | 16,384 > 8,192 | Sequence-parallel |
+| wq, wo | 8,192 | 16,384 > 8,192 | Column-parallel |
+| wk, wv | 1,024 | 16,384 > 1,024 | Column-parallel |
+| w1, w3 | 28,672 | 16,384 < 28,672 | Column-parallel |
+| w2 | 8,192 | 16,384 > 8,192 | Row-parallel (TP) |
 
-The solver discovers a **hybrid strategy**: sequence-parallel for attention
-projections and column-parallel for the MLP gate/up projections. This
-happens because the 70B MLP has a much larger output dimension (28,672 vs
-14,336 for 8B), pushing those layers below the crossover.
+The 70B uses column-parallel TP uniformly across all projections —
+matching the standard Megatron-style parallelism recipe. With `M/N = 2.0`
+for attention (closer to the crossover than the 8B's `M/N = 4.0`), the
+backward-pass cost of `P(sum)P(sum)` gradient reduction outweighs the
+forward memory-traffic advantage of sequence-parallel. For MLP,
+column-parallel is clearly favored (`M/N = 0.57`).
+
+Unlike the 8B, wo also uses column-parallel here. The larger weight
+size (8192×8192 vs 4096×4096) makes the sequence-parallel weight
+all-gather more expensive, tilting the balance toward column-parallel
+despite the residual add cost.
 
 ### Summary
 
-| Model | Attention | MLP (w1/w3) | Notes |
-|---|---|---|---|
-| LLaMA3-8B (seqlen=8K) | Seq-par | Seq-par (marginal) | Near crossover in MLP |
-| LLaMA3-8B (seqlen=4K) | Seq-par | Col-par | Mixed regime |
-| LLaMA3-70B (seqlen=8K) | Seq-par | Col-par | Hybrid attention/MLP |
+| Model | wq/wk/wv | wo | MLP (w1/w3) | w2 |
+|---|---|---|---|---|
+| LLaMA3-8B | Col-par | Seq-par | Col-par | Row-par |
+| LLaMA3-70B | Col-par | Col-par | Col-par | Row-par |
+
+The 70B converges to standard Megatron-style TP everywhere. The 8B uses
+a hybrid where wo remains sequence-parallel for residual add
+compatibility. In both cases, the MLP uses column-parallel TP paired with
+row-parallel w2.
 
 ## What This Means in Practice
 
-The conventional parallelism recipe applies column-parallel TP uniformly
-across all linear layers. This was designed for large models (70B+) where
-TP is essential for fitting weights in memory, and where the MLP's large
-output dimension makes column-parallel bandwidth-efficient.
+The solver's decisions align with the conventional Megatron-style TP
+recipe for LLaMA3-70B. For the smaller 8B model, the solver discovers a
+minor variation: wo uses sequence-parallel to avoid an all-reduce before
+the residual connection, while the rest of the attention uses
+column-parallel.
 
-For smaller models like LLaMA3-8B at long sequence lengths, the solver
-finds that sequence-parallel can be more efficient — the activation
-all-gather that column-parallel requires becomes the bottleneck when there
-are many tokens per GPU. This is consistent with the possibility that the
-standard 8-way TP configuration used for LLaMA3-8B training was inherited
-from larger-model recipes rather than optimized specifically for the 8B
-scale.
+The `M` vs `N` crossover remains a useful first-order heuristic for
+understanding strategy selection: layers where the weight is large
+relative to the activation (MLP) clearly favor column-parallel, while
+layers with small weights relative to the activation could go either
+way. But the full-graph solver accounts for additional costs — gradient
+reduction in the backward pass, redistribution between adjacent ops, and
+residual connection compatibility — that shift some decisions away from
+the forward-only prediction.
 
-The NCCL cost model surfaces this trade-off because it prices
+The NCCL cost model surfaces these trade-offs because it prices
 communication faithfully enough for the solver to distinguish between
-strategies that differ by small bandwidth margins. The previous default
-cost model inflated all-to-all costs by 5x, which masked these
-differences and pushed the solver toward column-parallel uniformly. With
-more accurate costs, the solver's decisions become interpretable through
-the simple `M` vs `N` lens.
+strategies that differ by small bandwidth margins.
 
 ## SDPA (Attention Computation)
 
