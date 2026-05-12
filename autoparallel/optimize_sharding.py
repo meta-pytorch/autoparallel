@@ -440,6 +440,7 @@ class ShardingOptimizer:
         default_comm_cost,
         producer_strategy,
         grad_param_nodes,
+        grad_chain_nodes=frozenset(),
     ):
         """Compute communication and sharding transition costs for transitioning
         from input placement inp_idx to the output_strategy's expected input at argi.
@@ -467,6 +468,8 @@ class ShardingOptimizer:
 
         if node in grad_param_nodes:
             comm_cost = comm_cost / self.rescale_grad_comm_cost_for_mp
+        elif node in grad_chain_nodes:
+            comm_cost = comm_cost * self.rescale_grad_comm_cost_for_mp
 
         return comm_cost, sharding_transition_cost
 
@@ -479,6 +482,26 @@ class ShardingOptimizer:
         grad_param_nodes = set(
             x[1] for x in get_param_and_grad_nodes(self.graph).values()
         )
+
+        # Extend the rescale to the entire gradient linear chain (not just the
+        # grad_param node itself). For nodes upstream of the grad_param in the
+        # chain, we penalize redistributions (multiply by the rescale factor)
+        # to discourage reductions in the lower-precision dtype before the
+        # dtype_cast. This complements the discount at the grad_param edge
+        # (divide by rescale) which encourages reductions in the higher-precision
+        # dtype after the cast.
+        grad_chain_nodes: set[torch.fx.Node] = set()
+        if self.rescale_grad_comm_cost_for_mp != 1.0:
+            for grad in list(grad_param_nodes):
+                if grad is None:
+                    continue
+                n = grad
+                while len(n.all_input_nodes) == 1:
+                    parent = n.all_input_nodes[0]
+                    if len(parent.all_input_nodes) != 1:
+                        break
+                    grad_chain_nodes.add(parent)
+                    n = parent
 
         # Precompute which node indices are cluster-linked so we can
         # copy costs from the root instead of recomputing them.
@@ -529,6 +552,7 @@ class ShardingOptimizer:
                             default_comm_cost,
                             producer_strategy,
                             grad_param_nodes,
+                            grad_chain_nodes,
                         )
                         te1 = time.perf_counter()
                         t_edge += te1 - te0
