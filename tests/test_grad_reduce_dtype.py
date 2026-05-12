@@ -51,7 +51,9 @@ def _run_autop(mesh, model_fn, input_fn, mp_policy, repeated_subgraphs=False):
     return sharding_placement, autop
 
 
-def _assert_no_pre_cast_redistribution(sharding_placement, autop):
+def _assert_no_pre_cast_redistribution(
+    sharding_placement, autop, require_linked_validation=False
+):
     """Assert that no chosen pre-cast decision var has comm_cost > 0.
 
     This directly validates the solver constraint: no redistribution
@@ -60,6 +62,8 @@ def _assert_no_pre_cast_redistribution(sharding_placement, autop):
     from torch._functorch._aot_autograd.fx_utils import get_param_and_grad_nodes
 
     opt = autop.sharding_optimizer
+    validated_pre_cast_keys = 0
+    validated_linked_keys = 0
 
     for param, grad in get_param_and_grad_nodes(opt.graph).values():
         if grad is None:
@@ -94,9 +98,10 @@ def _assert_no_pre_cast_redistribution(sharding_placement, autop):
             node_idx, argi, out_idx, inp_idx = key
             if node_idx not in pre_cast_node_idxs:
                 continue
-            dv = opt.decision_vars.get(key)
-            if dv is None:
-                continue
+            dv = opt._resolve_decision_var(key)
+            validated_pre_cast_keys += 1
+            if key in opt.cluster_links:
+                validated_linked_keys += 1
             assert dv.comm_cost == 0, (
                 f"Pre-cast node {opt.nodes[node_idx].name} has chosen decision var "
                 f"with comm_cost={dv.comm_cost} > 0 (strategy {dv.strategy}). "
@@ -111,6 +116,12 @@ def _assert_no_pre_cast_redistribution(sharding_placement, autop):
                 f"dtype_cast {dtype_cast_node.name} should have Partial output "
                 f"(no pre-cast reduction), but got {spec.output_specs.placements}"
             )
+
+    assert validated_pre_cast_keys > 0, "Expected to validate at least one pre-cast key"
+    if require_linked_validation:
+        assert (
+            validated_linked_keys > 0
+        ), "Expected to validate at least one cluster-linked pre-cast key"
 
 
 @apply_cuda_patches
@@ -154,7 +165,9 @@ def test_grad_reduce_dtype_f32_with_repeated_subgraphs(device_mesh_1d):
     sharding_placement, autop = _run_autop(
         mesh, model_fn, input_fn, mp_policy, repeated_subgraphs=True
     )
-    _assert_no_pre_cast_redistribution(sharding_placement, autop)
+    _assert_no_pre_cast_redistribution(
+        sharding_placement, autop, require_linked_validation=True
+    )
 
 
 @apply_cuda_patches
