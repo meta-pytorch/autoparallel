@@ -377,6 +377,9 @@ def _has_zero_cost(node):
     if node.target.is_view:
         return True
 
+    if node.target == torch.ops.autoparallel.dtype_cast.default:
+        return True
+
     return False
 
 
