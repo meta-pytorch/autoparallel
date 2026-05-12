@@ -1464,7 +1464,6 @@ class ShardingOptimizer:
             if node_idx not in pre_cast_node_idxs:
                 continue
             if dv.comm_cost > 0:
-                dv.cost = 10000.0
                 self.prob += (
                     dv.var == 0,
                     self._get_next_name("grad_reduce_dtype"),
