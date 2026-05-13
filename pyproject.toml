@@ -24,8 +24,8 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/pytorch-labs/autoparallel"
-Issues = "https://github.com/pytorch-labs/autoparallel/issues"
+Homepage = "https://github.com/meta-pytorch/autoparallel"
+Issues = "https://github.com/meta-pytorch/autoparallel/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["autoparallel"]
@@ -45,11 +45,19 @@ exclude = [
 allow-direct-references = true
 
 [tool.black]
-exclude = "autoparallel/tools/overlap_simulator/repro_.*\\.py"
+exclude = """
+(
+  autoparallel/tools/overlap_simulator/repro_.*\\.py
+  | autoparallel/visualizer/build_display_from_json\\.py
+)
+"""
 
 [tool.isort]
 profile = "black"
 skip_glob = ["autoparallel/tools/overlap_simulator/repro_*.py"]
 
 [tool.mypy]
-exclude = ["autoparallel/tools/overlap_simulator/repro_.*\\.py"]
+exclude = [
+  "autoparallel/tools/overlap_simulator/repro_.*\\.py",
+  "autoparallel/visualizer/build_display_from_json\\.py",
+]

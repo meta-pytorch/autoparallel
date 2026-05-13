@@ -239,6 +239,7 @@ class ShardingOptimizer:
         self.force_grad_reduce_in_higher_precision = (
             force_grad_reduce_in_higher_precision
         )
+        self._constraint_log: list[tuple[str, dict]] = []
         self._name_counters: dict[str, int] = {}
         t0 = time.perf_counter()
         self.strats = self.build_sharding_metadata()
@@ -935,10 +936,14 @@ class ShardingOptimizer:
 
     def _to_orig_solution(self, solution):
         """Translate a solution from concrete-graph nodes to original-graph nodes."""
+        if not self._concrete_to_orig:
+            return solution
         return {self._concrete_to_orig[node]: spec for node, spec in solution.items()}
 
     def _to_concrete_solution(self, solution):
         """Translate a solution from original-graph nodes to concrete-graph nodes."""
+        if not self._orig_to_concrete:
+            return solution
         return {self._orig_to_concrete[node]: spec for node, spec in solution.items()}
 
     def get_solution(self, verbose=False):
@@ -1053,8 +1058,14 @@ class ShardingOptimizer:
             if out_idx is None:
                 continue
 
-            compute_cost = estimate_strategy_runtime_cost(node, strategy)
-            total_compute += compute_cost
+            node_idx = self.node_map[node]
+
+            # Use pre-computed costs from decision vars instead of
+            # estimate_strategy_runtime_cost, which needs node.meta["val"]
+            # (absent on loaded optimizers).
+            dv = self._resolve_decision_var((node_idx, 0, out_idx, 0))
+            num_args = max(len(strategy.input_specs), 1)
+            total_compute += dv.compute_cost * num_args
 
             input_nodes = self._all_input_nodes(node)
             for argi, pred in enumerate(input_nodes):
@@ -1120,6 +1131,41 @@ class ShardingOptimizer:
             violated_constraints_log=self.get_violated_constraints_log(),
         )
 
+    def get_json(self):
+        from autoparallel.export_json import (
+            _normalize_cluster_layer,
+            export_sharding_json,
+        )
+
+        # Build selected DVs keyed by (node, argi) for explicit ordering.
+        selected_by_node: dict[torch.fx.Node, dict[int, DecisionVar]] = {}
+        for key in self.selected_keys:
+            node_idx, argi, out_idx, inp_idx = key
+            node = self.nodes[node_idx]
+            selected_by_node.setdefault(node, {})[argi] = self._resolve_decision_var(
+                key
+            )
+
+        # Build node-level cluster mapping: linked_node -> root_node
+        cluster_roots: dict[torch.fx.Node, torch.fx.Node] = {}
+        for linked_key, root_key in self.cluster_links.items():
+            linked_node = self.nodes[linked_key[0]]
+            root_node = self.nodes[root_key[0]]
+            cluster_roots[linked_node] = root_node
+
+        _normalize_cluster_layer(cluster_roots)
+
+        return export_sharding_json(
+            graph=self.graph,
+            mesh=self.mesh,
+            solution={
+                node: next(iter(dvs_by_argi.values())).strategy
+                for node, dvs_by_argi in selected_by_node.items()
+            },
+            selected_dvs=selected_by_node,
+            cluster_roots=cluster_roots,
+        )
+
     def get_strategy(self, node):
         """Look up the OpStrategy for a node.
 
@@ -1127,6 +1173,33 @@ class ShardingOptimizer:
         """
         node = self._normalize_node(node)
         return self.strats[node]
+
+    # ---- Serialization ----
+
+    def save(self, path):
+        """Save the full optimizer state for later interactive exploration."""
+        from autoparallel.serialization import save_optimizer
+
+        save_optimizer(self, path)
+
+    @classmethod
+    def load(cls, path):
+        """Load optimizer state saved with save()."""
+        from autoparallel.serialization import load_optimizer
+
+        return load_optimizer(cls, path)
+
+    def save_placements(self, path):
+        """Save the current placement choices as a lightweight JSON file."""
+        from autoparallel.serialization import save_placements
+
+        save_placements(self, path)
+
+    def load_placements(self, path):
+        """Load placements from a JSON file and return a dict[Node, OpSpec]."""
+        from autoparallel.serialization import load_placements
+
+        return load_placements(self, path)
 
     def print_costs_for_node(self, node, arg=0, **kwargs):
         from tabulate import tabulate  # type: ignore
@@ -1474,6 +1547,15 @@ class ShardingOptimizer:
 
         Σ_{params} (size_ratio * x_{param}) ≤ memory_limit
         """
+        self._constraint_log.append(
+            (
+                "add_parameter_memory_constraint",
+                {
+                    "memory_factor_low": memory_factor_low,
+                    "memory_factor_high": memory_factor_high,
+                },
+            )
+        )
         param_nodes: list[torch.fx.Node] = get_param_nodes(self.graph)
         elms: list[pulp.LpAffineExpression] = []
         budget_low: float = 0.0
@@ -1507,6 +1589,16 @@ class ShardingOptimizer:
         against the first DTensorSpec element in the tuple.
         """
         node = self._normalize_node(node)
+        self._constraint_log.append(
+            (
+                "add_node_constraint",
+                {
+                    "node_name": node.name,
+                    "placement": placement,
+                    "constraint_name": constraint_name,
+                },
+            )
+        )
         assert node in self.strats, (node, self.strats.keys())
         strat = self.strats[node]
         if placement is None:
@@ -1574,6 +1666,9 @@ class ShardingOptimizer:
         """USER (Category 5a): Force specific placements for input nodes.
         The corresponding gradient inputs are automatically constrained via
         add_forward_backward_consistency_constraints()."""
+        self._constraint_log.append(
+            ("add_sharded_input_constraint", {"input_placements": input_placements})
+        )
         self._add_io_placement_constraints(
             nodes_dict=get_plain_input_and_grad_nodes(self.graph),
             placements=input_placements,
@@ -1594,6 +1689,9 @@ class ShardingOptimizer:
         """USER (Category 5a): Force specific placements for output nodes.
         The corresponding tangent/gradient nodes are automatically constrained via
         add_forward_backward_consistency_constraints()."""
+        self._constraint_log.append(
+            ("add_sharded_output_constraint", {"output_placements": output_placements})
+        )
         self._add_io_placement_constraints(
             nodes_dict=get_plain_output_and_tangent_nodes(self.graph),
             placements=output_placements,

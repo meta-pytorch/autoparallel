@@ -8,7 +8,7 @@ mix) and applies it — no manual parallelism code required.
 > **Early Development Warning** — AutoParallel is experimental. Expect bugs,
 > incomplete features, and APIs that may change. Bugfixes are welcome; please
 > discuss significant changes in the
-> [issue tracker](https://github.com/pytorch-labs/autoparallel/issues) before
+> [issue tracker](https://github.com/meta-pytorch/autoparallel/issues) before
 > starting work.
 
 New to AutoParallel? Start with the [Getting Started guide](docs/getting_started.md).
@@ -22,10 +22,10 @@ New to AutoParallel? Start with the [Getting Started guide](docs/getting_started
 
 ```bash
 # Via SSH
-pip install git+ssh://git@github.com/pytorch-labs/autoparallel.git
+pip install git+ssh://git@github.com/meta-pytorch/autoparallel.git
 
 # Via HTTPS
-pip install git+https://github.com/pytorch-labs/autoparallel.git
+pip install git+https://github.com/meta-pytorch/autoparallel.git
 ```
 
 ## Quick start
@@ -62,6 +62,7 @@ Deeper explanations and advanced topics:
 - [How AutoParallel Chooses a Strategy](docs/how_autoparallel_chooses_a_strategy.md)
 - [Adaptive Sharding: Sequence-Parallel vs Column-Parallel](docs/adaptive_sharding.md)
 - [Using `local_map` for MoE and Custom Communication Patterns](docs/local_map_and_moe.md)
+- [Saving and Loading Optimizer State](docs/save_load.md)
 - [Documentation Index](docs/README.md)
 
 ## Developing

@@ -3,7 +3,6 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
-import re
 from collections import Counter
 
 import torch
@@ -13,18 +12,8 @@ from torch.distributed.tensor.placement_types import Replicate, Shard
 from autoparallel._testing.models.dsv3 import DeepSeekV3Model, make_dsv3_config
 from autoparallel._testing.models.llama3 import Transformer, TransformerModelArgs
 from autoparallel.api import AutoParallel
+from autoparallel.export_json import _get_layer_index
 from autoparallel.graph_passes.graph_clustering import get_identical_regions
-
-
-def _get_layer_index(node):
-    """Extract the transformer layer index from a node's nn_module_stack."""
-    nn_stack = node.meta.get("nn_module_stack") or node.meta.get("fwd_nn_module_stack")
-    if nn_stack:
-        for _key, (module_path, _cls) in nn_stack.items():
-            m = re.search(r"layers\.(\d+)", module_path)
-            if m:
-                return int(m.group(1))
-    return None
 
 
 def _clustered_nodes(clusters):
