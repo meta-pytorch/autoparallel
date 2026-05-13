@@ -597,6 +597,92 @@ def test_compute_optimal_placement_order_ss_to_rs(device_mesh_2d):
         assert "shard_order" in node.meta
 
 
+def test_compute_optimal_placement_order_ss_to_rs_with_grad_chain_redistribution(
+    device_mesh_2d,
+):
+    """Test that the optimization matches even when the grad chain boundary also
+    has a redistribution.
+
+    In models with mixed precision (dtype_cast) and column-parallel TP, the
+    backward grad chain typically looks like:
+
+        einsum (multi-input) → permute → dtype_cast → grad_alias
+
+    The einsum output may have a different placement (e.g., S(0)R) than what
+    the permute expects (P(sum)S(0)), creating a redistribution at the
+    permute node. The grad_alias also has a redistribution (PS(0) → SS from
+    the dtype_cast). Both nodes map to the same source (grad_alias), so the
+    redistribution_map must keep the first entry (at grad_alias) rather than
+    letting the later entry (at permute) overwrite it.
+    """
+    # Build a synthetic graph:
+    #   param → dtype_cast_fwd → permute_fwd → mm (multi-input)
+    #   mm_bwd (multi-input) → permute_bwd → dtype_cast_bwd → grad_alias
+    graph = torch.fx.Graph()
+    param = graph.placeholder("param")
+    x = graph.placeholder("x")
+    dtype_cast_fwd = graph.call_function(torch.ops.aten.clone.default, (param,))
+    permute_fwd = graph.call_function(torch.ops.aten.t.default, (dtype_cast_fwd,))
+    mm_fwd = graph.call_function(torch.ops.aten.mm.default, (x, permute_fwd))
+
+    grad_out = graph.placeholder("grad_out")
+    mm_bwd = graph.call_function(torch.ops.aten.mm.default, (x, grad_out))
+    permute_bwd = graph.call_function(torch.ops.aten.t.default, (mm_bwd,))
+    dtype_cast_bwd = graph.call_function(torch.ops.aten.clone.default, (permute_bwd,))
+    grad_alias = graph.call_function(torch.ops.aten.clone.default, (dtype_cast_bwd,))
+
+    graph.output((mm_fwd, grad_alias))
+    gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+
+    ss = DTensorSpec(device_mesh_2d, (Shard(0), Shard(0)))
+    rs = DTensorSpec(device_mesh_2d, (Replicate(), Shard(0)))
+    sr = DTensorSpec(device_mesh_2d, (Shard(0), Replicate()))
+    ps = DTensorSpec(device_mesh_2d, (Partial(), Shard(0)))
+
+    # The key setup: mm_bwd outputs S(0)R, but permute_bwd expects P(sum)S(0).
+    # This creates a redistribution at permute_bwd from its input (mm_bwd).
+    # The correct redistribution for the optimization is at grad_alias, where
+    # dtype_cast_bwd outputs P(sum)S(0) but grad_alias expects S(0)S(0).
+    sharding_placement = {
+        param: OpSpec(output_specs=ss, input_specs=[ss]),
+        x: OpSpec(output_specs=sr),
+        dtype_cast_fwd: OpSpec(output_specs=ss, input_specs=[ss]),
+        permute_fwd: OpSpec(output_specs=rs, input_specs=[rs]),
+        mm_fwd: OpSpec(output_specs=sr, input_specs=[sr, rs]),
+        grad_out: OpSpec(output_specs=sr),
+        mm_bwd: OpSpec(output_specs=sr, input_specs=[sr, sr]),
+        permute_bwd: OpSpec(output_specs=ps, input_specs=[ps]),
+        dtype_cast_bwd: OpSpec(output_specs=ps, input_specs=[ps]),
+        grad_alias: OpSpec(output_specs=ss, input_specs=[ss]),
+    }
+
+    import unittest.mock as mock
+
+    with mock.patch(
+        "autoparallel.shardings.ordered_sharding.get_param_and_grad_nodes"
+    ) as m:
+        m.return_value = {0: (param, grad_alias)}
+        placement_order = compute_optimal_placement_order_for_parameters(
+            gm, sharding_placement
+        )
+
+    # The optimization must still match: param and grad_alias should be present
+    assert param in placement_order, (
+        "param not in placement_order — redistribution_map overwrite likely "
+        "caused the grad pattern to be lost"
+    )
+    assert grad_alias in placement_order
+
+    # Verify forward chain ordering
+    assert placement_order[param].need_reorder is False
+    assert placement_order[dtype_cast_fwd].need_reorder is False
+    assert placement_order[permute_fwd].need_reorder is True
+
+    # Verify backward chain ordering
+    assert placement_order[grad_alias].need_reorder is True
+    assert placement_order[grad_alias].is_target_reversed_order is True
+
+
 def test_compute_optimal_placement_order_verifies_redistribution_map(device_mesh_2d):
     """Test that get_redistributed_input_placements correctly identifies redistribution.
 
