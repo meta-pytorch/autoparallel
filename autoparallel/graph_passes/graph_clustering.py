@@ -11,7 +11,7 @@ import logging
 import math
 import time
 from collections import defaultdict
-from typing import Optional, cast
+from typing import Optional
 
 import torch
 from torch._dynamo.graph_region_tracker import (
@@ -79,79 +79,6 @@ def _hash_node(node, strategies, input_pickler):
         ),
     )
     return sha256_hash(input_pickler.dumps(key))
-
-
-def _extend_with_sibling_getitems(
-    region_groups: list[list[Region]],
-    node_to_duplicates: dict[Node, IdenticalNodes],
-    strategies: dict[Node, OpStrategy],
-    topological_ranking: dict[Node, int],
-) -> None:
-    """Extend region groups with unclaimed getitem siblings of clustered nodes.
-
-    The backward-BFS expansion only reaches getitem users that happen to be on
-    the main data path.  Sibling tuple projections (e.g. logsumexp, RNG state
-    from SDPA) are left orphaned even though their producer is already aligned
-    across regions.  This post-pass recovers them.
-    """
-    claimed: set[Node] = set()
-    for region_group in region_groups:
-        for region in region_group:
-            claimed.update(region)
-
-    for region_group in region_groups:
-        root_region = region_group[0]
-        num_regions = len(region_group)
-
-        for pos in range(len(root_region)):
-            root_producer = root_region[pos]
-            getitems_by_idx: dict[int, list[Node]] = defaultdict(list)
-            for user in root_producer.users:
-                if (
-                    user.target is operator.getitem
-                    and user not in claimed
-                    and user in strategies
-                ):
-                    getitems_by_idx[cast(int, user.args[1])].append(user)
-
-            for k, root_matches in getitems_by_idx.items():
-                if len(root_matches) != 1:
-                    continue
-                root_getitem = root_matches[0]
-                if root_getitem not in node_to_duplicates:
-                    continue
-                root_dups = node_to_duplicates[root_getitem]
-                root_phase = root_getitem.meta.get("partitioner_tag")
-
-                candidates = [root_getitem]
-                valid = True
-                for other_region in region_group[1:]:
-                    other_producer = other_region[pos]
-                    matches = [
-                        user
-                        for user in other_producer.users
-                        if (
-                            user.target is operator.getitem
-                            and user.args[1] == k
-                            and user not in claimed
-                            and user in strategies
-                            and user in node_to_duplicates
-                            and node_to_duplicates[user] is root_dups
-                            and user.meta.get("partitioner_tag") == root_phase
-                        )
-                    ]
-                    if len(matches) != 1:
-                        valid = False
-                        break
-                    candidates.append(matches[0])
-
-                if valid and len(candidates) == num_regions:
-                    for region, getitem_node in zip(region_group, candidates):
-                        region.append(getitem_node)
-                        claimed.add(getitem_node)
-
-        for region in region_group:
-            region.sort(key=lambda n: topological_ranking[n])
 
 
 def get_identical_regions(
@@ -261,10 +188,6 @@ def get_identical_regions(
     region_groups = [
         region_group for region_group in region_groups if len(region_group[0]) > 1
     ]
-
-    _extend_with_sibling_getitems(
-        region_groups, node_to_duplicates, strategies, topological_ranking
-    )
 
     # sort everything so that we have nodes in topological ranking
     for region_group in region_groups:
