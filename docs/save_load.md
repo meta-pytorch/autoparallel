@@ -47,11 +47,11 @@ opt.remove_constraints(names)
 opt.resolve()
 ```
 
-No GPU, no model code, no process group needed in the notebook.
+No original model code or distributed process group is needed in the notebook. A GPU is not required for loading, inspecting, or re-solving.
 
 ## Workflow 2: Reuse placements in a training script
 
-Save the optimizer's placement choices as a lightweight JSON file, then load them in a different script to skip re-solving.
+Save the optimizer's placement choices as a lightweight JSON file, then reuse them in a later run without calling `optimize_placement()` again. Tracing and ILP construction still happen — only the solve step is skipped.
 
 ```python
 # === First run: solve and save placements ===
@@ -99,5 +99,5 @@ data = opt.get_json()
 ## Requirements and limitations
 
 - **`save()` / `load()`**: Uses `torch.save` (pickle). Same-codebase, same-PyTorch-version only. Custom ops must be registered before loading (the loader imports `autoparallel.cast_parametrization` automatically).
-- **`save_placements()` / `load_placements()`**: Plain JSON. Portable across runs, but the model graph and mesh must match (node names, mesh shape, mesh dim names are all validated on load).
-- **`get_json()`**: Requires a solved optimizer (call `get_solution()` or `optimize_placement()` first). The output is a Python dict, not written to disk — serialize it yourself if needed.
+- **`save_placements()` / `load_placements()`**: Plain JSON. Portable across runs, but the model graph and mesh must match. `load_placements()` validates mesh shape and dim names, and verifies that every saved node name exists in the current graph.
+- **`get_json()`**: Requires a solved optimizer — call `get_solution()` or `optimize_placement()` first, or load a saved optimizer that already contains a solution. The output is a Python dict, not written to disk — serialize it yourself if needed.

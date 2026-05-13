@@ -24,8 +24,8 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/pytorch-labs/autoparallel"
-Issues = "https://github.com/pytorch-labs/autoparallel/issues"
+Homepage = "https://github.com/meta-pytorch/autoparallel"
+Issues = "https://github.com/meta-pytorch/autoparallel/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["autoparallel"]

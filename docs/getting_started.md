@@ -33,7 +33,7 @@ after this guide.
 Install AutoParallel from GitHub:
 
 ```bash
-pip install git+https://github.com/pytorch-labs/autoparallel.git
+pip install git+https://github.com/meta-pytorch/autoparallel.git
 ```
 
 For local development:
