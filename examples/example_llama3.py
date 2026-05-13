@@ -15,6 +15,8 @@ from torch.testing._internal.distributed.fake_pg import FakeStore
 from autoparallel._testing.models.llama3 import Transformer, TransformerModelArgs
 from autoparallel.api import AutoParallel
 from autoparallel.compile import autoparallel_backend
+from autoparallel.cost_models.collective_runtime_estimation import set_nccl_topo_config
+from autoparallel.cost_models.nccl_cost_model import detect_nccl_topo_config
 from autoparallel.graph_passes.auto_bucketing import (
     aten_autobucketing_config,
     aten_autobucketing_reordering_pass,
@@ -94,10 +96,7 @@ def input_fn():
     return x
 
 
-# from autoparallel.cost_models.collective_runtime_estimation import set_nccl_topo_config
-# from autoparallel.cost_models.nccl_cost_model import detect_nccl_topo_config
-
-# set_nccl_topo_config(detect_nccl_topo_config(mesh))
+set_nccl_topo_config(detect_nccl_topo_config(mesh))
 
 autobucketing_level = "aten"
 

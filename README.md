@@ -11,6 +11,8 @@ mix) and applies it — no manual parallelism code required.
 > [issue tracker](https://github.com/pytorch-labs/autoparallel/issues) before
 > starting work.
 
+New to AutoParallel? Start with the [Getting Started guide](docs/getting_started.md).
+
 ## Requirements
 
 - Python >= 3.10
@@ -39,13 +41,33 @@ python examples/example_hf.py --model gpt2 --mesh 8
 
 You should see log output ending with `Forward + backward OK`.
 
-For more examples (LLaMA-3, pipeline parallelism, distributed checkpointing),
+For more examples (LLaMA-3, distributed checkpointing, `local_map` / MoE),
 see the [`examples/`](examples/) directory.
+
+## Documentation
+
+Start here if you're new to AutoParallel:
+
+- [Getting Started](docs/getting_started.md)
+- [Basic Concepts](docs/basic_concepts.md)
+- [API Walkthrough](docs/api_walkthrough.md)
+
+Troubleshooting and common questions:
+
+- [Troubleshooting](docs/troubleshooting.md)
+- [FAQ](docs/faq.md)
+
+Deeper explanations and advanced topics:
+
+- [How AutoParallel Chooses a Strategy](docs/how_autoparallel_chooses_a_strategy.md)
+- [Adaptive Sharding: Sequence-Parallel vs Column-Parallel](docs/adaptive_sharding.md)
+- [Using `local_map` for MoE and Custom Communication Patterns](docs/local_map_and_moe.md)
+- [Documentation Index](docs/README.md)
 
 ## Developing
 
 ```bash
-cd autoparallel
+# Run from the repository root
 pip install -e .
 ```
 

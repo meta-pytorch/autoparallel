@@ -727,163 +727,114 @@ _NVSWITCH_LAT_POINTS: dict[NCCLFunc, tuple[tuple[int, float], ...]] = {
 }
 _BLACKWELL_BW_SCALE = 640.0 / 320.0  # Blackwell/Hopper bw_intra ratio
 
-# --- Multi-node AllReduce bypass -------------------------------------------
+# --- Multi-node tuning table (H100 NVSwitch) --------------------------------
+#
+# NCCL discovers per-(algo, proto) latency and bandwidth via a topology graph
+# search at communicator init time. We can't run this search at optimization
+# time, but the results are deterministic for a given (n_nodes, ppn) on H100
+# NVSwitch. This table captures those values from NCCL 2.27.5 tuning logs,
+# replacing the previous empirical bypass paths that didn't generalize across
+# ppn values.
+#
+# Each table maps (n_nodes, ppn) to per-protocol (lat_us, bw_gbps) tuples
+# in (LL, LL128, SIMPLE) order. AG and RS are symmetric on H100 NVSwitch.
+# Blackwell reuses these tables with BW scaled by _BLACKWELL_BW_SCALE.
 
-# The algo selection loop (Ring/Tree/NVLS/NVLS_TREE) systematically
-# underestimates AR due to latency, BW-ramp, and peak-BW gaps.
-# Fitted from nccl-tests allreduce_perf on H100 NVSwitch at 2/4/8/16/32 nodes.
+# fmt: off
+# AllGather / ReduceScatter — Ring algo (the only eligible algo for AG/RS)
+_H100_AGRS_RING: dict[tuple[int, int], tuple[
+    tuple[float, float], tuple[float, float], tuple[float, float],
+]] = {
+    (2, 1): ((11.6, 48.0), (22.5, 88.3), (22.4, 96.0)),
+    (2, 2): ((11.3, 52.0), (21.8, 117.8), (29.2, 128.0)),
+    (2, 4): ((15.3, 44.6), (29.4, 201.9), (42.8, 219.4)),
+    (2, 8): ((23.3, 41.6), (44.6, 313.2), (70.0, 409.6)),
+    (4, 1): ((21.6, 27.2), (39.5, 58.9), (50.4, 64.0)),
+    (4, 2): ((18.7, 23.3), (33.6, 100.9), (64.0, 109.7)),
+    (4, 4): ((26.7, 21.8), (48.8, 188.4), (91.2, 204.8)),
+    (4, 8): ((42.7, 21.1), (79.2, 303.1), (145.6, 396.4)),
+    (8, 1): ((41.6, 23.3), (73.5, 50.5), (106.4, 54.9)),
+    (8, 2): ((33.5, 21.8), (57.2, 94.2), (133.6, 102.4)),
+    (8, 4): ((49.5, 21.1), (87.6, 182.3), (188.0, 198.2)),
+    (8, 8): ((81.5, 20.7), (148.4, 298.3), (296.8, 390.1)),
+}
 
-# Latency (us) from 1K-message benchmarks (latency-dominated regime).
-_AR_MULTI_NODE_LAT_POINTS = (
-    (2, 29.5),
-    (4, 41.5),
-    (8, 58.7),
-    (16, 67.2),
-    (32, 91.4),
-)
+# AllReduce — Ring algo
+_H100_AR_RING: dict[tuple[int, int], tuple[
+    tuple[float, float], tuple[float, float], tuple[float, float],
+]] = {
+    (2, 1): ((16.6, 24.0), (31.0, 44.2), (36.4, 48.0)),
+    (2, 2): ((16.0, 26.0), (29.6, 58.9), (50.0, 64.0)),
+    (2, 4): ((24.0, 22.3), (44.8, 100.9), (77.2, 109.7)),
+    (2, 8): ((40.0, 20.8), (75.2, 156.6), (131.6, 204.8)),
+    (4, 1): ((36.6, 13.6), (65.0, 29.4), (92.4, 32.0)),
+    (4, 2): ((30.8, 11.7), (53.2, 50.5), (119.6, 54.9)),
+    (4, 4): ((46.8, 10.9), (83.6, 94.2), (174.0, 102.4)),
+    (4, 8): ((78.8, 10.5), (144.4, 151.5), (282.8, 198.2)),
+    (8, 1): ((76.6, 11.7), (133.0, 25.2), (204.4, 27.4)),
+    (8, 2): ((60.4, 10.9), (100.4, 47.1), (258.8, 51.2)),
+    (8, 4): ((92.4, 10.5), (161.2, 91.2), (367.6, 99.1)),
+    (8, 8): ((156.4, 10.4), (282.8, 149.1), (585.2, 195.0)),
+}
 
-# Peak algo BW (GB/s) from 8G benchmarks (BW-dominated regime).
-_AR_MULTI_NODE_BW_POINTS = (
-    (2, 248.6),
-    (4, 166.0),
-    (8, 157.4),
-    (16, 158.9),
-    (32, 151.2),
-)
+# AllReduce — Tree algo
+_H100_AR_TREE: dict[tuple[int, int], tuple[
+    tuple[float, float], tuple[float, float], tuple[float, float],
+]] = {
+    (2, 1): ((16.8, 9.3), (31.0, 31.2), (36.4, 35.2)),
+    (2, 2): ((18.0, 16.6), (33.5, 62.4), (44.4, 70.4)),
+    (2, 4): ((20.4, 16.6), (38.5, 124.8), (60.4, 140.8)),
+    (2, 8): ((25.2, 16.6), (48.5, 124.8), (92.4, 140.8)),
+    (4, 1): ((26.8, 4.9), (48.0, 17.6), (64.4, 18.8)),
+    (4, 2): ((28.0, 8.7), (50.5, 35.2), (72.4, 37.5)),
+    (4, 4): ((30.4, 8.7), (55.5, 70.4), (88.4, 75.1)),
+    (4, 8): ((35.2, 8.7), (65.5, 98.6), (120.4, 122.4)),
+    (8, 1): ((36.8, 4.9), (65.0, 17.6), (92.4, 18.8)),
+    (8, 2): ((38.0, 8.7), (67.5, 35.2), (100.4, 37.5)),
+    (8, 4): ((40.4, 8.7), (72.5, 70.4), (116.4, 75.1)),
+    (8, 8): ((45.2, 8.7), (82.5, 98.6), (148.4, 122.4)),
+}
 
-# BW ramp tables: fraction of peak BW achieved at each per-GPU size bucket.
-# Indexed by log2(per_gpu_bytes >> 6), same scheme as _RING_CORRECTION_FACTOR.
-# Three tables by node count: 2-node has fewer pipeline stages; 4-8 node is
-# intermediate; 16+ node has a different ramp profile because NVLS_TREE
-# dominates the mid-range. Values at tiny indices (where BW term < 0.1us)
-# are set to 1.0 since the ramp value doesn't affect total time there.
-_AR_MULTI_NODE_RAMP_N2 = (
-    # idx: 0     1     2     3     4     5     6     7
-    1.00,
-    1.00,
-    1.00,
-    1.00,
-    0.01,
-    0.02,
-    0.04,
-    0.05,
-    # idx: 8     9    10    11    12    13    14    15
-    0.05,
-    0.08,
-    0.11,
-    0.16,
-    0.24,
-    0.29,
-    0.41,
-    0.56,
-    # idx:16    17    18    19    20    21    22    23
-    0.59,
-    0.75,
-    0.85,
-    0.91,
-    0.96,
-    0.98,
-    1.00,
-    1.00,
-)
+# AllReduce — NVLS_TREE algo (SIMPLE only, available when ppn >= 4)
+_H100_AR_NVLS_TREE: dict[tuple[int, int], tuple[float, float]] = {
+    (2, 4): (53.0, 160.0),
+    (2, 8): (53.0, 266.7),
+    (4, 4): (81.0, 80.0),
+    (4, 8): (81.0, 160.0),
+    (8, 4): (109.0, 80.0),
+    (8, 8): (109.0, 160.0),
+}
+# fmt: on
 
-_AR_MULTI_NODE_RAMP_N4 = (
-    # idx: 0     1     2     3     4     5     6     7
-    1.00,
-    1.00,
-    0.01,
-    0.02,
-    0.03,
-    0.04,
-    0.05,
-    0.06,
-    # idx: 8     9    10    11    12    13    14    15
-    0.09,
-    0.12,
-    0.15,
-    0.21,
-    0.32,
-    0.49,
-    0.66,
-    0.83,
-    # idx:16    17    18    19    20    21    22    23
-    0.95,
-    0.95,
-    0.97,
-    0.99,
+# NVLSTree BW ramp correction. NVLSTree peak BW from the tuning table is only
+# achieved at large per-GPU message sizes. At mid-range sizes the actual BW is
+# much lower due to NVLS protocol startup. Indexed by log2(per_gpu_bytes >> 6),
+# same scheme as _RING_CORRECTION_FACTOR. Fitted from nccl-tests allreduce_perf
+# on H100 NVSwitch at 2/4/8 nodes × ppn=4/8 (configs where NVLSTree is
+# eligible), averaged across node counts.
+_NVLS_TREE_RAMP = (
+    # logSize: 0     1     2     3     4     5     6     7
     1.00,
     1.00,
     1.00,
     1.00,
-)
-
-# Averaged from 16-node and 32-node H100 NVSwitch benchmarks.
-_AR_MULTI_NODE_RAMP_N16 = (
-    # idx: 0     1     2     3     4     5     6     7
     1.00,
     1.00,
-    0.02,
-    0.03,
-    0.03,
-    0.05,
-    0.07,
+    1.00,
+    1.00,
+    # logSize: 8     9    10    11    12    13    14    15
     0.10,
-    # idx: 8     9    10    11    12    13    14    15
-    0.13,
-    0.19,
-    0.19,
-    0.33,
-    0.54,
-    0.71,
-    0.89,
-    0.98,
-    # idx:16    17    18    19    20    21    22    23
-    1.00,
-    1.00,
-    1.00,
-    1.00,
-    1.00,
-    1.00,
-    1.00,
-    1.00,
-)
-
-# --- Multi-node AG/RS bypass (>8 nodes) ------------------------------------
-
-# At ≤8 nodes, the NCCL Ring model (algo selection loop) is accurate for
-# AG/RS. At 16+ nodes, Ring latency (O(nRanks) steps) overestimates by
-# 50-130%. Fitted from nccl-tests allgather/reduce_scatter on H100 NVSwitch.
-# AG and RS are symmetric on NVSwitch so they share constants.
-
-_AGRS_MULTI_NODE_LAT_POINTS = ((16, 219.0), (32, 548.0))
-_AGRS_MULTI_NODE_BW_POINTS = ((16, 320.0), (32, 310.0))
-
-# Ramp table averaged from AG and RS at 16/32 nodes. Protocol transitions
-# (LL→LL128→Simple) cause dips at certain per-GPU sizes; the ramp values
-# smooth over these while preserving the overall BW efficiency curve.
-_AGRS_MULTI_NODE_RAMP = (
-    # idx: 0     1     2     3     4     5     6     7
-    1.00,
-    1.00,
-    1.00,
-    1.00,
-    0.04,
-    0.05,
-    0.04,
-    0.06,
-    # idx: 8     9    10    11    12    13    14    15
-    0.11,
-    0.08,
-    0.16,
-    0.07,
-    0.12,
-    0.22,
-    0.34,
-    0.51,
-    # idx:16    17    18    19    20    21    22    23
-    0.50,
+    0.10,
+    0.15,
+    0.28,
+    0.41,
+    0.55,
     0.72,
-    0.86,
+    0.88,
+    # logSize: 16   17    18    19    20    21    22    23
+    1.00,
+    1.00,
+    1.00,
     1.00,
     1.00,
     1.00,
@@ -1005,6 +956,134 @@ def derive_mesh_dim_topo(
     )
 
 
+def _table_algo_time(
+    algo: NCCLAlgo,
+    proto: NCCLProto,
+    lat: float,
+    bw: float,
+    func: NCCLFunc,
+    n_bytes: int,
+    topo: MeshDimTopo,
+) -> float:
+    """Compute time from a tuning table (lat, bw) entry with size corrections."""
+    effective_bw = bw
+
+    # Tree correction factor from NCCL tuning.cc (line 581-585)
+    if algo == NCCLAlgo.TREE and func == NCCLFunc.ALLREDUCE:
+        log_size = _log2i(n_bytes >> 6)
+        if 0 <= log_size < 23:
+            effective_bw *= _TREE_CORRECTION_FACTOR[proto][log_size]
+
+    # NVLSTree BW ramp: per_gpu_bytes-indexed correction for NVLS protocol
+    # startup. The peak BW from the table is only reached at large per-GPU
+    # sizes; at mid-range sizes the actual throughput is much lower.
+    if algo == NCCLAlgo.NVLS_TREE:
+        log_per_gpu = _log2i((n_bytes // topo.n_ranks) >> 6)
+        if 0 <= log_per_gpu < 24:
+            effective_bw *= _NVLS_TREE_RAMP[log_per_gpu]
+        elif log_per_gpu < 0:
+            effective_bw *= _NVLS_TREE_RAMP[0]
+
+    # Ring plateau effect for multi-node Simple AllReduce (tuning.cc lines 597-599)
+    effective_lat = lat
+    if (
+        algo == NCCLAlgo.RING
+        and proto == NCCLProto.SIMPLE
+        and func == NCCLFunc.ALLREDUCE
+        and n_bytes / (topo.n_channels * topo.n_ranks) >= 64
+    ):
+        effective_lat *= 1.4
+
+    if effective_bw <= 0:
+        return float("inf")
+    return effective_lat + n_bytes / (1000.0 * effective_bw)
+
+
+_PROTOS = (NCCLProto.LL, NCCLProto.LL128, NCCLProto.SIMPLE)
+
+
+def _table_collective_time(
+    func: NCCLFunc,
+    n_bytes: int,
+    topo: MeshDimTopo,
+    config: NCCLTopoConfig,
+) -> float | None:
+    """Table-driven multi-node cost for Hopper+ NVSwitch.
+
+    Returns estimated time in microseconds, or None if the (n_nodes, ppn)
+    combination is not in the table (caller should fall back to the algo loop).
+    """
+    key = (topo.n_nodes, topo.ppn)
+    bw_scale = _BLACKWELL_BW_SCALE if config.arch == GpuArch.BLACKWELL else 1.0
+
+    best = float("inf")
+
+    if func in (NCCLFunc.ALLGATHER, NCCLFunc.REDUCESCATTER):
+        row = _H100_AGRS_RING.get(key)
+        if row is None:
+            return None
+        for i, proto in enumerate(_PROTOS):
+            lat, bw = row[i]
+            t = _table_algo_time(
+                NCCLAlgo.RING,
+                proto,
+                lat,
+                bw * bw_scale,
+                func,
+                n_bytes,
+                topo,
+            )
+            best = min(best, t)
+    else:
+        # AllReduce: Ring + Tree + NVLSTree
+        ring_row = _H100_AR_RING.get(key)
+        if ring_row is None:
+            return None
+        for i, proto in enumerate(_PROTOS):
+            lat, bw = ring_row[i]
+            t = _table_algo_time(
+                NCCLAlgo.RING,
+                proto,
+                lat,
+                bw * bw_scale,
+                func,
+                n_bytes,
+                topo,
+            )
+            best = min(best, t)
+
+        tree_row = _H100_AR_TREE.get(key)
+        if tree_row is not None:
+            for i, proto in enumerate(_PROTOS):
+                lat, bw = tree_row[i]
+                t = _table_algo_time(
+                    NCCLAlgo.TREE,
+                    proto,
+                    lat,
+                    bw * bw_scale,
+                    func,
+                    n_bytes,
+                    topo,
+                )
+                best = min(best, t)
+
+        nvls_tree = _H100_AR_NVLS_TREE.get(key)
+        if nvls_tree is not None:
+            lat, bw = nvls_tree
+            t = _table_algo_time(
+                NCCLAlgo.NVLS_TREE,
+                NCCLProto.SIMPLE,
+                lat,
+                bw * bw_scale,
+                func,
+                n_bytes,
+                topo,
+            )
+            best = min(best, t)
+
+    return best
+
+
 def nccl_collective_time(
     func: NCCLFunc,
     n_bytes: int,
@@ -1013,77 +1092,32 @@ def nccl_collective_time(
 ) -> float:
     """Pick the best algorithm+protocol and return estimated time in microseconds.
 
-    For Hopper+ with NVSwitch on a single node, uses empirical bandwidth
-    and latency fitted from nccl-tests at 2/4/8 GPUs. Multi-node AllReduce
-    and high-node-count AG/RS on Hopper+ NVSwitch also use empirical paths
-    with size-dependent BW ramp tables. Blackwell values are scaled from
-    Hopper by the bw_intra ratio. The algo selection loop is used for all
-    other cases.
+    Three dispatch paths for Hopper+ with NVSwitch:
+      1. Intra-node: empirical BW/lat from nccl-tests at 2/4/8 GPUs.
+      2. Multi-node: table-driven model using NCCL's topology-discovered
+         (lat, bw) constants per (n_nodes, ppn), with size-dependent
+         corrections for NVLSTree BW ramp and Tree correction factor.
+      3. All other configs: NCCL algo selection loop (tuning.cc port).
     """
-    # NVSwitch empirical path for Hopper+ intra-node
-    if (
-        config.arch in (GpuArch.HOPPER, GpuArch.BLACKWELL)
-        and config.has_nvswitch
-        and topo.n_nodes == 1
-    ):
+    is_hopper_nvswitch = (
+        config.arch in (GpuArch.HOPPER, GpuArch.BLACKWELL) and config.has_nvswitch
+    )
+
+    # Path 1: NVSwitch empirical path for Hopper+ intra-node
+    if is_hopper_nvswitch and topo.n_nodes == 1:
         bw = _interp_clamped(_NVSWITCH_BW_POINTS[func], topo.n_ranks)
         if config.arch == GpuArch.BLACKWELL:
             bw *= _BLACKWELL_BW_SCALE
         lat = _interp_clamped(_NVSWITCH_LAT_POINTS[func], topo.n_ranks)
         return lat + n_bytes / (1000.0 * bw)
 
-    # Empirical path for multi-node AllReduce on Hopper+ NVSwitch
-    if (
-        func == NCCLFunc.ALLREDUCE
-        and config.arch in (GpuArch.HOPPER, GpuArch.BLACKWELL)
-        and config.has_nvswitch
-        and topo.n_nodes > 1
-    ):
-        bw = _interp_clamped(_AR_MULTI_NODE_BW_POINTS, topo.n_nodes)
-        if config.arch == GpuArch.BLACKWELL:
-            bw *= _BLACKWELL_BW_SCALE
-        lat = _interp_clamped(_AR_MULTI_NODE_LAT_POINTS, topo.n_nodes)
-        if topo.n_nodes <= 2:
-            ramp_table = _AR_MULTI_NODE_RAMP_N2
-        elif topo.n_nodes <= 8:
-            ramp_table = _AR_MULTI_NODE_RAMP_N4
-        else:
-            ramp_table = _AR_MULTI_NODE_RAMP_N16
-        log_per_gpu = _log2i((n_bytes // topo.n_ranks) >> 6)
-        if 0 <= log_per_gpu < 24:
-            ramp = ramp_table[log_per_gpu]
-        elif log_per_gpu < 0:
-            ramp = ramp_table[0]
-        else:
-            ramp = 1.0
-        if ramp <= 0:
-            return float("inf")
-        return lat + n_bytes / (1000.0 * bw * ramp)
+    # Path 2: Table-driven path for multi-node Hopper+ NVSwitch
+    if is_hopper_nvswitch and topo.n_nodes > 1:
+        result = _table_collective_time(func, n_bytes, topo, config)
+        if result is not None:
+            return result
 
-    # Empirical path for multi-node AG/RS on Hopper+ NVSwitch (>8 nodes).
-    # At ≤8 nodes the Ring model in the algo loop below is accurate; at 16+
-    # nodes Ring latency scales as O(nRanks) which overestimates by 50-130%.
-    if (
-        func in (NCCLFunc.ALLGATHER, NCCLFunc.REDUCESCATTER)
-        and config.arch in (GpuArch.HOPPER, GpuArch.BLACKWELL)
-        and config.has_nvswitch
-        and topo.n_nodes > 8
-    ):
-        bw = _interp_clamped(_AGRS_MULTI_NODE_BW_POINTS, topo.n_nodes)
-        if config.arch == GpuArch.BLACKWELL:
-            bw *= _BLACKWELL_BW_SCALE
-        lat = _interp_clamped(_AGRS_MULTI_NODE_LAT_POINTS, topo.n_nodes)
-        log_per_gpu = _log2i((n_bytes // topo.n_ranks) >> 6)
-        if 0 <= log_per_gpu < 24:
-            ramp = _AGRS_MULTI_NODE_RAMP[log_per_gpu]
-        elif log_per_gpu < 0:
-            ramp = _AGRS_MULTI_NODE_RAMP[0]
-        else:
-            ramp = 1.0
-        if ramp <= 0:
-            return float("inf")
-        return lat + n_bytes / (1000.0 * bw * ramp)
-
+    # Path 3: NCCL algo selection loop
     algos = _eligible_algos(func, config, topo.n_nodes)
     best = float("inf")
     for algo in algos:

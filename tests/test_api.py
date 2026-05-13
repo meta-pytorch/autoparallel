@@ -440,6 +440,64 @@ def test_unused_parameters_captured(device_mesh_1d):
     ), f"unused_linear.bias not found in parallel model params: {param_names}"
 
 
+def test_unused_parameter_full_pipeline(device_mesh_1d):
+    """Unused parameters must not break the full pipeline including inference."""
+    dim = 128
+
+    class Model(nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            self.used_linear = nn.Linear(dim, dim)
+            self.unused_linear = nn.Linear(dim, dim)
+
+        def forward(self, x):
+            return self.used_linear(x)
+
+        def init_weights(self):
+            nn.init.ones_(self.used_linear.weight)
+            nn.init.zeros_(self.used_linear.bias)
+            nn.init.ones_(self.unused_linear.weight)
+            nn.init.zeros_(self.unused_linear.bias)
+
+    with torch.device("meta"):
+        model = Model(dim)
+
+    batch_size = 512
+    local_batch_size = batch_size // device_mesh_1d.size()
+    x = DTensor.from_local(
+        torch.rand(local_batch_size, dim, device="cuda"),
+        device_mesh_1d,
+        [Shard(0)],
+    )
+    parallel_mod = auto_parallel(
+        model,
+        device_mesh_1d,
+        sample_inputs=(x,),
+        out_shardings=(Shard(0),),
+    )
+    parallel_mod.to_empty(device="cuda")
+    parallel_mod.init_weights()
+
+    # Training forward + backward
+    inp = torch.rand(local_batch_size, dim, device="cuda")
+    out = parallel_mod(inp)
+    assert out.shape == (local_batch_size, dim)
+    out.sum().backward()
+
+    # Used params should have gradients
+    assert parallel_mod.used_linear.weight.grad is not None
+    assert parallel_mod.used_linear.bias.grad is not None
+    # Unused params should have no gradient (not None with zeros — actually None)
+    assert parallel_mod.unused_linear.weight.grad is None
+    assert parallel_mod.unused_linear.bias.grad is None
+
+    # Inference forward (exercises extract_forward_graph / deepcopy path)
+    with torch.no_grad():
+        out_infer = parallel_mod(inp)
+    assert out_infer.shape == out.shape
+    torch.testing.assert_close(out_infer, out)
+
+
 def test_aliased_submodule(device_mesh_1d):
     """Test that aliased submodules (two module attrs pointing to the same object) work.
 
@@ -757,3 +815,75 @@ def test_inherited_user_model(device_mesh_1d):
     assert isinstance(parallel_mod, Model)
     assert isinstance(parallel_mod, BaseModel)
     assert parallel_mod.get_num_params() > 0
+
+
+def _make_simple_parallel_mod(device_mesh_1d):
+    dim = 128
+    batch_size = 512
+    local_batch_size = batch_size // device_mesh_1d.size()
+
+    class SimpleLinear(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = nn.Linear(dim, dim)
+
+        def forward(self, x):
+            return self.linear(x)
+
+    with torch.device("meta"):
+        model = SimpleLinear()
+
+    x = DTensor.from_local(
+        torch.randn(local_batch_size, dim, device="cuda"),
+        device_mesh_1d,
+        [Shard(0)],
+    )
+
+    parallel_mod = auto_parallel(
+        model, device_mesh_1d, sample_inputs=(x,), out_shardings=(Shard(0),)
+    )
+    parallel_mod.to_empty(device="cuda")
+    return parallel_mod, local_batch_size, dim
+
+
+def test_compile_fullgraph_training(device_mesh_1d):
+    """torch.compile(fullgraph=True) works in training mode (grad enabled)."""
+    parallel_mod, bs, dim = _make_simple_parallel_mod(device_mesh_1d)
+    torch._dynamo.reset()
+    compiled = torch.compile(parallel_mod, fullgraph=True)
+    x = torch.randn(bs, dim, device="cuda")
+    out = compiled(x)
+    assert out.shape == (bs, dim)
+
+
+def test_compile_fullgraph_inference(device_mesh_1d):
+    """torch.compile(fullgraph=True) works in inference mode (no_grad)."""
+    parallel_mod, bs, dim = _make_simple_parallel_mod(device_mesh_1d)
+    torch._dynamo.reset()
+    compiled = torch.compile(parallel_mod, fullgraph=True)
+    with torch.no_grad():
+        x = torch.randn(bs, dim, device="cuda")
+        out = compiled(x)
+    assert out.shape == (bs, dim)
+
+
+def test_compile_fullgraph_no_recompilation(device_mesh_1d):
+    """Repeated fullgraph calls in both grad modes don't recompile."""
+    parallel_mod, bs, dim = _make_simple_parallel_mod(device_mesh_1d)
+    torch._dynamo.reset()
+    compiled = torch.compile(parallel_mod, fullgraph=True)
+
+    # Warm up both paths (each triggers one compilation)
+    compiled(torch.randn(bs, dim, device="cuda"))
+    with torch.no_grad():
+        compiled(torch.randn(bs, dim, device="cuda"))
+
+    # Subsequent calls in either mode must not recompile
+    torch._dynamo.config.error_on_recompile = True
+    try:
+        for _ in range(3):
+            compiled(torch.randn(bs, dim, device="cuda"))
+            with torch.no_grad():
+                compiled(torch.randn(bs, dim, device="cuda"))
+    finally:
+        torch._dynamo.config.error_on_recompile = False

@@ -1,4 +1,4 @@
-exclude: 'build|stubs'
+exclude: 'build|stubs|autoparallel/tools/overlap_simulator'
 
 default_language_version:
     python: python3

@@ -335,14 +335,13 @@ def create_execution_trace(
     for different reordering strategies.
     """
     launch_overhead = 1  # 1us
-    ms_to_us = 1000
 
     trace_events = []
     curr_time: dict[int | str, float] = {0: 0}
     global_time: dict[torch.fx.Node, float] = {}
 
     for node_idx, node in enumerate(gm.graph.nodes):
-        dur = runtime_estimator(node) * ms_to_us
+        dur = runtime_estimator(node)  # in us
         tid = _get_tid(node)
         if tid not in curr_time:
             curr_time[tid] = curr_time[0]

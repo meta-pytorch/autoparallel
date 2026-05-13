@@ -11,6 +11,7 @@ import torch
 from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
+from autoparallel._testing.models.dsv3 import DeepSeekV3Model, make_dsv3_config
 from autoparallel._testing.models.llama3 import Transformer, TransformerModelArgs
 from autoparallel.api import AutoParallel
 from autoparallel.graph_passes.graph_clustering import get_identical_regions
@@ -27,17 +28,21 @@ def _get_layer_index(node):
     return None
 
 
-def _clustering_stats(graph, strats, n_layers):
-    """Compute clustering statistics."""
-    clusters = get_identical_regions(graph, strats)
+def _clustered_nodes(clusters):
+    """Return every FX node that appears in any final clustered region."""
+    clustered = set()
+    for group in clusters:
+        for region in group:
+            clustered.update(region)
+    return clustered
 
-    clustered_nodes = set()
+
+def _clustering_stats(graph, strats, clusters, n_layers):
+    """Compute per-layer clustering coverage from precomputed clusters."""
+    clustered_nodes = _clustered_nodes(clusters)
     regions_per_group = []
     for group in clusters:
         regions_per_group.append(len(group))
-        for region in group:
-            for node in region:
-                clustered_nodes.add(node)
 
     per_layer_clustered = Counter()
     per_layer_total = Counter()
@@ -60,6 +65,120 @@ def _clustering_stats(graph, strats, n_layers):
         "per_layer_total": dict(per_layer_total),
         "regions_per_group": regions_per_group,
     }
+
+
+def _assert_layer_coverage(stats, n_layers, min_coverage, label, layers=None):
+    """Assert each repeated layer has enough nodes in clustered regions."""
+    layers = range(n_layers) if layers is None else layers
+    layer_totals = [stats["per_layer_total"].get(i, 0) for i in layers]
+    if len(set(layer_totals)) != 1:
+        raise AssertionError(
+            f"{label}: layers have different node counts: {layer_totals}"
+        )
+
+    total = layer_totals[0]
+    if total == 0:
+        raise AssertionError(f"{label}: no layer nodes found in clustering stats")
+    for layer_idx in layers:
+        clustered = stats["per_layer_clustered"].get(layer_idx, 0)
+        coverage = clustered / total
+        if coverage < min_coverage:
+            raise AssertionError(
+                f"{label}: layer {layer_idx} clustering coverage too low: "
+                f"{clustered}/{total} = {coverage:.1%}, "
+                f"expected >= {min_coverage:.1%}"
+            )
+
+
+def _assert_cross_layer_cluster(
+    clusters, expected_layers, min_region_size, phase, label
+):
+    """Assert there is one large same-phase region for each expected layer."""
+    expected_layers = set(expected_layers)
+    for group in clusters:
+        if len(group) != len(expected_layers):
+            continue
+        region_layers = []
+        for region in group:
+            tags = {n.meta.get("partitioner_tag") for n in region}
+            tags.discard(None)
+            if tags != {phase}:
+                break
+            layers = {idx for n in region if (idx := _get_layer_index(n)) is not None}
+            if len(region) < min_region_size or len(layers) != 1:
+                break
+            region_layers.append(next(iter(layers)))
+        else:
+            if set(region_layers) == expected_layers:
+                return
+    raise AssertionError(
+        f"{label}: missing {phase} cross-layer cluster for layers "
+        f"{sorted(expected_layers)} with min region size {min_region_size}"
+    )
+
+
+def _assert_no_forward_backward_mixing(clusters, label):
+    """Assert clustered regions never contain both forward and backward nodes."""
+    for i, group in enumerate(clusters):
+        for j, region in enumerate(group):
+            tags = set(n.meta.get("partitioner_tag") for n in region)
+            tags.discard(None)
+            if len(tags) > 1:
+                raise AssertionError(
+                    f"{label}: cluster group {i}, region {j} mixes phases: {tags}"
+                )
+
+
+def _run_clustering(autop, n_layers, input_sharding, output_sharding=None):
+    """Build AutoParallel state and return clustering stats plus raw clusters."""
+    if output_sharding is None:
+        output_sharding = input_sharding
+    with autop:
+        autop.add_input_constraints([input_sharding])
+        autop.add_output_constraints([output_sharding])
+
+        graph = autop.sharding_optimizer.graph
+        strats = autop.sharding_optimizer.strats
+        clusters = get_identical_regions(graph, strats)
+        stats = _clustering_stats(graph, strats, clusters, n_layers)
+    return stats, clusters
+
+
+def _assert_model_clustering(
+    stats,
+    clusters,
+    *,
+    label,
+    n_layers,
+    min_coverage,
+    forward_layers,
+    backward_layers,
+    coverage_layers=None,
+    min_region_size=100,
+):
+    """Assert coverage, phase separation, and large fwd/bwd layer clusters."""
+    _assert_layer_coverage(
+        stats,
+        n_layers,
+        min_coverage=min_coverage,
+        label=label,
+        layers=coverage_layers,
+    )
+    _assert_cross_layer_cluster(
+        clusters,
+        forward_layers,
+        min_region_size=min_region_size,
+        phase="is_forward",
+        label=label,
+    )
+    _assert_cross_layer_cluster(
+        clusters,
+        backward_layers,
+        min_region_size=min_region_size,
+        phase="is_backward",
+        label=label,
+    )
+    _assert_no_forward_backward_mixing(clusters, label=label)
 
 
 def _setup_llama_autop(device_mesh_2d, n_layers=4):
@@ -93,6 +212,34 @@ def _setup_llama_autop(device_mesh_2d, n_layers=4):
     return autop, model_args
 
 
+def _setup_ds3_local_map_autop(device_mesh_2d):
+    local_batch_size = 8
+    seq_len = 2048
+    global_batch_size = (
+        local_batch_size * device_mesh_2d.shape[0] * device_mesh_2d.shape[1]
+    )
+    config = make_dsv3_config(max_seq_len=seq_len)
+    with torch.device("meta"):
+        model = DeepSeekV3Model(
+            config,
+            mesh=device_mesh_2d,
+            compute_dtype=torch.bfloat16,
+        )
+    for module in model.modules():
+        if hasattr(module, "axis_name"):
+            module.axis_name = device_mesh_2d.mesh_dim_names[1]
+
+    def input_fn():
+        return torch.randint(
+            0,
+            config.vocab_size,
+            (global_batch_size, config.rope.max_seq_len),
+            device="cuda",
+        )
+
+    return AutoParallel(model, input_fn, device_mesh_2d, dynamic=True), config
+
+
 def test_clustering_high_coverage(device_mesh_2d):
     """The vast majority of layer-specific nodes should be clustered.
 
@@ -102,33 +249,40 @@ def test_clustering_high_coverage(device_mesh_2d):
     """
     n_layers = 4
     autop, _ = _setup_llama_autop(device_mesh_2d, n_layers=n_layers)
-    with autop:
-        x_sharding = (Shard(0), Replicate())
-        out_sharding = (Shard(0), Shard(2))
-        autop.add_input_constraints([x_sharding])
-        autop.add_output_constraints([out_sharding])
+    stats, clusters = _run_clustering(
+        autop,
+        n_layers,
+        input_sharding=(Shard(0), Replicate()),
+        output_sharding=(Shard(0), Shard(2)),
+    )
+    _assert_model_clustering(
+        stats,
+        clusters,
+        label="LLaMA",
+        n_layers=n_layers,
+        min_coverage=0.50,
+        forward_layers=range(n_layers),
+        # Layer 0 has known backward boundary asymmetry.
+        backward_layers=range(1, n_layers),
+    )
 
-        stats = _clustering_stats(
-            autop.sharding_optimizer.graph,
-            autop.sharding_optimizer.strats,
-            n_layers,
-        )
-
-    # Every layer should have the same total node count
-    layer_totals = [stats["per_layer_total"].get(i, 0) for i in range(n_layers)]
-    assert (
-        len(set(layer_totals)) == 1
-    ), f"Layers have different node counts: {layer_totals}"
-
-    # At least 50% of layer nodes should be clustered across all layers
-    total = layer_totals[0]
-    for layer_idx in range(n_layers):
-        clustered = stats["per_layer_clustered"].get(layer_idx, 0)
-        coverage = clustered / total
-        assert coverage >= 0.50, (
-            f"Layer {layer_idx} clustering coverage too low: "
-            f"{clustered}/{total} = {coverage:.1%}"
-        )
+    autop, config = _setup_ds3_local_map_autop(device_mesh_2d)
+    n_layers = len(config.layers)
+    stats, clusters = _run_clustering(
+        autop,
+        n_layers,
+        input_sharding=(Shard(0), Shard(0)),
+    )
+    _assert_model_clustering(
+        stats,
+        clusters,
+        label="DS3",
+        n_layers=n_layers,
+        min_coverage=0.75,
+        coverage_layers=range(1, n_layers),
+        forward_layers=range(1, n_layers),
+        backward_layers=range(1, n_layers),
+    )
 
 
 def test_clustering_no_forward_backward_mixing(device_mesh_2d):

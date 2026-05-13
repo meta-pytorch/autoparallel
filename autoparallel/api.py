@@ -32,6 +32,7 @@ from .graph_passes.graph_utils import (
     assert_has_no_collectives,
     cleanup_graph,
     fix_scatter_on_aliased_inputs,
+    functionalize_fresh_index_put_mutations,
     update_joint_with_descriptors,
 )
 from .input_validation import (
@@ -268,19 +269,17 @@ class AutoParallel:
             )
             torch._inductor.config.comprehensive_padding = False
 
-            rescale_grad_comm_cost_for_mp = 1.0
-            if self.mp_policy is not None:
-                param_size = self.mp_policy.param_dtype.itemsize
-                reduce_size = self.mp_policy.reduce_dtype.itemsize
-                if param_size != reduce_size:
-                    rescale_grad_comm_cost_for_mp = reduce_size / param_size
-                    # Tiebreak, favoring performing the comms in the largest
-                    # dtype
-                    rescale_grad_comm_cost_for_mp *= 1.1
+            force_grad_reduce_in_higher_precision = (
+                self.mp_policy is not None
+                and self.mp_policy.reduce_dtype is not None
+                and self.mp_policy.param_dtype is not None
+                and self.mp_policy.reduce_dtype.itemsize
+                > self.mp_policy.param_dtype.itemsize
+            )
             sharding_optimizer = ShardingOptimizer(
                 self.gm,
                 self.mesh,
-                rescale_grad_comm_cost_for_mp,
+                force_grad_reduce_in_higher_precision,
                 repeated_subgraphs=self.repeated_subgraphs,
             )
 
@@ -446,10 +445,8 @@ class AutoParallel:
         from torch._inductor.fx_passes.post_grad import view_to_reshape
 
         view_to_reshape(parallel_gm)
+        functionalize_fresh_index_put_mutations(parallel_gm)
 
-        mark_fsdp_all_gather_recomputation(
-            parallel_gm.graph, self.reshard_after_forward
-        )
         t_ac = time.perf_counter()
         # now rename input/param/tangent/output/grad_param/grad_input nodes following
         # our convention
@@ -481,6 +478,10 @@ class AutoParallel:
             sharding_placement
         )
 
+        mark_fsdp_all_gather_recomputation(
+            self.parallel_gm.graph, self.reshard_after_forward
+        )
+
         self.parallel_model_fn = parallel_model_fn = aot_compile_joint_with_descriptors(
             self.joint_with_descriptors,
             fw_compiler=self.compiler_fn,
@@ -494,42 +495,35 @@ class AutoParallel:
 
         fw_metadata = self.joint_with_descriptors._aot_state.fw_metadata
         num_fwd_outputs = fw_metadata.num_forward_returns
-        fwd_only_gm = extract_forward_graph(self.parallel_gm, num_fwd_outputs)
+        num_primals = len(fw_metadata.input_info)
+        fwd_only_gm = extract_forward_graph(
+            self.parallel_gm, num_fwd_outputs, num_primals
+        )
         compiler_fn = self.compiler_fn
         aot_config = self.joint_with_descriptors._aot_state.aot_config
         out_spec = self.joint_with_descriptors.out_spec
 
-        _inference_fn_cache = None
+        # Build inference function eagerly so that Dynamo doesn't try
+        # to trace into compiler_fn / RuntimeWrapper.post_compile (both
+        # on its skip list, causing graph breaks under fullgraph=True).
+        _fwd_example_inputs = [
+            n.meta["val"] for n in fwd_only_gm.graph.nodes if n.op == "placeholder"
+        ]
+        _compiled_fwd = compiler_fn(fwd_only_gm, _fwd_example_inputs)
 
-        def _get_inference_fn():
-            nonlocal _inference_fn_cache
-            if _inference_fn_cache is not None:
-                return _inference_fn_cache
-            example_inputs = [
-                n.meta["val"] for n in fwd_only_gm.graph.nodes if n.op == "placeholder"
-            ]
-            compiled = compiler_fn(fwd_only_gm, example_inputs)
+        from torch._functorch._aot_autograd.runtime_wrappers import RuntimeWrapper
 
-            # Wrap with RuntimeWrapper to handle mutation write-back
-            # (e.g. buffer updates like BatchNorm running stats), output
-            # alias handling, and intermediate base stripping.
-            from torch._functorch._aot_autograd.runtime_wrappers import RuntimeWrapper
+        _wrapped_fwd = RuntimeWrapper(
+            indices_of_inps_to_detach=[],
+            trace_joint=False,
+            disable_amp=False,
+        ).post_compile(_compiled_fwd, aot_config, runtime_metadata=fw_metadata)
 
-            wrapped = RuntimeWrapper(
-                indices_of_inps_to_detach=[],
-                trace_joint=False,
-                disable_amp=False,
-            ).post_compile(compiled, aot_config, runtime_metadata=fw_metadata)
+        @torch._dynamo.nonstrict_trace
+        def _inference_fn(args):
+            flat_outs = _wrapped_fwd(args)
+            return torch.utils._pytree.tree_unflatten(flat_outs, out_spec)
 
-            def inference_fn(args):
-                flat_outs = wrapped(args)
-                return torch.utils._pytree.tree_unflatten(flat_outs, out_spec)
-
-            _inference_fn_cache = inference_fn
-            return _inference_fn_cache
-
-        # TODO: this probably belongs in the AOTAutograd API
-        # TODO: pytree handling
         # Capture the exact FQNs the compiled graph expects as primals.
         # This avoids issues with aliased params/buffers where identity-based
         # dedup can break after init_weights reassigns tensors.
@@ -549,15 +543,17 @@ class AutoParallel:
             strategy = sharding_placement[node]
             solved_input_placements.append(tuple(strategy.output_specs.placements))
 
-        expected_inputs = _compute_expected_inputs(
+        expected_inputs, dynamic_dims = _compute_expected_inputs(
             self._traced_inputs, solved_input_placements, self.mesh
         )
 
-        def forward(self, *args):
+        def forward(self, *args, **kwargs):
             # Flatten pytree args (e.g. dicts, nested structures) to tensor
             # leaves, matching how Dynamo flattened the inputs during tracing.
             flat_args, _ = torch.utils._pytree.tree_flatten(args)
-            _check_forward_args(flat_args, expected_inputs)
+            if len(flat_args) != len(expected_inputs):
+                flat_args, _ = torch.utils._pytree.tree_flatten((args, kwargs))
+            _check_forward_args(flat_args, expected_inputs, dynamic_dims)
             # NB: don't close over the parameters/buffers, as the user may
             # reassign the module!
             # Use the exact param/buffer FQNs that the compiled graph
@@ -571,7 +567,7 @@ class AutoParallel:
                 # NB: don't do self.parallel_model_fn work around Dynamo bug
                 out = parallel_model_fn(boxed_args)
             else:
-                out = _get_inference_fn()(boxed_args)
+                out = _inference_fn(boxed_args)
             return out
 
         self.parallel_model = make_parallel_module(

@@ -115,7 +115,14 @@ def _assign_attr(
         curr_mod.register_parameter(field, attr)
     elif attr_kind == _AttrKind.BUFFER:
         assert isinstance(attr, torch.Tensor)
-        curr_mod.register_buffer(field, attr)
+        ref_curr_mod = ref_module
+        for attr_name in prefix:
+            ref_curr_mod = getattr(ref_curr_mod, attr_name)
+        curr_mod.register_buffer(
+            field,
+            attr,
+            persistent=field not in ref_curr_mod._non_persistent_buffers_set,
+        )
     else:
         setattr(curr_mod, field, attr)
 

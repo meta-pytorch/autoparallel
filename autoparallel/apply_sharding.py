@@ -121,20 +121,22 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
                 )
         return result
 
-    def _set_origin_and_target_device_order(self, node, curr_spec, tgt_spec):
+    def _compute_origin_and_target_shard_order(self, node, curr_spec, tgt_spec):
         # shard_order should be automatically assigned once `placements` is set
         assert curr_spec.shard_order is not None
         assert tgt_spec.shard_order is not None
-        if node in self.param_placement_order:
-            is_target_reversed_order, need_reorder = self.param_placement_order[node]
-            curr_spec.shard_order = _compute_shard_order(
-                curr_spec.shard_order,
-                reverse=not (is_target_reversed_order and need_reorder),
-            )
-            tgt_spec.shard_order = _compute_shard_order(
-                tgt_spec.shard_order,
-                reverse=is_target_reversed_order,
-            )
+        if node not in self.param_placement_order:
+            return curr_spec.shard_order, tgt_spec.shard_order
+        is_target_reversed_order, need_reorder = self.param_placement_order[node]
+        curr_shard_order = _compute_shard_order(
+            curr_spec.shard_order,
+            reverse=not (is_target_reversed_order and need_reorder),
+        )
+        tgt_shard_order = _compute_shard_order(
+            tgt_spec.shard_order,
+            reverse=is_target_reversed_order,
+        )
+        return curr_shard_order, tgt_shard_order
 
     def redistribute_tensor(self, arg, curr_spec, tgt_spec, node):
         tgt_placements = tuple(
@@ -143,20 +145,28 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
         x = arg
         if node in self.param_placement_order and self.param_placement_order[node][1]:
             assert curr_spec.placements != tgt_spec.placements
-        self._set_origin_and_target_device_order(node, curr_spec, tgt_spec)
+        curr_shard_order, tgt_shard_order = self._compute_origin_and_target_shard_order(
+            node, curr_spec, tgt_spec
+        )
         if (
             curr_spec.placements != tgt_spec.placements
-            or curr_spec.shard_order != tgt_spec.shard_order
+            or curr_shard_order != tgt_shard_order
         ):
+            curr_spec_c = DTensorSpec(
+                curr_spec.mesh,
+                curr_spec.placements,
+                tensor_meta=curr_spec.tensor_meta,
+                shard_order=curr_shard_order,
+            )
             tgt_spec_c = DTensorSpec(
                 tgt_spec.mesh,
                 tgt_placements,
                 tensor_meta=tgt_spec.tensor_meta,
-                shard_order=tgt_spec.shard_order,
+                shard_order=tgt_shard_order,
             )
             x = ordered_redistribute_local_tensor(
                 arg,
-                curr_spec,
+                curr_spec_c,
                 tgt_spec_c,
             )
         return x
@@ -362,7 +372,13 @@ def _make_local_args(gm, sharding_placement):
 
     local_args = []
     for node in gm.graph.find_nodes(op="placeholder"):
-        tensor = node.meta["val"]
+        val = node.meta.get("val")
+        if not isinstance(val, torch.Tensor):
+            # Non-tensor placeholders (e.g. baked-in booleans/strings):
+            # pass through the original value so the arg count stays aligned.
+            local_args.append(val)
+            continue
+        tensor = val
         tgt_spec = sharding_placement[node].input_specs[0]
         mesh = tgt_spec.mesh
         curr_placement = (Replicate(),) * mesh.ndim

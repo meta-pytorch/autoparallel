@@ -60,7 +60,7 @@ def test_compute_expected_inputs(device_mesh_1d):
     traced = [torch.empty(512, 128, device="meta")]
     placements = [(Shard(0),)]
 
-    result = _compute_expected_inputs(traced, placements, mesh)
+    result, _dynamic_dims = _compute_expected_inputs(traced, placements, mesh)
     assert len(result) == 1
     assert result[0].shape == (512 // world_size, 128)
     assert result[0].dtype == torch.float32
@@ -73,7 +73,7 @@ def test_compute_expected_inputs_replicated(device_mesh_1d):
     traced = [torch.empty(512, 128, device="meta")]
     placements = [(Replicate(),)]
 
-    result = _compute_expected_inputs(traced, placements, mesh)
+    result, _dynamic_dims = _compute_expected_inputs(traced, placements, mesh)
     assert len(result) == 1
     assert result[0].shape == (512, 128)
 
@@ -86,7 +86,7 @@ def test_compute_expected_inputs_uneven(device_mesh_2d):
     traced = [torch.empty(10, 128, device="meta")]
     placements = [(Replicate(), Shard(0))]
 
-    result = _compute_expected_inputs(traced, placements, mesh)
+    result, _dynamic_dims = _compute_expected_inputs(traced, placements, mesh)
     assert len(result) == 1
     expected_dim0 = (10 + tp_size - 1) // tp_size  # ceil(10/8) = 2
     assert result[0].shape == (expected_dim0, 128)
@@ -154,7 +154,7 @@ def test_compute_expected_inputs_dict_pytree(device_mesh_1d):
     ]
     constraints = [(Shard(0),), (Shard(0),)]
 
-    result = _compute_expected_inputs(traced, constraints, mesh)
+    result, _dynamic_dims = _compute_expected_inputs(traced, constraints, mesh)
     assert len(result) == 2
     assert result[0].shape == (512 // world_size, 128)
     assert result[1].shape == (512 // world_size, 64)

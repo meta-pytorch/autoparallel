@@ -80,7 +80,20 @@ def ordered_redistribute_local_tensor(
     The optimizations that we support for now are hard-coded, and we should
     generalize this in the future.
     """
-    if curr_spec.shard_order == tgt_spec.shard_order:
+    # _optimize_same_nd_sharding_as_1d flattens the 2D mesh into 1D and
+    # performs a single collective (e.g. S(0)S(0)->RR becomes S(0)->R on
+    # the flat mesh).  This is only correct when the data layout matches
+    # the flat mesh's natural rank ordering, i.e. both specs use default
+    # (ascending) shard_order.  We can't use structural equality here
+    # because shard_order tuples have different lengths when the number of
+    # sharded dims differs (e.g. S(0)S(0) has one entry while RR has none).
+    # is_default_device_order checks ascending mesh_dims per entry (and
+    # returns True for the empty tuple), which is the right consistency
+    # criterion.
+    both_default = DTensorSpec.is_default_device_order(
+        curr_spec.shard_order
+    ) and DTensorSpec.is_default_device_order(tgt_spec.shard_order)
+    if both_default:
         return _optimize_same_nd_sharding_as_1d(arg, curr_spec, tgt_spec)
     return redistribute_local_tensor(
         arg,
@@ -277,7 +290,7 @@ def compute_optimal_placement_order_for_parameters(
         redistribution_info = get_redistributed_input_placements(
             user_node, sharding_placement
         )
-        if redistribution_info:
+        if redistribution_info and source_node not in redistribution_map:
             redistribution_map[source_node] = (user_node, redistribution_info)
 
     # Find param-grad pairs where both require redistribution
