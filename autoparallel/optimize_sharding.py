@@ -69,11 +69,9 @@ The solver finds the globally optimal sharding strategy that minimizes total
 runtime cost while satisfying all constraints.
 """
 
-import json
 import logging
 import math
 import operator
-import re
 import tempfile
 import time
 from collections import defaultdict
@@ -217,140 +215,6 @@ def _assert_has_tensor_meta(spec_or_specs, node, label):
         assert (
             spec_or_specs.tensor_meta is not None
         ), f"{node} {label} doesn't have a tensor_meta"
-
-
-class _MeshPlaceholder:
-    """Lightweight stand-in for DeviceMesh when loading without a process group.
-
-    Provides the attributes used by get_json() and add_node_constraint()
-    without requiring distributed initialization.
-    """
-
-    def __init__(self, shape, dim_names):
-        self.shape = tuple(shape)
-        self.mesh_dim_names = tuple(dim_names) if dim_names else None
-        self.ndim = len(shape)
-
-
-def _resolve_target(target_str):
-    """Resolve a serialized target string back to the callable."""
-    if target_str == "<built-in function getitem>":
-        return operator.getitem
-    parts = target_str.split(".")
-    if len(parts) >= 2:
-        try:
-            obj = getattr(torch.ops, parts[0])
-            for p in parts[1:]:
-                obj = getattr(obj, p)
-            return obj
-        except AttributeError:
-            pass
-    return torch.ops.aten.alias.default
-
-
-def _patch_op_overload_pickle():
-    """Temporarily add pickle support to OpOverload so FX graphs with custom
-    ops can be serialized. Returns a context manager that removes the patch
-    on exit."""
-    import contextlib
-
-    @contextlib.contextmanager
-    def _patch():
-        had_reduce = hasattr(torch._ops.OpOverload, "__reduce__")
-        old_reduce = getattr(torch._ops.OpOverload, "__reduce__", None)
-
-        def _reduce(self):
-            return (_resolve_target, (str(self),))
-
-        torch._ops.OpOverload.__reduce__ = _reduce
-        try:
-            yield
-        finally:
-            if had_reduce:
-                torch._ops.OpOverload.__reduce__ = old_reduce
-            else:
-                del torch._ops.OpOverload.__reduce__
-
-    return _patch()
-
-
-def _get_layer_index(node):
-    """Extract the repeated-layer index from a node's module stack metadata.
-
-    Returns the integer layer index (e.g., 0 from 'layers.0.attention'),
-    or None if the node doesn't belong to a numbered layer.
-    """
-    stack = node.meta.get("nn_module_stack") or node.meta.get("fwd_nn_module_stack")
-    if not stack:
-        return None
-    for _, (qname, _cls) in stack.items():
-        m = re.search(r"layers\.(\d+)", qname)
-        if m:
-            return int(m.group(1))
-    return None
-
-
-def _normalize_cluster_layer(cluster_roots):
-    """Ensure all cluster roots come from the same layer where possible.
-
-    Forward clusters root on the first layer (e.g., layer 0) while backward
-    clusters root on the last layer (e.g., layer 3) due to topological
-    ordering.  This swaps backward roots to use the copy closest to the
-    canonical (lowest-index) layer, giving a more consistent view in the
-    visualizer.
-
-    Some backward clusters may not have a copy in the canonical layer (e.g.,
-    when layer 0's backward ops differ from other layers' due to being at the
-    boundary of the backward pass).  These remain in the lowest available layer.
-    """
-    if not cluster_roots:
-        return
-
-    # Build reverse map: root -> [linked_nodes]
-    root_to_linked: dict[torch.fx.Node, list[torch.fx.Node]] = {}
-    for linked, root in cluster_roots.items():
-        root_to_linked.setdefault(root, []).append(linked)
-
-    # Find canonical layer: the lowest layer index among roots.
-    # Forward clusters naturally root on the first layer (layer 0),
-    # so using min ensures we pick the first layer in the model.
-    layer_indices = set()
-    for root in root_to_linked:
-        idx = _get_layer_index(root)
-        if idx is not None:
-            layer_indices.add(idx)
-    if not layer_indices:
-        return
-    canonical = min(layer_indices)
-
-    # Swap roots that aren't in the canonical layer
-    for root in list(root_to_linked):
-        root_layer = _get_layer_index(root)
-        if root_layer is None or root_layer == canonical:
-            continue
-
-        # Find the linked node closest to the canonical layer
-        best = None
-        best_dist = float("inf")
-        for linked in root_to_linked[root]:
-            idx = _get_layer_index(linked)
-            if idx is not None:
-                dist = abs(idx - canonical)
-                if dist < best_dist:
-                    best = linked
-                    best_dist = dist
-        if best is None or _get_layer_index(best) == root_layer:
-            continue
-
-        # Swap: best becomes root, old root becomes linked
-        linked_nodes = root_to_linked.pop(root)
-        linked_nodes.remove(best)
-        linked_nodes.append(root)
-
-        del cluster_roots[best]
-        for linked in linked_nodes:
-            cluster_roots[linked] = best
-        root_to_linked[best] = linked_nodes
 
 
 class ShardingOptimizer:
@@ -1268,7 +1132,10 @@ class ShardingOptimizer:
         )
 
     def get_json(self):
-        from autoparallel.export_json import export_sharding_json
+        from autoparallel.export_json import (
+            _normalize_cluster_layer,
+            export_sharding_json,
+        )
 
         # Build selected DVs keyed by (node, argi) for explicit ordering.
         selected_by_node: dict[torch.fx.Node, dict[int, DecisionVar]] = {}
@@ -1310,362 +1177,35 @@ class ShardingOptimizer:
     # ---- Serialization ----
 
     def save(self, path):
-        """Save the full optimizer state for later interactive exploration.
+        """Save the full optimizer state for later interactive exploration."""
+        from autoparallel.serialization import save_optimizer
 
-        The saved file contains everything needed to rebuild the ILP and
-        re-solve without the original model code, DeviceMesh, or process group.
-        Can be called before or after solving — if unsolved, the loaded
-        optimizer can be solved in a notebook via get_solution() or resolve().
-        """
-        import copy
-
-        t0 = time.perf_counter()
-
-        # Convert selected_keys to node-name-based representation (if solved)
-        selected_keys_by_name = None
-        if hasattr(self, "selected_keys"):
-            selected_keys_by_name = {}
-            for key in self.selected_keys:
-                node_idx, argi, out_idx, inp_idx = key
-                node_name = self.nodes[node_idx].name
-                selected_keys_by_name.setdefault(node_name, []).append(
-                    (argi, out_idx, inp_idx)
-                )
-
-        # Re-key strats by node name, saving only root nodes (non-linked).
-        # Linked nodes share identical strats with their root and are
-        # reconstructed on load from cluster_links.
-        linked_node_names = {self.nodes[lk[0]].name for lk in self.cluster_links}
-        strats_by_name = {
-            node.name: strat
-            for node, strat in self.strats.items()
-            if node.name not in linked_node_names
-        }
-
-        # Save decision var costs as compact numpy arrays. Indices use int32,
-        # costs use float64 to preserve full precision (matching the in-memory
-        # representation used by the ILP solver).
-        import numpy as np
-
-        save_node_names = [n.name for n in self.nodes]
-        save_node_to_idx = {name: i for i, name in enumerate(save_node_names)}
-        n_dvs = len(self.decision_vars)
-        dv_costs_keys = np.empty((n_dvs, 4), dtype=np.int32)
-        dv_costs_vals = np.empty((n_dvs, 3), dtype=np.float64)
-        for row_idx, (key, dv) in enumerate(self.decision_vars.items()):
-            node_idx, argi, out_idx, inp_idx = key
-            save_node_idx = save_node_to_idx[self.nodes[node_idx].name]
-            dv_costs_keys[row_idx] = (save_node_idx, argi, out_idx, inp_idx)
-            dv_costs_vals[row_idx] = (
-                dv.compute_cost,
-                dv.comm_cost,
-                dv.sharding_transition_cost,
-            )
-
-        # Deepcopy the graph and keep only picklable metadata that we need.
-        # - desc: needed by add_forward_backward_consistency_constraints
-        # - partitioner_tag: needed by _build_decision_vars
-        # - stack_trace: used by export_json for source info
-        # - tensor_meta: used by export_json for shape/dtype
-        # - module_path: extracted from nn_module_stack (which contains
-        #   unpicklable class refs) as a plain string
-        # - is_gradient_acc, seq_nr: preserved for completeness
-        _SAVE_META_KEYS = {
-            "desc",
-            "partitioner_tag",
-            "stack_trace",
-            "tensor_meta",
-            "module_path",
-            "phase",
-            "is_gradient_acc",
-            "seq_nr",
-        }
-
-        # Extract module paths from nn_module_stack before deepcopy strips it
-        from autoparallel.export_json import _extract_module_path, _get_phase
-
-        module_paths = {}
-        phases = {}
-        for node in self.graph.nodes:
-            mp = _extract_module_path(node)
-            if mp is not None:
-                module_paths[node.name] = mp
-            if node.op not in ("placeholder", "output"):
-                phases[node.name] = _get_phase(node)
-
-        graph_copy = copy.deepcopy(self.graph)
-        for node in graph_copy.nodes:
-            meta = {k: v for k, v in node.meta.items() if k in _SAVE_META_KEYS}
-            if node.name in module_paths:
-                meta["module_path"] = module_paths[node.name]
-            if node.name in phases:
-                meta["phase"] = phases[node.name]
-            node.meta = meta
-
-        save_dict = {
-            "version": 1,
-            "graph": graph_copy,
-            "mesh_shape": list(self.mesh.shape),
-            "mesh_dim_names": (
-                list(self.mesh.mesh_dim_names) if self.mesh.mesh_dim_names else None
-            ),
-            "force_grad_reduce_in_higher_precision": self.force_grad_reduce_in_higher_precision,
-            "strats_by_name": strats_by_name,
-            "dv_costs_node_names": save_node_names,
-            "dv_costs_keys": dv_costs_keys,
-            "dv_costs_vals": dv_costs_vals,
-            "cluster_links_node_by_name": {
-                self.nodes[lk[0]].name: self.nodes[rk[0]].name
-                for lk, rk in self.cluster_links.items()
-            },
-            "constraint_log": self._constraint_log,
-            "selected_keys_by_name": selected_keys_by_name,
-        }
-        t1 = time.perf_counter()
-        logger.debug("save: prepared save_dict in %.3fs", t1 - t0)
-        with _patch_op_overload_pickle():
-            torch.save(save_dict, path)
-        logger.debug(
-            "save: wrote %s in %.3fs (total %.3fs)",
-            path,
-            time.perf_counter() - t1,
-            time.perf_counter() - t0,
-        )
+        save_optimizer(self, path)
 
     @classmethod
     def load(cls, path):
-        """Load optimizer state saved with save().
+        """Load optimizer state saved with save()."""
+        from autoparallel.serialization import load_optimizer
 
-        Returns a fully functional ShardingOptimizer that supports get_json(),
-        get_log(), add_node_constraint(), resolve(), diff_solutions(), etc.
-        No live DeviceMesh or process group is needed.
-        """
-        # Ensure custom ops are registered before loading
-        import autoparallel.cast_parametrization  # noqa: F401
-
-        t0 = time.perf_counter()
-        with _patch_op_overload_pickle():
-            save_dict = torch.load(path, weights_only=False)
-        t1 = time.perf_counter()
-        logger.debug("load: torch.load took %.3fs", t1 - t0)
-        assert save_dict["version"] == 1, f"Unsupported version: {save_dict['version']}"
-
-        graph = save_dict["graph"]
-        strats_by_name = save_dict["strats_by_name"]
-        cluster_links_node_by_name = save_dict["cluster_links_node_by_name"]
-
-        # Build node-name lookup from the graph
-        nodes_by_name = {node.name: node for node in graph.nodes}
-
-        # Build linked_node_name -> root_node_name mapping (already node-level)
-        linked_to_root_name = dict(cluster_links_node_by_name)
-
-        # Reconstruct strats: root strats are saved, linked strats copied
-        strats = {}
-        for node in graph.nodes:
-            if node.name in strats_by_name:
-                strats[node] = strats_by_name[node.name]
-            elif node.name in linked_to_root_name:
-                strats[node] = strats_by_name[linked_to_root_name[node.name]]
-
-        # Create optimizer without calling __init__
-        opt = cls.__new__(cls)
-        opt.gm = None
-        opt.graph = graph
-        opt._orig_to_concrete = {}
-        opt._concrete_to_orig = {}
-        opt.strats = strats
-        opt.nodes = list(strats.keys())
-        opt.node_map = {node: i for i, node in enumerate(opt.nodes)}
-        opt.force_grad_reduce_in_higher_precision = save_dict[
-            "force_grad_reduce_in_higher_precision"
-        ]
-        opt._constraint_log = []
-        opt._name_counters = {}
-
-        # Reconstruct cluster_links by expanding the node-level mapping over
-        # all (argi, out_idx, inp_idx) combinations. By construction in
-        # create_cluster_links, the argi/out_idx/inp_idx are identical
-        # between linked and root keys.
-        opt.cluster_links = {}
-        for linked_name, root_name in cluster_links_node_by_name.items():
-            linked_node = nodes_by_name[linked_name]
-            root_node = nodes_by_name[root_name]
-            linked_idx = opt.node_map[linked_node]
-            root_idx = opt.node_map[root_node]
-            for argi, out_idx, inp_idx in opt.walk_over_options(linked_node):
-                opt.cluster_links[(linked_idx, argi, out_idx, inp_idx)] = (
-                    root_idx,
-                    argi,
-                    out_idx,
-                    inp_idx,
-                )
-        opt._cluster_linked_node_idxs = {key[0] for key in opt.cluster_links}
-
-        # Mesh placeholder — provides shape/dim_names for get_json() and ndim
-        # for add_node_constraint() default placement, without needing a PG
-        opt.mesh = _MeshPlaceholder(
-            save_dict["mesh_shape"], save_dict["mesh_dim_names"]
-        )
-
-        # Rebuild PuLP variables and decision vars from saved costs.
-        t2 = time.perf_counter()
-        opt.pulp_variables = opt._create_pulp_variables()
-        t3 = time.perf_counter()
-        logger.debug(
-            "load: _create_pulp_variables took %.3fs (%d vars)",
-            t3 - t2,
-            len(opt.pulp_variables),
-        )
-        # Reconstruct decision_vars from compact tensors.
-        # Keys: int32 [num_dvs, 4] = [node_idx, argi, out_idx, inp_idx]
-        # Vals: float32 [num_dvs, 3] = [compute, comm, transition]
-        save_node_names = save_dict["dv_costs_node_names"]
-        keys_t = save_dict["dv_costs_keys"].tolist()
-        vals_t = save_dict["dv_costs_vals"].tolist()
-        opt.decision_vars = {}
-        for (save_node_idx, argi, out_idx, inp_idx), (
-            compute_cost,
-            comm_cost,
-            transition_cost,
-        ) in zip(keys_t, vals_t):
-            node_name = save_node_names[save_node_idx]
-            node = nodes_by_name[node_name]
-            node_idx = opt.node_map[node]
-            key = (node_idx, argi, out_idx, inp_idx)
-            strategy = opt.strats[node].strategies[out_idx]
-            opt.decision_vars[key] = DecisionVar(
-                var=opt.pulp_variables[key],
-                cost=compute_cost + comm_cost + transition_cost,
-                compute_cost=compute_cost,
-                comm_cost=comm_cost,
-                sharding_transition_cost=transition_cost,
-                strategy=strategy,
-                output_spec=strategy.output_specs,
-                input_spec=(
-                    strategy.input_specs[argi]
-                    if argi < len(strategy.input_specs)
-                    else None
-                ),
-            )
-        t4 = time.perf_counter()
-        logger.debug(
-            "load: decision_vars rebuild took %.3fs (%d entries)",
-            t4 - t3,
-            len(opt.decision_vars),
-        )
-
-        opt._root_to_linked = defaultdict(list)
-        for linked_key, root_key in opt.cluster_links.items():
-            opt._root_to_linked[root_key].append(linked_key)
-
-        opt.prob = pulp.LpProblem("AutoParallel", pulp.LpMinimize)
-        opt.add_default_constraints()
-        t5 = time.perf_counter()
-        logger.debug("load: add_default_constraints took %.3fs", t5 - t4)
-
-        # Replay user constraints
-        for method_name, kwargs in save_dict["constraint_log"]:
-            method = getattr(opt, method_name)
-            # Resolve node names back to node objects
-            if "node_name" in kwargs:
-                kwargs = dict(kwargs)
-                node_name = kwargs.pop("node_name")
-                kwargs["node"] = nodes_by_name[node_name]
-            method(**kwargs)
-        t6 = time.perf_counter()
-        logger.debug("load: constraint replay took %.3fs", t6 - t5)
-
-        # Set objective and restore solution if one was saved
-        opt._set_objective()
-        t7 = time.perf_counter()
-        logger.debug("load: _set_objective took %.3fs", t7 - t6)
-        if save_dict["selected_keys_by_name"] is not None:
-            opt._restore_solution(save_dict["selected_keys_by_name"], nodes_by_name)
-        logger.debug("load: total %.3fs", time.perf_counter() - t0)
-
-        return opt
+        return load_optimizer(cls, path)
 
     def _restore_solution(self, selected_keys_by_name, nodes_by_name):
         """Restore selected_keys and PuLP variable values from a saved solution."""
-        self.selected_keys = []
-        for node_name, key_parts in selected_keys_by_name.items():
-            node = nodes_by_name[node_name]
-            node_idx = self.node_map[node]
-            for argi, out_idx, inp_idx in key_parts:
-                self.selected_keys.append((node_idx, argi, out_idx, inp_idx))
+        from autoparallel.serialization import _restore_solution
 
-        # Set PuLP variable values: selected = 1.0, all others default to 0.0
-        selected_set = set(self.selected_keys)
-        for key in selected_set:
-            dv = self.decision_vars.get(key)
-            if dv is not None:
-                dv.var.varValue = 1.0
-
-        # Expand cluster links
-        for root_key in list(self.selected_keys):
-            self.selected_keys.extend(self._root_to_linked.get(root_key, []))
+        _restore_solution(self, selected_keys_by_name, nodes_by_name)
 
     def save_solution(self, path):
-        """Save the current solution as a lightweight JSON file.
+        """Save the current solution as a lightweight JSON file."""
+        from autoparallel.serialization import save_solution
 
-        The saved file can be loaded by another optimizer via load_solution()
-        to apply the same placements without re-solving.
-        """
-        from torch.distributed.tensor._op_schema import _pretty_print_spec
-
-        placements = {}
-        solution = self._extract_and_validate_solution()
-        for node, strategy in solution.items():
-            placements[node.name] = _pretty_print_spec(strategy.output_specs)
-
-        save_dict = {
-            "version": 1,
-            "mesh_shape": list(self.mesh.shape),
-            "mesh_dim_names": (
-                list(self.mesh.mesh_dim_names) if self.mesh.mesh_dim_names else None
-            ),
-            "placements": placements,
-        }
-        with open(path, "w") as f:
-            json.dump(save_dict, f, indent=2)
+        save_solution(self, path)
 
     def load_solution(self, path):
-        """Load a solution from a JSON file and return a dict[Node, OpSpec].
+        """Load a solution from a JSON file and return a dict[Node, OpSpec]."""
+        from autoparallel.serialization import load_solution
 
-        Matches saved placement strings against the strategies in self.strats.
-        The returned dict can be passed directly to apply_placement().
-        """
-        from torch.distributed.tensor._op_schema import _pretty_print_spec
-
-        with open(path) as f:
-            save_dict = json.load(f)
-
-        assert save_dict["version"] == 1
-
-        nodes_by_name = {node.name: node for node in self.nodes}
-        solution = {}
-        for node_name, placement_str in save_dict["placements"].items():
-            if node_name not in nodes_by_name:
-                raise RuntimeError(
-                    f"Node '{node_name}' from saved solution not found in current graph. "
-                    "The model may have changed since the solution was saved."
-                )
-            node = nodes_by_name[node_name]
-            strat = self.strats[node]
-            matched = None
-            for s in strat.strategies:
-                if _pretty_print_spec(s.output_specs) == placement_str:
-                    matched = s
-                    break
-            if matched is None:
-                raise RuntimeError(
-                    f"Placement '{placement_str}' for node '{node_name}' not found "
-                    f"in available strategies. The model or mesh may have changed."
-                )
-            solution[node] = matched
-
-        return solution
+        return load_solution(self, path)
 
     def print_costs_for_node(self, node, arg=0, **kwargs):
         from tabulate import tabulate  # type: ignore

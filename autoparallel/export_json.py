@@ -146,6 +146,74 @@ def _get_phase(node: torch.fx.Node) -> str:
     return "forward"
 
 
+def _get_layer_index(node):
+    """Extract the repeated-layer index from a node's module stack metadata.
+
+    Returns the integer layer index (e.g., 0 from 'layers.0.attention'),
+    or None if the node doesn't belong to a numbered layer.
+    """
+    stack = node.meta.get("nn_module_stack") or node.meta.get("fwd_nn_module_stack")
+    if not stack:
+        return None
+    for _, (qname, _cls) in stack.items():
+        m = re.search(r"layers\.(\d+)", qname)
+        if m:
+            return int(m.group(1))
+    return None
+
+
+def _normalize_cluster_layer(cluster_roots):
+    """Ensure all cluster roots come from the same layer where possible.
+
+    Forward clusters root on the first layer (e.g., layer 0) while backward
+    clusters root on the last layer (e.g., layer 3) due to topological
+    ordering.  This swaps backward roots to use the copy closest to the
+    canonical (lowest-index) layer, giving a more consistent view in the
+    visualizer.
+    """
+    if not cluster_roots:
+        return
+
+    root_to_linked: dict[torch.fx.Node, list[torch.fx.Node]] = {}
+    for linked, root in cluster_roots.items():
+        root_to_linked.setdefault(root, []).append(linked)
+
+    layer_indices = set()
+    for root in root_to_linked:
+        idx = _get_layer_index(root)
+        if idx is not None:
+            layer_indices.add(idx)
+    if not layer_indices:
+        return
+    canonical = min(layer_indices)
+
+    for root in list(root_to_linked):
+        root_layer = _get_layer_index(root)
+        if root_layer is None or root_layer == canonical:
+            continue
+
+        best = None
+        best_dist = float("inf")
+        for linked in root_to_linked[root]:
+            idx = _get_layer_index(linked)
+            if idx is not None:
+                dist = abs(idx - canonical)
+                if dist < best_dist:
+                    best = linked
+                    best_dist = dist
+        if best is None or _get_layer_index(best) == root_layer:
+            continue
+
+        linked_nodes = root_to_linked.pop(root)
+        linked_nodes.remove(best)
+        linked_nodes.append(root)
+
+        del cluster_roots[best]
+        for linked in linked_nodes:
+            cluster_roots[linked] = best
+        root_to_linked[best] = linked_nodes
+
+
 def _extract_shape_dtype(node: torch.fx.Node) -> tuple[list | None, str | None]:
     """Extract shape and dtype from the node's fake tensor value."""
     val = node.meta.get("val")
