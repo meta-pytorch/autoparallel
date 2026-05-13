@@ -7,7 +7,7 @@
 Save/load for ShardingOptimizer state.
 
 Handles full optimizer serialization (save/load) and lightweight
-solution-only serialization (save_solution/load_solution).
+solution-only serialization (save_placements/load_placements).
 """
 
 import json
@@ -48,7 +48,10 @@ def _resolve_target(target_str):
             return obj
         except AttributeError:
             pass
-    return torch.ops.aten.alias.default
+    raise RuntimeError(
+        f"Cannot resolve serialized op target '{target_str}'. "
+        "The model may require custom op registration before loading."
+    )
 
 
 def _patch_op_overload_pickle():
@@ -86,6 +89,8 @@ _SAVE_META_KEYS = {
     "phase",
     "is_gradient_acc",
     "seq_nr",
+    "ac_graph_id",
+    "recompute",
 }
 
 
@@ -319,8 +324,12 @@ def load_optimizer(cls, path):
     t5 = time.perf_counter()
     logger.debug("load: add_default_constraints took %.3fs", t5 - t4)
 
-    # Replay user constraints
-    for method_name, kwargs in save_dict["constraint_log"]:
+    # Replay user constraints. Suppress logging during replay so the
+    # loaded log is an exact copy of the original, not an expanded version
+    # (e.g., add_sharded_input_constraint internally calls add_node_constraint
+    # which would double-log).
+    saved_log = list(save_dict["constraint_log"])
+    for method_name, kwargs in saved_log:
         method = getattr(opt, method_name)
         # Resolve node names back to node objects
         if "node_name" in kwargs:
@@ -328,6 +337,7 @@ def load_optimizer(cls, path):
             node_name = kwargs.pop("node_name")
             kwargs["node"] = nodes_by_name[node_name]
         method(**kwargs)
+    opt._constraint_log = saved_log
     t6 = time.perf_counter()
     logger.debug("load: constraint replay took %.3fs", t6 - t5)
 
@@ -363,8 +373,8 @@ def _restore_solution(opt, selected_keys_by_name, nodes_by_name):
         opt.selected_keys.extend(opt._root_to_linked.get(root_key, []))
 
 
-def save_solution(opt, path):
-    """Save the current solution as a lightweight JSON file."""
+def save_placements(opt, path):
+    """Save the current placement choices as a lightweight JSON file."""
     from torch.distributed.tensor._op_schema import _pretty_print_spec
 
     placements = {}
@@ -384,8 +394,8 @@ def save_solution(opt, path):
         json.dump(save_dict, f, indent=2)
 
 
-def load_solution(opt, path):
-    """Load a solution from a JSON file and return a dict[Node, OpSpec].
+def load_placements(opt, path):
+    """Load placements from a JSON file and return a dict[Node, OpSpec].
 
     Matches saved placement strings against the strategies in opt.strats.
     The returned dict can be passed directly to apply_placement().
@@ -396,6 +406,14 @@ def load_solution(opt, path):
         save_dict = json.load(f)
 
     assert save_dict["version"] == 1
+
+    # Validate mesh compatibility
+    saved_shape = tuple(save_dict["mesh_shape"])
+    if tuple(opt.mesh.shape) != saved_shape:
+        raise RuntimeError(
+            f"Mesh shape mismatch: saved {list(saved_shape)}, "
+            f"current {list(opt.mesh.shape)}"
+        )
 
     nodes_by_name = {node.name: node for node in opt.nodes}
     solution = {}
@@ -419,4 +437,4 @@ def load_solution(opt, path):
             )
         solution[node] = matched
 
-    return solution
+    return opt._to_orig_solution(solution)

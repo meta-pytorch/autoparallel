@@ -7,6 +7,7 @@ import json
 import tempfile
 
 import torch
+from conftest import apply_cuda_patches
 from torch import nn
 from torch.distributed.tensor.placement_types import Shard
 
@@ -84,9 +85,11 @@ def test_resolve_target_aten_op():
     assert result is torch.ops.aten.mm.default
 
 
-def test_resolve_target_unknown_falls_back():
-    result = _resolve_target("nonexistent.op.name")
-    assert result is torch.ops.aten.alias.default
+def test_resolve_target_unknown_raises():
+    import pytest
+
+    with pytest.raises(RuntimeError, match="Cannot resolve"):
+        _resolve_target("nonexistent.op.name")
 
 
 # ---- _patch_op_overload_pickle tests ----
@@ -112,6 +115,7 @@ def test_patch_op_overload_pickle_cleans_up():
 # ---- save/load roundtrip tests ----
 
 
+@apply_cuda_patches
 def test_save_load_roundtrip(device_mesh_1d):
     dim = 64
     with torch.device("meta"):
@@ -142,6 +146,7 @@ def test_save_load_roundtrip(device_mesh_1d):
     assert len(data["nodes"]) > 0
 
 
+@apply_cuda_patches
 def test_save_load_preserves_solution(device_mesh_1d):
     dim = 64
     with torch.device("meta"):
@@ -162,6 +167,7 @@ def test_save_load_preserves_solution(device_mesh_1d):
     assert len(loaded.selected_keys) > 0
 
 
+@apply_cuda_patches
 def test_save_load_with_clusters(device_mesh_1d):
     dim = 64
     with torch.device("meta"):
@@ -182,10 +188,11 @@ def test_save_load_with_clusters(device_mesh_1d):
     assert len(loaded.nodes) == len(opt.nodes)
 
 
-# ---- save_solution/load_solution roundtrip tests ----
+# ---- save_placements/load_placements roundtrip tests ----
 
 
-def test_save_load_solution_roundtrip(device_mesh_1d):
+@apply_cuda_patches
+def test_save_load_placements_roundtrip(device_mesh_1d):
     dim = 64
     with torch.device("meta"):
         model = _SimpleModel(dim)
@@ -198,15 +205,16 @@ def test_save_load_solution_roundtrip(device_mesh_1d):
         opt.get_solution()
 
     with tempfile.NamedTemporaryFile(suffix=".json", mode="w") as f:
-        opt.save_solution(f.name)
-        solution = opt.load_solution(f.name)
+        opt.save_placements(f.name)
+        solution = opt.load_placements(f.name)
 
     assert len(solution) > 0
     for node, strategy in solution.items():
         assert hasattr(strategy, "output_specs")
 
 
-def test_save_solution_is_valid_json(device_mesh_1d):
+@apply_cuda_patches
+def test_save_placements_is_valid_json(device_mesh_1d):
     dim = 64
     with torch.device("meta"):
         model = _SimpleModel(dim)
@@ -219,7 +227,7 @@ def test_save_solution_is_valid_json(device_mesh_1d):
         opt.get_solution()
 
     with tempfile.NamedTemporaryFile(suffix=".json", mode="w") as f:
-        opt.save_solution(f.name)
+        opt.save_placements(f.name)
         with open(f.name) as rf:
             data = json.load(rf)
 

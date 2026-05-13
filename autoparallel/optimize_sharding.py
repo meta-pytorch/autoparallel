@@ -1195,17 +1195,17 @@ class ShardingOptimizer:
 
         _restore_solution(self, selected_keys_by_name, nodes_by_name)
 
-    def save_solution(self, path):
-        """Save the current solution as a lightweight JSON file."""
-        from autoparallel.serialization import save_solution
+    def save_placements(self, path):
+        """Save the current placement choices as a lightweight JSON file."""
+        from autoparallel.serialization import save_placements
 
-        save_solution(self, path)
+        save_placements(self, path)
 
-    def load_solution(self, path):
-        """Load a solution from a JSON file and return a dict[Node, OpSpec]."""
-        from autoparallel.serialization import load_solution
+    def load_placements(self, path):
+        """Load placements from a JSON file and return a dict[Node, OpSpec]."""
+        from autoparallel.serialization import load_placements
 
-        return load_solution(self, path)
+        return load_placements(self, path)
 
     def print_costs_for_node(self, node, arg=0, **kwargs):
         from tabulate import tabulate  # type: ignore

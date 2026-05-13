@@ -4,6 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import torch
+from conftest import apply_cuda_patches
 from torch import nn
 from torch.distributed.tensor.placement_types import Shard
 
@@ -39,6 +40,7 @@ def _setup_autop(model, dim, device_mesh):
 # ---- _get_layer_index tests ----
 
 
+@apply_cuda_patches
 def test_get_layer_index_from_nn_module_stack(device_mesh_1d):
     dim = 64
     with torch.device("meta"):
@@ -80,6 +82,7 @@ def test_get_layer_index_returns_none_for_non_layer_node():
 # ---- _normalize_cluster_layer tests ----
 
 
+@apply_cuda_patches
 def test_normalize_cluster_layer_swaps_backward_roots(device_mesh_1d):
     dim = 64
     with torch.device("meta"):
@@ -124,6 +127,7 @@ def test_normalize_cluster_layer_empty():
 # ---- export_sharding_json tests ----
 
 
+@apply_cuda_patches
 def test_export_json_produces_valid_structure(device_mesh_1d):
     dim = 64
     with torch.device("meta"):

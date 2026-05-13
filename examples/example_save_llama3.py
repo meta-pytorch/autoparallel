@@ -76,7 +76,7 @@ with AutoParallel(model, input_fn, mesh, mp_policy) as autop:
     autop.sharding_optimizer.save("llama3_8b.ap")
     print(f"Saved optimizer state to llama3_8b.ap ({time.time() - t_save:.1f}s)")
 
-    # Also save a lightweight solution file
-    autop.sharding_optimizer.save_solution("llama3_8b_solution.json")
-    print("Saved solution to llama3_8b_solution.json")
+    # Also save a lightweight placements file
+    autop.sharding_optimizer.save_placements("llama3_8b_solution.json")
+    print("Saved placements to llama3_8b_solution.json")
     print(f"Total time: {time.time() - t0:.1f}s")
