@@ -7,7 +7,7 @@
 Save/load for ShardingOptimizer state.
 
 Handles full optimizer serialization (save/load) and lightweight
-solution-only serialization (save_placements/load_placements).
+placement serialization (save_placements/load_placements).
 """
 
 import json
@@ -110,12 +110,16 @@ def save_optimizer(opt, path):
 
     t0 = time.perf_counter()
 
-    # Convert selected_keys to node-name-based representation (if solved)
+    # Convert selected_keys to node-name-based representation (if solved).
+    # Only persist root keys — linked keys are re-expanded on load.
     selected_keys_by_name = None
     if hasattr(opt, "selected_keys"):
         selected_keys_by_name = {}
+        linked = opt._cluster_linked_node_idxs
         for key in opt.selected_keys:
             node_idx, argi, out_idx, inp_idx = key
+            if node_idx in linked:
+                continue
             node_name = opt.nodes[node_idx].name
             selected_keys_by_name.setdefault(node_name, []).append(
                 (argi, out_idx, inp_idx)
@@ -433,7 +437,7 @@ def load_placements(opt, path):
         if node_name not in nodes_by_name:
             raise RuntimeError(
                 f"Node '{node_name}' from saved placements not found in current graph. "
-                "The model may have changed since the solution was saved."
+                "The model may have changed since the placements were saved."
             )
         output_str = entry["output"]
         input_strs = entry["inputs"]
