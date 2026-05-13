@@ -14,10 +14,10 @@ import triton
 import triton.language as tl
 from torch import nn
 from torch.distributed.tensor import DeviceMesh, DTensor
-from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
+from torch.distributed.tensor.placement_types import Replicate, Shard
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
-from autoparallel.collectives import all_to_all, axis_size, local_map
+from autoparallel.collectives import all_reduce, all_to_all, axis_size, local_map
 
 _MODULE_FQN = "module_fqn"
 
@@ -428,12 +428,12 @@ class TokenChoiceTopKRouter(nn.Module):
         #       top_scores is still derived from the original scores.
         if expert_bias is not None:
             _, selected_experts_indices = torch.topk(
-                scores + expert_bias, k=self.top_k, dim=-1
+                scores + expert_bias, k=self.top_k, dim=-1, sorted=False
             )
             top_scores = scores.gather(dim=-1, index=selected_experts_indices)
         else:
             top_scores, selected_experts_indices = torch.topk(
-                scores, k=self.top_k, dim=-1
+                scores, k=self.top_k, dim=-1, sorted=False
             )
 
         if self.score_func == "sigmoid" and self.route_norm:
@@ -616,7 +616,6 @@ def _token_combine(
         return routed_output
 
 
-# @torch.library.custom_op("autoparallel::local_mapped_region", mutates_args=())
 def local_mapped_region(
     x: torch.Tensor,
     selected_experts_indices: torch.Tensor,
@@ -629,12 +628,10 @@ def local_mapped_region(
     num_experts: int,
     score_before_experts: bool,
     axis_name: str,
+    token_count_reduce_axis_names: tuple[str, ...],
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    # assert False, f"{x.shape}, {selected_experts_indices.shape}, {top_scores.shape}, {out.shape}"
-
     dim = x.shape[-1]
 
-    # num_tokens_per_expert = torch.ops.autoparallel.batched_histc(
     num_tokens_per_expert = torch.histc(
         selected_experts_indices.flatten(),
         bins=num_experts,
@@ -642,8 +639,15 @@ def local_mapped_region(
         max=num_experts,
     )
 
-    # total_tokens_per_expert = all_reduce(num_tokens_per_expert, axis_name)
+    # Token counts are logically Partial(sum), Partial(sum). TorchTitan's
+    # optimizer hook aggregates them with an all-reduce, so reduce here and mark
+    # the local_map output replicated to match the optimizer-side contract.
     total_tokens_per_expert = num_tokens_per_expert
+    for axis_name_for_token_counts in token_count_reduce_axis_names:
+        total_tokens_per_expert = all_reduce(
+            total_tokens_per_expert,
+            axis_name_for_token_counts,
+        )
 
     token_indices_experts_sorted = torch.argsort(
         selected_experts_indices.view(-1), stable=True
@@ -703,98 +707,6 @@ def local_mapped_region(
     return out, total_tokens_per_expert
 
 
-# @local_mapped_region.register_fake
-def _(
-    routed_input: torch.Tensor,
-    selected_expert_indices: torch.Tensor,
-    top_scores: torch.Tensor,
-    out: torch.Tensor,
-    experts_w1: torch.Tensor,
-    experts_w2: torch.Tensor,
-    experts_w3: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    num_experts = 64
-    return torch.empty_like(routed_input), torch.empty(
-        (1, num_experts), dtype=routed_input.dtype, device=routed_input.device
-    )
-
-
-# @torch.library.custom_op("autoparallel::local_mapped_region_grad", mutates_args=())
-# def local_mapped_region_grad(
-#     routed_input: torch.Tensor,
-#     selected_experts_indices: torch.Tensor,
-#     top_scores: torch.Tensor,
-#     out: torch.Tensor,
-#     experts_w1: torch.Tensor,
-#     experts_w2: torch.Tensor,
-#     experts_w3: torch.Tensor,
-# ) -> tuple[
-#     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
-# ]:
-#     grad_i = torch.empty_like(routed_input)
-#     grad_o = torch.empty_like(out)
-#     grad_s = torch.empty_like(top_scores)
-#     g1 = torch.empty_like(experts_w1)
-#     g2 = torch.empty_like(experts_w2)
-#     g3 = torch.empty_like(experts_w3)
-#     return grad_i, grad_s, grad_o, g1, g2, g3
-
-
-# @local_mapped_region_grad.register_fake
-# def _(
-#     routed_input: torch.Tensor,
-#     selected_experts_indices: torch.Tensor,
-#     top_scores: torch.Tensor,
-#     out: torch.Tensor,
-#     experts_w1: torch.Tensor,
-#     experts_w2: torch.Tensor,
-#     experts_w3: torch.Tensor,
-# ) -> tuple[
-#     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
-# ]:
-#     grad_i = torch.empty_like(routed_input)
-#     grad_o = torch.empty_like(out)
-#     grad_s = torch.empty_like(top_scores)
-#     g1 = torch.empty_like(experts_w1)
-#     g2 = torch.empty_like(experts_w2)
-#     g3 = torch.empty_like(experts_w3)
-#     return grad_i, grad_s, grad_o, g1, g2, g3
-
-
-# def setup_context_local_mapped_region(ctx, inputs, output):
-#     # routed_input, num_tokens_per_expert, experts_w1, experts_w2, experts_w3 = inputs
-#     ctx.save_for_backward(*inputs)
-
-
-# def backward_local_mapped_region(ctx, grad, grad2):
-#     (
-#         routed_input,
-#         selected_experts_indices,
-#         top_scores,
-#         out,
-#         experts_w1,
-#         experts_w2,
-#         experts_w3,
-#     ) = ctx.saved_tensors
-#     grad_i, grad_s, grad_o, g1, g2, g3 = local_mapped_region_grad(
-#         routed_input,
-#         selected_experts_indices,
-#         top_scores,
-#         out,
-#         experts_w1,
-#         experts_w2,
-#         experts_w3,
-#     )
-#     return grad_i, None, grad_s, grad_o, g1, g2, g3
-
-
-# torch.library.register_autograd(
-#     "autoparallel::local_mapped_region",
-#     backward_local_mapped_region,
-#     setup_context=setup_context_local_mapped_region,
-# )
-
-
 def _moe_forward(
     x: torch.Tensor,
     router_gate_weight: torch.Tensor,
@@ -812,56 +724,16 @@ def _moe_forward(
     score_before_experts: bool,
     compute_dtype: torch.dtype | None = None,
 ):
-    # x: 64, 2048, 256
     bs, slen, dim = x.shape
     x = x.view(-1, dim)
 
-    # top_scores and selected_experts_indices shape (bs*slen*top_k,)
-    # num_tokens_per_expert shape (num_experts,)
     (
         top_scores,
         selected_experts_indices,
     ) = router(x, router_gate_weight, expert_bias)
 
-    # tokens_per_expert will be used to update the expert bias for load balancing.
-    # and also to count the expert usage
-    # TODO: Activation Checkpointing has the side effect of double counting tokens_per_expert --
-    #       first in the forward pass, and then in the backward pass. However, this has no
-    #       effect on the expert bias update thanks to the torch.sign() operator.
-    # moved out to remove mutation
-    # with torch.no_grad():
-    #     tokens_per_expert.add_(num_tokens_per_expert)
-
-    # top_scores and token_indices_experts_sorted shape (bs*slen*top_k,)
-    # num_tokens_per_expert shape (num_experts,)
-    # NOTE: the reason we need to compute num_tokens_per_expert again is:
-    #       1st computation in router is to update self.tokens_per_expert
-    #       which would be the same across all TP ranks.
-    #       2nd computation in reorderer is for the actual routing and experts computation
-    #       which would be sharded over TP ranks if expert_tensor_parallel_degree==1.
-    #       If tensor_paralllel_degree == expert_tensor_parallel_degree, they agree.
-    # (
-    #     top_scores_experts_sorted,
-    #     token_indices_experts_sorted,
-    #     # _, #num_tokens_per_expert,
-    # ) = reorderer(top_scores, selected_experts_indices)
-
-    # shape (bs*slen*top_k, dim)
-    # routed_output = experts(routed_input, num_tokens_per_expert)
-
     out = functional_feed_forward(shared_w1, shared_w2, shared_w3, x, compute_dtype)
 
-    ######################################################
-    # This is in the local_map region
-    ######################################################
-
-    # expert_placements = ((Replicate(), Shard(0)),) * 3
-    # in_placements = (
-    #     (Shard(0), Shard(0)),
-    #     (Shard(0), Shard(0)),
-    #     (Shard(0), Shard(0)),
-    #     (Shard(0), Shard(0)),
-    # )
     # Dynamo reorders captured variables (lifted freevars) before explicit
     # arguments, so x must come first in the input order and placements.
     reordered_placements = (
@@ -876,13 +748,18 @@ def _moe_forward(
         None,
         None,
         None,
+        None,
     )
+
+    token_count_reduce_axis_names: tuple[str, ...] = ()
+    if mesh is not None and mesh.mesh_dim_names is not None:
+        token_count_reduce_axis_names = tuple(mesh.mesh_dim_names)
 
     out, num_tokens_per_expert = local_map(
         local_mapped_region,
         out_placements=(
             (Shard(0), Shard(0)),
-            (Partial(reduce_op="sum"), Partial(reduce_op="sum")),
+            (Replicate(), Replicate()),
         ),
         in_placements=reordered_placements,
         redistribute_inputs=True,
@@ -900,20 +777,9 @@ def _moe_forward(
         router.num_experts,
         score_before_experts,
         axis_name,
+        token_count_reduce_axis_names,
     )
-    # assert False, f"there: {out.shape}, {num_tokens_per_expert.shape}"
 
-    ######################################################
-    # end of the local_map region
-    ######################################################
-
-    # shared expert
-    # if shared_experts is not None:
-    #     out = shared_experts(x)
-    # else:
-    #     out = torch.zeros_like(x)
-
-    # assert False, f"{out.shape}, {token_indices_experts_sorted.shape}, {routed_output.shape}"
     out = out.reshape(bs, slen, dim)
     return out, num_tokens_per_expert
 
@@ -1003,7 +869,7 @@ class MoE(nn.Module):
             self.compute_dtype,
         )
 
-        # HOPs don't support buffer mutations, keep this outside
+        # HOPs don't support buffer mutations, keep this outside.
         with torch.no_grad():
             self.tokens_per_expert.add_(num_tokens_per_expert)  # type: ignore[operator]
         return out
@@ -1049,7 +915,6 @@ class ScaledDotProductAttention(torch.nn.Module):
         if cls.backends:
             return
 
-        # Add CuDNN on B200 w/ highest priority
         cls.backends = [
             SDPBackend.FLASH_ATTENTION,
             SDPBackend.EFFICIENT_ATTENTION,
@@ -1526,22 +1391,16 @@ class Attention(nn.Module):
         )  # (bsz, seqlen, dim)
 
     def init_weights(self, init_std: float):
-        linear_list = [
-            self.wkv_a,
-            self.wkv_b,
-        ]
         if self.q_lora_rank > 0:
-            linear_list.extend([self.wq_a, self.wq_b])
-        else:
-            linear_list.append(self.wq)
-
-        for linear in linear_list:
-            nn.init.trunc_normal_(linear.weight, mean=0.0, std=0.02)
-        nn.init.trunc_normal_(self.wo.weight, mean=0.0, std=init_std)
-
-        self.kv_norm.reset_parameters()
-        if self.q_lora_rank > 0:
+            nn.init.trunc_normal_(self.wq_a.weight, mean=0.0, std=0.02)
             self.q_norm.reset_parameters()
+            nn.init.trunc_normal_(self.wq_b.weight, mean=0.0, std=0.02)
+        else:
+            nn.init.trunc_normal_(self.wq.weight, mean=0.0, std=0.02)
+        nn.init.trunc_normal_(self.wkv_a.weight, mean=0.0, std=0.02)
+        self.kv_norm.reset_parameters()
+        nn.init.trunc_normal_(self.wkv_b.weight, mean=0.0, std=0.02)
+        nn.init.trunc_normal_(self.wo.weight, mean=0.0, std=init_std)
 
 
 class TransformerBlock(nn.Module):
@@ -1581,7 +1440,7 @@ class TransformerBlock(nn.Module):
                 route_norm=moe_cfg.router.route_norm,
                 route_scale=moe_cfg.router.route_scale,
                 score_before_experts=moe_cfg.experts.token_dispatcher.score_before_experts,
-                use_grouped_mm=moe_cfg.experts.use_grouped_mm,
+                use_grouped_mm=getattr(moe_cfg.experts, "use_grouped_mm", True),
                 load_balance_coeff=moe_cfg.load_balance_coeff,
                 mesh=mesh,
                 compute_dtype=compute_dtype,
@@ -1621,9 +1480,9 @@ class TransformerBlock(nn.Module):
         return x
 
     def init_weights(self, buffer_device: torch.device):
-        for norm in (self.attention_norm, self.ffn_norm):
-            norm.reset_parameters()
         self.attention.init_weights(self.weight_init_std)
+        self.attention_norm.reset_parameters()
+        self.ffn_norm.reset_parameters()
         if self.moe_enabled:
             self.moe.init_weights(self.weight_init_std, buffer_device)
         else:
@@ -1673,8 +1532,10 @@ class DeepSeekV3Model(nn.Module):
     def init_weights(
         self, buffer_device: torch.device | None = None, seed: int | None = None
     ) -> None:
-        _init_weights_tok_embeddings(self, seed)
-        _init_weights_layers(self, buffer_device, seed)
+        if seed is not None:
+            torch.manual_seed(seed)
+        _init_weights_tok_embeddings(self)
+        _init_weights_layers(self, buffer_device)
         _init_weights_norm_and_output(self)
 
     def forward(
@@ -1722,9 +1583,7 @@ class DeepSeekV3Model(nn.Module):
         return output
 
 
-def _init_weights_tok_embeddings(self: DeepSeekV3Model, seed: int | None = None):
-    if seed is not None:
-        torch.manual_seed(seed)
+def _init_weights_tok_embeddings(self: DeepSeekV3Model):
     if self.tok_embeddings is not None:
         nn.init.normal_(self.tok_embeddings.weight)
 
@@ -1732,15 +1591,12 @@ def _init_weights_tok_embeddings(self: DeepSeekV3Model, seed: int | None = None)
 def _init_weights_layers(
     self: DeepSeekV3Model,
     buffer_device: torch.device | None,
-    seed: int | None = None,
 ):
     if buffer_device is None:
         buffer_device = self.freqs_cis.device  # type: ignore[assignment]
     with torch.device(buffer_device):  # type: ignore[arg-type]
         self.freqs_cis = precompute_freqs_cis(self.model_args)
     for i, layer in enumerate(self.layers.values()):
-        if seed is not None:
-            torch.manual_seed(seed)
         if layer is not None:
             assert isinstance(layer, TransformerBlock)
             layer.init_weights(buffer_device)  # type: ignore[arg-type]

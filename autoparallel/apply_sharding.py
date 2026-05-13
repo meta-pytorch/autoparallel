@@ -435,10 +435,15 @@ def _make_local_args(gm, sharding_placement):
     return local_args
 
 
-def _lower_to_parallel_graph(gm, sharding_placement, local_args, dynamic=False):
+def _lower_to_parallel_graph(
+    gm,
+    sharding_placement,
+    local_args,
+    dynamic=False,
+    *,
+    decompose_after_sharding=True,
+):
     """Two-pass lowering: interpret with sharding collectives, then decompose."""
-    decomp_table = _get_inductor_decomp_table()
-
     interp = ApplyShardingInterpreter(gm, sharding_placement, dynamic=dynamic)
 
     tracing_mode = "symbolic" if dynamic else "real"
@@ -448,12 +453,11 @@ def _lower_to_parallel_graph(gm, sharding_placement, local_args, dynamic=False):
     cleanup_graph(parallel_gm0)
 
     interp2 = torch.fx.Interpreter(parallel_gm0)
+    make_fx_kwargs = {"tracing_mode": tracing_mode}
+    if decompose_after_sharding:
+        make_fx_kwargs["decomposition_table"] = _get_inductor_decomp_table()
     with fx_traceback.preserve_node_meta():
-        parallel_gm = make_fx(
-            interp2.run,
-            decomposition_table=decomp_table,
-            tracing_mode=tracing_mode,
-        )(*local_args)
+        parallel_gm = make_fx(interp2.run, **make_fx_kwargs)(*local_args)
     cleanup_graph(parallel_gm)
 
     return parallel_gm
@@ -499,7 +503,14 @@ def _shard_params_and_buffers(gm, sharding_placement, params_spec, buffers_spec)
     return sharded_param_dict, sharded_buffer_dict
 
 
-def apply_sharding_to_model(gm, sharding_placement, params_spec, buffers_spec):
+def apply_sharding_to_model(
+    gm,
+    sharding_placement,
+    params_spec,
+    buffers_spec,
+    *,
+    decompose_after_sharding=True,
+):
     t0 = time.perf_counter()
     dynamic = _has_symbolic_shapes(gm)
 
@@ -532,7 +543,13 @@ def apply_sharding_to_model(gm, sharding_placement, params_spec, buffers_spec):
     local_args = _make_local_args(gm, sharding_placement)
     t1 = time.perf_counter()
 
-    parallel_gm = _lower_to_parallel_graph(gm, sharding_placement, local_args, dynamic)
+    parallel_gm = _lower_to_parallel_graph(
+        gm,
+        sharding_placement,
+        local_args,
+        dynamic,
+        decompose_after_sharding=decompose_after_sharding,
+    )
     t2 = time.perf_counter()
 
     _copy_descriptors_and_rename_placeholders(gm, parallel_gm)
