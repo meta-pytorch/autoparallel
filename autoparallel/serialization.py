@@ -25,14 +25,21 @@ logger: logging.Logger = logging.getLogger(__name__)
 class _MeshPlaceholder:
     """Lightweight stand-in for DeviceMesh when loading without a process group.
 
-    Provides the attributes used by get_json() and add_node_constraint()
-    without requiring distributed initialization.
+    Provides the attributes used by get_json(), add_node_constraint(),
+    and add_parameter_memory_constraint() without requiring distributed
+    initialization.
     """
 
     def __init__(self, shape, dim_names):
         self.shape = tuple(shape)
         self.mesh_dim_names = tuple(dim_names) if dim_names else None
         self.ndim = len(shape)
+
+    def size(self):
+        result = 1
+        for s in self.shape:
+            result *= s
+        return result
 
 
 def _resolve_target(target_str):
@@ -220,7 +227,8 @@ def load_optimizer(cls, path):
         save_dict = torch.load(path, weights_only=False)
     t1 = time.perf_counter()
     logger.debug("load: torch.load took %.3fs", t1 - t0)
-    assert save_dict["version"] == 1, f"Unsupported version: {save_dict['version']}"
+    if save_dict["version"] != 1:
+        raise RuntimeError(f"Unsupported save file version: {save_dict['version']}")
 
     graph = save_dict["graph"]
     strats_by_name = save_dict["strats_by_name"]
@@ -412,7 +420,10 @@ def load_placements(opt, path):
     with open(path) as f:
         save_dict = json.load(f)
 
-    assert save_dict["version"] == 1
+    if save_dict["version"] != 1:
+        raise RuntimeError(
+            f"Unsupported placements file version: {save_dict['version']}"
+        )
 
     # Validate mesh compatibility
     saved_shape = tuple(save_dict["mesh_shape"])
