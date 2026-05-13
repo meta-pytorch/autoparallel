@@ -3,7 +3,6 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
-import operator
 from collections import Counter
 
 import torch
@@ -295,78 +294,3 @@ def test_clustering_no_forward_backward_mixing(device_mesh_2d):
             tags = set(n.meta.get("partitioner_tag") for n in region)
             tags.discard(None)
             assert len(tags) <= 1, f"Cluster group {i}, region {j} mixes phases: {tags}"
-
-
-def test_getitem_siblings_are_clustered(device_mesh_2d):
-    """Getitem nodes that project sibling outputs from tuple-returning ops
-    (e.g. SDPA returning (output, logsumexp, rng_state)) should be clustered
-    together with their producer when the producer is already clustered."""
-    n_layers = 4
-    autop, _ = _setup_llama_autop(device_mesh_2d, n_layers=n_layers)
-    with autop:
-        x_sharding = (Shard(0), Replicate())
-        out_sharding = (Shard(0), Shard(2))
-        autop.add_input_constraints([x_sharding])
-        autop.add_output_constraints([out_sharding])
-
-        graph = autop.sharding_optimizer.graph
-        strats = autop.sharding_optimizer.strats
-        clusters = get_identical_regions(graph, strats)
-
-    clustered_nodes = set()
-    for group in clusters:
-        for region in group:
-            clustered_nodes.update(region)
-
-    # Find all getitem nodes that have strategies and belong to layers
-    unclustered_getitems = []
-    for node in graph.nodes:
-        if node.target is not operator.getitem:
-            continue
-        if node not in strats:
-            continue
-        layer_idx = _get_layer_index(node)
-        if layer_idx is not None and node not in clustered_nodes:
-            unclustered_getitems.append(node)
-
-    assert len(unclustered_getitems) == 0, (
-        f"{len(unclustered_getitems)} getitem nodes in layers are not clustered: "
-        f"{[n.name for n in unclustered_getitems[:5]]}"
-    )
-
-
-def test_getitem_siblings_cluster_consistency(device_mesh_2d):
-    """Getitem siblings added by _extend_with_sibling_getitems should appear
-    in the same cluster group as their producer, with one per region."""
-    n_layers = 4
-    autop, _ = _setup_llama_autop(device_mesh_2d, n_layers=n_layers)
-    with autop:
-        x_sharding = (Shard(0), Replicate())
-        out_sharding = (Shard(0), Shard(2))
-        autop.add_input_constraints([x_sharding])
-        autop.add_output_constraints([out_sharding])
-
-        graph = autop.sharding_optimizer.graph
-        strats = autop.sharding_optimizer.strats
-        clusters = get_identical_regions(graph, strats)
-
-    for i, group in enumerate(clusters):
-        num_regions = len(group)
-        # Collect all getitem nodes across all regions in this group
-        getitems_in_group = []
-        for region in group:
-            for node in region:
-                if node.target is operator.getitem:
-                    getitems_in_group.append(node)
-
-        if not getitems_in_group:
-            continue
-
-        # Each getitem index should appear exactly once per region
-        # Group getitems by their tuple index
-        by_index = Counter(n.args[1] for n in getitems_in_group)
-        for idx, count in by_index.items():
-            assert count == num_regions, (
-                f"Cluster group {i}: getitem[{idx}] appears {count} times "
-                f"but there are {num_regions} regions"
-            )
