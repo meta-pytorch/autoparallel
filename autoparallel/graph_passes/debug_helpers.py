@@ -348,9 +348,14 @@ def create_execution_trace(
 
         cat = _get_category(node)
         coll_type = _get_collective_type(node)
-        node_name = f"nccl:{coll_type}:{node.name}" if coll_type else str(node)
+        if coll_type:
+            event_name = f"nccl:{coll_type}"
+        elif node.op == "call_function":
+            event_name = str(node.target)
+        else:
+            event_name = node.op
 
-        event = {"ph": "X", "cat": cat, "name": node_name, "pid": 0, "tid": tid}
+        event = {"ph": "X", "cat": cat, "name": event_name, "pid": 0, "tid": tid}
 
         if _is_communication_node(node):
             if tid == 0 and _is_wait_tensor(node) and node.args[0].op != "placeholder":
@@ -371,6 +376,7 @@ def create_execution_trace(
             global_time[node] = curr_time[tid]
 
         event["args"] = {
+            "name": node.name,
             "order": node_idx,
             "output": get_repr(node, mode="content_only"),
             "inputs": [get_repr(arg) for arg in node.args],
