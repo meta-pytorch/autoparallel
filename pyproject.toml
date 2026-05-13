@@ -45,11 +45,19 @@ exclude = [
 allow-direct-references = true
 
 [tool.black]
-exclude = "autoparallel/tools/overlap_simulator/repro_.*\\.py"
+exclude = """
+(
+  autoparallel/tools/overlap_simulator/repro_.*\\.py
+  | autoparallel/visualizer/build_display_from_json\\.py
+)
+"""
 
 [tool.isort]
 profile = "black"
 skip_glob = ["autoparallel/tools/overlap_simulator/repro_*.py"]
 
 [tool.mypy]
-exclude = ["autoparallel/tools/overlap_simulator/repro_.*\\.py"]
+exclude = [
+  "autoparallel/tools/overlap_simulator/repro_.*\\.py",
+  "autoparallel/visualizer/build_display_from_json\\.py",
+]
