@@ -353,7 +353,7 @@ def load_optimizer(cls, path):
 
 
 def _restore_solution(opt, selected_keys_by_name, nodes_by_name):
-    """Restore selected_keys and PuLP variable values from a saved solution."""
+    """Restore selected_keys and PuLP variable values from a saved state."""
     opt.selected_keys = []
     for node_name, key_parts in selected_keys_by_name.items():
         node = nodes_by_name[node_name]
@@ -380,7 +380,10 @@ def save_placements(opt, path):
     placements = {}
     solution = opt._extract_and_validate_solution()
     for node, strategy in solution.items():
-        placements[node.name] = _pretty_print_spec(strategy.output_specs)
+        placements[node.name] = {
+            "output": _pretty_print_spec(strategy.output_specs),
+            "inputs": [_pretty_print_spec(s) for s in strategy.input_specs],
+        }
 
     save_dict = {
         "version": 1,
@@ -414,25 +417,40 @@ def load_placements(opt, path):
             f"Mesh shape mismatch: saved {list(saved_shape)}, "
             f"current {list(opt.mesh.shape)}"
         )
+    saved_names = (
+        tuple(save_dict["mesh_dim_names"]) if save_dict.get("mesh_dim_names") else None
+    )
+    current_names = tuple(opt.mesh.mesh_dim_names) if opt.mesh.mesh_dim_names else None
+    if saved_names != current_names:
+        raise RuntimeError(
+            f"Mesh dim names mismatch: saved {list(saved_names or [])}, "
+            f"current {list(current_names or [])}"
+        )
 
     nodes_by_name = {node.name: node for node in opt.nodes}
     solution = {}
-    for node_name, placement_str in save_dict["placements"].items():
+    for node_name, entry in save_dict["placements"].items():
         if node_name not in nodes_by_name:
             raise RuntimeError(
-                f"Node '{node_name}' from saved solution not found in current graph. "
+                f"Node '{node_name}' from saved placements not found in current graph. "
                 "The model may have changed since the solution was saved."
             )
+        output_str = entry["output"]
+        input_strs = entry["inputs"]
+
         node = nodes_by_name[node_name]
         strat = opt.strats[node]
         matched = None
         for s in strat.strategies:
-            if _pretty_print_spec(s.output_specs) == placement_str:
-                matched = s
-                break
+            if _pretty_print_spec(s.output_specs) != output_str:
+                continue
+            if [_pretty_print_spec(sp) for sp in s.input_specs] != input_strs:
+                continue
+            matched = s
+            break
         if matched is None:
             raise RuntimeError(
-                f"Placement '{placement_str}' for node '{node_name}' not found "
+                f"Placement '{output_str}' for node '{node_name}' not found "
                 f"in available strategies. The model or mesh may have changed."
             )
         solution[node] = matched

@@ -1190,7 +1190,7 @@ class ShardingOptimizer:
         return load_optimizer(cls, path)
 
     def _restore_solution(self, selected_keys_by_name, nodes_by_name):
-        """Restore selected_keys and PuLP variable values from a saved solution."""
+        """Restore selected_keys and PuLP variable values from a saved state."""
         from autoparallel.serialization import _restore_solution
 
         _restore_solution(self, selected_keys_by_name, nodes_by_name)
