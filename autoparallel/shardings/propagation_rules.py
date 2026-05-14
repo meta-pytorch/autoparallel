@@ -1213,3 +1213,121 @@ def index_strategy(mesh, op_schema: OpSchema):
     return expand_to_full_mesh_op_strategy(
         mesh, op_schema, single_mesh_dim_strategies, input_index=1
     )
+
+
+# ---------------------------------------------------------------------------
+# Workaround for upstream DTensor bug in common_reduction_strategy:
+# the `reduction_linear` flag is cumulative across strategies — once a
+# Partial(avg) strategy flips it to False, all subsequent strategies
+# (including valid ones like S(0)S(1)) are forced through
+# replicate_reduction_dims and collapse to RR.  This prevents the
+# optimizer from discovering the cheap reduce-scatter path for weight
+# gradient reductions.
+#
+# We re-register the linear-reduction ops with a fixed version that
+# resets reduction_linear per strategy.
+# ---------------------------------------------------------------------------
+
+
+def _fixed_common_reduction_strategy(
+    input_strategy,
+    reduce_dims,
+    keep_dim=False,
+    reduction_linear=True,
+    reduction_op="sum",
+):
+    from torch.distributed.tensor._ops._math_ops import (
+        _infer_reduce_dims_map,
+        map_placements_after_reduction,
+        replicate_reduction_dims,
+    )
+
+    reduction_strategy = OpStrategy([])
+
+    for op_spec in input_strategy.strategies:
+        # Per-strategy reset: the flag should not leak across strategies.
+        spec_reduction_linear = reduction_linear
+
+        if reduction_op == "avg":
+            from torch.distributed.tensor._ops.utils import (
+                is_tensor_evenly_shardable_on_dim,
+            )
+
+            output_spec = op_spec.output_spec
+            local_shape = list(output_spec.tensor_meta.shape)
+            for dim in reduce_dims:
+                if not is_tensor_evenly_shardable_on_dim(local_shape, output_spec, dim):
+                    spec_reduction_linear = False
+                    break
+
+        for p in op_spec.output_spec.placements:
+            if isinstance(p, Partial) and p.reduce_op != reduction_op:
+                spec_reduction_linear = False
+                break
+
+        if not spec_reduction_linear:
+            input_placements = replicate_reduction_dims(
+                op_spec.output_spec.placements, reduce_dims
+            )
+        else:
+            input_placements = op_spec.output_spec.placements
+
+        input_spec = DTensorSpec(
+            mesh=input_strategy.mesh,
+            placements=input_placements,
+            tensor_meta=op_spec.output_spec.tensor_meta,
+        )
+
+        reduce_dims_map = _infer_reduce_dims_map(reduce_dims, input_spec.ndim, keep_dim)
+        out_placements = map_placements_after_reduction(
+            input_spec.placements, reduce_dims, reduce_dims_map, reduction_op
+        )
+        redistribute_cost = [generate_redistribute_costs(input_strategy, input_spec)]
+        reduction_strategy.strategies.append(
+            OpSpec(
+                output_specs=DTensorSpec(
+                    mesh=input_strategy.mesh,
+                    placements=out_placements,
+                ),
+                input_specs=(input_spec,),
+                redistribute_cost=redistribute_cost,
+            )
+        )
+
+    return reduction_strategy
+
+
+def _fixed_linear_reduction_rule(mesh, op_schema):
+    from torch.distributed.tensor._ops._math_ops import (
+        LINEAR_REDUCTION_OP_MAP,
+        _infer_reduction_dims,
+    )
+
+    args_schema = op_schema.args_schema
+    input_strategy = args_schema[0]
+
+    dims = None
+    if len(args_schema) > 1:
+        dims = _infer_reduction_dims(args_schema[1], input_strategy.ndim)
+
+    reduce_dims = list(range(input_strategy.ndim)) if dims is None else dims
+    keep_dim = len(args_schema) > 2 and bool(args_schema[2])
+    reduction_op = LINEAR_REDUCTION_OP_MAP[op_schema.op]
+
+    return _fixed_common_reduction_strategy(
+        input_strategy,
+        reduce_dims,
+        keep_dim=keep_dim,
+        reduction_linear=True,
+        reduction_op=reduction_op,
+    )
+
+
+def _register_fixed_reduction_rules():
+    from torch.distributed.tensor._ops._math_ops import LINEAR_REDUCTION_OP_MAP
+
+    for op in LINEAR_REDUCTION_OP_MAP:
+        _op_rules[op] = _fixed_linear_reduction_rule
+
+
+_register_fixed_reduction_rules()

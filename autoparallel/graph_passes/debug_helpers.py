@@ -106,13 +106,30 @@ def build_arguments(fn):
     return args
 
 
+# _dtensor ops that are collective communications (not routed through
+# _c10d_functional but still run on the NCCL stream).
+_DTENSOR_COLLECTIVE_OPS = frozenset({"shard_dim_alltoall"})
+
+
 def _is_communication_node(node):
     if not node.op == "call_function":
         return False
     if not isinstance(node.target, torch._ops.OpOverload):
         return False
 
-    return node.target.namespace in ("_c10d_functional", "c10d_functional")
+    ns = node.target.namespace
+    if ns in ("_c10d_functional", "c10d_functional"):
+        return True
+    if ns == "_dtensor" and node.target._opname in _DTENSOR_COLLECTIVE_OPS:
+        return True
+    return False
+
+
+def _is_sync_collective(node):
+    """Return True for collectives that block (no wait_tensor follows)."""
+    if not _is_communication_node(node):
+        return False
+    return node.target.namespace == "_dtensor"
 
 
 def _is_wait_tensor(node):
@@ -208,6 +225,10 @@ def make_custom_runtime_estimation(mesh):
                 elif target == torch.ops._c10d_functional.all_reduce.default:
                     n_bytes = int(comm_bytes_gb * 1024**3)
                     return nccl_allreduce_cost(n_bytes, topo, nccl_config)
+                elif target == torch.ops._dtensor.shard_dim_alltoall.default:
+                    # alltoall moves similar data volume to allgather
+                    n_bytes = int(comm_bytes_gb * cost_mesh.shape[mesh_dim] * 1024**3)
+                    return nccl_allgather_cost(n_bytes, topo, nccl_config)
                 else:
                     return 0
 
@@ -221,6 +242,9 @@ def make_custom_runtime_estimation(mesh):
                 return reduce_scatter_cost(comm_bytes_gb, mesh_topo, mesh_dim)
             elif target == torch.ops._c10d_functional.all_reduce.default:
                 return allreduce_cost(comm_bytes_gb, mesh_topo, mesh_dim)
+            elif target == torch.ops._dtensor.shard_dim_alltoall.default:
+                comm_bytes_gb *= cost_mesh.shape[mesh_dim]
+                return allgather_cost(comm_bytes_gb, mesh_topo, mesh_dim)
             else:
                 return 0
         return estimate_strategy_runtime_cost(node, None)
@@ -283,6 +307,8 @@ def _get_collective_type(node):
         return "ReduceScatter"
     elif "all_reduce" in target_str:
         return "AllReduce"
+    elif "alltoall" in target_str:
+        return "AllToAll"
     elif "wait_tensor" in target_str:
         return "Wait"
     return "Unknown"
@@ -374,6 +400,9 @@ def create_execution_trace(
             curr_time[0] += launch_overhead
             # keep track of when a given collective will finish
             global_time[node] = curr_time[tid]
+            if _is_sync_collective(node):
+                # Synchronous collective: compute stream must wait for it
+                curr_time[0] = max(curr_time[0], curr_time[tid])
 
         event["args"] = {
             "name": node.name,

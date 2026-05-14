@@ -187,7 +187,13 @@ def is_collective(node: torch.fx.Node) -> bool:
     return (
         node.op == "call_function"
         and isinstance(node.target, torch._ops.OpOverload)
-        and node.target.namespace == "_c10d_functional"
+        and (
+            node.target.namespace == "_c10d_functional"
+            or (
+                node.target.namespace == "_dtensor"
+                and node.target._opname == "shard_dim_alltoall"
+            )
+        )
     )
 
 
