@@ -12,6 +12,7 @@ from torch._inductor.fx_passes.memory_estimator import MemoryTracker
 from autoparallel.graph_passes.debug_helpers import (
     _get_tid,
     _is_communication_node,
+    _is_sync_collective,
     _is_wait_tensor,
     _resolve_comm_node,
 )
@@ -74,6 +75,10 @@ def estimate_graph_metrics(
         if tid != 0:
             curr_time[0] += launch_overhead
             global_time[node] = curr_time[tid]
+            if _is_sync_collective(node):
+                stall = max(0.0, curr_time[tid] - curr_time[0])
+                exposed_comm_time += stall
+                curr_time[0] = max(curr_time[0], curr_time[tid])
 
     return GraphMetrics(
         total_time=max(curr_time.values()),

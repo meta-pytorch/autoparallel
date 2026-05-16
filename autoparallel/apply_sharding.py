@@ -19,6 +19,7 @@ from torch._inductor.decomposition import select_decomp_table
 from torch._subclasses.fake_tensor import FakeTensor, unset_fake_temporarily
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor._dtensor_spec import DTensorSpec, ShardOrderEntry
+from torch.distributed.tensor._redistribute import use_min_cost_redistribution_plan
 from torch.distributed.tensor.placement_types import Partial, Replicate, Shard  # noqa
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.utils._pytree import tree_flatten, tree_map_only
@@ -532,7 +533,10 @@ def apply_sharding_to_model(gm, sharding_placement, params_spec, buffers_spec):
     local_args = _make_local_args(gm, sharding_placement)
     t1 = time.perf_counter()
 
-    parallel_gm = _lower_to_parallel_graph(gm, sharding_placement, local_args, dynamic)
+    with use_min_cost_redistribution_plan():
+        parallel_gm = _lower_to_parallel_graph(
+            gm, sharding_placement, local_args, dynamic
+        )
     t2 = time.perf_counter()
 
     _copy_descriptors_and_rename_placeholders(gm, parallel_gm)
