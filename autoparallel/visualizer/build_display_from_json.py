@@ -1736,714 +1736,139 @@ def _build_perfetto_tab_html(non_param_nodes):
 </div>"""
 
 
-def generate_visualization_html(data: dict) -> str:
-    """Generate interactive HTML visualization from the JSON export dict.
+def _render_styles():
+    """Return the complete <style> block."""
+    return r"""<style>
+.ap-viz { margin: 0; padding: 0; box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f8fafc; color: #1e293b; }
+.ap-viz *, .ap-viz *::before, .ap-viz *::after { box-sizing: border-box; }
+.ap-viz .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
+.ap-viz h1 { font-size: 24px; font-weight: 700; margin: 0 0 4px 0; color: #1e293b; }
+.ap-viz .subtitle { color: #64748b; font-size: 14px; margin-bottom: 20px; }
+.ap-viz .stats-row { display: flex; gap: 12px; margin-bottom: 20px; flex-wrap: wrap; }
+.ap-viz .stat-card { background: white; border: 1px solid #e2e8f0; border-radius: 8px; padding: 14px 18px; flex: 1; min-width: 140px; color: #1e293b; }
+.ap-viz .stat-label { font-size: 11px; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.5px; }
+.ap-viz .stat-value { font-size: 22px; font-weight: 700; margin-top: 2px; }
+.ap-viz .stat-detail { font-size: 12px; color: #64748b; margin-top: 2px; }
+.ap-viz .controls { display: flex; gap: 12px; margin-bottom: 16px; flex-wrap: wrap; align-items: center; }
+.ap-viz .control-group { display: flex; gap: 4px; align-items: center; }
+.ap-viz .control-label { font-size: 11px; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.5px; margin-right: 4px; }
+.ap-viz .tabs { display: flex; gap: 0; border-bottom: 2px solid #e2e8f0; margin-bottom: 20px; }
+.ap-viz .tab { padding: 10px 20px; cursor: pointer; font-size: 14px; font-weight: 500; color: #64748b; border-bottom: 2px solid transparent; margin-bottom: -2px; transition: all 0.2s; background: transparent; }
+.ap-viz .tab:hover { color: #3b82f6; }
+.ap-viz .tab.active { color: #3b82f6; border-bottom-color: #3b82f6; }
+.ap-viz .tab-content { display: none; }
+.ap-viz .tab-content.active { display: block; }
+.ap-viz .card { background: white; border: 1px solid #e2e8f0; border-radius: 8px; padding: 18px; margin-bottom: 16px; color: #1e293b; }
+.ap-viz .card-title { font-size: 14px; font-weight: 600; margin-bottom: 12px; color: #1e293b; }
+.ap-viz .func-block { border-radius: 8px; padding: 14px; margin-bottom: 10px; border-left: 4px solid #cbd5e1; cursor: pointer; transition: box-shadow 0.2s; }
+.ap-viz .func-block:hover { box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
+.ap-viz .func-name { font-weight: 600; font-size: 14px; color: #1e293b; }
+.ap-viz .func-meta { font-size: 12px; color: #64748b; margin-top: 4px; }
+.ap-viz .placement-bar { height: 6px; border-radius: 3px; display: flex; overflow: hidden; margin-top: 6px; background: #f1f5f9; }
+.ap-viz .placement-bar-seg { height: 100%; min-width: 2px; }
+.ap-viz .collective-badge { display: inline-block; background: #FEE2E2; color: #DC2626; font-size: 11px; padding: 2px 8px; border-radius: 10px; margin: 2px 2px; font-weight: 500; }
 
-    Args:
-        data: The dict returned by export_sharding_json() or
-              ShardingOptimizer.get_json().
+.ap-viz .cluster-badge { display: inline-block; padding: 1px 6px; border-radius: 8px; font-size: 10px; font-weight: 600; color: #6B7280; background: #F1F5F9; margin-left: 4px; }
+.ap-viz .func-details { display: none; margin-top: 10px; padding-top: 10px; border-top: 1px solid rgba(0,0,0,0.1); font-size: 12px; }
+.ap-viz .func-block.expanded > .func-details { display: block; }
+.ap-viz .cost-bar-container { margin-bottom: 10px; }
+.ap-viz .cost-bar-label { font-size: 12px; margin-bottom: 3px; display: flex; justify-content: space-between; color: #1e293b; }
+.ap-viz .cost-bar { height: 24px; border-radius: 4px; display: flex; overflow: hidden; background: #f1f5f9; }
+.ap-viz .cost-bar-segment { height: 100%; display: flex; align-items: center; justify-content: center; font-size: 10px; color: white; font-weight: 500; min-width: 2px; }
+.ap-viz .treemap-container { position: relative; height: 400px; background: #f8fafc; border-radius: 8px; overflow: hidden; }
+.ap-viz .treemap-cell { position: absolute; overflow: hidden; cursor: pointer; border: 1px solid white; transition: opacity 0.15s; display: flex; align-items: center; justify-content: center; box-sizing: border-box; }
+.ap-viz .treemap-cell:hover { opacity: 0.85; }
+.ap-viz .treemap-cell span { font-size: 11px; color: white; font-weight: 500; text-shadow: 0 1px 2px rgba(0,0,0,0.5); pointer-events: none; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 0 4px; }
+.ap-viz table { width: 100%; border-collapse: collapse; font-size: 12px; color: #1e293b; }
+.ap-viz th { text-align: left; padding: 8px 10px; background: #f8fafc; border-bottom: 2px solid #e2e8f0; font-weight: 600; color: #64748b; text-transform: uppercase; font-size: 11px; letter-spacing: 0.3px; position: sticky; top: 0; z-index: 2; }
+.ap-viz td { padding: 7px 10px; border-bottom: 1px solid #f1f5f9; background: white; }
+.ap-viz tr:hover td { background: #f8fafc; }
+.ap-viz .placement-chip { display: inline-block; padding: 2px 8px; border-radius: 4px; font-family: monospace; font-size: 11px; font-weight: 500; position: relative; cursor: default; }
+.ap-viz .placement-chip .chip-tooltip { display: none; position: absolute; left: 0; top: 100%; margin-top: 4px; background: #1e293b; color: white; padding: 6px 10px; border-radius: 6px; font-size: 11px; font-family: monospace; white-space: pre; z-index: 1000; pointer-events: none; box-shadow: 0 2px 8px rgba(0,0,0,0.2); }
+.ap-viz .placement-chip:hover .chip-tooltip { display: block; }
+.ap-viz .cost-high { color: #DC2626; font-weight: 600; }
+.ap-viz .cost-med { color: #F59E0B; }
+.ap-viz .cost-low { color: #64748b; }
+.ap-viz .filter-bar { display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; align-items: center; }
+.ap-viz .filter-btn { padding: 4px 12px; border-radius: 16px; border: 1px solid #e2e8f0; background: white; color: #1e293b; cursor: pointer; font-size: 12px; transition: all 0.15s; }
+.ap-viz .filter-btn:hover { border-color: #3b82f6; }
+.ap-viz .filter-btn.active { background: #3b82f6; color: white; border-color: #3b82f6; }
+.ap-viz .search-box { padding: 5px 12px; border-radius: 16px; border: 1px solid #e2e8f0; background: white; color: #1e293b; font-size: 12px; width: 220px; outline: none; transition: border-color 0.15s; }
+.ap-viz .search-box:focus { border-color: #3b82f6; }
+.ap-viz .table-scroll { max-height: 600px; overflow-y: auto; }
+.ap-viz th.sortable { cursor: pointer; user-select: none; }
+.ap-viz th.sortable:hover { color: #3b82f6; }
+.ap-viz th.sort-asc::after { content: " \25B2"; font-size: 9px; }
+.ap-viz th.sort-desc::after { content: " \25BC"; font-size: 9px; }
 
-    Returns:
-        A self-contained HTML string.
-    """
-    mesh = data["mesh"]
-    nodes = data["nodes"]
-    summary = data["summary"]
+.ap-viz .notation-box { margin: -6px 0 16px 0; border: 1px solid #e2e8f0; border-radius: 8px; background: white; }
+.ap-viz .notation-summary { list-style: none; cursor: pointer; padding: 10px 14px; font-size: 12px; font-weight: 600; color: #334155; }
+.ap-viz .notation-summary::-webkit-details-marker { display: none; }
+.ap-viz .notation-body { padding: 0 14px 12px 14px; display: grid; gap: 6px; font-size: 12px; color: #475569; }
+.ap-viz .notation-code { display: inline-block; font-family: monospace; background: #f8fafc; border: 1px solid #e2e8f0; padding: 1px 6px; border-radius: 4px; color: #1e293b; }
+.ap-viz .ascii-dump { margin-top: 14px; padding: 14px; background: #0f172a; color: #e2e8f0; border-radius: 8px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 11px; line-height: 1.45; overflow-x: auto; white-space: pre; }
 
-    # Precompute per-node derived fields
-    for n in nodes:
-        placement = n.get("placement", "")
-        n["_bg"], n["_color"] = _placement_style(placement)
-        n["_total_comm"] = _node_total_comm(n)
-        n["_total_transition"] = _node_total_transition(n)
-        # Collectives on input edges
-        collectives = []
-        for inp in n.get("inputs", []):
-            coll = _infer_collective(
-                inp.get("src_placement"), inp.get("dst_placement")
-            )
-            if coll:
-                collectives.append(
-                    (inp["name"], coll, inp["src_placement"], inp["dst_placement"], inp["comm_cost"])
-                )
-        n["_collectives"] = collectives
+.ap-viz .overview-note { font-size: 12px; color: #64748b; margin-bottom: 14px; }
+.ap-viz .overview-section-title { font-size: 13px; font-weight: 700; color: #334155; margin: 18px 0 10px 0; }
+.ap-viz .overview-stage-card { border: 1px solid #e2e8f0; border-radius: 8px; padding: 14px; margin-bottom: 12px; background: #fff; }
+.ap-viz .overview-stage-header { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; }
+.ap-viz .overview-stage-name { font-size: 14px; font-weight: 700; color: #1e293b; }
+.ap-viz .overview-stage-sub { font-size: 12px; color: #64748b; margin-top: 2px; }
+.ap-viz .overview-stage-costs { display: flex; flex-wrap: wrap; gap: 10px; font-size: 12px; color: #475569; justify-content: flex-end; }
+.ap-viz .overview-stage-meta { font-size: 12px; color: #475569; margin-top: 10px; }
+.ap-viz .overview-mini-title { font-size: 11px; font-weight: 700; color: #64748b; text-transform: uppercase; letter-spacing: 0.4px; margin: 12px 0 6px 0; }
+.ap-viz .overview-list { display: grid; gap: 6px; }
+.ap-viz .overview-list-row { display: grid; grid-template-columns: minmax(260px, 1.5fr) minmax(120px, 0.9fr) auto; gap: 10px; align-items: start; font-size: 12px; color: #334155; }
+.ap-viz .overview-keyop-list { gap: 0; }
+.ap-viz .overview-keyop-row { padding: 8px 0; border-top: 1px solid #e2e8f0; }
+.ap-viz .overview-keyop-row:first-child { border-top: 0; padding-top: 0; }
+.ap-viz .overview-keyop-row:last-child { padding-bottom: 0; }
+.ap-viz .overview-list-label { font-family: monospace; overflow-wrap: anywhere; }
+.ap-viz .overview-list-meta { color: #64748b; font-size: 11px; }
+.ap-viz .overview-placement-cell { display: flex; flex-wrap: wrap; gap: 6px; }
+.ap-viz .overview-placement-flow { display: grid; gap: 4px; font-size: 11px; color: #475569; }
+.ap-viz .overview-placement-row { display: grid; grid-template-columns: 44px 1fr; gap: 8px; align-items: center; }
+.ap-viz .overview-placement-label { font-family: monospace; font-size: 11px; color: #64748b; text-align: right; }
+.ap-viz .overview-placement-values { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.ap-viz .overview-placement-arrow { color: #94a3b8; font-size: 11px; }
+.ap-viz .overview-placement-coll { color: #64748b; font-size: 11px; }
+.ap-viz .overview-details { margin-top: 10px; border: 1px solid #e2e8f0; border-radius: 8px; background: #f8fafc; }
+.ap-viz .overview-details > summary { cursor: pointer; padding: 8px 10px; font-size: 12px; font-weight: 600; color: #334155; }
+.ap-viz .overview-details-body { padding: 0 10px 10px 10px; }
+.ap-viz .perfetto-frame { display: block; border: 0; background: #fff; }
+.ap-viz .perfetto-status { margin-bottom: 12px; padding: 10px 12px; border-radius: 8px; border: 1px solid #e2e8f0; font-size: 12px; color: #475569; background: #f8fafc; }
+.ap-viz .perfetto-status.error { color: #B91C1C; background: #FEF2F2; border-color: #FECACA; }
+.ap-viz .param-tree table { width: 100%; }
+.ap-viz .param-tree td { vertical-align: top; }
+.ap-viz .param-module-row td { background: #f8fafc; font-weight: 600; color: #334155; }
+.ap-viz .param-tree th:first-child, .ap-viz .param-tree td:first-child { min-width: 420px; }
+.ap-viz .param-module-label { display: inline-flex; align-items: center; gap: 6px; }
+.ap-viz .param-name-cell { white-space: nowrap; }
+.ap-viz .param-leaf-name { font-family: monospace; font-size: 11px; color: #1e293b; }
+.ap-viz .param-node-icon { display: inline-block; vertical-align: middle; margin-right: 8px; }
+.ap-viz .param-module-icon { width: 10px; height: 10px; border-radius: 999px; background: #94a3b8; }
+.ap-viz .param-leaf-icon { width: 10px; height: 2px; background: #cbd5e1; border-radius: 999px; }
+.ap-viz tr.linked-row { opacity: 0.45; display: none; }
+.ap-viz tr.linked-row td { font-style: italic; }
+.ap-viz tr.arch-bwd { opacity: 0.6; }
+.ap-viz tr.arch-input-edge td { background: #f8fafc; border-bottom: 1px solid #f1f5f9; }
+.ap-viz .phase-badge { display: inline-block; padding: 1px 6px; border-radius: 8px; font-size: 10px; font-weight: 600; }
+.ap-viz .phase-fwd { color: #10B981; background: #ECFDF5; }
+.ap-viz .phase-bwd { color: #6B7280; background: #F1F5F9; }
+.ap-viz .zero-cost-group { opacity: 0.72; }
+.ap-viz .zero-cost-group:not(.expanded) > .func-details { display: none; }
+.ap-viz .cost-hotspot { border-left-color: #DC2626 !important; background: #FEF2F2; }
+.ap-viz .node-link { color: #3B82F6; text-decoration: none; cursor: pointer; }
+.ap-viz .node-link:hover { text-decoration: underline; }
+@keyframes nodeHighlight { from { background: #FEF08A; } to { background: transparent; } }
+.ap-viz .node-highlight { animation: nodeHighlight 1.5s ease-out; }
+.ap-viz .func-block.search-expanded > .func-details { display: block; }
+</style>"""
 
-    # Filter out output node for most views
-    compute_nodes = [n for n in nodes if n.get("op") != "output"]
 
-    # Cluster info
-    has_clusters = any("cluster_id" in n for n in compute_nodes)
-    root_nodes = [n for n in compute_nodes if "cluster_root" not in n]
-    # Count instances per cluster_id
-    cluster_counts = {}
-    for n in compute_nodes:
-        cid = n.get("cluster_id")
-        if cid is not None and "cluster_root" not in n:
-            cluster_counts[cid] = 1
-    for n in compute_nodes:
-        cid = n.get("cluster_id")
-        if cid is not None and "cluster_root" in n:
-            cluster_counts[cid] = cluster_counts.get(cid, 0) + 1
-
-    # Strategy distribution (root nodes only when clustered)
-    display_nodes = root_nodes if has_clusters else compute_nodes
-    param_nodes = [
-        n
-        for n in compute_nodes
-        if n.get("placeholder_kind") in {"param", "buffer"}
-    ]
-    architecture_nodes = [
-        n
-        for n in display_nodes
-        if n.get("placeholder_kind") not in {"param", "buffer"}
-    ]
-    perfetto_nodes = [
-        n
-        for n in compute_nodes
-        if n.get("placeholder_kind") not in {"param", "buffer"}
-    ]
-
-    # Build hierarchical module tree
-    module_tree = _build_module_tree(architecture_nodes)
-
-    # Top costly nodes
-    costly = sorted(architecture_nodes, key=_node_total_cost, reverse=True)
-    top_costly = [n for n in costly[:20] if _node_total_cost(n) > 0]
-
-    # Nodes with redistributions
-    redist_nodes = [n for n in architecture_nodes if n["_collectives"]]
-
-    # Mesh description
-    mesh_shape = "×".join(str(d) for d in mesh["shape"])
-    dim_names = mesh.get("dim_names")
-    mesh_desc = f"{mesh_shape}"
-    if dim_names:
-        mesh_desc += f" ({', '.join(dim_names)})"
-
-    # Per-layer cost breakdown (for Execution Overview)
-    import re as _re
-
-    layer_container_info = _find_repeated_layer_container(module_tree)
-    if layer_container_info is not None:
-        _lc_name = layer_container_info[1]
-        _layer_pattern = _re.compile(rf"{_re.escape(_lc_name)}\.(\d+)")
-    else:
-        _layer_pattern = None
-
-    layer_costs = {}
-    for n in architecture_nodes:
-        mp = n.get("module_path", "")
-        m = _layer_pattern.search(mp) if _layer_pattern else None
-        if m:
-            idx = int(m.group(1))
-            if idx not in layer_costs:
-                layer_costs[idx] = {
-                    "comm": 0.0,
-                    "compute": 0.0,
-                    "transition": 0.0,
-                    "num_nodes": 0,
-                }
-            layer_costs[idx]["comm"] += n["_total_comm"]
-            layer_costs[idx]["compute"] += n.get("compute_cost", 0)
-            layer_costs[idx]["transition"] += n["_total_transition"]
-            layer_costs[idx]["num_nodes"] += 1
-
-    total_cost = summary["total"] or 1
-    comm_pct = summary["comm"] / total_cost * 100
-    compute_pct = summary["compute"] / total_cost * 100
-    trans_pct = summary["transition"] / total_cost * 100
-
-    # ===== BUILD HTML =====
-    html = f'''<!DOCTYPE html>
-<html><head><meta charset="UTF-8">
-<style>
-.ap-viz {{ margin: 0; padding: 0; box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f8fafc; color: #1e293b; }}
-.ap-viz *, .ap-viz *::before, .ap-viz *::after {{ box-sizing: border-box; }}
-.ap-viz .container {{ max-width: 1200px; margin: 0 auto; padding: 20px; }}
-.ap-viz h1 {{ font-size: 24px; font-weight: 700; margin: 0 0 4px 0; color: #1e293b; }}
-.ap-viz .subtitle {{ color: #64748b; font-size: 14px; margin-bottom: 20px; }}
-.ap-viz .stats-row {{ display: flex; gap: 12px; margin-bottom: 20px; flex-wrap: wrap; }}
-.ap-viz .stat-card {{ background: white; border: 1px solid #e2e8f0; border-radius: 8px; padding: 14px 18px; flex: 1; min-width: 140px; color: #1e293b; }}
-.ap-viz .stat-label {{ font-size: 11px; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.5px; }}
-.ap-viz .stat-value {{ font-size: 22px; font-weight: 700; margin-top: 2px; }}
-.ap-viz .stat-detail {{ font-size: 12px; color: #64748b; margin-top: 2px; }}
-.ap-viz .controls {{ display: flex; gap: 12px; margin-bottom: 16px; flex-wrap: wrap; align-items: center; }}
-.ap-viz .control-group {{ display: flex; gap: 4px; align-items: center; }}
-.ap-viz .control-label {{ font-size: 11px; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.5px; margin-right: 4px; }}
-.ap-viz .tabs {{ display: flex; gap: 0; border-bottom: 2px solid #e2e8f0; margin-bottom: 20px; }}
-.ap-viz .tab {{ padding: 10px 20px; cursor: pointer; font-size: 14px; font-weight: 500; color: #64748b; border-bottom: 2px solid transparent; margin-bottom: -2px; transition: all 0.2s; background: transparent; }}
-.ap-viz .tab:hover {{ color: #3b82f6; }}
-.ap-viz .tab.active {{ color: #3b82f6; border-bottom-color: #3b82f6; }}
-.ap-viz .tab-content {{ display: none; }}
-.ap-viz .tab-content.active {{ display: block; }}
-.ap-viz .card {{ background: white; border: 1px solid #e2e8f0; border-radius: 8px; padding: 18px; margin-bottom: 16px; color: #1e293b; }}
-.ap-viz .card-title {{ font-size: 14px; font-weight: 600; margin-bottom: 12px; color: #1e293b; }}
-.ap-viz .func-block {{ border-radius: 8px; padding: 14px; margin-bottom: 10px; border-left: 4px solid #cbd5e1; cursor: pointer; transition: box-shadow 0.2s; }}
-.ap-viz .func-block:hover {{ box-shadow: 0 2px 8px rgba(0,0,0,0.08); }}
-.ap-viz .func-name {{ font-weight: 600; font-size: 14px; color: #1e293b; }}
-.ap-viz .func-meta {{ font-size: 12px; color: #64748b; margin-top: 4px; }}
-.ap-viz .placement-bar {{ height: 6px; border-radius: 3px; display: flex; overflow: hidden; margin-top: 6px; background: #f1f5f9; }}
-.ap-viz .placement-bar-seg {{ height: 100%; min-width: 2px; }}
-.ap-viz .collective-badge {{ display: inline-block; background: #FEE2E2; color: #DC2626; font-size: 11px; padding: 2px 8px; border-radius: 10px; margin: 2px 2px; font-weight: 500; }}
-
-.ap-viz .cluster-badge {{ display: inline-block; padding: 1px 6px; border-radius: 8px; font-size: 10px; font-weight: 600; color: #6B7280; background: #F1F5F9; margin-left: 4px; }}
-.ap-viz .func-details {{ display: none; margin-top: 10px; padding-top: 10px; border-top: 1px solid rgba(0,0,0,0.1); font-size: 12px; }}
-.ap-viz .func-block.expanded > .func-details {{ display: block; }}
-.ap-viz .cost-bar-container {{ margin-bottom: 10px; }}
-.ap-viz .cost-bar-label {{ font-size: 12px; margin-bottom: 3px; display: flex; justify-content: space-between; color: #1e293b; }}
-.ap-viz .cost-bar {{ height: 24px; border-radius: 4px; display: flex; overflow: hidden; background: #f1f5f9; }}
-.ap-viz .cost-bar-segment {{ height: 100%; display: flex; align-items: center; justify-content: center; font-size: 10px; color: white; font-weight: 500; min-width: 2px; }}
-.ap-viz .treemap-container {{ position: relative; height: 400px; background: #f8fafc; border-radius: 8px; overflow: hidden; }}
-.ap-viz .treemap-cell {{ position: absolute; overflow: hidden; cursor: pointer; border: 1px solid white; transition: opacity 0.15s; display: flex; align-items: center; justify-content: center; box-sizing: border-box; }}
-.ap-viz .treemap-cell:hover {{ opacity: 0.85; }}
-.ap-viz .treemap-cell span {{ font-size: 11px; color: white; font-weight: 500; text-shadow: 0 1px 2px rgba(0,0,0,0.5); pointer-events: none; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 0 4px; }}
-.ap-viz table {{ width: 100%; border-collapse: collapse; font-size: 12px; color: #1e293b; }}
-.ap-viz th {{ text-align: left; padding: 8px 10px; background: #f8fafc; border-bottom: 2px solid #e2e8f0; font-weight: 600; color: #64748b; text-transform: uppercase; font-size: 11px; letter-spacing: 0.3px; position: sticky; top: 0; z-index: 2; }}
-.ap-viz td {{ padding: 7px 10px; border-bottom: 1px solid #f1f5f9; background: white; }}
-.ap-viz tr:hover td {{ background: #f8fafc; }}
-.ap-viz .placement-chip {{ display: inline-block; padding: 2px 8px; border-radius: 4px; font-family: monospace; font-size: 11px; font-weight: 500; position: relative; cursor: default; }}
-.ap-viz .placement-chip .chip-tooltip {{ display: none; position: absolute; left: 0; top: 100%; margin-top: 4px; background: #1e293b; color: white; padding: 6px 10px; border-radius: 6px; font-size: 11px; font-family: monospace; white-space: pre; z-index: 1000; pointer-events: none; box-shadow: 0 2px 8px rgba(0,0,0,0.2); }}
-.ap-viz .placement-chip:hover .chip-tooltip {{ display: block; }}
-.ap-viz .cost-high {{ color: #DC2626; font-weight: 600; }}
-.ap-viz .cost-med {{ color: #F59E0B; }}
-.ap-viz .cost-low {{ color: #64748b; }}
-.ap-viz .filter-bar {{ display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; align-items: center; }}
-.ap-viz .filter-btn {{ padding: 4px 12px; border-radius: 16px; border: 1px solid #e2e8f0; background: white; color: #1e293b; cursor: pointer; font-size: 12px; transition: all 0.15s; }}
-.ap-viz .filter-btn:hover {{ border-color: #3b82f6; }}
-.ap-viz .filter-btn.active {{ background: #3b82f6; color: white; border-color: #3b82f6; }}
-.ap-viz .search-box {{ padding: 5px 12px; border-radius: 16px; border: 1px solid #e2e8f0; background: white; color: #1e293b; font-size: 12px; width: 220px; outline: none; transition: border-color 0.15s; }}
-.ap-viz .search-box:focus {{ border-color: #3b82f6; }}
-.ap-viz .table-scroll {{ max-height: 600px; overflow-y: auto; }}
-.ap-viz th.sortable {{ cursor: pointer; user-select: none; }}
-.ap-viz th.sortable:hover {{ color: #3b82f6; }}
-.ap-viz th.sort-asc::after {{ content: " \\25B2"; font-size: 9px; }}
-.ap-viz th.sort-desc::after {{ content: " \\25BC"; font-size: 9px; }}
-
-.ap-viz .notation-box {{ margin: -6px 0 16px 0; border: 1px solid #e2e8f0; border-radius: 8px; background: white; }}
-.ap-viz .notation-summary {{ list-style: none; cursor: pointer; padding: 10px 14px; font-size: 12px; font-weight: 600; color: #334155; }}
-.ap-viz .notation-summary::-webkit-details-marker {{ display: none; }}
-.ap-viz .notation-body {{ padding: 0 14px 12px 14px; display: grid; gap: 6px; font-size: 12px; color: #475569; }}
-.ap-viz .notation-code {{ display: inline-block; font-family: monospace; background: #f8fafc; border: 1px solid #e2e8f0; padding: 1px 6px; border-radius: 4px; color: #1e293b; }}
-.ap-viz .ascii-dump {{ margin-top: 14px; padding: 14px; background: #0f172a; color: #e2e8f0; border-radius: 8px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 11px; line-height: 1.45; overflow-x: auto; white-space: pre; }}
-
-.ap-viz .overview-note {{ font-size: 12px; color: #64748b; margin-bottom: 14px; }}
-.ap-viz .overview-section-title {{ font-size: 13px; font-weight: 700; color: #334155; margin: 18px 0 10px 0; }}
-.ap-viz .overview-stage-card {{ border: 1px solid #e2e8f0; border-radius: 8px; padding: 14px; margin-bottom: 12px; background: #fff; }}
-.ap-viz .overview-stage-header {{ display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; }}
-.ap-viz .overview-stage-name {{ font-size: 14px; font-weight: 700; color: #1e293b; }}
-.ap-viz .overview-stage-sub {{ font-size: 12px; color: #64748b; margin-top: 2px; }}
-.ap-viz .overview-stage-costs {{ display: flex; flex-wrap: wrap; gap: 10px; font-size: 12px; color: #475569; justify-content: flex-end; }}
-.ap-viz .overview-stage-meta {{ font-size: 12px; color: #475569; margin-top: 10px; }}
-.ap-viz .overview-mini-title {{ font-size: 11px; font-weight: 700; color: #64748b; text-transform: uppercase; letter-spacing: 0.4px; margin: 12px 0 6px 0; }}
-.ap-viz .overview-list {{ display: grid; gap: 6px; }}
-.ap-viz .overview-list-row {{ display: grid; grid-template-columns: minmax(260px, 1.5fr) minmax(120px, 0.9fr) auto; gap: 10px; align-items: start; font-size: 12px; color: #334155; }}
-.ap-viz .overview-keyop-list {{ gap: 0; }}
-.ap-viz .overview-keyop-row {{ padding: 8px 0; border-top: 1px solid #e2e8f0; }}
-.ap-viz .overview-keyop-row:first-child {{ border-top: 0; padding-top: 0; }}
-.ap-viz .overview-keyop-row:last-child {{ padding-bottom: 0; }}
-.ap-viz .overview-list-label {{ font-family: monospace; overflow-wrap: anywhere; }}
-.ap-viz .overview-list-meta {{ color: #64748b; font-size: 11px; }}
-.ap-viz .overview-placement-cell {{ display: flex; flex-wrap: wrap; gap: 6px; }}
-.ap-viz .overview-placement-flow {{ display: grid; gap: 4px; font-size: 11px; color: #475569; }}
-.ap-viz .overview-placement-row {{ display: grid; grid-template-columns: 44px 1fr; gap: 8px; align-items: center; }}
-.ap-viz .overview-placement-label {{ font-family: monospace; font-size: 11px; color: #64748b; text-align: right; }}
-.ap-viz .overview-placement-values {{ display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }}
-.ap-viz .overview-placement-arrow {{ color: #94a3b8; font-size: 11px; }}
-.ap-viz .overview-placement-coll {{ color: #64748b; font-size: 11px; }}
-.ap-viz .overview-details {{ margin-top: 10px; border: 1px solid #e2e8f0; border-radius: 8px; background: #f8fafc; }}
-.ap-viz .overview-details > summary {{ cursor: pointer; padding: 8px 10px; font-size: 12px; font-weight: 600; color: #334155; }}
-.ap-viz .overview-details-body {{ padding: 0 10px 10px 10px; }}
-.ap-viz .perfetto-frame {{ display: block; border: 0; background: #fff; }}
-.ap-viz .perfetto-status {{ margin-bottom: 12px; padding: 10px 12px; border-radius: 8px; border: 1px solid #e2e8f0; font-size: 12px; color: #475569; background: #f8fafc; }}
-.ap-viz .perfetto-status.error {{ color: #B91C1C; background: #FEF2F2; border-color: #FECACA; }}
-.ap-viz .param-tree table {{ width: 100%; }}
-.ap-viz .param-tree td {{ vertical-align: top; }}
-.ap-viz .param-module-row td {{ background: #f8fafc; font-weight: 600; color: #334155; }}
-.ap-viz .param-tree th:first-child, .ap-viz .param-tree td:first-child {{ min-width: 420px; }}
-.ap-viz .param-module-label {{ display: inline-flex; align-items: center; gap: 6px; }}
-.ap-viz .param-name-cell {{ white-space: nowrap; }}
-.ap-viz .param-leaf-name {{ font-family: monospace; font-size: 11px; color: #1e293b; }}
-.ap-viz .param-node-icon {{ display: inline-block; vertical-align: middle; margin-right: 8px; }}
-.ap-viz .param-module-icon {{ width: 10px; height: 10px; border-radius: 999px; background: #94a3b8; }}
-.ap-viz .param-leaf-icon {{ width: 10px; height: 2px; background: #cbd5e1; border-radius: 999px; }}
-.ap-viz tr.linked-row {{ opacity: 0.45; display: none; }}
-.ap-viz tr.linked-row td {{ font-style: italic; }}
-.ap-viz tr.arch-bwd {{ opacity: 0.6; }}
-.ap-viz tr.arch-input-edge td {{ background: #f8fafc; border-bottom: 1px solid #f1f5f9; }}
-.ap-viz .phase-badge {{ display: inline-block; padding: 1px 6px; border-radius: 8px; font-size: 10px; font-weight: 600; }}
-.ap-viz .phase-fwd {{ color: #10B981; background: #ECFDF5; }}
-.ap-viz .phase-bwd {{ color: #6B7280; background: #F1F5F9; }}
-.ap-viz .zero-cost-group {{ opacity: 0.72; }}
-.ap-viz .zero-cost-group:not(.expanded) > .func-details {{ display: none; }}
-.ap-viz .cost-hotspot {{ border-left-color: #DC2626 !important; background: #FEF2F2; }}
-.ap-viz .node-link {{ color: #3B82F6; text-decoration: none; cursor: pointer; }}
-.ap-viz .node-link:hover {{ text-decoration: underline; }}
-@keyframes nodeHighlight {{ from {{ background: #FEF08A; }} to {{ background: transparent; }} }}
-.ap-viz .node-highlight {{ animation: nodeHighlight 1.5s ease-out; }}
-.ap-viz .func-block.search-expanded > .func-details {{ display: block; }}
-</style></head><body>
-<div class="ap-viz">
-<div class="container">
-<h1>AutoParallel Strategy Visualizer</h1>
-<div class="subtitle">Mesh: {_esc(mesh_desc)} &middot; {len(compute_nodes)} nodes &middot; {len(redist_nodes)} redistributions'''
-
-    if has_clusters:
-        n_clusters = len(cluster_counts)
-        max_instances = max(cluster_counts.values()) + 1 if cluster_counts else 1
-        html += (
-            f" &middot; {n_clusters} repeated clusters "
-            f"(up to {max_instances} layer instances)"
-        )
-
-    html += f'''</div>
-
-<div class="stats-row">
-  <div class="stat-card">
-    <div class="stat-label">Total Cost</div>
-    <div class="stat-value">{_fmt_us(summary["total"])}</div>
-  </div>
-  <div class="stat-card">
-    <div class="stat-label">Communication</div>
-    <div class="stat-value" style="color:#DC2626">{_fmt_us(summary["comm"])}</div>
-    <div class="stat-detail">{comm_pct:.0f}% of total</div>
-  </div>
-  <div class="stat-card">
-    <div class="stat-label">Compute</div>
-    <div class="stat-value" style="color:#10B981">{_fmt_us(summary["compute"])}</div>
-    <div class="stat-detail">{compute_pct:.0f}% of total</div>
-  </div>
-  <div class="stat-card">
-    <div class="stat-label">Transitions</div>
-    <div class="stat-value" style="color:#F59E0B">{_fmt_us(summary["transition"])}</div>
-    <div class="stat-detail">{trans_pct:.0f}% of total</div>
-  </div>
-  <div class="stat-card">
-    <div class="stat-label">Redistributions</div>
-    <div class="stat-value">{len(redist_nodes)}</div>
-  </div>
-</div>
-
-<details class="notation-box">
-  <summary class="notation-summary">Placement notation</summary>
-  <div class="notation-body">
-    <div><span class="notation-code">R</span> replicate across that mesh dimension</div>
-    <div><span class="notation-code">S(i)</span> shard tensor dimension <strong>i</strong> across that mesh dimension</div>
-    <div><span class="notation-code">P(sum)</span> partial value with a pending reduction</div>
-    <div><span class="notation-code">S(0)S(1)</span> means the tensor is sharded on two mesh dimensions</div>
-  </div>
-</details>'''
-
-    # Controls bar
-    html += '''
-<div class="controls">
-  <div class="control-group">
-    <span class="control-label">Phase</span>
-    <button class="filter-btn active" data-filter-group="phase" data-filter-value="all" onclick="setFilterState('phase', 'all', this)">All</button>
-    <button class="filter-btn" data-filter-group="phase" data-filter-value="forward" onclick="setFilterState('phase', 'forward', this)">Forward</button>
-    <button class="filter-btn" data-filter-group="phase" data-filter-value="backward" onclick="setFilterState('phase', 'backward', this)">Backward</button>
-  </div>'''
-
-    if has_clusters:
-        html += '''
-  <div class="control-group">
-    <span class="control-label">Detail View</span>
-    <button class="filter-btn active" id="btn-cluster-collapse" onclick="toggleRepresentativeLayers(this)">Representative Layer</button>
-  </div>'''
-
-    html += '</div>'
-
-    # Tabs
-    html += '''
-<div class="tabs">
-  <div class="tab" data-tab-id="params" onclick="switchTab('params', this)">Parameters</div>
-  <div class="tab" data-tab-id="overview" onclick="switchTab('overview', this)">Execution Overview</div>
-  <div class="tab" data-tab-id="perfetto" onclick="switchTab('perfetto', this)">Perfetto</div>
-  <div class="tab" data-tab-id="arch" onclick="switchTab('arch', this)">Architecture</div>
-  <div class="tab active" data-tab-id="cost" onclick="switchTab('cost', this)">Cost Breakdown</div>
-  <div class="tab" data-tab-id="detail" onclick="switchTab('detail', this)">All Nodes</div>
-</div>'''
-
-    # ===== PARAMETERS TAB =====
-    html += '''
-<div data-tab="params" class="tab-content">'''
-    if param_nodes:
-        html += (
-            '<div class="card"><div class="card-title">Parameters and Buffers</div>'
-            f'<pre class="ascii-dump">{_esc(_build_param_ascii_dump(param_nodes))}</pre>'
-            '</div>'
-        )
-    else:
-        html += '<div class="card"><div class="card-title">Parameters and Buffers</div><div style="font-size:12px;color:#64748b">No parameter or buffer placeholder nodes available.</div></div>'
-    html += '</div>'
-
-    # ===== EXECUTION OVERVIEW TAB =====
-    html += '''
-<div data-tab="overview" class="tab-content">'''
-    html += _build_strategy_overview_html(architecture_nodes, layer_costs, module_tree)
-    html += '</div>'
-
-    # ===== PERFETTO TAB =====
-    html += '''
-<div data-tab="perfetto" class="tab-content">'''
-    html += _build_perfetto_tab_html(perfetto_nodes)
-    html += '</div>'
-
-    # ===== ARCHITECTURE TAB =====
-    html += '''
-<div data-tab="arch" class="tab-content">
-<div class="card"><div class="card-title">Computation Blocks by Module</div>
-<div class="filter-bar">
-  <input type="text" class="search-box" placeholder="Search modules..." oninput="setArchSearch(this)">
-  <button class="filter-btn" onclick="archExpandAll(this)">Expand All</button>
-  <button class="filter-btn" onclick="archCollapseAll(this)">Collapse All</button>
-</div>'''
-
-    # Render top-level tree children in execution order (dict preserves
-    # insertion order from graph traversal)
-    flat_costs = _flatten_tree_for_costs(module_tree)
-    comm_costs = sorted([s["comm_cost"] for _, s in flat_costs if s["comm_cost"] > 0])
-    comm_threshold = comm_costs[int(len(comm_costs) * 0.9)] if len(comm_costs) >= 5 else 0
-    for child in module_tree.children.values():
-        html += _render_tree_block(child, cluster_counts, mesh, depth=0, total_cost=total_cost, comm_threshold=comm_threshold)
-
-    html += '</div></div>'
-
-    # ===== COST BREAKDOWN TAB =====
-    html += f'''
-<div data-tab="cost" class="tab-content active">
-<div class="card"><div class="card-title">Cost Distribution</div>
-<div class="cost-bar-container">
-  <div class="cost-bar-label"><span>Cost Breakdown</span></div>
-  <div class="cost-bar" style="height:32px">
-    <div class="cost-bar-segment" style="width:{comm_pct}%;background:#DC2626">Comm {comm_pct:.0f}%</div>
-    <div class="cost-bar-segment" style="width:{compute_pct}%;background:#10B981">Compute {compute_pct:.0f}%</div>
-    <div class="cost-bar-segment" style="width:{trans_pct}%;background:#F59E0B">Trans {trans_pct:.0f}%</div>
-  </div>
-</div></div>'''
-
-    # Communication hotspots — group by (module, collective, src, dst) per phase
-    hotspot_by_phase = {"forward": {}, "backward": {}}
-    phase_totals = {"forward": 0.0, "backward": 0.0}
-    for n in architecture_nodes:
-        module = _strip_module_prefix(n.get("module_path", "") or n.get("name", ""))
-        # Use top-level module as the grouping scope
-        module_prefix = module.split(".")[0] if module else ""
-        phase = n.get("phase", "forward")
-        cid = n.get("cluster_id")
-        instances = (cluster_counts.get(cid, 0) + 1) if cid is not None else 1
-        for inp_name, coll_type, src_p, dst_p, ccost in n["_collectives"]:
-            if ccost <= 0:
-                continue
-            cost = ccost * instances
-            phase_totals[phase] = phase_totals.get(phase, 0) + cost
-            groups = hotspot_by_phase.get(phase, hotspot_by_phase["forward"])
-            key = (module_prefix, coll_type, src_p, dst_p)
-            if key not in groups:
-                groups[key] = {
-                    "coll": coll_type, "src": src_p, "dst": dst_p,
-                    "module": module_prefix,
-                    "total_cost": 0.0, "count": 0,
-                }
-            groups[key]["total_cost"] += cost
-            groups[key]["count"] += instances
-
-    def _hotspot_table_html(hotspots):
-        if not hotspots:
-            return '<p style="font-size:12px;color:#94a3b8">No communication costs.</p>'
-        rows = ""
-        for h in hotspots:
-            module_esc = _esc(h["module"]) if h["module"] else "(root)"
-            rows += (
-                f'<tr>'
-                f'<td style="font-size:12px;font-weight:500">'
-                f'<a href="#" class="node-link" onclick="jumpToArch(\'{_esc(h["module"])}\', this); return false">{module_esc}</a></td>'
-                f'<td><span class="collective-badge">{_esc(h["coll"])}</span></td>'
-                f'<td style="font-family:monospace;font-size:11px">{_esc(h["src"])} &rarr; {_esc(h["dst"])}</td>'
-                f'<td style="text-align:center">&times;{h["count"]}</td>'
-                f'<td style="font-family:monospace;font-weight:600;color:#DC2626">{_fmt_us(h["total_cost"])}</td>'
-                f'</tr>'
-            )
-        return (
-            '<div class="table-scroll" style="max-height:300px">'
-            '<table><thead><tr>'
-            '<th>Module</th><th>Collective</th><th>Placement Change</th><th>Occurrences</th><th>Total Comm</th>'
-            f'</tr></thead><tbody>{rows}</tbody></table></div>'
-        )
-
-    fwd_hotspots = sorted(hotspot_by_phase["forward"].values(), key=lambda h: -h["total_cost"])[:15]
-    bwd_hotspots = sorted(hotspot_by_phase["backward"].values(), key=lambda h: -h["total_cost"])[:15]
-
-    fwd_total = phase_totals["forward"]
-    bwd_total = phase_totals["backward"]
-    fwd_shown = sum(h["total_cost"] for h in fwd_hotspots)
-    bwd_shown = sum(h["total_cost"] for h in bwd_hotspots)
-    fwd_note = "" if fwd_shown >= fwd_total * 0.99 else f" (top 15 shown, {_fmt_us(fwd_total)} total)"
-    bwd_note = "" if bwd_shown >= bwd_total * 0.99 else f" (top 15 shown, {_fmt_us(bwd_total)} total)"
-
-    html += f'''
-<div class="card"><div class="card-title">Communication Hotspots — Forward <span style="font-weight:400;color:#64748b">{_fmt_us(fwd_total)}{fwd_note}</span></div>'''
-    html += _hotspot_table_html(fwd_hotspots)
-    html += f'''</div>
-<div class="card"><div class="card-title">Communication Hotspots — Backward <span style="font-weight:400;color:#64748b">{_fmt_us(bwd_total)}{bwd_note}</span></div>'''
-    html += _hotspot_table_html(bwd_hotspots)
-    html += '</div>'
-
-    html += '''
-<div class="card"><div class="card-title">Top Costly Operations</div>'''
-
-    if top_costly:
-        top_max = _node_total_cost(top_costly[0]) or 1
-        for n in top_costly:
-            total = _node_total_cost(n)
-            comm_w = n["_total_comm"] / top_max * 100
-            comp_w = n.get("compute_cost", 0) / top_max * 100
-            trans_w = n["_total_transition"] / top_max * 100
-            src = n.get("source")
-            src_label = f'{src["func"]}: {src["code"]}' if src else n.get("op", "")
-            html += f'''<div class="cost-bar-container">
-  <div class="cost-bar-label"><span style="font-family:monospace"><a href="#" class="node-link" onclick="jumpToNode('{_esc(n["name"])}', this); return false">{_esc(n["name"])}</a></span><span style="color:#64748b">{_esc(src_label)} &middot; total: {_fmt_us(total)}</span></div>
-  <div class="cost-bar">
-    <div class="cost-bar-segment" style="width:{comm_w}%;background:#DC2626" title="comm: {_fmt_us(n['_total_comm'])}"></div>
-    <div class="cost-bar-segment" style="width:{comp_w}%;background:#10B981" title="compute: {_fmt_us(n.get('compute_cost', 0))}"></div>
-    <div class="cost-bar-segment" style="width:{trans_w}%;background:#F59E0B" title="trans: {_fmt_us(n['_total_transition'])}"></div>
-  </div>
-</div>'''
-
-    # Cost by module — flat treemap with comm/compute mode toggle
-    treemap_items = _treemap_data(module_tree)
-    treemap_json = json.dumps(treemap_items)
-    html += f'''</div><div class="card"><div class="card-title">Cost by Module</div>
-<div class="filter-bar">
-  <button class="filter-btn active" onclick="setTreemapMode('comm', this)">Communication</button>
-  <button class="filter-btn" onclick="setTreemapMode('compute', this)">Compute</button>
-</div>
-<div class="treemap-container" id="treemap-container"></div>
-<script>
-function _tmFmtUs(us) {{ return us >= 1000 ? (us/1000).toFixed(1)+'ms' : Math.round(us)+'\\u00b5s'; }}
-
-function _tmSquarify(items, rect) {{
-  if (!items.length) return;
-  var total = 0;
-  for (var i = 0; i < items.length; i++) total += items[i].value;
-  if (total === 0) return;
-  _tmLayout(items, 0, rect, total, rect.w * rect.h);
-}}
-
-function _tmLayout(items, start, rect, total, area) {{
-  if (start >= items.length) return;
-  if (items.length - start === 1) {{
-    items[start]._x = rect.x; items[start]._y = rect.y;
-    items[start]._w = rect.w; items[start]._h = rect.h;
-    return;
-  }}
-  var short = Math.min(rect.w, rect.h);
-  var rowSum = 0, bestRatio = Infinity, end = start;
-  for (var i = start; i < items.length; i++) {{
-    rowSum += items[i].value;
-    var frac = rowSum / total * area;
-    var rowLen = frac / short;
-    var last = items[i].value / total * area / rowLen;
-    var ratio = Math.max(rowLen / last, last / rowLen);
-    if (ratio > bestRatio) break;
-    bestRatio = ratio;
-    end = i;
-  }}
-  rowSum = 0;
-  for (var i = start; i <= end; i++) rowSum += items[i].value;
-  var stripFrac = rowSum / total;
-  var pos = 0;
-  for (var i = start; i <= end; i++) {{
-    var itemFrac = items[i].value / rowSum;
-    if (rect.w >= rect.h) {{
-      var sw = rect.w * stripFrac;
-      items[i]._x = rect.x; items[i]._y = rect.y + rect.h * pos;
-      items[i]._w = sw; items[i]._h = rect.h * itemFrac;
-    }} else {{
-      var sh = rect.h * stripFrac;
-      items[i]._x = rect.x + rect.w * pos; items[i]._y = rect.y;
-      items[i]._w = rect.w * itemFrac; items[i]._h = sh;
-    }}
-    pos += itemFrac;
-  }}
-  if (end + 1 < items.length) {{
-    var rem;
-    if (rect.w >= rect.h) {{
-      rem = {{x: rect.x + rect.w * stripFrac, y: rect.y, w: rect.w * (1 - stripFrac), h: rect.h}};
-    }} else {{
-      rem = {{x: rect.x, y: rect.y + rect.h * stripFrac, w: rect.w, h: rect.h * (1 - stripFrac)}};
-    }}
-    _tmLayout(items, end + 1, rem, total - rowSum, rem.w * rem.h);
-  }}
-}}
-
-var _treemapInited = false;
-var _treemapMode = 'comm';
-var _treemapItems = {treemap_json};
-function setTreemapMode(mode, btn) {{
-  _treemapMode = mode;
-  btn.parentElement.querySelectorAll('.filter-btn').forEach(function(b) {{ b.classList.remove('active'); }});
-  btn.classList.add('active');
-  if (_treemapInited) _treemapRender();
-}}
-function initTreemap() {{
-  if (_treemapInited) return;
-  _treemapInited = true;
-  _treemapRender();
-}}
-function _treemapRender() {{
-  var container = document.getElementById('treemap-container');
-  container.innerHTML = '';
-  var mode = _treemapMode;
-
-  // Copy items and assign .value based on mode
-  var items = [];
-  for (var i = 0; i < _treemapItems.length; i++) {{
-    var d = _treemapItems[i];
-    var v = (mode === 'comm') ? d.comm : d.compute;
-    if (v > 0) items.push({{name: d.name, comm: d.comm, compute: d.compute, transition: d.transition, value: v}});
-  }}
-  items.sort(function(a, b) {{ return b.value - a.value; }});
-
-  if (!items.length) {{
-    container.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:#94a3b8;font-size:14px">No ' + mode + ' cost</div>';
-    return;
-  }}
-
-  var rect = {{x: 0, y: 0, w: container.offsetWidth, h: container.offsetHeight}};
-  _tmSquarify(items, rect);
-  var totalValue = 0;
-  for (var i = 0; i < items.length; i++) totalValue += items[i].value;
-
-  for (var i = 0; i < items.length; i++) {{
-    var d = items[i];
-    if (!d._w || !d._h) continue;
-
-    // Intensity: selected cost / total cost of this module
-    var t = d.comm + d.compute + d.transition;
-    var intensity = t > 0 ? d.value / t : 0;
-    var r, g, b;
-    if (mode === 'comm') {{
-      r = Math.round(255 - intensity * (255 - 0xDC));
-      g = Math.round(255 - intensity * (255 - 0x26));
-      b = Math.round(255 - intensity * (255 - 0x26));
-    }} else {{
-      r = Math.round(255 - intensity * (255 - 0x10));
-      g = Math.round(255 - intensity * (255 - 0xB9));
-      b = Math.round(255 - intensity * (255 - 0x81));
-    }}
-    var txtColor = intensity > 0.4 ? '#fff' : '#1e293b';
-
-    var cell = document.createElement('div');
-    cell.className = 'treemap-cell';
-    cell.style.left = d._x + 'px'; cell.style.top = d._y + 'px';
-    cell.style.width = d._w + 'px'; cell.style.height = d._h + 'px';
-    cell.style.background = 'rgb(' + r + ',' + g + ',' + b + ')';
-
-    var pct = (d.value / totalValue * 100).toFixed(1);
-    cell.title = d.name + '\\ncomm: ' + _tmFmtUs(d.comm) + '  compute: ' + _tmFmtUs(d.compute) + '  trans: ' + _tmFmtUs(d.transition) + '\\n' + pct + '% of total ' + mode;
-
-    if (d._w > 50 && d._h > 20) {{
-      var span = document.createElement('span');
-      span.textContent = d.name;
-      span.style.color = txtColor;
-      span.style.textShadow = 'none';
-      cell.appendChild(span);
-    }}
-    // Mini stacked cost bar at bottom
-    if (d._w > 20 && d._h > 16 && t > 0) {{
-      var bar = document.createElement('div');
-      bar.style.cssText = 'position:absolute;bottom:0;left:0;right:0;height:4px;display:flex;pointer-events:none';
-      bar.innerHTML = '<div style="width:'+(d.comm/t*100)+'%;background:#DC2626;height:100%"></div>'
-        + '<div style="width:'+(d.compute/t*100)+'%;background:#10B981;height:100%"></div>'
-        + '<div style="width:'+(d.transition/t*100)+'%;background:#F59E0B;height:100%"></div>';
-      cell.appendChild(bar);
-    }}
-    (function(name) {{
-      cell.addEventListener('click', function() {{
-        jumpToArch(name, cell);
-      }});
-    }})(d.name);
-    container.appendChild(cell);
-  }}
-}}
-</script>'''
-
-    html += '</div></div>'
-
-    # ===== ALL NODES TAB =====
-    html += '''
-<div data-tab="detail" class="tab-content">
-<div class="card">
-<div class="card-title">All Nodes</div>
-<div class="filter-bar">
-  <input type="text" class="search-box" placeholder="Search nodes..." oninput="setSearch(this)">
-  <button class="filter-btn active" data-filter-group="node-type" data-filter-value="all" onclick="setFilterState('nodeType', 'all', this)">All</button>
-  <button class="filter-btn" data-filter-group="node-type" data-filter-value="param" onclick="setFilterState('nodeType', 'param', this)">Parameters</button>
-  <button class="filter-btn" data-filter-group="node-type" data-filter-value="input" onclick="setFilterState('nodeType', 'input', this)">Inputs</button>
-  <button class="filter-btn" data-filter-group="node-type" data-filter-value="tangent" onclick="setFilterState('nodeType', 'tangent', this)">Tangents</button>
-  <button class="filter-btn" data-filter-group="node-type" data-filter-value="forward" onclick="setFilterState('nodeType', 'forward', this)">Forward</button>
-  <button class="filter-btn" data-filter-group="node-type" data-filter-value="backward" onclick="setFilterState('nodeType', 'backward', this)">Backward</button>
-  <button class="filter-btn" data-filter-group="node-type" data-filter-value="redist" onclick="setFilterState('nodeType', 'redist', this)">Has Redistribution</button>
-</div>
-<div class="table-scroll">
-<table data-role="node-table"><thead>
-<tr><th class="sortable" onclick="sortTable(0, 'str', this)">Name</th><th class="sortable" onclick="sortTable(1, 'str', this)">Op</th><th class="sortable" onclick="sortTable(2, 'str', this)">Phase</th><th>Shape</th><th class="sortable" onclick="sortTable(4, 'str', this)">Placement</th><th class="sortable" onclick="sortTable(5, 'num', this)">Comm</th><th class="sortable" onclick="sortTable(6, 'num', this)">Compute</th><th class="sortable" onclick="sortTable(7, 'num', this)">Trans</th><th>Redistribution</th><th class="sortable" onclick="sortTable(9, 'str', this)">Module</th></tr>
-</thead><tbody>'''
-
-    all_display = compute_nodes
-    for n in all_display:
-        comm = n["_total_comm"]
-        compute = n.get("compute_cost", 0)
-        transition = n["_total_transition"]
-        cost_class = "cost-high" if comm > 100 else "cost-med" if comm > 0 else "cost-low"
-        shape_str = ",".join(str(s) for s in n.get("shape", []))
-        dtype = n.get("dtype", "")
-        placement = n.get("placement", "")
-        phase = n.get("phase", "")
-        op_name = n.get("op", "")
-        module = n.get("module_path", "")
-        placeholder_kind = n.get("placeholder_kind", "")
-
-        # Collective badges
-        coll_html = ""
-        for _, ctype, cfrom, cto, ccost in n["_collectives"]:
-            coll_html += f'<span class="collective-badge">{_esc(ctype)}: {_esc(cfrom)}&rarr;{_esc(cto)} ({_fmt_us(ccost)})</span> '
-
-        is_linked = "cluster_root" in n
-        row_class = "node-row linked-row" if is_linked else "node-row"
-        cluster_html = ""
-        cid = n.get("cluster_id")
-        if cid is not None and not is_linked and cid in cluster_counts:
-            cluster_html = f'<span class="cluster-badge">&times;{cluster_counts[cid] + 1}</span>'
-
-        data_attrs = (
-            f'data-phase="{phase}" '
-            f'data-op="{_esc(op_name)}" '
-            f'data-comm="{comm}" '
-            f'data-redist="{1 if n["_collectives"] else 0}" '
-            f'data-linked="{1 if is_linked else 0}" '
-            f'data-placeholder-kind="{_esc(placeholder_kind)}" '
-            f'data-node-name="{_esc(n["name"])}"'
-        )
-
-        chip = _placement_chip_html(placement, n['_bg'], n['_color'], n.get("shape"), dtype, mesh)
-
-        html += f'''<tr class="{row_class}" {data_attrs}>
-  <td style="font-family:monospace;font-size:11px">{_esc(n["name"])}{cluster_html}</td>
-  <td style="font-size:11px">{_esc(op_name)}</td>
-  <td style="font-size:11px">{phase}</td>
-  <td style="font-size:11px">{_esc(dtype)}[{shape_str}]</td>
-  <td>{chip}</td>
-  <td class="{cost_class}" style="font-family:monospace" data-sort-value="{comm}">{_fmt_us(comm)}</td>
-  <td style="font-family:monospace" data-sort-value="{compute}">{_fmt_us(compute)}</td>
-  <td style="font-family:monospace" data-sort-value="{transition}">{_fmt_us(transition)}</td>
-  <td>{coll_html}</td>
-  <td style="font-size:11px;color:#64748b">{_esc(module)}</td>
-</tr>'''
-
-    html += '''</tbody></table></div></div></div>
-
-<script>
+def _render_script():
+    """Return the complete <script> block."""
+    return """<script>
 function _root(el) { return el.closest('.ap-viz'); }
 
 function switchTab(id, btn) {
@@ -2516,7 +1941,7 @@ function jumpToNode(name, el) {
   filterState.nodeType = 'all';
   filterState.searchText = '';
   filterState.representativeLayersOnly = false;
-  r.querySelectorAll('[data-filter-group="nodeType"]').forEach(function(b) {
+  r.querySelectorAll('[data-filter-group="node-type"]').forEach(function(b) {
     b.classList.toggle('active', b.textContent.trim() === 'All');
   });
   var clusterBtn = r.querySelector('#btn-cluster-collapse');
@@ -3309,7 +2734,628 @@ function loadPerfettoTrace(btn) {
 
 
 if (typeof initTreemap === 'function') initTreemap();
-</script>
-</div></div></body></html>'''
+</script>"""
 
+
+def _hotspot_table_html(hotspots):
+    if not hotspots:
+        return '<p style="font-size:12px;color:#94a3b8">No communication costs.</p>'
+    rows = ""
+    for h in hotspots:
+        module_esc = _esc(h["module"]) if h["module"] else "(root)"
+        rows += (
+            f'<tr>'
+            f'<td style="font-size:12px;font-weight:500">'
+            f'<a href="#" class="node-link" onclick="jumpToArch(\'{_esc(h["module"])}\', this); return false">{module_esc}</a></td>'
+            f'<td><span class="collective-badge">{_esc(h["coll"])}</span></td>'
+            f'<td style="font-family:monospace;font-size:11px">{_esc(h["src"])} &rarr; {_esc(h["dst"])}</td>'
+            f'<td style="text-align:center">&times;{h["count"]}</td>'
+            f'<td style="font-family:monospace;font-weight:600;color:#DC2626">{_fmt_us(h["total_cost"])}</td>'
+            f'</tr>'
+        )
+    return (
+        '<div class="table-scroll" style="max-height:300px">'
+        '<table><thead><tr>'
+        '<th>Module</th><th>Collective</th><th>Placement Change</th><th>Occurrences</th><th>Total Comm</th>'
+        f'</tr></thead><tbody>{rows}</tbody></table></div>'
+    )
+
+
+
+def _prepare_viz_data(data):
+    """Extract and precompute all shared data from the JSON export dict."""
+    mesh = data["mesh"]
+    nodes = data["nodes"]
+    summary = data["summary"]
+
+    # Precompute per-node derived fields
+    for n in nodes:
+        placement = n.get("placement", "")
+        n["_bg"], n["_color"] = _placement_style(placement)
+        n["_total_comm"] = _node_total_comm(n)
+        n["_total_transition"] = _node_total_transition(n)
+        # Collectives on input edges
+        collectives = []
+        for inp in n.get("inputs", []):
+            coll = _infer_collective(
+                inp.get("src_placement"), inp.get("dst_placement")
+            )
+            if coll:
+                collectives.append(
+                    (inp["name"], coll, inp["src_placement"], inp["dst_placement"], inp["comm_cost"])
+                )
+        n["_collectives"] = collectives
+
+    # Filter out output node for most views
+    compute_nodes = [n for n in nodes if n.get("op") != "output"]
+
+    # Cluster info
+    has_clusters = any("cluster_id" in n for n in compute_nodes)
+    root_nodes = [n for n in compute_nodes if "cluster_root" not in n]
+    # Count instances per cluster_id
+    cluster_counts = {}
+    for n in compute_nodes:
+        cid = n.get("cluster_id")
+        if cid is not None and "cluster_root" not in n:
+            cluster_counts[cid] = 1
+    for n in compute_nodes:
+        cid = n.get("cluster_id")
+        if cid is not None and "cluster_root" in n:
+            cluster_counts[cid] = cluster_counts.get(cid, 0) + 1
+
+    # Strategy distribution (root nodes only when clustered)
+    display_nodes = root_nodes if has_clusters else compute_nodes
+    param_nodes = [
+        n
+        for n in compute_nodes
+        if n.get("placeholder_kind") in {"param", "buffer"}
+    ]
+    architecture_nodes = [
+        n
+        for n in display_nodes
+        if n.get("placeholder_kind") not in {"param", "buffer"}
+    ]
+    perfetto_nodes = [
+        n
+        for n in compute_nodes
+        if n.get("placeholder_kind") not in {"param", "buffer"}
+    ]
+
+    # Build hierarchical module tree
+    module_tree = _build_module_tree(architecture_nodes)
+
+    # Top costly nodes
+    costly = sorted(architecture_nodes, key=_node_total_cost, reverse=True)
+    top_costly = [n for n in costly[:20] if _node_total_cost(n) > 0]
+
+    # Nodes with redistributions
+    redist_nodes = [n for n in architecture_nodes if n["_collectives"]]
+
+    # Mesh description
+    mesh_shape = "×".join(str(d) for d in mesh["shape"])
+    dim_names = mesh.get("dim_names")
+    mesh_desc = f"{mesh_shape}"
+    if dim_names:
+        mesh_desc += f" ({', '.join(dim_names)})"
+
+    # Per-layer cost breakdown (for Execution Overview)
+    import re as _re
+
+    layer_container_info = _find_repeated_layer_container(module_tree)
+    if layer_container_info is not None:
+        _lc_name = layer_container_info[1]
+        _layer_pattern = _re.compile(rf"{_re.escape(_lc_name)}\.(\d+)")
+    else:
+        _layer_pattern = None
+
+    layer_costs = {}
+    for n in architecture_nodes:
+        mp = n.get("module_path", "")
+        m = _layer_pattern.search(mp) if _layer_pattern else None
+        if m:
+            idx = int(m.group(1))
+            if idx not in layer_costs:
+                layer_costs[idx] = {
+                    "comm": 0.0,
+                    "compute": 0.0,
+                    "transition": 0.0,
+                    "num_nodes": 0,
+                }
+            layer_costs[idx]["comm"] += n["_total_comm"]
+            layer_costs[idx]["compute"] += n.get("compute_cost", 0)
+            layer_costs[idx]["transition"] += n["_total_transition"]
+            layer_costs[idx]["num_nodes"] += 1
+
+    total_cost = summary["total"] or 1
+    comm_pct = summary["comm"] / total_cost * 100
+    compute_pct = summary["compute"] / total_cost * 100
+    trans_pct = summary["transition"] / total_cost * 100
+
+    return {
+        "mesh": mesh, "nodes": nodes, "summary": summary,
+        "compute_nodes": compute_nodes, "has_clusters": has_clusters,
+        "cluster_counts": cluster_counts,
+        "param_nodes": param_nodes, "architecture_nodes": architecture_nodes,
+        "perfetto_nodes": perfetto_nodes, "module_tree": module_tree,
+        "top_costly": top_costly, "redist_nodes": redist_nodes,
+        "mesh_desc": mesh_desc, "layer_costs": layer_costs,
+        "total_cost": total_cost, "comm_pct": comm_pct,
+        "compute_pct": compute_pct, "trans_pct": trans_pct,
+    }
+
+
+def generate_visualization_html(data: dict) -> str:
+    """Generate interactive HTML visualization from the JSON export dict.
+
+    Args:
+        data: The dict returned by export_sharding_json() or
+              ShardingOptimizer.get_json().
+
+    Returns:
+        A self-contained HTML string.
+    """
+    ctx = _prepare_viz_data(data)
+    mesh = ctx["mesh"]
+    summary = ctx["summary"]
+    compute_nodes = ctx["compute_nodes"]
+    has_clusters = ctx["has_clusters"]
+    cluster_counts = ctx["cluster_counts"]
+    param_nodes = ctx["param_nodes"]
+    architecture_nodes = ctx["architecture_nodes"]
+    perfetto_nodes = ctx["perfetto_nodes"]
+    module_tree = ctx["module_tree"]
+    top_costly = ctx["top_costly"]
+    redist_nodes = ctx["redist_nodes"]
+    mesh_desc = ctx["mesh_desc"]
+    layer_costs = ctx["layer_costs"]
+    total_cost = ctx["total_cost"]
+    comm_pct = ctx["comm_pct"]
+    compute_pct = ctx["compute_pct"]
+    trans_pct = ctx["trans_pct"]
+
+    html = '<!DOCTYPE html>\n<html><head><meta charset="UTF-8">\n'
+    html += _render_styles()
+    html += f'''</head><body>
+<div class="ap-viz">
+<div class="container">
+<h1>AutoParallel Strategy Visualizer</h1>
+<div class="subtitle">Mesh: {_esc(mesh_desc)} &middot; {len(compute_nodes)} nodes &middot; {len(redist_nodes)} redistributions'''
+
+    if has_clusters:
+        n_clusters = len(cluster_counts)
+        max_instances = max(cluster_counts.values()) + 1 if cluster_counts else 1
+        html += (
+            f" &middot; {n_clusters} repeated clusters "
+            f"(up to {max_instances} layer instances)"
+        )
+
+    html += f'''</div>
+
+<div class="stats-row">
+  <div class="stat-card">
+    <div class="stat-label">Total Cost</div>
+    <div class="stat-value">{_fmt_us(summary["total"])}</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Communication</div>
+    <div class="stat-value" style="color:#DC2626">{_fmt_us(summary["comm"])}</div>
+    <div class="stat-detail">{comm_pct:.0f}% of total</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Compute</div>
+    <div class="stat-value" style="color:#10B981">{_fmt_us(summary["compute"])}</div>
+    <div class="stat-detail">{compute_pct:.0f}% of total</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Transitions</div>
+    <div class="stat-value" style="color:#F59E0B">{_fmt_us(summary["transition"])}</div>
+    <div class="stat-detail">{trans_pct:.0f}% of total</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Redistributions</div>
+    <div class="stat-value">{len(redist_nodes)}</div>
+  </div>
+</div>
+
+<details class="notation-box">
+  <summary class="notation-summary">Placement notation</summary>
+  <div class="notation-body">
+    <div><span class="notation-code">R</span> replicate across that mesh dimension</div>
+    <div><span class="notation-code">S(i)</span> shard tensor dimension <strong>i</strong> across that mesh dimension</div>
+    <div><span class="notation-code">P(sum)</span> partial value with a pending reduction</div>
+    <div><span class="notation-code">S(0)S(1)</span> means the tensor is sharded on two mesh dimensions</div>
+  </div>
+</details>'''
+
+    # Controls bar
+    html += '''
+<div class="controls">
+  <div class="control-group">
+    <span class="control-label">Phase</span>
+    <button class="filter-btn active" data-filter-group="phase" data-filter-value="all" onclick="setFilterState('phase', 'all', this)">All</button>
+    <button class="filter-btn" data-filter-group="phase" data-filter-value="forward" onclick="setFilterState('phase', 'forward', this)">Forward</button>
+    <button class="filter-btn" data-filter-group="phase" data-filter-value="backward" onclick="setFilterState('phase', 'backward', this)">Backward</button>
+  </div>'''
+
+    if has_clusters:
+        html += '''
+  <div class="control-group">
+    <span class="control-label">Detail View</span>
+    <button class="filter-btn active" id="btn-cluster-collapse" onclick="toggleRepresentativeLayers(this)">Representative Layer</button>
+  </div>'''
+
+    html += '</div>'
+
+    # Tabs
+    html += '''
+<div class="tabs">
+  <div class="tab" data-tab-id="params" onclick="switchTab('params', this)">Parameters</div>
+  <div class="tab" data-tab-id="overview" onclick="switchTab('overview', this)">Execution Overview</div>
+  <div class="tab" data-tab-id="perfetto" onclick="switchTab('perfetto', this)">Perfetto</div>
+  <div class="tab" data-tab-id="arch" onclick="switchTab('arch', this)">Architecture</div>
+  <div class="tab active" data-tab-id="cost" onclick="switchTab('cost', this)">Cost Breakdown</div>
+  <div class="tab" data-tab-id="detail" onclick="switchTab('detail', this)">All Nodes</div>
+</div>'''
+
+    # ===== PARAMETERS TAB =====
+    html += '''
+<div data-tab="params" class="tab-content">'''
+    if param_nodes:
+        html += (
+            '<div class="card"><div class="card-title">Parameters and Buffers</div>'
+            f'<pre class="ascii-dump">{_esc(_build_param_ascii_dump(param_nodes))}</pre>'
+            '</div>'
+        )
+    else:
+        html += '<div class="card"><div class="card-title">Parameters and Buffers</div><div style="font-size:12px;color:#64748b">No parameter or buffer placeholder nodes available.</div></div>'
+    html += '</div>'
+
+    # ===== EXECUTION OVERVIEW TAB =====
+    html += '''
+<div data-tab="overview" class="tab-content">'''
+    html += _build_strategy_overview_html(architecture_nodes, layer_costs, module_tree)
+    html += '</div>'
+
+    # ===== PERFETTO TAB =====
+    html += '''
+<div data-tab="perfetto" class="tab-content">'''
+    html += _build_perfetto_tab_html(perfetto_nodes)
+    html += '</div>'
+
+    # ===== ARCHITECTURE TAB =====
+    html += '''
+<div data-tab="arch" class="tab-content">
+<div class="card"><div class="card-title">Computation Blocks by Module</div>
+<div class="filter-bar">
+  <input type="text" class="search-box" placeholder="Search modules..." oninput="setArchSearch(this)">
+  <button class="filter-btn" onclick="archExpandAll(this)">Expand All</button>
+  <button class="filter-btn" onclick="archCollapseAll(this)">Collapse All</button>
+</div>'''
+
+    # Render top-level tree children in execution order (dict preserves
+    # insertion order from graph traversal)
+    flat_costs = _flatten_tree_for_costs(module_tree)
+    comm_costs = sorted([s["comm_cost"] for _, s in flat_costs if s["comm_cost"] > 0])
+    comm_threshold = comm_costs[int(len(comm_costs) * 0.9)] if len(comm_costs) >= 5 else 0
+    for child in module_tree.children.values():
+        html += _render_tree_block(child, cluster_counts, mesh, depth=0, total_cost=total_cost, comm_threshold=comm_threshold)
+
+    html += '</div></div>'
+
+    # ===== COST BREAKDOWN TAB =====
+    html += f'''
+<div data-tab="cost" class="tab-content active">
+<div class="card"><div class="card-title">Cost Distribution</div>
+<div class="cost-bar-container">
+  <div class="cost-bar-label"><span>Cost Breakdown</span></div>
+  <div class="cost-bar" style="height:32px">
+    <div class="cost-bar-segment" style="width:{comm_pct}%;background:#DC2626">Comm {comm_pct:.0f}%</div>
+    <div class="cost-bar-segment" style="width:{compute_pct}%;background:#10B981">Compute {compute_pct:.0f}%</div>
+    <div class="cost-bar-segment" style="width:{trans_pct}%;background:#F59E0B">Trans {trans_pct:.0f}%</div>
+  </div>
+</div></div>'''
+
+    # Communication hotspots — group by (module, collective, src, dst) per phase
+    hotspot_by_phase = {"forward": {}, "backward": {}}
+    phase_totals = {"forward": 0.0, "backward": 0.0}
+    for n in architecture_nodes:
+        module = _strip_module_prefix(n.get("module_path", "") or n.get("name", ""))
+        # Use top-level module as the grouping scope
+        module_prefix = module.split(".")[0] if module else ""
+        phase = n.get("phase", "forward")
+        cid = n.get("cluster_id")
+        instances = (cluster_counts.get(cid, 0) + 1) if cid is not None else 1
+        for inp_name, coll_type, src_p, dst_p, ccost in n["_collectives"]:
+            if ccost <= 0:
+                continue
+            cost = ccost * instances
+            phase_totals[phase] = phase_totals.get(phase, 0) + cost
+            groups = hotspot_by_phase.get(phase, hotspot_by_phase["forward"])
+            key = (module_prefix, coll_type, src_p, dst_p)
+            if key not in groups:
+                groups[key] = {
+                    "coll": coll_type, "src": src_p, "dst": dst_p,
+                    "module": module_prefix,
+                    "total_cost": 0.0, "count": 0,
+                }
+            groups[key]["total_cost"] += cost
+            groups[key]["count"] += instances
+
+
+    fwd_hotspots = sorted(hotspot_by_phase["forward"].values(), key=lambda h: -h["total_cost"])[:15]
+    bwd_hotspots = sorted(hotspot_by_phase["backward"].values(), key=lambda h: -h["total_cost"])[:15]
+
+    fwd_total = phase_totals["forward"]
+    bwd_total = phase_totals["backward"]
+    fwd_shown = sum(h["total_cost"] for h in fwd_hotspots)
+    bwd_shown = sum(h["total_cost"] for h in bwd_hotspots)
+    fwd_note = "" if fwd_shown >= fwd_total * 0.99 else f" (top 15 shown, {_fmt_us(fwd_total)} total)"
+    bwd_note = "" if bwd_shown >= bwd_total * 0.99 else f" (top 15 shown, {_fmt_us(bwd_total)} total)"
+
+    html += f'''
+<div class="card"><div class="card-title">Communication Hotspots — Forward <span style="font-weight:400;color:#64748b">{_fmt_us(fwd_total)}{fwd_note}</span></div>'''
+    html += _hotspot_table_html(fwd_hotspots)
+    html += f'''</div>
+<div class="card"><div class="card-title">Communication Hotspots — Backward <span style="font-weight:400;color:#64748b">{_fmt_us(bwd_total)}{bwd_note}</span></div>'''
+    html += _hotspot_table_html(bwd_hotspots)
+    html += '</div>'
+
+    html += '''
+<div class="card"><div class="card-title">Top Costly Operations</div>'''
+
+    if top_costly:
+        top_max = _node_total_cost(top_costly[0]) or 1
+        for n in top_costly:
+            total = _node_total_cost(n)
+            comm_w = n["_total_comm"] / top_max * 100
+            comp_w = n.get("compute_cost", 0) / top_max * 100
+            trans_w = n["_total_transition"] / top_max * 100
+            src = n.get("source")
+            src_label = f'{src["func"]}: {src["code"]}' if src else n.get("op", "")
+            html += f'''<div class="cost-bar-container">
+  <div class="cost-bar-label"><span style="font-family:monospace"><a href="#" class="node-link" onclick="jumpToNode('{_esc(n["name"])}', this); return false">{_esc(n["name"])}</a></span><span style="color:#64748b">{_esc(src_label)} &middot; total: {_fmt_us(total)}</span></div>
+  <div class="cost-bar">
+    <div class="cost-bar-segment" style="width:{comm_w}%;background:#DC2626" title="comm: {_fmt_us(n['_total_comm'])}"></div>
+    <div class="cost-bar-segment" style="width:{comp_w}%;background:#10B981" title="compute: {_fmt_us(n.get('compute_cost', 0))}"></div>
+    <div class="cost-bar-segment" style="width:{trans_w}%;background:#F59E0B" title="trans: {_fmt_us(n['_total_transition'])}"></div>
+  </div>
+</div>'''
+
+    # Cost by module — flat treemap with comm/compute mode toggle
+    treemap_items = _treemap_data(module_tree)
+    treemap_json = json.dumps(treemap_items)
+    html += f'''</div><div class="card"><div class="card-title">Cost by Module</div>
+<div class="filter-bar">
+  <button class="filter-btn active" onclick="setTreemapMode('comm', this)">Communication</button>
+  <button class="filter-btn" onclick="setTreemapMode('compute', this)">Compute</button>
+</div>
+<div class="treemap-container" id="treemap-container"></div>
+<script>
+function _tmFmtUs(us) {{ return us >= 1000 ? (us/1000).toFixed(1)+'ms' : Math.round(us)+'\\u00b5s'; }}
+
+function _tmSquarify(items, rect) {{
+  if (!items.length) return;
+  var total = 0;
+  for (var i = 0; i < items.length; i++) total += items[i].value;
+  if (total === 0) return;
+  _tmLayout(items, 0, rect, total, rect.w * rect.h);
+}}
+
+function _tmLayout(items, start, rect, total, area) {{
+  if (start >= items.length) return;
+  if (items.length - start === 1) {{
+    items[start]._x = rect.x; items[start]._y = rect.y;
+    items[start]._w = rect.w; items[start]._h = rect.h;
+    return;
+  }}
+  var short = Math.min(rect.w, rect.h);
+  var rowSum = 0, bestRatio = Infinity, end = start;
+  for (var i = start; i < items.length; i++) {{
+    rowSum += items[i].value;
+    var frac = rowSum / total * area;
+    var rowLen = frac / short;
+    var last = items[i].value / total * area / rowLen;
+    var ratio = Math.max(rowLen / last, last / rowLen);
+    if (ratio > bestRatio) break;
+    bestRatio = ratio;
+    end = i;
+  }}
+  rowSum = 0;
+  for (var i = start; i <= end; i++) rowSum += items[i].value;
+  var stripFrac = rowSum / total;
+  var pos = 0;
+  for (var i = start; i <= end; i++) {{
+    var itemFrac = items[i].value / rowSum;
+    if (rect.w >= rect.h) {{
+      var sw = rect.w * stripFrac;
+      items[i]._x = rect.x; items[i]._y = rect.y + rect.h * pos;
+      items[i]._w = sw; items[i]._h = rect.h * itemFrac;
+    }} else {{
+      var sh = rect.h * stripFrac;
+      items[i]._x = rect.x + rect.w * pos; items[i]._y = rect.y;
+      items[i]._w = rect.w * itemFrac; items[i]._h = sh;
+    }}
+    pos += itemFrac;
+  }}
+  if (end + 1 < items.length) {{
+    var rem;
+    if (rect.w >= rect.h) {{
+      rem = {{x: rect.x + rect.w * stripFrac, y: rect.y, w: rect.w * (1 - stripFrac), h: rect.h}};
+    }} else {{
+      rem = {{x: rect.x, y: rect.y + rect.h * stripFrac, w: rect.w, h: rect.h * (1 - stripFrac)}};
+    }}
+    _tmLayout(items, end + 1, rem, total - rowSum, rem.w * rem.h);
+  }}
+}}
+
+var _treemapInited = false;
+var _treemapMode = 'comm';
+var _treemapItems = {treemap_json};
+function setTreemapMode(mode, btn) {{
+  _treemapMode = mode;
+  btn.parentElement.querySelectorAll('.filter-btn').forEach(function(b) {{ b.classList.remove('active'); }});
+  btn.classList.add('active');
+  if (_treemapInited) _treemapRender();
+}}
+function initTreemap() {{
+  if (_treemapInited) return;
+  _treemapInited = true;
+  _treemapRender();
+}}
+function _treemapRender() {{
+  var container = document.getElementById('treemap-container');
+  container.innerHTML = '';
+  var mode = _treemapMode;
+
+  // Copy items and assign .value based on mode
+  var items = [];
+  for (var i = 0; i < _treemapItems.length; i++) {{
+    var d = _treemapItems[i];
+    var v = (mode === 'comm') ? d.comm : d.compute;
+    if (v > 0) items.push({{name: d.name, comm: d.comm, compute: d.compute, transition: d.transition, value: v}});
+  }}
+  items.sort(function(a, b) {{ return b.value - a.value; }});
+
+  if (!items.length) {{
+    container.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:#94a3b8;font-size:14px">No ' + mode + ' cost</div>';
+    return;
+  }}
+
+  var rect = {{x: 0, y: 0, w: container.offsetWidth, h: container.offsetHeight}};
+  _tmSquarify(items, rect);
+  var totalValue = 0;
+  for (var i = 0; i < items.length; i++) totalValue += items[i].value;
+
+  for (var i = 0; i < items.length; i++) {{
+    var d = items[i];
+    if (!d._w || !d._h) continue;
+
+    // Intensity: selected cost / total cost of this module
+    var t = d.comm + d.compute + d.transition;
+    var intensity = t > 0 ? d.value / t : 0;
+    var r, g, b;
+    if (mode === 'comm') {{
+      r = Math.round(255 - intensity * (255 - 0xDC));
+      g = Math.round(255 - intensity * (255 - 0x26));
+      b = Math.round(255 - intensity * (255 - 0x26));
+    }} else {{
+      r = Math.round(255 - intensity * (255 - 0x10));
+      g = Math.round(255 - intensity * (255 - 0xB9));
+      b = Math.round(255 - intensity * (255 - 0x81));
+    }}
+    var txtColor = intensity > 0.4 ? '#fff' : '#1e293b';
+
+    var cell = document.createElement('div');
+    cell.className = 'treemap-cell';
+    cell.style.left = d._x + 'px'; cell.style.top = d._y + 'px';
+    cell.style.width = d._w + 'px'; cell.style.height = d._h + 'px';
+    cell.style.background = 'rgb(' + r + ',' + g + ',' + b + ')';
+
+    var pct = (d.value / totalValue * 100).toFixed(1);
+    cell.title = d.name + '\\ncomm: ' + _tmFmtUs(d.comm) + '  compute: ' + _tmFmtUs(d.compute) + '  trans: ' + _tmFmtUs(d.transition) + '\\n' + pct + '% of total ' + mode;
+
+    if (d._w > 50 && d._h > 20) {{
+      var span = document.createElement('span');
+      span.textContent = d.name;
+      span.style.color = txtColor;
+      span.style.textShadow = 'none';
+      cell.appendChild(span);
+    }}
+    // Mini stacked cost bar at bottom
+    if (d._w > 20 && d._h > 16 && t > 0) {{
+      var bar = document.createElement('div');
+      bar.style.cssText = 'position:absolute;bottom:0;left:0;right:0;height:4px;display:flex;pointer-events:none';
+      bar.innerHTML = '<div style="width:'+(d.comm/t*100)+'%;background:#DC2626;height:100%"></div>'
+        + '<div style="width:'+(d.compute/t*100)+'%;background:#10B981;height:100%"></div>'
+        + '<div style="width:'+(d.transition/t*100)+'%;background:#F59E0B;height:100%"></div>';
+      cell.appendChild(bar);
+    }}
+    (function(name) {{
+      cell.addEventListener('click', function() {{
+        jumpToArch(name, cell);
+      }});
+    }})(d.name);
+    container.appendChild(cell);
+  }}
+}}
+</script>'''
+
+    html += '</div></div>'
+
+    # ===== ALL NODES TAB =====
+    html += '''
+<div data-tab="detail" class="tab-content">
+<div class="card">
+<div class="card-title">All Nodes</div>
+<div class="filter-bar">
+  <input type="text" class="search-box" placeholder="Search nodes..." oninput="setSearch(this)">
+  <button class="filter-btn active" data-filter-group="node-type" data-filter-value="all" onclick="setFilterState('nodeType', 'all', this)">All</button>
+  <button class="filter-btn" data-filter-group="node-type" data-filter-value="param" onclick="setFilterState('nodeType', 'param', this)">Parameters</button>
+  <button class="filter-btn" data-filter-group="node-type" data-filter-value="input" onclick="setFilterState('nodeType', 'input', this)">Inputs</button>
+  <button class="filter-btn" data-filter-group="node-type" data-filter-value="tangent" onclick="setFilterState('nodeType', 'tangent', this)">Tangents</button>
+  <button class="filter-btn" data-filter-group="node-type" data-filter-value="forward" onclick="setFilterState('nodeType', 'forward', this)">Forward</button>
+  <button class="filter-btn" data-filter-group="node-type" data-filter-value="backward" onclick="setFilterState('nodeType', 'backward', this)">Backward</button>
+  <button class="filter-btn" data-filter-group="node-type" data-filter-value="redist" onclick="setFilterState('nodeType', 'redist', this)">Has Redistribution</button>
+</div>
+<div class="table-scroll">
+<table data-role="node-table"><thead>
+<tr><th class="sortable" onclick="sortTable(0, 'str', this)">Name</th><th class="sortable" onclick="sortTable(1, 'str', this)">Op</th><th class="sortable" onclick="sortTable(2, 'str', this)">Phase</th><th>Shape</th><th class="sortable" onclick="sortTable(4, 'str', this)">Placement</th><th class="sortable" onclick="sortTable(5, 'num', this)">Comm</th><th class="sortable" onclick="sortTable(6, 'num', this)">Compute</th><th class="sortable" onclick="sortTable(7, 'num', this)">Trans</th><th>Redistribution</th><th class="sortable" onclick="sortTable(9, 'str', this)">Module</th></tr>
+</thead><tbody>'''
+
+    all_display = compute_nodes
+    for n in all_display:
+        comm = n["_total_comm"]
+        compute = n.get("compute_cost", 0)
+        transition = n["_total_transition"]
+        cost_class = "cost-high" if comm > 100 else "cost-med" if comm > 0 else "cost-low"
+        shape_str = ",".join(str(s) for s in n.get("shape", []))
+        dtype = n.get("dtype", "")
+        placement = n.get("placement", "")
+        phase = n.get("phase", "")
+        op_name = n.get("op", "")
+        module = n.get("module_path", "")
+        placeholder_kind = n.get("placeholder_kind", "")
+
+        # Collective badges
+        coll_html = ""
+        for _, ctype, cfrom, cto, ccost in n["_collectives"]:
+            coll_html += f'<span class="collective-badge">{_esc(ctype)}: {_esc(cfrom)}&rarr;{_esc(cto)} ({_fmt_us(ccost)})</span> '
+
+        is_linked = "cluster_root" in n
+        row_class = "node-row linked-row" if is_linked else "node-row"
+        cluster_html = ""
+        cid = n.get("cluster_id")
+        if cid is not None and not is_linked and cid in cluster_counts:
+            cluster_html = f'<span class="cluster-badge">&times;{cluster_counts[cid] + 1}</span>'
+
+        data_attrs = (
+            f'data-phase="{phase}" '
+            f'data-op="{_esc(op_name)}" '
+            f'data-comm="{comm}" '
+            f'data-redist="{1 if n["_collectives"] else 0}" '
+            f'data-linked="{1 if is_linked else 0}" '
+            f'data-placeholder-kind="{_esc(placeholder_kind)}" '
+            f'data-node-name="{_esc(n["name"])}"'
+        )
+
+        chip = _placement_chip_html(placement, n['_bg'], n['_color'], n.get("shape"), dtype, mesh)
+
+        html += f'''<tr class="{row_class}" {data_attrs}>
+  <td style="font-family:monospace;font-size:11px">{_esc(n["name"])}{cluster_html}</td>
+  <td style="font-size:11px">{_esc(op_name)}</td>
+  <td style="font-size:11px">{phase}</td>
+  <td style="font-size:11px">{_esc(dtype)}[{shape_str}]</td>
+  <td>{chip}</td>
+  <td class="{cost_class}" style="font-family:monospace" data-sort-value="{comm}">{_fmt_us(comm)}</td>
+  <td style="font-family:monospace" data-sort-value="{compute}">{_fmt_us(compute)}</td>
+  <td style="font-family:monospace" data-sort-value="{transition}">{_fmt_us(transition)}</td>
+  <td>{coll_html}</td>
+  <td style="font-size:11px;color:#64748b">{_esc(module)}</td>
+</tr>'''
+
+    html += '''</tbody></table></div></div></div>
+
+'''
+    html += _render_script()
+    html += '\n</div></div></body></html>'
     return html
