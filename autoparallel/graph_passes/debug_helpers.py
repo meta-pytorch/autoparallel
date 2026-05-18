@@ -177,7 +177,7 @@ def make_custom_runtime_estimation(mesh):
     }
     # Collectives where the input tensor is shard-sized and the actual
     # communicated volume is input_bytes * num_devices_on_mesh_dim.
-    _SCALES_BY_MESH_DIM = {"allgather", "all_to_all"}
+    _SCALES_BY_MESH_DIM = {"allgather"}
 
     def custom_runtime_estimation(node: torch.fx.Node, override_size=None):
         if not node.op == "call_function":
