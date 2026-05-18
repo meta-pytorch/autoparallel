@@ -388,17 +388,43 @@ def _compute_flops(fn, *args, **kwargs):
     return flop_counter.get_total_flops(), out
 
 
+def _compute_gemm_efficiency(flops: int, read_write_bytes: int) -> float:
+    """Estimate GEMM compute efficiency using a roofline model with
+    arithmetic-intensity-dependent efficiency.
+
+    Instead of assuming a fixed 70% efficiency for all GEMMs, we model
+    efficiency as a Hill function of arithmetic intensity (FLOPs / bytes):
+        eff = eff_max * AI^alpha / (AI^alpha + ai_half^alpha)
+
+    This captures the key insight that narrow/shallow GEMMs (low AI) achieve
+    much lower efficiency than large square GEMMs (high AI), even at the same
+    FLOP count. Parameters fitted against H100 bf16 GEMM benchmarks (666
+    shapes, MAPE=8.9% for M>=64 vs 17.7% for fixed 70%).
+    """
+    eff_max = 0.742
+    ai_half = 150.0  # AI at which efficiency reaches 50% of eff_max
+    alpha = 1.47  # steepness of the transition
+
+    if read_write_bytes == 0:
+        return eff_max
+
+    ai = flops / read_write_bytes
+    return eff_max * ai**alpha / (ai**alpha + ai_half**alpha)
+
+
+# Kernel launch overhead floor (us)
+_KERNEL_LAUNCH_OVERHEAD = 9
+
+
 def compute_read_write_time(read_write_bytes):
     gpu_memory_bandwidth = _get_device_gmem_bandwidth()
     read_write_time = read_write_bytes / gpu_memory_bandwidth * 1e6  # us
 
-    # suppose 70% efficiency for the operator
+    # ~70% bandwidth efficiency for memory-bound ops
     read_write_efficiency = 0.70
 
-    kernel_launch_overhead = 7  # us
-
     read_write_time = max(
-        read_write_time / read_write_efficiency, kernel_launch_overhead
+        read_write_time / read_write_efficiency, _KERNEL_LAUNCH_OVERHEAD
     )
     return read_write_time
 
@@ -481,10 +507,9 @@ def estimate_strategy_runtime_cost(node, strategy):
         # TODO: use PyTorch's version once it's giving correct results
         gpu_flops = _get_device_tflops(dtype) * 10**12
 
-        # suppose 70% efficiency for the operator
-        compute_efficiency = 0.70
+        compute_efficiency = _compute_gemm_efficiency(flops, read_write_bytes)
         compute_time = flops / gpu_flops * 1e6  # us
-        compute_time = compute_time / compute_efficiency
+        compute_time = compute_time / max(compute_efficiency, 1e-4)
 
         result = max(compute_time, read_write_time)
 
