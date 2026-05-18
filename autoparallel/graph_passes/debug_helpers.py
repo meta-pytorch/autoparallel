@@ -19,13 +19,9 @@ from torch.utils._dtype_abbrs import dtype_abbrs
 
 from autoparallel.cost_models.collective_runtime_estimation import (
     MeshTopoInfo,
-    allgather_cost,
-    allreduce_cost,
-    get_nccl_topo_config,
-    reduce_scatter_cost,
+    collective_comm_cost,
 )
 from autoparallel.cost_models.compute_estimation import estimate_strategy_runtime_cost
-from autoparallel.cost_models.nccl_cost_model import derive_mesh_dim_topo
 
 
 def parse_tensor_annotation(annotation: str) -> torch.Tensor:
@@ -172,7 +168,16 @@ def _resolve_comm_node(node, global_time):
 
 
 def make_custom_runtime_estimation(mesh):
-    nccl_config = get_nccl_topo_config()
+    _TARGET_TO_COLLECTIVE = {
+        torch.ops._c10d_functional.all_gather_into_tensor.default: "allgather",
+        torch.ops._c10d_functional.all_gather_into_tensor_out.default: "allgather",
+        torch.ops._c10d_functional.reduce_scatter_tensor.default: "reduce_scatter",
+        torch.ops._c10d_functional.all_reduce.default: "allreduce",
+        torch.ops._dtensor.shard_dim_alltoall.default: "all_to_all",
+    }
+    # Collectives where the input tensor is shard-sized and the actual
+    # communicated volume is input_bytes * num_devices_on_mesh_dim.
+    _SCALES_BY_MESH_DIM = {"allgather"}
 
     def custom_runtime_estimation(node: torch.fx.Node, override_size=None):
         if not node.op == "call_function":
@@ -183,6 +188,9 @@ def make_custom_runtime_estimation(mesh):
         if _is_communication_node(node):
             target = node.target
             if target == torch.ops._c10d_functional.wait_tensor.default:
+                return 0
+            collective = _TARGET_TO_COLLECTIVE.get(target)
+            if collective is None:
                 return 0
             # Resolve group_name to a mesh and dimension. Collectives may
             # use per-dimension groups or the flattened mesh group created
@@ -199,54 +207,18 @@ def make_custom_runtime_estimation(mesh):
                 return 0
             mesh_topo = MeshTopoInfo.build_from_mesh(cost_mesh)
             t = node.args[0].meta["val"]  # type: ignore[union-attr]
-            comm_bytes_gb = t.numel() * t.itemsize / 2**30
+            comm_bytes = t.numel() * t.itemsize
             if override_size is not None:
-                comm_bytes_gb = override_size
-
-            if nccl_config is not None:
-                from autoparallel.cost_models.nccl_cost_model import (
-                    nccl_allgather_cost,
-                    nccl_allreduce_cost,
-                    nccl_reduce_scatter_cost,
-                )
-
-                mesh_shape = tuple(cost_mesh.shape)
-                topo = derive_mesh_dim_topo(nccl_config, mesh_shape, mesh_dim)
-
-                if target in {
-                    torch.ops._c10d_functional.all_gather_into_tensor.default,
-                    torch.ops._c10d_functional.all_gather_into_tensor_out.default,
-                }:
-                    n_bytes = int(comm_bytes_gb * cost_mesh.shape[mesh_dim] * 1024**3)
-                    return nccl_allgather_cost(n_bytes, topo, nccl_config)
-                elif target == torch.ops._c10d_functional.reduce_scatter_tensor.default:
-                    n_bytes = int(comm_bytes_gb * 1024**3)
-                    return nccl_reduce_scatter_cost(n_bytes, topo, nccl_config)
-                elif target == torch.ops._c10d_functional.all_reduce.default:
-                    n_bytes = int(comm_bytes_gb * 1024**3)
-                    return nccl_allreduce_cost(n_bytes, topo, nccl_config)
-                elif target == torch.ops._dtensor.shard_dim_alltoall.default:
-                    # alltoall moves similar data volume to allgather
-                    n_bytes = int(comm_bytes_gb * cost_mesh.shape[mesh_dim] * 1024**3)
-                    return nccl_allgather_cost(n_bytes, topo, nccl_config)
-                else:
-                    return 0
-
-            if target in {
-                torch.ops._c10d_functional.all_gather_into_tensor.default,
-                torch.ops._c10d_functional.all_gather_into_tensor_out.default,
-            }:
-                comm_bytes_gb *= cost_mesh.shape[mesh_dim]
-                return allgather_cost(comm_bytes_gb, mesh_topo, mesh_dim)
-            elif target == torch.ops._c10d_functional.reduce_scatter_tensor.default:
-                return reduce_scatter_cost(comm_bytes_gb, mesh_topo, mesh_dim)
-            elif target == torch.ops._c10d_functional.all_reduce.default:
-                return allreduce_cost(comm_bytes_gb, mesh_topo, mesh_dim)
-            elif target == torch.ops._dtensor.shard_dim_alltoall.default:
-                comm_bytes_gb *= cost_mesh.shape[mesh_dim]
-                return allgather_cost(comm_bytes_gb, mesh_topo, mesh_dim)
-            else:
-                return 0
+                comm_bytes = int(override_size * 2**30)
+            if collective in _SCALES_BY_MESH_DIM:
+                comm_bytes *= cost_mesh.shape[mesh_dim]
+            return collective_comm_cost(
+                collective,
+                comm_bytes,
+                tuple(cost_mesh.shape),
+                mesh_dim,
+                mesh_topo,
+            )
         return estimate_strategy_runtime_cost(node, None)
 
     return custom_runtime_estimation
