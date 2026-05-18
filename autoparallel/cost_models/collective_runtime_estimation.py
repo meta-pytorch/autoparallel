@@ -62,6 +62,41 @@ def _nccl_comm_cost(
         return 0.0
 
 
+def collective_comm_cost(
+    collective: str,
+    comm_bytes: int,
+    mesh_shape: tuple[int, ...],
+    mesh_dim: int,
+    mesh_topo: MeshTopoInfo | None = None,
+) -> float:
+    """Single dispatch point for collective communication cost.
+
+    Works with both the NCCL cost model (when configured via set_nccl_topo_config)
+    and the default PyTorch cost model.
+
+    Args:
+        collective: one of "allgather", "allreduce", "reduce_scatter", "all_to_all"
+        comm_bytes: total bytes communicated (post-collective size for allgather,
+            pre-collective size for reduce_scatter)
+        mesh_shape: shape of the device mesh
+        mesh_dim: which mesh dimension the collective runs on
+        mesh_topo: required when NCCL cost model is not configured
+    """
+    if _nccl_topo_config is not None:
+        return _nccl_comm_cost(mesh_shape, mesh_dim, comm_bytes, collective)
+    assert mesh_topo is not None
+    comm_bytes_gb = comm_bytes / 1024**3
+    if collective == "allgather":
+        return allgather_cost(comm_bytes_gb, mesh_topo, mesh_dim)
+    elif collective == "allreduce":
+        return allreduce_cost(comm_bytes_gb, mesh_topo, mesh_dim)
+    elif collective == "reduce_scatter":
+        return reduce_scatter_cost(comm_bytes_gb, mesh_topo, mesh_dim)
+    elif collective == "all_to_all":
+        return all_to_all_cost(comm_bytes_gb, mesh_topo, mesh_dim)
+    return 0.0
+
+
 def all_to_all_cost(bytes_gb: float, mesh_topo: MeshTopoInfo, mesh_dim: int) -> float:
     num_devices_on_mesh_dim = mesh_topo.mesh_dim_devices[mesh_dim]
     mesh_dim_bandwidth = mesh_topo.mesh_dim_bandwidth[mesh_dim]
@@ -109,8 +144,7 @@ def redistribute_cost(
     comm_bytes_gb = (
         spec_to_bytes(current_spec) / current_spec.num_shards / 1024 / 1024 / 1024
     )
-    use_nccl = _nccl_topo_config is not None
-    mesh_shape = tuple(current_spec.mesh.shape) if use_nccl else ()
+    mesh_shape = tuple(current_spec.mesh.shape)
     # Transformation that considered for redistribute cost:
     # 1. allgather 2. alltoall
     # 3. allreduce 4. reduce_scatter
@@ -129,13 +163,9 @@ def redistribute_cost(
             current = cast(Shard, current)
             # allgather gives larger comm bytes
             comm_bytes_gb *= num_devices_on_mesh_dim
-            # add up allgather comm cost
-            if use_nccl:
-                cost += _nccl_comm_cost(
-                    mesh_shape, i, int(comm_bytes_gb * 1024**3), "allgather"
-                )
-            else:
-                cost += allgather_cost(comm_bytes_gb, mesh_topo, i)
+            cost += collective_comm_cost(
+                "allgather", int(comm_bytes_gb * 1024**3), mesh_shape, i, mesh_topo
+            )
             if current.dim != 0:
                 # penalize cases like  S(1) -> R as there are additional compute cost
                 # which corresponds to reshuffling the whole output tensor
@@ -146,14 +176,9 @@ def redistribute_cost(
         elif current.is_shard() and target.is_shard():
             current = cast(Shard, current)
             target = cast(Shard, target)
-            # should be alltoall comm, since we haven't implement it yet, add penalty
-            # to favor allgather instead
-            if use_nccl:
-                cost += _nccl_comm_cost(
-                    mesh_shape, i, int(comm_bytes_gb * 1024**3), "all_to_all"
-                )
-            else:
-                cost += all_to_all_cost(comm_bytes_gb, mesh_topo, i)  # us
+            cost += collective_comm_cost(
+                "all_to_all", int(comm_bytes_gb * 1024**3), mesh_shape, i, mesh_topo
+            )
 
             num_copies = 0
             if current.dim != 0:
@@ -166,22 +191,18 @@ def redistribute_cost(
             cost += num_copies * compute_cost
 
         elif current.is_partial() and target.is_replicate():
-            # add up allreduce comm cost
-            if use_nccl:
-                cost += _nccl_comm_cost(
-                    mesh_shape, i, int(comm_bytes_gb * 1024**3), "allreduce"
-                )
-            else:
-                cost += allreduce_cost(comm_bytes_gb, mesh_topo, i)
+            cost += collective_comm_cost(
+                "allreduce", int(comm_bytes_gb * 1024**3), mesh_shape, i, mesh_topo
+            )
         elif current.is_partial() and target.is_shard():
             target = cast(Shard, target)
-            # add up reduce_scatter comm cost
-            if use_nccl:
-                cost += _nccl_comm_cost(
-                    mesh_shape, i, int(comm_bytes_gb * 1024**3), "reduce_scatter"
-                )
-            else:
-                cost += reduce_scatter_cost(comm_bytes_gb, mesh_topo, i)
+            cost += collective_comm_cost(
+                "reduce_scatter",
+                int(comm_bytes_gb * 1024**3),
+                mesh_shape,
+                i,
+                mesh_topo,
+            )
             if target.dim != 0:
                 # penalize cases like  P -> S(1) as there are additional compute cost
                 # which corresponds to reshuffling the whole input tensor
