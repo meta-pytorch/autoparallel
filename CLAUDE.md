@@ -10,16 +10,12 @@ AutoParallel is a PyTorch library for automatic model sharding and parallelizati
 
 ## Core Architecture
 
-The library consists of several key components that work together:
+The optimization flow: Model → FX Graph → Sharding Options → ILP → Optimal Strategy → Apply Sharding
 
-- **api.py**: Main entry point with `AutoParallel` class that orchestrates the sharding process
-- **optimize_sharding.py**: Contains `ShardingOptimizer` that uses PuLP (linear programming) to find optimal sharding strategies
-- **apply_sharding.py**: Applies computed sharding strategies to PyTorch models using DTensor specs
-- **propagation_rules.py**: Defines how tensor sharding propagates through different PyTorch operations
-- **compute_estimation.py**: Estimates runtime costs for different sharding strategies
-- **export_module.py**: Handles AOT (Ahead-of-Time) compilation and module export
-
-The optimization flow: Model → FX Graph → Sharding Options → Linear Program → Optimal Strategy → Apply Sharding
+Key entry points:
+- **api.py**: `AutoParallel` class that orchestrates tracing, optimization, and sharding
+- **optimize_sharding.py**: `ShardingOptimizer` — formulates and solves the sharding ILP
+- **apply_sharding.py**: Applies the computed strategy using DTensor
 
 ## Development Commands
 
