@@ -437,6 +437,7 @@ class ExperimentRunner:
                 )
 
                 # Gather estimations once — reused for both before/after stats and scheduling
+                node_estimations: Dict[fx.Node, float]
                 node_estimations, fusion_region_of = gather_node_runtime_estimations(gm)
 
                 colls_file_path = resolve_colls_file_path(
@@ -467,6 +468,7 @@ class ExperimentRunner:
                     fusion_region_of=fusion_region_of,
                 )
                 # gather runtime estimations as bucketing adds another collectives and ops
+                node_estimations_after: Dict[fx.Node, float]
                 (
                     node_estimations_after,
                     fusion_region_of,
