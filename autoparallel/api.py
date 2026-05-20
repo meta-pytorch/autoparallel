@@ -60,44 +60,34 @@ logger = logging.getLogger(__name__)
 
 
 def _boxed_nop_preserve_node_meta(
-    fx_g, example_inputs, pre_pass=None, tag_forward=False, tag_backward=False
+    fx_g, example_inputs, pre_pass=None, tag_forward=False
 ):
     if pre_pass is not None:
         pre_pass(fx_g.graph)
 
     if tag_forward:
-        # Tag all forward call_function nodes so the second compilation
-        # knows they belong to the original forward graph.
-        for node in fx_g.graph.nodes:
-            if node.op == "call_function":
-                node.meta.setdefault("custom", {})
-                node.meta["custom"]["ap_graph_part"] = "forward"
-        # Additionally tag the forward graph's OUTPUT values as "must save".
-        # These are the tensors the first min_cut decided to save for
-        # backward — only these should be saved in the second compilation.
+        # Tag the forward graph's OUTPUT values as "must save". These are
+        # the tensors the first min_cut decided to save for backward —
+        # only these should be saved in the second compilation.
+        # Uses the "custom" meta field (not "recompute") to avoid
+        # interfering with ac_joint_pass which uses "recompute" for
+        # activation checkpointing decisions.
         output_node = next(n for n in fx_g.graph.nodes if n.op == "output")
         for out in output_node.args[0]:
             if not isinstance(out, torch.fx.Node) or out.op != "call_function":
                 continue
             if out.target == operator.getitem:
-                # getitem nodes don't get their custom field preserved by
-                # preserve_node_meta (operator.getitem is a Python builtin,
-                # not dispatched through TorchDispatchMode). Tag the parent
-                # multi-output op with the specific getitem indices to save.
+                # getitem metadata doesn't survive preserve_node_meta
+                # (Python builtin, not dispatched). Tag the parent
+                # multi-output op instead — DCE in _extract_fwd_bwd_modules
+                # removes any unused getitem children.
                 parent = out.args[0]
                 if isinstance(parent, torch.fx.Node):
                     parent.meta.setdefault("custom", {})
-                    parent.meta["custom"].setdefault("ap_save_getitems", [])
-                    parent.meta["custom"]["ap_save_getitems"].append(out.args[1])
+                    parent.meta["custom"]["ap_must_save"] = True
             else:
                 out.meta.setdefault("custom", {})
                 out.meta["custom"]["ap_must_save"] = True
-
-    if tag_backward:
-        for node in fx_g.graph.nodes:
-            if node.op == "call_function":
-                node.meta.setdefault("custom", {})
-                node.meta["custom"]["ap_graph_part"] = "backward"
 
     def run(args):
         with torch.fx.traceback.preserve_node_meta():
@@ -546,12 +536,11 @@ class AutoParallel:
             from functools import partial
 
         fw_compiler_fn = partial(compiler_fn, tag_forward=True)
-        bw_compiler_fn = partial(compiler_fn, tag_backward=True)
 
         self.parallel_model_fn = parallel_model_fn = aot_compile_joint_with_descriptors(
             self.joint_with_descriptors,
             fw_compiler=fw_compiler_fn,
-            bw_compiler=bw_compiler_fn,
+            bw_compiler=compiler_fn,
         )
 
         # Build a forward-only graph for inference (no backward, no

@@ -91,16 +91,6 @@ class _SaveAllPartitioner(CustomPartitionerFn):
         force_save_effectful_ops(gm)
         force_save_bw_mutation_src(gm)
 
-        # Nodes from the first compilation's backward and untagged nodes
-        # (fresh autograd backward ops) should not appear in the forward
-        # graph. Mark them must_be_in_backward so classify_nodes excludes
-        # them from the forward.
-        for node in gm.graph.nodes:
-            if node.op != "call_function":
-                continue
-            if node.meta.get("custom", {}).get("ap_graph_part") != "forward":
-                node.meta["partitioner_tag"] = "must_be_in_backward"
-
         if static_lifetime_input_indices is None:
             static_lifetime_input_indices = []
         node_info = classify_nodes(gm, static_lifetime_input_indices, num_fwd_outputs)
@@ -130,34 +120,28 @@ class _SaveAllPartitioner(CustomPartitionerFn):
                     saved_sym_nodes.append(node)
                 return
             if _is_multi_output(node):
+                # Multi-output ops tagged ap_must_save: save all their
+                # getitem children (DCE removes unused ones later).
+                if node.meta.get("custom", {}).get("ap_must_save"):
+                    for user in node.users:
+                        if user.target == operator.getitem:
+                            saved_values.append(user)
                 return
             if is_opaque_node(node):
                 saved_opaque_nodes.append(node)
                 return
             if must_recompute(node):
                 return
-            # Only save nodes that the first compilation's min_cut decided
-            # to save (tagged ap_must_save via the "custom" meta field).
-            # These are exactly the forward graph's output tensors from the
-            # first partitioner — reproducing its save/recompute decisions.
-            # Placeholders (primals) don't carry the tag but must always be
-            # saved when needed.
-            #
-            # For getitem nodes (outputs of multi-output ops like SDPA),
-            # preserve_node_meta doesn't copy the custom field (Python
-            # builtin, not dispatched). Instead, the parent op carries
-            # ap_save_getitems with the specific indices to save.
-            custom = node.meta.get("custom", {})
+            # Save nodes tagged ap_must_save by the first compilation.
+            # These are the forward graph's output tensors from the first
+            # partitioner — reproducing its save/recompute decisions.
+            # ac_joint_pass may override some with PREFER_RECOMPUTE for
+            # better memory; the must_recompute check above respects this.
+            # Placeholders (primals) are always saved when needed.
             if node.op == "placeholder":
                 saved_values.append(node)
-            elif custom.get("ap_must_save", False):
+            elif node.meta.get("custom", {}).get("ap_must_save"):
                 saved_values.append(node)
-            elif node.target == operator.getitem and isinstance(
-                node.args[0], torch.fx.Node
-            ):
-                parent_custom = node.args[0].meta.get("custom", {})
-                if node.args[1] in parent_custom.get("ap_save_getitems", []):
-                    saved_values.append(node)
 
         for node in node_info.required_fw_nodes:
             _maybe_save(node)
