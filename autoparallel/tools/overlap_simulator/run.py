@@ -437,7 +437,8 @@ class ExperimentRunner:
                 )
 
                 # Gather estimations once — reused for both before/after stats and scheduling
-                node_estimations, fusion_region_of = gather_node_runtime_estimations(gm)
+                node_estimations: Dict[fx.Node, float]
+                node_estimations, fusion_region_of = gather_node_runtime_estimations(gm)  # type: ignore[assignment]
 
                 colls_file_path = resolve_colls_file_path(
                     self.variant_config.get_colls_file_func()
@@ -467,10 +468,10 @@ class ExperimentRunner:
                     fusion_region_of=fusion_region_of,
                 )
                 # gather runtime estimations as bucketing adds another collectives and ops
+                node_estimations_after: Dict[fx.Node, float]
                 (
-                    node_estimations_after,
                     fusion_region_of,
-                ) = gather_node_runtime_estimations(gm_after)
+                ) = gather_node_runtime_estimations(gm_after)  # type: ignore[assignment]
                 estimator = self._create_estimator(
                     node_estimations_after, colls_file_path
                 )
