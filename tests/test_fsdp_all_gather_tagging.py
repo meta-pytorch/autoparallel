@@ -158,6 +158,26 @@ def test_force_recompute_tags_dtype_cast_before_ag():
             assert node.meta["ac_graph_id"] == AP_AC_GRAPH_ID
 
 
+def test_force_recompute_tags_permute_after_wait():
+    """A permute([1, 0]) after wait_tensor gets MUST_RECOMPUTE (single-input chain)."""
+    graph = _new_graph()
+    param = _add_placeholder(graph, "param")
+    activation = _add_placeholder(graph, "activation")
+    ag = _add_all_gather(graph, param)
+    wait = _add_wait_tensor(graph, ag)
+    permute = graph.call_function(torch.ops.aten.permute.default, args=(wait, [1, 0]))
+    permute.meta["val"] = torch.empty(64)
+    out = _add_mm(graph, permute, activation)
+    _add_output(graph, [out])
+
+    force_recompute_fsdp_all_gather(graph)
+
+    for node in graph.nodes:
+        if node.target == torch.ops.aten.permute.default:
+            assert node.meta["recompute"] is CheckpointPolicy.MUST_RECOMPUTE
+            assert node.meta["ac_graph_id"] == AP_AC_GRAPH_ID
+
+
 def test_force_recompute_ignores_non_fsdp_all_gather():
     """all_gather nodes that don't trace back to a placeholder are skipped."""
     graph = _new_graph()

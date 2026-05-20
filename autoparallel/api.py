@@ -5,6 +5,7 @@
 
 import copy
 import logging
+import operator
 import time
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
@@ -26,6 +27,7 @@ from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from .apply_sharding import apply_sharding_to_model
 from .cast_parametrization import apply_dtype_cast, canonicalize_mp, set_dtype_cast
 from .graph_passes.activation_checkpointing import mark_fsdp_all_gather_recomputation
+from .graph_passes.fuse_allgather import fuse_dp_tp_allgather
 from .graph_passes.graph_utils import (
     _add_alias,
     _replace_view_mm_view_with_einsum,
@@ -57,7 +59,46 @@ _APPLY_VIEW_MM_VIEW_PATTERN = True
 logger = logging.getLogger(__name__)
 
 
-def _boxed_nop_preserve_node_meta(fx_g, example_inputs):
+def _boxed_nop_preserve_node_meta(
+    fx_g, example_inputs, pre_pass=None, tag_forward=False, tag_backward=False
+):
+    if pre_pass is not None:
+        pre_pass(fx_g.graph)
+
+    if tag_forward:
+        # Tag all forward call_function nodes so the second compilation
+        # knows they belong to the original forward graph.
+        for node in fx_g.graph.nodes:
+            if node.op == "call_function":
+                node.meta.setdefault("custom", {})
+                node.meta["custom"]["ap_graph_part"] = "forward"
+        # Additionally tag the forward graph's OUTPUT values as "must save".
+        # These are the tensors the first min_cut decided to save for
+        # backward — only these should be saved in the second compilation.
+        output_node = next(n for n in fx_g.graph.nodes if n.op == "output")
+        for out in output_node.args[0]:
+            if not isinstance(out, torch.fx.Node) or out.op != "call_function":
+                continue
+            if out.target == operator.getitem:
+                # getitem nodes don't get their custom field preserved by
+                # preserve_node_meta (operator.getitem is a Python builtin,
+                # not dispatched through TorchDispatchMode). Tag the parent
+                # multi-output op with the specific getitem indices to save.
+                parent = out.args[0]
+                if isinstance(parent, torch.fx.Node):
+                    parent.meta.setdefault("custom", {})
+                    parent.meta["custom"].setdefault("ap_save_getitems", [])
+                    parent.meta["custom"]["ap_save_getitems"].append(out.args[1])
+            else:
+                out.meta.setdefault("custom", {})
+                out.meta["custom"]["ap_must_save"] = True
+
+    if tag_backward:
+        for node in fx_g.graph.nodes:
+            if node.op == "call_function":
+                node.meta.setdefault("custom", {})
+                node.meta["custom"]["ap_graph_part"] = "backward"
+
     def run(args):
         with torch.fx.traceback.preserve_node_meta():
             return torch.fx.Interpreter(fx_g).boxed_run(args)
@@ -473,6 +514,17 @@ class AutoParallel:
             sharded_buffer_dict,
         )
 
+    def _make_fuse_allgather_pass(self):
+        flat_mesh = self.mesh._flatten() if self.mesh.ndim > 1 else self.mesh
+        pg = flat_mesh.get_group()
+        full_group_size = flat_mesh.size()
+        full_group_name = pg.group_name
+
+        def pre_pass(graph):
+            fuse_dp_tp_allgather(graph, full_group_size, full_group_name)
+
+        return pre_pass
+
     def apply_placement(self, sharding_placement):
         sharded_param_dict, sharded_buffer_dict = self._apply_placement_common(
             sharding_placement
@@ -482,10 +534,24 @@ class AutoParallel:
             self.parallel_gm.graph, self.reshard_after_forward
         )
 
+        compiler_fn = self.compiler_fn
+        if self.mesh.ndim > 1:
+            from functools import partial
+
+            compiler_fn = partial(
+                compiler_fn,
+                pre_pass=self._make_fuse_allgather_pass(),
+            )
+        else:
+            from functools import partial
+
+        fw_compiler_fn = partial(compiler_fn, tag_forward=True)
+        bw_compiler_fn = partial(compiler_fn, tag_backward=True)
+
         self.parallel_model_fn = parallel_model_fn = aot_compile_joint_with_descriptors(
             self.joint_with_descriptors,
-            fw_compiler=self.compiler_fn,
-            bw_compiler=self.compiler_fn,
+            fw_compiler=fw_compiler_fn,
+            bw_compiler=bw_compiler_fn,
         )
 
         # Build a forward-only graph for inference (no backward, no

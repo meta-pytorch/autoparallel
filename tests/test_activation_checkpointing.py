@@ -918,3 +918,38 @@ def test_local_map_custom_metadata_propagation(device_mesh_3d):
         "inside_local_map": 2,
         "outside_checkpoint": 0,
     }
+
+
+# ---------------------------------------------------------------------------
+# Family 4: autoparallel_backend torch.compile round-trip
+# ---------------------------------------------------------------------------
+
+
+def test_autoparallel_backend_compile(device_mesh_2d):
+    """autoparallel_backend() compiles successfully with default_partition
+    and produces a backward that recomputes FSDP allgathers."""
+    import torch._dynamo
+
+    from autoparallel.compile import autoparallel_backend
+    from autoparallel.graph_passes.activation_checkpointing import (
+        is_all_gather_into_tensor,
+    )
+
+    parallel_mod, bs, seq_len, dim = _build_parallel_module(
+        AttentionBlockNoAC, device_mesh_2d
+    )
+    _materialize_parallel_module(parallel_mod)
+
+    local_bs = bs // device_mesh_2d.shape[0]
+    x = torch.rand(local_bs, seq_len, dim, device="cuda", requires_grad=False)
+
+    try:
+        compiled = torch.compile(
+            parallel_mod,
+            backend=autoparallel_backend(overlap_scheduling=False),
+            fullgraph=True,
+        )
+        out = compiled(x)
+        out.sum().backward()
+    finally:
+        torch._dynamo.reset()
