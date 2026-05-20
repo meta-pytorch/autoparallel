@@ -931,9 +931,6 @@ def test_autoparallel_backend_compile(device_mesh_2d):
     import torch._dynamo
 
     from autoparallel.compile import autoparallel_backend
-    from autoparallel.graph_passes.activation_checkpointing import (
-        is_all_gather_into_tensor,
-    )
 
     parallel_mod, bs, seq_len, dim = _build_parallel_module(
         AttentionBlockNoAC, device_mesh_2d
