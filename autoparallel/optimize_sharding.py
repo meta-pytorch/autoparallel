@@ -1475,29 +1475,82 @@ class ShardingOptimizer:
             )
 
     def add_grad_reduce_dtype_constraints(self):
-        """Forbid gradient redistribution before the dtype cast.
+        """Forbid redistribution on the wrong side of dtype_cast nodes.
 
-        When MixedPrecisionPolicy specifies a reduce_dtype larger than
-        param_dtype (e.g., param_dtype=bf16, reduce_dtype=f32), the gradient
-        chain looks like:
+        When MixedPrecisionPolicy inserts dtype_cast nodes to convert between
+        storage dtype and compute dtype, we want collectives to run in the
+        smaller dtype. This method enforces two independent constraints:
+
+        **Forward** (unconditional when dtype_cast nodes exist):
+        Forces allgather to happen after the cast (in param_dtype, e.g. bf16)
+        rather than before it (in storage dtype, e.g. f32). Applies whenever
+        the model stores parameters in a higher-precision dtype than
+        param_dtype, regardless of reduce_dtype.
+
+            primals (storage_dtype) -> [unary ops] -> dtype_cast (param_dtype)
+
+        **Backward** (when reduce_dtype > param_dtype):
+        Forces reduce-scatter to happen after the cast (in reduce_dtype, e.g.
+        f32) rather than before it (in param_dtype, e.g. bf16).
 
             einsum (param_dtype) -> [unary ops] -> dtype_cast -> alias (grad_param)
 
-        We want redistribution to happen after the dtype_cast so that the
-        reduce-scatter runs in reduce_dtype. This is enforced by disabling
-        (forcing to zero) any decision variables on pre-cast edges that
-        would imply a placement change, making redistribution before the
-        cast impossible. Redistribution may still happen after the cast
-        (e.g., at the edge from dtype_cast to the grad_param alias), which
-        is correct since that communication occurs in reduce_dtype.
-
-        The multi-input producer (e.g., einsum) is excluded — only edges
-        between unary nodes in the pre-cast chain are affected.
+        Both are enforced by disabling decision variables on pre-cast edges
+        that would imply a placement change.
         """
+        # --- Forward: forbid redistribution before param dtype_cast ---
+        # Only when the cast reduces precision (storage_dtype > param_dtype),
+        # so that allgather runs in the smaller param_dtype. When the cast
+        # increases precision (e.g. bf16 storage → f32 compute), we want the
+        # allgather in the smaller storage dtype, which is already the default.
+        fwd_pre_cast_node_idxs: set[int] = set()
+        for param, _grad in get_param_and_grad_nodes(self.graph).values():
+            # Walk forward from param through single-user unary nodes
+            n = param
+            while True:
+                if n.target == torch.ops.autoparallel.dtype_cast.default:
+                    break
+                users = list(n.users.keys())
+                if len(users) != 1:
+                    break
+                child = users[0]
+                if len(child.all_input_nodes) != 1:
+                    break
+                n = child
+
+            if n.target != torch.ops.autoparallel.dtype_cast.default:
+                continue
+
+            # Only constrain if it downcasts
+            storage_dtype = param.meta["val"].dtype
+            cast_dtype = n.meta["val"].dtype
+            if cast_dtype.itemsize >= storage_dtype.itemsize:
+                continue
+
+            # Mark dtype_cast and all nodes between param and dtype_cast
+            # (exclusive of param itself since placeholders don't have
+            # input edges)
+            node = n
+            while node != param:
+                if node in self.node_map:
+                    fwd_pre_cast_node_idxs.add(self.node_map[node])
+                parent = node.all_input_nodes[0]
+                node = parent
+
+        for key, dv in self.decision_vars.items():
+            node_idx, argi, out_idx, inp_idx = key
+            if node_idx not in fwd_pre_cast_node_idxs:
+                continue
+            if dv.comm_cost > 0:
+                self.prob += (
+                    dv.var == 0,
+                    self._get_next_name("fwd_param_dtype"),
+                )
+
+        # --- Backward: forbid redistribution before grad dtype_cast ---
         if not self.force_grad_reduce_in_higher_precision:
             return
 
-        # Collect pre-cast node indices
         pre_cast_node_idxs: set[int] = set()
         for param, grad in get_param_and_grad_nodes(self.graph).values():
             if grad is None:
