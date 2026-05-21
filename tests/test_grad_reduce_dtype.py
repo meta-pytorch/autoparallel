@@ -208,3 +208,169 @@ def test_grad_reduce_dtype_same_dtype_no_constraint(device_mesh_1d):
     )
     sharding_placement, _ = _run_autop(mesh, model_fn, input_fn, mp_policy)
     assert sharding_placement is not None, "Optimizer should find a feasible solution"
+
+
+# ---- Forward dtype_cast constraint tests ----
+
+
+def _assert_no_fwd_pre_cast_redistribution(
+    sharding_placement, autop, require_linked_validation=False
+):
+    """Assert that no forward dtype_cast has redistribution on its input edge.
+
+    Validates that every forward dtype_cast node matches its producer's
+    placement, so allgather happens on the cast output (smaller dtype)
+    rather than on the raw parameter (larger storage dtype).
+    """
+    from torch._functorch._aot_autograd.fx_utils import get_param_and_grad_nodes
+
+    opt = autop.sharding_optimizer
+    validated_keys = 0
+    validated_linked_keys = 0
+
+    for param, _grad in get_param_and_grad_nodes(opt.graph).values():
+        # Walk forward from param through single-user unary nodes
+        n = param
+        while True:
+            if n.target == torch.ops.autoparallel.dtype_cast.default:
+                break
+            users = list(n.users.keys())
+            if len(users) != 1:
+                break
+            child = users[0]
+            if len(child.all_input_nodes) != 1:
+                break
+            n = child
+
+        if n.target != torch.ops.autoparallel.dtype_cast.default:
+            continue
+
+        # Only check downcasts (storage > param_dtype)
+        storage_dtype = param.meta["val"].dtype
+        cast_dtype = n.meta["val"].dtype
+        if cast_dtype.itemsize >= storage_dtype.itemsize:
+            continue
+
+        # Collect pre-cast node indices
+        fwd_pre_cast_node_idxs = set()
+        node = n
+        while node != param:
+            if node in opt.node_map:
+                fwd_pre_cast_node_idxs.add(opt.node_map[node])
+            node = node.all_input_nodes[0]
+
+        for key in opt.selected_keys:
+            node_idx, argi, out_idx, inp_idx = key
+            if node_idx not in fwd_pre_cast_node_idxs:
+                continue
+            dv = opt._resolve_decision_var(key)
+            validated_keys += 1
+            if key in opt.cluster_links:
+                validated_linked_keys += 1
+            assert dv.comm_cost == 0, (
+                f"Forward pre-cast node {opt.nodes[node_idx].name} has chosen "
+                f"decision var with comm_cost={dv.comm_cost} > 0. "
+                f"Redistribution should not happen before the dtype_cast."
+            )
+
+    assert validated_keys > 0, "Expected to validate at least one forward pre-cast key"
+    if require_linked_validation:
+        assert (
+            validated_linked_keys > 0
+        ), "Expected to validate at least one cluster-linked forward pre-cast key"
+
+
+@apply_cuda_patches
+def test_fwd_allgather_in_param_dtype(device_mesh_1d):
+    """With param_dtype=bf16 and f32 storage, forward allgather should happen
+    after the dtype_cast (in bf16), not before it (in f32)."""
+    dim = 1024
+    mesh = device_mesh_1d
+
+    def model_fn():
+        return SimpleLinear(dim)
+
+    def input_fn():
+        return torch.randn(2048 * mesh.shape[0], dim, device="cuda")
+
+    mp_policy = MixedPrecisionPolicy(
+        param_dtype=torch.bfloat16, reduce_dtype=torch.float32
+    )
+    sharding_placement, autop = _run_autop(mesh, model_fn, input_fn, mp_policy)
+    _assert_no_fwd_pre_cast_redistribution(sharding_placement, autop)
+
+
+@apply_cuda_patches
+def test_fwd_allgather_in_param_dtype_reduce_bf16(device_mesh_1d):
+    """With param_dtype=bf16, reduce_dtype=bf16, and f32 storage, the forward
+    constraint should still fire (it depends on storage > param_dtype, not on
+    reduce_dtype)."""
+    dim = 1024
+    mesh = device_mesh_1d
+
+    def model_fn():
+        return SimpleLinear(dim)
+
+    def input_fn():
+        return torch.randn(2048 * mesh.shape[0], dim, device="cuda")
+
+    mp_policy = MixedPrecisionPolicy(
+        param_dtype=torch.bfloat16, reduce_dtype=torch.bfloat16
+    )
+    sharding_placement, autop = _run_autop(mesh, model_fn, input_fn, mp_policy)
+    _assert_no_fwd_pre_cast_redistribution(sharding_placement, autop)
+
+
+@apply_cuda_patches
+def test_fwd_allgather_with_repeated_subgraphs(device_mesh_1d):
+    """Forward constraint with repeated_subgraphs=True (cluster-linked nodes)."""
+    dim = 1024
+    mesh = device_mesh_1d
+
+    def model_fn():
+        return StackedLinear(dim, n_layers=4)
+
+    def input_fn():
+        return torch.randn(2048 * mesh.shape[0], dim, device="cuda")
+
+    mp_policy = MixedPrecisionPolicy(
+        param_dtype=torch.bfloat16, reduce_dtype=torch.float32
+    )
+    sharding_placement, autop = _run_autop(
+        mesh, model_fn, input_fn, mp_policy, repeated_subgraphs=True
+    )
+    _assert_no_fwd_pre_cast_redistribution(
+        sharding_placement, autop, require_linked_validation=True
+    )
+
+
+@apply_cuda_patches
+def test_fwd_no_constraint_when_upcasting(device_mesh_1d):
+    """With param_dtype=f32 and bf16 storage (upcast), the forward constraint
+    should NOT fire since the storage dtype is already smaller."""
+    dim = 1024
+    mesh = device_mesh_1d
+
+    def model_fn():
+        m = SimpleLinear(dim)
+        # Force bf16 storage so dtype_cast goes bf16 -> f32
+        m.linear.weight = nn.Parameter(m.linear.weight.to(torch.bfloat16))
+        return m
+
+    def input_fn():
+        return torch.randn(2048 * mesh.shape[0], dim, device="cuda")
+
+    mp_policy = MixedPrecisionPolicy(
+        param_dtype=torch.float32, reduce_dtype=torch.bfloat16
+    )
+    sharding_placement, autop = _run_autop(mesh, model_fn, input_fn, mp_policy)
+
+    # Verify no fwd_param_dtype constraints were added to the ILP
+    opt = autop.sharding_optimizer
+    fwd_constraint_names = [
+        name for name in opt.prob.constraints if name.startswith("fwd_param_dtype")
+    ]
+    assert len(fwd_constraint_names) == 0, (
+        f"Forward dtype constraint should not fire for upcasting, "
+        f"but found {len(fwd_constraint_names)} constraints: {fwd_constraint_names}"
+    )
