@@ -27,7 +27,7 @@ from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from .apply_sharding import apply_sharding_to_model
 from .cast_parametrization import apply_dtype_cast, canonicalize_mp, set_dtype_cast
 from .graph_passes.activation_checkpointing import mark_fsdp_all_gather_recomputation
-from .graph_passes.fuse_allgather import fuse_dp_tp_allgather
+from .graph_passes.fuse_allgather import fuse_chained_allgathers
 from .graph_passes.graph_utils import (
     _add_alias,
     _replace_view_mm_view_with_einsum,
@@ -510,8 +510,18 @@ class AutoParallel:
         full_group_size = flat_mesh.size()
         full_group_name = pg.group_name
 
+        subgroup_order = {
+            self.mesh.get_group(mesh_dim=dim).group_name: dim
+            for dim in range(self.mesh.ndim)
+        }
+
         def pre_pass(graph):
-            fuse_dp_tp_allgather(graph, full_group_size, full_group_name)
+            fuse_chained_allgathers(
+                graph,
+                full_group_size,
+                full_group_name,
+                subgroup_order=subgroup_order,
+            )
 
         return pre_pass
 
@@ -555,6 +565,13 @@ class AutoParallel:
             self.parallel_gm, num_fwd_outputs, num_primals
         )
         compiler_fn = self.compiler_fn
+        if self.mesh.ndim > 1:
+            from functools import partial
+
+            compiler_fn = partial(
+                compiler_fn,
+                pre_pass=self._make_fuse_allgather_pass(),
+            )
         aot_config = self.joint_with_descriptors._aot_state.aot_config
         out_spec = self.joint_with_descriptors.out_spec
 
