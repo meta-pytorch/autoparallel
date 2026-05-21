@@ -202,7 +202,7 @@ def fuse_chained_allgathers(
         if subgroup_order is not None:
             if ag1_group not in subgroup_order or ag2_group not in subgroup_order:
                 continue
-            if subgroup_order[ag1_group] <= subgroup_order[ag2_group]:
+            if subgroup_order[ag1_group] >= subgroup_order[ag2_group]:
                 continue
 
         # Validate matching dtype.
