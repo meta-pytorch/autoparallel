@@ -1,4 +1,4 @@
-exclude: 'build|stubs|autoparallel/tools/overlap_simulator|autoparallel/visualizer/build_display_from_json\.py'
+exclude: 'build|stubs|autoparallel/tools/overlap_simulator/repro_.*\.py|autoparallel/visualizer/build_display_from_json\.py'
 
 default_language_version:
     python: python3
