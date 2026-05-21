@@ -469,9 +469,7 @@ class ExperimentRunner:
                 )
                 # gather runtime estimations as bucketing adds another collectives and ops
                 node_estimations_after: Dict[fx.Node, float]
-                (
-                    fusion_region_of,
-                ) = gather_node_runtime_estimations(gm_after)  # type: ignore[assignment]
+                node_estimations_after, fusion_region_of = gather_node_runtime_estimations(gm_after)  # type: ignore[assignment]
                 estimator = self._create_estimator(
                     node_estimations_after, colls_file_path
                 )
