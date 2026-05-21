@@ -250,13 +250,18 @@ def force_recompute_fsdp_all_gather(graph: torch.fx.Graph) -> None:
             ag_node = node.args[0]
             force_recompute_node(ag_node)  # all_gather
             force_recompute_node(node)  # wait_tensor
-            # Force-recompute slice that comes after wait
-            for user in node.users:
-                if (
-                    user.op == "call_function"
-                    and user.target == torch.ops.aten.slice.Tensor
-                ):
-                    force_recompute_node(user)
+            # Force-recompute the downstream single-input chain from
+            # wait_tensor (permute, slice, reshape, etc.). Without this,
+            # the partitioner saves the first untagged downstream node,
+            # which holds the same allgathered data and defeats the
+            # MUST_RECOMPUTE on the allgather itself.
+            w = node
+            while len(w.users) == 1:
+                user = next(iter(w.users))
+                if len(user.all_input_nodes) > 1:
+                    break
+                force_recompute_node(user)
+                w = user
             # Force-recompute potential dtype casts from all_gather
             if (
                 ag_node.all_input_nodes[0].op == "call_function"
