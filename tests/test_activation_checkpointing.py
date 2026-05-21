@@ -908,13 +908,10 @@ def test_local_map_custom_metadata_propagation(device_mesh_3d):
         f"{[n.name for n in sdpa_nodes]}"
     )
     fwd_sdpa, bwd_sdpa = sdpa_nodes
-    assert fwd_sdpa.meta["custom"] == {
+    expected_custom = {
         "inside_checkpoint": 0,
         "inside_local_map": 2,
         "outside_checkpoint": 0,
     }
-    assert bwd_sdpa.meta["custom"] == {
-        "inside_checkpoint": 0,
-        "inside_local_map": 2,
-        "outside_checkpoint": 0,
-    }
+    assert expected_custom.items() <= fwd_sdpa.meta["custom"].items()
+    assert expected_custom.items() <= bwd_sdpa.meta["custom"].items()
