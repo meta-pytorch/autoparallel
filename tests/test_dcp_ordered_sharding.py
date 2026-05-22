@@ -126,6 +126,48 @@ class TestChunkOffsetsForDCP:
                 expected_offset,
             ), f"rank {rank} coord {coord}: {offset} != ({expected_offset},)"
 
+    def test_uneven_shapes_local_sizes_differ(self):
+        """With uneven tensor sizes, default and reversed orders produce
+        different local shapes for some ranks — the bug that _make_local_args
+        would hit if it used default placements for reversed-order params."""
+        mesh_shape = (2, 4)
+        global_shape = (17,)  # 17 doesn't divide evenly by 2 or 4
+
+        default_placements = (Shard(0), Shard(0))
+        reversed_placements = (_StridedShard(0, split_factor=4), Shard(0))
+
+        shape_mismatches = 0
+        for rank in range(8):
+            coord = list(_mesh_coords(rank, mesh_shape))
+            default_shape, _ = _compute_local_shape_and_global_offset(
+                global_shape, mesh_shape, coord, default_placements
+            )
+            reversed_shape, _ = _compute_local_shape_and_global_offset(
+                global_shape, mesh_shape, coord, reversed_placements
+            )
+            if default_shape != reversed_shape:
+                shape_mismatches += 1
+
+        assert shape_mismatches > 0, (
+            "Uneven tensor size should produce different local shapes "
+            "for default vs reversed shard order"
+        )
+
+    def test_uneven_shapes_all_ranks_cover_full_tensor(self):
+        """With uneven sizes, _StridedShard shards still cover the full tensor."""
+        mesh_shape = (2, 4)
+        reversed_placements = (_StridedShard(0, split_factor=4), Shard(0))
+
+        global_tensor = torch.arange(17, dtype=torch.float)
+        shards = _shard_tensor(global_tensor, mesh_shape, reversed_placements)
+
+        all_values = set()
+        for rank in range(8):
+            for val in shards[rank].tolist():
+                all_values.add(int(val))
+
+        assert all_values == set(range(17))
+
     def test_reversed_order_offsets_differ(self):
         """_StridedShard offsets differ from regular Shard offsets."""
         mesh_shape = (2, 4)

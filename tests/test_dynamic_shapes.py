@@ -588,7 +588,7 @@ class TestShapeEnvSwap:
                 },
             )(),
         ):
-            (local_arg,) = _make_local_args(gm, sharding_placement)
+            (local_arg,) = _make_local_args(gm, sharding_placement, {})
 
         assert local_arg.requires_grad
 
@@ -838,7 +838,7 @@ class TestHasRankVaryingSize:
                     },
                 )(),
             ):
-                (local_param,) = _make_local_args(gm, sharding_placement)
+                (local_param,) = _make_local_args(gm, sharding_placement, {})
 
         # dim 0 is unevenly sharded (400 % 7 != 0) so it should be symbolic
         assert any(isinstance(s, torch.SymInt) for s in local_param.shape), (

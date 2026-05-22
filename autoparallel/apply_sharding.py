@@ -355,7 +355,7 @@ def _has_rank_varying_size(dim_idx, global_shape, spec):
     return False
 
 
-def _make_local_args(gm, sharding_placement):
+def _make_local_args(gm, sharding_placement, param_placement_order):
     """Create local tensors for each placeholder via DTensor redistribute.
 
     Uses DTensor's redistribute to compute correct local shapes and strides.
@@ -395,9 +395,23 @@ def _make_local_args(gm, sharding_placement):
                     device=tensor.device,
                 )
 
+        # For reversed-order params, use _StridedShard placements so the
+        # local shape matches the actual runtime parameter shard layout.
+        redistribute_placements = tgt_spec.placements
+        if (
+            node in param_placement_order
+            and param_placement_order[node].is_target_reversed_order
+        ):
+            reversed_shard_order = _compute_shard_order(
+                tgt_spec.shard_order, reverse=True
+            )
+            redistribute_placements = DTensorSpec._convert_shard_order_to_StridedShard(
+                reversed_shard_order, tgt_spec.placements, mesh
+            )
+
         sharded = DTensor.from_local(
             concrete_tensor, mesh, curr_placement
-        ).redistribute(mesh, tgt_spec.placements)
+        ).redistribute(mesh, redistribute_placements)
         local = sharded.to_local()
 
         # For dynamic shapes, re-create with fresh SymInts.
@@ -561,7 +575,7 @@ def apply_sharding_to_model(gm, sharding_placement, params_spec, buffers_spec):
         gm, sharding_placement
     )
 
-    local_args = _make_local_args(gm, sharding_placement)
+    local_args = _make_local_args(gm, sharding_placement, param_placement_order)
     t1 = time.perf_counter()
 
     with use_min_cost_redistribution_plan():
