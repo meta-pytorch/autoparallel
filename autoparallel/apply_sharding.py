@@ -290,9 +290,7 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
         return out
 
 
-def shard_node_given_placements(node, sharding_placement):
-    tgt_spec = sharding_placement[node].input_specs[0]
-    mesh = tgt_spec.mesh
+def shard_node_given_placements(node, mesh, placements):
     curr_placement = (Replicate(),) * mesh.ndim
     tensor = node.meta["val"]
 
@@ -302,7 +300,7 @@ def shard_node_given_placements(node, sharding_placement):
     with unset_fake_temporarily():
         tensor = torch.empty(tensor.shape, dtype=tensor.dtype, device="meta")
         sharded_tensor = DTensor.from_local(tensor, mesh, curr_placement).redistribute(
-            mesh, tgt_spec.placements
+            mesh, placements
         )
 
     return sharded_tensor
@@ -506,37 +504,29 @@ def _shard_params_and_buffers(
     for fqn in params_spec:
         n = fqn_to_param[fqn]
         tgt_spec = sharding_placement[n].input_specs[0]
-        mesh = tgt_spec.mesh
-        needs_reversed = (
+        placements = tgt_spec.placements
+        if (
             n in param_placement_order
             and param_placement_order[n].is_target_reversed_order
-        )
+        ):
+            reversed_shard_order = _compute_shard_order(
+                tgt_spec.shard_order, reverse=True
+            )
+            placements = DTensorSpec._convert_shard_order_to_StridedShard(
+                reversed_shard_order, tgt_spec.placements, tgt_spec.mesh
+            )
         with unset_fake_temporarily():
-            if needs_reversed:
-                reversed_shard_order = _compute_shard_order(
-                    tgt_spec.shard_order, reverse=True
-                )
-                strided_placements = DTensorSpec._convert_shard_order_to_StridedShard(
-                    reversed_shard_order, tgt_spec.placements, mesh
-                )
-                tensor = torch.empty(
-                    n.meta["val"].shape, dtype=n.meta["val"].dtype, device="meta"
-                )
-                curr_placement = (Replicate(),) * mesh.ndim
-                sharded_param_dict[fqn] = nn.Parameter(
-                    DTensor.from_local(tensor, mesh, curr_placement).redistribute(
-                        mesh, strided_placements
-                    )
-                )
-            else:
-                sharded_param_dict[fqn] = nn.Parameter(
-                    shard_node_given_placements(n, sharding_placement)
-                )
+            sharded_param_dict[fqn] = nn.Parameter(
+                shard_node_given_placements(n, tgt_spec.mesh, placements)
+            )
 
     sharded_buffer_dict = {}
     for fqn in buffers_spec:
         n = fqn_to_buffer[fqn]
-        sharded_buffer_dict[fqn] = shard_node_given_placements(n, sharding_placement)
+        tgt_spec = sharding_placement[n].input_specs[0]
+        sharded_buffer_dict[fqn] = shard_node_given_placements(
+            n, tgt_spec.mesh, tgt_spec.placements
+        )
 
     return sharded_param_dict, sharded_buffer_dict
 
