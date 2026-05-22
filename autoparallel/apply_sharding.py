@@ -290,27 +290,37 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
         return out
 
 
-def _get_effective_placements(node, sharding_placement, param_placement_order):
-    """Return the (mesh, placements) to use when sharding a node.
+def _build_physical_placements(sharding_placement, param_placement_order):
+    """Build a dict mapping each node to its physical DTensorSpec.
 
-    For reversed-order params, converts to _StridedShard placements so the
-    physical layout matches the intended shard order. For everything else,
-    returns the solver-assigned placements unchanged.
+    For reversed-order nodes in param_placement_order, converts to
+    _StridedShard placements so the physical layout matches the intended
+    shard order. For everything else, returns the solver-assigned spec.
     """
-    tgt_spec = sharding_placement[node].input_specs[0]
-    placements = tgt_spec.placements
-    if (
-        node in param_placement_order
-        and param_placement_order[node].is_target_reversed_order
-    ):
-        reversed_shard_order = _compute_shard_order(tgt_spec.shard_order, reverse=True)
-        placements = DTensorSpec._convert_shard_order_to_StridedShard(
-            reversed_shard_order, tgt_spec.placements, tgt_spec.mesh
-        )
-    return tgt_spec.mesh, placements
+    physical = {}
+    for node, op_spec in sharding_placement.items():
+        if op_spec.input_specs is None:
+            continue
+        tgt_spec = op_spec.input_specs[0]
+        if (
+            node in param_placement_order
+            and param_placement_order[node].is_target_reversed_order
+        ):
+            reversed_shard_order = _compute_shard_order(
+                tgt_spec.shard_order, reverse=True
+            )
+            placements = DTensorSpec._convert_shard_order_to_StridedShard(
+                reversed_shard_order, tgt_spec.placements, tgt_spec.mesh
+            )
+            tgt_spec = DTensorSpec(
+                tgt_spec.mesh, placements, tensor_meta=tgt_spec.tensor_meta
+            )
+        physical[node] = tgt_spec
+    return physical
 
 
-def shard_node_given_placements(node, mesh, placements):
+def shard_node_given_placements(node, spec):
+    mesh = spec.mesh
     curr_placement = (Replicate(),) * mesh.ndim
     tensor = node.meta["val"]
 
@@ -320,7 +330,7 @@ def shard_node_given_placements(node, mesh, placements):
     with unset_fake_temporarily():
         tensor = torch.empty(tensor.shape, dtype=tensor.dtype, device="meta")
         sharded_tensor = DTensor.from_local(tensor, mesh, curr_placement).redistribute(
-            mesh, placements
+            mesh, spec.placements
         )
 
     return sharded_tensor
@@ -373,7 +383,7 @@ def _has_rank_varying_size(dim_idx, global_shape, spec):
     return False
 
 
-def _make_local_args(gm, sharding_placement, param_placement_order):
+def _make_local_args(gm, physical_placements):
     """Create local tensors for each placeholder via DTensor redistribute.
 
     Uses DTensor's redistribute to compute correct local shapes and strides.
@@ -395,9 +405,8 @@ def _make_local_args(gm, sharding_placement, param_placement_order):
             local_args.append(val)
             continue
         tensor = val
-        mesh, redistribute_placements = _get_effective_placements(
-            node, sharding_placement, param_placement_order
-        )
+        spec = physical_placements[node]
+        mesh = spec.mesh
         curr_placement = (Replicate(),) * mesh.ndim
 
         # Use DTensor to compute the correct local shape and strides.
@@ -416,7 +425,7 @@ def _make_local_args(gm, sharding_placement, param_placement_order):
 
         sharded = DTensor.from_local(
             concrete_tensor, mesh, curr_placement
-        ).redistribute(mesh, redistribute_placements)
+        ).redistribute(mesh, spec.placements)
         local = sharded.to_local()
 
         # For dynamic shapes, re-create with fresh SymInts.
@@ -428,9 +437,7 @@ def _make_local_args(gm, sharding_placement, param_placement_order):
             dynamic_sizes = [
                 DimDynamic.DYNAMIC
                 if (isinstance(s, torch.SymInt) and not s.node.expr.is_number)
-                or _has_rank_varying_size(
-                    i, tensor.shape, DTensorSpec(mesh, redistribute_placements)
-                )
+                or _has_rank_varying_size(i, tensor.shape, spec)
                 else DimDynamic.STATIC
                 for i, s in enumerate(tensor.shape)
             ]
@@ -500,9 +507,7 @@ def _copy_descriptors_and_rename_placeholders(source_gm, target_gm):
     target_gm.recompile()
 
 
-def _shard_params_and_buffers(
-    gm, sharding_placement, params_spec, buffers_spec, param_placement_order
-):
+def _shard_params_and_buffers(gm, physical_placements, params_spec, buffers_spec):
     """Shard parameters and buffers according to the sharding placement."""
     # NB: ok to NOT use the parallel_gm here because we will just reapply the
     # correct sharding placement via sharding_placement
@@ -512,21 +517,17 @@ def _shard_params_and_buffers(
     sharded_param_dict = {}
     for fqn in params_spec:
         n = fqn_to_param[fqn]
-        mesh, placements = _get_effective_placements(
-            n, sharding_placement, param_placement_order
-        )
         with unset_fake_temporarily():
             sharded_param_dict[fqn] = nn.Parameter(
-                shard_node_given_placements(n, mesh, placements)
+                shard_node_given_placements(n, physical_placements[n])
             )
 
     sharded_buffer_dict = {}
     for fqn in buffers_spec:
         n = fqn_to_buffer[fqn]
-        mesh, placements = _get_effective_placements(
-            n, sharding_placement, param_placement_order
+        sharded_buffer_dict[fqn] = shard_node_given_placements(
+            n, physical_placements[n]
         )
-        sharded_buffer_dict[fqn] = shard_node_given_placements(n, mesh, placements)
 
     return sharded_param_dict, sharded_buffer_dict
 
@@ -564,8 +565,11 @@ def apply_sharding_to_model(gm, sharding_placement, params_spec, buffers_spec):
     param_placement_order = compute_optimal_placement_order_for_parameters(
         gm, sharding_placement
     )
+    physical_placements = _build_physical_placements(
+        sharding_placement, param_placement_order
+    )
 
-    local_args = _make_local_args(gm, sharding_placement, param_placement_order)
+    local_args = _make_local_args(gm, physical_placements)
     t1 = time.perf_counter()
 
     with use_min_cost_redistribution_plan():
@@ -582,7 +586,7 @@ def apply_sharding_to_model(gm, sharding_placement, params_spec, buffers_spec):
     t3 = time.perf_counter()
 
     sharded_param_dict, sharded_buffer_dict = _shard_params_and_buffers(
-        gm, sharding_placement, params_spec, buffers_spec, param_placement_order
+        gm, physical_placements, params_spec, buffers_spec
     )
     t4 = time.perf_counter()
 

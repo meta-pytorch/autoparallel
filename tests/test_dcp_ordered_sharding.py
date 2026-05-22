@@ -437,6 +437,7 @@ def _build_linear_graph_and_placements(device_mesh_2d):
     from torch._functorch.aot_autograd import aot_export_joint_with_descriptors
     from torch.distributed.tensor._op_schema import OpSpec
 
+    from autoparallel.apply_sharding import _build_physical_placements
     from autoparallel.shardings.ordered_sharding import (
         build_param_grad_linear_chains,
         compute_optimal_placement_order_for_parameters,
@@ -478,8 +479,11 @@ def _build_linear_graph_and_placements(device_mesh_2d):
     param_placement_order = compute_optimal_placement_order_for_parameters(
         gm, sharding_placement
     )
+    physical_placements = _build_physical_placements(
+        sharding_placement, param_placement_order
+    )
 
-    return gm, sharding_placement, param_placement_order, param
+    return gm, sharding_placement, physical_placements, param_placement_order, param
 
 
 class TestShardParamsWithOrderedSharding:
@@ -494,7 +498,8 @@ class TestShardParamsWithOrderedSharding:
 
         (
             gm,
-            sharding_placement,
+            _,
+            physical_placements,
             param_placement_order,
             param_node,
         ) = _build_linear_graph_and_placements(device_mesh_2d)
@@ -507,7 +512,7 @@ class TestShardParamsWithOrderedSharding:
         params_spec = {fqn: None for fqn in fqn_to_param}
 
         sharded_params, _ = _shard_params_and_buffers(
-            gm, sharding_placement, params_spec, {}, param_placement_order
+            gm, physical_placements, params_spec, {}
         )
 
         # The single parameter should have _StridedShard placements.
@@ -523,18 +528,21 @@ class TestShardParamsWithOrderedSharding:
         """When param_placement_order is empty, params get regular Shard placements."""
         from torch._functorch._aot_autograd.fx_utils import get_named_param_nodes
 
-        from autoparallel.apply_sharding import _shard_params_and_buffers
+        from autoparallel.apply_sharding import (
+            _build_physical_placements,
+            _shard_params_and_buffers,
+        )
 
-        gm, sharding_placement, _, _ = _build_linear_graph_and_placements(
+        gm, sharding_placement, _, _, _ = _build_linear_graph_and_placements(
             device_mesh_2d
         )
+        default_physical = _build_physical_placements(sharding_placement, {})
 
         fqn_to_param = get_named_param_nodes(gm.graph)
         params_spec = {fqn: None for fqn in fqn_to_param}
-        empty_order = {}
 
         sharded_params, _ = _shard_params_and_buffers(
-            gm, sharding_placement, params_spec, {}, empty_order
+            gm, default_physical, params_spec, {}
         )
 
         param = next(iter(sharded_params.values()))
@@ -549,12 +557,16 @@ class TestShardParamsWithOrderedSharding:
         is genuinely different."""
         from torch._functorch._aot_autograd.fx_utils import get_named_param_nodes
 
-        from autoparallel.apply_sharding import _shard_params_and_buffers
+        from autoparallel.apply_sharding import (
+            _build_physical_placements,
+            _shard_params_and_buffers,
+        )
 
         (
             gm,
             sharding_placement,
-            param_placement_order,
+            physical_placements,
+            _,
             _,
         ) = _build_linear_graph_and_placements(device_mesh_2d)
 
@@ -563,11 +575,12 @@ class TestShardParamsWithOrderedSharding:
 
         # Shard with reversed order.
         reversed_params, _ = _shard_params_and_buffers(
-            gm, sharding_placement, params_spec, {}, param_placement_order
+            gm, physical_placements, params_spec, {}
         )
         # Shard with default order.
+        default_physical = _build_physical_placements(sharding_placement, {})
         default_params, _ = _shard_params_and_buffers(
-            gm, sharding_placement, params_spec, {}, {}
+            gm, default_physical, params_spec, {}
         )
 
         reversed_param = next(iter(reversed_params.values()))

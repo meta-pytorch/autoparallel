@@ -575,7 +575,7 @@ class TestShapeEnvSwap:
             placements=(Replicate(),),
             tensor_meta=TensorMeta(torch.Size([16, 128]), (128, 1), torch.float32),
         )
-        sharding_placement = {x: type("Placement", (), {"input_specs": (spec,)})()}
+        sharding_placement = {x: spec}
 
         with patch(
             "autoparallel.apply_sharding.DTensor.from_local",
@@ -588,7 +588,7 @@ class TestShapeEnvSwap:
                 },
             )(),
         ):
-            (local_arg,) = _make_local_args(gm, sharding_placement, {})
+            (local_arg,) = _make_local_args(gm, sharding_placement)
 
         assert local_arg.requires_grad
 
@@ -816,9 +816,7 @@ class TestHasRankVaryingSize:
             placements=(Replicate(), Shard(0)),
             tensor_meta=TensorMeta(torch.Size([400, 100]), (100, 1), torch.float32),
         )
-        sharding_placement = {
-            p: type("P", (), {"input_specs": (spec,)})(),
-        }
+        sharding_placement = {p: spec}
 
         # Swap ShapeEnv (as apply_sharding_to_model does)
         fake_mode.shape_env = ShapeEnv()
@@ -838,7 +836,7 @@ class TestHasRankVaryingSize:
                     },
                 )(),
             ):
-                (local_param,) = _make_local_args(gm, sharding_placement, {})
+                (local_param,) = _make_local_args(gm, sharding_placement)
 
         # dim 0 is unevenly sharded (400 % 7 != 0) so it should be symbolic
         assert any(isinstance(s, torch.SymInt) for s in local_param.shape), (
