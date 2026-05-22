@@ -14,7 +14,11 @@ Uses a fake process group (single-process) and meta-device tensors so
 the tests can run without multiple GPUs.
 """
 
+import math
+
 import torch
+from torch.distributed._local_tensor import LocalTensor, LocalTensorMode
+from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor._dtensor_spec import DTensorSpec
 from torch.distributed.tensor._utils import _compute_local_shape_and_global_offset
@@ -32,58 +36,28 @@ from autoparallel.apply_sharding import _compute_shard_order
 # ---------------------------------------------------------------------------
 
 
-def _rank_coord(rank, mesh_shape, mesh_dim):
-    stride = 1
-    for d in range(len(mesh_shape) - 1, mesh_dim, -1):
-        stride *= mesh_shape[d]
-    return (rank // stride) % mesh_shape[mesh_dim]
+def _mesh_coords(rank, mesh_shape):
+    """Compute a rank's coordinates in a mesh, using DeviceMesh's own logic."""
+    mesh_tensor = torch.arange(math.prod(mesh_shape)).view(mesh_shape)
+    return DeviceMesh._compute_coordinates_from_mesh(mesh_tensor, rank)
 
 
-def _shard_tensor_default_order(global_tensor, mesh_shape, placements):
-    """Shard a tensor using default (left-to-right) mesh dim order.
+def _shard_tensor(global_tensor, mesh, placements):
+    """Shard a tensor into per-rank local shards via DTensor redistribute.
 
-    Returns dict[rank -> local_tensor].
+    Uses LocalTensorMode to simulate multi-rank execution on a single process.
+    Returns dict[rank -> Tensor].
     """
-    world_size = 1
-    for s in mesh_shape:
-        world_size *= s
-
-    shards = {}
-    for rank in range(world_size):
-        shard = global_tensor
-        for mesh_dim, placement in enumerate(placements):
-            if isinstance(placement, Shard):
-                n_chunks = mesh_shape[mesh_dim]
-                coord = _rank_coord(rank, mesh_shape, mesh_dim)
-                chunk_size = shard.size(placement.dim) // n_chunks
-                shard = shard.narrow(placement.dim, coord * chunk_size, chunk_size)
-        shards[rank] = shard.contiguous().clone()
-    return shards
-
-
-def _shard_tensor_reversed_order(global_tensor, mesh_shape, shard_dim):
-    """Shard a tensor along shard_dim using reversed mesh dim order (dim 1 first, then dim 0).
-
-    This is the physical layout that _StridedShard produces for S(d)S(d) with
-    reversed shard order on a 2D mesh.
-
-    Returns dict[rank -> local_tensor].
-    """
-    assert len(mesh_shape) == 2
-    world_size = mesh_shape[0] * mesh_shape[1]
-
-    shards = {}
-    for rank in range(world_size):
-        coord0 = _rank_coord(rank, mesh_shape, 0)
-        coord1 = _rank_coord(rank, mesh_shape, 1)
-        # Reversed order: shard by mesh_dim_1 first, then mesh_dim_0.
-        total_size = global_tensor.size(shard_dim)
-        chunk1 = total_size // mesh_shape[1]
-        shard = global_tensor.narrow(shard_dim, coord1 * chunk1, chunk1)
-        chunk0 = chunk1 // mesh_shape[0]
-        shard = shard.narrow(shard_dim, coord0 * chunk0, chunk0)
-        shards[rank] = shard.contiguous().clone()
-    return shards
+    if isinstance(mesh, tuple):
+        mesh_shape = mesh
+        mesh = DeviceMesh("cuda", torch.arange(math.prod(mesh_shape)).view(mesh_shape))
+    world_size = mesh.mesh.numel()
+    ranks = frozenset(range(world_size))
+    replicated = LocalTensor({r: global_tensor.clone() for r in range(world_size)})
+    with LocalTensorMode(ranks):
+        dt = DTensor.from_local(replicated, mesh, (Replicate(),) * mesh.ndim)
+        dt = dt.redistribute(mesh, placements)
+    return dt._local_tensor._local_tensors
 
 
 # ---------------------------------------------------------------------------
@@ -141,7 +115,7 @@ class TestChunkOffsetsForDCP:
         placements = (Shard(0), Shard(0))
 
         for rank in range(8):
-            coord = [_rank_coord(rank, mesh_shape, d) for d in range(2)]
+            coord = list(_mesh_coords(rank, mesh_shape))
             local_shape, offset = _compute_local_shape_and_global_offset(
                 global_shape, mesh_shape, coord, placements
             )
@@ -164,7 +138,7 @@ class TestChunkOffsetsForDCP:
         default_offsets = {}
         reversed_offsets = {}
         for rank in range(8):
-            coord = [_rank_coord(rank, mesh_shape, d) for d in range(2)]
+            coord = list(_mesh_coords(rank, mesh_shape))
             _, d_off = _compute_local_shape_and_global_offset(
                 global_shape, mesh_shape, coord, default_placements
             )
@@ -181,16 +155,13 @@ class TestChunkOffsetsForDCP:
         """_StridedShard offsets match the actual data positions from reversed sharding."""
         mesh_shape = (2, 4)
         global_shape = (64,)
+        reversed_placements = (_StridedShard(0, split_factor=4), Shard(0))
 
         # Create a tensor with known values and shard it in reversed order.
         global_tensor = torch.arange(64, dtype=torch.float)
-        reversed_shards = _shard_tensor_reversed_order(
-            global_tensor, mesh_shape, shard_dim=0
-        )
-
-        reversed_placements = (_StridedShard(0, split_factor=4), Shard(0))
+        reversed_shards = _shard_tensor(global_tensor, mesh_shape, reversed_placements)
         for rank in range(8):
-            coord = [_rank_coord(rank, mesh_shape, d) for d in range(2)]
+            coord = list(_mesh_coords(rank, mesh_shape))
             _, offset = _compute_local_shape_and_global_offset(
                 global_shape, mesh_shape, coord, reversed_placements
             )
@@ -208,16 +179,14 @@ class TestChunkOffsetsForDCP:
 
         all_indices = set()
         for rank in range(8):
-            coord = [_rank_coord(rank, mesh_shape, d) for d in range(2)]
+            coord = list(_mesh_coords(rank, mesh_shape))
             local_shape, offset = _compute_local_shape_and_global_offset(
                 global_shape, mesh_shape, coord, reversed_placements
             )
             # For _StridedShard, indices may be non-contiguous, but local_shape
             # gives the number of elements this rank holds.
             global_tensor = torch.arange(64, dtype=torch.float)
-            local = _shard_tensor_reversed_order(
-                global_tensor, mesh_shape, shard_dim=0
-            )[rank]
+            local = _shard_tensor(global_tensor, mesh_shape, reversed_placements)[rank]
             for val in local.tolist():
                 all_indices.add(int(val))
 
@@ -298,7 +267,7 @@ class TestDCPRoundTrip:
         strided_placements = (_StridedShard(0, split_factor=4), Shard(0))
 
         for rank in range(8):
-            coord = [_rank_coord(rank, mesh_shape, d) for d in range(2)]
+            coord = list(_mesh_coords(rank, mesh_shape))
             save_shape, save_offset = _compute_local_shape_and_global_offset(
                 global_shape, mesh_shape, coord, strided_placements
             )
@@ -318,7 +287,7 @@ class TestDCPRoundTrip:
 
         mismatch_count = 0
         for rank in range(8):
-            coord = [_rank_coord(rank, mesh_shape, d) for d in range(2)]
+            coord = list(_mesh_coords(rank, mesh_shape))
             _, s_off = _compute_local_shape_and_global_offset(
                 global_shape, mesh_shape, coord, strided_placements
             )
@@ -340,14 +309,12 @@ class TestDCPRoundTrip:
         strided_placements = (_StridedShard(0, split_factor=4), Shard(0))
 
         global_tensor = torch.arange(64, dtype=torch.float)
-        reversed_shards = _shard_tensor_reversed_order(
-            global_tensor, mesh_shape, shard_dim=0
-        )
+        reversed_shards = _shard_tensor(global_tensor, mesh_shape, strided_placements)
 
         # "Save" side: each rank contributes its local shard with offset metadata.
         saved_chunks = {}
         for rank in range(8):
-            coord = [_rank_coord(rank, mesh_shape, d) for d in range(2)]
+            coord = list(_mesh_coords(rank, mesh_shape))
             local_shape, offset = _compute_local_shape_and_global_offset(
                 global_shape, mesh_shape, coord, strided_placements
             )
@@ -362,7 +329,7 @@ class TestDCPRoundTrip:
         covered = set()
         for rank in range(8):
             chunk = saved_chunks[rank]
-            coord = [_rank_coord(rank, mesh_shape, d) for d in range(2)]
+            coord = list(_mesh_coords(rank, mesh_shape))
             load_shape, load_offset = _compute_local_shape_and_global_offset(
                 global_shape, mesh_shape, coord, strided_placements
             )
@@ -392,11 +359,11 @@ class TestDCPRoundTrip:
         strided_placements = (_StridedShard(0, split_factor=4), Shard(0))
 
         global_tensor = torch.randn(64)
-        shards = _shard_tensor_reversed_order(global_tensor, mesh_shape, shard_dim=0)
+        shards = _shard_tensor(global_tensor, mesh_shape, strided_placements)
 
         # Verify each rank's chunk metadata is consistent between save and load.
         for rank in range(8):
-            coord = [_rank_coord(rank, mesh_shape, d) for d in range(2)]
+            coord = list(_mesh_coords(rank, mesh_shape))
             save_shape, save_off = _compute_local_shape_and_global_offset(
                 global_shape, mesh_shape, coord, strided_placements
             )
@@ -570,7 +537,7 @@ class TestShardParamsWithOrderedSharding:
         # Compute DCP chunk offsets for both.
         mismatch_count = 0
         for rank in range(mesh.size(0) * mesh.size(1)):
-            coord = [_rank_coord(rank, tuple(mesh.shape), d) for d in range(2)]
+            coord = list(_mesh_coords(rank, tuple(mesh.shape)))
             _, rev_off = _compute_local_shape_and_global_offset(
                 global_shape,
                 tuple(mesh.shape),
