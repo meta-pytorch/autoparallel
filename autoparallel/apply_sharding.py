@@ -85,17 +85,14 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
         self,
         module,
         sharding_placement,
-        enable_ordered_sharding_optimization: bool = True,
+        param_placement_order: dict | None = None,
         dynamic: bool = False,
     ):
         super().__init__(module, garbage_collect_values=True, graph=None)
         self.sharding_placement = sharding_placement
         self.dynamic = dynamic
-        param_placement_order = {}
-        if enable_ordered_sharding_optimization:
-            param_placement_order = compute_optimal_placement_order_for_parameters(
-                module, sharding_placement
-            )
+        if param_placement_order is None:
+            param_placement_order = {}
         self.param_placement_order = param_placement_order
 
     def run_node(self, n):
@@ -436,11 +433,18 @@ def _make_local_args(gm, sharding_placement):
     return local_args
 
 
-def _lower_to_parallel_graph(gm, sharding_placement, local_args, dynamic=False):
+def _lower_to_parallel_graph(
+    gm, sharding_placement, local_args, dynamic=False, param_placement_order=None
+):
     """Two-pass lowering: interpret with sharding collectives, then decompose."""
     decomp_table = _get_inductor_decomp_table()
 
-    interp = ApplyShardingInterpreter(gm, sharding_placement, dynamic=dynamic)
+    interp = ApplyShardingInterpreter(
+        gm,
+        sharding_placement,
+        param_placement_order=param_placement_order,
+        dynamic=dynamic,
+    )
 
     tracing_mode = "symbolic" if dynamic else "real"
 
@@ -475,7 +479,9 @@ def _copy_descriptors_and_rename_placeholders(source_gm, target_gm):
     target_gm.recompile()
 
 
-def _shard_params_and_buffers(gm, sharding_placement, params_spec, buffers_spec):
+def _shard_params_and_buffers(
+    gm, sharding_placement, params_spec, buffers_spec, param_placement_order
+):
     """Shard parameters and buffers according to the sharding placement."""
     # NB: ok to NOT use the parallel_gm here because we will just reapply the
     # correct sharding placement via sharding_placement
@@ -485,12 +491,33 @@ def _shard_params_and_buffers(gm, sharding_placement, params_spec, buffers_spec)
     sharded_param_dict = {}
     for fqn in params_spec:
         n = fqn_to_param[fqn]
+        tgt_spec = sharding_placement[n].input_specs[0]
+        mesh = tgt_spec.mesh
+        needs_reversed = (
+            n in param_placement_order
+            and param_placement_order[n].is_target_reversed_order
+        )
         with unset_fake_temporarily():
-            sharded_param_dict[fqn] = nn.Parameter(
-                shard_node_given_placements(n, sharding_placement)
-            )
-            tgt_spec = sharding_placement[n].input_specs[0]
-            sharded_param_dict[fqn]._spec.shard_order = tgt_spec.shard_order
+            if needs_reversed:
+                reversed_shard_order = _compute_shard_order(
+                    tgt_spec.shard_order, reverse=True
+                )
+                strided_placements = DTensorSpec._convert_shard_order_to_StridedShard(
+                    reversed_shard_order, tgt_spec.placements, mesh
+                )
+                tensor = torch.empty(
+                    n.meta["val"].shape, dtype=n.meta["val"].dtype, device="meta"
+                )
+                curr_placement = (Replicate(),) * mesh.ndim
+                sharded_param_dict[fqn] = nn.Parameter(
+                    DTensor.from_local(tensor, mesh, curr_placement).redistribute(
+                        mesh, strided_placements
+                    )
+                )
+            else:
+                sharded_param_dict[fqn] = nn.Parameter(
+                    shard_node_given_placements(n, sharding_placement)
+                )
 
     sharded_buffer_dict = {}
     for fqn in buffers_spec:
@@ -530,12 +557,20 @@ def apply_sharding_to_model(gm, sharding_placement, params_spec, buffers_spec):
             fake_mode.shape_env = ShapeEnv()
             fake_mode.static_shapes = False
 
+    param_placement_order = compute_optimal_placement_order_for_parameters(
+        gm, sharding_placement
+    )
+
     local_args = _make_local_args(gm, sharding_placement)
     t1 = time.perf_counter()
 
     with use_min_cost_redistribution_plan():
         parallel_gm = _lower_to_parallel_graph(
-            gm, sharding_placement, local_args, dynamic
+            gm,
+            sharding_placement,
+            local_args,
+            dynamic,
+            param_placement_order=param_placement_order,
         )
     t2 = time.perf_counter()
 
@@ -543,7 +578,7 @@ def apply_sharding_to_model(gm, sharding_placement, params_spec, buffers_spec):
     t3 = time.perf_counter()
 
     sharded_param_dict, sharded_buffer_dict = _shard_params_and_buffers(
-        gm, sharding_placement, params_spec, buffers_spec
+        gm, sharding_placement, params_spec, buffers_spec, param_placement_order
     )
     t4 = time.perf_counter()
 

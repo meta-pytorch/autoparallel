@@ -214,9 +214,7 @@ class TestShardOrderSpecIsolation:
             t: OpSpec(output_specs=shared_tgt_spec, input_specs=[shared_tgt_spec]),
         }
 
-        interp = ApplyShardingInterpreter(
-            gm, sharding_placement, enable_ordered_sharding_optimization=False
-        )
+        interp = ApplyShardingInterpreter(gm, sharding_placement)
         # Manually set param_placement_order for the consuming node
         interp.param_placement_order = {
             t: OrderInfo(is_target_reversed_order=False, need_reorder=True),
