@@ -92,7 +92,9 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
         self.sharding_placement = sharding_placement
         self.dynamic = dynamic
         if param_placement_order is None:
-            param_placement_order = {}
+            param_placement_order = compute_optimal_placement_order_for_parameters(
+                module, sharding_placement
+            )
         self.param_placement_order = param_placement_order
 
     def run_node(self, n):

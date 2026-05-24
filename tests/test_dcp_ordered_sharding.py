@@ -342,56 +342,71 @@ class TestDCPRoundTrip:
         # At least some ranks should have different offsets.
         assert mismatch_count > 0
 
-    def test_data_integrity_after_simulated_round_trip(self):
-        """Simulate a DCP round-trip: shard with _StridedShard, compute
-        chunk metadata, then reassemble using those offsets. Verify the
-        reassembled tensor matches the original."""
+    def test_redistribute_round_trip(self):
+        """Shard with _StridedShard, then gather back to Replicate via
+        redistribute. Verify the reassembled tensor matches the original."""
         mesh_shape = (2, 4)
-        global_shape = (64,)
         strided_placements = (_StridedShard(0, split_factor=4), Shard(0))
 
         global_tensor = torch.arange(64, dtype=torch.float)
-        reversed_shards = _shard_tensor(global_tensor, mesh_shape, strided_placements)
+        shards = _shard_tensor(global_tensor, mesh_shape, strided_placements)
+        mesh = DeviceMesh("cuda", torch.arange(math.prod(mesh_shape)).view(mesh_shape))
+        replicated = (Replicate(),) * len(mesh_shape)
+        world_size = math.prod(mesh_shape)
+        ranks = frozenset(range(world_size))
+        with LocalTensorMode(ranks):
+            dt = DTensor.from_local(LocalTensor(shards), mesh, strided_placements)
+            gathered_dt = dt.redistribute(mesh, replicated)
 
-        # "Save" side: each rank contributes its local shard with offset metadata.
-        saved_chunks = {}
-        for rank in range(8):
+        for rank in range(world_size):
+            torch.testing.assert_close(
+                gathered_dt._local_tensor._local_tensors[rank].cpu(),
+                global_tensor,
+                msg=f"Round-trip mismatch on rank {rank}",
+            )
+
+    def test_dcp_chunk_metadata_matches_physical_layout(self):
+        """Verify that _compute_local_shape_and_global_offset (the function
+        DCP's planner calls to build chunk metadata) produces local shapes
+        and first-offsets consistent with the actual physical layout from
+        DTensor.redistribute.
+
+        For _StridedShard the local shard is non-contiguous in global index
+        space, so the first-offset alone can't reconstruct the full shard.
+        But DCP uses (first_offset, local_shape) to identify the chunk, and
+        the redistribute round-trip test above proves data correctness.
+        Here we verify the metadata interface itself."""
+        mesh_shape = (2, 4)
+        strided_placements = (_StridedShard(0, split_factor=4), Shard(0))
+        global_shape = (64,)
+        world_size = math.prod(mesh_shape)
+
+        global_tensor = torch.arange(64, dtype=torch.float)
+        shards = _shard_tensor(global_tensor, mesh_shape, strided_placements)
+
+        first_offsets = set()
+        for rank in range(world_size):
+            actual_shard = shards[rank]
             coord = list(_mesh_coords(rank, mesh_shape))
             local_shape, offset = _compute_local_shape_and_global_offset(
                 global_shape, mesh_shape, coord, strided_placements
             )
-            saved_chunks[rank] = {
-                "data": reversed_shards[rank],
-                "offset": offset,
-                "shape": local_shape,
-            }
 
-        # "Load" side: same placements, so offsets match. Reassemble.
-        reconstructed = torch.zeros(64, dtype=torch.float)
-        covered = set()
-        for rank in range(8):
-            chunk = saved_chunks[rank]
-            coord = list(_mesh_coords(rank, mesh_shape))
-            load_shape, load_offset = _compute_local_shape_and_global_offset(
-                global_shape, mesh_shape, coord, strided_placements
+            # Local shape from DCP metadata must match actual shard size.
+            assert local_shape == actual_shard.shape, (
+                f"rank {rank}: DCP local_shape {local_shape} != "
+                f"actual shard shape {tuple(actual_shard.shape)}"
             )
-            assert chunk["offset"] == load_offset
-            assert chunk["shape"] == load_shape
 
-            # Place data at the offset positions.
-            data = chunk["data"]
-            for i, val in enumerate(data.tolist()):
-                idx = load_offset[0] + i
-                reconstructed[idx] = val
-                covered.add(idx)
+            # First offset must match the first element of the actual shard.
+            assert offset[0] == int(actual_shard[0].item()), (
+                f"rank {rank}: DCP offset {offset[0]} != "
+                f"actual first element {int(actual_shard[0].item())}"
+            )
+            first_offsets.add(offset[0])
 
-        # For strided sharding, simple offset+i doesn't directly reconstruct
-        # because the data is non-contiguous in global space. Instead, verify
-        # that each rank's shard matches the expected slice of the global tensor.
-        for rank in range(8):
-            expected = reversed_shards[rank]
-            actual = saved_chunks[rank]["data"]
-            torch.testing.assert_close(actual, expected)
+        # All ranks should have distinct first-offsets (no overlap).
+        assert len(first_offsets) == world_size
 
     def test_load_into_same_placement_preserves_data(self):
         """When loading into a model with the same _StridedShard placements,
