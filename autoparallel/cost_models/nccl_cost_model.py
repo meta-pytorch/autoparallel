@@ -870,6 +870,25 @@ _NVLS_TREE_RAMP = (
     1.00,
 )
 
+# Ring BW ramp correction for full-mesh (ppn == gpus_per_node) configs in the
+# table-driven path. The tuning table BW overestimates achievable Ring
+# throughput by ~15% at large per-GPU sizes and much more at mid-range, because
+# the tuning table reports theoretical peak BW assuming perfect NIC/NVSwitch
+# utilization. This correction is indexed by log2(per_gpu_bytes >> 6), same
+# scheme as _RING_CORRECTION_FACTOR. Fitted from AG/RS nccl-tests benchmarks
+# at 2-32 nodes, ppn=8 on H100 NVSwitch. Not applied for sub-mesh configs
+# (ppn < gpus_per_node) where the table BW is already accurate.
+# fmt: off
+_TABLE_RING_FULL_MESH_RAMP = (
+    # 64B,   128B,  256B,  512B,  1KB,   2KB,   4KB,   8KB
+    0.01,  0.02,  0.03,  0.06,  0.10,  0.16,  0.25,  0.36,  # noqa: E241
+    # 16KB,  32KB,  64KB,  128KB, 256KB, 512KB, 1MB,   2MB
+    0.68,  0.68,  0.68,  0.68,  0.68,  0.68,  0.68,  0.68,  # noqa: E241
+    # 4MB,   8MB,   16MB,  32MB,  64MB,  128MB, 256MB, 512MB
+    0.68,  0.68,  0.79,  0.87,  0.87,  0.87,  0.87,  0.87,  # noqa: E241
+)
+# fmt: on
+
 # --- AllToAll (entirely empirical, no NCCL equivalent) ---------------------
 
 # CE-path AllToAll bandwidth for NVSwitch-connected Hopper+ GPUs (GB/s).
@@ -1011,6 +1030,16 @@ def _table_algo_time(
             effective_bw *= _NVLS_TREE_RAMP[log_per_gpu]
         elif log_per_gpu < 0:
             effective_bw *= _NVLS_TREE_RAMP[0]
+
+    # Ring BW ramp for full-mesh configs (ppn=8). The tuning table BW
+    # overestimates achievable throughput; the correction is largest at
+    # mid-range per-GPU sizes and plateaus at ~0.87 for large messages.
+    if algo == NCCLAlgo.RING and topo.n_nodes > 1 and topo.ppn >= 8:
+        log_per_gpu = _log2i((n_bytes // topo.n_ranks) >> 6)
+        if 0 <= log_per_gpu < len(_TABLE_RING_FULL_MESH_RAMP):
+            effective_bw *= _TABLE_RING_FULL_MESH_RAMP[log_per_gpu]
+        elif log_per_gpu < 0:
+            effective_bw *= _TABLE_RING_FULL_MESH_RAMP[0]
 
     # Ring plateau effect for multi-node Simple AllReduce (tuning.cc lines 597-599)
     effective_lat = lat
