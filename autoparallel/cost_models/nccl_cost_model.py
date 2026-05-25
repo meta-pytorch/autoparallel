@@ -1040,6 +1040,13 @@ def _table_collective_time(
 
     Returns estimated time in microseconds, or None if the (n_nodes, ppn)
     combination is not in the table (caller should fall back to the algo loop).
+
+    For AG/RS the only table algo is Ring. For AR, all algos (Ring, Tree,
+    NVLSTree) are in the table, but Ring is excluded because the tuning table
+    BW overestimates the achievable peak at larger node counts. The caller
+    always runs the algo loop for Ring (which has a depth-scaled correction
+    factor), so excluding Ring here lets the algo loop provide the Ring
+    candidate while Tree/NVLSTree come from the table.
     """
     key = (topo.n_nodes, topo.ppn)
     bw_scale = _BLACKWELL_BW_SCALE if config.arch == GpuArch.BLACKWELL else 1.0
@@ -1063,25 +1070,12 @@ def _table_collective_time(
             )
             best = min(best, t)
     else:
-        # AllReduce: Ring + Tree + NVLSTree
-        ring_row = _H100_AR_RING.get(key)
-        if ring_row is None:
-            return None
-        for i, proto in enumerate(_PROTOS):
-            lat, bw = ring_row[i]
-            t = _table_algo_time(
-                NCCLAlgo.RING,
-                proto,
-                lat,
-                bw * bw_scale,
-                func,
-                n_bytes,
-                topo,
-            )
-            best = min(best, t)
+        # AllReduce: Tree + NVLSTree from table (Ring from algo loop via caller)
+        has_any = False
 
         tree_row = _H100_AR_TREE.get(key)
         if tree_row is not None:
+            has_any = True
             for i, proto in enumerate(_PROTOS):
                 lat, bw = tree_row[i]
                 t = _table_algo_time(
@@ -1097,6 +1091,7 @@ def _table_collective_time(
 
         nvls_tree = _H100_AR_NVLS_TREE.get(key)
         if nvls_tree is not None:
+            has_any = True
             lat, bw = nvls_tree
             t = _table_algo_time(
                 NCCLAlgo.NVLS_TREE,
@@ -1108,6 +1103,9 @@ def _table_collective_time(
                 topo,
             )
             best = min(best, t)
+
+        if not has_any:
+            return None
 
     return best
 
@@ -1143,7 +1141,15 @@ def nccl_collective_time(
     if is_hopper_nvswitch and topo.n_nodes > 1:
         result = _table_collective_time(func, n_bytes, topo, config)
         if result is not None:
-            return result
+            if func in (NCCLFunc.ALLGATHER, NCCLFunc.REDUCESCATTER):
+                return result
+            # For AllReduce, the table provides Tree/NVLSTree. Combine with
+            # Ring from the algo loop (which has depth-scaled BW correction).
+            best = result
+            for proto in _eligible_protos(NCCLAlgo.RING):
+                t = _nccl_algo_time(func, NCCLAlgo.RING, proto, n_bytes, topo, config)
+                best = min(best, t)
+            return best
 
     # Path 3: NCCL algo selection loop
     algos = _eligible_algos(func, config, topo.n_nodes)
