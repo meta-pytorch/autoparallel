@@ -757,6 +757,14 @@ _H100_AGRS_RING: dict[tuple[int, int], tuple[
     (8, 2): ((33.5, 21.8), (57.2, 94.2), (133.6, 102.4)),
     (8, 4): ((49.5, 21.1), (87.6, 182.3), (188.0, 198.2)),
     (8, 8): ((81.5, 20.7), (148.4, 298.3), (296.8, 390.1)),
+    (16, 1): ((81.6, 21.8), (141.5, 47.1), (218.4, 51.2)),
+    (16, 2): ((63.1, 21.1), (104.4, 91.2), (272.8, 99.1)),
+    (16, 4): ((95.1, 20.7), (165.2, 179.4), (381.6, 195.0)),
+    (16, 8): ((159.1, 20.6), (286.8, 295.9), (599.2, 387.0)),
+    (32, 1): ((161.6, 21.1), (277.5, 45.6), (442.4, 49.5)),
+    (32, 2): ((122.3, 20.7), (198.8, 89.7), (551.2, 97.5)),
+    (32, 4): ((186.3, 20.6), (320.4, 178.0), (768.8, 193.5)),
+    (32, 8): ((314.3, 20.5), (563.6, 294.8), (1204.0, 385.5)),
 }
 
 # AllReduce — Ring algo
@@ -775,6 +783,14 @@ _H100_AR_RING: dict[tuple[int, int], tuple[
     (8, 2): ((60.4, 10.9), (100.4, 47.1), (258.8, 51.2)),
     (8, 4): ((92.4, 10.5), (161.2, 91.2), (367.6, 99.1)),
     (8, 8): ((156.4, 10.4), (282.8, 149.1), (585.2, 195.0)),
+    (16, 1): ((156.6, 10.9), (269.0, 23.6), (428.4, 25.6)),
+    (16, 2): ((119.6, 10.5), (194.8, 45.6), (537.2, 49.5)),
+    (16, 4): ((183.6, 10.4), (316.4, 89.7), (754.8, 97.5)),
+    (16, 8): ((311.6, 10.3), (559.6, 148.0), (1190.0, 193.5)),
+    (32, 1): ((316.6, 10.5), (541.0, 22.8), (876.4, 24.8)),
+    (32, 2): ((238.0, 10.4), (383.6, 44.9), (1094.0, 48.8)),
+    (32, 4): ((366.0, 10.3), (626.8, 89.0), (1529.2, 96.8)),
+    (32, 8): ((622.0, 10.2), (1113.2, 147.4), (2399.6, 192.8)),
 }
 
 # AllReduce — Tree algo
@@ -793,6 +809,14 @@ _H100_AR_TREE: dict[tuple[int, int], tuple[
     (8, 2): ((38.0, 8.7), (67.5, 35.2), (100.4, 37.5)),
     (8, 4): ((40.4, 8.7), (72.5, 70.4), (116.4, 75.1)),
     (8, 8): ((45.2, 8.7), (82.5, 98.6), (148.4, 122.4)),
+    (16, 1): ((46.8, 4.9), (82.0, 17.6), (120.4, 18.8)),
+    (16, 2): ((48.0, 8.7), (84.5, 35.2), (128.4, 37.5)),
+    (16, 4): ((50.4, 8.7), (89.5, 70.4), (144.4, 75.1)),
+    (16, 8): ((55.2, 8.7), (99.5, 98.6), (176.4, 122.4)),
+    (32, 1): ((56.8, 4.9), (99.0, 17.6), (148.4, 18.8)),
+    (32, 2): ((58.0, 8.7), (101.5, 35.2), (156.4, 37.5)),
+    (32, 4): ((60.4, 8.7), (106.5, 70.4), (172.4, 75.1)),
+    (32, 8): ((65.2, 8.7), (116.5, 98.6), (204.4, 122.4)),
 }
 
 # AllReduce — NVLS_TREE algo (SIMPLE only, available when ppn >= 4)
@@ -803,6 +827,10 @@ _H100_AR_NVLS_TREE: dict[tuple[int, int], tuple[float, float]] = {
     (4, 8): (81.0, 160.0),
     (8, 4): (109.0, 80.0),
     (8, 8): (109.0, 160.0),
+    (16, 4): (137.0, 80.0),
+    (16, 8): (137.0, 160.0),
+    (32, 4): (165.0, 80.0),
+    (32, 8): (165.0, 160.0),
 }
 # fmt: on
 
@@ -841,6 +869,24 @@ _NVLS_TREE_RAMP = (
     1.00,
     1.00,
 )
+
+# Empirical end-to-end correction for full-mesh (ppn == gpus_per_node) Ring in
+# the table-driven path. Compensates for a bundle of effects: unmodeled Ring
+# pipeline fill/drain at small per-GPU chunk sizes, protocol-selection mismatch
+# (the table formula picks LL128 where NCCL uses SIMPLE), and residual BW
+# inefficiency at large node counts. Indexed by log2(per_gpu_bytes >> 6), same
+# scheme as _RING_CORRECTION_FACTOR. Fitted from AG/RS nccl-tests benchmarks
+# at 2-32 nodes, ppn=8 on H100 NVSwitch.
+# fmt: off
+_TABLE_RING_FULL_MESH_RAMP = (
+    # 64B,   128B,  256B,  512B,  1KB,   2KB,   4KB,   8KB
+    0.01,  0.02,  0.03,  0.06,  0.10,  0.16,  0.25,  0.36,  # noqa: E241
+    # 16KB,  32KB,  64KB,  128KB, 256KB, 512KB, 1MB,   2MB
+    0.68,  0.68,  0.68,  0.68,  0.68,  0.68,  0.68,  0.68,  # noqa: E241
+    # 4MB,   8MB,   16MB,  32MB,  64MB,  128MB, 256MB, 512MB
+    0.68,  0.68,  0.79,  0.87,  0.87,  0.87,  0.87,  0.87,  # noqa: E241
+)
+# fmt: on
 
 # --- AllToAll (entirely empirical, no NCCL equivalent) ---------------------
 
@@ -964,6 +1010,7 @@ def _table_algo_time(
     func: NCCLFunc,
     n_bytes: int,
     topo: MeshDimTopo,
+    is_full_mesh: bool = False,
 ) -> float:
     """Compute time from a tuning table (lat, bw) entry with size corrections."""
     effective_bw = bw
@@ -983,6 +1030,14 @@ def _table_algo_time(
             effective_bw *= _NVLS_TREE_RAMP[log_per_gpu]
         elif log_per_gpu < 0:
             effective_bw *= _NVLS_TREE_RAMP[0]
+
+    # Full-mesh Ring empirical correction (see _TABLE_RING_FULL_MESH_RAMP).
+    if algo == NCCLAlgo.RING and topo.n_nodes > 1 and is_full_mesh:
+        log_per_gpu = _log2i((n_bytes // topo.n_ranks) >> 6)
+        if 0 <= log_per_gpu < len(_TABLE_RING_FULL_MESH_RAMP):
+            effective_bw *= _TABLE_RING_FULL_MESH_RAMP[log_per_gpu]
+        elif log_per_gpu < 0:
+            effective_bw *= _TABLE_RING_FULL_MESH_RAMP[0]
 
     # Ring plateau effect for multi-node Simple AllReduce (tuning.cc lines 597-599)
     effective_lat = lat
@@ -1012,9 +1067,17 @@ def _table_collective_time(
 
     Returns estimated time in microseconds, or None if the (n_nodes, ppn)
     combination is not in the table (caller should fall back to the algo loop).
+
+    For AG/RS the only table algo is Ring. For AR, all algos (Ring, Tree,
+    NVLSTree) are in the table, but Ring is excluded because the tuning table
+    BW overestimates the achievable peak at larger node counts. The caller
+    always runs the algo loop for Ring (which has a depth-scaled correction
+    factor), so excluding Ring here lets the algo loop provide the Ring
+    candidate while Tree/NVLSTree come from the table.
     """
     key = (topo.n_nodes, topo.ppn)
     bw_scale = _BLACKWELL_BW_SCALE if config.arch == GpuArch.BLACKWELL else 1.0
+    is_full_mesh = topo.ppn == config.gpus_per_node
 
     best = float("inf")
 
@@ -1032,28 +1095,16 @@ def _table_collective_time(
                 func,
                 n_bytes,
                 topo,
+                is_full_mesh,
             )
             best = min(best, t)
     else:
-        # AllReduce: Ring + Tree + NVLSTree
-        ring_row = _H100_AR_RING.get(key)
-        if ring_row is None:
-            return None
-        for i, proto in enumerate(_PROTOS):
-            lat, bw = ring_row[i]
-            t = _table_algo_time(
-                NCCLAlgo.RING,
-                proto,
-                lat,
-                bw * bw_scale,
-                func,
-                n_bytes,
-                topo,
-            )
-            best = min(best, t)
+        # AllReduce: Tree + NVLSTree from table (Ring from algo loop via caller)
+        has_any = False
 
         tree_row = _H100_AR_TREE.get(key)
         if tree_row is not None:
+            has_any = True
             for i, proto in enumerate(_PROTOS):
                 lat, bw = tree_row[i]
                 t = _table_algo_time(
@@ -1069,6 +1120,7 @@ def _table_collective_time(
 
         nvls_tree = _H100_AR_NVLS_TREE.get(key)
         if nvls_tree is not None:
+            has_any = True
             lat, bw = nvls_tree
             t = _table_algo_time(
                 NCCLAlgo.NVLS_TREE,
@@ -1080,6 +1132,9 @@ def _table_collective_time(
                 topo,
             )
             best = min(best, t)
+
+        if not has_any:
+            return None
 
     return best
 
@@ -1115,7 +1170,15 @@ def nccl_collective_time(
     if is_hopper_nvswitch and topo.n_nodes > 1:
         result = _table_collective_time(func, n_bytes, topo, config)
         if result is not None:
-            return result
+            if func in (NCCLFunc.ALLGATHER, NCCLFunc.REDUCESCATTER):
+                return result
+            # For AllReduce, the table provides Tree/NVLSTree. Combine with
+            # Ring from the algo loop (which has depth-scaled BW correction).
+            best = result
+            for proto in _eligible_protos(NCCLAlgo.RING):
+                t = _nccl_algo_time(func, NCCLAlgo.RING, proto, n_bytes, topo, config)
+                best = min(best, t)
+            return best
 
     # Path 3: NCCL algo selection loop
     algos = _eligible_algos(func, config, topo.n_nodes)
