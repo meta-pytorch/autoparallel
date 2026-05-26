@@ -870,14 +870,13 @@ _NVLS_TREE_RAMP = (
     1.00,
 )
 
-# Ring BW ramp correction for full-mesh (ppn == gpus_per_node) configs in the
-# table-driven path. The tuning table BW overestimates achievable Ring
-# throughput by ~15% at large per-GPU sizes and much more at mid-range, because
-# the tuning table reports theoretical peak BW assuming perfect NIC/NVSwitch
-# utilization. This correction is indexed by log2(per_gpu_bytes >> 6), same
+# Empirical end-to-end correction for full-mesh (ppn == gpus_per_node) Ring in
+# the table-driven path. Compensates for a bundle of effects: unmodeled Ring
+# pipeline fill/drain at small per-GPU chunk sizes, protocol-selection mismatch
+# (the table formula picks LL128 where NCCL uses SIMPLE), and residual BW
+# inefficiency at large node counts. Indexed by log2(per_gpu_bytes >> 6), same
 # scheme as _RING_CORRECTION_FACTOR. Fitted from AG/RS nccl-tests benchmarks
-# at 2-32 nodes, ppn=8 on H100 NVSwitch. Not applied for sub-mesh configs
-# (ppn < gpus_per_node) where the table BW is already accurate.
+# at 2-32 nodes, ppn=8 on H100 NVSwitch.
 # fmt: off
 _TABLE_RING_FULL_MESH_RAMP = (
     # 64B,   128B,  256B,  512B,  1KB,   2KB,   4KB,   8KB
@@ -1011,6 +1010,7 @@ def _table_algo_time(
     func: NCCLFunc,
     n_bytes: int,
     topo: MeshDimTopo,
+    is_full_mesh: bool = False,
 ) -> float:
     """Compute time from a tuning table (lat, bw) entry with size corrections."""
     effective_bw = bw
@@ -1031,10 +1031,8 @@ def _table_algo_time(
         elif log_per_gpu < 0:
             effective_bw *= _NVLS_TREE_RAMP[0]
 
-    # Ring BW ramp for full-mesh configs (ppn=8). The tuning table BW
-    # overestimates achievable throughput; the correction is largest at
-    # mid-range per-GPU sizes and plateaus at ~0.87 for large messages.
-    if algo == NCCLAlgo.RING and topo.n_nodes > 1 and topo.ppn >= 8:
+    # Full-mesh Ring empirical correction (see _TABLE_RING_FULL_MESH_RAMP).
+    if algo == NCCLAlgo.RING and topo.n_nodes > 1 and is_full_mesh:
         log_per_gpu = _log2i((n_bytes // topo.n_ranks) >> 6)
         if 0 <= log_per_gpu < len(_TABLE_RING_FULL_MESH_RAMP):
             effective_bw *= _TABLE_RING_FULL_MESH_RAMP[log_per_gpu]
@@ -1079,6 +1077,7 @@ def _table_collective_time(
     """
     key = (topo.n_nodes, topo.ppn)
     bw_scale = _BLACKWELL_BW_SCALE if config.arch == GpuArch.BLACKWELL else 1.0
+    is_full_mesh = topo.ppn == config.gpus_per_node
 
     best = float("inf")
 
@@ -1096,6 +1095,7 @@ def _table_collective_time(
                 func,
                 n_bytes,
                 topo,
+                is_full_mesh,
             )
             best = min(best, t)
     else:
