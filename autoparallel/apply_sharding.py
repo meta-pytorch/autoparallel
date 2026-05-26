@@ -3,6 +3,7 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+import contextlib
 import copy
 import logging
 import operator
@@ -463,6 +464,61 @@ def _make_local_args(gm, physical_placements):
     return local_args
 
 
+@contextlib.contextmanager
+def _mark_rank_symbols_ignorable():
+    """Make _runtime_compute_coordinate_on_dim mark its unbacked symbols as ignorable.
+
+    compile_on_one_rank produces unbacked SymInts for per-rank mesh coordinates.
+    The upstream fake impl only marks them ignorable inside Dynamo, but
+    AutoParallel traces through make_fx instead. This wraps the fake impl
+    so that the symbols are also marked ignorable during make_fx tracing,
+    preventing PendingUnbackedSymbolNotFound errors.
+
+    No-op when compile_on_one_rank is disabled.
+
+    NOTE: We intentionally do NOT enable compile_on_one_rank by default when
+    dynamic=True, even though the two features are complementary (symbolic
+    shapes + symbolic rank coordinates). compile_on_one_rank changes how
+    process groups are referenced in the graph (ProcessGroup objects instead
+    of string names), and ProcessGroup objects are not deepcopy-safe. This
+    breaks extract_forward_graph in apply_placement(), which deepcopies the
+    joint graph. Until ProcessGroup gains deepcopy support upstream, callers
+    must opt in to compile_on_one_rank explicitly.
+    """
+    import torch.distributed.config as dist_config
+
+    if not dist_config.compile_on_one_rank:
+        yield
+        return
+
+    # Force-import the ops module so the op is registered.
+    from torch.distributed._ops import device_mesh as _dm_ops  # noqa: F401
+
+    _orig = _dm_ops._runtime_compute_coordinate_on_dim_fake
+
+    def _patched(full_mesh, index):
+        sz = _orig(full_mesh, index)
+        # The original only marks as ignorable inside Dynamo. We also need it
+        # during make_fx tracing — the coordinate is resolved at runtime via
+        # dist.get_rank() so it is safe to ignore during graph capture.
+        ctx = torch._custom_op.impl.get_ctx()
+        shape_env = ctx._shape_env
+        sym_expr = sz.node._expr
+        if sym_expr not in shape_env.ignorable_fresh_unbacked_symbols:
+            shape_env.ignorable_fresh_unbacked_symbols.append(sym_expr)
+        return sz
+
+    torch.library.register_fake(
+        "device_mesh::_runtime_compute_coordinate_on_dim", _patched
+    )
+    try:
+        yield
+    finally:
+        torch.library.register_fake(
+            "device_mesh::_runtime_compute_coordinate_on_dim", _orig
+        )
+
+
 def _lower_to_parallel_graph(
     gm, sharding_placement, local_args, dynamic=False, param_placement_order=None
 ):
@@ -571,18 +627,19 @@ def apply_sharding_to_model(gm, sharding_placement, params_spec, buffers_spec):
         sharding_placement, param_placement_order
     )
 
-    local_args = _make_local_args(gm, physical_placements)
-    t1 = time.perf_counter()
+    with _mark_rank_symbols_ignorable():
+        local_args = _make_local_args(gm, physical_placements)
+        t1 = time.perf_counter()
 
-    with use_min_cost_redistribution_plan():
-        parallel_gm = _lower_to_parallel_graph(
-            gm,
-            sharding_placement,
-            local_args,
-            dynamic,
-            param_placement_order=param_placement_order,
-        )
-    t2 = time.perf_counter()
+        with use_min_cost_redistribution_plan():
+            parallel_gm = _lower_to_parallel_graph(
+                gm,
+                sharding_placement,
+                local_args,
+                dynamic,
+                param_placement_order=param_placement_order,
+            )
+        t2 = time.perf_counter()
 
     _copy_descriptors_and_rename_placeholders(gm, parallel_gm)
     t3 = time.perf_counter()
