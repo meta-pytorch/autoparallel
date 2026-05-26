@@ -261,6 +261,8 @@ def load_optimizer(cls, path):
         "force_grad_reduce_in_higher_precision"
     ]
     opt._constraint_log = []
+    opt._memory_constraint = None
+    opt._node_constraint_names = {}
     opt._name_counters = {}
 
     # Reconstruct cluster_links by expanding the node-level mapping over

@@ -1266,16 +1266,16 @@ class TestMultiNodeTableDriven:
 
     def test_table_returns_none_for_unknown_config(self):
         """Table should return None for (n_nodes, ppn) not in the table."""
-        config = h100_topo_config(num_nodes=16)
-        topo = derive_mesh_dim_topo(config, (128,), 0)
+        config = h100_topo_config(num_nodes=64)
+        topo = derive_mesh_dim_topo(config, (512,), 0)
         n_bytes = 1 << 30
         result = _table_collective_time(NCCLFunc.ALLREDUCE, n_bytes, topo, config)
         assert result is None
 
     def test_fallback_for_unknown_config(self):
         """Configs not in the table should still produce valid costs."""
-        config = h100_topo_config(num_nodes=16)
-        topo = derive_mesh_dim_topo(config, (128,), 0)
+        config = h100_topo_config(num_nodes=64)
+        topo = derive_mesh_dim_topo(config, (512,), 0)
         n_bytes = 1 << 30
         cost = nccl_allreduce_cost(n_bytes, topo, config)
         assert cost > 0

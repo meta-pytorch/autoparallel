@@ -575,7 +575,7 @@ class TestShapeEnvSwap:
             placements=(Replicate(),),
             tensor_meta=TensorMeta(torch.Size([16, 128]), (128, 1), torch.float32),
         )
-        sharding_placement = {x: type("Placement", (), {"input_specs": (spec,)})()}
+        sharding_placement = {x: spec}
 
         with patch(
             "autoparallel.apply_sharding.DTensor.from_local",
@@ -816,9 +816,7 @@ class TestHasRankVaryingSize:
             placements=(Replicate(), Shard(0)),
             tensor_meta=TensorMeta(torch.Size([400, 100]), (100, 1), torch.float32),
         )
-        sharding_placement = {
-            p: type("P", (), {"input_specs": (spec,)})(),
-        }
+        sharding_placement = {p: spec}
 
         # Swap ShapeEnv (as apply_sharding_to_model does)
         fake_mode.shape_env = ShapeEnv()
