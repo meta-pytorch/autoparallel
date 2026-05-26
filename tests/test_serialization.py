@@ -236,3 +236,26 @@ def test_save_placements_is_valid_json(device_mesh_1d):
     assert "placements" in data
     assert isinstance(data["placements"], dict)
     assert len(data["placements"]) > 0
+
+
+@apply_cuda_patches
+def test_loaded_optimizer_resolve_without_memory_constraint(device_mesh_1d):
+    """A loaded optimizer that never had a memory constraint should be
+    able to call resolve() without crashing."""
+    dim = 64
+    with torch.device("meta"):
+        model = _SimpleModel(dim)
+
+    autop = _setup_autop(model, dim, device_mesh_1d)
+    with autop:
+        autop.add_input_constraints([(Shard(0),)])
+        autop.add_output_constraints([(Shard(0),)])
+        opt = autop.sharding_optimizer
+        opt.get_solution()
+
+    with tempfile.NamedTemporaryFile(suffix=".ap") as f:
+        opt.save(f.name)
+        loaded = type(opt).load(f.name)
+
+    solution = loaded.resolve()
+    assert len(solution) > 0
