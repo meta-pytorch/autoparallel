@@ -57,7 +57,6 @@ profile = "black"
 skip_glob = ["autoparallel/tools/overlap_simulator/repro_*.py"]
 
 [tool.mypy]
-explicit_package_bases = true
 exclude = [
   "autoparallel/tools/overlap_simulator/repro_.*\\.py",
   "autoparallel/visualizer/build_display_from_json\\.py",
