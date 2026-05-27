@@ -808,45 +808,6 @@ def _unsafe_index_rule(mesh, op_schema):
     raise NotImplementedError()
 
 
-def sdpa_rule(op, mesh, op_schema):
-    out_strat = get_op_strategy(op, op_schema)
-    # remove wrong context-parallel strategy
-    # https://github.com/pytorch/pytorch/pull/131351#discussion_r1716164659
-    new_strats = []
-    for ss in out_strat.strategies:
-        if (
-            torch.distributed.tensor.placement_types.Shard(2)
-            not in ss.input_specs[0].placements
-        ):
-            new_strats.append(ss)
-    out_strat.strategies = new_strats
-    return out_strat
-
-
-@register_rule(torch.ops.aten._scaled_dot_product_efficient_attention.default)
-def _(mesh, op_schema):
-    op = torch.ops.aten._scaled_dot_product_efficient_attention.default
-    return sdpa_rule(op, mesh, op_schema)
-
-
-@register_rule(torch.ops.aten._scaled_dot_product_flash_attention.default)
-def _(mesh, op_schema):
-    op = torch.ops.aten._scaled_dot_product_flash_attention.default
-    return sdpa_rule(op, mesh, op_schema)
-
-
-@register_rule(torch.ops.aten._scaled_dot_product_flash_attention_backward.default)
-def _(mesh, op_schema):
-    op = torch.ops.aten._scaled_dot_product_flash_attention_backward.default
-    return sdpa_rule(op, mesh, op_schema)
-
-
-@register_rule(torch.ops.aten._scaled_dot_product_efficient_attention_backward.default)
-def _(mesh, op_schema):
-    op = torch.ops.aten._scaled_dot_product_efficient_attention_backward.default
-    return sdpa_rule(op, mesh, op_schema)
-
-
 @register_rule(torch.ops.aten.reshape.default)
 def reshape_rule(mesh, op_schema):
     op = torch.ops.aten.reshape.default
