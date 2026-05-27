@@ -291,6 +291,30 @@ def _log2i(n: int) -> int:
     return n.bit_length() - 1
 
 
+def _interp_correction(table: tuple[float, ...], n_bytes: int, shift: int = 6) -> float:
+    """Interpolate a log2-indexed correction table using fractional log2.
+
+    Correction tables like _RING_CORRECTION_FACTOR are indexed by
+    _log2i(bytes >> shift), which creates step-function discontinuities at
+    power-of-2 boundaries.  This function interpolates between adjacent
+    entries for a smooth curve.
+    """
+    shifted = n_bytes >> shift
+    if shifted <= 0:
+        return table[0]
+    log_val = math.log2(shifted)
+    lo = int(log_val)
+    hi = lo + 1
+    if lo < 0:
+        return table[0]
+    if hi >= len(table):
+        return table[-1]
+    if lo >= len(table):
+        return table[-1]
+    frac = log_val - lo
+    return table[lo] * (1 - frac) + table[hi] * frac
+
+
 # ---------------------------------------------------------------------------
 # Bandwidth computation — port of tuning.cc lines 285-353
 # ---------------------------------------------------------------------------
@@ -566,19 +590,14 @@ def _nccl_algo_time(
 
     # [Empirical] Ring correction factor for multi-node pipelining ramp.
     # NCCL has treeCorrectionFactor but no Ring equivalent. Fitted from H100
-    # AG benchmarks at 2/4/8 nodes.
+    # AG benchmarks at 2/4/8 nodes. Interpolated for continuity.
     if algo == NCCLAlgo.RING and topo.n_nodes > 1:
-        log_per_gpu = _log2i((n_bytes // topo.n_ranks) >> 6)
+        per_gpu_bytes = n_bytes // topo.n_ranks
         if topo.n_nodes > 4:
             table = _depth_scaled_ring_correction(topo.n_nodes)
         else:
             table = _RING_CORRECTION_FACTOR
-        if 0 <= log_per_gpu < len(table):
-            corr = table[log_per_gpu]
-        elif log_per_gpu < 0:
-            corr = table[0]
-        else:
-            corr = 1.0
+        corr = _interp_correction(table, per_gpu_bytes)
         bw *= corr
 
     # Ring plateau effect for multi-node Simple allreduce (lines 597-599)
@@ -1025,17 +1044,19 @@ def _table_algo_time(
     # startup. The peak BW from the table is only reached at large per-GPU
     # sizes; at mid-range sizes the actual throughput is much lower.
     if algo == NCCLAlgo.NVLS_TREE:
-        log_per_gpu = _log2i((n_bytes // topo.n_ranks) >> 6)
-        if 0 <= log_per_gpu < 24:
-            effective_bw *= _NVLS_TREE_RAMP[log_per_gpu]
-        elif log_per_gpu < 0:
-            effective_bw *= _NVLS_TREE_RAMP[0]
+        per_gpu_bytes = n_bytes // topo.n_ranks
+        effective_bw *= _interp_correction(_NVLS_TREE_RAMP, per_gpu_bytes)
 
     # Full-mesh Ring empirical correction (see _TABLE_RING_FULL_MESH_RAMP).
+    # Unlike the other corrections, this does NOT clamp to table[-1] above
+    # the fitted range — at very large per-GPU sizes the table BW is accurate.
     if algo == NCCLAlgo.RING and topo.n_nodes > 1 and is_full_mesh:
-        log_per_gpu = _log2i((n_bytes // topo.n_ranks) >> 6)
+        per_gpu_bytes = n_bytes // topo.n_ranks
+        log_per_gpu = _log2i(per_gpu_bytes >> 6)
         if 0 <= log_per_gpu < len(_TABLE_RING_FULL_MESH_RAMP):
-            effective_bw *= _TABLE_RING_FULL_MESH_RAMP[log_per_gpu]
+            effective_bw *= _interp_correction(
+                _TABLE_RING_FULL_MESH_RAMP, per_gpu_bytes
+            )
         elif log_per_gpu < 0:
             effective_bw *= _TABLE_RING_FULL_MESH_RAMP[0]
 
