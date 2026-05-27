@@ -22,6 +22,7 @@ from autoparallel.cost_models.nccl_cost_model import (
     _eligible_algos,
     _eligible_protos,
     _interp_clamped,
+    _interp_correction,
     _log2i,
     _nccl_algo_time,
     _table_collective_time,
@@ -1326,3 +1327,56 @@ class TestRingCorrectionMonotonicity:
                 f"cost({n_bytes // 2}) = {prev_cost:.2f}"
             )
             prev_cost = cost
+
+
+class TestInterpCorrection:
+    """Tests for _interp_correction — smooth interpolation of log2-indexed tables."""
+
+    TABLE = (0.10, 0.20, 0.40, 0.80, 1.00)
+
+    def test_exact_power_of_two_returns_table_value(self):
+        for idx in range(len(self.TABLE)):
+            n_bytes = (1 << idx) << 6
+            result = _interp_correction(self.TABLE, n_bytes)
+            assert result == pytest.approx(
+                self.TABLE[idx]
+            ), f"idx={idx}: expected {self.TABLE[idx]}, got {result}"
+
+    def test_midpoint_interpolates(self):
+        import math
+
+        # 3 * 64 = 192 bytes, log2(3) ≈ 1.585 → between idx 1 and 2
+        n_bytes = 3 << 6
+        result = _interp_correction(self.TABLE, n_bytes)
+        frac = math.log2(3) - 1
+        expected = self.TABLE[1] * (1 - frac) + self.TABLE[2] * frac
+        assert result == pytest.approx(expected, abs=1e-10)
+
+    def test_below_range_clamps_to_first(self):
+        assert _interp_correction(self.TABLE, 0) == self.TABLE[0]
+        assert _interp_correction(self.TABLE, 1) == self.TABLE[0]
+
+    def test_above_range_clamps_to_last(self):
+        n_bytes = (1 << 20) << 6
+        assert _interp_correction(self.TABLE, n_bytes) == self.TABLE[-1]
+
+    @pytest.mark.parametrize("n_nodes", [8, 16, 32])
+    def test_no_discontinuity_at_power_of_two_boundary(self, n_nodes):
+        """Cost just below and just above a power-of-two should be close."""
+        config = h100_topo_config(num_nodes=n_nodes, gpus_per_node=8)
+        n_gpus = n_nodes * 8
+        topo = derive_mesh_dim_topo(config, (n_gpus,), 0)
+        for exp in range(16, 26):
+            boundary = 1 << exp
+            cost_below = nccl_collective_time(
+                NCCLFunc.ALLGATHER, boundary - 1, topo, config
+            )
+            cost_above = nccl_collective_time(
+                NCCLFunc.ALLGATHER, boundary + 1, topo, config
+            )
+            ratio = cost_above / cost_below if cost_below > 0 else 1.0
+            assert 0.85 < ratio < 1.15, (
+                f"n_nodes={n_nodes}, boundary={boundary}: "
+                f"cost_below={cost_below:.2f}, cost_above={cost_above:.2f}, "
+                f"ratio={ratio:.3f} (>15% jump)"
+            )
