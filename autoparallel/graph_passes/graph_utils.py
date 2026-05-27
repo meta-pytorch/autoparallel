@@ -212,9 +212,12 @@ def eliminate_alias_round_trips(gm: torch.fx.GraphModule, solution: dict) -> int
             c_input_specs = solution[consumer].input_specs
             if c_input_specs is None:
                 continue
-            positions = [
-                i for i, n in enumerate(all_input_nodes(consumer)) if n is alias
-            ]
+            # input_specs is indexed by position within the in-solution-filtered
+            # input list (matching apply_sharding._get_input_nodes and
+            # ShardingOptimizer._all_input_nodes); get_attr / shape-computation
+            # args are filtered out.
+            filtered_inputs = [n for n in all_input_nodes(consumer) if n in solution]
+            positions = [i for i, n in enumerate(filtered_inputs) if n is alias]
             if not positions:
                 continue
             specs_at_positions = [c_input_specs[i] for i in positions]
@@ -232,6 +235,7 @@ def eliminate_alias_round_trips(gm: torch.fx.GraphModule, solution: dict) -> int
             changed = True
 
     if changed:
+        gm.graph.lint()
         gm.recompile()
     return eliminated
 

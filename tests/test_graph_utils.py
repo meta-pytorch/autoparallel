@@ -346,7 +346,52 @@ def test_extract_forward_deepcopy_with_tensor_constants():
     assert result._tensor_constant0.device.type == "cuda"
 
 
-# --- eliminate_alias_round_trips tests ---
+def test_eliminate_alias_round_trips_handles_mixed_arg_consumer(device_mesh_2d):
+    """Consumer with a non-sharded arg (e.g. get_attr) before the alias must
+    still index input_specs by the filtered (in-solution) position, matching
+    apply_sharding's _get_input_nodes convention.
+    """
+    mesh = device_mesh_2d
+    shape = (4,)
+    x_pl = (Shard(0), Shard(0))
+    a_pl = (Shard(0), Replicate())
+
+    gm = torch.fx.GraphModule({}, torch.fx.Graph())
+    g = gm.graph
+    x = g.placeholder("x")
+    x.meta["val"] = torch.empty(4, device="meta")
+    alias = g.call_function(torch.ops.aten.alias.default, args=(x,))
+    alias.meta["val"] = torch.empty(4, device="meta")
+    # get_attr is a non-sharded node placed BEFORE the alias in the consumer's
+    # raw arg list. apply_sharding filters it out, so input_specs only has one
+    # entry (for the alias).
+    gm._mod = torch.nn.Identity()
+    submod = g.get_attr("_mod")
+    consumer = g.call_function(
+        torch.ops.higher_order.invoke_subgraph, args=(submod, alias)
+    )
+    consumer.meta["val"] = torch.empty(4, device="meta")
+    g.output((consumer,))
+    gm.recompile()
+
+    sol = {
+        x: OpSpec(_make_spec(mesh, x_pl, shape)),
+        alias: OpSpec(
+            _make_spec(mesh, a_pl, shape),
+            input_specs=(_make_spec(mesh, a_pl, shape),),
+        ),
+        consumer: OpSpec(
+            _make_spec(mesh, x_pl, shape),
+            # only one entry — for the alias (the get_attr is filtered out)
+            input_specs=(_make_spec(mesh, x_pl, shape),),
+        ),
+    }
+
+    eliminated = eliminate_alias_round_trips(gm, sol)
+
+    assert eliminated == 1
+    # alias arg position in raw all_input_nodes is 1; in filtered it is 0.
+    assert list(consumer.all_input_nodes) == [submod, x]
 
 
 def _make_spec(mesh, placements, shape, dtype=torch.float32):
