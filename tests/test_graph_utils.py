@@ -4,10 +4,14 @@
 # LICENSE file in the root directory of this source tree.
 
 import torch
+from torch.distributed._tensor.placement_types import DTensorSpec, TensorMeta
+from torch.distributed.tensor._op_schema import OpSpec
+from torch.distributed.tensor.placement_types import Replicate, Shard
 from torch.fx.experimental.proxy_tensor import make_fx
 
 from autoparallel.graph_passes.graph_utils import (
     _replace_view_mm_view_with_einsum,
+    eliminate_alias_round_trips,
     functionalize_fresh_index_put_mutations,
 )
 
@@ -340,3 +344,203 @@ def test_extract_forward_deepcopy_with_tensor_constants():
     # The real tensor constant should survive the deepcopy
     assert hasattr(result, "_tensor_constant0")
     assert result._tensor_constant0.device.type == "cuda"
+
+
+# --- eliminate_alias_round_trips tests ---
+
+
+def _make_spec(mesh, placements, shape, dtype=torch.float32):
+    t = torch.empty(shape, dtype=dtype, device="meta")
+    return DTensorSpec(
+        mesh, tuple(placements), tensor_meta=TensorMeta(t.shape, t.stride(), t.dtype)
+    )
+
+
+def _build_alias_graph(num_consumers):
+    """Build a GraphModule: x -> alias -> add(alias, alias, ..., y) per consumer.
+
+    Returns (gm, x, alias, consumers). Each consumer is an add taking the
+    alias twice (so we cover the repeated-input case) plus a distinct
+    placeholder, so we can independently control its input_specs.
+    """
+    gm = torch.fx.GraphModule({}, torch.fx.Graph())
+    g = gm.graph
+    x = g.placeholder("x")
+    x.meta["val"] = torch.empty(4, device="meta")
+    alias = g.call_function(torch.ops.aten.alias.default, args=(x,))
+    alias.meta["val"] = torch.empty(4, device="meta")
+    consumers = []
+    for i in range(num_consumers):
+        y = g.placeholder(f"y{i}")
+        y.meta["val"] = torch.empty(4, device="meta")
+        c = g.call_function(torch.ops.aten.add.Tensor, args=(alias, y))
+        c.meta["val"] = torch.empty(4, device="meta")
+        consumers.append(c)
+    g.output(tuple(consumers))
+    gm.recompile()
+    return gm, x, alias, consumers
+
+
+def test_eliminate_alias_round_trips_rewires_matching_consumer(device_mesh_2d):
+    mesh = device_mesh_2d
+    shape = (4,)
+    x_pl = (Shard(0), Shard(0))
+    a_pl = (Shard(0), Replicate())  # alias all-gathered along tp
+
+    gm, x, alias, [c_round_trip, c_use_ag] = _build_alias_graph(2)
+    sol = {
+        x: OpSpec(_make_spec(mesh, x_pl, shape)),
+        alias: OpSpec(
+            _make_spec(mesh, a_pl, shape),
+            input_specs=(_make_spec(mesh, a_pl, shape),),
+        ),
+        c_round_trip: OpSpec(
+            _make_spec(mesh, x_pl, shape),
+            input_specs=(
+                _make_spec(mesh, x_pl, shape),  # would redistribute alias R -> S(1)
+                _make_spec(mesh, x_pl, shape),
+            ),
+        ),
+        c_use_ag: OpSpec(
+            _make_spec(mesh, a_pl, shape),
+            input_specs=(
+                _make_spec(mesh, a_pl, shape),  # uses alias directly at S(0)R
+                _make_spec(mesh, a_pl, shape),
+            ),
+        ),
+    }
+
+    eliminated = eliminate_alias_round_trips(gm, sol)
+
+    assert eliminated == 1
+    assert list(c_round_trip.all_input_nodes)[0] is x
+    assert list(c_use_ag.all_input_nodes)[0] is alias
+    assert alias in sol  # still referenced by c_use_ag
+
+
+def test_eliminate_alias_round_trips_erases_when_no_users(device_mesh_2d):
+    mesh = device_mesh_2d
+    shape = (4,)
+    x_pl = (Shard(0), Shard(0))
+    a_pl = (Shard(0), Replicate())
+
+    gm, x, alias, [c1, c2] = _build_alias_graph(2)
+    sol = {
+        x: OpSpec(_make_spec(mesh, x_pl, shape)),
+        alias: OpSpec(
+            _make_spec(mesh, a_pl, shape),
+            input_specs=(_make_spec(mesh, a_pl, shape),),
+        ),
+        c1: OpSpec(
+            _make_spec(mesh, x_pl, shape),
+            input_specs=(_make_spec(mesh, x_pl, shape), _make_spec(mesh, x_pl, shape)),
+        ),
+        c2: OpSpec(
+            _make_spec(mesh, x_pl, shape),
+            input_specs=(_make_spec(mesh, x_pl, shape), _make_spec(mesh, x_pl, shape)),
+        ),
+    }
+
+    eliminated = eliminate_alias_round_trips(gm, sol)
+
+    assert eliminated == 2
+    assert alias not in sol
+    alias_nodes = gm.graph.find_nodes(
+        op="call_function", target=torch.ops.aten.alias.default
+    )
+    assert alias_nodes == []
+
+
+def test_eliminate_alias_round_trips_noop_when_placements_match(device_mesh_2d):
+    mesh = device_mesh_2d
+    shape = (4,)
+    pl = (Shard(0), Replicate())
+
+    gm, x, alias, [c] = _build_alias_graph(1)
+    sol = {
+        x: OpSpec(_make_spec(mesh, pl, shape)),
+        alias: OpSpec(
+            _make_spec(mesh, pl, shape),
+            input_specs=(_make_spec(mesh, pl, shape),),
+        ),
+        c: OpSpec(
+            _make_spec(mesh, pl, shape),
+            input_specs=(_make_spec(mesh, pl, shape), _make_spec(mesh, pl, shape)),
+        ),
+    }
+
+    eliminated = eliminate_alias_round_trips(gm, sol)
+
+    assert eliminated == 0
+    assert alias in sol
+    assert list(c.all_input_nodes)[0] is alias
+
+
+def test_eliminate_alias_round_trips_skips_intermediate_redistribution(device_mesh_2d):
+    """Consumer that doesn't want either x's or alias's placement is left alone."""
+    mesh = device_mesh_2d
+    shape = (4,)
+    x_pl = (Shard(0), Shard(0))
+    a_pl = (Shard(0), Replicate())
+    other_pl = (Replicate(), Replicate())
+
+    gm, x, alias, [c] = _build_alias_graph(1)
+    sol = {
+        x: OpSpec(_make_spec(mesh, x_pl, shape)),
+        alias: OpSpec(
+            _make_spec(mesh, a_pl, shape),
+            input_specs=(_make_spec(mesh, a_pl, shape),),
+        ),
+        c: OpSpec(
+            _make_spec(mesh, other_pl, shape),
+            input_specs=(
+                _make_spec(mesh, other_pl, shape),
+                _make_spec(mesh, other_pl, shape),
+            ),
+        ),
+    }
+
+    eliminated = eliminate_alias_round_trips(gm, sol)
+
+    assert eliminated == 0
+    assert list(c.all_input_nodes)[0] is alias
+
+
+def test_eliminate_alias_round_trips_handles_repeated_input(device_mesh_2d):
+    """A consumer using alias in multiple positions is rewired exactly once."""
+    mesh = device_mesh_2d
+    shape = (4,)
+    x_pl = (Shard(0), Shard(0))
+    a_pl = (Shard(0), Replicate())
+
+    gm = torch.fx.GraphModule({}, torch.fx.Graph())
+    g = gm.graph
+    x = g.placeholder("x")
+    x.meta["val"] = torch.empty(4, device="meta")
+    alias = g.call_function(torch.ops.aten.alias.default, args=(x,))
+    alias.meta["val"] = torch.empty(4, device="meta")
+    # Consumer takes alias as both args (e.g. x + x)
+    c = g.call_function(torch.ops.aten.add.Tensor, args=(alias, alias))
+    c.meta["val"] = torch.empty(4, device="meta")
+    g.output((c,))
+    gm.recompile()
+
+    sol = {
+        x: OpSpec(_make_spec(mesh, x_pl, shape)),
+        alias: OpSpec(
+            _make_spec(mesh, a_pl, shape),
+            input_specs=(_make_spec(mesh, a_pl, shape),),
+        ),
+        c: OpSpec(
+            _make_spec(mesh, x_pl, shape),
+            input_specs=(_make_spec(mesh, x_pl, shape), _make_spec(mesh, x_pl, shape)),
+        ),
+    }
+
+    eliminated = eliminate_alias_round_trips(gm, sol)
+
+    # Exactly one consumer was rewired (positions for the same consumer fold
+    # into a single replace_input_with call).
+    assert eliminated == 1
+    assert all(n is x for n in c.all_input_nodes)
+    assert alias not in sol  # alias has no remaining users → erased

@@ -183,6 +183,59 @@ def _add_alias(gm, version="v1"):
     return gm
 
 
+def eliminate_alias_round_trips(gm: torch.fx.GraphModule, solution: dict) -> int:
+    """Bypass aliases for consumers that would redistribute back to the producer's placement.
+
+    When an alias node A's chosen placement differs from its producer X's placement,
+    a consumer C of A whose input_spec matches X's placement would redistribute
+    A -> X-placement at runtime. Rewire such consumers to read X directly so the
+    larger intermediate (e.g. all-gathered) tensor isn't kept alive across them.
+    """
+    eliminated = 0
+    changed = False
+    for alias in list(gm.graph.nodes):
+        if alias.op != "call_function" or alias.target != torch.ops.aten.alias.default:
+            continue
+        if alias not in solution:
+            continue
+        producer = alias.args[0]
+        if not isinstance(producer, torch.fx.Node) or producer not in solution:
+            continue
+        x_placements = solution[producer].output_specs.placements
+        a_placements = solution[alias].output_specs.placements
+        if x_placements == a_placements:
+            continue
+
+        for consumer in list(alias.users):
+            if consumer not in solution:
+                continue
+            c_input_specs = solution[consumer].input_specs
+            if c_input_specs is None:
+                continue
+            positions = [
+                i for i, n in enumerate(all_input_nodes(consumer)) if n is alias
+            ]
+            if not positions:
+                continue
+            specs_at_positions = [c_input_specs[i] for i in positions]
+            if any(s is None for s in specs_at_positions):
+                continue
+            if not all(s.placements == x_placements for s in specs_at_positions):
+                continue
+            consumer.replace_input_with(alias, producer)
+            eliminated += 1
+            changed = True
+
+        if not alias.users:
+            del solution[alias]
+            gm.graph.erase_node(alias)
+            changed = True
+
+    if changed:
+        gm.recompile()
+    return eliminated
+
+
 def is_collective(node: torch.fx.Node) -> bool:
     return (
         node.op == "call_function"
