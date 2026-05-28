@@ -480,8 +480,12 @@ def _replace_view_mm_view_with_einsum(gm):
             new_node.meta.update(replaced_node.meta)
             # Preserve the mm node's seq_nr so that forward/backward
             # einsum pairs remain matched by autograd's sequence numbering.
-            if "seq_nr" in node.meta:
-                new_node.meta["seq_nr"] = node.meta["seq_nr"]
+            # Also preserve recompute/ac_graph_id from the mm node so that
+            # activation checkpointing policies (e.g. selective AC) survive
+            # the mm → einsum conversion.
+            for key in ("seq_nr", "recompute", "ac_graph_id"):
+                if key in node.meta:
+                    new_node.meta[key] = node.meta[key]
             replaced_node.replace_all_uses_with(new_node)
     gm.graph.eliminate_dead_code()
     gm.graph.lint()

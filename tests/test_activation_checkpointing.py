@@ -706,6 +706,117 @@ def test_user_ac_tags_survive_compile_roundtrip_no_rng(device_mesh_2d):
 
 
 # ---------------------------------------------------------------------------
+# Family 2c: recompute tags survive mm → einsum conversion
+# ---------------------------------------------------------------------------
+
+
+def _make_alternating_mm_policy(meta):
+    """Save every odd mm, recompute every even mm. Save everything else."""
+
+    def _policy(ctx, func, *args, **kwargs):
+        mode = "recompute" if ctx.is_recompute else "forward"
+        mm_count_key = f"{mode}_mm_count"
+        if func == torch.ops.aten.mm.default:
+            meta[mm_count_key] += 1
+            if meta[mm_count_key] % 2 == 0:
+                return CheckpointPolicy.PREFER_RECOMPUTE
+        return CheckpointPolicy.MUST_SAVE
+
+    return _policy
+
+
+def _alternating_ac_context_fn():
+    from collections import defaultdict
+
+    meta = defaultdict(int)
+    return create_selective_checkpoint_contexts(_make_alternating_mm_policy(meta))
+
+
+class MLPBlockWithAlternatingAC(nn.Module):
+    """MLP with alternating mm AC policy. Four linears inside the checkpoint
+    region produce four mm ops; the policy saves odd mm outputs and recomputes
+    even ones. After mm→einsum conversion, the einsum nodes should carry the
+    same alternating tags.
+
+    Uses checkpoint_wrapper (same as apply_ac) rather than calling
+    torch.utils.checkpoint.checkpoint directly."""
+
+    def __init__(self, nheads, dim, ffn_dim):
+        super().__init__()
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+            checkpoint_wrapper,
+        )
+
+        self.mlp = checkpoint_wrapper(
+            nn.Sequential(
+                nn.Linear(dim, ffn_dim, bias=False),
+                nn.ReLU(),
+                nn.Linear(ffn_dim, dim, bias=False),
+                nn.ReLU(),
+                nn.Linear(dim, ffn_dim, bias=False),
+                nn.ReLU(),
+                nn.Linear(ffn_dim, dim, bias=False),
+            ),
+            context_fn=_alternating_ac_context_fn,
+        )
+
+    def forward(self, x):
+        return self.mlp(x) + x
+
+
+def test_einsum_conversion_preserves_alternating_recompute_tags(device_mesh_1d):
+    """When _replace_view_mm_view_with_einsum converts mm → einsum, the
+    recompute tags from the user's selective AC policy must transfer to the
+    einsum nodes (not be lost by copying only the replaced view node's meta)."""
+    nheads, dim, ffn_dim = 8, 128, 512
+    bs, seq_len = 32, 32
+
+    def input_fn():
+        return torch.rand(bs, seq_len, dim, device="cuda")
+
+    with torch.device("meta"):
+        model = MLPBlockWithAlternatingAC(nheads, dim, ffn_dim)
+
+    gm = _build_joint_graph(model, input_fn, device_mesh_1d)
+
+    # After build_model_graph, mm nodes are converted to einsum if the
+    # view-mm-view pattern matches (batch dims present).
+    einsum_nodes = gm.graph.find_nodes(
+        op="call_function", target=torch.ops.aten.einsum.default
+    )
+    mm_nodes = gm.graph.find_nodes(op="call_function", target=torch.ops.aten.mm.default)
+    linear_nodes = einsum_nodes + mm_nodes
+    assert len(linear_nodes) > 0, "Expected mm or einsum nodes in the graph"
+
+    fwd_linear = [
+        n for n in linear_nodes if n.meta.get("partitioner_tag", "") != "is_backward"
+    ]
+    assert len(fwd_linear) >= 4, (
+        f"Expected at least 4 forward mm/einsum nodes (from 4 linears), "
+        f"got {len(fwd_linear)}"
+    )
+
+    # Every forward mm/einsum inside the checkpoint region must have a
+    # recompute tag — the alternating policy tags all of them (MUST_SAVE
+    # for odd, PREFER_RECOMPUTE for even).
+    for n in fwd_linear:
+        assert n.meta.get("recompute") is not None, (
+            f"Forward {n.target.__name__} node {n} has no recompute tag — "
+            f"AC metadata was lost during mm → einsum conversion"
+        )
+
+    # Verify the alternating pattern: at least one MUST_SAVE and at least
+    # one PREFER_RECOMPUTE among the forward nodes.
+    tags = [n.meta["recompute"] for n in fwd_linear]
+    assert (
+        CheckpointPolicy.MUST_SAVE in tags
+    ), "Expected at least one MUST_SAVE from alternating policy"
+    assert (
+        CheckpointPolicy.PREFER_RECOMPUTE in tags
+    ), "Expected at least one PREFER_RECOMPUTE from alternating policy"
+
+
+# ---------------------------------------------------------------------------
 # Family 3: local_map + activation checkpointing
 # ---------------------------------------------------------------------------
 
