@@ -119,15 +119,17 @@ def fuse_chained_allgathers(
     full_group_size: int,
     full_group_name: str,
     subgroup_order: dict[str, int] | None = None,
+    reversed_full_group_name: str | None = None,
 ) -> int:
     """Fuse consecutive allgather chains on different subgroups into a single allgather.
 
     Detects chains of two allgathers on different process groups connected
-    through single-user view ops that compose to the identity::
+    either directly (wait1 feeds into ag2) or through single-user view ops
+    that compose to the identity::
 
         ag1      = all_gather(x, size1, pg1)
         wait1    = wait_tensor(ag1)
-        ...      = identity_view_ops(wait1)
+        ...      = [optional identity_view_ops(wait1)]
         ag2      = all_gather(..., size2, pg2)
         wait2    = wait_tensor(ag2)
 
@@ -136,14 +138,15 @@ def fuse_chained_allgathers(
         full_ag   = all_gather(x, size1 * size2, full_pg)
         full_wait = wait_tensor(full_ag)
 
-    Requirements:
-    - The two group sizes must multiply to ``full_group_size``.
-    - Every node between the two allgathers must have exactly one user.
-    - The view ops between them must compose to the identity (verified
-      via FakeTensor shape and stride metadata).
-    - Both allgathers must have the same dtype.
-    - When ``subgroup_order`` is provided, both process groups must be in
-      that mapping and appear in descending mesh-dim order.
+    The correct flattened process group depends on the chain direction:
+    - Descending mesh-dim order (tp before dp): ``full_group_name``
+      (row-major flat mesh).
+    - Ascending mesh-dim order (dp before tp): ``reversed_full_group_name``
+      (column-major flat mesh).
+
+    Direct chains (no view ops between AGs) are accepted when
+    ``subgroup_order`` validates the direction.  Without ``subgroup_order``,
+    an identity view chain is still required for safety.
 
     Returns the number of fusions performed.
     """
@@ -182,8 +185,10 @@ def fuse_chained_allgathers(
         if len(ag1.users) != 1:
             continue
 
-        # Validate that the view chain between wait1 and ag2 is identity.
-        if not _is_identity_view_chain(wait1, ag2):
+        # Validate that the view chain between wait1 and ag2 is identity,
+        # or that it's a direct chain (wait1 feeds ag2 with no intermediate ops).
+        is_direct_chain = ag2.args[0] is wait1
+        if not is_direct_chain and not _is_identity_view_chain(wait1, ag2):
             continue
 
         # Validate group sizes.
@@ -199,11 +204,28 @@ def fuse_chained_allgathers(
         assert isinstance(ag2_group, str)
         if ag1_group == ag2_group:
             continue
+
+        # Determine the correct flat mesh based on chain direction.
         if subgroup_order is not None:
             if ag1_group not in subgroup_order or ag2_group not in subgroup_order:
                 continue
-            if subgroup_order[ag1_group] <= subgroup_order[ag2_group]:
+            ag1_dim = subgroup_order[ag1_group]
+            ag2_dim = subgroup_order[ag2_group]
+            if ag1_dim < ag2_dim:
+                # Ascending (dp→tp): needs column-major flat mesh
+                if reversed_full_group_name is None:
+                    continue
+                target_group_name = reversed_full_group_name
+            elif ag1_dim > ag2_dim:
+                # Descending (tp→dp): needs row-major flat mesh
+                target_group_name = full_group_name
+            else:
                 continue
+        else:
+            # Without subgroup_order, require identity view chain for safety.
+            if is_direct_chain:
+                continue
+            target_group_name = full_group_name
 
         # Validate matching dtype.
         ag1_val = ag1.meta.get("val")
@@ -230,7 +252,7 @@ def fuse_chained_allgathers(
         with graph.inserting_before(ag2):
             full_ag = graph.call_function(
                 torch.ops._c10d_functional.all_gather_into_tensor.default,
-                args=(original_input, full_group_size, full_group_name),
+                args=(original_input, full_group_size, target_group_name),
             )
             full_ag.meta.update(ag2.meta)
 
@@ -251,7 +273,7 @@ def fuse_chained_allgathers(
             ag2_group_size,
             ag2_group,
             full_group_size,
-            full_group_name,
+            target_group_name,
         )
 
     if fusions > 0:

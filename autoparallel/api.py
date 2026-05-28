@@ -520,12 +520,22 @@ class AutoParallel:
             for dim in range(self.mesh.ndim)
         }
 
+        # Column-major flat mesh for ascending (dp→tp) chains from reverse
+        # shard order.  mesh["tp","dp"] transposes the dims so _flatten()
+        # produces ranks in column-major order.
+        reversed_full_group_name = None
+        if self.mesh.ndim == 2:
+            reversed_dim_names = tuple(reversed(self.mesh.mesh_dim_names))
+            reversed_flat_mesh = self.mesh[reversed_dim_names]._flatten()
+            reversed_full_group_name = reversed_flat_mesh.get_group().group_name
+
         def pre_pass(graph):
             fuse_chained_allgathers(
                 graph,
                 full_group_size,
                 full_group_name,
                 subgroup_order=subgroup_order,
+                reversed_full_group_name=reversed_full_group_name,
             )
 
         return pre_pass

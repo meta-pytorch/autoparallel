@@ -199,19 +199,24 @@ def test_subgroup_order_validation():
     assert fusions == 0
     assert _count_ops(graph, AG) == 2
 
-    # Correct subgroup order — should fuse
+    # dp(0)→tp(1) ascending chain: needs reversed_full_group_name
     fusions = fuse_chained_allgathers(
         graph,
         full_group_size=128,
         full_group_name="full",
         subgroup_order={"dp": 0, "tp": 1},
+        reversed_full_group_name="full_rev",
     )
     assert fusions == 1
     assert _count_ops(graph, AG) == 1
 
+    # Verify the fused AG uses the reversed group
+    ag_node = graph.find_nodes(op="call_function", target=AG)[0]
+    assert ag_node.args[2] == "full_rev"
 
-def test_reversed_subgroup_order_does_not_fuse():
-    """Only descending mesh-dim allgather order is fuseable."""
+
+def test_descending_subgroup_order_fuses():
+    """Descending mesh-dim order (tp→dp) fuses with the default flat mesh."""
     graph = torch.fx.Graph()
     x = _add_placeholder(graph, "x", (8, 4096))
     result = _add_chained_allgather(graph, x, size1=8, pg1="tp", size2=16, pg2="dp")
@@ -224,8 +229,11 @@ def test_reversed_subgroup_order_does_not_fuse():
         subgroup_order={"dp": 0, "tp": 1},
     )
 
-    assert fusions == 0
-    assert _count_ops(graph, AG) == 2
+    assert fusions == 1
+    assert _count_ops(graph, AG) == 1
+
+    ag_node = graph.find_nodes(op="call_function", target=AG)[0]
+    assert ag_node.args[2] == "full"
 
 
 def test_with_cast_before_allgather():
@@ -275,8 +283,7 @@ def test_standalone_allgather_untouched():
 def test_direct_chain_no_views():
     """Two allgathers directly chained (ag1 -> wait -> ag2) with no view ops.
 
-    Without intervening views to reconcile the rank ordering between the
-    two subgroup allgathers and the flattened group, this is NOT fuseable.
+    Without subgroup_order, this is NOT fuseable (can't validate direction).
     """
     graph = torch.fx.Graph()
     x = _add_placeholder(graph, "x", (8, 4096))
@@ -293,6 +300,79 @@ def test_direct_chain_no_views():
     assert fusions == 0
     assert _count_ops(graph, AG) == 2
     assert _count_ops(graph, WAIT) == 2
+
+
+def test_direct_chain_ascending_with_reversed_group():
+    """Direct dp→tp chain fuses when subgroup_order and reversed group are provided."""
+    graph = torch.fx.Graph()
+    x = _add_placeholder(graph, "x", (8, 4096))
+    ag1 = _add_all_gather(graph, x, 16, "dp")
+    wait1 = _add_wait_tensor(graph, ag1)
+    ag2 = _add_all_gather(graph, wait1, 8, "tp")
+    wait2 = _add_wait_tensor(graph, ag2)
+    graph.output((wait2,))
+
+    fusions = fuse_chained_allgathers(
+        graph,
+        full_group_size=128,
+        full_group_name="full",
+        subgroup_order={"dp": 0, "tp": 1},
+        reversed_full_group_name="full_rev",
+    )
+
+    assert fusions == 1
+    assert _count_ops(graph, AG) == 1
+    assert _count_ops(graph, WAIT) == 1
+
+    ag_node = graph.find_nodes(op="call_function", target=AG)[0]
+    assert ag_node.args[1] == 128
+    assert ag_node.args[2] == "full_rev"
+
+
+def test_direct_chain_descending_with_subgroup_order():
+    """Direct tp→dp chain fuses with the default flat mesh."""
+    graph = torch.fx.Graph()
+    x = _add_placeholder(graph, "x", (8, 4096))
+    ag1 = _add_all_gather(graph, x, 8, "tp")
+    wait1 = _add_wait_tensor(graph, ag1)
+    ag2 = _add_all_gather(graph, wait1, 16, "dp")
+    wait2 = _add_wait_tensor(graph, ag2)
+    graph.output((wait2,))
+
+    fusions = fuse_chained_allgathers(
+        graph,
+        full_group_size=128,
+        full_group_name="full",
+        subgroup_order={"dp": 0, "tp": 1},
+    )
+
+    assert fusions == 1
+    assert _count_ops(graph, AG) == 1
+
+    ag_node = graph.find_nodes(op="call_function", target=AG)[0]
+    assert ag_node.args[2] == "full"
+
+
+def test_ascending_without_reversed_group_does_not_fuse():
+    """dp→tp chain without reversed_full_group_name cannot fuse."""
+    graph = torch.fx.Graph()
+    x = _add_placeholder(graph, "x", (8, 4096))
+    ag1 = _add_all_gather(graph, x, 16, "dp")
+    wait1 = _add_wait_tensor(graph, ag1)
+    ag2 = _add_all_gather(graph, wait1, 8, "tp")
+    wait2 = _add_wait_tensor(graph, ag2)
+    graph.output((wait2,))
+
+    fusions = fuse_chained_allgathers(
+        graph,
+        full_group_size=128,
+        full_group_name="full",
+        subgroup_order={"dp": 0, "tp": 1},
+        # no reversed_full_group_name
+    )
+
+    assert fusions == 0
+    assert _count_ops(graph, AG) == 2
 
 
 def test_noop_view_chain():
