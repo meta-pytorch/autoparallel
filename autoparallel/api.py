@@ -26,6 +26,7 @@ from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from .apply_sharding import apply_sharding_to_model
 from .cast_parametrization import apply_dtype_cast, canonicalize_mp, set_dtype_cast
 from .graph_passes.activation_checkpointing import mark_fsdp_all_gather_recomputation
+from .graph_passes.fuse_allgather import fuse_chained_allgathers
 from .graph_passes.graph_utils import (
     _add_alias,
     _replace_view_mm_view_with_einsum,
@@ -57,7 +58,10 @@ _APPLY_VIEW_MM_VIEW_PATTERN = True
 logger = logging.getLogger(__name__)
 
 
-def _boxed_nop_preserve_node_meta(fx_g, example_inputs):
+def _boxed_nop_preserve_node_meta(fx_g, example_inputs, pre_pass=None):
+    if pre_pass is not None:
+        pre_pass(fx_g.graph)
+
     def run(args):
         with torch.fx.traceback.preserve_node_meta():
             return torch.fx.Interpreter(fx_g).boxed_run(args)
@@ -473,6 +477,27 @@ class AutoParallel:
             sharded_buffer_dict,
         )
 
+    def _make_fuse_allgather_pass(self):
+        flat_mesh = self.mesh._flatten() if self.mesh.ndim > 1 else self.mesh
+        pg = flat_mesh.get_group()
+        full_group_size = flat_mesh.size()
+        full_group_name = pg.group_name
+
+        subgroup_order = {
+            self.mesh.get_group(mesh_dim=dim).group_name: dim
+            for dim in range(self.mesh.ndim)
+        }
+
+        def pre_pass(graph):
+            fuse_chained_allgathers(
+                graph,
+                full_group_size,
+                full_group_name,
+                subgroup_order=subgroup_order,
+            )
+
+        return pre_pass
+
     def apply_placement(self, sharding_placement):
         sharded_param_dict, sharded_buffer_dict = self._apply_placement_common(
             sharding_placement
@@ -482,10 +507,19 @@ class AutoParallel:
             self.parallel_gm.graph, self.reshard_after_forward
         )
 
+        compiler_fn = self.compiler_fn
+        if self.mesh.ndim > 1:
+            from functools import partial
+
+            compiler_fn = partial(
+                compiler_fn,
+                pre_pass=self._make_fuse_allgather_pass(),
+            )
+
         self.parallel_model_fn = parallel_model_fn = aot_compile_joint_with_descriptors(
             self.joint_with_descriptors,
-            fw_compiler=self.compiler_fn,
-            bw_compiler=self.compiler_fn,
+            fw_compiler=compiler_fn,
+            bw_compiler=compiler_fn,
         )
 
         # Build a forward-only graph for inference (no backward, no
@@ -500,6 +534,13 @@ class AutoParallel:
             self.parallel_gm, num_fwd_outputs, num_primals
         )
         compiler_fn = self.compiler_fn
+        if self.mesh.ndim > 1:
+            from functools import partial
+
+            compiler_fn = partial(
+                compiler_fn,
+                pre_pass=self._make_fuse_allgather_pass(),
+            )
         aot_config = self.joint_with_descriptors._aot_state.aot_config
         out_spec = self.joint_with_descriptors.out_spec
 
