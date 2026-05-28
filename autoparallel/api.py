@@ -528,11 +528,13 @@ class AutoParallel:
         if self.mesh.ndim == 2:
             if not hasattr(self, "_reversed_flat_pg"):
                 import torch.distributed as dist
+                from torch._subclasses.fake_tensor import unset_fake_temporarily
 
                 col_major_ranks = self.mesh.mesh.T.contiguous().view(-1).tolist()
-                self._reversed_flat_pg = dist.new_group(
-                    ranks=col_major_ranks, sort_ranks=False
-                )
+                with unset_fake_temporarily():
+                    self._reversed_flat_pg = dist.new_group(
+                        ranks=col_major_ranks, sort_ranks=False
+                    )
             reversed_full_group_name = self._reversed_flat_pg.group_name
 
         def pre_pass(graph):
