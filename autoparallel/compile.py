@@ -238,16 +238,28 @@ def autoparallel_backend(
         overlap_scheduling: Enable comm/compute overlap scheduling.
     """
     functorch_patches: dict[str, Any] = {}
-    inductor_patches: dict[str, Any] = (
-        dict(_INDUCTOR_OVERLAP_PATCHES) if overlap_scheduling else {}
-    )
 
     if enable_ac:
         functorch_patches["joint_custom_pass"] = _make_ac_joint_pass(
             ac_stage_size_in_GiB
         )
 
-    inductor_patches["custom_partitioner_fn"] = _SaveAllPartitioner()
+    # Overlap scheduling configs must be set globally (not via config.patch
+    # context manager) because backward compilation is lazy — it happens on
+    # the first .backward() call, after compile_fx returns and the context
+    # manager has exited.
+    if overlap_scheduling:
+        cfg = torch._inductor.config.aten_distributed_optimizations
+        cfg.enable_overlap_scheduling = True
+        cfg.collective_bucketing = True
+        cfg.insert_overlap_deps = True
+        cfg.max_compute_pre_fetch = 10
+
+    # custom_partitioner_fn only applies to forward partitioning, so it can
+    # stay in the context manager.
+    inductor_patches: dict[str, Any] = {
+        "custom_partitioner_fn": _SaveAllPartitioner(),
+    }
 
     def backend(gm, example_inputs):
         with (

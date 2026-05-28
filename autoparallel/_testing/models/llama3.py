@@ -600,6 +600,14 @@ def _apply_op_sac(module: nn.Module) -> nn.Module:
             to_save = func in _OP_SAC_SAVE_LIST and not (
                 func == torch.ops.aten.mm.default and meta[mm_count_key] % 2 == 0
             )
+            # Also save the first residual add output (h = x + attn(...))
+            # to match the reference's min-cut which saves both residual
+            # activations per block.
+            if func == torch.ops.aten.add.Tensor:
+                add_count_key = f"{mode}_add_count"
+                meta[add_count_key] += 1
+                if meta[add_count_key] == 1:
+                    to_save = True
             return (
                 CheckpointPolicy.MUST_SAVE
                 if to_save
