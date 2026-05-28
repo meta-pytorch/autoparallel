@@ -5,6 +5,7 @@
 
 import copy
 import logging
+import operator
 import time
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
@@ -26,11 +27,13 @@ from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from .apply_sharding import apply_sharding_to_model
 from .cast_parametrization import apply_dtype_cast, canonicalize_mp, set_dtype_cast
 from .graph_passes.activation_checkpointing import mark_fsdp_all_gather_recomputation
+from .graph_passes.fuse_allgather import fuse_chained_allgathers
 from .graph_passes.graph_utils import (
     _add_alias,
     _replace_view_mm_view_with_einsum,
     assert_has_no_collectives,
     cleanup_graph,
+    eliminate_alias_round_trips,
     fix_scatter_on_aliased_inputs,
     functionalize_fresh_index_put_mutations,
     update_joint_with_descriptors,
@@ -57,7 +60,36 @@ _APPLY_VIEW_MM_VIEW_PATTERN = True
 logger = logging.getLogger(__name__)
 
 
-def _boxed_nop_preserve_node_meta(fx_g, example_inputs):
+def _boxed_nop_preserve_node_meta(
+    fx_g, example_inputs, pre_pass=None, tag_forward=False
+):
+    if pre_pass is not None:
+        pre_pass(fx_g.graph)
+
+    if tag_forward:
+        # Tag the forward graph's OUTPUT values as "must save". These are
+        # the tensors the first min_cut decided to save for backward —
+        # only these should be saved in the second compilation.
+        # Uses the "custom" meta field (not "recompute") to avoid
+        # interfering with ac_joint_pass which uses "recompute" for
+        # activation checkpointing decisions.
+        output_node = next(n for n in fx_g.graph.nodes if n.op == "output")
+        for out in output_node.args[0]:
+            if not isinstance(out, torch.fx.Node) or out.op != "call_function":
+                continue
+            if out.target == operator.getitem:
+                # getitem metadata doesn't survive preserve_node_meta
+                # (Python builtin, not dispatched). Tag the parent
+                # multi-output op instead — DCE in _extract_fwd_bwd_modules
+                # removes any unused getitem children.
+                parent = out.args[0]
+                if isinstance(parent, torch.fx.Node):
+                    parent.meta.setdefault("custom", {})
+                    parent.meta["custom"]["ap_must_save"] = True
+            else:
+                out.meta.setdefault("custom", {})
+                out.meta["custom"]["ap_must_save"] = True
+
     def run(args):
         with torch.fx.traceback.preserve_node_meta():
             return torch.fx.Interpreter(fx_g).boxed_run(args)
@@ -361,6 +393,10 @@ class AutoParallel:
 
         self.sharding_placement = self.sharding_optimizer.get_solution(verbose=False)
 
+        eliminated = eliminate_alias_round_trips(self.gm, self.sharding_placement)
+        if eliminated:
+            logger.info("Eliminated %d alias redistribution round-trips", eliminated)
+
         if verbose:
             logger.info(self.sharding_optimizer.get_log(verbose=True))
 
@@ -473,6 +509,45 @@ class AutoParallel:
             sharded_buffer_dict,
         )
 
+    def _make_fuse_allgather_pass(self):
+        flat_mesh = self.mesh._flatten() if self.mesh.ndim > 1 else self.mesh
+        pg = flat_mesh.get_group()
+        full_group_size = flat_mesh.size()
+        full_group_name = pg.group_name
+
+        subgroup_order = {
+            self.mesh.get_group(mesh_dim=dim).group_name: dim
+            for dim in range(self.mesh.ndim)
+        }
+
+        # Column-major process group for ascending (dp→tp) chains from
+        # reverse shard order.  Transposing the mesh tensor and flattening
+        # gives ranks in column-major order; sort_ranks=False preserves
+        # that order so allgather concatenates dp-fast.
+        reversed_full_group_name = None
+        if self.mesh.ndim == 2:
+            if not hasattr(self, "_reversed_flat_pg"):
+                import torch.distributed as dist
+                from torch._subclasses.fake_tensor import unset_fake_temporarily
+
+                with unset_fake_temporarily():
+                    col_major_ranks = self.mesh.mesh.T.contiguous().view(-1).tolist()
+                    self._reversed_flat_pg = dist.new_group(
+                        ranks=col_major_ranks, sort_ranks=False
+                    )
+            reversed_full_group_name = self._reversed_flat_pg.group_name
+
+        def pre_pass(graph):
+            fuse_chained_allgathers(
+                graph,
+                full_group_size,
+                full_group_name,
+                subgroup_order=subgroup_order,
+                reversed_full_group_name=reversed_full_group_name,
+            )
+
+        return pre_pass
+
     def apply_placement(self, sharding_placement):
         sharded_param_dict, sharded_buffer_dict = self._apply_placement_common(
             sharding_placement
@@ -482,10 +557,23 @@ class AutoParallel:
             self.parallel_gm.graph, self.reshard_after_forward
         )
 
+        compiler_fn = self.compiler_fn
+        if self.mesh.ndim > 1:
+            from functools import partial
+
+            compiler_fn = partial(
+                compiler_fn,
+                pre_pass=self._make_fuse_allgather_pass(),
+            )
+        else:
+            from functools import partial
+
+        fw_compiler_fn = partial(compiler_fn, tag_forward=True)
+
         self.parallel_model_fn = parallel_model_fn = aot_compile_joint_with_descriptors(
             self.joint_with_descriptors,
-            fw_compiler=self.compiler_fn,
-            bw_compiler=self.compiler_fn,
+            fw_compiler=fw_compiler_fn,
+            bw_compiler=compiler_fn,
         )
 
         # Build a forward-only graph for inference (no backward, no
@@ -500,6 +588,13 @@ class AutoParallel:
             self.parallel_gm, num_fwd_outputs, num_primals
         )
         compiler_fn = self.compiler_fn
+        if self.mesh.ndim > 1:
+            from functools import partial
+
+            compiler_fn = partial(
+                compiler_fn,
+                pre_pass=self._make_fuse_allgather_pass(),
+            )
         aot_config = self.joint_with_descriptors._aot_state.aot_config
         out_spec = self.joint_with_descriptors.out_spec
 
