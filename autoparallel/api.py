@@ -520,14 +520,20 @@ class AutoParallel:
             for dim in range(self.mesh.ndim)
         }
 
-        # Column-major flat mesh for ascending (dp→tp) chains from reverse
-        # shard order.  mesh["tp","dp"] transposes the dims so _flatten()
-        # produces ranks in column-major order.
+        # Column-major process group for ascending (dp→tp) chains from
+        # reverse shard order.  Transposing the mesh tensor and flattening
+        # gives ranks in column-major order; sort_ranks=False preserves
+        # that order so allgather concatenates dp-fast.
         reversed_full_group_name = None
         if self.mesh.ndim == 2:
-            reversed_dim_names = tuple(reversed(self.mesh.mesh_dim_names))
-            reversed_flat_mesh = self.mesh[reversed_dim_names]._flatten()
-            reversed_full_group_name = reversed_flat_mesh.get_group().group_name
+            if not hasattr(self, "_reversed_flat_pg"):
+                import torch.distributed as dist
+
+                col_major_ranks = self.mesh.mesh.T.contiguous().view(-1).tolist()
+                self._reversed_flat_pg = dist.new_group(
+                    ranks=col_major_ranks, sort_ranks=False
+                )
+            reversed_full_group_name = self._reversed_flat_pg.group_name
 
         def pre_pass(graph):
             fuse_chained_allgathers(

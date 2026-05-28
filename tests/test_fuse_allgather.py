@@ -420,3 +420,109 @@ def test_unsqueeze_squeeze_chain():
 
     assert fusions == 0
     assert _count_ops(graph, AG) == 2
+
+
+def test_fuse_with_device_mesh(device_mesh_2d):
+    """Integration test: build fuse pass from a real 2D DeviceMesh and verify
+    that direct dp→tp chains fuse using the column-major process group."""
+    import torch.distributed as dist
+
+    mesh = device_mesh_2d
+    dp_size = mesh.size(0)
+    tp_size = mesh.size(1)
+    full_size = dp_size * tp_size
+
+    # Row-major flat mesh (default)
+    flat_mesh = mesh._flatten()
+    full_group_name = flat_mesh.get_group().group_name
+
+    # Column-major process group via sort_ranks=False
+    col_major_ranks = mesh.mesh.T.contiguous().view(-1).tolist()
+    reversed_pg = dist.new_group(ranks=col_major_ranks, sort_ranks=False)
+    reversed_full_group_name = reversed_pg.group_name
+
+    assert full_group_name != reversed_full_group_name
+
+    subgroup_order = {
+        mesh.get_group(mesh_dim=dim).group_name: dim for dim in range(mesh.ndim)
+    }
+    dp_pg = mesh.get_group(mesh_dim=0).group_name
+    tp_pg = mesh.get_group(mesh_dim=1).group_name
+    assert dp_pg != tp_pg
+
+    # Build a direct dp→tp chain using real PG names.
+    graph = torch.fx.Graph()
+    x = _add_placeholder(graph, "x", (1, 4096))
+    ag1 = _add_all_gather(graph, x, dp_size, dp_pg)
+    wait1 = _add_wait_tensor(graph, ag1)
+    ag2 = _add_all_gather(graph, wait1, tp_size, tp_pg)
+    wait2 = _add_wait_tensor(graph, ag2)
+    graph.output((wait2,))
+
+    fusions = fuse_chained_allgathers(
+        graph,
+        full_group_size=full_size,
+        full_group_name=full_group_name,
+        subgroup_order=subgroup_order,
+        reversed_full_group_name=reversed_full_group_name,
+    )
+
+    assert fusions == 1
+    assert _count_ops(graph, AG) == 1
+
+    ag_node = graph.find_nodes(op="call_function", target=AG)[0]
+    assert ag_node.args[1] == full_size
+    assert ag_node.args[2] == reversed_full_group_name
+
+
+def test_col_major_rank_ordering_correctness():
+    """Verify that allgather on the column-major process group produces the
+    same result as two sequential allgathers (dp then tp) for reverse shard
+    order data.
+
+    For reverse shard order S(0)S(0) on a (dp, tp) mesh, tp is the outer
+    shard and dp is the inner shard.  Rank (dp=i, tp=j) holds the shard at
+    position j*dp_size + i in the full tensor.
+
+    Sequential AG(dp) then AG(tp) recovers the full tensor in correct order.
+    A single AG on the column-major group must produce the same ordering.
+    """
+    dp_size, tp_size = 4, 2
+    full_size = dp_size * tp_size
+    chunk = 3  # rows per shard
+
+    # Per-rank shards: rank r at (dp=r//tp, tp=r%tp) holds shard j*dp+i
+    rank_to_shard = {}
+    for r in range(full_size):
+        dp_idx, tp_idx = r // tp_size, r % tp_size
+        shard_pos = tp_idx * dp_size + dp_idx
+        rank_to_shard[r] = torch.arange(
+            shard_pos * chunk, (shard_pos + 1) * chunk, dtype=torch.float
+        )
+
+    # --- Sequential: AG(dp) then AG(tp) ---
+    # AG(dp): for each tp group, gather dp shards in rank order.
+    after_ag_dp = {}
+    for tp_idx in range(tp_size):
+        dp_group = sorted(r for r in range(full_size) if r % tp_size == tp_idx)
+        gathered = torch.cat([rank_to_shard[r] for r in dp_group])
+        for r in dp_group:
+            after_ag_dp[r] = gathered
+
+    # AG(tp): for each dp group, gather tp results in rank order.
+    for dp_idx in range(dp_size):
+        tp_group = sorted(r for r in range(full_size) if r // tp_size == dp_idx)
+        sequential_result = torch.cat([after_ag_dp[r] for r in tp_group])
+        break  # all ranks get the same result
+
+    # --- Fused: single AG on column-major group ---
+    col_major_ranks = []
+    for tp_idx in range(tp_size):
+        for dp_idx in range(dp_size):
+            col_major_ranks.append(dp_idx * tp_size + tp_idx)
+    fused_result = torch.cat([rank_to_shard[r] for r in col_major_ranks])
+
+    # Both must produce the original tensor in order [0, 1, 2, ..., N*chunk-1]
+    expected = torch.arange(full_size * chunk, dtype=torch.float)
+    torch.testing.assert_close(sequential_result, expected)
+    torch.testing.assert_close(fused_result, expected)
