@@ -4,6 +4,7 @@
 *.pyc
 *.pyo
 *.so
+*.log
 
 .mypy_cache/
 *.egg-info/
@@ -12,5 +13,6 @@ build/
 dist/
 tmp/
 out/
+profile_results/
 
 .vscode/

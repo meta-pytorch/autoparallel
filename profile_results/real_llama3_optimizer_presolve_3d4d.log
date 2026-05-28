@@ -1,7 +1,0 @@
-[14:50:20] start model=1B mesh_ndim=3 skip_solve timeout=1200s
-2026-05-26 14:50:29,648 INFO:autoparallel.api:Graph tracing took 6.073s
-2026-05-26 14:58:18,227 INFO:autoparallel.optimize_sharding:ShardingOptimizer phase profile: phase=strategy_enumeration mesh_shape=(4, 4, 4) mesh_dim_names=('dp', 'tp', 'cp') mesh_size=64 model_params=1.24B graph_nodes=4140 strategy_options=662279 option_tuples=181062856 elapsed=459.509s
-2026-05-26 15:07:42,067 INFO:autoparallel.optimize_sharding:ShardingOptimizer phase profile: phase=decision_vars mesh_shape=(4, 4, 4) mesh_dim_names=('dp', 'tp', 'cp') mesh_size=64 model_params=1.24B unique_ilp_vars=20390366 logical_decision_vars=181062856 cluster_copied_decision_vars=160672490 elapsed=462.310s
-[15:10:23] done model=1B mesh_ndim=3 rc=124
-[15:10:23] start model=1B mesh_ndim=4 skip_solve timeout=1200s
-2026-05-26 15:10:32,788 INFO:autoparallel.api:Graph tracing took 6.079s

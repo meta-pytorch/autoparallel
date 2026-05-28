@@ -203,6 +203,62 @@ class DecisionVar:
     input_spec: Any  # DTensorSpec
 
 
+@dataclass
+class LPRelaxationResult:
+    objective: float
+    status: str
+    solve_s: float
+    total_s: float
+
+
+@dataclass
+class DPTopology:
+    nodes: list[torch.fx.Node]
+    predecessors: dict[torch.fx.Node, list[torch.fx.Node]]
+    node_to_index: dict[torch.fx.Node, int]
+
+
+class DPBasedShardingSolver:
+    def __init__(self, optimizer):
+        self.optimizer = optimizer
+        self.topology: Optional[DPTopology] = None
+
+    def build_topological_order(self):
+        nodes = [node for node in self.optimizer.nodes if node.op != "output"]
+        node_to_index = {node: i for i, node in enumerate(nodes)}
+        predecessors = {}
+
+        for node in nodes:
+            node_predecessors = self.optimizer._all_input_nodes(node)
+            predecessors[node] = node_predecessors
+            node_index = node_to_index[node]
+            for pred in node_predecessors:
+                pred_index = node_to_index.get(pred)
+                if pred_index is None:
+                    raise RuntimeError(
+                        f"Predecessor {pred} for node {node} is missing from "
+                        "the DP topology"
+                    )
+                if pred_index >= node_index:
+                    raise RuntimeError(
+                        f"Predecessor {pred} for node {node} does not appear "
+                        "before it in topological order"
+                    )
+
+        self.topology = DPTopology(
+            nodes=nodes,
+            predecessors=predecessors,
+            node_to_index=node_to_index,
+        )
+        return self.topology
+
+    def get_solution(self, verbose=False):
+        raise NotImplementedError(
+            "DP-based sharding solver only builds topological order today; "
+            "strategy selection is not implemented yet."
+        )
+
+
 def _assert_has_tensor_meta(spec_or_specs, node, label):
     """Assert that all DTensorSpecs in a spec (possibly a tuple) have tensor_meta."""
     if isinstance(spec_or_specs, (list, tuple)):
@@ -224,8 +280,15 @@ class ShardingOptimizer:
         mesh,
         force_grad_reduce_in_higher_precision=False,
         repeated_subgraphs=False,
+        solver_backend="ilp",
     ):
         self.orig_gm = gm
+        if solver_backend not in {"ilp", "dp"}:
+            raise ValueError(
+                f"Unsupported solver_backend={solver_backend!r}; "
+                "expected 'ilp' or 'dp'"
+            )
+        self.solver_backend = solver_backend
         # The optimizer works on a concretized copy of the graph where all
         # symbolic shapes are replaced with their concrete hint values. This
         # centralizes dynamic-shape handling: the optimization pipeline
@@ -276,6 +339,37 @@ class ShardingOptimizer:
         get_placement_options_timer().report()
 
         self.cluster_links: dict[tuple, tuple] = {}
+        if self.solver_backend == "dp":
+            t0 = time.perf_counter()
+            self.solver = DPBasedShardingSolver(self)
+            topology = self.solver.build_topological_order()
+            t1 = time.perf_counter()
+            self.profile["dp"] = {
+                "topology_nodes": len(topology.nodes),
+                "topology_edges": sum(
+                    len(preds) for preds in topology.predecessors.values()
+                ),
+            }
+            self.profile["timings"].update(
+                {
+                    "topology_construction_s": t1 - t0,
+                    "init_total_s": t1 - t_init_start,
+                }
+            )
+            logger.info(
+                "ShardingOptimizer phase profile: phase=dp_topology "
+                "mesh_shape=%s mesh_dim_names=%s mesh_size=%s model_params=%s "
+                "topology_nodes=%s topology_edges=%s elapsed=%.3fs",
+                self.profile["mesh"]["shape"],
+                self.profile["mesh"]["dim_names"],
+                self.profile["mesh"]["size"],
+                self._format_billions(self.profile["model"]["parameter_numel"]),
+                self.profile["dp"]["topology_nodes"],
+                self.profile["dp"]["topology_edges"],
+                t1 - t0,
+            )
+            return
+
         if repeated_subgraphs:
             t = time.time()
             clusters = get_identical_regions(self.gm.graph, self.strats)
@@ -641,14 +735,19 @@ class ShardingOptimizer:
                 for inp_idx in range(len(strategy.redistribute_cost[argi])):
                     yield argi, out_idx, inp_idx
 
-    def _create_pulp_variables(self):
-        """Create PuLP binary variables for all decision points, resolving
-        cluster links so that identical nodes share the same variable.
+    def _create_pulp_variables(self, variable_category=pulp.LpBinary):
+        """Create PuLP variables for all decision points, resolving cluster
+        links so that identical nodes share the same variable.
 
         Returns a dict mapping root (node_idx, argi, out_idx, inp_idx) keys
         to their PuLP variables. Linked keys are not stored; use
         _get_pulp_variable() to resolve them through cluster_links.
         """
+        if variable_category not in {pulp.LpBinary, pulp.LpContinuous}:
+            raise ValueError(
+                f"Unsupported variable_category={variable_category!r}; "
+                "expected pulp.LpBinary or pulp.LpContinuous"
+            )
         cluster_linked_node_idxs = {key[0] for key in self.cluster_links}
 
         pulp_variables = {}
@@ -661,10 +760,16 @@ class ShardingOptimizer:
             for argi, out_idx, inp_idx in self.walk_over_options(node):
                 key = (node_idx, argi, out_idx, inp_idx)
                 root_node = self.nodes[node_idx]
+                bounds = (
+                    {"lowBound": 0, "upBound": 1}
+                    if variable_category == pulp.LpContinuous
+                    else {}
+                )
                 pulp_variables[key] = pulp.LpVariable(
                     f"n={root_node},s={node_idx},arg={argi},"
                     f"output_p={out_idx},input_p={inp_idx}",
-                    cat=pulp.LpBinary,
+                    cat=variable_category,
+                    **bounds,
                 )
 
         return pulp_variables
@@ -1133,6 +1238,97 @@ class ShardingOptimizer:
             terms.append(dv.var * dv.cost * multiplier)
         self.prob += pulp.lpSum(terms)
 
+    def get_lower_bound(self, verbose=False):
+        """Solve the LP relaxation and return a lower bound on the ILP objective.
+
+        This relaxes the existing binary PuLP variables to continuous variables
+        in [0, 1], solves the current problem with all constraints already added,
+        then restores the optimizer state. The result is a certificate only:
+        fractional LP values are not valid sharding placements.
+        """
+        if self.solver_backend == "dp":
+            raise NotImplementedError(
+                "LP relaxation is only available for the PuLP-backed optimizer"
+            )
+
+        t0 = time.perf_counter()
+        old_objective = self.prob.objective
+        old_status = self.prob.status
+        old_sol_status = getattr(self.prob, "sol_status", None)
+        old_selected_keys_marker = object()
+        old_selected_keys = getattr(self, "selected_keys", old_selected_keys_marker)
+        var_states = {
+            var: (var.cat, var.lowBound, var.upBound, var.varValue)
+            for var in self.pulp_variables.values()
+        }
+
+        try:
+            if self.prob.objective is None:
+                self._set_objective()
+
+            for var in self.pulp_variables.values():
+                var.cat = pulp.LpContinuous
+                var.lowBound = 0
+                var.upBound = 1
+                var.varValue = None
+
+            solver = pulp.PULP_CBC_CMD(msg=verbose)
+            t_solve0 = time.perf_counter()
+            with tempfile.TemporaryDirectory() as tmpdir:
+                solver.tmpDir = tmpdir
+                self.prob.solve(solver)
+            solve_s = time.perf_counter() - t_solve0
+
+            status = pulp.LpStatus.get(self.prob.status, self.prob.status)
+            objective = self._safe_float(pulp.value(self.prob.objective))
+            result = LPRelaxationResult(
+                objective=objective,
+                status=status,
+                solve_s=solve_s,
+                total_s=time.perf_counter() - t0,
+            )
+            self.profile["last_lp_relaxation"] = {
+                "objective": result.objective,
+                "status": result.status,
+                "solve_s": result.solve_s,
+                "total_s": result.total_s,
+            }
+            logger.info(
+                "ShardingOptimizer LP relaxation profile: "
+                "mesh_shape=%s mesh_dim_names=%s mesh_size=%s model_params=%s "
+                "unique_ilp_vars=%s constraints=%s status=%s objective=%.4f "
+                "timings={solve=%.3fs,total=%.3fs}",
+                self.profile["mesh"]["shape"],
+                self.profile["mesh"]["dim_names"],
+                self.profile["mesh"]["size"],
+                self._format_billions(self.profile["model"]["parameter_numel"]),
+                len(self.pulp_variables),
+                len(self.prob.constraints),
+                result.status,
+                result.objective,
+                result.solve_s,
+                result.total_s,
+            )
+            return result
+        finally:
+            for var, (cat, low_bound, up_bound, value) in var_states.items():
+                var.cat = cat
+                var.lowBound = low_bound
+                var.upBound = up_bound
+                var.varValue = value
+            self.prob.objective = old_objective
+            self.prob.status = old_status
+            if old_sol_status is None:
+                if hasattr(self.prob, "sol_status"):
+                    delattr(self.prob, "sol_status")
+            else:
+                self.prob.sol_status = old_sol_status
+            if old_selected_keys is old_selected_keys_marker:
+                if hasattr(self, "selected_keys"):
+                    delattr(self, "selected_keys")
+            else:
+                self.selected_keys = old_selected_keys
+
     def _solve(self, verbose=False):
         solver = pulp.PULP_CBC_CMD(msg=verbose)
         # Use a dedicated temp directory for PuLP's intermediate files (.mps,
@@ -1257,6 +1453,9 @@ class ShardingOptimizer:
         return {self._orig_to_concrete[node]: spec for node, spec in solution.items()}
 
     def get_solution(self, verbose=False):
+        if self.solver_backend == "dp":
+            return self.solver.get_solution(verbose=verbose)
+
         t0 = time.perf_counter()
         t_objective0 = time.perf_counter()
         self._set_objective()

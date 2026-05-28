@@ -1,3 +1,0 @@
-model_key,mesh_ndim,mesh_shape,timeout_s,result
-1B,3,4x4x4,1200,timeout_after_decision_vars_before_constraints
-1B,4,4x4x2x2,,not_run
