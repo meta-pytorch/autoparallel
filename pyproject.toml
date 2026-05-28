@@ -61,3 +61,9 @@ exclude = [
   "autoparallel/tools/overlap_simulator/repro_.*\\.py",
   "autoparallel/visualizer/build_display_from_json\\.py",
 ]
+
+[tool.pyrefly]
+search-path = [
+  "/home/wangkj/.conda/envs/pt-dev/lib/python3.12/site-packages",
+  "/data/users/wangkj/pytorch",
+]

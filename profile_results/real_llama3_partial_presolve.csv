@@ -1,0 +1,3 @@
+model_key,mesh_ndim,mesh_shape,parameter_b,graph_nodes,strategy_options,option_tuples,strategy_enumeration_s,unique_ilp_vars,logical_decision_vars,cluster_copied_decision_vars,decision_var_build_s,constraints,solve_s,status
+1B,3,4x4x4,1.2358144,4140,662279,181062856,459.509,20390366,181062856,160672490,462.310,,,timeout_before_constraints
+1B,4,4x4x2x2,1.2358144,,,,,,,,,,,not_run

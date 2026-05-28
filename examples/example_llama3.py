@@ -8,10 +8,6 @@ import time
 from functools import partial
 
 import torch
-from torch.distributed.fsdp import MixedPrecisionPolicy
-from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
-from torch.testing._internal.distributed.fake_pg import FakeStore
-
 from autoparallel._testing.models.llama3 import Transformer, TransformerModelArgs
 from autoparallel.api import AutoParallel
 from autoparallel.compile import autoparallel_backend
@@ -24,6 +20,9 @@ from autoparallel.graph_passes.auto_bucketing import (
 )
 from autoparallel.graph_passes.debug_helpers import make_custom_runtime_estimation
 from autoparallel.graph_passes.estimate_graph_metrics import estimate_graph_metrics
+from torch.distributed.fsdp import MixedPrecisionPolicy
+from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
+from torch.testing._internal.distributed.fake_pg import FakeStore
 
 logging.basicConfig(level=logging.DEBUG)
 

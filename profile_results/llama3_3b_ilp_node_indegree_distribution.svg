@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="980" height="620" viewBox="0 0 980 620">
+<rect width="100%" height="100%" fill="#ffffff"/>
+<style>
+text { font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #111827; }
+.title { font-size: 24px; font-weight: 700; }
+.subtitle { font-size: 13px; fill: #4b5563; }
+.axis { stroke: #111827; stroke-width: 1.2; }
+.grid { stroke: #e5e7eb; stroke-width: 1; }
+.tick { font-size: 12px; fill: #374151; }
+.label { font-size: 13px; font-weight: 600; }
+.note { font-size: 12px; fill: #6b7280; }
+</style>
+<text class="title" x="92" y="42">AutoParallel ILP Node In-Degree Distribution</text>
+<text class="subtitle" x="92" y="66">LLaMA3 3B, mesh=(64,), repeated_subgraphs=True; raw optimizer DAG, no manual cluster collapse</text>
+<text class="subtitle" x="92" y="84">Nodes excluding output: 7199; unique direct dependency edges: 8805</text>
+<line class="grid" x1="92" y1="524.0" x2="938" y2="524.0"/>
+<text class="tick" x="80" y="528.0" text-anchor="end">1</text>
+<line class="grid" x1="92" y1="419.0" x2="938" y2="419.0"/>
+<text class="tick" x="80" y="423.0" text-anchor="end">10</text>
+<line class="grid" x1="92" y1="314.0" x2="938" y2="314.0"/>
+<text class="tick" x="80" y="318.0" text-anchor="end">100</text>
+<line class="grid" x1="92" y1="209.0" x2="938" y2="209.0"/>
+<text class="tick" x="80" y="213.0" text-anchor="end">1000</text>
+<line class="grid" x1="92" y1="104.0" x2="938" y2="104.0"/>
+<text class="tick" x="80" y="108.0" text-anchor="end">10000</text>
+<line class="axis" x1="92" y1="524" x2="938" y2="524"/>
+<line class="axis" x1="92" y1="104" x2="92" y2="524"/>
+<text class="tick" x="515.0" y="586" text-anchor="middle">direct dependency nodes / in-degree</text>
+<text class="tick" transform="translate(26 314.0) rotate(-90)" text-anchor="middle">node count, log scale</text>
+<rect x="140.2" y="271.0" width="92.0" height="253.0" rx="4" fill="#64748b"/>
+<text class="label" x="186.2" y="247.0" text-anchor="middle">257</text>
+<text class="note" x="186.2" y="263.0" text-anchor="middle">3.57%</text>
+<text class="tick" x="186.2" y="550.0" text-anchor="middle">0</text>
+<rect x="328.8" y="133.2" width="92.0" height="390.8" rx="4" fill="#2563eb"/>
+<text class="label" x="374.8" y="109.2" text-anchor="middle">5275</text>
+<text class="note" x="374.8" y="125.2" text-anchor="middle">73.27%</text>
+<text class="tick" x="374.8" y="550.0" text-anchor="middle">1</text>
+<rect x="517.2" y="187.3" width="92.0" height="336.7" rx="4" fill="#0f766e"/>
+<text class="label" x="563.2" y="163.3" text-anchor="middle">1611</text>
+<text class="note" x="563.2" y="179.3" text-anchor="middle">22.38%</text>
+<text class="tick" x="563.2" y="550.0" text-anchor="middle">2</text>
+<rect x="705.8" y="372.0" width="92.0" height="152.0" rx="4" fill="#d97706"/>
+<text class="label" x="751.8" y="348.0" text-anchor="middle">28</text>
+<text class="note" x="751.8" y="364.0" text-anchor="middle">0.39%</text>
+<text class="tick" x="751.8" y="550.0" text-anchor="middle">3</text>
+<rect x="894.2" y="372.0" width="92.0" height="152.0" rx="4" fill="#dc2626"/>
+<text class="label" x="940.2" y="348.0" text-anchor="middle">28</text>
+<text class="note" x="940.2" y="364.0" text-anchor="middle">0.39%</text>
+<text class="tick" x="940.2" y="550.0" text-anchor="middle">8</text>
+<text class="note" x="92" y="606">Histogram: 0-&gt;257, 1-&gt;5275, 2-&gt;1611, 3-&gt;28, 8-&gt;28</text>
+</svg>

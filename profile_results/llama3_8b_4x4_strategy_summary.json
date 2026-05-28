@@ -1,0 +1,2054 @@
+{
+  "config": {
+    "batch_size": 8,
+    "input_constraint": "Shard(0), Replicate()",
+    "mesh_dim_names": [
+      "dp",
+      "tp"
+    ],
+    "mesh_shape": [
+      4,
+      4
+    ],
+    "model": "autoparallel._testing.models.llama3 Transformer 8B config",
+    "output_constraint": "Shard(0), Shard(2)",
+    "seqlen": 8192,
+    "vocab_size": 128256,
+    "world_size": 16
+  },
+  "elapsed_s": 115.23945621983148,
+  "json_summary": {
+    "comm": 212780.17498325979,
+    "compute": 581120.8234224034,
+    "total": 794933.9984056632,
+    "transition": 1033.0
+  },
+  "optimizer_profile": {
+    "ilp": {
+      "cluster_copied_decision_variables": 8181840,
+      "constraints": 175408,
+      "logical_decision_variables": 8657526,
+      "unique_variables": 475686
+    },
+    "last_solve": {
+      "constraints": 175412,
+      "extract_s": 0.044429945992305875,
+      "kind": "solve",
+      "objective": 794933.998405679,
+      "objective_s": 3.8023465629667044,
+      "pipeline_total_s": 102.16174313612282,
+      "solve_s": 59.80278266593814,
+      "status": "Optimal",
+      "total_s": 63.73084603413008,
+      "unique_variables": 475686
+    },
+    "mesh": {
+      "dim_names": [
+        "dp",
+        "tp"
+      ],
+      "ndim": 2,
+      "shape": [
+        4,
+        4
+      ],
+      "size": 16
+    },
+    "model": {
+      "graph_nodes": 8668,
+      "op_counts": {
+        "call_function": 8373,
+        "output": 1,
+        "placeholder": 294
+      },
+      "parameter_bytes": 32121044992,
+      "parameter_nodes": 291,
+      "parameter_numel": 8030261248,
+      "tensor_nodes": 8667,
+      "unknown_parameter_nodes": 0
+    },
+    "strategies": {
+      "max_strategies_per_node": 81,
+      "nodes": 8668,
+      "option_tuples": 8657526,
+      "strategy_options": 220687
+    },
+    "timings": {
+      "compute_cost_estimation_s": 1.9735342266503721,
+      "constraint_construction_s": 3.2506618059705943,
+      "cost_estimation_s": 4.9254587206523865,
+      "decision_var_build_s": 15.363263476872817,
+      "decision_var_overhead_s": 6.9146421970799565,
+      "edge_cost_estimation_s": 2.9519244940020144,
+      "ilp_construction_s": 13.688466562191024,
+      "init_total_s": 38.43089710199274,
+      "pulp_var_creation_s": 3.5231625591404736,
+      "strategy_enumeration_s": 10.847158421995118,
+      "validation_s": 0.060926787089556456
+    }
+  },
+  "param_strategy_groups": {
+    "layers.*.attention.wk.weight": {
+      "S(0)S(0)": 32
+    },
+    "layers.*.attention.wo.weight": {
+      "S(0)S(0)": 32
+    },
+    "layers.*.attention.wq.weight": {
+      "S(0)S(0)": 32
+    },
+    "layers.*.attention.wv.weight": {
+      "S(0)S(0)": 32
+    },
+    "layers.*.attention_norm.weight": {
+      "S(0)S(0)": 32
+    },
+    "layers.*.feed_forward.w1.weight": {
+      "S(0)S(0)": 32
+    },
+    "layers.*.feed_forward.w2.weight": {
+      "S(0)S(1)": 32
+    },
+    "layers.*.feed_forward.w3.weight": {
+      "S(0)S(0)": 32
+    },
+    "layers.*.ffn_norm.weight": {
+      "S(0)S(0)": 32
+    },
+    "norm.weight": {
+      "S(0)S(0)": 1
+    },
+    "output.weight": {
+      "S(0)S(0)": 1
+    },
+    "tok_embeddings.weight": {
+      "S(1)S(1)": 1
+    }
+  },
+  "phase_placement_counts": {
+    "backward": [
+      [
+        "S(0)S(2)",
+        1634
+      ],
+      [
+        "S(0)S(1)",
+        1423
+      ],
+      [
+        "P(sum)S(0)",
+        354
+      ],
+      [
+        "P(sum)P(sum)",
+        291
+      ],
+      [
+        "S(0)S(0)",
+        258
+      ],
+      [
+        "RR",
+        257
+      ],
+      [
+        "P(sum)S(1)",
+        225
+      ],
+      [
+        "RS(0)",
+        129
+      ],
+      [
+        "S(0)P(sum)",
+        97
+      ],
+      [
+        "S(0)R",
+        32
+      ],
+      [
+        "RS(1)",
+        32
+      ],
+      [
+        "(S(0)S(1), S(0)S(1), S(0)S(1))",
+        32
+      ],
+      [
+        "S(1)S(1)",
+        3
+      ]
+    ],
+    "forward": [
+      [
+        "S(0)S(2)",
+        1378
+      ],
+      [
+        "S(0)S(1)",
+        1227
+      ],
+      [
+        "S(0)S(0)",
+        516
+      ],
+      [
+        "RR",
+        324
+      ],
+      [
+        "RS(1)",
+        258
+      ],
+      [
+        "S(0)R",
+        66
+      ],
+      [
+        "RS(0)",
+        64
+      ],
+      [
+        "(S(0)S(1), S(0)S(1), None, None, None, None, RR, RR, RR)",
+        32
+      ],
+      [
+        "S(0)P(sum)",
+        32
+      ],
+      [
+        "S(1)S(1)",
+        2
+      ],
+      [
+        "S(2)S(2)",
+        1
+      ]
+    ]
+  },
+  "placement_counts": [
+    [
+      "S(0)S(2)",
+      3012
+    ],
+    [
+      "S(0)S(1)",
+      2650
+    ],
+    [
+      "S(0)S(0)",
+      774
+    ],
+    [
+      "RR",
+      581
+    ],
+    [
+      "P(sum)S(0)",
+      354
+    ],
+    [
+      "P(sum)P(sum)",
+      291
+    ],
+    [
+      "RS(1)",
+      290
+    ],
+    [
+      "P(sum)S(1)",
+      225
+    ],
+    [
+      "RS(0)",
+      193
+    ],
+    [
+      "S(0)P(sum)",
+      129
+    ],
+    [
+      "S(0)R",
+      98
+    ],
+    [
+      "(S(0)S(1), S(0)S(1), None, None, None, None, RR, RR, RR)",
+      32
+    ],
+    [
+      "(S(0)S(1), S(0)S(1), S(0)S(1))",
+      32
+    ],
+    [
+      "S(1)S(1)",
+      5
+    ],
+    [
+      "S(2)S(2)",
+      1
+    ]
+  ],
+  "sample_forward_interesting_nodes": [
+    {
+      "inputs": [],
+      "module_path": "layers.0.attention.wq.weight",
+      "name": "primals_2",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        4096,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.0.attention.wk.weight",
+      "name": "primals_3",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        1024,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.0.attention.wv.weight",
+      "name": "primals_4",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        1024,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.0.attention.wo.weight",
+      "name": "primals_5",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        4096,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.0.feed_forward.w1.weight",
+      "name": "primals_6",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        14336,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.0.feed_forward.w2.weight",
+      "name": "primals_7",
+      "op": "placeholder",
+      "placement": "S(0)S(1)",
+      "shape": [
+        4096,
+        14336
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.0.feed_forward.w3.weight",
+      "name": "primals_8",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        14336,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.1.attention.wq.weight",
+      "name": "primals_11",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        4096,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.1.attention.wk.weight",
+      "name": "primals_12",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        1024,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.1.attention.wv.weight",
+      "name": "primals_13",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        1024,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.1.attention.wo.weight",
+      "name": "primals_14",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        4096,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.1.feed_forward.w1.weight",
+      "name": "primals_15",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        14336,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.1.feed_forward.w2.weight",
+      "name": "primals_16",
+      "op": "placeholder",
+      "placement": "S(0)S(1)",
+      "shape": [
+        4096,
+        14336
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.1.feed_forward.w3.weight",
+      "name": "primals_17",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        14336,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.2.attention.wq.weight",
+      "name": "primals_20",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        4096,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.2.attention.wk.weight",
+      "name": "primals_21",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        1024,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.2.attention.wv.weight",
+      "name": "primals_22",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        1024,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.2.attention.wo.weight",
+      "name": "primals_23",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        4096,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.2.feed_forward.w1.weight",
+      "name": "primals_24",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        14336,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.2.feed_forward.w2.weight",
+      "name": "primals_25",
+      "op": "placeholder",
+      "placement": "S(0)S(1)",
+      "shape": [
+        4096,
+        14336
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.2.feed_forward.w3.weight",
+      "name": "primals_26",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        14336,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.3.attention.wq.weight",
+      "name": "primals_29",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        4096,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.3.attention.wk.weight",
+      "name": "primals_30",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        1024,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.3.attention.wv.weight",
+      "name": "primals_31",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        1024,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.3.attention.wo.weight",
+      "name": "primals_32",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        4096,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.3.feed_forward.w1.weight",
+      "name": "primals_33",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        14336,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.3.feed_forward.w2.weight",
+      "name": "primals_34",
+      "op": "placeholder",
+      "placement": "S(0)S(1)",
+      "shape": [
+        4096,
+        14336
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.3.feed_forward.w3.weight",
+      "name": "primals_35",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        14336,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.4.attention.wq.weight",
+      "name": "primals_38",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        4096,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.4.attention.wk.weight",
+      "name": "primals_39",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        1024,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.4.attention.wv.weight",
+      "name": "primals_40",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        1024,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.4.attention.wo.weight",
+      "name": "primals_41",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        4096,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.4.feed_forward.w1.weight",
+      "name": "primals_42",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        14336,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.4.feed_forward.w2.weight",
+      "name": "primals_43",
+      "op": "placeholder",
+      "placement": "S(0)S(1)",
+      "shape": [
+        4096,
+        14336
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.4.feed_forward.w3.weight",
+      "name": "primals_44",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        14336,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.5.attention.wq.weight",
+      "name": "primals_47",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        4096,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.5.attention.wk.weight",
+      "name": "primals_48",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        1024,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.5.attention.wv.weight",
+      "name": "primals_49",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        1024,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.5.attention.wo.weight",
+      "name": "primals_50",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        4096,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.5.feed_forward.w1.weight",
+      "name": "primals_51",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        14336,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.5.feed_forward.w2.weight",
+      "name": "primals_52",
+      "op": "placeholder",
+      "placement": "S(0)S(1)",
+      "shape": [
+        4096,
+        14336
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.5.feed_forward.w3.weight",
+      "name": "primals_53",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        14336,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.6.attention.wq.weight",
+      "name": "primals_56",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        4096,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.6.attention.wk.weight",
+      "name": "primals_57",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        1024,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.6.attention.wv.weight",
+      "name": "primals_58",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        1024,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.6.attention.wo.weight",
+      "name": "primals_59",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        4096,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.6.feed_forward.w1.weight",
+      "name": "primals_60",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        14336,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.6.feed_forward.w2.weight",
+      "name": "primals_61",
+      "op": "placeholder",
+      "placement": "S(0)S(1)",
+      "shape": [
+        4096,
+        14336
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.6.feed_forward.w3.weight",
+      "name": "primals_62",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        14336,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.7.attention.wq.weight",
+      "name": "primals_65",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        4096,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.7.attention.wk.weight",
+      "name": "primals_66",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        1024,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.7.attention.wv.weight",
+      "name": "primals_67",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        1024,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.7.attention.wo.weight",
+      "name": "primals_68",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        4096,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.7.feed_forward.w1.weight",
+      "name": "primals_69",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        14336,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.7.feed_forward.w2.weight",
+      "name": "primals_70",
+      "op": "placeholder",
+      "placement": "S(0)S(1)",
+      "shape": [
+        4096,
+        14336
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.7.feed_forward.w3.weight",
+      "name": "primals_71",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        14336,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.8.attention.wq.weight",
+      "name": "primals_74",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        4096,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.8.attention.wk.weight",
+      "name": "primals_75",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        1024,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.8.attention.wv.weight",
+      "name": "primals_76",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        1024,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.8.attention.wo.weight",
+      "name": "primals_77",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        4096,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.8.feed_forward.w1.weight",
+      "name": "primals_78",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        14336,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.8.feed_forward.w2.weight",
+      "name": "primals_79",
+      "op": "placeholder",
+      "placement": "S(0)S(1)",
+      "shape": [
+        4096,
+        14336
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.8.feed_forward.w3.weight",
+      "name": "primals_80",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        14336,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.9.attention.wq.weight",
+      "name": "primals_83",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        4096,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.9.attention.wk.weight",
+      "name": "primals_84",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        1024,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.9.attention.wv.weight",
+      "name": "primals_85",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        1024,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.9.attention.wo.weight",
+      "name": "primals_86",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        4096,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.9.feed_forward.w1.weight",
+      "name": "primals_87",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        14336,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.9.feed_forward.w2.weight",
+      "name": "primals_88",
+      "op": "placeholder",
+      "placement": "S(0)S(1)",
+      "shape": [
+        4096,
+        14336
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.9.feed_forward.w3.weight",
+      "name": "primals_89",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        14336,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.10.attention.wq.weight",
+      "name": "primals_92",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        4096,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.10.attention.wk.weight",
+      "name": "primals_93",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        1024,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.10.attention.wv.weight",
+      "name": "primals_94",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        1024,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.10.attention.wo.weight",
+      "name": "primals_95",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        4096,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.10.feed_forward.w1.weight",
+      "name": "primals_96",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        14336,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.10.feed_forward.w2.weight",
+      "name": "primals_97",
+      "op": "placeholder",
+      "placement": "S(0)S(1)",
+      "shape": [
+        4096,
+        14336
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.10.feed_forward.w3.weight",
+      "name": "primals_98",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        14336,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.11.attention.wq.weight",
+      "name": "primals_101",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        4096,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.11.attention.wk.weight",
+      "name": "primals_102",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        1024,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.11.attention.wv.weight",
+      "name": "primals_103",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        1024,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.11.attention.wo.weight",
+      "name": "primals_104",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        4096,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.11.feed_forward.w1.weight",
+      "name": "primals_105",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        14336,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.11.feed_forward.w2.weight",
+      "name": "primals_106",
+      "op": "placeholder",
+      "placement": "S(0)S(1)",
+      "shape": [
+        4096,
+        14336
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.11.feed_forward.w3.weight",
+      "name": "primals_107",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        14336,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.12.attention.wq.weight",
+      "name": "primals_110",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        4096,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.12.attention.wk.weight",
+      "name": "primals_111",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        1024,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.12.attention.wv.weight",
+      "name": "primals_112",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        1024,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.12.attention.wo.weight",
+      "name": "primals_113",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        4096,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.12.feed_forward.w1.weight",
+      "name": "primals_114",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        14336,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.12.feed_forward.w2.weight",
+      "name": "primals_115",
+      "op": "placeholder",
+      "placement": "S(0)S(1)",
+      "shape": [
+        4096,
+        14336
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.12.feed_forward.w3.weight",
+      "name": "primals_116",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        14336,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.13.attention.wq.weight",
+      "name": "primals_119",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        4096,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.13.attention.wk.weight",
+      "name": "primals_120",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        1024,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.13.attention.wv.weight",
+      "name": "primals_121",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        1024,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.13.attention.wo.weight",
+      "name": "primals_122",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        4096,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.13.feed_forward.w1.weight",
+      "name": "primals_123",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        14336,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.13.feed_forward.w2.weight",
+      "name": "primals_124",
+      "op": "placeholder",
+      "placement": "S(0)S(1)",
+      "shape": [
+        4096,
+        14336
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.13.feed_forward.w3.weight",
+      "name": "primals_125",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        14336,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.14.attention.wq.weight",
+      "name": "primals_128",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        4096,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.14.attention.wk.weight",
+      "name": "primals_129",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        1024,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.14.attention.wv.weight",
+      "name": "primals_130",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        1024,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.14.attention.wo.weight",
+      "name": "primals_131",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        4096,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.14.feed_forward.w1.weight",
+      "name": "primals_132",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        14336,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.14.feed_forward.w2.weight",
+      "name": "primals_133",
+      "op": "placeholder",
+      "placement": "S(0)S(1)",
+      "shape": [
+        4096,
+        14336
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.14.feed_forward.w3.weight",
+      "name": "primals_134",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        14336,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.15.attention.wq.weight",
+      "name": "primals_137",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        4096,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.15.attention.wk.weight",
+      "name": "primals_138",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        1024,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.15.attention.wv.weight",
+      "name": "primals_139",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        1024,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.15.attention.wo.weight",
+      "name": "primals_140",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        4096,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.15.feed_forward.w1.weight",
+      "name": "primals_141",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        14336,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.15.feed_forward.w2.weight",
+      "name": "primals_142",
+      "op": "placeholder",
+      "placement": "S(0)S(1)",
+      "shape": [
+        4096,
+        14336
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.15.feed_forward.w3.weight",
+      "name": "primals_143",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        14336,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.16.attention.wq.weight",
+      "name": "primals_146",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        4096,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.16.attention.wk.weight",
+      "name": "primals_147",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        1024,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.16.attention.wv.weight",
+      "name": "primals_148",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        1024,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.16.attention.wo.weight",
+      "name": "primals_149",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        4096,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.16.feed_forward.w1.weight",
+      "name": "primals_150",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        14336,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.16.feed_forward.w2.weight",
+      "name": "primals_151",
+      "op": "placeholder",
+      "placement": "S(0)S(1)",
+      "shape": [
+        4096,
+        14336
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.16.feed_forward.w3.weight",
+      "name": "primals_152",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        14336,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.17.attention.wq.weight",
+      "name": "primals_155",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        4096,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.17.attention.wk.weight",
+      "name": "primals_156",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        1024,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.17.attention.wv.weight",
+      "name": "primals_157",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        1024,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.17.attention.wo.weight",
+      "name": "primals_158",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        4096,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.17.feed_forward.w1.weight",
+      "name": "primals_159",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        14336,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.17.feed_forward.w2.weight",
+      "name": "primals_160",
+      "op": "placeholder",
+      "placement": "S(0)S(1)",
+      "shape": [
+        4096,
+        14336
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.17.feed_forward.w3.weight",
+      "name": "primals_161",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        14336,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.18.attention.wq.weight",
+      "name": "primals_164",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        4096,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.18.attention.wk.weight",
+      "name": "primals_165",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        1024,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.18.attention.wv.weight",
+      "name": "primals_166",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        1024,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.18.attention.wo.weight",
+      "name": "primals_167",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        4096,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.18.feed_forward.w1.weight",
+      "name": "primals_168",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        14336,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.18.feed_forward.w2.weight",
+      "name": "primals_169",
+      "op": "placeholder",
+      "placement": "S(0)S(1)",
+      "shape": [
+        4096,
+        14336
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.18.feed_forward.w3.weight",
+      "name": "primals_170",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        14336,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.19.attention.wq.weight",
+      "name": "primals_173",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        4096,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.19.attention.wk.weight",
+      "name": "primals_174",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        1024,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.19.attention.wv.weight",
+      "name": "primals_175",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        1024,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.19.attention.wo.weight",
+      "name": "primals_176",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        4096,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.19.feed_forward.w1.weight",
+      "name": "primals_177",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        14336,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.19.feed_forward.w2.weight",
+      "name": "primals_178",
+      "op": "placeholder",
+      "placement": "S(0)S(1)",
+      "shape": [
+        4096,
+        14336
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.19.feed_forward.w3.weight",
+      "name": "primals_179",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        14336,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.20.attention.wq.weight",
+      "name": "primals_182",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        4096,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.20.attention.wk.weight",
+      "name": "primals_183",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        1024,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.20.attention.wv.weight",
+      "name": "primals_184",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        1024,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.20.attention.wo.weight",
+      "name": "primals_185",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        4096,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.20.feed_forward.w1.weight",
+      "name": "primals_186",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        14336,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.20.feed_forward.w2.weight",
+      "name": "primals_187",
+      "op": "placeholder",
+      "placement": "S(0)S(1)",
+      "shape": [
+        4096,
+        14336
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.20.feed_forward.w3.weight",
+      "name": "primals_188",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        14336,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.21.attention.wq.weight",
+      "name": "primals_191",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        4096,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.21.attention.wk.weight",
+      "name": "primals_192",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        1024,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.21.attention.wv.weight",
+      "name": "primals_193",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        1024,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.21.attention.wo.weight",
+      "name": "primals_194",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        4096,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.21.feed_forward.w1.weight",
+      "name": "primals_195",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        14336,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.21.feed_forward.w2.weight",
+      "name": "primals_196",
+      "op": "placeholder",
+      "placement": "S(0)S(1)",
+      "shape": [
+        4096,
+        14336
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.21.feed_forward.w3.weight",
+      "name": "primals_197",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        14336,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.22.attention.wq.weight",
+      "name": "primals_200",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        4096,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.22.attention.wk.weight",
+      "name": "primals_201",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        1024,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.22.attention.wv.weight",
+      "name": "primals_202",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        1024,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.22.attention.wo.weight",
+      "name": "primals_203",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        4096,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.22.feed_forward.w1.weight",
+      "name": "primals_204",
+      "op": "placeholder",
+      "placement": "S(0)S(0)",
+      "shape": [
+        14336,
+        4096
+      ]
+    },
+    {
+      "inputs": [],
+      "module_path": "layers.22.feed_forward.w2.weight",
+      "name": "primals_205",
+      "op": "placeholder",
+      "placement": "S(0)S(1)",
+      "shape": [
+        4096,
+        14336
+      ]
+    }
+  ]
+}
