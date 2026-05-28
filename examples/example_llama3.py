@@ -12,7 +12,11 @@ from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
 from torch.testing._internal.distributed.fake_pg import FakeStore
 
-from autoparallel._testing.models.llama3 import Transformer, TransformerModelArgs
+from autoparallel._testing.models.llama3 import (
+    Transformer,
+    TransformerModelArgs,
+    apply_ac,
+)
 from autoparallel.api import AutoParallel
 from autoparallel.compile import autoparallel_backend
 from autoparallel.cost_models.collective_runtime_estimation import set_nccl_topo_config
@@ -128,6 +132,8 @@ else:
 # parallelize the model
 with torch.device("meta"):
     model = model_fn()
+
+apply_ac(model, mode="selective", selective_ac_option="op")
 
 mp_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
 
@@ -262,7 +268,9 @@ parallel_mod.to_empty(device="cuda")
 parallel_mod.init_weights()
 
 # Compile with AutoParallel-optimized Inductor passes
-parallel_mod = torch.compile(parallel_mod, backend=autoparallel_backend())
+parallel_mod = torch.compile(
+    parallel_mod, backend=autoparallel_backend(enable_ac=False)
+)
 
 # now let's run it
 x = (

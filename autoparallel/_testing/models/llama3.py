@@ -3,8 +3,9 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+from collections import defaultdict
 from dataclasses import dataclass
-from typing import ClassVar, Optional
+from typing import ClassVar, Literal, Optional
 
 import torch
 import torch.nn.functional as F
@@ -544,3 +545,111 @@ class Transformer(nn.Module):
         h = self.norm(h) if self.norm else h
         output = self.output(h) if self.output else h
         return output
+
+
+# Ops whose outputs are saved (not recomputed) during selective AC.
+# Matches TorchTitan's _op_sac_save_list.
+_OP_SAC_SAVE_LIST: set = {
+    torch.ops.aten.mm.default,
+    torch.ops.aten._scaled_dot_product_efficient_attention.default,
+    torch.ops.aten._scaled_dot_product_flash_attention.default,
+    torch.ops.aten._scaled_dot_product_cudnn_attention.default,
+    torch.ops.aten._scaled_dot_product_attention_math.default,
+    torch.ops.aten._scaled_dot_product_fused_attention_overrideable.default,
+    torch.ops._c10d_functional.reduce_scatter_tensor.default,
+    torch.ops.aten.max.default,
+    torch._higher_order_ops.flex_attention,
+    torch._higher_order_ops.inductor_compiled_code,
+}
+
+# torch_attn._varlen_attn may not exist in all PyTorch builds
+if hasattr(torch.ops, "torch_attn") and hasattr(torch.ops.torch_attn, "_varlen_attn"):
+    _OP_SAC_SAVE_LIST.add(torch.ops.torch_attn._varlen_attn.default)
+
+
+def _apply_full_ac(module: nn.Module) -> nn.Module:
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+        checkpoint_wrapper,
+    )
+
+    return checkpoint_wrapper(module)
+
+
+def _apply_layer_sac(module: nn.Module, layer_idx: int, ac_freq: int) -> nn.Module:
+    if not ac_freq or layer_idx % ac_freq == 0:
+        return _apply_full_ac(module)
+    return module
+
+
+def _apply_op_sac(module: nn.Module) -> nn.Module:
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+        checkpoint_wrapper,
+    )
+    from torch.utils.checkpoint import (
+        CheckpointPolicy,
+        create_selective_checkpoint_contexts,
+    )
+
+    def _get_custom_policy(meta):
+        def _custom_policy(ctx, func, *args, **kwargs):
+            mode = "recompute" if ctx.is_recompute else "forward"
+            mm_count_key = f"{mode}_mm_count"
+            if func == torch.ops.aten.mm.default:
+                meta[mm_count_key] += 1
+            # Save output of all ops in save list, except every 2nd matmul
+            to_save = func in _OP_SAC_SAVE_LIST and not (
+                func == torch.ops.aten.mm.default and meta[mm_count_key] % 2 == 0
+            )
+            return (
+                CheckpointPolicy.MUST_SAVE
+                if to_save
+                else CheckpointPolicy.PREFER_RECOMPUTE
+            )
+
+        return _custom_policy
+
+    def selective_checkpointing_context_fn():
+        meta = defaultdict(int)
+        return create_selective_checkpoint_contexts(_get_custom_policy(meta))
+
+    return checkpoint_wrapper(module, context_fn=selective_checkpointing_context_fn)
+
+
+def apply_ac(
+    model: Transformer,
+    mode: Literal["full", "selective"] = "full",
+    selective_ac_option: str = "2",
+) -> None:
+    """Apply activation checkpointing to each TransformerBlock in the model.
+
+    Mirrors TorchTitan's activation checkpointing. Should be called on the
+    model before passing it to AutoParallel.
+
+    Args:
+        model: A Transformer model with a ``layers`` ModuleDict.
+        mode: ``"full"`` checkpoints every layer; ``"selective"`` uses
+            ``selective_ac_option`` to pick a strategy.
+        selective_ac_option: When mode is ``"selective"``, either a digit
+            string like ``"2"`` (checkpoint every nth layer) or ``"op"``
+            (per-op policy that recomputes every 2nd matmul).
+    """
+    for layer_id, transformer_block in model.layers.named_children():
+        if mode == "full":
+            transformer_block = _apply_full_ac(transformer_block)
+        elif mode == "selective":
+            if selective_ac_option == "op":
+                transformer_block = _apply_op_sac(transformer_block)
+            elif selective_ac_option.isdigit():
+                transformer_block = _apply_layer_sac(
+                    transformer_block, int(layer_id), int(selective_ac_option)
+                )
+            else:
+                raise ValueError(
+                    f"Invalid selective_ac_option: {selective_ac_option!r}. "
+                    "Use 'op' or a positive integer string like '2'."
+                )
+        else:
+            raise ValueError(
+                f"Invalid AC mode: {mode!r}. Valid modes: 'full', 'selective'."
+            )
+        model.layers.register_module(layer_id, transformer_block)
