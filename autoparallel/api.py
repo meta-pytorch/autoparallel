@@ -530,8 +530,8 @@ class AutoParallel:
                 import torch.distributed as dist
                 from torch._subclasses.fake_tensor import unset_fake_temporarily
 
-                col_major_ranks = self.mesh.mesh.T.contiguous().view(-1).tolist()
                 with unset_fake_temporarily():
+                    col_major_ranks = self.mesh.mesh.T.contiguous().view(-1).tolist()
                     self._reversed_flat_pg = dist.new_group(
                         ranks=col_major_ranks, sort_ranks=False
                     )
