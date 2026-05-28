@@ -215,12 +215,12 @@ class TestShardOrderSpecIsolation:
         }
 
         interp = ApplyShardingInterpreter(
-            gm, sharding_placement, enable_ordered_sharding_optimization=False
+            gm,
+            sharding_placement,
+            param_placement_order={
+                t: OrderInfo(is_target_reversed_order=False, need_reorder=True),
+            },
         )
-        # Manually set param_placement_order for the consuming node
-        interp.param_placement_order = {
-            t: OrderInfo(is_target_reversed_order=False, need_reorder=True),
-        }
 
         # Call redistribute_tensor — this should NOT mutate shared_curr_spec
         local = torch.randn(2, 64, device="meta")

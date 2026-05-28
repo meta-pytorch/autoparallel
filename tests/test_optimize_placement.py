@@ -594,3 +594,250 @@ def test_world_size_larger_than_parameter(device_mesh_1d):
     param_nodes = get_param_nodes(autop.gm.graph)
     for node in param_nodes:
         assert sharding_placement[node].output_specs.placements == (Replicate(),)
+
+
+def _setup_memory_and_node_constraint(mesh, memory_first):
+    """Set up a model where one param is forced to Replicate via add_node_constraint
+    while add_parameter_memory_constraint wants to shard everything.
+
+    Without lazy application, the memory constraint would count the
+    Replicate-constrained param and become infeasible.
+
+    Args:
+        memory_first: if True, add_parameter_memory_constraint is called before
+            add_node_constraint (the previously-broken order).
+    """
+    dim1 = 1024
+    dim2 = 4096
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear1 = nn.Linear(dim1, dim2, bias=False)
+            self.linear2 = nn.Linear(dim2, dim1, bias=False)
+
+        def forward(self, x):
+            return self.linear2(F.relu(self.linear1(x)))
+
+    bs = 2048 * mesh.shape[0]
+
+    def input_fn():
+        return torch.rand(bs, dim1, device="cuda", requires_grad=True)
+
+    with torch.device("meta"):
+        model = Model()
+
+    autop = AutoParallel(model, input_fn, mesh)
+    autop.__enter__()
+
+    opt = autop.sharding_optimizer
+    # Pick the first param node and force it to Replicate, which conflicts with
+    # a tight memory budget that expects all params to be sharded.
+    param_nodes = get_param_nodes(opt.graph)
+    constrained_node = param_nodes[0]
+    orig_constrained_node = opt._concrete_to_orig.get(
+        constrained_node, constrained_node
+    )
+    replicate_placement = (Replicate(),) * mesh.ndim
+
+    x_sharding = (Shard(0),) + (Replicate(),) * (mesh.ndim - 1)
+    autop.add_input_constraints([x_sharding])
+    autop.add_output_constraints([x_sharding])
+
+    if memory_first:
+        autop.add_parameter_memory_constraint(low=None, high=None)
+        opt.add_node_constraint(constrained_node, placement=replicate_placement)
+    else:
+        opt.add_node_constraint(constrained_node, placement=replicate_placement)
+        autop.add_parameter_memory_constraint(low=None, high=None)
+
+    return autop, opt, orig_constrained_node, replicate_placement
+
+
+@apply_cuda_patches
+@pytest.mark.parametrize("memory_first", [True, False])
+def test_node_constraint_excludes_from_memory_budget_get_solution(
+    device_mesh_1d, memory_first
+):
+    """add_node_constraint + add_parameter_memory_constraint should not conflict,
+    regardless of call order.  Verified via get_solution (the primary solve path)."""
+    (
+        autop,
+        opt,
+        constrained_node,
+        replicate_placement,
+    ) = _setup_memory_and_node_constraint(device_mesh_1d, memory_first)
+    try:
+        solution = autop.optimize_placement()
+        assert solution[constrained_node].output_specs.placements == replicate_placement
+    finally:
+        autop.__exit__(None, None, None)
+
+
+@apply_cuda_patches
+@pytest.mark.parametrize("memory_first", [True, False])
+def test_node_constraint_excludes_from_memory_budget_resolve(
+    device_mesh_1d, memory_first
+):
+    """Same as the get_solution test but exercises the resolve() path."""
+    (
+        autop,
+        opt,
+        constrained_node,
+        replicate_placement,
+    ) = _setup_memory_and_node_constraint(device_mesh_1d, memory_first)
+    try:
+        # First solve to set the objective
+        autop.optimize_placement()
+        # Re-solve via resolve()
+        solution = opt.resolve()
+        assert solution[constrained_node].output_specs.placements == replicate_placement
+    finally:
+        autop.__exit__(None, None, None)
+
+
+@apply_cuda_patches
+def test_node_constraint_after_solve_resolve(device_mesh_1d):
+    """Solve once with memory constraint, then add a node constraint and resolve().
+
+    The memory constraint must be rebuilt to exclude the newly constrained
+    param, otherwise the re-solve becomes infeasible.
+    """
+    dim1 = 1024
+    dim2 = 4096
+    mesh = device_mesh_1d
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear1 = nn.Linear(dim1, dim2, bias=False)
+            self.linear2 = nn.Linear(dim2, dim1, bias=False)
+
+        def forward(self, x):
+            return self.linear2(F.relu(self.linear1(x)))
+
+    bs = 2048 * mesh.shape[0]
+
+    def input_fn():
+        return torch.rand(bs, dim1, device="cuda", requires_grad=True)
+
+    with torch.device("meta"):
+        model = Model()
+
+    with AutoParallel(model, input_fn, mesh) as autop:
+        x_sharding = (Shard(0),)
+        autop.add_input_constraints([x_sharding])
+        autop.add_output_constraints([x_sharding])
+        autop.add_parameter_memory_constraint(low=None, high=None)
+
+        # First solve — all params can be sharded
+        autop.optimize_placement()
+
+        # Now force one param to Replicate and re-solve
+        opt = autop.sharding_optimizer
+        param_nodes = get_param_nodes(opt.graph)
+        constrained_node = param_nodes[0]
+        orig_node = opt._concrete_to_orig.get(constrained_node, constrained_node)
+        replicate = (Replicate(),)
+        opt.add_node_constraint(constrained_node, placement=replicate)
+
+        solution = opt.resolve()
+        assert solution[orig_node].output_specs.placements == replicate
+
+
+@apply_cuda_patches
+def test_remove_memory_constraint_then_resolve(device_mesh_1d):
+    """Removing the memory constraint by name should prevent it from being
+    rebuilt on the next resolve()."""
+    dim1 = 1024
+    dim2 = 4096
+    mesh = device_mesh_1d
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear1 = nn.Linear(dim1, dim2, bias=False)
+            self.linear2 = nn.Linear(dim2, dim1, bias=False)
+
+        def forward(self, x):
+            return self.linear2(F.relu(self.linear1(x)))
+
+    bs = 2048 * mesh.shape[0]
+
+    def input_fn():
+        return torch.rand(bs, dim1, device="cuda", requires_grad=True)
+
+    with torch.device("meta"):
+        model = Model()
+
+    with AutoParallel(model, input_fn, mesh) as autop:
+        x_sharding = (Shard(0),)
+        autop.add_input_constraints([x_sharding])
+        autop.add_output_constraints([x_sharding])
+        # Memory constraint forces sharding
+        autop.add_parameter_memory_constraint(low=None, high=None)
+        solution = autop.optimize_placement()
+
+        opt = autop.sharding_optimizer
+        param_nodes = get_param_nodes(opt.graph)
+        for node in param_nodes:
+            orig = opt._concrete_to_orig.get(node, node)
+            assert solution[orig].output_specs.placements == (Shard(0),)
+
+        # Remove memory constraint and re-solve — optimizer is free to replicate
+        opt.remove_constraints(["memory_constraint_high", "memory_constraint_low"])
+        solution = opt.resolve()
+        assert "memory_constraint_high" not in opt.prob.constraints
+        assert "memory_constraint_low" not in opt.prob.constraints
+
+
+@apply_cuda_patches
+def test_remove_node_constraint_restores_memory_budget(device_mesh_1d):
+    """After removing a node constraint, that param should be included in the
+    memory budget again on the next resolve()."""
+    dim1 = 1024
+    dim2 = 4096
+    mesh = device_mesh_1d
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear1 = nn.Linear(dim1, dim2, bias=False)
+            self.linear2 = nn.Linear(dim2, dim1, bias=False)
+
+        def forward(self, x):
+            return self.linear2(F.relu(self.linear1(x)))
+
+    bs = 2048 * mesh.shape[0]
+
+    def input_fn():
+        return torch.rand(bs, dim1, device="cuda", requires_grad=True)
+
+    with torch.device("meta"):
+        model = Model()
+
+    with AutoParallel(model, input_fn, mesh) as autop:
+        x_sharding = (Shard(0),)
+        autop.add_input_constraints([x_sharding])
+        autop.add_output_constraints([x_sharding])
+        autop.add_parameter_memory_constraint(low=None, high=None)
+
+        opt = autop.sharding_optimizer
+        param_nodes = get_param_nodes(opt.graph)
+        constrained_node = param_nodes[0]
+        orig_node = opt._concrete_to_orig.get(constrained_node, constrained_node)
+        replicate = (Replicate(),)
+
+        # Force one param to Replicate (excluded from memory budget)
+        constraint_names = opt.add_node_constraint(
+            constrained_node, placement=replicate
+        )
+        solution = autop.optimize_placement()
+        assert solution[orig_node].output_specs.placements == replicate
+
+        # Remove the node constraint — param should be back in the memory budget
+        opt.remove_constraints(constraint_names)
+        solution = opt.resolve()
+        # With memory budget enforced and no node constraint, the optimizer
+        # should shard this param again
+        assert solution[orig_node].output_specs.placements == (Shard(0),)

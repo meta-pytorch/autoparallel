@@ -240,6 +240,11 @@ class ShardingOptimizer:
             force_grad_reduce_in_higher_precision
         )
         self._constraint_log: list[tuple[str, dict]] = []
+        self._memory_constraint: tuple[float, float] | None = None
+        # Maps ILP constraint name → node_name for active node constraints,
+        # so that _apply_memory_constraint can exclude constrained params and
+        # remove_constraints can keep this in sync.
+        self._node_constraint_names: dict[str, str] = {}
         self._name_counters: dict[str, int] = {}
         t0 = time.perf_counter()
         self.strats = self.build_sharding_metadata()
@@ -880,6 +885,7 @@ class ShardingOptimizer:
         self.prob += pulp.lpSum(terms)
 
     def _solve(self, verbose=False):
+        self._apply_memory_constraint()
         solver = pulp.PULP_CBC_CMD(msg=verbose)
         # Use a dedicated temp directory for PuLP's intermediate files (.mps,
         # .sol, etc.) so they are always cleaned up, even if the process is
@@ -975,8 +981,12 @@ class ShardingOptimizer:
     def remove_constraints(self, names):
         """Remove constraints by name, allowing re-solve to revert to the
         unconstrained optimum."""
+        memory_names = {"memory_constraint_high", "memory_constraint_low"}
         for name in names:
             del self.prob.constraints[name]
+            self._node_constraint_names.pop(name, None)
+            if name in memory_names:
+                self._memory_constraint = None
 
     def diff_solutions(self, solution_a, solution_b):
         """Compare two solutions and report placement changes and cost diffs.
@@ -1599,6 +1609,11 @@ class ShardingOptimizer:
         """USER (Category 5b): Constrain total parameter memory usage.
 
         Σ_{params} (size_ratio * x_{param}) ≤ memory_limit
+
+        The actual ILP constraints are added lazily at solve time so that
+        node constraints registered after this call are still respected.
+        Parameters with user-defined node constraints are excluded to avoid
+        infeasible problems.
         """
         self._constraint_log.append(
             (
@@ -1609,11 +1624,31 @@ class ShardingOptimizer:
                 },
             )
         )
+        self._memory_constraint = (memory_factor_low, memory_factor_high)
+
+    def _apply_memory_constraint(self):
+        """Rebuild the parameter memory constraint in the ILP.
+
+        Called on every solve so that node constraints added after
+        add_parameter_memory_constraint() are always respected.
+        """
+        if self._memory_constraint is None:
+            return
+        memory_factor_low, memory_factor_high = self._memory_constraint
+
+        # Remove previous memory constraints before rebuilding
+        for name in ("memory_constraint_high", "memory_constraint_low"):
+            self.prob.constraints.pop(name, None)
+
+        user_constrained_names = set(self._node_constraint_names.values())
+
         param_nodes: list[torch.fx.Node] = get_param_nodes(self.graph)
         elms: list[pulp.LpAffineExpression] = []
         budget_low: float = 0.0
         budget_high: float = 0.0
         for node in param_nodes:
+            if node.name in user_constrained_names:
+                continue
             node_idx = self.node_map[node]
             num_out_strat = len(self.strats[node].strategies)
             ratios: list[float] = []
@@ -1673,11 +1708,14 @@ class ShardingOptimizer:
             raise RuntimeError(
                 f"Couldn't find appropriate constraint {node} {constraint_name} {placement}"
             )
-        return self._add_node_constraint(
+        names = self._add_node_constraint(
             node,
             output_constraint_indices=output_constraint_indices,
             constraint_name=constraint_name,
         )
+        for name in names:
+            self._node_constraint_names[name] = node.name
+        return names
 
     def _add_io_placement_constraints(
         self,

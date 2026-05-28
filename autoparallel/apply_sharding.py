@@ -3,6 +3,7 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+import contextlib
 import copy
 import logging
 import operator
@@ -85,14 +86,13 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
         self,
         module,
         sharding_placement,
-        enable_ordered_sharding_optimization: bool = True,
+        param_placement_order: dict | None = None,
         dynamic: bool = False,
     ):
         super().__init__(module, garbage_collect_values=True, graph=None)
         self.sharding_placement = sharding_placement
         self.dynamic = dynamic
-        param_placement_order = {}
-        if enable_ordered_sharding_optimization:
+        if param_placement_order is None:
             param_placement_order = compute_optimal_placement_order_for_parameters(
                 module, sharding_placement
             )
@@ -293,9 +293,37 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
         return out
 
 
-def shard_node_given_placements(node, sharding_placement):
-    tgt_spec = sharding_placement[node].input_specs[0]
-    mesh = tgt_spec.mesh
+def _build_physical_placements(sharding_placement, param_placement_order):
+    """Build a dict mapping each node to its physical DTensorSpec.
+
+    For reversed-order nodes in param_placement_order, converts to
+    _StridedShard placements so the physical layout matches the intended
+    shard order. For everything else, returns the solver-assigned spec.
+    """
+    physical = {}
+    for node, op_spec in sharding_placement.items():
+        if op_spec.input_specs is None:
+            continue
+        tgt_spec = op_spec.input_specs[0]
+        if (
+            node in param_placement_order
+            and param_placement_order[node].is_target_reversed_order
+        ):
+            reversed_shard_order = _compute_shard_order(
+                tgt_spec.shard_order, reverse=True
+            )
+            placements = DTensorSpec._convert_shard_order_to_StridedShard(
+                reversed_shard_order, tgt_spec.placements, tgt_spec.mesh
+            )
+            tgt_spec = DTensorSpec(
+                tgt_spec.mesh, placements, tensor_meta=tgt_spec.tensor_meta
+            )
+        physical[node] = tgt_spec
+    return physical
+
+
+def shard_node_given_placements(node, spec):
+    mesh = spec.mesh
     curr_placement = (Replicate(),) * mesh.ndim
     tensor = node.meta["val"]
 
@@ -305,7 +333,7 @@ def shard_node_given_placements(node, sharding_placement):
     with unset_fake_temporarily():
         tensor = torch.empty(tensor.shape, dtype=tensor.dtype, device="meta")
         sharded_tensor = DTensor.from_local(tensor, mesh, curr_placement).redistribute(
-            mesh, tgt_spec.placements
+            mesh, spec.placements
         )
 
     return sharded_tensor
@@ -358,7 +386,7 @@ def _has_rank_varying_size(dim_idx, global_shape, spec):
     return False
 
 
-def _make_local_args(gm, sharding_placement):
+def _make_local_args(gm, physical_placements):
     """Create local tensors for each placeholder via DTensor redistribute.
 
     Uses DTensor's redistribute to compute correct local shapes and strides.
@@ -380,8 +408,8 @@ def _make_local_args(gm, sharding_placement):
             local_args.append(val)
             continue
         tensor = val
-        tgt_spec = sharding_placement[node].input_specs[0]
-        mesh = tgt_spec.mesh
+        spec = physical_placements[node]
+        mesh = spec.mesh
         curr_placement = (Replicate(),) * mesh.ndim
 
         # Use DTensor to compute the correct local shape and strides.
@@ -400,7 +428,7 @@ def _make_local_args(gm, sharding_placement):
 
         sharded = DTensor.from_local(
             concrete_tensor, mesh, curr_placement
-        ).redistribute(mesh, tgt_spec.placements)
+        ).redistribute(mesh, spec.placements)
         local = sharded.to_local()
 
         # For dynamic shapes, re-create with fresh SymInts.
@@ -412,7 +440,7 @@ def _make_local_args(gm, sharding_placement):
             dynamic_sizes = [
                 DimDynamic.DYNAMIC
                 if (isinstance(s, torch.SymInt) and not s.node.expr.is_number)
-                or _has_rank_varying_size(i, tensor.shape, tgt_spec)
+                or _has_rank_varying_size(i, tensor.shape, spec)
                 else DimDynamic.STATIC
                 for i, s in enumerate(tensor.shape)
             ]
@@ -436,11 +464,73 @@ def _make_local_args(gm, sharding_placement):
     return local_args
 
 
-def _lower_to_parallel_graph(gm, sharding_placement, local_args, dynamic=False):
+@contextlib.contextmanager
+def _mark_rank_symbols_ignorable():
+    """Make _runtime_compute_coordinate_on_dim mark its unbacked symbols as ignorable.
+
+    compile_on_one_rank produces unbacked SymInts for per-rank mesh coordinates.
+    The upstream fake impl only marks them ignorable inside Dynamo, but
+    AutoParallel traces through make_fx instead. This wraps the fake impl
+    so that the symbols are also marked ignorable during make_fx tracing,
+    preventing PendingUnbackedSymbolNotFound errors.
+
+    No-op when compile_on_one_rank is disabled.
+
+    NOTE: We intentionally do NOT enable compile_on_one_rank by default when
+    dynamic=True, even though the two features are complementary (symbolic
+    shapes + symbolic rank coordinates). compile_on_one_rank changes how
+    process groups are referenced in the graph (ProcessGroup objects instead
+    of string names), and ProcessGroup objects are not deepcopy-safe. This
+    breaks extract_forward_graph in apply_placement(), which deepcopies the
+    joint graph. Until ProcessGroup gains deepcopy support upstream, callers
+    must opt in to compile_on_one_rank explicitly.
+    """
+    import torch.distributed.config as dist_config
+
+    if not dist_config.compile_on_one_rank:
+        yield
+        return
+
+    # Force-import the ops module so the op is registered.
+    from torch.distributed._ops import device_mesh as _dm_ops  # noqa: F401
+
+    _orig = _dm_ops._runtime_compute_coordinate_on_dim_fake
+
+    def _patched(full_mesh, index):
+        sz = _orig(full_mesh, index)
+        # The original only marks as ignorable inside Dynamo. We also need it
+        # during make_fx tracing — the coordinate is resolved at runtime via
+        # dist.get_rank() so it is safe to ignore during graph capture.
+        ctx = torch._custom_op.impl.get_ctx()
+        shape_env = ctx._shape_env
+        sym_expr = sz.node._expr
+        if sym_expr not in shape_env.ignorable_fresh_unbacked_symbols:
+            shape_env.ignorable_fresh_unbacked_symbols.append(sym_expr)
+        return sz
+
+    torch.library.register_fake(
+        "device_mesh::_runtime_compute_coordinate_on_dim", _patched
+    )
+    try:
+        yield
+    finally:
+        torch.library.register_fake(
+            "device_mesh::_runtime_compute_coordinate_on_dim", _orig
+        )
+
+
+def _lower_to_parallel_graph(
+    gm, sharding_placement, local_args, dynamic=False, param_placement_order=None
+):
     """Two-pass lowering: interpret with sharding collectives, then decompose."""
     decomp_table = _get_inductor_decomp_table()
 
-    interp = ApplyShardingInterpreter(gm, sharding_placement, dynamic=dynamic)
+    interp = ApplyShardingInterpreter(
+        gm,
+        sharding_placement,
+        param_placement_order=param_placement_order,
+        dynamic=dynamic,
+    )
 
     tracing_mode = "symbolic" if dynamic else "real"
 
@@ -475,7 +565,7 @@ def _copy_descriptors_and_rename_placeholders(source_gm, target_gm):
     target_gm.recompile()
 
 
-def _shard_params_and_buffers(gm, sharding_placement, params_spec, buffers_spec):
+def _shard_params_and_buffers(gm, physical_placements, params_spec, buffers_spec):
     """Shard parameters and buffers according to the sharding placement."""
     # NB: ok to NOT use the parallel_gm here because we will just reapply the
     # correct sharding placement via sharding_placement
@@ -487,15 +577,15 @@ def _shard_params_and_buffers(gm, sharding_placement, params_spec, buffers_spec)
         n = fqn_to_param[fqn]
         with unset_fake_temporarily():
             sharded_param_dict[fqn] = nn.Parameter(
-                shard_node_given_placements(n, sharding_placement)
+                shard_node_given_placements(n, physical_placements[n])
             )
-            tgt_spec = sharding_placement[n].input_specs[0]
-            sharded_param_dict[fqn]._spec.shard_order = tgt_spec.shard_order
 
     sharded_buffer_dict = {}
     for fqn in buffers_spec:
         n = fqn_to_buffer[fqn]
-        sharded_buffer_dict[fqn] = shard_node_given_placements(n, sharding_placement)
+        sharded_buffer_dict[fqn] = shard_node_given_placements(
+            n, physical_placements[n]
+        )
 
     return sharded_param_dict, sharded_buffer_dict
 
@@ -530,20 +620,32 @@ def apply_sharding_to_model(gm, sharding_placement, params_spec, buffers_spec):
             fake_mode.shape_env = ShapeEnv()
             fake_mode.static_shapes = False
 
-    local_args = _make_local_args(gm, sharding_placement)
-    t1 = time.perf_counter()
+    param_placement_order = compute_optimal_placement_order_for_parameters(
+        gm, sharding_placement
+    )
+    physical_placements = _build_physical_placements(
+        sharding_placement, param_placement_order
+    )
 
-    with use_min_cost_redistribution_plan():
-        parallel_gm = _lower_to_parallel_graph(
-            gm, sharding_placement, local_args, dynamic
-        )
-    t2 = time.perf_counter()
+    with _mark_rank_symbols_ignorable():
+        local_args = _make_local_args(gm, physical_placements)
+        t1 = time.perf_counter()
+
+        with use_min_cost_redistribution_plan():
+            parallel_gm = _lower_to_parallel_graph(
+                gm,
+                sharding_placement,
+                local_args,
+                dynamic,
+                param_placement_order=param_placement_order,
+            )
+        t2 = time.perf_counter()
 
     _copy_descriptors_and_rename_placeholders(gm, parallel_gm)
     t3 = time.perf_counter()
 
     sharded_param_dict, sharded_buffer_dict = _shard_params_and_buffers(
-        gm, sharding_placement, params_spec, buffers_spec
+        gm, physical_placements, params_spec, buffers_spec
     )
     t4 = time.perf_counter()
 
