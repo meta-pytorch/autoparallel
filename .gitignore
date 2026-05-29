@@ -9,6 +9,8 @@
 .mypy_cache/
 *.egg-info/
 
+*.pdf
+
 build/
 dist/
 tmp/
