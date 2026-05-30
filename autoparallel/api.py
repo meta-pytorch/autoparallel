@@ -203,8 +203,15 @@ class AutoParallel:
         dynamic: bool = False,
         cost_model: Any = "nccl",
         repeated_subgraphs: bool = True,
+        solver: str = "ilp",
     ):
         self.stack = ExitStack()
+        # "approx" builds a lighter optimizer (no PuLP variables/constraints),
+        # which is much faster to construct; optimize_placement(solver="approx")
+        # then solves it heuristically. "ilp" builds the full PuLP problem.
+        if solver not in ("ilp", "approx"):
+            raise ValueError(f"Unknown solver={solver!r}; expected 'ilp' or 'approx'")
+        self.solver = solver
         self.fake_mode = (
             FakeTensorMode()
         )  # TODO: maybe need to reuse the model's fake mode
@@ -281,6 +288,7 @@ class AutoParallel:
                 self.mesh,
                 force_grad_reduce_in_higher_precision,
                 repeated_subgraphs=self.repeated_subgraphs,
+                build_pulp=self.solver != "approx",
             )
 
             self.sharding_optimizer = sharding_optimizer
@@ -356,15 +364,19 @@ class AutoParallel:
         self.sharding_optimizer.add_sharded_output_constraint(constraints)
         self.output_constraints = constraints
 
-    def optimize_placement(self, verbose=True, solver="ilp", approximate_options=None):
+    def optimize_placement(self, verbose=True, solver=None, approximate_options=None):
         """Solve for the optimal placement.
 
-        solver="ilp" (default) uses the exact PuLP/CBC solver. solver="approx"
-        uses the heuristic ApproximateShardingSolver, which trades a small
-        objective gap for a much faster solve. approximate_options is forwarded
-        as kwargs to the approximate solver (e.g. candidate_limit, max_sweeps).
+        solver="ilp" uses the exact PuLP/CBC solver. solver="approx" uses the
+        heuristic ApproximateShardingSolver, which trades a small objective gap
+        for a much faster solve. approximate_options is forwarded as kwargs to
+        the approximate solver (e.g. candidate_limit, max_sweeps). Defaults to the
+        solver chosen at AutoParallel construction; note an optimizer built with
+        solver="approx" has no PuLP problem and cannot run the ILP.
         """
         self._assert_entered()
+        if solver is None:
+            solver = self.solver
 
         if solver in ("approx", "approximate"):
             from .approximate_sharding import ApproximateShardingSolver
@@ -374,6 +386,12 @@ class AutoParallel:
             )
             self.sharding_placement = approx.get_solution(verbose=verbose)
         elif solver == "ilp":
+            if self.sharding_optimizer.prob is None:
+                raise RuntimeError(
+                    "solver='ilp' requires a PuLP problem, but this AutoParallel "
+                    "was constructed with solver='approx' (no PuLP built). "
+                    "Construct with solver='ilp' to use the exact solver."
+                )
             self.sharding_placement = self.sharding_optimizer.get_solution(
                 verbose=False
             )
@@ -394,7 +412,10 @@ class AutoParallel:
             ),
         )
 
-        if self.sharding_optimizer.prob.status == -1:
+        if (
+            self.sharding_optimizer.prob is not None
+            and self.sharding_optimizer.prob.status == -1
+        ):
             raise RuntimeError(
                 "The sharding optimizer could not find a feasible solution. "
                 "This typically means the user-specified constraints are "

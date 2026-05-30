@@ -43,6 +43,9 @@ from typing import Any, Optional
 
 import numpy as np
 import pulp
+import torch
+from torch.distributed.tensor._dtensor_spec import DTensorSpec
+from torch.distributed.tensor.placement_types import Replicate, Shard
 
 from .cost_models.compute_estimation import _get_sharded_shape_stride
 
@@ -293,7 +296,11 @@ class ApproximateShardingSolver:
             self.allowed_out[opt.node_map[node]] = list(range(len(strat.strategies)))
 
         t = time.perf_counter()
-        paired_edges, authoritative = self._parse_constraints()
+        if opt.prob is None:
+            # Lite build: no PuLP problem was constructed, derive topology directly.
+            paired_edges, authoritative = self._topology_direct()
+        else:
+            paired_edges, authoritative = self._parse_constraints()
         # Flow edges are taken from the ILP's output_input_consistent constraints
         # (the authoritative producer per consumer-arg), NOT from _all_input_nodes:
         # the two disagree for some ops (einsum list-args, alias/backward nodes),
@@ -423,6 +430,159 @@ class ApproximateShardingSolver:
         for n, out_set in restrict.items():
             if n in self.allowed_out:
                 self.allowed_out[n] = [o for o in self.allowed_out[n] if o in out_set]
+        return paired_edges, authoritative
+
+    def _topology_direct(self):
+        """Compute the same topology (forbidden / out_idx restrictions / paired
+        edges / flow producers) that _parse_constraints extracts, but directly
+        from the graph + cluster_links + _constraint_log, WITHOUT a PuLP problem.
+        This lets the optimizer skip building millions of PuLP variables and
+        constraints when only the approximate solver is used.
+
+        Mirrors ShardingOptimizer.add_inf_cost_constraint /
+        add_grad_reduce_dtype_constraints / add_forward_backward_consistency_constraints /
+        _add_paired_output_constraint / add_node_constraint /
+        add_output_input_consistent_constraint. Verified byte-identical to
+        _parse_constraints on a full build (see tests)."""
+        from torch._functorch._aot_autograd.fx_utils import (
+            get_param_and_grad_nodes,
+            get_plain_input_and_grad_nodes,
+            get_plain_output_and_tangent_nodes,
+        )
+
+        opt = self.opt
+        cl = opt.cluster_links
+
+        def rootkey(k):
+            return cl.get(k, k)
+
+        cluster_linked = {key[0] for key in cl}
+        node_root = {}
+        for lk, rk in cl.items():
+            node_root[lk[0]] = rk[0]
+
+        def nroot(idx):
+            return node_root.get(idx, idx)
+
+        # 1. inf-cost forbidden (== add_inf_cost_constraint).
+        for key, dv in opt.decision_vars.items():
+            if not math.isfinite(dv.cost) or dv.cost == 10000.0:
+                self.forbidden.add(key)
+
+        # 2. grad-reduce-dtype forbidden (== add_grad_reduce_dtype_constraints).
+        if getattr(opt, "force_grad_reduce_in_higher_precision", False):
+            cast_op = torch.ops.autoparallel.dtype_cast.default
+            pre_cast: set[int] = set()
+            for param, grad in get_param_and_grad_nodes(opt.graph).values():
+                if grad is None:
+                    continue
+                chain = [grad]
+                n = grad
+                while len(n.all_input_nodes) == 1:
+                    parent = n.all_input_nodes[0]
+                    if len(parent.all_input_nodes) != 1:
+                        break
+                    chain.append(parent)
+                    n = parent
+                cast_idx = next(
+                    (i for i, nd in enumerate(chain) if nd.target == cast_op), None
+                )
+                if cast_idx is None:
+                    continue
+                for nd in chain[cast_idx:]:
+                    if nd in opt.node_map:
+                        pre_cast.add(opt.node_map[nd])
+            for key, dv in opt.decision_vars.items():
+                if key[0] in pre_cast and dv.comm_cost > 0:
+                    self.forbidden.add(key)
+
+        # 3. forward/backward paired output constraints + disables
+        #    (== add_forward_backward_consistency_constraints / _add_paired_output_constraint).
+        paired_edges: list[tuple[int, int, frozenset]] = []
+
+        def add_paired(node_a, node_b):
+            idx_a, idx_b = opt.node_map[node_a], opt.node_map[node_b]
+            strat_a = [str(s.output_specs) for s in opt.strats[node_a].strategies]
+            strat_b = [str(s.output_specs) for s in opt.strats[node_b].strategies]
+            num_inp_a = len(opt.strats[node_a].strategies[0].redistribute_cost[0])
+            for out_idx, sp in enumerate(strat_a):
+                if sp not in strat_b:
+                    for inp in range(num_inp_a):
+                        self.forbidden.add(rootkey((idx_a, 0, out_idx, inp)))
+                    continue
+                out_idx_b = strat_b.index(sp)
+                ra = rootkey((idx_a, 0, out_idx, 0))[0]
+                rb = rootkey((idx_b, 0, out_idx_b, 0))[0]
+                paired_edges.append((ra, rb, frozenset({(out_idx, out_idx_b)})))
+
+        for param, grad in get_param_and_grad_nodes(opt.graph).values():
+            if grad is not None:
+                add_paired(param, grad)
+        for node, gnode in get_plain_input_and_grad_nodes(opt.graph).values():
+            if gnode is not None:
+                add_paired(node, gnode)
+        for node, tnode in get_plain_output_and_tangent_nodes(opt.graph).values():
+            if tnode is not None:
+                add_paired(node, tnode)
+
+        # 4. user node/input/output placement restrictions (== add_node_constraint),
+        #    replayed from _constraint_log.
+        restrict: dict[int, set] = {}
+        for fname, kwargs in getattr(opt, "_constraint_log", []):
+            if fname != "add_node_constraint":
+                continue
+            node = next(
+                (nd for nd in opt.nodes if nd.name == kwargs["node_name"]), None
+            )
+            if node is None or node not in opt.strats:
+                continue
+            placement = kwargs["placement"]
+            if placement is None:
+                placement = (Shard(0),) + (Replicate(),) * (opt.mesh.ndim - 1)
+            out_set = set()
+            for i, s in enumerate(opt.strats[node].strategies):
+                specs = s.output_specs
+                if isinstance(specs, DTensorSpec):
+                    if specs.placements == placement:
+                        out_set.add(i)
+                elif isinstance(specs, (list, tuple)):
+                    for spec in specs:
+                        if isinstance(spec, DTensorSpec):
+                            if spec.placements == placement:
+                                out_set.add(i)
+                            break
+            r = nroot(opt.node_map[node])
+            restrict[r] = restrict.get(r, out_set) & out_set
+        for n_idx, out_set in restrict.items():
+            if n_idx in self.allowed_out:
+                self.allowed_out[n_idx] = [
+                    o for o in self.allowed_out[n_idx] if o in out_set
+                ]
+
+        # 5. flow producers (== add_output_input_consistent_constraint): for each
+        #    consumer-arg, the set of (cluster-resolved) producers feeding it.
+        authoritative: dict[tuple[int, int], set] = {}
+        for node in opt.graph.nodes:
+            if node.op == "output" or node not in opt.node_map:
+                continue
+            p_idx = opt.node_map[node]
+            p_linked = p_idx in cluster_linked
+            p_root = nroot(p_idx)
+            for user in node.users:
+                if user.op == "output" or user not in opt.node_map:
+                    continue
+                u_idx = opt.node_map[user]
+                if p_linked and u_idx in cluster_linked:
+                    continue
+                ain = opt._all_input_nodes(user)
+                argi = next((i for i, x in enumerate(ain) if x is node), None)
+                if argi is None:
+                    continue
+                ispecs = opt.strats[user].strategies[0].input_specs
+                if argi < len(ispecs) and ispecs[argi] is None:
+                    continue
+                authoritative.setdefault((nroot(u_idx), argi), set()).add(p_root)
+
         return paired_edges, authoritative
 
     def _out_fully_forbidden(self, v, node, o):
@@ -1029,8 +1189,10 @@ class ApproximateShardingSolver:
 
     def _write_back(self):
         opt = self.opt
-        for var in opt.pulp_variables.values():
-            var.varValue = 0
+        has_pulp = bool(opt.pulp_variables)
+        if has_pulp:
+            for var in opt.pulp_variables.values():
+                var.varValue = 0
         selected = []
         feasible = True
         for v in self.cost_bearing:
@@ -1044,15 +1206,18 @@ class ApproximateShardingSolver:
                 key = (v, argi, o, inp)
                 if key in self.forbidden:
                     feasible = False
-                opt.pulp_variables[key].varValue = 1
+                if has_pulp:
+                    opt.pulp_variables[key].varValue = 1
                 selected.append(key)
         opt.selected_keys = list(selected)
         for rk in selected:
             opt.selected_keys.extend(opt._root_to_linked.get(rk, []))
-        opt.prob.status = pulp.LpStatusOptimal
-        opt.prob.sol_status = pulp.LpSolutionOptimal
-        # Populate prob.objective so callers can score the assignment with
-        # pulp.value(prob.objective); the returned value uses the equivalent but
-        # cheaper total_objective() rather than evaluating the full expression.
-        opt._set_objective()
+        # Populate prob.objective (when a PuLP problem exists) so callers can also
+        # score via pulp.value(prob.objective); the returned value uses the
+        # equivalent but cheaper total_objective(). In the lite (no-PuLP) build,
+        # there is no problem to populate.
+        if opt.prob is not None:
+            opt.prob.status = pulp.LpStatusOptimal
+            opt.prob.sol_status = pulp.LpSolutionOptimal
+            opt._set_objective()
         return INF if not feasible else self.total_objective()

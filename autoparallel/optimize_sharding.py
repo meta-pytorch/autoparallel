@@ -281,6 +281,7 @@ class ShardingOptimizer:
         force_grad_reduce_in_higher_precision=False,
         repeated_subgraphs=False,
         solver_backend="ilp",
+        build_pulp=True,
     ):
         self.orig_gm = gm
         if solver_backend not in {"ilp", "dp"}:
@@ -289,6 +290,13 @@ class ShardingOptimizer:
                 "expected 'ilp' or 'dp'"
             )
         self.solver_backend = solver_backend
+        # When False, skip creating PuLP variables and constraints entirely.
+        # decision_var costs + strategies + cluster_links are still built, which
+        # is all the approximate solver needs (it derives the constraint topology
+        # directly). This avoids constructing millions of PuLP objects on large /
+        # 3D meshes, where that dominates build time.
+        self.build_pulp = build_pulp
+        self.prob = None
         # The optimizer works on a concretized copy of the graph where all
         # symbolic shapes are replaced with their concrete hint values. This
         # centralizes dynamic-shape handling: the optimization pipeline
@@ -401,8 +409,9 @@ class ShardingOptimizer:
         )
         self.validate()
         t2 = time.perf_counter()
-        self.prob = pulp.LpProblem("AutoParallel", pulp.LpMinimize)
-        self.add_default_constraints()
+        if self.build_pulp:
+            self.prob = pulp.LpProblem("AutoParallel", pulp.LpMinimize)
+            self.add_default_constraints()
         t3 = time.perf_counter()
         decision_var_build_s = t1 - t0
         cost_estimation_s = self._decision_var_profile["cost_estimation_s"]
@@ -427,7 +436,7 @@ class ShardingOptimizer:
             }
         )
         n_unique_vars = len(self.pulp_variables)
-        n_constraints = len(self.prob.constraints)
+        n_constraints = len(self.prob.constraints) if self.prob is not None else 0
         self.profile["ilp"] = {
             "unique_variables": n_unique_vars,
             "logical_decision_variables": self._decision_var_profile[
@@ -819,7 +828,7 @@ class ShardingOptimizer:
         """Build DecisionVar entries for every (node_idx, argi, out_idx, inp_idx)
         combination in the strategy space."""
         t_pulp_start = time.perf_counter()
-        self.pulp_variables = self._create_pulp_variables()
+        self.pulp_variables = self._create_pulp_variables() if self.build_pulp else {}
         t_pulp_end = time.perf_counter()
 
         # Precompute which node indices are cluster-linked so we can
@@ -845,24 +854,30 @@ class ShardingOptimizer:
 
             num_args = len(op_strategy.strategies[0].input_specs)
 
+            # Hoisted out of the per-(out_idx, argi, inp_idx) loops: these depend
+            # only on the node, not on the strategy choice. Recomputing them per
+            # decision var was O(#vars) calls to _all_input_nodes (a tree_flatten
+            # each), which dominated build time on large/3D meshes.
+            all_input_nodes = self._all_input_nodes(node)
+            producer_strategies = [self.strats[n] for n in all_input_nodes]
+            pulp_variables = self.pulp_variables
+
             for out_idx, output_strategy in enumerate(op_strategy.strategies):
                 tc0 = time.perf_counter()
                 compute_cost = estimate_strategy_runtime_cost(node, output_strategy)
-                tc1 = time.perf_counter()
-                t_compute += tc1 - tc0
+                t_compute += time.perf_counter() - tc0
                 per_arg_compute = compute_cost / num_args
 
+                te0 = time.perf_counter()
                 for argi, redist_costs in enumerate(output_strategy.redistribute_cost):
+                    producer_strategy = (
+                        producer_strategies[argi]
+                        if argi < len(producer_strategies)
+                        else None
+                    )
+                    input_spec = output_strategy.input_specs[argi]
                     for inp_idx, default_comm_cost in enumerate(redist_costs):
                         key = (node_idx, argi, out_idx, inp_idx)
-
-                        all_input_nodes = self._all_input_nodes(node)
-                        producer_strategy = (
-                            self.strats[all_input_nodes[argi]]
-                            if all_input_nodes
-                            else None
-                        )
-                        te0 = time.perf_counter()
                         comm_cost, transition_cost = self._compute_edge_costs(
                             node,
                             output_strategy,
@@ -871,22 +886,19 @@ class ShardingOptimizer:
                             default_comm_cost,
                             producer_strategy,
                         )
-                        te1 = time.perf_counter()
-                        t_edge += te1 - te0
-
                         redist_costs[inp_idx] = comm_cost
-
                         decision_vars[key] = DecisionVar(
-                            var=self.pulp_variables[key],
+                            var=pulp_variables[key] if pulp_variables else None,
                             cost=comm_cost + per_arg_compute + transition_cost,
                             compute_cost=per_arg_compute,
                             comm_cost=comm_cost,
                             sharding_transition_cost=transition_cost,
                             strategy=output_strategy,
                             output_spec=output_strategy.output_specs,
-                            input_spec=output_strategy.input_specs[argi],
+                            input_spec=input_spec,
                         )
                         n_vars += 1
+                t_edge += time.perf_counter() - te0
 
         # Batch-copy redistribute_cost from root strats to linked strats.
         # The root pass above updated redistribute_cost in place with
@@ -951,7 +963,7 @@ class ShardingOptimizer:
         node_idx, argi, out_idx, _ = key
         strategy = self.strats[self.nodes[node_idx]].strategies[out_idx]
         return DecisionVar(
-            var=self._get_pulp_variable(key),
+            var=self._get_pulp_variable(key) if self.pulp_variables else None,
             cost=root_dv.cost,
             compute_cost=root_dv.compute_cost,
             comm_cost=root_dv.comm_cost,
@@ -1644,6 +1656,8 @@ class ShardingOptimizer:
     # ---- Logging ----
 
     def get_violated_constraints_log(self):
+        if self.prob is None:
+            return "Violated constraints: [] (no PuLP problem; lite build)"
         violated_constraints = [
             (k, c) for k, c in self.prob.constraints.items() if not c.valid()
         ]
@@ -2097,6 +2111,8 @@ class ShardingOptimizer:
                 },
             )
         )
+        if self.prob is None:
+            return  # approx solver reads the factors from _constraint_log
         param_nodes: list[torch.fx.Node] = get_param_nodes(self.graph)
         elms: list[pulp.LpAffineExpression] = []
         budget_low: float = 0.0
@@ -2161,6 +2177,8 @@ class ShardingOptimizer:
             raise RuntimeError(
                 f"Couldn't find appropriate constraint {node} {constraint_name} {placement}"
             )
+        if self.prob is None:
+            return []  # approx solver replays this from _constraint_log
         return self._add_node_constraint(
             node,
             output_constraint_indices=output_constraint_indices,
