@@ -356,10 +356,29 @@ class AutoParallel:
         self.sharding_optimizer.add_sharded_output_constraint(constraints)
         self.output_constraints = constraints
 
-    def optimize_placement(self, verbose=True):
+    def optimize_placement(self, verbose=True, solver="ilp", approximate_options=None):
+        """Solve for the optimal placement.
+
+        solver="ilp" (default) uses the exact PuLP/CBC solver. solver="approx"
+        uses the heuristic ApproximateShardingSolver, which trades a small
+        objective gap for a much faster solve. approximate_options is forwarded
+        as kwargs to the approximate solver (e.g. candidate_limit, max_sweeps).
+        """
         self._assert_entered()
 
-        self.sharding_placement = self.sharding_optimizer.get_solution(verbose=False)
+        if solver in ("approx", "approximate"):
+            from .approximate_sharding import ApproximateShardingSolver
+
+            approx = ApproximateShardingSolver(
+                self.sharding_optimizer, **(approximate_options or {})
+            )
+            self.sharding_placement = approx.get_solution(verbose=verbose)
+        elif solver == "ilp":
+            self.sharding_placement = self.sharding_optimizer.get_solution(
+                verbose=False
+            )
+        else:
+            raise ValueError(f"Unknown solver={solver!r}; expected 'ilp' or 'approx'")
 
         if verbose:
             logger.info(self.sharding_optimizer.get_log(verbose=True))

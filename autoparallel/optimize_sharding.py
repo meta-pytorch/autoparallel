@@ -1231,7 +1231,15 @@ class ShardingOptimizer:
     # ---- Solution ----
 
     def _set_objective(self):
-        """Add the cost minimization objective to the ILP."""
+        """Add the cost minimization objective to the ILP.
+
+        Idempotent: a no-op if the objective has already been set. This lets the
+        approximate solver populate ``prob.objective`` (so its assignment can be
+        scored with ``pulp.value(prob.objective)``) without clobbering or
+        double-adding it, and keeps repeated get_solution() calls safe.
+        """
+        if self.prob.objective is not None:
+            return
         terms = []
         for key, dv in self.decision_vars.items():
             multiplier = 1 + len(self._root_to_linked.get(key, []))
