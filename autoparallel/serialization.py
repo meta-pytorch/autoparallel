@@ -286,6 +286,19 @@ def load_optimizer(cls, path):
     # for add_node_constraint() default placement, without needing a PG
     opt.mesh = _MeshPlaceholder(save_dict["mesh_shape"], save_dict["mesh_dim_names"])
 
+    # Map saved decision-var keys to loaded node indices. Only these keys had
+    # a finite-cost (valid) strategy edge at save time; invalid edges were
+    # pruned and must not get a variable, so seed _valid_keys before creating
+    # the PuLP variables (see ShardingOptimizer._build_decision_vars).
+    save_node_names = save_dict["dv_costs_node_names"]
+    keys_t = save_dict["dv_costs_keys"].tolist()
+    vals_t = save_dict["dv_costs_vals"].tolist()
+    mapped_keys = [
+        (opt.node_map[nodes_by_name[save_node_names[k[0]]]], k[1], k[2], k[3])
+        for k in keys_t
+    ]
+    opt._valid_keys = set(mapped_keys)
+
     # Rebuild PuLP variables and decision vars from saved costs.
     t2 = time.perf_counter()
     opt.pulp_variables = opt._create_pulp_variables()
@@ -296,19 +309,14 @@ def load_optimizer(cls, path):
         len(opt.pulp_variables),
     )
     # Reconstruct decision_vars from compact tensors.
-    save_node_names = save_dict["dv_costs_node_names"]
-    keys_t = save_dict["dv_costs_keys"].tolist()
-    vals_t = save_dict["dv_costs_vals"].tolist()
     opt.decision_vars = {}
-    for (save_node_idx, argi, out_idx, inp_idx), (
+    for key, (
         compute_cost,
         comm_cost,
         transition_cost,
-    ) in zip(keys_t, vals_t):
-        node_name = save_node_names[save_node_idx]
-        node = nodes_by_name[node_name]
-        node_idx = opt.node_map[node]
-        key = (node_idx, argi, out_idx, inp_idx)
+    ) in zip(mapped_keys, vals_t):
+        node_idx, argi, out_idx, inp_idx = key
+        node = opt.nodes[node_idx]
         strategy = opt.strats[node].strategies[out_idx]
         opt.decision_vars[key] = DecisionVar(
             var=opt.pulp_variables[key],

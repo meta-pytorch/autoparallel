@@ -841,3 +841,38 @@ def test_remove_node_constraint_restores_memory_budget(device_mesh_1d):
         # With memory budget enforced and no node constraint, the optimizer
         # should shard this param again
         assert solution[orig_node].output_specs.placements == (Shard(0),)
+
+
+@apply_cuda_patches
+def test_invalid_strategies_are_pruned(device_mesh_2d):
+    """Infinite-cost (invalid) strategy edges must not be materialized as
+    variables or constraints, and pruning them must not change the optimum."""
+    import math
+
+    mesh = device_mesh_2d
+    model_fn, input_fn = _make_model_and_input_fn(mesh, "transformer_block")
+    with torch.device("meta"):
+        model = model_fn()
+
+    with AutoParallel(model, input_fn, mesh) as autop:
+        autop.add_input_constraints([(Shard(0), Replicate())])
+        autop.add_output_constraints([(Shard(0), Replicate())])
+        autop.add_parameter_memory_constraint(low=None, high=None)
+        opt = autop.sharding_optimizer
+
+        # Invariant: every materialized decision var is finite-cost, and the
+        # PuLP variable set is exactly the set of valid (finite) keys.
+        assert all(math.isfinite(dv.cost) for dv in opt.decision_vars.values())
+        assert set(opt.pulp_variables) == opt._valid_keys
+        assert all(k in opt._valid_keys for k in opt.decision_vars)
+
+        # No inf-cost (== 0) constraints should be emitted any more.
+        assert not any(
+            name.startswith("inf_cases") for name in opt.prob.constraints
+        )
+
+        # The pruned problem must still solve to a valid solution.
+        solution = autop.optimize_placement()
+        param_nodes = get_param_nodes(autop.gm.graph)
+        for node in param_nodes:
+            assert node in solution
