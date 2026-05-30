@@ -245,6 +245,17 @@ class ShardingOptimizer:
         # so that _apply_memory_constraint can exclude constrained params and
         # remove_constraints can keep this in sync.
         self._node_constraint_names: dict[str, str] = {}
+        # Maps node_name → list of (mesh_dim, placement) per-axis constraints.
+        # A per-axis constraint keeps a param in the memory budget (unlike a full
+        # node constraint) but restricts which strategies it can use, so the
+        # budget must compute its best achievable memory ratio over only the
+        # strategies that satisfy these constraints.
+        self._node_axis_constraints: dict[
+            str, list[tuple[int, Placement]]
+        ] = defaultdict(list)
+        # Variables pinned to 0 by axis constraints applied with method="fix".
+        # Stored so they can be restored by remove_constraints / for re-solving.
+        self._fixed_vars: list = []
         self._name_counters: dict[str, int] = {}
         t0 = time.perf_counter()
         self.strats = self.build_sharding_metadata()
@@ -910,6 +921,73 @@ class ShardingOptimizer:
                 "constraints, and consider relaxing input/output constraints or "
                 "using a larger mesh."
             )
+
+    def solve_lp_relaxation(self, verbose=False, frac_tol=1e-6, extract=False):
+        """Solve the continuous relaxation of the ILP (binary variables relaxed
+        to [0, 1]) and report diagnostics, restoring the binary categories on
+        exit so a later ILP solve is unaffected.
+
+        Returns a dict with the relaxation objective (a lower bound on the ILP
+        optimum), the solve time, the number/fraction of decision variables that
+        came out fractional, and the solver status.  This is the lens for
+        understanding why constraints (e.g. propagated annotations) speed up the
+        ILP: a relaxation that is tighter (objective closer to the ILP optimum)
+        and less fractional leaves branch-and-bound far less work.
+
+        For this sharding problem the relaxation is empirically integral, so the
+        relaxation optimum equals the ILP optimum.  With ``extract=True`` and an
+        integral solution, the dict also contains a ``"solution"`` key with the
+        per-node strategy dict (same form as :meth:`get_solution`) — i.e. the LP
+        relaxation can be used as a much cheaper exact solve, skipping
+        branch-and-bound.  ``"solution"`` is ``None`` when the relaxation came
+        out fractional.
+
+        Requires the objective to have been set (e.g. via a prior get_solution,
+        or _set_objective).
+        """
+        variables = self.prob.variables()
+        original_cats = [v.cat for v in variables]
+        self._apply_memory_constraint()
+        t0 = time.perf_counter()
+        try:
+            for v in variables:
+                v.cat = pulp.LpContinuous  # bounds are already [0, 1] for binaries
+            solver = pulp.PULP_CBC_CMD(msg=verbose)
+            with tempfile.TemporaryDirectory() as tmpdir:
+                solver.tmpDir = tmpdir
+                self.prob.solve(solver)
+            solve_time = time.perf_counter() - t0
+            objective = pulp.value(self.prob.objective)
+            n_fractional = 0
+            n_vars = 0
+            for v in variables:
+                val = v.value()
+                if val is None:
+                    continue
+                n_vars += 1
+                if min(val, 1.0 - val) > frac_tol:
+                    n_fractional += 1
+            solution = None
+            if extract and n_fractional == 0:
+                self.selected_keys = [
+                    key
+                    for key, dv in self.decision_vars.items()
+                    if dv.var.value() is not None and dv.var.value() > 0.5
+                ]
+                for root_key in list(self.selected_keys):
+                    self.selected_keys.extend(self._root_to_linked.get(root_key, []))
+                solution = self._to_orig_solution(self._extract_and_validate_solution())
+        finally:
+            for v, cat in zip(variables, original_cats):
+                v.cat = cat
+        return {
+            "objective": objective,
+            "solve_time": solve_time,
+            "n_fractional": n_fractional,
+            "n_vars": n_vars,
+            "status": pulp.LpStatus[self.prob.status],
+            "solution": solution,
+        }
 
     def _extract_and_validate_solution(self):
         """Validate the ILP solution and return the optimal strategy per node."""
@@ -1651,7 +1729,14 @@ class ShardingOptimizer:
                 continue
             node_idx = self.node_map[node]
             num_out_strat = len(self.strats[node].strategies)
+            # Per-axis constraints restrict which strategies this param may use,
+            # which raises its best achievable memory ratio (e.g. a param pinned
+            # to Replicate on the tensor axis can no longer be sharded there).
+            # The budget must reflect that, or it would under-allocate and make
+            # the problem spuriously infeasible.
+            axis_constraints = self._node_axis_constraints.get(node.name, [])
             ratios: list[float] = []
+            allowed_ratios: list[float] = []
             for out_idx in range(num_out_strat):
                 dv = self._resolve_decision_var((node_idx, 0, out_idx, 0))
                 spec: DTensorSpec = dv.input_spec
@@ -1663,7 +1748,12 @@ class ShardingOptimizer:
                 ratio = new_size / old_size
                 ratios.append(ratio)
                 elms.append(dv.var * ratio)
-            best_ratio: float = min(ratios)
+                out_spec = self.strats[node].strategies[out_idx].output_specs
+                if isinstance(out_spec, DTensorSpec) and all(
+                    out_spec.placements[m] == p for m, p in axis_constraints
+                ):
+                    allowed_ratios.append(ratio)
+            best_ratio: float = min(allowed_ratios) if allowed_ratios else min(ratios)
             budget_low += max(best_ratio, memory_factor_low)
             budget_high += max(best_ratio, memory_factor_high)
 
@@ -1716,6 +1806,86 @@ class ShardingOptimizer:
         for name in names:
             self._node_constraint_names[name] = node.name
         return names
+
+    def add_node_axis_constraint(
+        self, node, mesh_dim, placement, constraint_name=None, method="constraint"
+    ):
+        """Force a node's output placement on a single mesh axis, leaving the
+        other axes free for the ILP.
+
+        This is the per-mesh-axis analogue of :meth:`add_node_constraint` and is
+        what sharding propagation emits: it can pin the tensor-parallel axis of a
+        weight while leaving the data axis open for FSDP.  Unlike
+        :meth:`add_node_constraint` it does *not* register the node in
+        ``_node_constraint_names``, so a partially-constrained parameter is still
+        counted by the memory budget and can be sharded on its free axes.
+
+        ``method`` controls how the pin is enforced:
+
+        * ``"constraint"`` adds an ``== 1`` equality over the matching decision
+          variables (removable by name via :meth:`remove_constraints`).
+        * ``"fix"`` instead sets the upper bound of the *non-matching* decision
+          variables to 0.  This shrinks the problem (the solver's presolve drops
+          fixed columns) rather than adding a row, which scales much better on
+          large meshes where adding thousands of equality rows otherwise slows
+          the solve.  It is not removable by constraint name.
+
+        For nodes with tuple output_specs the placement is matched against the
+        first DTensorSpec element, matching :meth:`add_node_constraint`.
+        """
+        node = self._normalize_node(node)
+        if constraint_name is None:
+            constraint_name = "axis_constraint"
+        self._constraint_log.append(
+            (
+                "add_node_axis_constraint",
+                {
+                    "node_name": node.name,
+                    "mesh_dim": mesh_dim,
+                    "placement": placement,
+                    "constraint_name": constraint_name,
+                    "method": method,
+                },
+            )
+        )
+        assert node in self.strats, (node, self.strats.keys())
+        strat = self.strats[node]
+        output_constraint_indices = []
+        for i, s in enumerate(strat.strategies):
+            specs = s.output_specs
+            spec = None
+            if isinstance(specs, DTensorSpec):
+                spec = specs
+            elif isinstance(specs, (list, tuple)):
+                spec = next((x for x in specs if isinstance(x, DTensorSpec)), None)
+            if spec is not None and spec.placements[mesh_dim] == placement:
+                output_constraint_indices.append(i)
+        if len(output_constraint_indices) == 0:
+            raise RuntimeError(
+                f"Couldn't find a strategy for {node} with {placement} on mesh "
+                f"dim {mesh_dim} (constraint {constraint_name})"
+            )
+        self._node_axis_constraints[node.name].append((mesh_dim, placement))
+        if method == "fix":
+            self._fix_node_output_indices(node, set(output_constraint_indices))
+            return []
+        return self._add_node_constraint(
+            node,
+            output_constraint_indices=output_constraint_indices,
+            constraint_name=constraint_name,
+        )
+
+    def _fix_node_output_indices(self, node, keep_out_idxs):
+        """Pin a node's output strategy by fixing every decision variable whose
+        out_idx is not in ``keep_out_idxs`` to 0 (upper bound)."""
+        node_idx = self.node_map[node]
+        for argi, out_idx, inp_idx in self.walk_over_options(node):
+            if out_idx in keep_out_idxs:
+                continue
+            var = self._get_pulp_variable((node_idx, argi, out_idx, inp_idx))
+            if var.upBound != 0:
+                var.upBound = 0
+                self._fixed_vars.append(var)
 
     def _add_io_placement_constraints(
         self,
