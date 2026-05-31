@@ -138,6 +138,61 @@ def _skip_enumeration_redistribute_cost():
         _dt_utils.redistribute_cost = orig
 
 
+# Number of fork workers for the per-edge cost computation in _build_decision_vars
+# (the dominant cost of build on large/3D meshes). 1 = serial (use for A/B
+# verification); default scales with cores. The computation is per-node
+# independent and deterministic, so the parallel result is byte-identical.
+_PARALLEL_BUILD_WORKERS = int(
+    os.environ.get("AP_PARALLEL_BUILD", str(min(32, (os.cpu_count() or 1))))
+)
+
+# Set to the optimizer before forking cost workers; the workers read it from the
+# fork-inherited address space (no pickling of the mesh / strategy graph).
+_FORK_OPT: "ShardingOptimizer | None" = None
+
+
+def _par_node_edge_costs(node_idx):
+    """Worker: compute the per-edge (comm, transition) costs and the per-strategy
+    compute cost for one root node, reading the fork-inherited optimizer. Pure —
+    it reads strats and mutates nothing; the parent assembles DecisionVars from
+    these primitives. Returns (node_idx, out_data) where
+    out_data[out_idx] = (per_arg_compute, arg_rows) and
+    arg_rows[argi][inp_idx] = (comm_cost, transition_cost)."""
+    opt = _FORK_OPT
+    node = opt.nodes[node_idx]
+    op_strategy = opt.strats[node]
+    num_args = len(op_strategy.strategies[0].input_specs)
+    all_input_nodes = opt._all_input_nodes(node)
+    producer_strategies = [opt.strats[n] for n in all_input_nodes]
+    out_data = []
+    for output_strategy in op_strategy.strategies:
+        per_arg_compute = (
+            estimate_strategy_runtime_cost(node, output_strategy) / num_args
+        )
+        arg_rows = []
+        for argi, redist_costs in enumerate(output_strategy.redistribute_cost):
+            producer_strategy = (
+                producer_strategies[argi]
+                if argi < len(producer_strategies)
+                else None
+            )
+            arg_rows.append(
+                [
+                    opt._compute_edge_costs(
+                        node,
+                        output_strategy,
+                        argi,
+                        inp_idx,
+                        default_comm_cost,
+                        producer_strategy,
+                    )
+                    for inp_idx, default_comm_cost in enumerate(redist_costs)
+                ]
+            )
+        out_data.append((per_arg_compute, arg_rows))
+    return node_idx, out_data
+
+
 
 def concretize_symint(val):
     """Concretize a SymInt to a plain int, pass through other values.
@@ -944,47 +999,35 @@ class ShardingOptimizer:
             (self.node_map[node], node, strat) for node, strat in self.strats.items()
         ]
 
-        # Build DVs for root nodes only (not cluster-linked). Compute the edge
-        # cost first and only materialize a variable when it is finite.
-        for node_idx, node, op_strategy in strats_items:
-            if node.op == "output":
-                continue
-            if node_idx in self._cluster_linked_node_idxs:
-                continue
+        # Phase A: compute every root node's per-edge costs. This (the comm-cost
+        # estimate over millions of edges) dominates build, is per-node
+        # independent, and mutates nothing, so it runs across forked workers.
+        root_idxs = [
+            node_idx
+            for node_idx, node, _ in strats_items
+            if node.op != "output" and node_idx not in self._cluster_linked_node_idxs
+        ]
+        tc0 = time.perf_counter()
+        node_results = self._compute_node_edge_costs(root_idxs)
+        t_edge = time.perf_counter() - tc0
 
-            num_args = len(op_strategy.strategies[0].input_specs)
-            # Hoisted out of the per-(out_idx, argi, inp_idx) loops: these depend
-            # only on the node, not on the strategy choice. Recomputing them per
-            # decision var was O(#vars) calls to _all_input_nodes (a tree_flatten
-            # each), which dominated build time on large/3D meshes.
-            all_input_nodes = self._all_input_nodes(node)
-            producer_strategies = [self.strats[n] for n in all_input_nodes]
-
-            for out_idx, output_strategy in enumerate(op_strategy.strategies):
-                tc0 = time.perf_counter()
-                compute_cost = estimate_strategy_runtime_cost(node, output_strategy)
-                t_compute += time.perf_counter() - tc0
-                per_arg_compute = compute_cost / num_args
-
-                te0 = time.perf_counter()
+        # Phase B: assemble decision vars (and PuLP variables) from the computed
+        # costs. Serial because PuLP vars and DecisionVars hold parent-owned
+        # strategy objects; byte-identical to computing the costs inline. This
+        # also writes the real costs back into each strat's redistribute_cost
+        # (overwriting the enumeration dummies) for the cluster batch-copy and
+        # _compute_solution_cost readers below.
+        for node_idx, out_data in node_results:
+            node = self.nodes[node_idx]
+            op_strategy = self.strats[node]
+            for out_idx, (per_arg_compute, arg_rows) in enumerate(out_data):
+                output_strategy = op_strategy.strategies[out_idx]
                 for argi, redist_costs in enumerate(output_strategy.redistribute_cost):
-                    producer_strategy = (
-                        producer_strategies[argi]
-                        if argi < len(producer_strategies)
-                        else None
-                    )
                     input_spec = output_strategy.input_specs[argi]
-                    for inp_idx, default_comm_cost in enumerate(redist_costs):
-                        comm_cost, transition_cost = self._compute_edge_costs(
-                            node,
-                            output_strategy,
-                            argi,
-                            inp_idx,
-                            default_comm_cost,
-                            producer_strategy,
-                        )
+                    for inp_idx, (comm_cost, transition_cost) in enumerate(
+                        arg_rows[argi]
+                    ):
                         redist_costs[inp_idx] = comm_cost
-
                         cost = comm_cost + per_arg_compute + transition_cost
                         # Prune invalid (infinite-cost) edges: no variable, no
                         # DecisionVar. A key absent from decision_vars is treated
@@ -1015,7 +1058,6 @@ class ShardingOptimizer:
                             input_spec=input_spec,
                         )
                         n_vars += 1
-                t_edge += time.perf_counter() - te0
 
         # Batch-copy redistribute_cost from root strats to linked strats.
         # The root pass above updated redistribute_cost in place with
@@ -1070,6 +1112,32 @@ class ShardingOptimizer:
             }
         )
         return decision_vars
+
+    def _compute_node_edge_costs(self, root_idxs):
+        """Phase A of _build_decision_vars: per-root-node edge costs. Parallel
+        across forked workers when enabled; workers read this optimizer from the
+        fork-inherited address space (no pickling of the mesh / strategy graph)
+        and return only primitive cost tuples. The computation is deterministic,
+        so the parallel result is byte-identical to the serial path."""
+        global _FORK_OPT
+        _FORK_OPT = self
+        try:
+            if _PARALLEL_BUILD_WORKERS <= 1 or len(root_idxs) < 64:
+                return [_par_node_edge_costs(ni) for ni in root_idxs]
+            import multiprocessing as mp
+
+            ctx = mp.get_context("fork")
+            with ctx.Pool(_PARALLEL_BUILD_WORKERS) as pool:
+                # imap (ordered), not imap_unordered: results come back in
+                # root_idxs order so decision_vars is assembled in the same node
+                # order as the serial path. This keeps the PuLP objective's
+                # lpSum term order identical too, so even the ILP path is
+                # bit-for-bit unchanged (float addition is not associative).
+                return list(
+                    pool.imap(_par_node_edge_costs, root_idxs, chunksize=4)
+                )
+        finally:
+            _FORK_OPT = None
 
     def _resolve_decision_var(self, key):
         """Return a DecisionVar for key, reconstructing on the fly for linked keys."""
