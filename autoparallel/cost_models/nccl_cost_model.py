@@ -1471,3 +1471,174 @@ def gb200_topo_config(
         has_nvswitch=has_nvswitch,
         **kwargs,
     )
+
+
+# ===========================================================================
+# Section 4: Candidate mesh enumeration
+#
+# Enumerates the space of mesh shapes that mesh discovery should evaluate.
+# The mesh dimensionality is capped at MAX_MESH_DIMS (the practical limit for
+# FSDP/TP/CP/EP combinations). For N = 2^M GPUs, the number of ordered
+# factorizations into at most P parts is sum_{k=1}^{P} C(M-1, k-1).
+# ===========================================================================
+
+# Practical cap on mesh dimensionality (FSDP / TP / CP / EP).
+MAX_MESH_DIMS = 4
+
+# Role names assigned to mesh dimensions outermost -> innermost. The innermost
+# (rightmost) dimension is always the tensor-parallel dim, since
+# derive_mesh_dim_topo treats it as the most intra-node communicator.
+_OUTER_DIM_ROLES = ("dp", "cp", "ep")
+
+
+@functools.cache
+def ordered_factorizations(
+    n: int, max_parts: int = MAX_MESH_DIMS, min_factor: int = 2
+) -> tuple[tuple[int, ...], ...]:
+    """All ordered factorizations of ``n`` into 1..``max_parts`` integer factors.
+
+    "Ordered" means ``(4, 2)`` and ``(2, 4)`` are distinct candidates: factor
+    order maps to mesh-dimension order, which determines the intra/inter-node
+    topology of each communicator. Every factor is ``>= min_factor``.
+
+    For ``n = 2**M`` these are the compositions of ``M``; the count into exactly
+    ``k`` parts is ``C(M-1, k-1)``, so the total over ``k = 1..P`` is
+    ``sum_{k=1}^{P} C(M-1, k-1)``.
+    """
+    if n < min_factor or max_parts < 1:
+        return ()
+    results: list[tuple[int, ...]] = [(n,)]
+    if max_parts >= 2:
+        # A leading factor f is valid only if the remainder n // f can still be
+        # factored into >= 1 part of size >= min_factor, i.e. n // f >= min_factor.
+        for f in range(min_factor, n // min_factor + 1):
+            if n % f != 0:
+                continue
+            for rest in ordered_factorizations(n // f, max_parts - 1, min_factor):
+                results.append((f,) + rest)
+    return tuple(results)
+
+
+def exact_factorizations(
+    n: int, n_parts: int, min_factor: int = 2
+) -> tuple[tuple[int, ...], ...]:
+    """Ordered factorizations of ``n`` into exactly ``n_parts`` factors."""
+    if n_parts == 0:
+        return ((),) if n == 1 else ()
+    return tuple(
+        f for f in ordered_factorizations(n, n_parts, min_factor) if len(f) == n_parts
+    )
+
+
+def _name_mesh_dims(ndim: int) -> tuple[str, ...]:
+    """Assign role names to ``ndim`` mesh dimensions (outermost -> innermost)."""
+    if ndim <= 0:
+        return ()
+    if ndim == 1:
+        return ("dp",)
+    outer = list(_OUTER_DIM_ROLES[: ndim - 1])
+    while len(outer) < ndim - 1:
+        outer.append(f"mesh{len(outer)}")
+    return tuple(outer) + ("tp",)
+
+
+@dataclass(frozen=True)
+class MeshCandidate:
+    """A candidate device-mesh shape with topology-derived metadata."""
+
+    shape: tuple[int, ...]
+    dim_names: tuple[str, ...]
+    # Number of trailing (innermost) dims whose communicators stay within a
+    # single node, given the topology used to generate this candidate. 0 when
+    # no topology information was available.
+    n_intra_dims: int
+
+    @property
+    def ndim(self) -> int:
+        return len(self.shape)
+
+    @property
+    def size(self) -> int:
+        return math.prod(self.shape)
+
+
+def count_intra_node_dims(shape: tuple[int, ...], config: NCCLTopoConfig | None) -> int:
+    """Count trailing mesh dims whose communicator is intra-node.
+
+    Scans dims from innermost (rightmost) outward, stopping at the first dim
+    whose communicator spans more than one node. Returns 0 if no topology is
+    available.
+    """
+    if config is None:
+        return 0
+    count = 0
+    for dim_idx in reversed(range(len(shape))):
+        topo = derive_mesh_dim_topo(config, shape, dim_idx)
+        if topo.n_nodes == 1:
+            count += 1
+        else:
+            break
+    return count
+
+
+def is_node_aligned(shape: tuple[int, ...], gpus_per_node: int) -> bool:
+    """Whether ``shape`` aligns to node boundaries for ``gpus_per_node``.
+
+    A shape is node-aligned if it fits within a single node, or if some suffix
+    of dims has product exactly ``gpus_per_node`` (so the innermost dims fill
+    whole nodes and the outer dims span nodes cleanly).
+    """
+    total = math.prod(shape)
+    if total <= gpus_per_node:
+        return True
+    suffix = 1
+    for dim in reversed(shape):
+        suffix *= dim
+        if suffix == gpus_per_node:
+            return True
+        if suffix > gpus_per_node:
+            return False
+    return False
+
+
+def enumerate_candidate_meshes(
+    n_gpus: int,
+    topo_config: NCCLTopoConfig | None = None,
+    max_dims: int = MAX_MESH_DIMS,
+) -> list[MeshCandidate]:
+    """Enumerate candidate mesh shapes for ``n_gpus``, capped at ``max_dims`` dims.
+
+    Returns every ordered factorization of ``n_gpus`` into 1..``max_dims``
+    factors (the full search space; see :func:`ordered_factorizations`). When a
+    ``topo_config`` is provided, each candidate is annotated with the number of
+    intra-node dims and the list is ordered so that node-aligned, topology
+    friendly shapes (more intra-node parallelism on the innermost dims) come
+    first — this lets mesh discovery evaluate promising candidates early and
+    prune the rest.
+    """
+    candidates = [
+        MeshCandidate(
+            shape=shape,
+            dim_names=_name_mesh_dims(len(shape)),
+            n_intra_dims=count_intra_node_dims(shape, topo_config),
+        )
+        for shape in ordered_factorizations(n_gpus, max_dims)
+    ]
+
+    if topo_config is None:
+        return candidates
+
+    gpn = topo_config.gpus_per_node
+
+    def sort_key(c: MeshCandidate) -> tuple:
+        # Node-aligned first, then more intra-node parallelism, then fewer
+        # mesh dims, then a deterministic tiebreak on the shape.
+        return (
+            0 if is_node_aligned(c.shape, gpn) else 1,
+            -c.n_intra_dims,
+            c.ndim,
+            c.shape,
+        )
+
+    candidates.sort(key=sort_key)
+    return candidates

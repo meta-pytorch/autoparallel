@@ -884,21 +884,18 @@ class ShardingOptimizer:
             terms.append(dv.var * dv.cost * multiplier)
         self.prob += pulp.lpSum(terms)
 
-    def _solve(self, verbose=False):
+    def _solve(self, verbose=False, time_limit=None):
         self._apply_memory_constraint()
-        solver = pulp.PULP_CBC_CMD(msg=verbose)
+        solver_kwargs = {"msg": verbose}
+        if time_limit is not None:
+            solver_kwargs["timeLimit"] = time_limit
+        solver = pulp.PULP_CBC_CMD(**solver_kwargs)
         # Use a dedicated temp directory for PuLP's intermediate files (.mps,
         # .sol, etc.) so they are always cleaned up, even if the process is
         # killed.  Without this, leftover files can fill up /tmp (tmpfs).
         with tempfile.TemporaryDirectory() as tmpdir:
             solver.tmpDir = tmpdir
             self.prob.solve(solver)
-
-        self.selected_keys = [
-            key for key, dv in self.decision_vars.items() if dv.var.value() == 1
-        ]
-        for root_key in list(self.selected_keys):
-            self.selected_keys.extend(self._root_to_linked.get(root_key, []))
 
         if self.prob.status == -1:
             logger.warning(self.get_violated_constraints_log())
@@ -910,6 +907,20 @@ class ShardingOptimizer:
                 "constraints, and consider relaxing input/output constraints or "
                 "using a larger mesh."
             )
+        if self.prob.status != 1:
+            # e.g. the solver hit time_limit without proving optimality. The
+            # variable assignment is not trustworthy, so signal the caller.
+            raise RuntimeError(
+                f"The sharding optimizer did not reach optimality "
+                f"(solver status={self.prob.status}). It may have hit the "
+                f"time limit; retry with a larger time_limit or a smaller mesh."
+            )
+
+        self.selected_keys = [
+            key for key, dv in self.decision_vars.items() if dv.var.value() == 1
+        ]
+        for root_key in list(self.selected_keys):
+            self.selected_keys.extend(self._root_to_linked.get(root_key, []))
 
     def _extract_and_validate_solution(self):
         """Validate the ILP solution and return the optimal strategy per node."""
@@ -952,10 +963,10 @@ class ShardingOptimizer:
             return solution
         return {self._orig_to_concrete[node]: spec for node, spec in solution.items()}
 
-    def get_solution(self, verbose=False):
+    def get_solution(self, verbose=False, time_limit=None):
         t0 = time.perf_counter()
         self._set_objective()
-        self._solve(verbose)
+        self._solve(verbose, time_limit=time_limit)
         obj_value = pulp.value(self.prob.objective)
         logger.debug(
             "ILP solve took %.3fs (objective=%.4f)", time.perf_counter() - t0, obj_value
@@ -977,6 +988,48 @@ class ShardingOptimizer:
             obj_value,
         )
         return self._to_orig_solution(self._extract_and_validate_solution())
+
+    def relaxed_cost(self, verbose=False, time_limit: float = 60.0) -> float:
+        """Solve the LP relaxation and return its objective (a lower bound).
+
+        Relaxing the binary decision variables to ``[0, 1]`` continuous yields
+        an admissible lower bound on the true ILP objective (the integer
+        optimum can only be >= the relaxed optimum). Mesh discovery uses this to
+        prune candidate meshes whose lower bound already exceeds the best
+        feasible cost found so far.
+
+        Variable categories are restored to binary afterwards so a subsequent
+        get_solution() / resolve() solves the original ILP.
+
+        Returns:
+            - ``float('inf')`` if the relaxation is infeasible (so is the ILP,
+              and the candidate can be safely pruned).
+            - ``float('-inf')`` if the solve did not converge within
+              ``time_limit`` seconds, which disables pruning for that candidate
+              (a non-admissible bound must never prune a real candidate).
+            - otherwise the relaxed objective.
+        """
+        self._set_objective()
+        self._apply_memory_constraint()
+        for dv in self.decision_vars.values():
+            dv.var.cat = pulp.LpContinuous
+            dv.var.lowBound = 0
+            dv.var.upBound = 1
+        try:
+            solver = pulp.PULP_CBC_CMD(msg=verbose, timeLimit=time_limit)
+            with tempfile.TemporaryDirectory() as tmpdir:
+                solver.tmpDir = tmpdir
+                self.prob.solve(solver)
+            if self.prob.status == -1:
+                return float("inf")
+            if self.prob.status != 1:
+                # Did not solve to optimality (e.g. hit the time limit); the
+                # objective is not a valid lower bound, so disable pruning.
+                return float("-inf")
+            return pulp.value(self.prob.objective)
+        finally:
+            for dv in self.decision_vars.values():
+                dv.var.cat = pulp.LpBinary
 
     def remove_constraints(self, names):
         """Remove constraints by name, allowing re-solve to revert to the

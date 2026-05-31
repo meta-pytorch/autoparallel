@@ -57,6 +57,16 @@ _APPLY_VIEW_MM_VIEW_PATTERN = True
 logger = logging.getLogger(__name__)
 
 
+def _get_device_from_device_type(device_type: str) -> torch.device:
+    """Resolve a concrete device from a device type string (auto-mesh path)."""
+    if device_type == "cpu":
+        return torch.device("cpu")
+    from torch.distributed.device_mesh import _get_device_handle
+
+    device_handle = _get_device_handle(device_type)
+    return torch.device(device_type, device_handle.current_device())
+
+
 def _boxed_nop_preserve_node_meta(fx_g, example_inputs):
     def run(args):
         with torch.fx.traceback.preserve_node_meta():
@@ -189,32 +199,74 @@ def build_joint_graph(
 class AutoParallel:
     """
     Args:
-        mesh: Defines placement options.
-        The meta model is moved to a fake device based on mesh.device_type.
+        mesh: Defines placement options. Either a concrete ``DeviceMesh`` or the
+            string ``"auto"`` to enable automatic mesh discovery, in which case
+            the mesh shape is searched over candidate factorizations of the GPU
+            count (see ``autoparallel.mesh_discovery``). The meta model is moved
+            to a fake device based on the mesh / ``device_type``.
+        device_type: Device type used when ``mesh="auto"`` (default ``"cuda"``).
+        world_size: Number of GPUs to search over when ``mesh="auto"``. Defaults
+            to the initialized process group's world size.
+        mesh_max_dims: Cap on mesh dimensionality during auto discovery.
+        mesh_candidate_fn: Optional ``(n_gpus, topo_config) -> list[MeshCandidate]``
+            override for candidate generation during auto discovery.
+        mesh_constraint_fn: Optional ``(optimizer, mesh) -> None`` applied to each
+            candidate's ILP during auto discovery so the search is constraint
+            aware (e.g. to add the same input/output constraints).
+        mesh_prune: When True (default), use the ILP's LP relaxation as a lower
+            bound to prune candidate meshes during auto discovery.
     """
 
     def __init__(
         self,
         model,
         input_fn,
-        mesh: DeviceMesh,
+        mesh: Union[DeviceMesh, str],
         mp_policy: Optional[MixedPrecisionPolicy] = None,
         reshard_after_forward: bool = True,
         dynamic: bool = False,
         cost_model: Any = "nccl",
         repeated_subgraphs: bool = True,
+        device_type: str = "cuda",
+        world_size: Optional[int] = None,
+        mesh_max_dims: int = 4,
+        mesh_candidate_fn: Optional[Callable] = None,
+        mesh_constraint_fn: Optional[Callable] = None,
+        mesh_prune: bool = True,
+        mesh_solve_time_limit: Optional[float] = 300.0,
     ):
         self.stack = ExitStack()
         self.fake_mode = (
             FakeTensorMode()
         )  # TODO: maybe need to reuse the model's fake mode
         # self.fake_mode.allow_scalar_outputs = True
-        device = _get_device_from_mesh(mesh)
+
+        self.auto_mesh = isinstance(mesh, str)
+        if isinstance(mesh, str):
+            if mesh != "auto":
+                raise ValueError(f"mesh must be a DeviceMesh or 'auto', got {mesh!r}")
+            self.device_type = device_type
+            device = _get_device_from_device_type(device_type)
+        else:
+            self.device_type = mesh.device_type
+            device = _get_device_from_mesh(mesh)
+
         if mp_policy is not None:
             mp_policy = canonicalize_mp(mp_policy)
         self.mp_policy = mp_policy
         self.cost_model = cost_model
         self.repeated_subgraphs = repeated_subgraphs
+
+        # Auto-mesh discovery configuration.
+        self.world_size = world_size
+        self.mesh_max_dims = mesh_max_dims
+        self.mesh_candidate_fn = mesh_candidate_fn
+        self.mesh_constraint_fn = mesh_constraint_fn
+        self.mesh_prune = mesh_prune
+        self.mesh_solve_time_limit = mesh_solve_time_limit
+        # Populated by __enter__ when auto_mesh is enabled.
+        self.mesh_discovery_result = None
+
         # copy user model to avoid modifying it in-place
         # in dtype casting and move_to_fake
         model = copy.deepcopy(model)
@@ -224,7 +276,8 @@ class AutoParallel:
 
         self.model = move_to_fake(model, self.fake_mode, device)
         self.input_fn = input_fn
-        self.mesh = mesh
+        # self.mesh is None until discovery picks one (auto mode).
+        self.mesh = None if self.auto_mesh else mesh
         self.compiler_fn = _boxed_nop_preserve_node_meta  # type: ignore[assignment]
         self.reshard_after_forward = reshard_after_forward
 
@@ -244,46 +297,34 @@ class AutoParallel:
         # won't be called (Python only calls __exit__ if __enter__
         # succeeds), so we must unwind the stack ourselves.
         try:
-            from .cost_models.collective_runtime_estimation import (
-                get_nccl_topo_config,
-                set_nccl_topo_config,
-            )
-            from .cost_models.nccl_cost_model import (
-                NCCLTopoConfig,
-                detect_nccl_topo_config,
-            )
+            from .cost_models.collective_runtime_estimation import get_nccl_topo_config
 
             self._prev_nccl_config = get_nccl_topo_config()
-            if isinstance(self.cost_model, NCCLTopoConfig):
-                set_nccl_topo_config(self.cost_model)
-            elif self.cost_model == "nccl":
-                set_nccl_topo_config(detect_nccl_topo_config(self.mesh))
+            topo_config = self._resolve_topo_config()
+
+            # The joint graph is reused across all candidate meshes. Tracing
+            # still runs under an active mesh context because mesh-capturing
+            # constructs (e.g. local_map) resolve the current mesh at trace
+            # time; for auto discovery we use a full-size detection mesh.
+            if self.auto_mesh:
+                with self._detection_mesh():
+                    self.build_model_graph()
             else:
-                set_nccl_topo_config(None)
+                self.stack.enter_context(self.mesh)
+                self.build_model_graph()
 
-            self.stack.enter_context(self.mesh)
-
-            self.build_model_graph()
             self.old_inductor_comprehensive_padding = (
                 torch._inductor.config.comprehensive_padding
             )
             torch._inductor.config.comprehensive_padding = False
 
-            force_grad_reduce_in_higher_precision = (
-                self.mp_policy is not None
-                and self.mp_policy.reduce_dtype is not None
-                and self.mp_policy.param_dtype is not None
-                and self.mp_policy.reduce_dtype.itemsize
-                > self.mp_policy.param_dtype.itemsize
-            )
-            sharding_optimizer = ShardingOptimizer(
-                self.gm,
-                self.mesh,
-                force_grad_reduce_in_higher_precision,
-                repeated_subgraphs=self.repeated_subgraphs,
-            )
-
-            self.sharding_optimizer = sharding_optimizer
+            if self.auto_mesh:
+                self.mesh, self.sharding_optimizer = self._discover_mesh(topo_config)
+                # The chosen mesh drives downstream cost estimation and
+                # apply_sharding; enter it as the active mesh context.
+                self.stack.enter_context(self.mesh)
+            else:
+                self.sharding_optimizer = self._build_optimizer(self.mesh)
 
             self.input_constraints = None
             self.output_constraints = None
@@ -296,6 +337,131 @@ class AutoParallel:
             raise
 
         return self
+
+    def _resolve_topo_config(self):
+        """Resolve and install the NCCL topology config used for cost estimation.
+
+        Returns the resolved NCCLTopoConfig (or None for the default cost
+        model). For auto-mesh discovery the config only needs the GPU arch and
+        gpus_per_node — per-dimension topology is derived from each candidate's
+        mesh shape.
+        """
+        from .cost_models.collective_runtime_estimation import set_nccl_topo_config
+        from .cost_models.nccl_cost_model import NCCLTopoConfig, detect_nccl_topo_config
+
+        if isinstance(self.cost_model, NCCLTopoConfig):
+            topo_config = self.cost_model
+        elif self.cost_model == "nccl":
+            topo_config = detect_nccl_topo_config(self._detection_mesh())
+        else:
+            topo_config = None
+        set_nccl_topo_config(topo_config)
+        return topo_config
+
+    def _detection_mesh(self):
+        """A mesh used only for arch/topology auto-detection (size matters)."""
+        if not self.auto_mesh:
+            return self.mesh
+        from torch._subclasses.fake_tensor import unset_fake_temporarily
+        from torch.distributed.device_mesh import init_device_mesh
+
+        with unset_fake_temporarily():
+            return init_device_mesh(self.device_type, (self._auto_world_size(),))
+
+    def _auto_world_size(self) -> int:
+        if self.world_size is not None:
+            return self.world_size
+        if torch.distributed.is_initialized():
+            return torch.distributed.get_world_size()
+        raise RuntimeError(
+            "mesh='auto' requires either world_size= or an initialized "
+            "process group to determine the number of GPUs."
+        )
+
+    def _build_optimizer(self, mesh):
+        """Construct a ShardingOptimizer for the given mesh over the traced graph."""
+        # The placement-options cache keys on op/spec fingerprints but not the
+        # mesh, so it must be cleared between candidate meshes (auto discovery
+        # builds several optimizers, one per mesh, over the same graph).
+        from .shardings.placement_options import reset_placement_options_cache
+
+        reset_placement_options_cache()
+
+        force_grad_reduce_in_higher_precision = (
+            self.mp_policy is not None
+            and self.mp_policy.reduce_dtype is not None
+            and self.mp_policy.param_dtype is not None
+            and self.mp_policy.reduce_dtype.itemsize
+            > self.mp_policy.param_dtype.itemsize
+        )
+        return ShardingOptimizer(
+            self.gm,
+            mesh,
+            force_grad_reduce_in_higher_precision,
+            repeated_subgraphs=self.repeated_subgraphs,
+        )
+
+    def _discover_mesh(self, topo_config):
+        """Search candidate meshes and return ``(best_mesh, best_optimizer)``."""
+        from .mesh_discovery import (
+            build_device_mesh,
+            discover_mesh,
+            enumerate_candidate_meshes,
+        )
+
+        n_gpus = self._auto_world_size()
+        candidate_fn = self.mesh_candidate_fn or enumerate_candidate_meshes
+        candidates = candidate_fn(n_gpus, topo_config, self.mesh_max_dims)
+
+        # Build each candidate's optimizer once and cache it so the LP
+        # relaxation (lower bound) and the ILP solve reuse the same problem.
+        optimizers: dict[tuple, Any] = {}
+        meshes: dict[tuple, DeviceMesh] = {}
+
+        def _get_optimizer(candidate):
+            if candidate.shape not in optimizers:
+                mesh = build_device_mesh(candidate, self.device_type)
+                opt = self._build_optimizer(mesh)
+                if self.mesh_constraint_fn is not None:
+                    self.mesh_constraint_fn(opt, mesh)
+                meshes[candidate.shape] = mesh
+                optimizers[candidate.shape] = opt
+            return optimizers[candidate.shape]
+
+        def evaluate(candidate):
+            opt = _get_optimizer(candidate)
+            try:
+                opt.get_solution(verbose=False, time_limit=self.mesh_solve_time_limit)
+            except RuntimeError:
+                # Infeasible, or the solver did not converge within the time
+                # limit — either way this candidate is not selectable.
+                return float("inf"), False
+            import pulp
+
+            return pulp.value(opt.prob.objective), True
+
+        lower_bound = None
+        if self.mesh_prune:
+
+            def lower_bound(candidate):  # noqa: F811
+                return _get_optimizer(candidate).relaxed_cost()
+
+        result = discover_mesh(
+            candidates, evaluate, lower_bound=lower_bound, verbose=True
+        )
+        self.mesh_discovery_result = result
+        best_mesh = meshes[result.best.shape]
+        best_opt = optimizers[result.best.shape]
+        logger.info(
+            "Auto-mesh discovery selected shape %s (cost=%.4f) out of %d "
+            "candidates (evaluated %d, pruned %d)",
+            result.best.shape,
+            result.best_cost,
+            len(candidates),
+            result.n_evaluated,
+            result.n_pruned,
+        )
+        return best_mesh, best_opt
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         from .cost_models.collective_runtime_estimation import set_nccl_topo_config
