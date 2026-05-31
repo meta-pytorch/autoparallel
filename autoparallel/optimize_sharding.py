@@ -1383,6 +1383,10 @@ class ShardingOptimizer:
         try:
             if self.prob.objective is None:
                 self._set_objective()
+            # The relaxation must include the parameter-memory constraint, or it
+            # is a lower bound on a different (unconstrained) problem and can fall
+            # below the true ILP optimum.
+            self._apply_memory_constraint()
 
             for var in self.pulp_variables.values():
                 var.cat = pulp.LpContinuous
