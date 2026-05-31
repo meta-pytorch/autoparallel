@@ -427,6 +427,11 @@ class ApproximateShardingSolver:
                         (next(iter(na)), next(iter(nb)),
                          frozenset({(next(iter(oa)), next(iter(ob)))}))
                     )
+        # method="fix" axis pins leave no PuLP row to parse above, so replay the
+        # log to recover them (constraint-method pins are also picked up here,
+        # idempotently with their == 1 rows).
+        for n, out_set in self._axis_restrict_from_log().items():
+            restrict[n] = restrict.get(n, out_set) & out_set
         for n, out_set in restrict.items():
             if n in self.allowed_out:
                 self.allowed_out[n] = [o for o in self.allowed_out[n] if o in out_set]
@@ -469,7 +474,39 @@ class ApproximateShardingSolver:
             if not math.isfinite(dv.cost) or dv.cost == 10000.0:
                 self.forbidden.add(key)
 
-        # 2. grad-reduce-dtype forbidden (== add_grad_reduce_dtype_constraints).
+        # 2a. forward param-dtype forbidden (== add_grad_reduce_dtype_constraints
+        #     forward part, unconditional). Force the FSDP allgather to run after
+        #     a downcasting param dtype_cast (in the smaller param_dtype) by
+        #     forbidding any pre-cast redistribution.
+        cast_op = torch.ops.autoparallel.dtype_cast.default
+        fwd_pre_cast: set[int] = set()
+        for param, _grad in get_param_and_grad_nodes(opt.graph).values():
+            n = param
+            while True:
+                if n.target == cast_op:
+                    break
+                users = list(n.users.keys())
+                if len(users) != 1:
+                    break
+                child = users[0]
+                if len(child.all_input_nodes) != 1:
+                    break
+                n = child
+            if n.target != cast_op:
+                continue
+            if n.meta["val"].dtype.itemsize >= param.meta["val"].dtype.itemsize:
+                continue  # only constrain downcasts
+            node = n
+            while node != param:
+                if node in opt.node_map:
+                    fwd_pre_cast.add(opt.node_map[node])
+                node = node.all_input_nodes[0]
+        for key, dv in opt.decision_vars.items():
+            if key[0] in fwd_pre_cast and dv.comm_cost > 0:
+                self.forbidden.add(key)
+
+        # 2. grad-reduce-dtype (backward) forbidden
+        #    (== add_grad_reduce_dtype_constraints backward part).
         if getattr(opt, "force_grad_reduce_in_higher_precision", False):
             cast_op = torch.ops.autoparallel.dtype_cast.default
             pre_cast: set[int] = set()
@@ -553,6 +590,12 @@ class ApproximateShardingSolver:
                             break
             r = nroot(opt.node_map[node])
             restrict[r] = restrict.get(r, out_set) & out_set
+        # 4b. per-axis placement restrictions (== add_node_axis_constraint), what
+        #     sharding propagation emits. With method="fix" these leave no PuLP
+        #     row to parse, so replaying the log is the only way the approx solver
+        #     sees the pin.
+        for r, out_set in self._axis_restrict_from_log().items():
+            restrict[r] = restrict.get(r, out_set) & out_set
         for n_idx, out_set in restrict.items():
             if n_idx in self.allowed_out:
                 self.allowed_out[n_idx] = [
@@ -585,10 +628,69 @@ class ApproximateShardingSolver:
 
         return paired_edges, authoritative
 
+    def _axis_restrict_from_log(self):
+        """out_idx restrictions implied by add_node_axis_constraint calls,
+        replayed from _constraint_log → {root_node_idx: set(out_idx)}.
+
+        This is how the approximate solver honors propagated per-axis pins: keep
+        only the strategies whose output placement matches the pinned axis,
+        exactly like ShardingOptimizer.add_node_axis_constraint. It works whether
+        the pin was applied as a PuLP row ("constraint") or as variable bounds
+        ("fix", which leaves no row to parse) and in the lite (no-PuLP) build."""
+        opt = self.opt
+        node_root = {lk[0]: rk[0] for lk, rk in opt.cluster_links.items()}
+        restrict: dict[int, set] = {}
+        for fname, kwargs in getattr(opt, "_constraint_log", []):
+            if fname != "add_node_axis_constraint":
+                continue
+            node = next(
+                (nd for nd in opt.nodes if nd.name == kwargs["node_name"]), None
+            )
+            if node is None or node not in opt.strats:
+                continue
+            mesh_dim, placement = kwargs["mesh_dim"], kwargs["placement"]
+            out_set = set()
+            for i, s in enumerate(opt.strats[node].strategies):
+                specs = s.output_specs
+                if isinstance(specs, DTensorSpec):
+                    spec = specs
+                elif isinstance(specs, (list, tuple)):
+                    spec = next((x for x in specs if isinstance(x, DTensorSpec)), None)
+                else:
+                    spec = None
+                if spec is not None and spec.placements[mesh_dim] == placement:
+                    out_set.add(i)
+            r = node_root.get(opt.node_map[node], opt.node_map[node])
+            restrict[r] = restrict.get(r, out_set) & out_set
+        return restrict
+
+    def _is_forbidden(self, key) -> bool:
+        """A strategy edge is forbidden if a constraint ruled it out OR it was
+        pruned for infinite cost. Pruning removes such keys from decision_vars
+        entirely (see ShardingOptimizer._build_decision_vars), so a key missing
+        from decision_vars is just as forbidden as one in ``self.forbidden``."""
+        return key in self.forbidden or key not in self.opt.decision_vars
+
+    def _surviving_dv(self, v, argi, o):
+        """A DecisionVar for (v, argi, o, *) using any inp_idx that survived
+        pruning, or None if every edge for that (arg, out) was pruned.
+        compute_cost / input_spec are identical across inp_idx for a fixed out."""
+        strat = self.opt.strats[self.opt.nodes[v]].strategies[o]
+        n_inp = (
+            len(strat.redistribute_cost[argi])
+            if argi < len(strat.redistribute_cost)
+            else 1
+        )
+        for inp in range(n_inp):
+            dv = self.opt.decision_vars.get((v, argi, o, inp))
+            if dv is not None:
+                return dv
+        return None
+
     def _out_fully_forbidden(self, v, node, o):
         strat = self.opt.strats[node].strategies[o]
         for argi, costs in enumerate(strat.redistribute_cost):
-            if all((v, argi, o, inp) in self.forbidden for inp in range(len(costs))):
+            if all(self._is_forbidden((v, argi, o, inp)) for inp in range(len(costs))):
                 return True
         return False
 
@@ -736,13 +838,16 @@ class ApproximateShardingSolver:
         opt = self.opt
         strat = opt.strats[node].strategies[o]
         mult = self.node_mult[v]
-        lb = opt.decision_vars[(v, 0, o, 0)].compute_cost * len(strat.redistribute_cost)
+        dv0 = self._surviving_dv(v, 0, o)
+        if dv0 is None:
+            return INF  # every edge for this output strategy was pruned
+        lb = dv0.compute_cost * len(strat.redistribute_cost)
         lb *= mult
         for argi, _p in self.input_edges.get(v, []):
             best = INF
             for inp in range(len(strat.redistribute_cost[argi])):
                 key = (v, argi, o, inp)
-                if key in self.forbidden:
+                if self._is_forbidden(key):
                     continue
                 dv = opt.decision_vars[key]
                 best = min(best, dv.comm_cost + dv.sharding_transition_cost)
@@ -797,7 +902,7 @@ class ApproximateShardingSolver:
         }
 
     def _param_ratio(self, v, node, o):
-        spec = self.opt.decision_vars[(v, 0, o, 0)].input_spec
+        spec = self._surviving_dv(v, 0, o).input_spec
         new_shape, _ = _get_sharded_shape_stride(spec)
         return math.prod(new_shape) / math.prod(spec.tensor_meta.shape)
 
@@ -859,7 +964,10 @@ class ApproximateShardingSolver:
         for i, o in enumerate(out_indices):
             strat = opt.strats[node].strategies[o]
             n_args = len(strat.redistribute_cost)
-            dv0 = opt.decision_vars[(m, 0, o, 0)]
+            dv0 = self._surviving_dv(m, 0, o)
+            if dv0 is None:  # whole output strategy pruned
+                out[i] = BIG
+                continue
             c = dv0.compute_cost * n_args
             # Args with no flow edge (constructors / None-spec) are scored at
             # inp=0 here; args with a producer are charged via the pairwise edges.
@@ -867,7 +975,7 @@ class ApproximateShardingSolver:
                 if argi in prod:
                     continue
                 key = (m, argi, o, 0)
-                if key in self.forbidden:
+                if self._is_forbidden(key):
                     c = BIG
                     break
                 dv = opt.decision_vars[key]
@@ -890,7 +998,7 @@ class ApproximateShardingSolver:
         for ov in ov_vals:
             for op in op_vals:
                 key = (v, argi, ov, op)
-                if key in self.forbidden:
+                if self._is_forbidden(key):
                     continue
                 dv = opt.decision_vars[key]
                 R[ov, op] = dv.comm_cost + dv.sharding_transition_cost
@@ -1181,7 +1289,7 @@ class ApproximateShardingSolver:
                 p = prod.get(argi)
                 inp = self.cur_out[p] if p is not None else 0
                 key = (v, argi, o, inp)
-                if key in self.forbidden:
+                if self._is_forbidden(key):
                     return INF
                 c += self.opt.decision_vars[key].cost
             total += self.node_mult[v] * c
@@ -1204,9 +1312,11 @@ class ApproximateShardingSolver:
                 p = prod.get(argi)
                 inp = self.cur_out[p] if p is not None else 0
                 key = (v, argi, o, inp)
-                if key in self.forbidden:
+                if self._is_forbidden(key):
                     feasible = False
-                if has_pulp:
+                # A pruned key has no PuLP variable; the infeasible flag above
+                # already records it (and raises in _solve).
+                if has_pulp and key in opt.pulp_variables:
                     opt.pulp_variables[key].varValue = 1
                 selected.append(key)
         opt.selected_keys = list(selected)

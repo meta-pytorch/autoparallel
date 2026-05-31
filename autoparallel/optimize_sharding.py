@@ -2549,6 +2549,8 @@ class ShardingOptimizer:
             if out_idx in keep_out_idxs:
                 continue
             var = self._get_pulp_variable((node_idx, argi, out_idx, inp_idx))
+            if var is None:  # pruned (invalid) strategy edge, or lite (no-PuLP) build
+                continue
             if var.upBound != 0:
                 var.upBound = 0
                 self._fixed_vars.append(var)
