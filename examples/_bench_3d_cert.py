@@ -1,22 +1,26 @@
 """3D optimality certificate for the merged solver on full LLaMA3-1B.
 
-The 3D ILP has ~8M binary variables; the exact CBC solve is impractical (a 2.6 GB
-MPS file). The LP relaxation, however, is empirically integral for this problem
-(verified on 2D, where it equals the exact optimum), so its objective is a tight
-lower bound on the ILP optimum. This script does ONE full PuLP build, then:
+The 3D ILP has ~8M binary variables; the exact CBC solve (and even CBC's LP
+relaxation) is impractical (a 2.6 GB MPS file; CBC simplex runs for hours). The
+LP relaxation is empirically integral for this problem (verified on 2D, where it
+equals the exact optimum), so its objective is a tight lower bound on the ILP
+optimum. We solve that LP with HiGHS (scipy.optimize.linprog), which handles the
+8M-variable sparse LP in minutes, then compare to the approximate solvers.
 
-  1. get_lower_bound()  -> LP lower bound (the optimality reference)
-  2. annotate + propagate + ApproximateShardingSolver  -> merged objective
-
-and reports the certified gap = (merged - lb) / lb. Slow (one ~13min build + a
-multi-minute LP solve) but a one-shot 3D certificate. Env: MESH, SEQLEN.
+One full PuLP build feeds: the HiGHS LP lower bound (optimality reference), and
+the prune+dp / merged approximate objectives. Reports the certified gaps. Env:
+MESH, SEQLEN.
 """
 import logging
 import os
 import time
 from unittest.mock import patch
 
+import numpy as np
+import pulp
+import scipy.sparse as sp
 import torch
+from scipy.optimize import linprog
 from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor.placement_types import Replicate, Shard
 from torch.testing._internal.distributed.fake_pg import FakeStore
@@ -65,12 +69,45 @@ def input_fn():
     return torch.randint(0, vocab_size, (batch_size, SEQLEN), device="cuda")
 
 
+def lp_lower_bound_highs(opt):
+    """Solve the LP relaxation (binaries -> [0,1]) of opt.prob with HiGHS and
+    return its objective: a tight lower bound on the ILP optimum."""
+    variables = opt.prob.variables()
+    idx = {v.name: i for i, v in enumerate(variables)}
+    n = len(variables)
+    c = np.zeros(n)
+    for v, coeff in opt.prob.objective.items():
+        c[idx[v.name]] += coeff
+    rows_eq, cols_eq, data_eq, b_eq = [], [], [], []
+    rows_ub, cols_ub, data_ub, b_ub = [], [], [], []
+    r_eq = r_ub = 0
+    for con in opt.prob.constraints.values():
+        rhs = -con.constant
+        items = list(con.items())
+        if con.sense == pulp.LpConstraintEQ:
+            for v, coeff in items:
+                rows_eq.append(r_eq); cols_eq.append(idx[v.name]); data_eq.append(coeff)
+            b_eq.append(rhs); r_eq += 1
+        else:  # LE: a<=b ; GE: a>=b -> -a<=-b
+            sign = 1.0 if con.sense == pulp.LpConstraintLE else -1.0
+            for v, coeff in items:
+                rows_ub.append(r_ub); cols_ub.append(idx[v.name]); data_ub.append(sign * coeff)
+            b_ub.append(sign * rhs); r_ub += 1
+    A_eq = sp.csr_matrix((data_eq, (rows_eq, cols_eq)), shape=(r_eq, n)) if r_eq else None
+    A_ub = sp.csr_matrix((data_ub, (rows_ub, cols_ub)), shape=(r_ub, n)) if r_ub else None
+    res = linprog(c, A_ub=A_ub, b_ub=(b_ub or None), A_eq=A_eq, b_eq=(b_eq or None),
+                  bounds=(0, 1), method="highs")
+    if not res.success:
+        raise RuntimeError(f"HiGHS LP failed: {res.message}")
+    return res.fun, n, r_eq + r_ub
+
+
 set_nccl_topo_config(detect_nccl_topo_config(mesh))
 mp = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
 x = (Shard(0),) + (Replicate(),) * (ndim - 1)
 out = (Shard(0), Shard(2)) if ndim == 2 else x
 
-log(f"=== 3D cert: LLaMA3-1B mesh={MESH_SHAPE}{names} seqlen={SEQLEN} ===")
+log(f"=== 3D cert (HiGHS): LLaMA3-1B mesh={MESH_SHAPE}{names} seqlen={SEQLEN} ===")
 t = time.perf_counter()
 autop = AutoParallel(model_fn(), input_fn, mesh, mp, repeated_subgraphs=True, solver="ilp")
 autop.__enter__()
@@ -78,16 +115,18 @@ autop.add_parameter_memory_constraint(low=None, high=None)
 autop.add_input_constraints([x])
 autop.add_output_constraints([out])
 opt = autop.sharding_optimizer
-log(f"[build] {time.perf_counter()-t:.1f}s  decision_vars={len(opt.decision_vars)}  "
-    f"pulp_vars={len(opt.pulp_variables)}")
-
-# LP-relaxation lower bound = optimality reference (the exact ILP is intractable).
 opt._set_objective()
-t = time.perf_counter()
-lb = opt.get_lower_bound(verbose=False).objective
-log(f"[LP-bound] {time.perf_counter()-t:.1f}s  lower_bound={lb:.1f}")
+opt._apply_memory_constraint()
+log(f"[build] {time.perf_counter()-t:.1f}s  decision_vars={len(opt.decision_vars)}  "
+    f"pulp_vars={len(opt.pulp_variables)}  constraints={len(opt.prob.constraints)}")
 
-# Merged solver on the same build: propagate the TP plan, then approx-solve.
+# prune+dp (approx, no annotation) on the same problem.
+t = time.perf_counter()
+ApproximateShardingSolver(opt).get_solution(verbose=False)
+prune_dp = opt.profile["approximate"]["objective"]
+log(f"[prune+dp]  approx {time.perf_counter()-t:.1f}s  objective={prune_dp:.1f}")
+
+# merged (prune+dp+annotated): propagate the TP plan, then approx-solve.
 cp = (None,) * (ndim - 1) + (Shard(0),)
 rp = (None,) * (ndim - 1) + (Shard(1),)
 for proj in ["wq", "wk", "wv"]:
@@ -100,9 +139,16 @@ autop.propagate_annotations(verbose=False, method="fix")
 t = time.perf_counter()
 ApproximateShardingSolver(opt).get_solution(verbose=False)
 merged = opt.profile["approximate"]["objective"]
-log(f"[merged] approx {time.perf_counter()-t:.1f}s  objective={merged:.1f}")
+log(f"[merged]    approx {time.perf_counter()-t:.1f}s  objective={merged:.1f}")
 
-gap = 100 * (merged - lb) / lb
-log(f"\n=== 3D certified gap = {gap:+.2f}%  (merged {merged:.1f} vs LP lower bound "
-    f"{lb:.1f}) ===")
-log(f"acceptance gap<=10%: {abs(gap)<=10}  (<=5%: {abs(gap)<=5})")
+# LP relaxation lower bound via HiGHS = optimality reference.
+t = time.perf_counter()
+lb, nvar, ncon = lp_lower_bound_highs(opt)
+log(f"[LP-bound]  HiGHS {time.perf_counter()-t:.1f}s  lower_bound={lb:.1f}  "
+    f"(vars={nvar} cons={ncon})")
+
+log("")
+for name, obj in [("prune+dp", prune_dp), ("merged", merged)]:
+    gap = 100 * (obj - lb) / lb
+    log(f"=== 3D {name:<9} gap = {gap:+.2f}%  (obj {obj:.1f} vs LP lower bound "
+        f"{lb:.1f})  <=10%: {abs(gap)<=10}  <=5%: {abs(gap)<=5} ===")
