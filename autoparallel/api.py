@@ -44,6 +44,7 @@ from .input_validation import (
 )
 from .module_construction import make_parallel_module
 from .optimize_sharding import ShardingOptimizer
+from .propagation import ShardingAnnotation, ShardingPropagator
 from .shardings.placement_options import _get_device_from_mesh
 from .tracing import (
     _add_unused_params_and_buffers,
@@ -287,6 +288,8 @@ class AutoParallel:
 
             self.input_constraints = None
             self.output_constraints = None
+            self._annotations: list[tuple[Any, ShardingAnnotation]] = []
+            self.propagation_result = None
 
             self.active = True
 
@@ -355,6 +358,165 @@ class AutoParallel:
         # forces sharding of fwd output to be S(0) on first dimension and R on others
         self.sharding_optimizer.add_sharded_output_constraint(constraints)
         self.output_constraints = constraints
+
+    # ---- Sharding annotations (Shardy-like propagation) ----
+
+    def _normalize_placements(self, placements):
+        """Pad/validate a placement tuple to mesh.ndim, leaving missing trailing
+        axes open (``None``)."""
+        placements = tuple(placements)
+        if len(placements) > self.mesh.ndim:
+            raise ValueError(
+                f"annotation has {len(placements)} placements but mesh has "
+                f"{self.mesh.ndim} dims"
+            )
+        return placements + (None,) * (self.mesh.ndim - len(placements))
+
+    def _param_fqn_to_node(self):
+        from torch._functorch._aot_autograd.fx_utils import get_param_and_grad_nodes
+
+        graph = self.sharding_optimizer.graph
+        return {
+            desc.target: node
+            for desc, (node, _grad) in get_param_and_grad_nodes(graph).items()
+        }
+
+    def annotate_parameter(self, fqn, placements, priority=1):
+        """Annotate the sharding of one or more parameters.
+
+        ``fqn`` is a parameter fully-qualified name, optionally a glob pattern
+        (e.g. ``"layers.*.attention.wq.weight"``) to annotate the matching
+        parameter in every layer at once.  ``placements`` is a tuple of
+        :class:`Placement` (or ``None`` to leave a mesh axis open — typical for
+        the data/FSDP axis of a weight).  Weights default to a lower priority
+        than activations so the data-parallel axis wins shared-axis conflicts.
+        """
+        import fnmatch
+
+        placements = self._normalize_placements(placements)
+        fqn_map = self._param_fqn_to_node()
+        matched = [node for name, node in fqn_map.items() if fnmatch.fnmatch(name, fqn)]
+        if not matched:
+            raise ValueError(
+                f"No parameter matches {fqn!r}. Available parameters: "
+                f"{sorted(fqn_map)}"
+            )
+        for node in matched:
+            self._annotations.append((node, ShardingAnnotation(placements, priority)))
+        return matched
+
+    def annotate_input(self, idx, placements, priority=0):
+        """Annotate the sharding of graph input ``idx``."""
+        from torch._functorch._aot_autograd.fx_utils import (
+            get_plain_input_and_grad_nodes,
+        )
+
+        placements = self._normalize_placements(placements)
+        graph = self.sharding_optimizer.graph
+        nodes = {
+            desc.idx: node
+            for desc, (node, _grad) in get_plain_input_and_grad_nodes(graph).items()
+        }
+        if idx not in nodes:
+            raise ValueError(f"No graph input with index {idx}; have {sorted(nodes)}")
+        self._annotations.append((nodes[idx], ShardingAnnotation(placements, priority)))
+        return nodes[idx]
+
+    def annotate_output(self, idx, placements, priority=0):
+        """Annotate the sharding of graph output ``idx``."""
+        from torch._functorch._aot_autograd.fx_utils import (
+            get_plain_output_and_tangent_nodes,
+        )
+
+        placements = self._normalize_placements(placements)
+        graph = self.sharding_optimizer.graph
+        nodes = {
+            desc.idx: node
+            for desc, (node, _t) in get_plain_output_and_tangent_nodes(graph).items()
+        }
+        if idx not in nodes:
+            raise ValueError(f"No graph output with index {idx}; have {sorted(nodes)}")
+        self._annotations.append((nodes[idx], ShardingAnnotation(placements, priority)))
+        return nodes[idx]
+
+    def annotate_node(self, node, placements, priority=0):
+        """Annotate the sharding of an arbitrary graph node."""
+        placements = self._normalize_placements(placements)
+        self._annotations.append((node, ShardingAnnotation(placements, priority)))
+        return node
+
+    def _mirror_annotations_to_backward(self):
+        """Build extra propagation seeds on the backward twins of annotated
+        forward tensors.
+
+        A gradient shares the sharding of the value it is the gradient of, so a
+        forward annotation also pins its twin (parameter->grad, input->grad,
+        output->tangent).  Seeding the twins lets the TP plan propagate through
+        the backward pass too.  These seeds are only used for propagation: the
+        twins themselves stay unconstrained (handled by the forward/backward
+        consistency constraints), but their neighbors get determined.
+        """
+        from torch._functorch._aot_autograd.fx_utils import (
+            get_param_and_grad_nodes,
+            get_plain_input_and_grad_nodes,
+            get_plain_output_and_tangent_nodes,
+        )
+
+        graph = self.sharding_optimizer.graph
+        twin = {}
+        for _d, (node, grad) in get_param_and_grad_nodes(graph).items():
+            if grad is not None:
+                twin[node] = grad
+        for _d, (node, grad) in get_plain_input_and_grad_nodes(graph).items():
+            if grad is not None:
+                twin[node] = grad
+        for _d, (node, tangent) in get_plain_output_and_tangent_nodes(graph).items():
+            if tangent is not None:
+                twin[node] = tangent
+
+        mirrored = []
+        for node, ann in self._annotations:
+            if node in twin:
+                mirrored.append((twin[node], ann))
+        return mirrored
+
+    def propagate_annotations(self, verbose=True, aggressive=False, method="fix"):
+        """Propagate the registered annotations Shardy-style and turn the
+        unambiguously-determined nodes into ILP constraints, shrinking the
+        search space.  Returns a :class:`PropagationResult`.
+
+        Call this after the ``annotate_*`` / ``add_*_constraint`` calls and
+        before :meth:`optimize_placement`.
+
+        With ``aggressive=False`` (the default) only genuine ``Shard`` axes are
+        pinned, which keeps the full-ILP optimum reachable.  ``aggressive=True``
+        also pins ``Replicate`` / ``Partial`` axes for a larger reduction at the
+        cost of possibly forbidding cheaper reshard placements (e.g. sequence
+        parallelism), so the objective may move slightly off the optimum.
+
+        ``method`` is how each pin is enforced: ``"fix"`` (default) removes the
+        ruled-out decision variables (shrinks the problem; scales best on large
+        meshes), ``"constraint"`` adds removable ``== 1`` rows instead.
+        """
+        self._assert_entered()
+        propagator = ShardingPropagator(self.sharding_optimizer)
+        seeds = self._annotations + self._mirror_annotations_to_backward()
+        propagator.run(seeds)
+        self.propagation_result = propagator.apply_to_optimizer(
+            aggressive=aggressive, method=method
+        )
+        if verbose:
+            logger.info(
+                "Annotation propagation reduced the output-strategy search "
+                "space by %.1f%% (%d -> %d) via %d per-axis constraints on %d "
+                "nodes",
+                100.0 * self.propagation_result.reduction,
+                self.propagation_result.strategies_before,
+                self.propagation_result.strategies_after,
+                self.propagation_result.axis_constraints,
+                self.propagation_result.nodes_determined,
+            )
+        return self.propagation_result
 
     def optimize_placement(self, verbose=True):
         self._assert_entered()
