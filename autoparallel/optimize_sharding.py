@@ -203,6 +203,62 @@ class DecisionVar:
     input_spec: Any  # DTensorSpec
 
 
+@dataclass
+class LPRelaxationResult:
+    objective: float
+    status: str
+    solve_s: float
+    total_s: float
+
+
+@dataclass
+class DPTopology:
+    nodes: list[torch.fx.Node]
+    predecessors: dict[torch.fx.Node, list[torch.fx.Node]]
+    node_to_index: dict[torch.fx.Node, int]
+
+
+class DPBasedShardingSolver:
+    def __init__(self, optimizer):
+        self.optimizer = optimizer
+        self.topology: Optional[DPTopology] = None
+
+    def build_topological_order(self):
+        nodes = [node for node in self.optimizer.nodes if node.op != "output"]
+        node_to_index = {node: i for i, node in enumerate(nodes)}
+        predecessors = {}
+
+        for node in nodes:
+            node_predecessors = self.optimizer._all_input_nodes(node)
+            predecessors[node] = node_predecessors
+            node_index = node_to_index[node]
+            for pred in node_predecessors:
+                pred_index = node_to_index.get(pred)
+                if pred_index is None:
+                    raise RuntimeError(
+                        f"Predecessor {pred} for node {node} is missing from "
+                        "the DP topology"
+                    )
+                if pred_index >= node_index:
+                    raise RuntimeError(
+                        f"Predecessor {pred} for node {node} does not appear "
+                        "before it in topological order"
+                    )
+
+        self.topology = DPTopology(
+            nodes=nodes,
+            predecessors=predecessors,
+            node_to_index=node_to_index,
+        )
+        return self.topology
+
+    def get_solution(self, verbose=False):
+        raise NotImplementedError(
+            "DP-based sharding solver only builds topological order today; "
+            "strategy selection is not implemented yet."
+        )
+
+
 def _assert_has_tensor_meta(spec_or_specs, node, label):
     """Assert that all DTensorSpecs in a spec (possibly a tuple) have tensor_meta."""
     if isinstance(spec_or_specs, (list, tuple)):
@@ -224,8 +280,23 @@ class ShardingOptimizer:
         mesh,
         force_grad_reduce_in_higher_precision=False,
         repeated_subgraphs=False,
+        solver_backend="ilp",
+        build_pulp=True,
     ):
         self.orig_gm = gm
+        if solver_backend not in {"ilp", "dp"}:
+            raise ValueError(
+                f"Unsupported solver_backend={solver_backend!r}; "
+                "expected 'ilp' or 'dp'"
+            )
+        self.solver_backend = solver_backend
+        # When False, skip creating PuLP variables and constraints entirely.
+        # decision_var costs + strategies + cluster_links are still built, which
+        # is all the approximate solver needs (it derives the constraint topology
+        # directly). This avoids constructing millions of PuLP objects on large /
+        # 3D meshes, where that dominates build time.
+        self.build_pulp = build_pulp
+        self.prob = None
         # The optimizer works on a concretized copy of the graph where all
         # symbolic shapes are replaced with their concrete hint values. This
         # centralizes dynamic-shape handling: the optimization pipeline
@@ -261,19 +332,72 @@ class ShardingOptimizer:
         # strategy edge has finite cost. Invalid (infinite-cost) edges are
         # pruned and get no variable. None means "no pruning filter".
         self._valid_keys: set[tuple] | None = None
+        self.profile: dict[str, Any] = {
+            "mesh": self._profile_mesh(),
+            "model": self._profile_model(),
+            "timings": {},
+        }
+        t_init_start = time.perf_counter()
         t0 = time.perf_counter()
         self.strats = self.build_sharding_metadata()
+        t_strategy = time.perf_counter() - t0
+        self.profile["timings"]["strategy_enumeration_s"] = t_strategy
+        self.profile["strategies"] = self._profile_strategies()
+        logger.info(
+            "ShardingOptimizer phase profile: phase=strategy_enumeration "
+            "mesh_shape=%s mesh_dim_names=%s mesh_size=%s model_params=%s "
+            "graph_nodes=%s strategy_options=%s option_tuples=%s elapsed=%.3fs",
+            self.profile["mesh"]["shape"],
+            self.profile["mesh"]["dim_names"],
+            self.profile["mesh"]["size"],
+            self._format_billions(self.profile["model"]["parameter_numel"]),
+            self.profile["model"]["graph_nodes"],
+            self.profile["strategies"]["strategy_options"],
+            self.profile["strategies"]["option_tuples"],
+            t_strategy,
+        )
         # nodes/node_map are derived from strats (not graph.nodes) so that
         # shape-computation nodes skipped by build_sharding_metadata don't
         # appear and indices stay consistent.
         self.nodes = list(self.strats.keys())
         self.node_map = {node: i for i, node in enumerate(self.nodes)}
-        logger.debug("Placement options took %.3fs", time.perf_counter() - t0)
+        logger.debug("Placement options took %.3fs", t_strategy)
         from autoparallel.shardings.placement_options import get_placement_options_timer
 
         get_placement_options_timer().report()
 
         self.cluster_links: dict[tuple, tuple] = {}
+        if self.solver_backend == "dp":
+            t0 = time.perf_counter()
+            self.solver = DPBasedShardingSolver(self)
+            topology = self.solver.build_topological_order()
+            t1 = time.perf_counter()
+            self.profile["dp"] = {
+                "topology_nodes": len(topology.nodes),
+                "topology_edges": sum(
+                    len(preds) for preds in topology.predecessors.values()
+                ),
+            }
+            self.profile["timings"].update(
+                {
+                    "topology_construction_s": t1 - t0,
+                    "init_total_s": t1 - t_init_start,
+                }
+            )
+            logger.info(
+                "ShardingOptimizer phase profile: phase=dp_topology "
+                "mesh_shape=%s mesh_dim_names=%s mesh_size=%s model_params=%s "
+                "topology_nodes=%s topology_edges=%s elapsed=%.3fs",
+                self.profile["mesh"]["shape"],
+                self.profile["mesh"]["dim_names"],
+                self.profile["mesh"]["size"],
+                self._format_billions(self.profile["model"]["parameter_numel"]),
+                self.profile["dp"]["topology_nodes"],
+                self.profile["dp"]["topology_edges"],
+                t1 - t0,
+            )
+            return
+
         if repeated_subgraphs:
             t = time.time()
             clusters = get_identical_regions(self.gm.graph, self.strats)
@@ -283,13 +407,78 @@ class ShardingOptimizer:
         t0 = time.perf_counter()
         self.decision_vars = self._build_decision_vars()
         t1 = time.perf_counter()
+        logger.info(
+            "ShardingOptimizer phase profile: phase=decision_vars "
+            "mesh_shape=%s mesh_dim_names=%s mesh_size=%s model_params=%s "
+            "unique_ilp_vars=%s logical_decision_vars=%s "
+            "cluster_copied_decision_vars=%s pulp_var_creation=%.3fs "
+            "compute_cost=%.3fs edge_cost=%.3fs cost_estimation=%.3fs "
+            "elapsed=%.3fs",
+            self.profile["mesh"]["shape"],
+            self.profile["mesh"]["dim_names"],
+            self.profile["mesh"]["size"],
+            self._format_billions(self.profile["model"]["parameter_numel"]),
+            self._decision_var_profile["unique_pulp_variables"],
+            self._decision_var_profile["logical_decision_variables"],
+            self._decision_var_profile["cluster_copied_decision_variables"],
+            self._decision_var_profile["pulp_var_creation_s"],
+            self._decision_var_profile["compute_cost_estimation_s"],
+            self._decision_var_profile["edge_cost_estimation_s"],
+            self._decision_var_profile["cost_estimation_s"],
+            t1 - t0,
+        )
         self.validate()
         t2 = time.perf_counter()
-        self.prob = pulp.LpProblem("AutoParallel", pulp.LpMinimize)
-        self.add_default_constraints()
+        if self.build_pulp:
+            self.prob = pulp.LpProblem("AutoParallel", pulp.LpMinimize)
+            self.add_default_constraints()
         t3 = time.perf_counter()
+        decision_var_build_s = t1 - t0
+        cost_estimation_s = self._decision_var_profile["cost_estimation_s"]
+        decision_var_overhead_s = max(
+            decision_var_build_s
+            - self._decision_var_profile["pulp_var_creation_s"]
+            - cost_estimation_s,
+            0.0,
+        )
+        self.profile["timings"].update(
+            {
+                "decision_var_build_s": decision_var_build_s,
+                "decision_var_overhead_s": decision_var_overhead_s,
+                "validation_s": t2 - t1,
+                "constraint_construction_s": t3 - t2,
+                "ilp_construction_s": (
+                    self._decision_var_profile["pulp_var_creation_s"]
+                    + decision_var_overhead_s
+                    + (t3 - t2)
+                ),
+                "init_total_s": t3 - t_init_start,
+            }
+        )
         n_unique_vars = len(self.pulp_variables)
-        n_constraints = len(self.prob.constraints)
+        n_constraints = len(self.prob.constraints) if self.prob is not None else 0
+        self.profile["ilp"] = {
+            "unique_variables": n_unique_vars,
+            "logical_decision_variables": self._decision_var_profile[
+                "logical_decision_variables"
+            ],
+            "cluster_copied_decision_variables": self._decision_var_profile[
+                "cluster_copied_decision_variables"
+            ],
+            "constraints": n_constraints,
+        }
+        logger.info(
+            "ShardingOptimizer phase profile: phase=constraints "
+            "mesh_shape=%s mesh_dim_names=%s mesh_size=%s model_params=%s "
+            "unique_ilp_vars=%s constraints=%s elapsed=%.3fs",
+            self.profile["mesh"]["shape"],
+            self.profile["mesh"]["dim_names"],
+            self.profile["mesh"]["size"],
+            self._format_billions(self.profile["model"]["parameter_numel"]),
+            n_unique_vars,
+            n_constraints,
+            t3 - t2,
+        )
         logger.debug(
             "ILP construction took %.3fs "
             "(decision_vars=%.3fs, validate=%.3fs, constraints=%.3fs)",
@@ -304,6 +493,157 @@ class ShardingOptimizer:
             len(self.decision_vars),
             n_constraints,
         )
+        self._log_init_profile()
+
+    def _profile_mesh(self):
+        try:
+            mesh_shape = tuple(int(d) for d in self.mesh.shape)
+        except Exception:
+            mesh_shape = tuple()
+        try:
+            mesh_size = int(self.mesh.size())
+        except Exception:
+            mesh_size = math.prod(mesh_shape) if mesh_shape else None
+        return {
+            "ndim": getattr(self.mesh, "ndim", len(mesh_shape)),
+            "shape": mesh_shape,
+            "dim_names": getattr(self.mesh, "mesh_dim_names", None),
+            "size": mesh_size,
+        }
+
+    def _profile_model(self):
+        graph_nodes = list(self.graph.nodes)
+        op_counts = defaultdict(int)
+        tensor_nodes = 0
+        for node in graph_nodes:
+            op_counts[node.op] += 1
+            if _produces_tensor(node.meta.get("val")):
+                tensor_nodes += 1
+
+        param_numel = 0
+        param_bytes = 0
+        unknown_param_nodes = 0
+        try:
+            param_nodes = get_param_nodes(self.graph)
+        except Exception:
+            param_nodes = []
+            unknown_param_nodes = None
+
+        for node in param_nodes:
+            val = node.meta.get("val")
+            if not isinstance(val, torch.Tensor):
+                unknown_param_nodes += 1
+                continue
+            numel = self._safe_tensor_numel(val)
+            if numel is None:
+                unknown_param_nodes += 1
+                continue
+            param_numel += numel
+            try:
+                param_bytes += numel * val.element_size()
+            except Exception:
+                pass
+
+        return {
+            "graph_nodes": len(graph_nodes),
+            "tensor_nodes": tensor_nodes,
+            "op_counts": dict(op_counts),
+            "parameter_nodes": len(param_nodes),
+            "parameter_numel": param_numel,
+            "parameter_bytes": param_bytes,
+            "unknown_parameter_nodes": unknown_param_nodes,
+        }
+
+    @staticmethod
+    def _safe_tensor_numel(tensor):
+        try:
+            numel = tensor.numel()
+            if isinstance(numel, int):
+                return numel
+            return int(numel)
+        except Exception:
+            pass
+
+        shape = getattr(tensor, "shape", None)
+        if shape is None:
+            return None
+
+        total = 1
+        for dim in shape:
+            dim = concretize_symint(dim)
+            if not isinstance(dim, int):
+                return None
+            total *= dim
+        return total
+
+    def _profile_strategies(self):
+        strategy_options = 0
+        option_tuples = 0
+        max_strategies_per_node = 0
+        for node in self.strats:
+            if node.op == "output" or not hasattr(self.strats[node], "strategies"):
+                continue
+            strategies = self.strats[node].strategies
+            strategy_options += len(strategies)
+            max_strategies_per_node = max(max_strategies_per_node, len(strategies))
+            option_tuples += sum(1 for _ in self.walk_over_options(node))
+        return {
+            "nodes": len(self.strats),
+            "strategy_options": strategy_options,
+            "option_tuples": option_tuples,
+            "max_strategies_per_node": max_strategies_per_node,
+        }
+
+    @staticmethod
+    def _format_billions(count):
+        if count is None:
+            return "unknown"
+        if count >= 1_000_000_000:
+            return f"{count / 1_000_000_000:.2f}B"
+        if count >= 1_000_000:
+            return f"{count / 1_000_000:.2f}M"
+        return str(count)
+
+    @staticmethod
+    def _safe_float(value):
+        try:
+            return float(value)
+        except Exception:
+            return math.nan
+
+    def _log_init_profile(self):
+        mesh = self.profile["mesh"]
+        model = self.profile["model"]
+        strategies = self.profile["strategies"]
+        ilp = self.profile["ilp"]
+        timings = self.profile["timings"]
+        logger.info(
+            "ShardingOptimizer init profile: "
+            "mesh_shape=%s mesh_dim_names=%s mesh_size=%s "
+            "model_params=%s param_nodes=%s graph_nodes=%s tensor_nodes=%s "
+            "strategy_options=%s option_tuples=%s "
+            "unique_ilp_vars=%s logical_decision_vars=%s constraints=%s "
+            "timings={strategy_enumeration=%.3fs,cost_estimation=%.3fs,"
+            "ilp_construction=%.3fs,validation=%.3fs,total=%.3fs}",
+            mesh["shape"],
+            mesh["dim_names"],
+            mesh["size"],
+            self._format_billions(model["parameter_numel"]),
+            model["parameter_nodes"],
+            model["graph_nodes"],
+            model["tensor_nodes"],
+            strategies["strategy_options"],
+            strategies["option_tuples"],
+            ilp["unique_variables"],
+            ilp["logical_decision_variables"],
+            ilp["constraints"],
+            timings["strategy_enumeration_s"],
+            timings["cost_estimation_s"],
+            timings["ilp_construction_s"],
+            timings["validation_s"],
+            timings["init_total_s"],
+        )
+        logger.debug("ShardingOptimizer init profile detail: %s", self.profile)
 
     def _get_next_name(self, prefix):
         idx = self._name_counters.setdefault(prefix, 0)
@@ -424,9 +764,9 @@ class ShardingOptimizer:
                 for inp_idx in range(len(strategy.redistribute_cost[argi])):
                     yield argi, out_idx, inp_idx
 
-    def _create_pulp_variables(self):
-        """Create PuLP binary variables for all decision points, resolving
-        cluster links so that identical nodes share the same variable.
+    def _create_pulp_variables(self, variable_category=pulp.LpBinary):
+        """Create PuLP variables for all decision points, resolving cluster
+        links so that identical nodes share the same variable.
 
         Returns a dict mapping root (node_idx, argi, out_idx, inp_idx) keys
         to their PuLP variables. Linked keys are not stored; use
@@ -438,6 +778,11 @@ class ShardingOptimizer:
         constraint, so skipping them shrinks the ILP without changing the
         optimum (see _build_decision_vars).
         """
+        if variable_category not in {pulp.LpBinary, pulp.LpContinuous}:
+            raise ValueError(
+                f"Unsupported variable_category={variable_category!r}; "
+                "expected pulp.LpBinary or pulp.LpContinuous"
+            )
         cluster_linked_node_idxs = {key[0] for key in self.cluster_links}
 
         pulp_variables = {}
@@ -452,10 +797,16 @@ class ShardingOptimizer:
                 if self._valid_keys is not None and key not in self._valid_keys:
                     continue
                 root_node = self.nodes[node_idx]
+                bounds = (
+                    {"lowBound": 0, "upBound": 1}
+                    if variable_category == pulp.LpContinuous
+                    else {}
+                )
                 pulp_variables[key] = pulp.LpVariable(
                     f"n={root_node},s={node_idx},arg={argi},"
                     f"output_p={out_idx},input_p={inp_idx}",
-                    cat=pulp.LpBinary,
+                    cat=variable_category,
+                    **bounds,
                 )
 
         return pulp_variables
@@ -513,6 +864,11 @@ class ShardingOptimizer:
         forced to zero by an inf-cost constraint anyway, so dropping it leaves
         the optimum unchanged while removing ~30% of the variables and the
         corresponding ~80% of constraints that are pure ``var == 0`` bounds.
+
+        When ``build_pulp`` is False (approximate solver only) no PuLP variables
+        are created (``DecisionVar.var`` is None); the valid-key set is still
+        built so the approximate solver can treat a key absent from
+        ``decision_vars`` as forbidden.
         """
         # Precompute which node indices are cluster-linked so we can
         # copy costs from the root instead of recomputing them.
@@ -520,12 +876,13 @@ class ShardingOptimizer:
 
         t_compute = 0.0
         t_edge = 0.0
+        n_vars = 0
         n_pruned = 0
         n_cluster_copied = 0
 
         t_pulp_start = time.perf_counter()
         self.pulp_variables = {}
-        self._valid_keys: set[tuple] = set()
+        self._valid_keys = set()
         decision_vars = {}
         strats_items = [
             (self.node_map[node], node, strat) for node, strat in self.strats.items()
@@ -540,21 +897,28 @@ class ShardingOptimizer:
                 continue
 
             num_args = len(op_strategy.strategies[0].input_specs)
+            # Hoisted out of the per-(out_idx, argi, inp_idx) loops: these depend
+            # only on the node, not on the strategy choice. Recomputing them per
+            # decision var was O(#vars) calls to _all_input_nodes (a tree_flatten
+            # each), which dominated build time on large/3D meshes.
             all_input_nodes = self._all_input_nodes(node)
+            producer_strategies = [self.strats[n] for n in all_input_nodes]
 
             for out_idx, output_strategy in enumerate(op_strategy.strategies):
                 tc0 = time.perf_counter()
                 compute_cost = estimate_strategy_runtime_cost(node, output_strategy)
-                tc1 = time.perf_counter()
-                t_compute += tc1 - tc0
+                t_compute += time.perf_counter() - tc0
                 per_arg_compute = compute_cost / num_args
 
+                te0 = time.perf_counter()
                 for argi, redist_costs in enumerate(output_strategy.redistribute_cost):
                     producer_strategy = (
-                        self.strats[all_input_nodes[argi]] if all_input_nodes else None
+                        producer_strategies[argi]
+                        if argi < len(producer_strategies)
+                        else None
                     )
+                    input_spec = output_strategy.input_specs[argi]
                     for inp_idx, default_comm_cost in enumerate(redist_costs):
-                        te0 = time.perf_counter()
                         comm_cost, transition_cost = self._compute_edge_costs(
                             node,
                             output_strategy,
@@ -563,23 +927,26 @@ class ShardingOptimizer:
                             default_comm_cost,
                             producer_strategy,
                         )
-                        te1 = time.perf_counter()
-                        t_edge += te1 - te0
-
                         redist_costs[inp_idx] = comm_cost
 
                         cost = comm_cost + per_arg_compute + transition_cost
+                        # Prune invalid (infinite-cost) edges: no variable, no
+                        # DecisionVar. A key absent from decision_vars is treated
+                        # as forbidden by both the ILP and the approximate solver.
                         if not math.isfinite(cost):
                             n_pruned += 1
                             continue
 
                         key = (node_idx, argi, out_idx, inp_idx)
-                        var = pulp.LpVariable(
-                            f"n={node},s={node_idx},arg={argi},"
-                            f"output_p={out_idx},input_p={inp_idx}",
-                            cat=pulp.LpBinary,
-                        )
-                        self.pulp_variables[key] = var
+                        if self.build_pulp:
+                            var = pulp.LpVariable(
+                                f"n={node},s={node_idx},arg={argi},"
+                                f"output_p={out_idx},input_p={inp_idx}",
+                                cat=pulp.LpBinary,
+                            )
+                            self.pulp_variables[key] = var
+                        else:
+                            var = None
                         self._valid_keys.add(key)
                         decision_vars[key] = DecisionVar(
                             var=var,
@@ -589,8 +956,10 @@ class ShardingOptimizer:
                             sharding_transition_cost=transition_cost,
                             strategy=output_strategy,
                             output_spec=output_strategy.output_specs,
-                            input_spec=output_strategy.input_specs[argi],
+                            input_spec=input_spec,
                         )
+                        n_vars += 1
+                t_edge += time.perf_counter() - te0
 
         # Batch-copy redistribute_cost from root strats to linked strats.
         # The root pass above updated redistribute_cost in place with
@@ -630,6 +999,23 @@ class ShardingOptimizer:
             t_compute,
             t_edge,
         )
+        self._decision_var_profile = {
+            "logical_decision_variables": n_vars,
+            "cluster_copied_decision_variables": n_cluster_copied,
+            "unique_pulp_variables": len(self.pulp_variables),
+            "pulp_var_creation_s": t_pulp_end - t_pulp_start,
+            "compute_cost_estimation_s": t_compute,
+            "edge_cost_estimation_s": t_edge,
+            "cost_estimation_s": t_compute + t_edge,
+        }
+        self.profile["timings"].update(
+            {
+                "pulp_var_creation_s": t_pulp_end - t_pulp_start,
+                "compute_cost_estimation_s": t_compute,
+                "edge_cost_estimation_s": t_edge,
+                "cost_estimation_s": t_compute + t_edge,
+            }
+        )
         return decision_vars
 
     def _resolve_decision_var(self, key):
@@ -642,7 +1028,7 @@ class ShardingOptimizer:
         node_idx, argi, out_idx, _ = key
         strategy = self.strats[self.nodes[node_idx]].strategies[out_idx]
         return DecisionVar(
-            var=self._get_pulp_variable(key),
+            var=self._get_pulp_variable(key) if self.pulp_variables else None,
             cost=root_dv.cost,
             compute_cost=root_dv.compute_cost,
             comm_cost=root_dv.comm_cost,
@@ -955,12 +1341,111 @@ class ShardingOptimizer:
     # ---- Solution ----
 
     def _set_objective(self):
-        """Add the cost minimization objective to the ILP."""
+        """Add the cost minimization objective to the ILP.
+
+        Idempotent: a no-op if the objective has already been set. This lets the
+        approximate solver populate ``prob.objective`` (so its assignment can be
+        scored with ``pulp.value(prob.objective)``) without clobbering or
+        double-adding it, and keeps repeated get_solution() calls safe.
+        """
+        if self.prob.objective is not None:
+            return
         terms = []
         for key, dv in self.decision_vars.items():
             multiplier = 1 + len(self._root_to_linked.get(key, []))
             terms.append(dv.var * dv.cost * multiplier)
         self.prob += pulp.lpSum(terms)
+
+    def get_lower_bound(self, verbose=False):
+        """Solve the LP relaxation and return a lower bound on the ILP objective.
+
+        This relaxes the existing binary PuLP variables to continuous variables
+        in [0, 1], solves the current problem with all constraints already added,
+        then restores the optimizer state. The result is a certificate only:
+        fractional LP values are not valid sharding placements.
+        """
+        if self.solver_backend == "dp":
+            raise NotImplementedError(
+                "LP relaxation is only available for the PuLP-backed optimizer"
+            )
+
+        t0 = time.perf_counter()
+        old_objective = self.prob.objective
+        old_status = self.prob.status
+        old_sol_status = getattr(self.prob, "sol_status", None)
+        old_selected_keys_marker = object()
+        old_selected_keys = getattr(self, "selected_keys", old_selected_keys_marker)
+        var_states = {
+            var: (var.cat, var.lowBound, var.upBound, var.varValue)
+            for var in self.pulp_variables.values()
+        }
+
+        try:
+            if self.prob.objective is None:
+                self._set_objective()
+
+            for var in self.pulp_variables.values():
+                var.cat = pulp.LpContinuous
+                var.lowBound = 0
+                var.upBound = 1
+                var.varValue = None
+
+            solver = pulp.PULP_CBC_CMD(msg=verbose)
+            t_solve0 = time.perf_counter()
+            with tempfile.TemporaryDirectory() as tmpdir:
+                solver.tmpDir = tmpdir
+                self.prob.solve(solver)
+            solve_s = time.perf_counter() - t_solve0
+
+            status = pulp.LpStatus.get(self.prob.status, self.prob.status)
+            objective = self._safe_float(pulp.value(self.prob.objective))
+            result = LPRelaxationResult(
+                objective=objective,
+                status=status,
+                solve_s=solve_s,
+                total_s=time.perf_counter() - t0,
+            )
+            self.profile["last_lp_relaxation"] = {
+                "objective": result.objective,
+                "status": result.status,
+                "solve_s": result.solve_s,
+                "total_s": result.total_s,
+            }
+            logger.info(
+                "ShardingOptimizer LP relaxation profile: "
+                "mesh_shape=%s mesh_dim_names=%s mesh_size=%s model_params=%s "
+                "unique_ilp_vars=%s constraints=%s status=%s objective=%.4f "
+                "timings={solve=%.3fs,total=%.3fs}",
+                self.profile["mesh"]["shape"],
+                self.profile["mesh"]["dim_names"],
+                self.profile["mesh"]["size"],
+                self._format_billions(self.profile["model"]["parameter_numel"]),
+                len(self.pulp_variables),
+                len(self.prob.constraints),
+                result.status,
+                result.objective,
+                result.solve_s,
+                result.total_s,
+            )
+            return result
+        finally:
+            for var, (cat, low_bound, up_bound, value) in var_states.items():
+                var.cat = cat
+                var.lowBound = low_bound
+                var.upBound = up_bound
+                var.varValue = value
+            self.prob.objective = old_objective
+            self.prob.status = old_status
+            if old_sol_status is None:
+                if hasattr(self.prob, "sol_status"):
+                    delattr(self.prob, "sol_status")
+            else:
+                self.prob.sol_status = old_sol_status
+            if old_selected_keys is old_selected_keys_marker:
+                if hasattr(self, "selected_keys"):
+                    delattr(self, "selected_keys")
+            else:
+                self.selected_keys = old_selected_keys
 
     def _solve(self, verbose=False):
         self._apply_memory_constraint()
@@ -977,9 +1462,11 @@ class ShardingOptimizer:
         # Use a dedicated temp directory for PuLP's intermediate files (.mps,
         # .sol, etc.) so they are always cleaned up, even if the process is
         # killed.  Without this, leftover files can fill up /tmp (tmpfs).
+        t0 = time.perf_counter()
         with tempfile.TemporaryDirectory() as tmpdir:
             solver.tmpDir = tmpdir
             self.prob.solve(solver)
+        solve_s = time.perf_counter() - t0
 
         self.selected_keys = [
             key for key, dv in self.decision_vars.items() if dv.var.value() == 1
@@ -997,6 +1484,60 @@ class ShardingOptimizer:
                 "constraints, and consider relaxing input/output constraints or "
                 "using a larger mesh."
             )
+        return solve_s
+
+    def _log_solve_profile(
+        self,
+        solve_kind,
+        objective_value,
+        objective_s,
+        solve_s,
+        extract_s,
+        total_s,
+    ):
+        mesh = self.profile["mesh"]
+        model = self.profile["model"]
+        timings = self.profile["timings"]
+        status = pulp.LpStatus.get(self.prob.status, self.prob.status)
+        pipeline_total_s = timings["init_total_s"] + total_s
+        logger.info(
+            "ShardingOptimizer %s profile: "
+            "mesh_shape=%s mesh_dim_names=%s mesh_size=%s model_params=%s "
+            "unique_ilp_vars=%s constraints=%s status=%s objective=%.4f "
+            "timings={strategy_enumeration=%.3fs,cost_estimation=%.3fs,"
+            "ilp_construction=%.3fs,objective=%.3fs,solve=%.3fs,"
+            "extract=%.3fs,total_solve_call=%.3fs,total_pipeline=%.3fs}",
+            solve_kind,
+            mesh["shape"],
+            mesh["dim_names"],
+            mesh["size"],
+            self._format_billions(model["parameter_numel"]),
+            len(self.pulp_variables),
+            len(self.prob.constraints),
+            status,
+            objective_value,
+            timings["strategy_enumeration_s"],
+            timings["cost_estimation_s"],
+            timings["ilp_construction_s"],
+            objective_s,
+            solve_s,
+            extract_s,
+            total_s,
+            pipeline_total_s,
+        )
+        self.profile["last_solve"] = {
+            "kind": solve_kind,
+            "objective": objective_value,
+            "status": status,
+            "constraints": len(self.prob.constraints),
+            "unique_variables": len(self.pulp_variables),
+            "objective_s": objective_s,
+            "solve_s": solve_s,
+            "extract_s": extract_s,
+            "total_s": total_s,
+            "pipeline_total_s": pipeline_total_s,
+        }
+        logger.debug("ShardingOptimizer solve profile detail: %s", self.profile)
 
     def solve_lp_relaxation(self, verbose=False, frac_tol=1e-6, extract=False):
         """Solve the continuous relaxation of the ILP (binary variables relaxed
@@ -1107,14 +1648,30 @@ class ShardingOptimizer:
         return {self._orig_to_concrete[node]: spec for node, spec in solution.items()}
 
     def get_solution(self, verbose=False):
+        if self.solver_backend == "dp":
+            return self.solver.get_solution(verbose=verbose)
+
         t0 = time.perf_counter()
+        t_objective0 = time.perf_counter()
         self._set_objective()
-        self._solve(verbose)
-        obj_value = pulp.value(self.prob.objective)
+        t_objective1 = time.perf_counter()
+        solve_s = self._solve(verbose)
+        obj_value = self._safe_float(pulp.value(self.prob.objective))
+        t_extract0 = time.perf_counter()
+        solution = self._to_orig_solution(self._extract_and_validate_solution())
+        t_extract1 = time.perf_counter()
         logger.debug(
             "ILP solve took %.3fs (objective=%.4f)", time.perf_counter() - t0, obj_value
         )
-        return self._to_orig_solution(self._extract_and_validate_solution())
+        self._log_solve_profile(
+            "solve",
+            obj_value,
+            t_objective1 - t_objective0,
+            solve_s,
+            t_extract1 - t_extract0,
+            t_extract1 - t0,
+        )
+        return solution
 
     def resolve(self, verbose=False):
         """Re-solve the ILP after adding or removing constraints.
@@ -1123,14 +1680,25 @@ class ShardingOptimizer:
         be called multiple times after modifying constraints.
         """
         t0 = time.perf_counter()
-        self._solve(verbose)
-        obj_value = pulp.value(self.prob.objective)
+        solve_s = self._solve(verbose)
+        obj_value = self._safe_float(pulp.value(self.prob.objective))
+        t_extract0 = time.perf_counter()
+        solution = self._to_orig_solution(self._extract_and_validate_solution())
+        t_extract1 = time.perf_counter()
         logger.debug(
             "ILP re-solve took %.3fs (objective=%.4f)",
             time.perf_counter() - t0,
             obj_value,
         )
-        return self._to_orig_solution(self._extract_and_validate_solution())
+        self._log_solve_profile(
+            "re-solve",
+            obj_value,
+            0.0,
+            solve_s,
+            t_extract1 - t_extract0,
+            t_extract1 - t0,
+        )
+        return solution
 
     def remove_constraints(self, names):
         """Remove constraints by name, allowing re-solve to revert to the
@@ -1271,6 +1839,8 @@ class ShardingOptimizer:
     # ---- Logging ----
 
     def get_violated_constraints_log(self):
+        if self.prob is None:
+            return "Violated constraints: [] (no PuLP problem; lite build)"
         violated_constraints = [
             (k, c) for k, c in self.prob.constraints.items() if not c.valid()
         ]
@@ -1800,6 +2370,8 @@ class ShardingOptimizer:
         """
         if self._memory_constraint is None:
             return
+        if self.prob is None:
+            return  # approx (lite) build reads the factors from _constraint_log
         memory_factor_low, memory_factor_high = self._memory_constraint
 
         # Remove previous memory constraints before rebuilding
@@ -1888,6 +2460,8 @@ class ShardingOptimizer:
             raise RuntimeError(
                 f"Couldn't find appropriate constraint {node} {constraint_name} {placement}"
             )
+        if self.prob is None:
+            return []  # approx (lite) build replays this from _constraint_log
         names = self._add_node_constraint(
             node,
             output_constraint_indices=output_constraint_indices,
@@ -1959,6 +2533,8 @@ class ShardingOptimizer:
         if method == "fix":
             self._fix_node_output_indices(node, set(output_constraint_indices))
             return []
+        if self.prob is None:
+            return []  # approx (lite) build replays this from _constraint_log
         return self._add_node_constraint(
             node,
             output_constraint_indices=output_constraint_indices,

@@ -257,6 +257,7 @@ def load_optimizer(cls, path):
     opt.strats = strats
     opt.nodes = list(strats.keys())
     opt.node_map = {node: i for i, node in enumerate(opt.nodes)}
+    opt.solver_backend = "ilp"
     opt.force_grad_reduce_in_higher_precision = save_dict[
         "force_grad_reduce_in_higher_precision"
     ]
