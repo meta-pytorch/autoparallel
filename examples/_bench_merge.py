@@ -76,17 +76,29 @@ mesh = torch.distributed.device_mesh.init_device_mesh(
 )
 ndim = mesh.ndim
 
-vocab_size = 128256
+# MODEL=1b is the real LLaMA3-1B; MODEL=small is a tractable proxy whose smaller
+# tensors yield few enough decision variables that the exact ILP/LP-bound finish
+# on a 3D mesh (where the 1B PuLP problem has ~8M variables and is impractical),
+# letting us certify the approximate solver's gap on real 3D structure.
+MODEL = os.environ.get("MODEL", "1b")
+vocab_size = 1024 if MODEL == "small" else 128256
 batch_size = 2 * mesh.shape[0]
 seqlen = SEQLEN
 
 
 def model_fn():
-    args = TransformerModelArgs(
-        dim=2048, n_layers=16, n_heads=32, n_kv_heads=8,
-        ffn_dim_multiplier=1.5, multiple_of=256, rope_theta=500000,
-        vocab_size=vocab_size, max_seq_len=seqlen,
-    )
+    if MODEL == "small":
+        args = TransformerModelArgs(
+            dim=256, n_layers=4, n_heads=8, n_kv_heads=4,
+            multiple_of=64, rope_theta=500000,
+            vocab_size=vocab_size, max_seq_len=seqlen,
+        )
+    else:
+        args = TransformerModelArgs(
+            dim=2048, n_layers=16, n_heads=32, n_kv_heads=8,
+            ffn_dim_multiplier=1.5, multiple_of=256, rope_theta=500000,
+            vocab_size=vocab_size, max_seq_len=seqlen,
+        )
     if N_LAYERS:
         args.n_layers = N_LAYERS
     with torch.device("meta"):
@@ -123,8 +135,8 @@ def add_constraints(autop):
 set_nccl_topo_config(detect_nccl_topo_config(mesh))
 mp = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
 
-log(f"=== LLaMA3-1B  mesh={MESH_SHAPE}{mesh_names}  world={world_size}  "
-    f"seqlen={seqlen}  layers={N_LAYERS or 16} ===")
+log(f"=== LLaMA3-{MODEL}  mesh={MESH_SHAPE}{mesh_names}  world={world_size}  "
+    f"seqlen={seqlen}  vocab={vocab_size}  layers={N_LAYERS or '(default)'} ===")
 results = {}  # name -> dict(build, solve, total, obj)
 
 
