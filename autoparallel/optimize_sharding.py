@@ -69,9 +69,11 @@ The solver finds the globally optimal sharding strategy that minimizes total
 runtime cost while satisfying all constraints.
 """
 
+import contextlib
 import logging
 import math
 import operator
+import os
 import tempfile
 import time
 from collections import defaultdict
@@ -106,6 +108,35 @@ from .shardings.placement_options import get_placement_options_for_node
 from .shardings.propagation_rules import _create_all_options
 
 logger = logging.getLogger(__name__)
+
+# Strategy enumeration fills each OpSpec's redistribute_cost via torch's
+# generate_redistribute_costs (an expensive per-strategy redistribute-plan
+# computation, the dominant cost of build on large/3D meshes). But
+# _build_decision_vars overwrites every edge with the NCCL-aware
+# estimate_strategy_comms_cost, and nothing reads the enumeration costs in
+# between (remove_invalid_configs / keep_unique_configs select on placements/
+# shapes only). So during enumeration we replace torch's redistribute_cost with
+# a structure-preserving dummy to skip the wasted work; the final decision_vars
+# are byte-identical. Autoparallel's own cost model uses a separate
+# redistribute_cost (collective_runtime_estimation) and is unaffected. Escape
+# hatch for A/B verification: AP_FAST_BUILD=0.
+_FAST_BUILD = os.environ.get("AP_FAST_BUILD", "1") == "1"
+
+
+@contextlib.contextmanager
+def _skip_enumeration_redistribute_cost():
+    if not _FAST_BUILD:
+        yield
+        return
+    import torch.distributed.tensor._ops.utils as _dt_utils
+
+    orig = _dt_utils.redistribute_cost
+    _dt_utils.redistribute_cost = lambda *args, **kwargs: 0.0
+    try:
+        yield
+    finally:
+        _dt_utils.redistribute_cost = orig
+
 
 
 def concretize_symint(val):
@@ -660,52 +691,58 @@ class ShardingOptimizer:
 
     def build_sharding_metadata(self):
         strats = {}
-        for node in self.graph.nodes:
-            if node.op in ("placeholder", "get_attr"):
-                val = node.meta.get("val")
-                if isinstance(val, torch.Tensor):
-                    strats[node] = _create_all_options(self.mesh, val.shape, tensor=val)
-                elif node.op == "placeholder":
-                    # Non-tensor placeholders (e.g. baked-in booleans/strings):
-                    # keep them in strats with empty-shape replicate options
-                    # so the constraint system can reference them.
-                    strats[node] = _create_all_options(self.mesh, ())
+        # Enumeration's redistribute_cost matrices are overwritten with real
+        # costs in _build_decision_vars, so skip computing them here (see
+        # _skip_enumeration_redistribute_cost).
+        with _skip_enumeration_redistribute_cost():
+            for node in self.graph.nodes:
+                if node.op in ("placeholder", "get_attr"):
+                    val = node.meta.get("val")
+                    if isinstance(val, torch.Tensor):
+                        strats[node] = _create_all_options(
+                            self.mesh, val.shape, tensor=val
+                        )
+                    elif node.op == "placeholder":
+                        # Non-tensor placeholders (e.g. baked-in booleans/strings):
+                        # keep them in strats with empty-shape replicate options
+                        # so the constraint system can reference them.
+                        strats[node] = _create_all_options(self.mesh, ())
+                    else:
+                        # Non-tensor get_attr: GraphModule submodules used by
+                        # HOPs — not added to strats, invisible to the ILP.
+                        # _all_input_nodes filters them.
+                        assert node.op == "get_attr"
+                        assert any(
+                            isinstance(u.target, torch._ops.HigherOrderOperator)
+                            or "local_map" in u.name
+                            for u in node.users
+                        ), f"Non-tensor get_attr {node} is not used by a HOP"
+                elif node.op == "call_function":
+                    if not _produces_tensor(node.meta.get("val")):
+                        # Shape-computation nodes (sym_size, operator.mul, etc.)
+                        # produce scalars, not tensors — skip sharding.
+                        continue
+                    user_strats = tree_map_only(
+                        torch.fx.Node,
+                        lambda x: strats.get(x, x.meta.get("val")),
+                        node.args,
+                    )
+                    user_args = tree_map_only(
+                        torch.fx.Node, lambda x: x.meta.get("val"), node.args
+                    )
+                    user_kwargs = tree_map_only(
+                        torch.fx.Node, lambda x: x.meta.get("val"), node.kwargs
+                    )
+                    strats[node] = get_placement_options_for_node(
+                        self.mesh, node, user_strats, user_args, user_kwargs
+                    )
+                elif node.op == "output":
+                    user_strats = tree_map_only(
+                        torch.fx.Node, lambda x: strats[x], node.args
+                    )
+                    strats[node] = user_strats
                 else:
-                    # Non-tensor get_attr: GraphModule submodules used by
-                    # HOPs — not added to strats, invisible to the ILP.
-                    # _all_input_nodes filters them.
-                    assert node.op == "get_attr"
-                    assert any(
-                        isinstance(u.target, torch._ops.HigherOrderOperator)
-                        or "local_map" in u.name
-                        for u in node.users
-                    ), f"Non-tensor get_attr {node} is not used by a HOP"
-            elif node.op == "call_function":
-                if not _produces_tensor(node.meta.get("val")):
-                    # Shape-computation nodes (sym_size, operator.mul, etc.)
-                    # produce scalars, not tensors — skip sharding.
-                    continue
-                user_strats = tree_map_only(
-                    torch.fx.Node,
-                    lambda x: strats.get(x, x.meta.get("val")),
-                    node.args,
-                )
-                user_args = tree_map_only(
-                    torch.fx.Node, lambda x: x.meta.get("val"), node.args
-                )
-                user_kwargs = tree_map_only(
-                    torch.fx.Node, lambda x: x.meta.get("val"), node.kwargs
-                )
-                strats[node] = get_placement_options_for_node(
-                    self.mesh, node, user_strats, user_args, user_kwargs
-                )
-            elif node.op == "output":
-                user_strats = tree_map_only(
-                    torch.fx.Node, lambda x: strats[x], node.args
-                )
-                strats[node] = user_strats
-            else:
-                raise ValueError(f"Unexpected node op: {node.op}")
+                    raise ValueError(f"Unexpected node op: {node.op}")
         return strats
 
     def create_cluster_links(self, clusters):
