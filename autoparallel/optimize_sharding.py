@@ -219,10 +219,13 @@ def concretize_gm(gm):
     return concrete_gm, orig_to_concrete, concrete_to_orig
 
 
-@dataclass
+@dataclass(slots=True)
 class DecisionVar:
     """A decision variable in the ILP, representing one (node, arg, output_placement,
-    input_placement) choice with its associated costs and strategy metadata."""
+    input_placement) choice with its associated costs and strategy metadata.
+
+    slots=True: there are millions of these on large/3D meshes, so dropping the
+    per-instance __dict__ materially cuts both build time and memory."""
 
     var: Any  # pulp.LpVariable
     cost: float
@@ -397,7 +400,11 @@ class ShardingOptimizer:
 
         get_placement_options_timer().report()
 
-        self.cluster_links: dict[tuple, tuple] = {}
+        # Node-level: cluster-copy node idx -> root node idx (option indices are
+        # identical between copy and root; resolved on demand via
+        # _cluster_root_key / _linked_option_keys).
+        self.cluster_links: dict[int, int] = {}
+        self._root_to_copies: dict[int, list[int]] = defaultdict(list)
         if self.solver_backend == "dp":
             t0 = time.perf_counter()
             self.solver = DPBasedShardingSolver(self)
@@ -746,28 +753,40 @@ class ShardingOptimizer:
         return strats
 
     def create_cluster_links(self, clusters):
-        """Create a mapping between identical optimization nodes to reduce the
-        optimization space. If cluster_links[key1] == key2, the optimization
-        problem uses key2's variable in place of key1."""
+        """Map each cluster-copy node to its root node (node-level). The optimizer
+        reuses the root's decision variable for every copy, and the per-(arg, out,
+        inp) option index is identical between a copy and its root, so we store
+        only the node->node map and reconstruct option keys on demand (see
+        _cluster_root_key / _linked_option_keys). Materializing one dict entry per
+        option-tuple instead costs tens of millions of entries (and seconds of
+        build time) on large/3D meshes."""
         for cluster_group in clusters:
             cluster0 = cluster_group[0]
             for cluster_i in cluster_group[1:]:
                 for n0, ni in zip(cluster0, cluster_i):
-                    idx0 = self.node_map[n0]
-                    idx1 = self.node_map[ni]
-                    options_n0 = list(self.walk_over_options(n0))
-                    options_ni = list(self.walk_over_options(ni))
-                    assert options_n0 == options_ni, (
-                        f"Problem with graph clustering: {n0} and {ni} don't have the same number "
-                        "of input/output placements. Please report a bug"
+                    assert len(self.strats[n0].strategies) == len(
+                        self.strats[ni].strategies
+                    ), (
+                        f"Problem with graph clustering: {n0} and {ni} don't have "
+                        "the same number of strategies. Please report a bug"
                     )
-                    for argi, out_idx, inp_idx in options_n0:
-                        self.cluster_links[(idx1, argi, out_idx, inp_idx)] = (
-                            idx0,
-                            argi,
-                            out_idx,
-                            inp_idx,
-                        )
+                    self.cluster_links[self.node_map[ni]] = self.node_map[n0]
+
+    def _cluster_root_key(self, key):
+        """Resolve an option key to its cluster-root option key, or return it
+        unchanged when the node is not a cluster copy. The (arg, out, inp) indices
+        are identical between a copy and its root."""
+        root_idx = self.cluster_links.get(key[0])
+        return key if root_idx is None else (root_idx, key[1], key[2], key[3])
+
+    def _linked_option_keys(self, root_key):
+        """The option keys on the cluster copies of root_key's node (each a mirror
+        of root_key with the copy's node index). A copy mirrors its root's
+        per-option validity, so callers pass valid root keys only."""
+        copies = self._root_to_copies.get(root_key[0])
+        if not copies:
+            return ()
+        return [(c, root_key[1], root_key[2], root_key[3]) for c in copies]
 
     def _all_input_nodes(self, node):
         """Variant of node.all_input_nodes that preserves duplicate nodes.
@@ -820,7 +839,7 @@ class ShardingOptimizer:
                 f"Unsupported variable_category={variable_category!r}; "
                 "expected pulp.LpBinary or pulp.LpContinuous"
             )
-        cluster_linked_node_idxs = {key[0] for key in self.cluster_links}
+        cluster_linked_node_idxs = set(self.cluster_links)
 
         pulp_variables = {}
         for node, _ in self.strats.items():
@@ -854,7 +873,7 @@ class ShardingOptimizer:
 
         Returns None if the key was pruned (invalid/infinite-cost strategy).
         """
-        root_key = self.cluster_links.get(key, key)
+        root_key = self._cluster_root_key(key)
         return self.pulp_variables.get(root_key)
 
     def _compute_edge_costs(
@@ -909,7 +928,7 @@ class ShardingOptimizer:
         """
         # Precompute which node indices are cluster-linked so we can
         # copy costs from the root instead of recomputing them.
-        self._cluster_linked_node_idxs = {key[0] for key in self.cluster_links}
+        self._cluster_linked_node_idxs = set(self.cluster_links)
 
         t_compute = 0.0
         t_edge = 0.0
@@ -1002,10 +1021,7 @@ class ShardingOptimizer:
         # The root pass above updated redistribute_cost in place with
         # edge-computed costs; linked strats need the same values for
         # _compute_solution_cost and other readers.
-        linked_node_to_root_node: dict[int, int] = {}
-        for linked_key, root_key in self.cluster_links.items():
-            linked_node_to_root_node[linked_key[0]] = root_key[0]
-        for linked_node_idx, root_node_idx in linked_node_to_root_node.items():
+        for linked_node_idx, root_node_idx in self.cluster_links.items():
             linked_node = self.nodes[linked_node_idx]
             root_node = self.nodes[root_node_idx]
             linked_op = self.strats[linked_node]
@@ -1018,12 +1034,12 @@ class ShardingOptimizer:
                 ]
         n_cluster_copied = len(self.cluster_links)
 
-        # Linked keys mirror their root's validity (redistribute_cost is copied
-        # from the root above), so only valid root keys map to linked keys.
-        self._root_to_linked: dict[tuple, list[tuple]] = defaultdict(list)
-        for linked_key, root_key in self.cluster_links.items():
-            if root_key in self._valid_keys:
-                self._root_to_linked[root_key].append(linked_key)
+        # Root node idx -> [copy node idxs]. Option keys are reconstructed on
+        # demand (see _linked_option_keys); a copy mirrors its root's per-option
+        # validity, so no per-option filtering is needed here.
+        self._root_to_copies = defaultdict(list)
+        for copy_idx, root_idx in self.cluster_links.items():
+            self._root_to_copies[root_idx].append(copy_idx)
 
         t_pulp_end = time.perf_counter()
         logger.debug(
@@ -1060,7 +1076,7 @@ class ShardingOptimizer:
         dv = self.decision_vars.get(key)
         if dv is not None:
             return dv
-        root_key = self.cluster_links[key]
+        root_key = self._cluster_root_key(key)
         root_dv = self.decision_vars[root_key]
         node_idx, argi, out_idx, _ = key
         strategy = self.strats[self.nodes[node_idx]].strategies[out_idx]
@@ -1088,8 +1104,10 @@ class ShardingOptimizer:
             key = (node_idx, argi, out_idx, inp_idx)
             if key in self.decision_vars:
                 return self._resolve_decision_var(key)
-            root_key = self.cluster_links.get(key)
-            if root_key is not None and root_key in self.decision_vars:
+            if (
+                key[0] in self.cluster_links
+                and self._cluster_root_key(key) in self.decision_vars
+            ):
                 return self._resolve_decision_var(key)
         return None
 
@@ -1105,10 +1123,10 @@ class ShardingOptimizer:
         result = {}
         for _, out_idx, inp_idx in self.walk_over_options(node, argi):
             key = (node_idx, argi, out_idx, inp_idx)
-            if key in self.cluster_links:
+            if key[0] in self.cluster_links:
                 if not resolve_clusters:
                     continue
-                var = self.pulp_variables.get(self.cluster_links[key])
+                var = self.pulp_variables.get(self._cluster_root_key(key))
             else:
                 var = self.pulp_variables.get(key)
             if var is None:  # pruned (invalid/infinite-cost) strategy edge
@@ -1389,7 +1407,7 @@ class ShardingOptimizer:
             return
         terms = []
         for key, dv in self.decision_vars.items():
-            multiplier = 1 + len(self._root_to_linked.get(key, []))
+            multiplier = 1 + len(self._root_to_copies.get(key[0], ()))
             terms.append(dv.var * dv.cost * multiplier)
         self.prob += pulp.lpSum(terms)
 
@@ -1513,7 +1531,7 @@ class ShardingOptimizer:
             key for key, dv in self.decision_vars.items() if dv.var.value() == 1
         ]
         for root_key in list(self.selected_keys):
-            self.selected_keys.extend(self._root_to_linked.get(root_key, []))
+            self.selected_keys.extend(self._linked_option_keys(root_key))
 
         if self.prob.status == -1:
             logger.warning(self.get_violated_constraints_log())
@@ -1638,7 +1656,7 @@ class ShardingOptimizer:
                     if dv.var.value() is not None and dv.var.value() > 0.5
                 ]
                 for root_key in list(self.selected_keys):
-                    self.selected_keys.extend(self._root_to_linked.get(root_key, []))
+                    self.selected_keys.extend(self._linked_option_keys(root_key))
                 solution = self._to_orig_solution(self._extract_and_validate_solution())
         finally:
             for v, cat in zip(variables, original_cats):
@@ -1932,10 +1950,8 @@ class ShardingOptimizer:
 
         # Build node-level cluster mapping: linked_node -> root_node
         cluster_roots: dict[torch.fx.Node, torch.fx.Node] = {}
-        for linked_key, root_key in self.cluster_links.items():
-            linked_node = self.nodes[linked_key[0]]
-            root_node = self.nodes[root_key[0]]
-            cluster_roots[linked_node] = root_node
+        for copy_idx, root_idx in self.cluster_links.items():
+            cluster_roots[self.nodes[copy_idx]] = self.nodes[root_idx]
 
         _normalize_cluster_layer(cluster_roots)
 

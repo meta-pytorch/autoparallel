@@ -135,7 +135,7 @@ def save_optimizer(opt, path):
     # Re-key strats by node name, saving only root nodes (non-linked).
     # Linked nodes share identical strats with their root and are
     # reconstructed on load from cluster_links.
-    linked_node_names = {opt.nodes[lk[0]].name for lk in opt.cluster_links}
+    linked_node_names = {opt.nodes[c].name for c in opt.cluster_links}
     strats_by_name = {
         node.name: strat
         for node, strat in opt.strats.items()
@@ -193,8 +193,8 @@ def save_optimizer(opt, path):
         "dv_costs_keys": dv_costs_keys,
         "dv_costs_vals": dv_costs_vals,
         "cluster_links_node_by_name": {
-            opt.nodes[lk[0]].name: opt.nodes[rk[0]].name
-            for lk, rk in opt.cluster_links.items()
+            opt.nodes[c].name: opt.nodes[r].name
+            for c, r in opt.cluster_links.items()
         },
         "constraint_log": opt._constraint_log,
         "selected_keys_by_name": selected_keys_by_name,
@@ -272,22 +272,12 @@ def load_optimizer(cls, path):
     opt.build_pulp = True
     opt.profile = {"timings": {}}
 
-    # Reconstruct cluster_links by expanding the node-level mapping over
-    # all (argi, out_idx, inp_idx) combinations.
-    opt.cluster_links = {}
-    for linked_name, root_name in cluster_links_node_by_name.items():
-        linked_node = nodes_by_name[linked_name]
-        root_node = nodes_by_name[root_name]
-        linked_idx = opt.node_map[linked_node]
-        root_idx = opt.node_map[root_node]
-        for argi, out_idx, inp_idx in opt.walk_over_options(linked_node):
-            opt.cluster_links[(linked_idx, argi, out_idx, inp_idx)] = (
-                root_idx,
-                argi,
-                out_idx,
-                inp_idx,
-            )
-    opt._cluster_linked_node_idxs = {key[0] for key in opt.cluster_links}
+    # cluster_links is node-level: copy node idx -> root node idx.
+    opt.cluster_links = {
+        opt.node_map[nodes_by_name[linked_name]]: opt.node_map[nodes_by_name[root_name]]
+        for linked_name, root_name in cluster_links_node_by_name.items()
+    }
+    opt._cluster_linked_node_idxs = set(opt.cluster_links)
 
     # Mesh placeholder — provides shape/dim_names for get_json() and ndim
     # for add_node_constraint() default placement, without needing a PG
@@ -344,9 +334,9 @@ def load_optimizer(cls, path):
         len(opt.decision_vars),
     )
 
-    opt._root_to_linked = defaultdict(list)
-    for linked_key, root_key in opt.cluster_links.items():
-        opt._root_to_linked[root_key].append(linked_key)
+    opt._root_to_copies = defaultdict(list)
+    for copy_idx, root_idx in opt.cluster_links.items():
+        opt._root_to_copies[root_idx].append(copy_idx)
 
     opt.prob = pulp.LpProblem("AutoParallel", pulp.LpMinimize)
     opt.add_default_constraints()
@@ -399,7 +389,7 @@ def _restore_solution(opt, selected_keys_by_name, nodes_by_name):
 
     # Expand cluster links
     for root_key in list(opt.selected_keys):
-        opt.selected_keys.extend(opt._root_to_linked.get(root_key, []))
+        opt.selected_keys.extend(opt._linked_option_keys(root_key))
 
 
 def save_placements(opt, path):

@@ -275,7 +275,8 @@ class ApproximateShardingSolver:
     # ------------------------------------------------------------------ #
     def _build_problem(self):
         opt = self.opt
-        cluster_linked = {key[0] for key in opt.cluster_links}
+        # cluster_links is node-level: copy node idx -> root node idx.
+        cluster_linked = set(opt.cluster_links)
         self.cost_bearing = [
             opt.node_map[node]
             for node in opt.strats
@@ -283,8 +284,8 @@ class ApproximateShardingSolver:
         ]
 
         root_to_copies: dict[int, set] = defaultdict(set)
-        for linked_key, root_key in opt.cluster_links.items():
-            root_to_copies[root_key[0]].add(linked_key[0])
+        for copy_idx, root_idx in opt.cluster_links.items():
+            root_to_copies[root_idx].add(copy_idx)
         self.node_mult = {
             v: 1 + len(root_to_copies.get(v, ())) for v in self.cost_bearing
         }
@@ -456,15 +457,13 @@ class ApproximateShardingSolver:
         )
 
         opt = self.opt
-        cl = opt.cluster_links
+        cl = opt.cluster_links  # node-level: copy node idx -> root node idx
 
         def rootkey(k):
-            return cl.get(k, k)
+            return opt._cluster_root_key(k)
 
-        cluster_linked = {key[0] for key in cl}
-        node_root = {}
-        for lk, rk in cl.items():
-            node_root[lk[0]] = rk[0]
+        cluster_linked = set(cl)
+        node_root = dict(cl)
 
         def nroot(idx):
             return node_root.get(idx, idx)
@@ -638,7 +637,7 @@ class ApproximateShardingSolver:
         the pin was applied as a PuLP row ("constraint") or as variable bounds
         ("fix", which leaves no row to parse) and in the lite (no-PuLP) build."""
         opt = self.opt
-        node_root = {lk[0]: rk[0] for lk, rk in opt.cluster_links.items()}
+        node_root = dict(opt.cluster_links)  # node-level: copy idx -> root idx
         restrict: dict[int, set] = {}
         for fname, kwargs in getattr(opt, "_constraint_log", []):
             if fname != "add_node_axis_constraint":
@@ -698,10 +697,8 @@ class ApproximateShardingSolver:
         opt = self.opt
         n = len(opt.nodes)
         uf = _UnionFind(n)
-        # cluster_links has one entry per option-key; collapse to unique
-        # (linked_node, root_node) pairs so the K-scaled loops below run over
-        # hundreds of pairs, not millions of duplicates.
-        cluster_pairs = {(lk[0], rk[0]) for lk, rk in opt.cluster_links.items()}
+        # cluster_links is node-level: (copy node idx, root node idx) pairs.
+        cluster_pairs = set(opt.cluster_links.items())
         for li, ri in cluster_pairs:
             uf.union(li, ri)
         for a, b, _ in paired_edges:
@@ -1321,7 +1318,7 @@ class ApproximateShardingSolver:
                 selected.append(key)
         opt.selected_keys = list(selected)
         for rk in selected:
-            opt.selected_keys.extend(opt._root_to_linked.get(rk, []))
+            opt.selected_keys.extend(opt._linked_option_keys(rk))
         # Populate prob.objective (when a PuLP problem exists) so callers can also
         # score via pulp.value(prob.objective); the returned value uses the
         # equivalent but cheaper total_objective(). In the lite (no-PuLP) build,
