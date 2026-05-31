@@ -1495,6 +1495,11 @@ class ShardingOptimizer:
         extract_s,
         total_s,
     ):
+        # Optimizers loaded from a save file skip init-time profiling; there is
+        # nothing to extend, and the phase timings below are absent.
+        profile = getattr(self, "profile", None)
+        if not profile or "init_total_s" not in profile.get("timings", {}):
+            return
         mesh = self.profile["mesh"]
         model = self.profile["model"]
         timings = self.profile["timings"]

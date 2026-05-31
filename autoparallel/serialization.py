@@ -264,7 +264,13 @@ def load_optimizer(cls, path):
     opt._constraint_log = []
     opt._memory_constraint = None
     opt._node_constraint_names = {}
+    opt._node_axis_constraints = defaultdict(list)
+    opt._fixed_vars = []
     opt._name_counters = {}
+    # Loaded optimizers rebuild the PuLP problem below but carry no init-time
+    # profiling; an empty profile lets solve-time profile writes/guards no-op.
+    opt.build_pulp = True
+    opt.profile = {"timings": {}}
 
     # Reconstruct cluster_links by expanding the node-level mapping over
     # all (argi, out_idx, inp_idx) combinations.
