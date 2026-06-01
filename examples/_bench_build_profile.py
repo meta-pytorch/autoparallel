@@ -18,6 +18,13 @@ from autoparallel.cost_models.collective_runtime_estimation import set_nccl_topo
 from autoparallel.cost_models.nccl_cost_model import detect_nccl_topo_config
 
 logging.basicConfig(level=logging.ERROR)
+if os.environ.get("DEBUG_CLUSTER") == "1":
+    h = logging.StreamHandler()
+    h.setLevel(logging.DEBUG)
+    for nm in ("autoparallel.graph_passes.graph_clustering", "autoparallel.optimize_sharding"):
+        lg = logging.getLogger(nm)
+        lg.setLevel(logging.DEBUG)
+        lg.addHandler(h)
 for fn, val in [("device_count", lambda: 8), ("get_device_name", lambda *a, **k: "H100"),
                 ("get_device_capability", lambda *a, **k: (9, 0))]:
     patch(f"torch.cuda.{fn}", val).start()
@@ -25,8 +32,15 @@ patch("torch.cuda.get_device_properties", lambda *a, **k: type(
     "P", (), {"major": 9, "minor": 0, "name": "H100",
               "total_memory": 80 * 1024**3, "multi_processor_count": 132})()).start()
 
+MODEL = os.environ.get("MODEL", "1b")
 SEQLEN = int(os.environ.get("SEQLEN", "2048"))
 MESH_SHAPE = tuple(int(x) for x in os.environ.get("MESH", "2,4,8").split(","))
+_CFG = {
+    "1b": dict(dim=2048, n_layers=16, n_heads=32, n_kv_heads=8, ffn_dim_multiplier=1.5, multiple_of=256),
+    "3b": dict(dim=3072, n_layers=28, n_heads=24, n_kv_heads=8, ffn_dim_multiplier=1.0, multiple_of=256),
+    "8b": dict(dim=4096, n_layers=32, n_heads=32, n_kv_heads=8, ffn_dim_multiplier=1.3, multiple_of=1024),
+    "70b": dict(dim=8192, n_layers=80, n_heads=64, n_kv_heads=8, ffn_dim_multiplier=1.3, multiple_of=4096),
+}
 ws = 1
 for d in MESH_SHAPE:
     ws *= d
@@ -40,8 +54,7 @@ batch_size = 2 * mesh.shape[0]
 
 def model_fn():
     args = TransformerModelArgs(
-        dim=2048, n_layers=16, n_heads=32, n_kv_heads=8, ffn_dim_multiplier=1.5,
-        multiple_of=256, rope_theta=500000, vocab_size=vocab_size, max_seq_len=SEQLEN)
+        rope_theta=500000, vocab_size=vocab_size, max_seq_len=SEQLEN, **_CFG[MODEL])
     with torch.device("meta"):
         return Transformer(args)
 
@@ -52,7 +65,7 @@ def input_fn():
 
 set_nccl_topo_config(detect_nccl_topo_config(mesh))
 mp = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
-print(f"=== build profile: mesh={MESH_SHAPE}{names} seqlen={SEQLEN} ===", flush=True)
+print(f"=== build profile: MODEL={MODEL} mesh={MESH_SHAPE}{names} seqlen={SEQLEN} ===", flush=True)
 
 t = time.perf_counter()
 autop = AutoParallel(model_fn(), input_fn, mesh, mp, repeated_subgraphs=True, solver="approx")
