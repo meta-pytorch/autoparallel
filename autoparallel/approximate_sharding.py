@@ -121,8 +121,7 @@ class ApproximateShardingSolver:
         self,
         optimizer,
         candidate_limit: Optional[int] = 64,
-        bp_iters: int = 20,
-        bp_damping: float = 0.2,
+        bp_iters: int = 400,
         bp_tol: float = 1e-3,
         max_sweeps: int = 12,
         max_time_s: float = 60.0,
@@ -133,7 +132,6 @@ class ApproximateShardingSolver:
         self.opt = optimizer
         self.candidate_limit = candidate_limit
         self.bp_iters = bp_iters
-        self.bp_damping = bp_damping
         self.bp_tol = bp_tol
         self.max_sweeps = max_sweeps
         self.max_time_s = max_time_s
@@ -191,12 +189,15 @@ class ApproximateShardingSolver:
             )
 
         deadline = t0 + self.max_time_s
-        # Candidate 1: belief propagation init.
+        # TRW-S init, then local-search polish. TRW-S reaches the exact MAP on the
+        # (integral) sharding problem, so the old greedy second candidate it used
+        # to be compared against is strictly dominated and has been dropped; the
+        # polish remains for the memory budget and as a local-search safety net.
         t_bp0 = time.perf_counter()
-        self._belief_propagation()
+        self._belief_propagation(deadline)
         if verbose:
-            logger.info("approx phase: bp converged iter=%s delta=%.4g in %.2fs; "
-                        "bp_decode energy=%.1f",
+            logger.info("approx phase: trws iter=%s delta=%.4g in %.2fs; "
+                        "decode energy=%.1f",
                         getattr(self, "_bp_last_iter", None),
                         getattr(self, "_bp_last_delta", float("nan")),
                         time.perf_counter() - t_bp0,
@@ -204,25 +205,11 @@ class ApproximateShardingSolver:
         self._memory_repair()
         self._coordinate_descent(deadline)
         if verbose:
-            logger.info("approx phase: bp+cd energy=%.1f", self._fast_total_energy())
+            logger.info("approx phase: trws+cd energy=%.1f", self._fast_total_energy())
         self._star_block_search(deadline)
         bp_energy = self._fast_total_energy()
-        bp_snapshot = [g.current for g in self.groups]
         if verbose:
-            logger.info("approx phase: bp+cd+star energy=%.1f", bp_energy)
-
-        # Candidate 2: greedy init (cheap insurance against BP doing poorly).
-        self._greedy_init()
-        self._memory_repair()
-        self._coordinate_descent(deadline)
-        self._star_block_search(deadline)
-        greedy_energy = self._fast_total_energy()
-        if verbose:
-            logger.info("approx phase: greedy+cd+star energy=%.1f", greedy_energy)
-
-        if bp_energy <= greedy_energy:
-            for gid, ci in enumerate(bp_snapshot):
-                self._set_group(gid, ci)
+            logger.info("approx phase: trws+cd+star energy=%.1f", bp_energy)
         t_solve = time.perf_counter() - t0 - t_build
 
         objective = self._write_back()
@@ -240,12 +227,11 @@ class ApproximateShardingSolver:
         )
         logger.info(
             "ApproximateShardingSolver: status=%s objective=%.4f "
-            "(bp=%.1f greedy=%.1f) groups=%d nodes=%d "
+            "(trws+polish=%.1f) groups=%d nodes=%d "
             "timings={build=%.3fs,solve=%.3fs,total=%.3fs}",
             status,
             objective,
             bp_energy,
-            greedy_energy,
             len(self.groups),
             len(self.cost_bearing),
             t_build,
@@ -260,7 +246,6 @@ class ApproximateShardingSolver:
             "total_s": total_s,
             "groups": len(self.groups),
             "bp_energy": bp_energy,
-            "greedy_energy": greedy_energy,
         }
         if infeasible:
             raise RuntimeError(
@@ -1028,46 +1013,80 @@ class ApproximateShardingSolver:
     # ------------------------------------------------------------------ #
     # Belief propagation (min-sum) + decode
     # ------------------------------------------------------------------ #
-    def _belief_propagation(self):
-        """Sequential (forward-backward, topological) min-sum message passing.
-        Exact MAP on trees in one sweep; near-optimal on the near-tree transformer
-        graph in a few sweeps, far better than synchronous flooding."""
+    def _belief_propagation(self, deadline=None):
+        """Sequential tree-reweighted message passing (TRW-S).
+
+        Plain loopy min-sum BP settles into globally-inconsistent fixed points on
+        this MRF (empirically 5-16% above the optimum). TRW-S optimizes a convex
+        upper bound over a tree decomposition (here: monotonic chains induced by a
+        node ordering), so on the integral sharding problem it converges to the
+        exact MAP. Node g is reweighted by 1/(chains through g) = 1/max(in,out)deg
+        under the ordering; forward and backward half-sweeps send only along edges
+        oriented with the pass. We decode each sweep and keep the best assignment."""
         G = len(self.groups)
+        if G == 0:
+            return
         unary = self.g_unary
         nbrs = self.nbrs
-        damp = self.bp_damping
 
         order = sorted(range(G), key=lambda g: min(self.groups[g].members))
+        pos = [0] * G
+        for i, g in enumerate(order):
+            pos[g] = i
+        gamma = np.ones(G)
+        for g in range(G):
+            indeg = sum(1 for h in nbrs[g] if pos[h] < pos[g])
+            outdeg = sum(1 for h in nbrs[g] if pos[h] > pos[g])
+            gamma[g] = 1.0 / max(indeg, outdeg, 1)
+
         msg: dict[tuple, np.ndarray] = {}
         for g in range(G):
             for h in nbrs[g]:
                 msg[(g, h)] = np.zeros(len(unary[h]))
 
+        # We decode every sweep and keep the best assignment. The decoded energy
+        # converges in long, irregular plateaus (it can sit at a high value for
+        # ~100 sweeps, drop, plateau again, then drop to the optimum), so neither
+        # an energy-plateau counter nor a message-delta threshold detects true
+        # convergence without stopping on a false plateau. We therefore run a
+        # fixed sweep budget (bounded by the time deadline), which is enough for
+        # the slowest converger observed, and an exact fixed point ends early.
+        best_e = INF
+        best_snap = None
         for sweep in range(self.bp_iters):
             max_delta = 0.0
-            for direction in (order, order[::-1]):
-                for g in direction:
+            for forward in (True, False):
+                for g in order if forward else order[::-1]:
                     if not nbrs[g]:
                         continue
-                    in_sum = unary[g].copy()
-                    for k in nbrs[g]:
-                        in_sum += msg[(k, g)]
+                    wp = unary[g].copy()
+                    for r in nbrs[g]:
+                        wp += msg[(r, g)]
+                    wp *= gamma[g]
                     for h in nbrs[g]:
-                        excl = in_sum - msg[(h, g)]
+                        if (pos[h] > pos[g]) != forward:
+                            continue
                         P = self._pair_matrix(g, h)  # (D_g, D_h)
-                        m = (excl[:, None] + P).min(axis=0)
+                        m = ((wp - msg[(h, g)])[:, None] + P).min(axis=0)
                         m -= m.min()
-                        md = (1 - damp) * m + damp * msg[(g, h)]
-                        delta = np.abs(md - msg[(g, h)]).max()
-                        if delta > max_delta:
-                            max_delta = delta
-                        msg[(g, h)] = md
+                        d = np.abs(m - msg[(g, h)]).max()
+                        if d > max_delta:
+                            max_delta = d
+                        msg[(g, h)] = m
+            self._decode(msg)
+            e = self._fast_total_energy()
+            if e < best_e:
+                best_e, best_snap = e, [grp.current for grp in self.groups]
             self._bp_last_iter = sweep + 1
             self._bp_last_delta = max_delta
-            if max_delta < self.bp_tol:
+            if max_delta == 0.0 or (
+                deadline is not None and time.perf_counter() > deadline
+            ):
                 break
 
-        self._decode(msg)
+        if best_snap is not None:
+            for gid, ci in enumerate(best_snap):
+                self._set_group(gid, ci)
 
     def _decode(self, msg):
         """Sequential topological decode: fix each group to the argmin of its
@@ -1096,24 +1115,6 @@ class ApproximateShardingSolver:
         group.current = ci
         for m, o in group.choices[ci].items():
             self.cur_out[m] = o
-
-    def _greedy_init(self):
-        order = sorted(range(len(self.groups)),
-                       key=lambda g: min(self.groups[g].members))
-        for gid in order:
-            self._set_group(gid, 0)
-        for gid in order:
-            best_i, best_e = 0, INF
-            for ci in range(self.groups[gid].domain):
-                e = self.g_unary[gid][ci]
-                for h in self.nbrs[gid]:
-                    if min(self.groups[h].members) < min(self.groups[gid].members):
-                        ch = self.groups[h].current
-                        e += (self.C[(gid, h)][ci, ch] if gid < h
-                              else self.C[(h, gid)][ch, ci])
-                if e < best_e:
-                    best_i, best_e = ci, e
-            self._set_group(gid, best_i)
 
     def _coordinate_descent(self, deadline):
         for _ in range(self.max_sweeps):

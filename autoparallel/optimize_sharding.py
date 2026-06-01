@@ -1209,6 +1209,11 @@ class ShardingOptimizer:
                 continue
             if node not in self.strats:
                 continue
+            # Cluster copies are structurally identical to their root (same
+            # strategies and input structure, asserted in create_cluster_links),
+            # so validating the root covers them.
+            if self.node_map[node] in self.cluster_links:
+                continue
             strat = self.strats[node]
             strat0 = strat.strategies[0]
             all_input_nodes = self._all_input_nodes(node)
