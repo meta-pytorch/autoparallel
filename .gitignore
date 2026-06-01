@@ -10,6 +10,9 @@
 *.egg-info/
 
 *.pdf
+*.png
+*.svg
+*.csv
 
 build/
 dist/
