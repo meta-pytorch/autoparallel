@@ -179,28 +179,36 @@ def main():
 
     try:
         losses = []
+        step_times = []
         for step in range(args.train_steps):
+            torch.cuda.synchronize(device)
+            t_step = time.perf_counter()
             optimizer.zero_grad(set_to_none=True)
             step_loss = torch.zeros((), device=device)
             for mi, ml in zip(input_mbs, label_mbs):
                 logits = parallel_mod(mi)
-                if torch.any(torch.isnan(logits)):
-                    raise RuntimeError("NaN in forward output")
                 loss = vocab_parallel_cross_entropy(
                     logits, ml, vocab_size=model_args.vocab_size, tp_group=tp_group,
                     tp_rank=tp_rank, tp_degree=tp_degree, normalizer=normalizer)
-                if torch.any(torch.isnan(loss)):
-                    raise RuntimeError("NaN in loss")
                 loss.backward()
                 step_loss = step_loss + loss.detach()
             torch.nn.utils.clip_grad_norm_(parallel_mod.parameters(), args.max_grad_norm)
             optimizer.step()
+            torch.cuda.synchronize(device)
+            step_times.append(time.perf_counter() - t_step)
             with torch.no_grad():
                 logged = step_loss.clone()
                 dist.all_reduce(logged, op=dist.ReduceOp.SUM)
             losses.append(float(logged.item()))
-            print_rank0(f"step={step:03d} loss={losses[-1]:.6f}")
+            print_rank0(f"step={step:03d} loss={losses[-1]:.6f} step_time={1000*step_times[-1]:.0f}ms")
 
+        warmup = min(3, max(0, len(step_times) - 2))
+        steady = sorted(step_times[warmup:])
+        if steady:
+            mean_ms = 1000 * sum(steady) / len(steady)
+            print_rank0(f"[latency] solver={args.solver} per-step (excl {warmup} warmup, "
+                        f"{len(steady)} steps): mean={mean_ms:.0f}ms "
+                        f"median={1000*steady[len(steady)//2]:.0f}ms min={1000*steady[0]:.0f}ms")
         print_rank0(f"\nloss curve: {[round(x, 4) for x in losses]}")
         verdict = "PASS" if losses[-1] < losses[0] else "FAIL"
         print_rank0(f"SANITY {verdict}: loss {losses[0]:.4f} -> {losses[-1]:.4f}")

@@ -182,8 +182,11 @@ class ApproximateShardingSolver:
             logger.info(
                 "approx build: problem=%.2fs %s factors=%.2fs groups=%d "
                 "cost_bearing=%d edges=%d max_domain=%d",
-                t_bp - t0, getattr(self, "_build_times", {}), t_bf - t_bp,
-                len(self.groups), len(self.cost_bearing),
+                t_bp - t0,
+                getattr(self, "_build_times", {}),
+                t_bf - t_bp,
+                len(self.groups),
+                len(self.cost_bearing),
                 sum(len(v) for v in self.input_edges.values()),
                 max((g.domain for g in self.groups), default=0),
             )
@@ -196,12 +199,13 @@ class ApproximateShardingSolver:
         t_bp0 = time.perf_counter()
         self._belief_propagation(deadline)
         if verbose:
-            logger.info("approx phase: trws iter=%s delta=%.4g in %.2fs; "
-                        "decode energy=%.1f",
-                        getattr(self, "_bp_last_iter", None),
-                        getattr(self, "_bp_last_delta", float("nan")),
-                        time.perf_counter() - t_bp0,
-                        self._fast_total_energy())
+            logger.info(
+                "approx phase: trws iter=%s delta=%.4g in %.2fs; " "decode energy=%.1f",
+                getattr(self, "_bp_last_iter", None),
+                getattr(self, "_bp_last_delta", float("nan")),
+                time.perf_counter() - t_bp0,
+                self._fast_total_energy(),
+            )
         self._memory_repair()
         self._coordinate_descent(deadline)
         if verbose:
@@ -314,7 +318,9 @@ class ApproximateShardingSolver:
         for v in self.cost_bearing:
             node = opt.nodes[v]
             self.allowed_out[v] = [
-                o for o in self.allowed_out[v] if not self._out_fully_forbidden(v, node, o)
+                o
+                for o in self.allowed_out[v]
+                if not self._out_fully_forbidden(v, node, o)
             ]
         t_forbid = time.perf_counter()
 
@@ -375,9 +381,9 @@ class ApproximateShardingSolver:
                     if pos_key is not None and neg_key is not None:
                         break
                 if pos_key is not None and neg_key is not None:
-                    authoritative.setdefault(
-                        (neg_key[0], neg_key[1]), set()
-                    ).add(pos_key[0])
+                    authoritative.setdefault((neg_key[0], neg_key[1]), set()).add(
+                        pos_key[0]
+                    )
                 continue
             if name.startswith(self._SKIP_PREFIXES):
                 continue
@@ -410,8 +416,11 @@ class ApproximateShardingSolver:
                 oa, ob = {k[2] for k in neg}, {k[2] for k in pos}
                 if len(na) == 1 and len(nb) == 1 and len(oa) == 1 and len(ob) == 1:
                     paired_edges.append(
-                        (next(iter(na)), next(iter(nb)),
-                         frozenset({(next(iter(oa)), next(iter(ob)))}))
+                        (
+                            next(iter(na)),
+                            next(iter(nb)),
+                            frozenset({(next(iter(oa)), next(iter(ob)))}),
+                        )
                     )
         # method="fix" axis pins leave no PuLP row to parse above, so replay the
         # log to recover them (constraint-method pins are also picked up here,
@@ -775,8 +784,11 @@ class ApproximateShardingSolver:
                 if nb in assign and nb in member_set:
                     allowed = allow[(nb, m)].get(assign[nb], set())
                     cand = allowed if cand is None else (cand & allowed)
-            cand = set(self.allowed_out.get(m, [])) if cand is None else (
-                cand & set(self.allowed_out.get(m, [])))
+            cand = (
+                set(self.allowed_out.get(m, []))
+                if cand is None
+                else (cand & set(self.allowed_out.get(m, [])))
+            )
             return cand
 
         def dfs(i, assign):
@@ -797,7 +809,8 @@ class ApproximateShardingSolver:
         if len(results) >= limit:
             logger.warning(
                 "Approximate solver: group of %d nodes hit group_domain_limit=%d.",
-                len(members), limit,
+                len(members),
+                limit,
             )
         return results
 
@@ -873,8 +886,9 @@ class ApproximateShardingSolver:
             for v in param_idxs:
                 r = ratios[v]
                 mn = min(r.values())
-                self.allowed_out[v] = [o for o in self.allowed_out[v]
-                                       if r[o] <= mn + 1e-12]
+                self.allowed_out[v] = [
+                    o for o in self.allowed_out[v] if r[o] <= mn + 1e-12
+                ]
         self._memory = {
             "param_idxs": param_idxs,
             "ratios": ratios,
@@ -1140,8 +1154,11 @@ class ApproximateShardingSolver:
 
     def _star_block_search(self, deadline):
         ranked = sorted(
-            ((len(self.nbrs[g]), g) for g in range(len(self.groups))
-             if len(self.nbrs[g]) >= 2 and self.groups[g].domain > 1),
+            (
+                (len(self.nbrs[g]), g)
+                for g in range(len(self.groups))
+                if len(self.nbrs[g]) >= 2 and self.groups[g].domain > 1
+            ),
             reverse=True,
         )
         for _ in range(self.star_passes):
@@ -1213,34 +1230,48 @@ class ApproximateShardingSolver:
     def _current_memory(self):
         if self._memory is None:
             return 0.0
-        return sum(self._memory["ratios"][v][self.cur_out[v]]
-                   for v in self._memory["param_idxs"])
+        return sum(
+            self._memory["ratios"][v][self.cur_out[v]]
+            for v in self._memory["param_idxs"]
+        )
 
     def _memory_ok_after(self, gid, ci):
         if self._memory is None or self._memory.get("tight"):
             return True
         ratios = self._memory["ratios"]
         choice = self.groups[gid].choices[ci]
-        delta = sum(ratios[m][o] - ratios[m][self.cur_out[m]]
-                    for m, o in choice.items() if m in ratios)
+        delta = sum(
+            ratios[m][o] - ratios[m][self.cur_out[m]]
+            for m, o in choice.items()
+            if m in ratios
+        )
         mem = self._current_memory() + delta
-        return (self._memory["budget_low"] - 1e-6 <= mem
-                <= self._memory["budget_high"] + 1e-6)
+        return (
+            self._memory["budget_low"] - 1e-6
+            <= mem
+            <= self._memory["budget_high"] + 1e-6
+        )
 
     def _block_memory_ok(self):
         if self._memory is None or self._memory.get("tight"):
             return True
         mem = self._current_memory()
-        return (self._memory["budget_low"] - 1e-6 <= mem
-                <= self._memory["budget_high"] + 1e-6)
+        return (
+            self._memory["budget_low"] - 1e-6
+            <= mem
+            <= self._memory["budget_high"] + 1e-6
+        )
 
     def _memory_repair(self):
         if self._memory is None or self._memory.get("tight"):
             return
         low, high = self._memory["budget_low"], self._memory["budget_high"]
         ratios = self._memory["ratios"]
-        param_groups = {self.node_to_group[v] for v in self._memory["param_idxs"]
-                        if v in self.node_to_group}
+        param_groups = {
+            self.node_to_group[v]
+            for v in self._memory["param_idxs"]
+            if v in self.node_to_group
+        }
         for _ in range(2 * max(1, len(param_groups))):
             mem = self._current_memory()
             if low - 1e-6 <= mem <= high + 1e-6:
@@ -1254,8 +1285,11 @@ class ApproximateShardingSolver:
                     if ci == group.current:
                         continue
                     choice = group.choices[ci]
-                    dmem = sum(ratios[m][choice[m]] - ratios[m][self.cur_out[m]]
-                               for m in choice if m in ratios)
+                    dmem = sum(
+                        ratios[m][choice[m]] - ratios[m][self.cur_out[m]]
+                        for m in choice
+                        if m in ratios
+                    )
                     if (dmem < -1e-9) != over and abs(dmem) > 1e-9:
                         continue
                     if abs(dmem) <= 1e-9:
@@ -1264,8 +1298,13 @@ class ApproximateShardingSolver:
                     if best is None or score < best[0]:
                         best = (score, gid, ci)
             if best is None:
-                logger.warning("Approximate solver: memory repair stuck at %.4f "
-                               "(budget=[%.4f,%.4f]).", mem, low, high)
+                logger.warning(
+                    "Approximate solver: memory repair stuck at %.4f "
+                    "(budget=[%.4f,%.4f]).",
+                    mem,
+                    low,
+                    high,
+                )
                 return
             self._set_group(best[1], best[2])
 

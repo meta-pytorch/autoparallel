@@ -3,6 +3,7 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+import logging
 import math
 
 import pulp
@@ -87,6 +88,44 @@ def test_approx_objective_close_to_ilp():
             f"approx={approx_objective} ilp={ilp_objective} "
             f"gap={(approx_objective / ilp_objective - 1) * 100:.1f}%"
         )
+
+
+@apply_cuda_patches
+@pytest.mark.filterwarnings("ignore:Constructing LpVariable")
+@pytest.mark.filterwarnings("ignore:Overwriting previously set objective")
+def test_lp_solver_matches_ilp():
+    """The LP-relaxation solver returns an integral, ILP-feasible assignment whose
+    objective equals the exact ILP optimum (the relaxation is integral here)."""
+    mesh = _fake_2d_mesh()
+    with _tiny_llama3_autop(mesh) as autop:
+        _add_constraints(autop, mesh)
+        opt = autop.sharding_optimizer
+
+        autop.optimize_placement(verbose=False, solver="lp")
+        lp_objective = pulp.value(opt.prob.objective)
+        violated = [n for n, c in opt.prob.constraints.items() if not c.valid()]
+        assert not violated, f"lp violated {len(violated)} constraints"
+
+        autop.optimize_placement(verbose=False, solver="ilp")
+        ilp_objective = pulp.value(opt.prob.objective)
+
+        assert math.isfinite(lp_objective)
+        assert lp_objective == pytest.approx(ilp_objective, rel=1e-6)
+
+
+@apply_cuda_patches
+@pytest.mark.filterwarnings("ignore:Constructing LpVariable")
+@pytest.mark.filterwarnings("ignore:Overwriting previously set objective")
+def test_optimality_check_logs_certified_gap(caplog):
+    """optimality_check=True solves the LP lower bound and logs the certified gap."""
+    mesh = _fake_2d_mesh()
+    with _tiny_llama3_autop(mesh) as autop:
+        _add_constraints(autop, mesh)
+        with caplog.at_level(logging.INFO, logger="autoparallel.api"):
+            autop.optimize_placement(
+                verbose=False, solver="approx", optimality_check=True
+            )
+        assert any("optimality check" in r.message for r in caplog.records)
 
 
 @apply_cuda_patches

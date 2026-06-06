@@ -194,6 +194,11 @@ class AutoParallel:
         The meta model is moved to a fake device based on mesh.device_type.
     """
 
+    # Selectable solvers. "ilp": exact PuLP/CBC. "approx": heuristic TRW-S
+    # (light build, no PuLP). "lp": LP relaxation used directly as the solve
+    # (empirically integral for this problem, so much cheaper than CBC).
+    SOLVER_CHOICES = ("ilp", "approx", "lp")
+
     def __init__(
         self,
         model,
@@ -207,11 +212,16 @@ class AutoParallel:
         solver: str = "ilp",
     ):
         self.stack = ExitStack()
+        # The solver chosen here decides how the optimizer is built: "ilp"/"lp"
+        # build the full PuLP problem (CBC exact solve / LP relaxation solve);
         # "approx" builds a lighter optimizer (no PuLP variables/constraints),
-        # which is much faster to construct; optimize_placement(solver="approx")
-        # then solves it heuristically. "ilp" builds the full PuLP problem.
-        if solver not in ("ilp", "approx"):
-            raise ValueError(f"Unknown solver={solver!r}; expected 'ilp' or 'approx'")
+        # much faster to construct, solved heuristically. optimize_placement(
+        # solver=...) may override the solve as long as it is compatible with
+        # this build.
+        if solver not in self.SOLVER_CHOICES:
+            raise ValueError(
+                f"Unknown solver={solver!r}; expected one of {self.SOLVER_CHOICES}"
+            )
         self.solver = solver
         self.fake_mode = (
             FakeTensorMode()
@@ -289,7 +299,7 @@ class AutoParallel:
                 self.mesh,
                 force_grad_reduce_in_higher_precision,
                 repeated_subgraphs=self.repeated_subgraphs,
-                build_pulp=self.solver != "approx",
+                build_pulp=self.solver in ("ilp", "lp"),
             )
 
             self.sharding_optimizer = sharding_optimizer
@@ -526,39 +536,73 @@ class AutoParallel:
             )
         return self.propagation_result
 
-    def optimize_placement(self, verbose=True, solver=None, approximate_options=None):
+    def optimize_placement(
+        self,
+        verbose=True,
+        solver=None,
+        approximate_options=None,
+        optimality_check=False,
+    ):
         """Solve for the optimal placement.
 
-        solver="ilp" uses the exact PuLP/CBC solver. solver="approx" uses the
-        heuristic ApproximateShardingSolver, which trades a small objective gap
-        for a much faster solve. approximate_options is forwarded as kwargs to
-        the approximate solver (e.g. candidate_limit, max_sweeps). Defaults to the
-        solver chosen at AutoParallel construction; note an optimizer built with
-        solver="approx" has no PuLP problem and cannot run the ILP.
+        solver selects how the placement is solved (defaults to the solver chosen
+        at AutoParallel construction):
+          - "ilp":    exact PuLP/CBC solve.
+          - "approx": heuristic TRW-S ApproximateShardingSolver — trades a small
+            objective gap for a much faster solve.
+          - "lp":     solve the LP relaxation and use it directly. This problem is
+            empirically integral, so the relaxation optimum equals the ILP optimum
+            while skipping branch-and-bound; raises if it comes out fractional.
+        approximate_options is forwarded as kwargs to the approximate solver
+        (e.g. candidate_limit, max_sweeps). The requested solver must be
+        compatible with how the optimizer was built: "ilp"/"lp" need a PuLP
+        problem (build with solver="ilp" or "lp").
+
+        optimality_check: after solving, solve the LP relaxation as a lower bound
+        and log the certified gap of the achieved objective from the optimum.
+        Requires a PuLP problem (i.e. an "ilp"/"lp" build).
         """
         self._assert_entered()
         if solver is None:
             solver = self.solver
 
+        opt = self.sharding_optimizer
         if solver in ("approx", "approximate"):
             from .approximate_sharding import ApproximateShardingSolver
 
-            approx = ApproximateShardingSolver(
-                self.sharding_optimizer, **(approximate_options or {})
-            )
+            approx = ApproximateShardingSolver(opt, **(approximate_options or {}))
             self.sharding_placement = approx.get_solution(verbose=verbose)
         elif solver == "ilp":
-            if self.sharding_optimizer.prob is None:
+            if opt.prob is None:
                 raise RuntimeError(
                     "solver='ilp' requires a PuLP problem, but this AutoParallel "
-                    "was constructed with solver='approx' (no PuLP built). "
+                    "was constructed without one (e.g. solver='approx'). "
                     "Construct with solver='ilp' to use the exact solver."
                 )
-            self.sharding_placement = self.sharding_optimizer.get_solution(
-                verbose=False
-            )
+            self.sharding_placement = opt.get_solution(verbose=False)
+        elif solver in ("lp", "lp_relax", "lp_relaxation"):
+            if opt.prob is None:
+                raise RuntimeError(
+                    "solver='lp' requires a PuLP problem, but this AutoParallel "
+                    "was constructed without one (e.g. solver='approx'). "
+                    "Construct with solver='lp' or 'ilp' to use the LP solver."
+                )
+            opt._set_objective()
+            res = opt.solve_lp_relaxation(verbose=verbose, extract=True)
+            if res["solution"] is None:
+                raise RuntimeError(
+                    "solver='lp' requires an integral LP relaxation, but it came "
+                    f"out fractional ({res['n_fractional']}/{res['n_vars']} "
+                    "variables). Use solver='ilp' for an exact integral solve."
+                )
+            self.sharding_placement = res["solution"]
         else:
-            raise ValueError(f"Unknown solver={solver!r}; expected 'ilp' or 'approx'")
+            raise ValueError(
+                f"Unknown solver={solver!r}; expected one of {self.SOLVER_CHOICES}"
+            )
+
+        if optimality_check:
+            self._log_optimality_check(solver, verbose=verbose)
 
         if verbose:
             logger.info(self.sharding_optimizer.get_log(verbose=True))
@@ -588,6 +632,39 @@ class AutoParallel:
             )
 
         return self.sharding_placement
+
+    def _log_optimality_check(self, solver, verbose=False):
+        """Solve the LP relaxation as a lower bound and log the certified gap of
+        the achieved objective from the optimum. Needs a PuLP problem."""
+        import pulp
+
+        opt = self.sharding_optimizer
+        if opt.prob is None:
+            logger.warning(
+                "optimality_check skipped: solver=%r build has no PuLP problem; "
+                "construct with solver='ilp' or 'lp' to enable it.",
+                self.solver,
+            )
+            return
+        achieved = opt._safe_float(pulp.value(opt.prob.objective))
+        lb_res = opt.get_lower_bound(verbose=verbose)
+        lb = lb_res.objective
+        if not lb or lb <= 0 or achieved is None:
+            logger.warning(
+                "optimality_check inconclusive: lower_bound=%s achieved=%s",
+                lb,
+                achieved,
+            )
+            return
+        gap = (achieved - lb) / lb
+        logger.info(
+            "optimality check (solver=%s): objective=%.4f LP lower bound=%.4f "
+            "=> within %.2f%% of optimum (certified)",
+            solver,
+            achieved,
+            lb,
+            gap * 100,
+        )
 
     def _apply_placement_common(self, sharding_placement):
         t0 = time.perf_counter()
