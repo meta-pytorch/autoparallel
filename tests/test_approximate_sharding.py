@@ -93,6 +93,41 @@ def test_approx_objective_close_to_ilp():
 @apply_cuda_patches
 @pytest.mark.filterwarnings("ignore:Constructing LpVariable")
 @pytest.mark.filterwarnings("ignore:Overwriting previously set objective")
+def test_approx_memory_constrained_matches_ilp():
+    """A non-tight parameter-memory budget routes the approx solver through the
+    Lagrangian relaxation. The result must respect the budget and stay within a
+    small objective gap of the budget-constrained ILP optimum."""
+    mesh = _fake_2d_mesh()
+    with _tiny_llama3_autop(mesh) as autop:
+        # high=0.5 > 1/world_size, so the budget is non-tight (params are not
+        # pinned at build time) and can bind the runtime-optimal placement.
+        autop.add_parameter_memory_constraint(low=0.0, high=0.5)
+        autop.add_input_constraints([(Shard(0),) + (Replicate(),) * (mesh.ndim - 1)])
+        autop.add_output_constraints([(Shard(0), Shard(2))])
+        opt = autop.sharding_optimizer
+
+        autop.optimize_placement(verbose=False, solver="approx")
+        approx_objective = pulp.value(opt.prob.objective)
+        # Materialize the memory rows and check the approx assignment against ALL
+        # constraints, including the budget it was solved under.
+        opt._apply_memory_constraint()
+        violated = [n for n, c in opt.prob.constraints.items() if not c.valid()]
+        assert not violated, f"approx violated {len(violated)} constraints"
+
+        autop.optimize_placement(verbose=False, solver="ilp")
+        ilp_objective = pulp.value(opt.prob.objective)
+
+        assert math.isfinite(approx_objective)
+        assert approx_objective >= ilp_objective - 1e-6  # ILP is optimal
+        assert approx_objective <= ilp_objective * 1.05 + 1e-6, (
+            f"approx={approx_objective} ilp={ilp_objective} "
+            f"gap={(approx_objective / ilp_objective - 1) * 100:.2f}%"
+        )
+
+
+@apply_cuda_patches
+@pytest.mark.filterwarnings("ignore:Constructing LpVariable")
+@pytest.mark.filterwarnings("ignore:Overwriting previously set objective")
 def test_lp_solver_matches_ilp():
     """The LP-relaxation solver returns an integral, ILP-feasible assignment whose
     objective equals the exact ILP optimum (the relaxation is integral here)."""

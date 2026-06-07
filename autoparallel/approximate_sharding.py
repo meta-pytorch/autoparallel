@@ -151,6 +151,11 @@ class ApproximateShardingSolver:
         self.consumers: dict[int, list[tuple[int, int]]] = defaultdict(list)
         self.cur_out: dict[int, int] = {}
         self._memory: Optional[dict[str, Any]] = None
+        # When False, the hard memory-budget checks in local search are skipped
+        # (used by the Lagrangian solve, which enforces the budget softly via a
+        # penalty folded into the unaries instead).
+        self._mem_enforce: bool = True
+        self._mem_unary: list[np.ndarray] = []
 
         # Populated by _build_factors().
         self.g_unary: list[np.ndarray] = []
@@ -197,23 +202,42 @@ class ApproximateShardingSolver:
         # to be compared against is strictly dominated and has been dropped; the
         # polish remains for the memory budget and as a local-search safety net.
         t_bp0 = time.perf_counter()
-        self._belief_propagation(deadline)
-        if verbose:
-            logger.info(
-                "approx phase: trws iter=%s delta=%.4g in %.2fs; " "decode energy=%.1f",
-                getattr(self, "_bp_last_iter", None),
-                getattr(self, "_bp_last_delta", float("nan")),
-                time.perf_counter() - t_bp0,
-                self._fast_total_energy(),
+        mem = self._memory
+        if mem is not None and not mem.get("tight"):
+            # A non-tight budget can bind the runtime-optimal placement; solve it
+            # exactly via Lagrangian relaxation (folds λ·ratio into the unaries).
+            # A tight budget is already handled by build-time param pinning, and
+            # the no-memory case has nothing to relax, so both take the plain path.
+            res = self.solve_lagrangian(
+                mem["budget_low"],
+                mem["budget_high"],
+                deadline=deadline,
+                verbose=verbose,
             )
-        self._memory_repair()
-        self._coordinate_descent(deadline)
-        if verbose:
-            logger.info("approx phase: trws+cd energy=%.1f", self._fast_total_energy())
-        self._star_block_search(deadline)
+            if verbose:
+                logger.info(
+                    "approx phase: lagrangian lam=%.4g memory=%.4f feasible=%s",
+                    res["lam"],
+                    res["memory"],
+                    res["feasible"],
+                )
+        else:
+            self._belief_propagation(deadline)
+            if verbose:
+                logger.info(
+                    "approx phase: trws iter=%s delta=%.4g in %.2fs; "
+                    "decode energy=%.1f",
+                    getattr(self, "_bp_last_iter", None),
+                    getattr(self, "_bp_last_delta", float("nan")),
+                    time.perf_counter() - t_bp0,
+                    self._fast_total_energy(),
+                )
+            self._memory_repair()
+            self._coordinate_descent(deadline)
+            self._star_block_search(deadline)
         bp_energy = self._fast_total_energy()
         if verbose:
-            logger.info("approx phase: trws+cd+star energy=%.1f", bp_energy)
+            logger.info("approx phase: polished energy=%.1f", bp_energy)
         t_solve = time.perf_counter() - t0 - t_build
 
         objective = self._write_back()
@@ -1236,7 +1260,7 @@ class ApproximateShardingSolver:
         )
 
     def _memory_ok_after(self, gid, ci):
-        if self._memory is None or self._memory.get("tight"):
+        if self._memory is None or self._memory.get("tight") or not self._mem_enforce:
             return True
         ratios = self._memory["ratios"]
         choice = self.groups[gid].choices[ci]
@@ -1253,7 +1277,7 @@ class ApproximateShardingSolver:
         )
 
     def _block_memory_ok(self):
-        if self._memory is None or self._memory.get("tight"):
+        if self._memory is None or self._memory.get("tight") or not self._mem_enforce:
             return True
         mem = self._current_memory()
         return (
@@ -1307,6 +1331,164 @@ class ApproximateShardingSolver:
                 )
                 return
             self._set_group(best[1], best[2])
+
+    # ------------------------------------------------------------------ #
+    # Lagrangian memory-constrained solve
+    # ------------------------------------------------------------------ #
+    def _build_mem_unary(self):
+        """Per-group vector mem_unary[gid][ci] = Σ_{param member} ratio[member][ci],
+        i.e. the memory term as a node-separable unary so it folds into the
+        Lagrangian objective with no change to the pairwise structure."""
+        self._mem_unary = [np.zeros(g.domain) for g in self.groups]
+        if self._memory is None:
+            return
+        ratios = self._memory["ratios"]
+        for v in self._memory["param_idxs"]:
+            gid = self.node_to_group.get(v)
+            if gid is None:
+                continue
+            r = ratios[v]
+            self._mem_unary[gid] += np.array(
+                [r[c[v]] for c in self.groups[gid].choices]
+            )
+
+    def _run_search(self, deadline):
+        self._belief_propagation(deadline)
+        self._coordinate_descent(deadline)
+        self._star_block_search(deadline)
+
+    def solve_lagrangian(
+        self,
+        budget_low,
+        budget_high,
+        deadline=None,
+        max_iter=30,
+        lam_tol=1e-9,
+        verbose=False,
+    ):
+        """Memory-constrained solve via Lagrangian relaxation.
+
+        The budget Σ_param ratio[v][x_v] ∈ [low, high] is a single linear,
+        node-separable coupling. Penalizing it by λ folds λ·ratio into each param
+        node's unary and leaves the pairwise MRF untouched, so TRW-S + polish
+        solves the penalized problem directly. a(λ) := Σ ratio at the optimum is
+        monotone non-increasing in λ (larger λ ⇒ more sharding ⇒ less memory), so
+        a scalar bisection on λ ≥ 0 drives a(λ) into the budget. The cheapest
+        feasible assignment seen is kept; the existing greedy repair only closes
+        any small residual from integrality.
+
+        Leaves the solver at the chosen assignment (does not write back) and
+        returns a dict: objective (true), memory (achieved a), lam, feasible,
+        iters."""
+        if not self._mem_unary:
+            self._build_mem_unary()
+        t_start = time.perf_counter()
+        if deadline is None:
+            deadline = t_start + self.max_time_s
+        # Reserve the tail of the budget for the constrained polish below.
+        bisect_deadline = t_start + 0.6 * (deadline - t_start)
+        base = [u.copy() for u in self.g_unary]
+        prev_enforce = self._mem_enforce
+        self._mem_enforce = False
+        eps = 1e-6
+
+        best = {"objective": INF, "snapshot": None, "memory": None, "lam": None}
+        # Closest over-budget assignment (smallest excess memory) — the seed the
+        # repair step nudges down into the budget to recover integer solutions
+        # that lie inside the (memory, cost) hull and so no lambda can reach.
+        seed = {"memory": INF, "snapshot": None}
+
+        def evaluate(lam):
+            for gid in range(len(self.groups)):
+                self.g_unary[gid] = base[gid] + lam * self._mem_unary[gid]
+            self._run_search(bisect_deadline)
+            a = self._current_memory()
+            obj = self.total_objective()
+            feasible = budget_low - eps <= a <= budget_high + eps
+            if feasible and obj < best["objective"]:
+                best.update(
+                    objective=obj,
+                    snapshot=[g.current for g in self.groups],
+                    memory=a,
+                    lam=lam,
+                )
+            if budget_high + eps < a < seed["memory"]:
+                seed.update(memory=a, snapshot=[g.current for g in self.groups])
+            if verbose:
+                logger.info(
+                    "lagrangian: lam=%.6g memory=%.5f obj=%.2f feasible=%s",
+                    lam,
+                    a,
+                    obj,
+                    feasible,
+                )
+            return a
+
+        a0 = evaluate(0.0)
+        iters = 1
+        if a0 <= budget_high + eps:
+            lam = 0.0  # unconstrained optimum already fits the budget
+        else:
+            lo_lam, hi_lam = 0.0, 1.0
+            while evaluate(hi_lam) > budget_high + eps and iters < max_iter:
+                lo_lam, hi_lam = hi_lam, hi_lam * 2.0
+                iters += 1
+            while iters < max_iter and hi_lam - lo_lam > lam_tol:
+                mid = 0.5 * (lo_lam + hi_lam)
+                a = evaluate(mid)
+                iters += 1
+                if a > budget_high + eps:
+                    lo_lam = mid  # still over budget, penalize harder
+                else:
+                    hi_lam = mid  # feasible, try to relax toward the cheaper side
+            lam = hi_lam
+
+        for gid in range(len(self.groups)):
+            self.g_unary[gid] = base[gid]
+        self._mem_enforce = prev_enforce
+
+        # Constrained polish (under the base unary, budget enforced). No single λ
+        # recovers integer solutions inside the (memory, cost) hull; coordinate +
+        # star search restricted to the budget can climb from an over-sharded
+        # point back up to a cheaper intermediate-memory one. We polish both the
+        # bisection's feasible point and the repaired closest-over-budget seed and
+        # keep the cheapest feasible result.
+        def polish(snapshot):
+            for gid, ci in enumerate(snapshot):
+                self._set_group(gid, ci)
+            self._memory_repair()
+            self._coordinate_descent(deadline)
+            self._star_block_search(deadline)
+            a = self._current_memory()
+            if budget_low - eps <= a <= budget_high + eps:
+                obj = self.total_objective()
+                if obj < best["objective"]:
+                    best.update(
+                        objective=obj,
+                        snapshot=[g.current for g in self.groups],
+                        memory=a,
+                        lam=lam,
+                    )
+
+        for snap in (best["snapshot"], seed["snapshot"]):
+            if snap is not None:
+                polish(snap)
+
+        if best["snapshot"] is not None:
+            for gid, ci in enumerate(best["snapshot"]):
+                self._set_group(gid, ci)
+        else:
+            # Nothing landed in [low, high]; repair the last assignment in place.
+            self._memory_repair()
+
+        a = self._current_memory()
+        return {
+            "objective": self.total_objective(),
+            "memory": a,
+            "lam": lam,
+            "feasible": budget_low - eps <= a <= budget_high + eps,
+            "iters": iters,
+        }
 
     # ------------------------------------------------------------------ #
     # Write-back
