@@ -378,6 +378,11 @@ class AutoParallel:
         self.output_constraints = constraints
 
     # ---- Sharding annotations (Shardy-like propagation) ----
+    # EXPERIMENTAL: opt-in only. These have no effect unless you call an
+    # annotate_* method and then propagate_annotations() before
+    # optimize_placement(); the default solve path never invokes them. The
+    # propagation may shrink the search space in ways that move the objective off
+    # the full-ILP optimum, so treat results as unstable.
 
     def _normalize_placements(self, placements):
         """Pad/validate a placement tuple to mesh.ndim, leaving missing trailing
@@ -499,12 +504,15 @@ class AutoParallel:
         return mirrored
 
     def propagate_annotations(self, verbose=True, aggressive=False, method="fix"):
-        """Propagate the registered annotations Shardy-style and turn the
+        """EXPERIMENTAL (opt-in, off by default; may be unstable).
+
+        Propagate the registered annotations Shardy-style and turn the
         unambiguously-determined nodes into ILP constraints, shrinking the
         search space.  Returns a :class:`PropagationResult`.
 
         Call this after the ``annotate_*`` / ``add_*_constraint`` calls and
-        before :meth:`optimize_placement`.
+        before :meth:`optimize_placement`.  The default solve path does not call
+        this; nothing happens unless you invoke it explicitly.
 
         With ``aggressive=False`` (the default) only genuine ``Shard`` axes are
         pinned, which keeps the full-ILP optimum reachable.  ``aggressive=True``

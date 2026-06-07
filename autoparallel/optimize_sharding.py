@@ -172,9 +172,7 @@ def _par_node_edge_costs(node_idx):
         arg_rows = []
         for argi, redist_costs in enumerate(output_strategy.redistribute_cost):
             producer_strategy = (
-                producer_strategies[argi]
-                if argi < len(producer_strategies)
-                else None
+                producer_strategies[argi] if argi < len(producer_strategies) else None
             )
             arg_rows.append(
                 [
@@ -191,7 +189,6 @@ def _par_node_edge_costs(node_idx):
             )
         out_data.append((per_arg_compute, arg_rows))
     return node_idx, out_data
-
 
 
 def concretize_symint(val):
@@ -308,6 +305,14 @@ class DPTopology:
 
 
 class DPBasedShardingSolver:
+    """EXPERIMENTAL / incomplete — not part of the supported solver path.
+
+    Only reachable when ``ShardingOptimizer`` is built with the non-default
+    ``solver_backend="dp"`` (not exposed through ``AutoParallel``), and today it
+    only builds a topological order: :meth:`get_solution` raises
+    ``NotImplementedError``. Kept for in-progress work; do not rely on it.
+    """
+
     def __init__(self, optimizer):
         self.optimizer = optimizer
         self.topology: Optional[DPTopology] = None
@@ -1133,9 +1138,7 @@ class ShardingOptimizer:
                 # order as the serial path. This keeps the PuLP objective's
                 # lpSum term order identical too, so even the ILP path is
                 # bit-for-bit unchanged (float addition is not associative).
-                return list(
-                    pool.imap(_par_node_edge_costs, root_idxs, chunksize=4)
-                )
+                return list(pool.imap(_par_node_edge_costs, root_idxs, chunksize=4))
         finally:
             _FORK_OPT = None
 
@@ -1167,7 +1170,9 @@ class ShardingOptimizer:
         that only need per-strategy costs can use whichever edge survived.
         """
         strategy = self.strats[self.nodes[node_idx]].strategies[out_idx]
-        n_inp = len(strategy.redistribute_cost[argi]) if strategy.redistribute_cost else 1
+        n_inp = (
+            len(strategy.redistribute_cost[argi]) if strategy.redistribute_cost else 1
+        )
         for inp_idx in range(n_inp):
             key = (node_idx, argi, out_idx, inp_idx)
             if key in self.decision_vars:
