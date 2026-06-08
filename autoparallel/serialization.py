@@ -193,8 +193,7 @@ def save_optimizer(opt, path):
         "dv_costs_keys": dv_costs_keys,
         "dv_costs_vals": dv_costs_vals,
         "cluster_links_node_by_name": {
-            opt.nodes[c].name: opt.nodes[r].name
-            for c, r in opt.cluster_links.items()
+            opt.nodes[c].name: opt.nodes[r].name for c, r in opt.cluster_links.items()
         },
         "constraint_log": opt._constraint_log,
         "selected_keys_by_name": selected_keys_by_name,

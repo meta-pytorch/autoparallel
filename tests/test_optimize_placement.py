@@ -867,9 +867,7 @@ def test_invalid_strategies_are_pruned(device_mesh_2d):
         assert all(k in opt._valid_keys for k in opt.decision_vars)
 
         # No inf-cost (== 0) constraints should be emitted any more.
-        assert not any(
-            name.startswith("inf_cases") for name in opt.prob.constraints
-        )
+        assert not any(name.startswith("inf_cases") for name in opt.prob.constraints)
 
         # The pruned problem must still solve to a valid solution.
         solution = autop.optimize_placement()
