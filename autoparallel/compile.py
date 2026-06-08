@@ -12,13 +12,6 @@ from torch._inductor.compile_fx import compile_fx
 
 from .graph_passes.activation_checkpointing import ac_joint_pass
 
-_INDUCTOR_OVERLAP_PATCHES = {
-    "aten_distributed_optimizations.enable_overlap_scheduling": True,
-    "aten_distributed_optimizations.collective_bucketing": True,
-    "aten_distributed_optimizations.insert_overlap_deps": True,
-    "aten_distributed_optimizations.max_compute_pre_fetch": 10,
-}
-
 
 def _make_ac_joint_pass(
     ac_stage_size_in_GiB: Optional[Union[float, str]] = "auto",
@@ -51,18 +44,25 @@ def autoparallel_backend(
         overlap_scheduling: Enable comm/compute overlap scheduling.
     """
     functorch_patches = {}
-    inductor_patches = _INDUCTOR_OVERLAP_PATCHES if overlap_scheduling else {}
 
     if enable_ac:
         functorch_patches["joint_custom_pass"] = _make_ac_joint_pass(
             ac_stage_size_in_GiB
         )
 
+    # Overlap scheduling configs must be set globally (not via config.patch
+    # context manager) because backward compilation is lazy — it happens on
+    # the first .backward() call, after compile_fx returns and the context
+    # manager has exited.
+    if overlap_scheduling:
+        cfg = torch._inductor.config.aten_distributed_optimizations
+        cfg.enable_overlap_scheduling = True
+        cfg.collective_bucketing = True
+        cfg.insert_overlap_deps = True
+        cfg.max_compute_pre_fetch = 10
+
     def backend(gm, example_inputs):
-        with (
-            torch._functorch.config.patch(functorch_patches),
-            torch._inductor.config.patch(inductor_patches),
-        ):
+        with torch._functorch.config.patch(functorch_patches):
             return compile_fx(gm, example_inputs)
 
     return backend
