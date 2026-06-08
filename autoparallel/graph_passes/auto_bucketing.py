@@ -23,9 +23,16 @@ def _patch_fsdp_bucketing():
     1. Primary-group-only: only include the group with the most FSDP
        all-gathers in fsdp_groups, preventing minority groups (tp, combined)
        from limiting dp bucketing aggressiveness.
-    2. Non-adjacent bucketing: allow collectives to be bucketed even when
-       interleaved with non-FSDP collectives on other groups. Only
-       descendant conflicts prevent bucketing, not graph position.
+    2. Topo-span-bounded bucketing: allow collectives to be bucketed even
+       when interleaved with non-FSDP collectives on other groups, but
+       close the bucket once its topo-span (rank of latest member minus
+       rank of first member) exceeds aten_autobucketing_config.max_topo_span.
+
+       Without a span bound, merging collectives that are far apart in the
+       graph rewires the dependency graph so that stable_topological_sort
+       can pull compute from late layers forward, batching many MMs before
+       any RS fires (the MM*N problem). The span bound caps how far compute
+       can be displaced by any one bucket merge.
     """
     import torch._inductor.fx_passes.bucketing as bucketing_mod
     import torch._inductor.fx_passes.fsdp as fsdp_mod
@@ -71,6 +78,11 @@ def _patch_fsdp_bucketing():
         filter_wait_node=None,
     ):
         g = gm.graph
+        # Snapshot ranks before any bucketing mutates the graph. Used to
+        # bound each bucket's topo-span, which bounds how far compute can
+        # be displaced by stable_topological_sort after merging.
+        ranks = {n.name: i for i, n in enumerate(g.nodes)}
+
         groups = defaultdict(list)
         for node in g.nodes:
             if is_wait_tensor(node) and filter_node(node.args[0]):
@@ -83,12 +95,19 @@ def _patch_fsdp_bucketing():
             return []
 
         node_descendents = collect_node_descendants(g)
+        max_topo_span = aten_autobucketing_config.max_topo_span
 
         buckets = []
+        # Metrics aggregated across all groups.
+        n_close_bytes = 0
+        n_close_span = 0
+        max_observed_span = 0
+
         for key, nodes in groups.items():
             cur_bucket = []
             cur_bucket_descendents = OrderedSet()
             cur_bucket_size_bytes = 0
+            cur_bucket_start_rank = None
             cur_bucket_id = 0
             bucket_size_bytes = int(
                 bucket_cap_mb_by_bucket_idx(cur_bucket_id) * 1024 * 1024
@@ -101,24 +120,65 @@ def _patch_fsdp_bucketing():
                 n_input_val = node.all_input_nodes[0].meta["val"]
                 in_size_bytes = n_input_val.numel() * n_input_val.element_size()
                 size_bytes = max(out_size_bytes, in_size_bytes)
-                if (
+
+                node_rank = ranks.get(node.name, 0)
+                would_span = (
+                    node_rank - cur_bucket_start_rank
+                    if cur_bucket_start_rank is not None
+                    else 0
+                )
+
+                close_for_bytes = (
                     cur_bucket_size_bytes + size_bytes > bucket_size_bytes
                     and cur_bucket
-                ):
+                )
+                close_for_span = (
+                    max_topo_span is not None
+                    and would_span > max_topo_span
+                    and cur_bucket
+                )
+
+                if close_for_bytes or close_for_span:
                     if len(cur_bucket) > 1:
                         buckets.append(cur_bucket)
+                        if close_for_bytes:
+                            n_close_bytes += 1
+                        if close_for_span:
+                            n_close_span += 1
+                        observed_span = (
+                            ranks.get(cur_bucket[-1].name, 0) - cur_bucket_start_rank
+                        )
+                        max_observed_span = max(max_observed_span, observed_span)
                     cur_bucket = []
                     cur_bucket_size_bytes = 0
                     cur_bucket_id += 1
                     cur_bucket_descendents = OrderedSet()
+                    cur_bucket_start_rank = None
                     bucket_size_bytes = int(
                         bucket_cap_mb_by_bucket_idx(cur_bucket_id) * 1024 * 1024
                     )
                 cur_bucket_size_bytes += size_bytes
                 cur_bucket.append(node)
                 cur_bucket_descendents |= node_descendents[node]
+                if cur_bucket_start_rank is None:
+                    cur_bucket_start_rank = node_rank
             if len(cur_bucket) > 1:
                 buckets.append(cur_bucket)
+                observed_span = (
+                    ranks.get(cur_bucket[-1].name, 0) - cur_bucket_start_rank
+                )
+                max_observed_span = max(max_observed_span, observed_span)
+
+        if buckets:
+            logger.info(
+                "greedy_bucket: %d buckets, max_span=%d, "
+                "closed (bytes=%d, span=%d, max_topo_span=%s)",
+                len(buckets),
+                max_observed_span,
+                n_close_bytes,
+                n_close_span,
+                max_topo_span,
+            )
         return buckets
 
     fsdp_mod.identify_fsdp_groups = _patched_identify_fsdp_groups
@@ -128,130 +188,26 @@ def _patch_fsdp_bucketing():
 _patch_fsdp_bucketing()
 
 
-def _cap_compute_batch_size(
-    graph, original_compute_names, original_rs_after_compute, max_consecutive=8
-):
-    """Break up long compute segments between ReduceScatter operations.
+def _max_consec_compute_between_rs(graph):
+    """Return the maximum consecutive compute nodes between RS ops.
 
-    After overlap scheduling + FSDP bucketing, compute nodes may be reordered
-    so that many layers' matmuls execute before any ReduceScatter fires. This
-    inflates peak memory because all layers' activations are alive
-    simultaneously.
-
-    Instead of restoring the full original order (which kills comm/compute
-    overlap), this function only intervenes when the number of compute nodes
-    between consecutive ReduceScatter ops exceeds max_consecutive. For each
-    oversized segment, it sorts compute nodes by original order, splits into
-    chunks, then:
-    1. Chains consecutive compute nodes within each chunk (so they move
-       together during topological sort).
-    2. Adds a dep from the first compute node of each chunk to an RS node
-       that originally appeared between the previous chunk and this one.
-
-    Args:
-        graph: The post-scheduled FX graph.
-        original_compute_names: List of compute node names in original order.
-        original_rs_after_compute: Dict mapping compute node name to the list
-            of RS node names that appeared between it and the next compute node
-            in the original (pre-scheduling) graph.
-        max_consecutive: Maximum compute nodes allowed between RS ops.
+    Useful as a regression metric: bucketing followed by topo sort can
+    pull compute from late layers forward, batching many MMs before any
+    RS fires. This metric grows linearly with the size of such batches.
     """
-    from torch._dynamo.graph_deduplication import _stable_topological_sort
     from torch._inductor.fx_passes.overlap_scheduling import is_compute_node
 
-    def _is_rs(node):
-        if node.op != "call_function":
-            return False
-        name = str(node.target)
-        return "reduce_scatter" in name and "wait" not in name
-
-    original_rank = {name: rank for rank, name in enumerate(original_compute_names)}
-    node_by_name = {n.name: n for n in graph.nodes}
-
-    scheduled_rs_names = {
-        n.name for n in graph.nodes if n.op == "call_function" and _is_rs(n)
-    }
-
-    # Collect compute nodes between RS ops in the post-scheduled graph.
-    segments: list[tuple[list[torch.fx.Node], torch.fx.Node | None]] = []
-    current_compute: list[torch.fx.Node] = []
-    for node in graph.nodes:
-        if node.op != "call_function":
+    max_run = cur = 0
+    for n in graph.nodes:
+        if n.op != "call_function":
             continue
-        if is_compute_node(node):
-            current_compute.append(node)
-        elif _is_rs(node):
-            segments.append((current_compute, node))
-            current_compute = []
-    if current_compute:
-        segments.append((current_compute, None))
-
-    additional_deps: dict[torch.fx.Node, OrderedSet] = defaultdict(OrderedSet)
-
-    for compute_nodes, _seg_rs_node in segments:
-        if len(compute_nodes) <= max_consecutive:
-            continue
-
-        sorted_nodes = sorted(
-            compute_nodes,
-            key=lambda n: original_rank.get(n.name, float("inf")),
-        )
-
-        # Split into chunks of max_consecutive.
-        chunks = []
-        for i in range(0, len(sorted_nodes), max_consecutive):
-            chunks.append(sorted_nodes[i : i + max_consecutive])
-
-        # Chain consecutive compute nodes within each chunk.
-        for chunk in chunks:
-            for j in range(1, len(chunk)):
-                additional_deps[chunk[j]].add(chunk[j - 1])
-
-        # At each chunk boundary, find an RS that originally appeared between
-        # the last compute of the previous chunk and the first compute of
-        # the current chunk, then add dep: first_of_chunk after RS.
-        for ci in range(1, len(chunks)):
-            prev_chunk = chunks[ci - 1]
-            curr_chunk = chunks[ci]
-
-            last_in_prev = prev_chunk[-1]
-            first_in_curr = curr_chunk[0]
-            last_rank = original_rank.get(last_in_prev.name, -1)
-            first_rank = original_rank.get(
-                first_in_curr.name, len(original_compute_names)
-            )
-
-            found_rs_node = None
-            for r in range(last_rank, first_rank):
-                cname = (
-                    original_compute_names[r]
-                    if r < len(original_compute_names)
-                    else None
-                )
-                if cname is None:
-                    continue
-                for rs_name in original_rs_after_compute.get(cname, []):
-                    if rs_name in scheduled_rs_names:
-                        rs_obj = node_by_name.get(rs_name)
-                        if rs_obj is not None:
-                            found_rs_node = rs_obj
-                            break
-                if found_rs_node is not None:
-                    break
-
-            if found_rs_node is not None:
-                additional_deps[first_in_curr].add(found_rs_node)
-
-    if not additional_deps:
-        return
-
-    try:
-        _stable_topological_sort(graph, additional_deps)
-    except AssertionError:
-        logger.warning(
-            "Failed to cap compute batch size (cycle detected), "
-            "falling back to uncapped ordering"
-        )
+        target = str(n.target)
+        if is_compute_node(n):
+            cur += 1
+            max_run = max(max_run, cur)
+        elif "reduce_scatter" in target and "wait" not in target:
+            cur = 0
+    return max_run
 
 
 class simplefsdp_autobucketing_config:
@@ -341,6 +297,10 @@ class aten_autobucketing_config:
     - max_in_flight_gb: maximum GB of concurrent collective data
     - compute_overlap_multipler: scale factor for compute time used to hide collectives
     - max_coll_distance: maximum node distance for overlap consideration
+    - max_topo_span: maximum number of graph positions a single bucket may
+        span. Bounds how far compute can be displaced when bucketing rewires
+        the dep graph and stable_topological_sort runs afterwards. Set to
+        None to disable the span bound (only bytes cap applies).
     """
 
     max_in_flight_gb = 2.0
@@ -348,6 +308,7 @@ class aten_autobucketing_config:
     max_coll_distance = 100
     custom_runtime_estimation = None
     max_compute_pre_fetch = 50
+    max_topo_span: int | None = 1500
     collective_bucketing = False
     save_trace = True
     _counter = 0
@@ -357,27 +318,6 @@ def aten_autobucketing_reordering_pass(
     gm: torch.fx.Graph, configs: "aten_autobucketing_config"
 ) -> torch.fx.GraphModule:
     assert gm.owning_module is not None
-
-    # Record compute + RS interleaving before bucketing + overlap scheduling.
-    from torch._inductor.fx_passes.overlap_scheduling import is_compute_node
-
-    def _is_rs_node(node):
-        if node.op != "call_function":
-            return False
-        name = str(node.target)
-        return "reduce_scatter" in name and "wait" not in name
-
-    original_compute_names = []
-    original_rs_after_compute: dict[str, list[str]] = {}
-    last_compute_name = None
-    for n in gm.owning_module.graph.nodes:
-        if n.op != "call_function":
-            continue
-        if is_compute_node(n):
-            original_compute_names.append(n.name)
-            last_compute_name = n.name
-        elif _is_rs_node(n) and last_compute_name is not None:
-            original_rs_after_compute.setdefault(last_compute_name, []).append(n.name)
 
     new_gm = schedule_overlap_bucketing(
         gm.owning_module,
@@ -389,9 +329,12 @@ def aten_autobucketing_reordering_pass(
         max_coll_distance=configs.max_coll_distance,
     )
 
-    _cap_compute_batch_size(
-        new_gm.graph, original_compute_names, original_rs_after_compute
+    logger.info(
+        "aten_autobucketing_reordering_pass: post-pass "
+        "max_consec_compute_between_rs=%d",
+        _max_consec_compute_between_rs(new_gm.graph),
     )
+
     new_gm.recompile()
 
     if configs.save_trace:
