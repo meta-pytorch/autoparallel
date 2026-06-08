@@ -1127,7 +1127,16 @@ class ShardingOptimizer:
         global _FORK_OPT
         _FORK_OPT = self
         try:
-            if _PARALLEL_BUILD_WORKERS <= 1 or len(root_idxs) < 64:
+            # Forking a process that has already initialized CUDA crashes the
+            # workers ("Cannot re-initialize CUDA in forked subprocess") once they
+            # touch the NCCL cost model. Real-GPU runs (examples, torchrun) and
+            # any test that has touched CUDA hit this, so fall back to the
+            # (byte-identical) serial path whenever CUDA is live.
+            if (
+                _PARALLEL_BUILD_WORKERS <= 1
+                or len(root_idxs) < 64
+                or torch.cuda.is_initialized()
+            ):
                 return [_par_node_edge_costs(ni) for ni in root_idxs]
             import multiprocessing as mp
 
