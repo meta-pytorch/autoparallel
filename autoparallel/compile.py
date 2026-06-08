@@ -51,7 +51,7 @@ def autoparallel_backend(
         overlap_scheduling: Enable comm/compute overlap scheduling.
     """
     functorch_patches = {}
-    inductor_patches = _INDUCTOR_OVERLAP_PATCHES if overlap_scheduling else {}
+    inductor_patches = _INDUCTOR_OVERLAP_PATCHES if overlap_scheduling else None
 
     if enable_ac:
         functorch_patches["joint_custom_pass"] = _make_ac_joint_pass(
@@ -59,10 +59,7 @@ def autoparallel_backend(
         )
 
     def backend(gm, example_inputs):
-        with (
-            torch._functorch.config.patch(functorch_patches),
-            torch._inductor.config.patch(inductor_patches),
-        ):
-            return compile_fx(gm, example_inputs)
+        with torch._functorch.config.patch(functorch_patches):
+            return compile_fx(gm, example_inputs, config_patches=inductor_patches)
 
     return backend
