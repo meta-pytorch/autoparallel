@@ -25,17 +25,27 @@ _INDUCTOR_OVERLAP_PATCHES = {
 
 
 class _SaveAllPartitioner(CustomPartitionerFn):
-    """Tag-driven partitioner: save all forward tensors except MUST_RECOMPUTE.
+    """Reproduce the first partitioner's save/recompute decisions via tags.
 
-    The first compilation (inside AutoParallel) already makes recomputation
-    decisions via MUST_RECOMPUTE tags on FSDP allgather chains. Those tags
-    survive into the second compilation via preserve_node_meta.
+    AutoParallel partitions the joint graph twice: once inside apply_placement
+    via aot_compile_joint_with_descriptors (the "first" partitioner), and
+    again when the user calls torch.compile(parallel_mod, backend=...).
 
-    Unlike default_partition (which uses positional fwd/bwd boundary detection
-    and fails on interleaved backward ops like gradient reduce_scatters), this
-    partitioner uses classify_nodes for topology-based boundary detection. And
-    unlike min_cut_rematerialization_partition, it doesn't run a second min-cut
-    that would diverge from the first compilation's decisions.
+    The first compilation tags each forward output that it decided to save
+    with custom.ap_must_save in _boxed_nop_preserve_node_meta(tag_forward=True).
+    Those tags propagate to the second compilation's joint graph through
+    preserve_node_meta. This partitioner reads the tags and saves exactly
+    those nodes — sidestepping min-cut, which would make independent
+    cost-based decisions on the second joint graph and may save FSDP
+    allgather outputs that should be recomputed via FSDP prefetch.
+
+    Specifically, when ac_joint_pass runs in the second compilation it
+    adds PREFER_RECOMPUTE tags to compute ops, which causes min-cut to
+    recompute matmuls in backward. The backward then needs unsharded
+    weights to redo those computations, force_save_collectives marks the
+    allgather outputs as MUST_SAVE, and min-cut saves them. This
+    partitioner avoids the chain by ignoring those tags entirely and
+    saving only what the first partitioner already chose.
     """
 
     def __call__(
@@ -86,6 +96,14 @@ class _SaveAllPartitioner(CustomPartitionerFn):
         if graph_has_recomputable_ops:
             gm = cleanup_recompute_tags(gm, is_default_partition=False)
 
+        # Apply PyTorch's standard save-forcing passes. None of these affect
+        # our own save decision (which only consults `ap_must_save`), but
+        # they normalize the graph by setting MUST_SAVE on collectives,
+        # effectful ops, and backward-mutated values. We keep them as a
+        # defense against future PyTorch internals that may consult these
+        # tags during extraction. force_save_collectives correctly skips
+        # nodes already tagged MUST_RECOMPUTE (e.g. FSDP allgathers), so
+        # the FSDP recomputation contract is preserved.
         if not torch._functorch.config.unsafe_allow_optimization_of_collectives:
             force_save_collectives(gm)
         force_save_effectful_ops(gm)

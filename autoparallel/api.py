@@ -9,6 +9,7 @@ import operator
 import time
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, Callable, Optional, Union
 
 import torch
@@ -58,12 +59,7 @@ _APPLY_VIEW_MM_VIEW_PATTERN = True
 logger = logging.getLogger(__name__)
 
 
-def _boxed_nop_preserve_node_meta(
-    fx_g, example_inputs, pre_pass=None, tag_forward=False
-):
-    if pre_pass is not None:
-        pre_pass(fx_g.graph)
-
+def _boxed_nop_preserve_node_meta(fx_g, example_inputs, tag_forward=False):
     if tag_forward:
         # Tag the forward graph's OUTPUT values as "must save". These are
         # the tensors the first min_cut decided to save for backward —
@@ -511,8 +507,6 @@ class AutoParallel:
         mark_fsdp_all_gather_recomputation(
             self.parallel_gm.graph, self.reshard_after_forward
         )
-
-        from functools import partial
 
         fw_compiler_fn = partial(self.compiler_fn, tag_forward=True)
 
