@@ -289,6 +289,25 @@ def _saved_names_from_default_compile(
     return saved_names
 
 
+def _simple_partition(saved_node_meta):
+    graph = torch.fx.Graph()
+    x = graph.placeholder("primals_1")
+    x.meta["val"] = torch.randn(4, device="meta")
+    tangent = graph.placeholder("tangents_1")
+    tangent.meta["val"] = torch.randn(4, device="meta")
+    saved = graph.call_function(torch.ops.aten.add.Tensor, args=(x, x))
+    saved.meta["val"] = torch.randn(4, device="meta")
+    saved.meta.update(saved_node_meta)
+    bwd = graph.call_function(torch.ops.aten.mul.Tensor, args=(saved, tangent))
+    bwd.meta["val"] = torch.randn(4, device="meta")
+    output = graph.output((saved, bwd))
+    output.meta["desc"] = [None, None]
+    gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+    return _SaveAllPartitioner()(
+        gm, [torch.randn(4), torch.randn(4)], num_fwd_outputs=1
+    )
+
+
 # ---------------------------------------------------------------------------
 # Unit tests for the standalone mechanisms
 # ---------------------------------------------------------------------------
@@ -330,7 +349,26 @@ def test_boxed_nop_tag_forward_skips_getitem():
 
     # Parent (split) gets the tag, not the getitem
     assert split.meta.get("custom", {}).get("ap_must_save") is True
+    assert split.meta.get("custom", {}).get("ap_must_save_getitem_indices") == [0]
     assert g0.meta.get("custom", {}).get("ap_must_save") is None
+
+
+def test_boxed_nop_tag_forward_records_getitem_indices():
+    graph = torch.fx.Graph()
+    x = graph.placeholder("x")
+    x.meta["val"] = torch.randn(6, device="meta")
+    split = graph.call_function(torch.ops.aten.split.Tensor, args=(x, 2))
+    split.meta["val"] = [torch.randn(2, device="meta")] * 3
+    g0 = graph.call_function(operator.getitem, args=(split, 0))
+    g0.meta["val"] = torch.randn(2, device="meta")
+    g2 = graph.call_function(operator.getitem, args=(split, 2))
+    g2.meta["val"] = torch.randn(2, device="meta")
+    graph.output((g0, g2))
+    gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+
+    _boxed_nop_preserve_node_meta(gm, None, tag_forward=True)
+
+    assert split.meta["custom"]["ap_must_save_getitem_indices"] == [0, 2]
 
 
 def test_boxed_nop_no_tag_forward_default():
@@ -346,6 +384,41 @@ def test_boxed_nop_no_tag_forward_default():
     _boxed_nop_preserve_node_meta(gm, None)
 
     assert add.meta.get("custom", {}).get("ap_must_save") is None
+
+
+def test_save_all_partitioner_saves_ap_must_save_despite_prefer_recompute():
+    fw, bw = _simple_partition(
+        {
+            "custom": {"ap_must_save": True},
+            "recompute": CheckpointPolicy.PREFER_RECOMPUTE,
+        }
+    )
+
+    fw_outputs = next(n for n in fw.graph.nodes if n.op == "output").args[0]
+    bw_placeholders = [n.name for n in bw.graph.nodes if n.op == "placeholder"]
+    assert "add_tensor" in [n.name for n in fw_outputs if isinstance(n, torch.fx.Node)]
+    assert "add_tensor" in bw_placeholders
+
+
+def test_save_all_partitioner_honors_must_save():
+    fw, bw = _simple_partition({"recompute": CheckpointPolicy.MUST_SAVE})
+
+    fw_outputs = next(n for n in fw.graph.nodes if n.op == "output").args[0]
+    bw_placeholders = [n.name for n in bw.graph.nodes if n.op == "placeholder"]
+    assert "add_tensor" in [n.name for n in fw_outputs if isinstance(n, torch.fx.Node)]
+    assert "add_tensor" in bw_placeholders
+
+
+def test_save_all_partitioner_does_not_save_must_recompute():
+    fw, bw = _simple_partition(
+        {
+            "custom": {"ap_must_save": True},
+            "recompute": CheckpointPolicy.MUST_RECOMPUTE,
+        }
+    )
+
+    bw_placeholders = [n.name for n in bw.graph.nodes if n.op == "placeholder"]
+    assert "add_tensor" not in bw_placeholders
 
 
 def test_preserve_node_meta_propagates_recompute_through_collectives():

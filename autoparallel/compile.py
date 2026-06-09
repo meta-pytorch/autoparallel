@@ -12,6 +12,7 @@ import torch._functorch.config
 import torch._inductor.config
 from torch._inductor.compile_fx import compile_fx
 from torch._inductor.custom_graph_pass import CustomPartitionerFn
+from torch.utils.checkpoint import CheckpointPolicy
 
 from .api import _suppress_wait_tensor_side_effect
 from .graph_passes.activation_checkpointing import ac_joint_pass
@@ -72,7 +73,6 @@ class _SaveAllPartitioner(CustomPartitionerFn):
             has_recomputable_rng_ops,
             is_opaque_node,
             is_sym_node,
-            must_recompute,
             raise_getitems,
             reordering_to_mimic_autograd_engine,
             thread_graphsafe_rng_from_hops,
@@ -96,14 +96,10 @@ class _SaveAllPartitioner(CustomPartitionerFn):
         if graph_has_recomputable_ops:
             gm = cleanup_recompute_tags(gm, is_default_partition=False)
 
-        # Apply PyTorch's standard save-forcing passes. None of these affect
-        # our own save decision (which only consults `ap_must_save`), but
-        # they normalize the graph by setting MUST_SAVE on collectives,
-        # effectful ops, and backward-mutated values. We keep them as a
-        # defense against future PyTorch internals that may consult these
-        # tags during extraction. force_save_collectives correctly skips
-        # nodes already tagged MUST_RECOMPUTE (e.g. FSDP allgathers), so
-        # the FSDP recomputation contract is preserved.
+        # Apply PyTorch's standard save-forcing passes, then honor their
+        # MUST_SAVE tags below. force_save_collectives skips nodes already
+        # tagged MUST_RECOMPUTE (e.g. FSDP allgathers), so the FSDP
+        # recomputation contract is preserved.
         if not torch._functorch.config.unsafe_allow_optimization_of_collectives:
             force_save_collectives(gm)
         force_save_effectful_ops(gm)
@@ -132,30 +128,43 @@ class _SaveAllPartitioner(CustomPartitionerFn):
                 and len(node.users) > 0
             )
 
+        def _must_recompute(node: torch.fx.Node) -> bool:
+            return node.meta.get("recompute") is CheckpointPolicy.MUST_RECOMPUTE
+
+        def _must_save(node: torch.fx.Node) -> bool:
+            return node.meta.get("recompute") is CheckpointPolicy.MUST_SAVE
+
         def _maybe_save(node: torch.fx.Node) -> None:
             if is_sym_node(node):
                 if not _is_assert_only_symbool(node):
                     saved_sym_nodes.append(node)
                 return
             if _is_multi_output(node):
-                # Multi-output ops tagged ap_must_save: save all their
-                # getitem children (DCE removes unused ones later).
-                if node.meta.get("custom", {}).get("ap_must_save"):
+                if _must_recompute(node):
+                    return
+                custom = node.meta.get("custom", {})
+                if _must_save(node) or custom.get("ap_must_save"):
+                    # getitem metadata does not survive preserve_node_meta, so
+                    # the first partitioner tags the parent multi-output op. If
+                    # it recorded specific getitem indices, replay only those.
+                    indices = custom.get("ap_must_save_getitem_indices")
                     for user in node.users:
-                        if user.target == operator.getitem:
+                        if user.target != operator.getitem:
+                            continue
+                        if indices is None or user.args[1] in indices:
                             saved_values.append(user)
                 return
             if is_opaque_node(node):
                 saved_opaque_nodes.append(node)
                 return
-            if must_recompute(node):
+            if _must_recompute(node):
                 return
             # Save nodes tagged ap_must_save by the first compilation.
             # These are the forward graph's output tensors from the first
             # partitioner — reproducing its save/recompute decisions.
             if node.op == "placeholder":
                 saved_values.append(node)
-            elif node.meta.get("custom", {}).get("ap_must_save"):
+            elif node.meta.get("custom", {}).get("ap_must_save") or _must_save(node):
                 saved_values.append(node)
 
         for node in node_info.required_fw_nodes:

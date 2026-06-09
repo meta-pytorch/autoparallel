@@ -74,12 +74,16 @@ def _boxed_nop_preserve_node_meta(fx_g, example_inputs, tag_forward=False):
             if out.target == operator.getitem:
                 # getitem metadata doesn't survive preserve_node_meta
                 # (Python builtin, not dispatched). Tag the parent
-                # multi-output op instead — DCE in _extract_fwd_bwd_modules
-                # removes any unused getitem children.
+                # multi-output op instead, keeping the getitem index so the
+                # second partitioner can replay the exact saved output.
                 parent = out.args[0]
                 if isinstance(parent, torch.fx.Node):
-                    parent.meta.setdefault("custom", {})
-                    parent.meta["custom"]["ap_must_save"] = True
+                    custom = parent.meta.setdefault("custom", {})
+                    custom["ap_must_save"] = True
+                    indices = custom.setdefault("ap_must_save_getitem_indices", [])
+                    idx = out.args[1]
+                    if idx not in indices:
+                        indices.append(idx)
             else:
                 out.meta.setdefault("custom", {})
                 out.meta["custom"]["ap_must_save"] = True
