@@ -85,6 +85,14 @@ class _SaveAllPartitioner(CustomPartitionerFn):
         # MUST_RECOMPUTE allgathers and the baked-in backward copies
         # compute the same values from the same primals. Without CSE,
         # both appear in the backward (duplication).
+        #
+        # Caveat: fx_graph_cse keeps the first occurrence and drops later
+        # duplicates without merging metadata. If a duplicate has
+        # ap_must_save and the kept node doesn't, the tag is lost. In
+        # practice the duplicates we care about are FSDP allgather chains
+        # whose first occurrence (forward) carries MUST_RECOMPUTE — kept
+        # correctly — so the safety contract holds. General replay
+        # semantics across CSE'd duplicates is a known limitation.
         if torch._functorch.config.cse:
             from torch._functorch.partitioners import fx_graph_cse
 
@@ -110,6 +118,10 @@ class _SaveAllPartitioner(CustomPartitionerFn):
         node_info = classify_nodes(gm, static_lifetime_input_indices, num_fwd_outputs)
 
         if len(node_info.required_bw_nodes) == 0:
+            # Inference path (no backward nodes from autograd): fall back to
+            # the standard partitioner. Our ap_must_save tags are not used
+            # here, but inference doesn't have the fwd/bwd-divergence problem
+            # _SaveAllPartitioner exists to solve.
             return default_partition(
                 gm,
                 joint_inputs,
@@ -122,10 +134,18 @@ class _SaveAllPartitioner(CustomPartitionerFn):
         saved_sym_nodes = []
         saved_opaque_nodes = []
 
+        def _has_tuple_val(node: torch.fx.Node) -> bool:
+            return isinstance(node.meta.get("val"), (list, tuple))
+
         def _is_multi_output(node: torch.fx.Node) -> bool:
-            return (
-                all(user.target == operator.getitem for user in node.users)
-                and len(node.users) > 0
+            # Definitive test: the node returns a tuple/list. Checking users
+            # alone (only getitem) is fragile because a single non-getitem
+            # user (e.g. a debug op or a sym-shape extractor) flips the
+            # answer without changing the node's actual return type.
+            if _has_tuple_val(node):
+                return True
+            return len(node.users) > 0 and all(
+                user.target == operator.getitem for user in node.users
             )
 
         def _must_recompute(node: torch.fx.Node) -> bool:
@@ -135,19 +155,32 @@ class _SaveAllPartitioner(CustomPartitionerFn):
             return node.meta.get("recompute") is CheckpointPolicy.MUST_SAVE
 
         def _maybe_save(node: torch.fx.Node) -> None:
+            # MUST_RECOMPUTE wins over everything else. Check before any
+            # save branch (including opaque) so the first compilation's
+            # explicit recompute intent is always honored.
+            if _must_recompute(node):
+                return
+            # Sym nodes are saved unconditionally per the standard
+            # partitioner convention; ap_must_save/MUST_SAVE tags on them
+            # are ignored. Assert-only symbools are pure runtime checks
+            # and don't need to cross the fwd/bwd boundary.
             if is_sym_node(node):
                 if not _is_assert_only_symbool(node):
                     saved_sym_nodes.append(node)
                 return
             if _is_multi_output(node):
-                if _must_recompute(node):
-                    return
                 custom = node.meta.get("custom", {})
                 if _must_save(node) or custom.get("ap_must_save"):
                     # getitem metadata does not survive preserve_node_meta, so
                     # the first partitioner tags the parent multi-output op. If
-                    # it recorded specific getitem indices, replay only those.
-                    indices = custom.get("ap_must_save_getitem_indices")
+                    # only ap_must_save is set and it recorded specific getitem
+                    # indices, replay only those. MUST_SAVE is a stronger
+                    # directive ("save all tensor outputs needed") and overrides
+                    # the index restriction — save every getitem child.
+                    if _must_save(node):
+                        indices = None
+                    else:
+                        indices = custom.get("ap_must_save_getitem_indices")
                     for user in node.users:
                         if user.target != operator.getitem:
                             continue
@@ -155,9 +188,11 @@ class _SaveAllPartitioner(CustomPartitionerFn):
                             saved_values.append(user)
                 return
             if is_opaque_node(node):
+                # Opaque nodes (ProcessGroup, ScriptObject) can't be
+                # recomputed — they have no functional meaning. Saved
+                # unconditionally regardless of ap_must_save / MUST_SAVE
+                # tags; this matches the standard partitioner's behavior.
                 saved_opaque_nodes.append(node)
-                return
-            if _must_recompute(node):
                 return
             # Save nodes tagged ap_must_save by the first compilation.
             # These are the forward graph's output tensors from the first
@@ -176,6 +211,14 @@ class _SaveAllPartitioner(CustomPartitionerFn):
         # inputs in _extract_fwd_bwd_modules.
         for node in node_info.unclaimed_nodes:
             _maybe_save(node)
+
+        # Deduplicate. Multi-output getitem handling, overlapping iteration
+        # over required_fw_nodes + unclaimed_nodes, or overlapping save tags
+        # can land the same node in a list twice. Matches upstream
+        # default_partition's dict.fromkeys deduping.
+        saved_values = list(dict.fromkeys(saved_values))
+        saved_sym_nodes = list(dict.fromkeys(saved_sym_nodes))
+        saved_opaque_nodes = list(dict.fromkeys(saved_opaque_nodes))
 
         fw_module, bw_module = _extract_fwd_bwd_modules(
             gm,

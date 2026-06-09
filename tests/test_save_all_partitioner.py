@@ -308,6 +308,65 @@ def _simple_partition(saved_node_meta):
     )
 
 
+def _multi_output_partition(
+    parent_meta,
+    saved_indices=None,
+    extra_parent_consumer=False,
+):
+    """Build a tiny joint graph with a multi-output forward op (split) and
+    run _SaveAllPartitioner on it.
+
+    parent_meta is merged into the multi-output op's meta. Optionally tag
+    saved_indices on the parent (mirroring what tag_forward does). If
+    extra_parent_consumer is True, the parent is also referenced directly
+    in the output (a non-getitem user that survives DCE), so the partitioner
+    observes split.users containing both getitems and a non-getitem node.
+    """
+    graph = torch.fx.Graph()
+    x = graph.placeholder("primals_1")
+    x.meta["val"] = torch.randn(6, device="meta")
+    tangent = graph.placeholder("tangents_1")
+    tangent.meta["val"] = torch.randn(6, device="meta")
+
+    split = graph.call_function(torch.ops.aten.split.Tensor, args=(x, 2))
+    split.meta["val"] = [torch.randn(2, device="meta")] * 3
+    custom = split.meta.setdefault("custom", {})
+    custom.update(parent_meta.get("custom", {}))
+    if "recompute" in parent_meta:
+        split.meta["recompute"] = parent_meta["recompute"]
+    if saved_indices is not None:
+        custom["ap_must_save_getitem_indices"] = saved_indices
+
+    g0 = graph.call_function(operator.getitem, args=(split, 0))
+    g0.meta["val"] = torch.randn(2, device="meta")
+    g1 = graph.call_function(operator.getitem, args=(split, 1))
+    g1.meta["val"] = torch.randn(2, device="meta")
+    g2 = graph.call_function(operator.getitem, args=(split, 2))
+    g2.meta["val"] = torch.randn(2, device="meta")
+
+    # Concatenate g0+g1+g2 + tangent so all getitems feed into backward
+    cat = graph.call_function(torch.ops.aten.cat.default, args=([g0, g1, g2],))
+    cat.meta["val"] = torch.randn(6, device="meta")
+    bwd = graph.call_function(torch.ops.aten.mul.Tensor, args=(cat, tangent))
+    bwd.meta["val"] = torch.randn(6, device="meta")
+
+    # Optionally make split a direct forward output (non-getitem user).
+    if extra_parent_consumer:
+        output_args = (cat, split, bwd)
+        num_fwd_outputs = 2
+    else:
+        output_args = (cat, bwd)
+        num_fwd_outputs = 1
+    output = graph.output(output_args)
+    output.meta["desc"] = [None] * len(output_args)
+    gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+    return _SaveAllPartitioner()(
+        gm,
+        [torch.randn(6), torch.randn(6)],
+        num_fwd_outputs=num_fwd_outputs,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Unit tests for the standalone mechanisms
 # ---------------------------------------------------------------------------
@@ -419,6 +478,207 @@ def test_save_all_partitioner_does_not_save_must_recompute():
 
     bw_placeholders = [n.name for n in bw.graph.nodes if n.op == "placeholder"]
     assert "add_tensor" not in bw_placeholders
+
+
+def test_save_all_partitioner_must_recompute_blocks_multi_output_save():
+    """MUST_RECOMPUTE on a multi-output op blocks saving its getitem
+    children, even when ap_must_save is also set. Documents the invariant
+    that the first partitioner's recompute decision wins over its own
+    save tags (which can happen if both are set during graph passes)."""
+    fw, bw = _multi_output_partition(
+        parent_meta={
+            "custom": {"ap_must_save": True},
+            "recompute": CheckpointPolicy.MUST_RECOMPUTE,
+        },
+        saved_indices=[0, 1, 2],
+    )
+
+    # No getitem children should appear in backward inputs
+    bw_placeholders = [n.name for n in bw.graph.nodes if n.op == "placeholder"]
+    assert not any(
+        name.startswith("getitem") for name in bw_placeholders
+    ), f"MUST_RECOMPUTE should block multi-output save, got: {bw_placeholders}"
+
+
+def test_save_all_partitioner_must_recompute_blocks_opaque_save():
+    """MUST_RECOMPUTE blocks saving even on nodes that would otherwise be
+    saved as opaque. The _must_recompute check must run before is_opaque_node
+    so the first partitioner's recompute intent is honored uniformly."""
+    # Build a fake graph with a node we'll force is_opaque_node to recognize.
+    graph = torch.fx.Graph()
+    x = graph.placeholder("primals_1")
+    x.meta["val"] = torch.randn(4, device="meta")
+    tangent = graph.placeholder("tangents_1")
+    tangent.meta["val"] = torch.randn(4, device="meta")
+    opaque_like = graph.call_function(torch.ops.aten.add.Tensor, args=(x, x))
+    opaque_like.meta["val"] = torch.randn(4, device="meta")
+    opaque_like.meta["recompute"] = CheckpointPolicy.MUST_RECOMPUTE
+    bwd = graph.call_function(torch.ops.aten.mul.Tensor, args=(opaque_like, tangent))
+    bwd.meta["val"] = torch.randn(4, device="meta")
+    output = graph.output((opaque_like, bwd))
+    output.meta["desc"] = [None, None]
+    gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+
+    # Force is_opaque_node to return True for our op. _SaveAllPartitioner
+    # imports it from torch._functorch.partitioners, so patch there.
+    import torch._functorch.partitioners as partitioners
+
+    original = partitioners.is_opaque_node
+    partitioners.is_opaque_node = lambda n: n.name == "add_tensor"
+    try:
+        fw, bw = _SaveAllPartitioner()(
+            gm, [torch.randn(4), torch.randn(4)], num_fwd_outputs=1
+        )
+    finally:
+        partitioners.is_opaque_node = original
+
+    # add_tensor was tagged MUST_RECOMPUTE; even though is_opaque_node
+    # returned True, it should NOT be saved
+    bw_placeholders = [n.name for n in bw.graph.nodes if n.op == "placeholder"]
+    assert "add_tensor" not in bw_placeholders, (
+        f"MUST_RECOMPUTE on an opaque-classified node was ignored; "
+        f"backward placeholders: {bw_placeholders}"
+    )
+
+
+def test_save_all_partitioner_multi_output_with_non_getitem_user():
+    """A multi-output op tagged ap_must_save must save its getitem children
+    (not the parent tuple) even when it has a non-getitem user. The save
+    logic must look at the node's value type, not just its users."""
+    fw, bw = _multi_output_partition(
+        parent_meta={"custom": {"ap_must_save": True}},
+        saved_indices=[0, 1, 2],
+        extra_parent_consumer=True,
+    )
+
+    # Backward should receive the getitem children, NOT the split tuple
+    bw_placeholders = [n for n in bw.graph.nodes if n.op == "placeholder"]
+    # No placeholder should have a tuple/list value (which would mean we
+    # saved the multi-output op directly)
+    for n in bw_placeholders:
+        val = n.meta.get("val")
+        assert not isinstance(val, (list, tuple)), (
+            f"Backward got placeholder {n.name} with tuple/list val — multi-output op "
+            f"was saved directly instead of its getitem children"
+        )
+    # And at least one getitem should be present (the save took effect)
+    getitem_names = [n.name for n in bw_placeholders if n.name.startswith("getitem")]
+    assert len(getitem_names) > 0, (
+        f"Expected getitem children to be saved, got placeholders: "
+        f"{[n.name for n in bw_placeholders]}"
+    )
+
+
+def test_save_all_partitioner_replays_only_indexed_getitems():
+    """When tag_forward records specific getitem indices on a multi-output
+    parent, only those indices should appear as saved backward inputs;
+    other indices should not be saved (and would be recomputed if needed).
+
+    Build a graph where backward consumes BOTH getitem 0 and getitem 1, but
+    we only tag index 0 as ap_must_save. The partitioner should save
+    getitem 0 only.
+    """
+    graph = torch.fx.Graph()
+    x = graph.placeholder("primals_1")
+    x.meta["val"] = torch.randn(4, device="meta")
+    t0 = graph.placeholder("tangents_1")
+    t0.meta["val"] = torch.randn(2, device="meta")
+    t1 = graph.placeholder("tangents_2")
+    t1.meta["val"] = torch.randn(2, device="meta")
+
+    # Multi-output op: split into 2 chunks. Mark only index 0 as ap_must_save.
+    split = graph.call_function(torch.ops.aten.split.Tensor, args=(x, 2))
+    split.meta["val"] = [torch.randn(2, device="meta")] * 2
+    custom = split.meta.setdefault("custom", {})
+    custom["ap_must_save"] = True
+    custom["ap_must_save_getitem_indices"] = [0]
+
+    g0 = graph.call_function(operator.getitem, args=(split, 0))
+    g0.meta["val"] = torch.randn(2, device="meta")
+    g1 = graph.call_function(operator.getitem, args=(split, 1))
+    g1.meta["val"] = torch.randn(2, device="meta")
+
+    # Forward outputs: a value that depends on both g0 and g1 (so both
+    # getitems are required in forward).
+    add_fw = graph.call_function(torch.ops.aten.add.Tensor, args=(g0, g1))
+    add_fw.meta["val"] = torch.randn(2, device="meta")
+
+    # Backward ops: independent muls using g0 and g1 respectively, so each
+    # getitem is a real backward dependency.
+    bwd0 = graph.call_function(torch.ops.aten.mul.Tensor, args=(g0, t0))
+    bwd0.meta["val"] = torch.randn(2, device="meta")
+    bwd1 = graph.call_function(torch.ops.aten.mul.Tensor, args=(g1, t1))
+    bwd1.meta["val"] = torch.randn(2, device="meta")
+
+    output = graph.output((add_fw, bwd0, bwd1))
+    output.meta["desc"] = [None, None, None]
+    gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+    fw, bw = _SaveAllPartitioner()(
+        gm,
+        [torch.randn(4), torch.randn(2), torch.randn(2)],
+        num_fwd_outputs=1,
+    )
+
+    bw_placeholders = [n.name for n in bw.graph.nodes if n.op == "placeholder"]
+    # getitem 0 should be a saved backward input (we tagged index 0)
+    assert (
+        "getitem" in bw_placeholders
+    ), f"Expected getitem (index 0) to be saved; got {bw_placeholders}"
+    # getitem 1 should NOT be a saved input — it's not in the indices list
+    assert "getitem_1" not in bw_placeholders, (
+        f"Expected getitem_1 (index 1) NOT to be saved (index restriction); "
+        f"got {bw_placeholders}"
+    )
+
+
+def test_save_all_partitioner_must_save_overrides_getitem_indices():
+    """MUST_SAVE on a multi-output parent should save ALL getitem children
+    even if ap_must_save_getitem_indices restricts to a subset. MUST_SAVE
+    is a stronger directive than ap_must_save's index-specific replay."""
+    graph = torch.fx.Graph()
+    x = graph.placeholder("primals_1")
+    x.meta["val"] = torch.randn(4, device="meta")
+    t0 = graph.placeholder("tangents_1")
+    t0.meta["val"] = torch.randn(2, device="meta")
+    t1 = graph.placeholder("tangents_2")
+    t1.meta["val"] = torch.randn(2, device="meta")
+
+    split = graph.call_function(torch.ops.aten.split.Tensor, args=(x, 2))
+    split.meta["val"] = [torch.randn(2, device="meta")] * 2
+    # Both MUST_SAVE AND restricted indices. MUST_SAVE should win.
+    split.meta["recompute"] = CheckpointPolicy.MUST_SAVE
+    custom = split.meta.setdefault("custom", {})
+    custom["ap_must_save"] = True
+    custom["ap_must_save_getitem_indices"] = [0]
+
+    g0 = graph.call_function(operator.getitem, args=(split, 0))
+    g0.meta["val"] = torch.randn(2, device="meta")
+    g1 = graph.call_function(operator.getitem, args=(split, 1))
+    g1.meta["val"] = torch.randn(2, device="meta")
+
+    add_fw = graph.call_function(torch.ops.aten.add.Tensor, args=(g0, g1))
+    add_fw.meta["val"] = torch.randn(2, device="meta")
+    bwd0 = graph.call_function(torch.ops.aten.mul.Tensor, args=(g0, t0))
+    bwd0.meta["val"] = torch.randn(2, device="meta")
+    bwd1 = graph.call_function(torch.ops.aten.mul.Tensor, args=(g1, t1))
+    bwd1.meta["val"] = torch.randn(2, device="meta")
+
+    output = graph.output((add_fw, bwd0, bwd1))
+    output.meta["desc"] = [None, None, None]
+    gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+    fw, bw = _SaveAllPartitioner()(
+        gm,
+        [torch.randn(4), torch.randn(2), torch.randn(2)],
+        num_fwd_outputs=1,
+    )
+
+    bw_placeholders = [n.name for n in bw.graph.nodes if n.op == "placeholder"]
+    # Both getitems should be saved (MUST_SAVE overrides the index restriction)
+    assert "getitem" in bw_placeholders, f"Expected getitem; got {bw_placeholders}"
+    assert "getitem_1" in bw_placeholders, (
+        f"Expected getitem_1 even though indices=[0] (MUST_SAVE should override); "
+        f"got {bw_placeholders}"
+    )
 
 
 def test_preserve_node_meta_propagates_recompute_through_collectives():
