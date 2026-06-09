@@ -5,6 +5,7 @@
 
 import copy
 import logging
+import operator
 import time
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
@@ -57,7 +58,36 @@ _APPLY_VIEW_MM_VIEW_PATTERN = True
 logger = logging.getLogger(__name__)
 
 
-def _boxed_nop_preserve_node_meta(fx_g, example_inputs):
+def _boxed_nop_preserve_node_meta(
+    fx_g, example_inputs, pre_pass=None, tag_forward=False
+):
+    if pre_pass is not None:
+        pre_pass(fx_g.graph)
+
+    if tag_forward:
+        # Tag the forward graph's OUTPUT values as "must save". These are
+        # the tensors the first min_cut decided to save for backward —
+        # only these should be saved in the second compilation.
+        # Uses the "custom" meta field (not "recompute") to avoid
+        # interfering with ac_joint_pass which uses "recompute" for
+        # activation checkpointing decisions.
+        output_node = next(n for n in fx_g.graph.nodes if n.op == "output")
+        for out in output_node.args[0]:
+            if not isinstance(out, torch.fx.Node) or out.op != "call_function":
+                continue
+            if out.target == operator.getitem:
+                # getitem metadata doesn't survive preserve_node_meta
+                # (Python builtin, not dispatched). Tag the parent
+                # multi-output op instead — DCE in _extract_fwd_bwd_modules
+                # removes any unused getitem children.
+                parent = out.args[0]
+                if isinstance(parent, torch.fx.Node):
+                    parent.meta.setdefault("custom", {})
+                    parent.meta["custom"]["ap_must_save"] = True
+            else:
+                out.meta.setdefault("custom", {})
+                out.meta["custom"]["ap_must_save"] = True
+
     def run(args):
         with torch.fx.traceback.preserve_node_meta():
             return torch.fx.Interpreter(fx_g).boxed_run(args)
@@ -482,9 +512,13 @@ class AutoParallel:
             self.parallel_gm.graph, self.reshard_after_forward
         )
 
+        from functools import partial
+
+        fw_compiler_fn = partial(self.compiler_fn, tag_forward=True)
+
         self.parallel_model_fn = parallel_model_fn = aot_compile_joint_with_descriptors(
             self.joint_with_descriptors,
-            fw_compiler=self.compiler_fn,
+            fw_compiler=fw_compiler_fn,
             bw_compiler=self.compiler_fn,
         )
 
