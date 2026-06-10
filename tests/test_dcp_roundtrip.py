@@ -11,12 +11,13 @@ into a fresh non-sharded model, and verifies the post-load loss curve matches
 the AP loss curve. This exercises the AP-to-non-AP resharding path that DCP
 performs at load time on _StridedShard parameters.
 
-Requires real multi-GPU (uses MultiProcessTestCase via DTensorTestBase). On
-hosts with fewer than world_size GPUs the test self-skips via the harness.
+Requires real multi-GPU (uses MultiProcessTestCase via DTensorTestBase). Skips
+explicitly on hosts with fewer than 4 GPUs.
 """
 
 import tempfile
 
+import pytest
 import torch
 from torch import nn
 from torch.distributed.checkpoint import load as dcp_load
@@ -100,6 +101,10 @@ class TestDCPRoundTrip(DTensorTestBase):
     def world_size(self) -> int:
         return 4
 
+    @pytest.mark.skipif(
+        torch.cuda.device_count() < 4,
+        reason="DCP round-trip test requires at least 4 GPUs",
+    )
     @with_comms
     def test_ap_to_non_ap_resharding(self):
         torch.manual_seed(21)
