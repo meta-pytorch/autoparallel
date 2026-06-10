@@ -11,7 +11,7 @@ from torch.distributed.tensor.placement_types import Replicate, Shard
 
 from autoparallel.api import auto_parallel
 from autoparallel.input_validation import (
-    TracedInputs,
+    ForwardInputs,
     _check_forward_args,
     _compute_expected_inputs,
     _extract_input_info,
@@ -61,7 +61,9 @@ def test_compute_expected_inputs(device_mesh_1d):
     traced = [torch.empty(512, 128, device="meta")]
     placements = [(Shard(0),)]
 
-    result, _dynamic_dims = _compute_expected_inputs(traced, {}, placements, mesh)
+    result, _dynamic_dims = _compute_expected_inputs(
+        ForwardInputs(args=tuple(traced)), placements, mesh
+    )
     assert len(result) == 1
     assert result[0].shape == (512 // world_size, 128)
     assert result[0].dtype == torch.float32
@@ -74,7 +76,9 @@ def test_compute_expected_inputs_replicated(device_mesh_1d):
     traced = [torch.empty(512, 128, device="meta")]
     placements = [(Replicate(),)]
 
-    result, _dynamic_dims = _compute_expected_inputs(traced, {}, placements, mesh)
+    result, _dynamic_dims = _compute_expected_inputs(
+        ForwardInputs(args=tuple(traced)), placements, mesh
+    )
     assert len(result) == 1
     assert result[0].shape == (512, 128)
 
@@ -87,7 +91,9 @@ def test_compute_expected_inputs_uneven(device_mesh_2d):
     traced = [torch.empty(10, 128, device="meta")]
     placements = [(Replicate(), Shard(0))]
 
-    result, _dynamic_dims = _compute_expected_inputs(traced, {}, placements, mesh)
+    result, _dynamic_dims = _compute_expected_inputs(
+        ForwardInputs(args=tuple(traced)), placements, mesh
+    )
     assert len(result) == 1
     expected_dim0 = (10 + tp_size - 1) // tp_size  # ceil(10/8) = 2
     assert result[0].shape == (expected_dim0, 128)
@@ -145,7 +151,7 @@ def test_compute_expected_inputs_dict_pytree(device_mesh_1d):
     mesh = device_mesh_1d
     world_size = mesh.size()
 
-    # Simulate traced_inputs containing a dict (as produced by build_joint_graph
+    # Simulate traced inputs containing a dict (as produced by build_joint_graph
     # when the model takes a dict argument)
     traced = [
         {
@@ -155,7 +161,9 @@ def test_compute_expected_inputs_dict_pytree(device_mesh_1d):
     ]
     constraints = [(Shard(0),), (Shard(0),)]
 
-    result, _dynamic_dims = _compute_expected_inputs(traced, {}, constraints, mesh)
+    result, _dynamic_dims = _compute_expected_inputs(
+        ForwardInputs(args=tuple(traced)), constraints, mesh
+    )
     assert len(result) == 2
     assert result[0].shape == (512 // world_size, 128)
     assert result[1].shape == (512 // world_size, 64)
@@ -243,13 +251,13 @@ def test_dict_input_integration(device_mesh_1d):
         parallel_mod({"x": torch.rand(local_batch_size + 1, dim, device="cuda")})
 
 
-def test_traced_inputs_defaults_and_frozen():
-    """TracedInputs has empty defaults and is frozen."""
-    ti = TracedInputs()
+def test_forward_inputs_defaults_and_frozen():
+    """ForwardInputs has empty defaults and is frozen."""
+    ti = ForwardInputs()
     assert ti.args == ()
     assert ti.kwargs == {}
 
-    ti2 = TracedInputs(args=(1, 2), kwargs={"k": 3})
+    ti2 = ForwardInputs(args=(1, 2), kwargs={"k": 3})
     assert ti2.args == (1, 2)
     assert ti2.kwargs == {"k": 3}
 
@@ -262,20 +270,22 @@ def test_compute_expected_inputs_with_kwargs(device_mesh_1d):
     mesh = device_mesh_1d
     world_size = mesh.size()
 
-    traced_args = [torch.empty(512, 128, device="meta")]
-    traced_kwargs = {
-        "mask": torch.empty(512, device="meta"),
-        "positions": torch.empty(512, 64, device="meta"),
-    }
+    traced = ForwardInputs(
+        args=(torch.empty(512, 128, device="meta"),),
+        kwargs={
+            "mask": torch.empty(512, device="meta"),
+            "positions": torch.empty(512, 64, device="meta"),
+        },
+    )
     # Order matches tree_flatten((args, kwargs)): args first, then kwargs in
     # dict key order.
     placements = [
-        (Shard(0),),  # traced_args[0]
+        (Shard(0),),  # args[0]
         (Shard(0),),  # mask
         (Replicate(),),  # positions
     ]
 
-    result, _ = _compute_expected_inputs(traced_args, traced_kwargs, placements, mesh)
+    result, _ = _compute_expected_inputs(traced, placements, mesh)
     assert len(result) == 3
     assert result[0].shape == (512 // world_size, 128)
     assert result[1].shape == (512 // world_size,)

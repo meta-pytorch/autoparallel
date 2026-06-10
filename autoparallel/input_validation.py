@@ -11,7 +11,7 @@ from torch.distributed.tensor import DeviceMesh
 
 
 @dataclass(frozen=True)
-class TracedInputs:
+class ForwardInputs:
     """Explicit ``(args, kwargs)`` container for AutoParallel's ``input_fn``.
 
     Return this from ``input_fn`` (or pass as ``sample_inputs`` to
@@ -24,18 +24,18 @@ class TracedInputs:
     kwargs: dict = field(default_factory=dict)
 
 
-def _compute_expected_inputs(traced_args, traced_kwargs, input_placements, mesh):
+def _compute_expected_inputs(traced_inputs, input_placements, mesh):
     """Compute expected runtime inputs by applying sharding to traced global shapes.
 
-    ``traced_args`` and ``traced_kwargs`` may contain pytree structures (dicts,
+    ``traced_inputs`` is a :class:`ForwardInputs` carrying the ``(args, kwargs)``
+    used during tracing. Each side may contain pytree structures (dicts,
     nested tuples, etc.). We flatten ``(args, kwargs)`` together to tensor
     leaves before applying sharding, since the compiled graph operates on flat
     tensor args in that canonical order (matching how Dynamo and AOT autograd
     lay out placeholders).
 
     Args:
-        traced_args: The positional inputs used during tracing (may contain pytrees).
-        traced_kwargs: The keyword inputs used during tracing (may contain pytrees).
+        traced_inputs: The ``ForwardInputs`` used during tracing.
         input_placements: A placement tuple for each tensor leaf, as determined
             by the solver's solution.
         mesh: The device mesh.
@@ -49,7 +49,9 @@ def _compute_expected_inputs(traced_args, traced_kwargs, input_placements, mesh)
     import torch.utils._pytree as pytree
     from torch.distributed.tensor.placement_types import Shard
 
-    flat_inputs, _ = pytree.tree_flatten((tuple(traced_args), traced_kwargs))
+    flat_inputs, _ = pytree.tree_flatten(
+        (tuple(traced_inputs.args), traced_inputs.kwargs)
+    )
 
     result = []
     dynamic_dims: set[tuple[int, int]] = set()
@@ -227,8 +229,8 @@ def _make_input_fn_with_kwargs(
     kwargs_dtypes: list[torch.dtype],
     kwargs_devices: list[torch.device],
     kwargs_spec: Any,
-) -> Callable[[], TracedInputs]:
-    """Create an input_fn that returns a ``TracedInputs(args, kwargs)``.
+) -> Callable[[], ForwardInputs]:
+    """Create an input_fn that returns a ``ForwardInputs(args, kwargs)``.
 
     Mirrors ``_make_input_fn`` but reconstructs the positional and keyword
     pytrees separately so that the user-provided ``forward`` keyword-only
@@ -236,7 +238,7 @@ def _make_input_fn_with_kwargs(
     """
     import torch.utils._pytree as pytree
 
-    def input_fn() -> TracedInputs:
+    def input_fn() -> ForwardInputs:
         args_tensors = [
             torch.empty(shape, dtype=dtype, device=device)
             for shape, dtype, device in zip(args_shapes, args_dtypes, args_devices)
@@ -251,7 +253,7 @@ def _make_input_fn_with_kwargs(
         kwargs = pytree.tree_unflatten(kwargs_tensors, kwargs_spec)
         if not isinstance(args, tuple):
             args = (args,)
-        return TracedInputs(args=args, kwargs=kwargs)
+        return ForwardInputs(args=args, kwargs=kwargs)
 
     return input_fn
 

@@ -1001,7 +1001,10 @@ class TestDynamicDimsParameter:
             StatelessSymbolicContext,
         )
 
-        from autoparallel.input_validation import _compute_expected_inputs
+        from autoparallel.input_validation import (
+            ForwardInputs,
+            _compute_expected_inputs,
+        )
 
         shape_env = ShapeEnv()
         fake_mode = FakeTensorMode(shape_env=shape_env, static_shapes=False)
@@ -1028,7 +1031,9 @@ class TestDynamicDimsParameter:
             def size(self, dim=0):
                 return 1
 
-        _, dynamic_dims = _compute_expected_inputs([t1, t2], {}, [(), ()], FakeMesh())
+        _, dynamic_dims = _compute_expected_inputs(
+            ForwardInputs(args=(t1, t2)), [(), ()], FakeMesh()
+        )
         assert (0, 0) in dynamic_dims, "t1 dim 0 should be dynamic"
         assert (0, 1) not in dynamic_dims, "t1 dim 1 should be static"
         assert (1, 0) in dynamic_dims, "t2 dim 0 should be dynamic"
@@ -1044,7 +1049,10 @@ class TestDynamicDimsParameter:
             StatelessSymbolicContext,
         )
 
-        from autoparallel.input_validation import _compute_expected_inputs
+        from autoparallel.input_validation import (
+            ForwardInputs,
+            _compute_expected_inputs,
+        )
 
         shape_env = ShapeEnv()
         fake_mode = FakeTensorMode(shape_env=shape_env, static_shapes=False)
@@ -1061,7 +1069,9 @@ class TestDynamicDimsParameter:
                 return 1
 
         # Non-tensor followed by tensor: the tensor is result_idx=1
-        _, dynamic_dims = _compute_expected_inputs([42, t1], {}, [()], FakeMesh())
+        _, dynamic_dims = _compute_expected_inputs(
+            ForwardInputs(args=(42, t1)), [()], FakeMesh()
+        )
         assert (1, 0) in dynamic_dims, "tensor at result_idx=1, dim 0 should be dynamic"
         assert (0, 0) not in dynamic_dims, "result_idx=0 is a non-tensor"
 
@@ -1377,7 +1387,6 @@ def test_dynamic_check_forward_args_accepts_different_batch(device_mesh_1d):
 
         expected, dynamic_dims = _compute_expected_inputs(
             autop._traced_inputs,
-            autop._traced_kwargs,
             autop.input_constraints,
             device_mesh_1d,
         )

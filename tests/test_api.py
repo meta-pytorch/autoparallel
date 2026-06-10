@@ -13,7 +13,7 @@ from torch.distributed.tensor.placement_types import Replicate, Shard
 
 from autoparallel.api import AutoParallel, auto_parallel
 from autoparallel.compile import autoparallel_backend
-from autoparallel.input_validation import TracedInputs
+from autoparallel.input_validation import ForwardInputs
 
 
 def test_from_meta_model(device_mesh_1d):
@@ -910,8 +910,8 @@ class _KwargOnlyModel(nn.Module):
         nn.init.zeros_(self.linear.bias)
 
 
-def test_input_fn_traced_inputs_kwargs(device_mesh_1d):
-    """input_fn returning TracedInputs traces a kwarg-only forward end-to-end."""
+def test_input_fn_forward_inputs_kwargs(device_mesh_1d):
+    """input_fn returning ForwardInputs traces a kwarg-only forward end-to-end."""
     dim = 128
     batch_size = 512
     local_bs = batch_size // device_mesh_1d.size()
@@ -923,7 +923,7 @@ def test_input_fn_traced_inputs_kwargs(device_mesh_1d):
         tokens = torch.randn(batch_size, dim, device="cuda")
         masks = torch.ones(batch_size, device="cuda")
         positions = torch.zeros(batch_size, dim, device="cuda")
-        return TracedInputs(
+        return ForwardInputs(
             args=(tokens,),
             kwargs={"attention_masks": masks, "positions": positions},
         )
@@ -944,7 +944,7 @@ def test_input_fn_traced_inputs_kwargs(device_mesh_1d):
     assert out.shape == (local_bs, dim)
 
 
-def test_input_fn_traced_inputs_kwargs_reorder(device_mesh_1d):
+def test_input_fn_forward_inputs_kwargs_reorder(device_mesh_1d):
     """Caller may pass kwargs in any order; reorder_kwargs aligns them."""
     dim = 128
     batch_size = 512
@@ -954,7 +954,7 @@ def test_input_fn_traced_inputs_kwargs_reorder(device_mesh_1d):
         model = _KwargOnlyModel(dim)
 
     def input_fn():
-        return TracedInputs(
+        return ForwardInputs(
             args=(torch.randn(batch_size, dim, device="cuda"),),
             kwargs={
                 "attention_masks": torch.ones(batch_size, device="cuda"),
@@ -1016,8 +1016,8 @@ def test_input_fn_positional_bc(device_mesh_1d):
     assert out.shape == (local_bs, dim)
 
 
-def test_auto_parallel_traced_inputs(device_mesh_1d):
-    """Simple auto_parallel(...) accepts TracedInputs sample_inputs."""
+def test_auto_parallel_forward_inputs(device_mesh_1d):
+    """Simple auto_parallel(...) accepts ForwardInputs sample_inputs."""
     dim = 128
     batch_size = 512
     local_bs = batch_size // device_mesh_1d.size()
@@ -1044,7 +1044,7 @@ def test_auto_parallel_traced_inputs(device_mesh_1d):
     parallel_mod = auto_parallel(
         model,
         device_mesh_1d,
-        sample_inputs=TracedInputs(
+        sample_inputs=ForwardInputs(
             args=(tokens,),
             kwargs={"attention_masks": masks, "positions": positions},
         ),

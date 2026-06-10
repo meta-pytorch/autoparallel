@@ -36,7 +36,7 @@ from .graph_passes.graph_utils import (
     update_joint_with_descriptors,
 )
 from .input_validation import (
-    TracedInputs,
+    ForwardInputs,
     _check_forward_args,
     _compute_expected_inputs,
     _extract_input_info,
@@ -94,8 +94,7 @@ def _suppress_wait_tensor_side_effect():
 class JointGraphResult:
     gm: torch.fx.GraphModule
     joint_with_descriptors: Any
-    traced_inputs: list[Any]
-    traced_kwargs: dict[str, Any]
+    traced_inputs: "ForwardInputs"
 
 
 def _make_inputs_dynamic(
@@ -138,23 +137,20 @@ def build_joint_graph(
     with fake_mode:
         raw_inputs = input_fn()
 
-    if isinstance(raw_inputs, TracedInputs):
-        formatted_args: tuple[Any, ...] = tuple(raw_inputs.args)
-        formatted_kwargs: dict[str, Any] = dict(raw_inputs.kwargs)
+    if isinstance(raw_inputs, ForwardInputs):
+        traced_inputs = ForwardInputs(
+            args=tuple(raw_inputs.args), kwargs=dict(raw_inputs.kwargs)
+        )
     elif isinstance(raw_inputs, tuple):
-        formatted_args = raw_inputs
-        formatted_kwargs = {}
+        traced_inputs = ForwardInputs(args=raw_inputs)
     else:
-        formatted_args = (raw_inputs,)
-        formatted_kwargs = {}
+        traced_inputs = ForwardInputs(args=(raw_inputs,))
 
     if fake_mode.shape_env is not None:
-        formatted_args, formatted_kwargs = _make_inputs_dynamic(
-            (formatted_args, formatted_kwargs), fake_mode
+        args, kwargs = _make_inputs_dynamic(
+            (traced_inputs.args, traced_inputs.kwargs), fake_mode
         )
-
-    traced_inputs = list(formatted_args)
-    traced_kwargs = formatted_kwargs
+        traced_inputs = ForwardInputs(args=args, kwargs=kwargs)
 
     with (
         set_dtype_cast(True),
@@ -162,7 +158,7 @@ def build_joint_graph(
         torch._dynamo.utils._disable_saved_tensors_hooks_during_tracing(),
     ):
         torch_ir_with_fqn = _dynamo_graph_capture_for_export(model)(
-            *formatted_args, **formatted_kwargs
+            *traced_inputs.args, **traced_inputs.kwargs
         )
         _restore_state_dict(model, torch_ir_with_fqn)
         _add_unused_params_and_buffers(model, torch_ir_with_fqn)
@@ -171,8 +167,8 @@ def build_joint_graph(
         joint_with_descriptors = aot_export_joint_with_descriptors(
             stack,
             torch_ir_with_fqn,
-            formatted_args,
-            formatted_kwargs or None,
+            traced_inputs.args,
+            traced_inputs.kwargs or None,
             decompositions=decomp_table,
         )
     gm = joint_with_descriptors.graph_module
@@ -200,7 +196,6 @@ def build_joint_graph(
         gm=gm,
         joint_with_descriptors=joint_with_descriptors,
         traced_inputs=traced_inputs,
-        traced_kwargs=traced_kwargs,
     )
 
 
@@ -342,7 +337,6 @@ class AutoParallel:
         self.gm = result.gm
         self.joint_with_descriptors = result.joint_with_descriptors
         self._traced_inputs = result.traced_inputs
-        self._traced_kwargs = result.traced_kwargs
 
     # TODO: Specify what the low/high meaning is (percentage?)
     def add_parameter_memory_constraint(self, low=None, high=None):
@@ -564,7 +558,6 @@ class AutoParallel:
 
         expected_inputs, dynamic_dims = _compute_expected_inputs(
             self._traced_inputs,
-            self._traced_kwargs,
             solved_input_placements,
             self.mesh,
         )
@@ -575,9 +568,9 @@ class AutoParallel:
         from torch.export._tree_utils import reorder_kwargs
 
         trace_in_spec = torch.utils._pytree.tree_flatten(
-            (tuple(self._traced_inputs), self._traced_kwargs)
+            (tuple(self._traced_inputs.args), self._traced_inputs.kwargs)
         )[1]
-        has_traced_kwargs = bool(self._traced_kwargs)
+        has_traced_kwargs = bool(self._traced_inputs.kwargs)
 
         def forward(self, *args, **kwargs):
             if has_traced_kwargs or kwargs:
@@ -700,8 +693,8 @@ def auto_parallel(
         >>> parallel_model = auto_parallel(model, mesh, sample_inputs, out_shardings=...)
 
     Example with keyword-only forward args:
-        >>> from autoparallel import TracedInputs
-        >>> sample_inputs = TracedInputs(
+        >>> from autoparallel import ForwardInputs
+        >>> sample_inputs = ForwardInputs(
         ...     args=(tokens,),
         ...     kwargs={"attention_masks": mask, "positions": pos},
         ... )
@@ -713,7 +706,7 @@ def auto_parallel(
     else:
         raw_inputs = sample_inputs
 
-    if isinstance(raw_inputs, TracedInputs):
+    if isinstance(raw_inputs, ForwardInputs):
         (
             args_shapes,
             args_dtypes,
