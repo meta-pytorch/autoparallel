@@ -3,21 +3,39 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 import torch
 from torch.distributed.tensor import DeviceMesh
 
 
-def _compute_expected_inputs(traced_inputs, input_placements, mesh):
+@dataclass(frozen=True)
+class ForwardInputs:
+    """Explicit ``(args, kwargs)`` container for AutoParallel's ``input_fn``.
+
+    Return this from ``input_fn`` (or pass as ``sample_inputs`` to
+    ``auto_parallel``) to trace a model whose ``forward`` takes keyword-only
+    arguments. Any other return value is interpreted positionally, preserving
+    the historical contract.
+    """
+
+    args: tuple = ()
+    kwargs: dict = field(default_factory=dict)
+
+
+def flatten_and_convert_inputs_to_local_shapes(traced_inputs, input_placements, mesh):
     """Compute expected runtime inputs by applying sharding to traced global shapes.
 
-    traced_inputs may contain pytree structures (dicts, nested tuples, etc.).
-    We flatten them to tensor leaves before applying sharding, since the compiled
-    graph operates on flat tensor args.
+    ``traced_inputs`` is a :class:`ForwardInputs` carrying the ``(args, kwargs)``
+    used during tracing. Each side may contain pytree structures (dicts,
+    nested tuples, etc.). We flatten ``(args, kwargs)`` together to tensor
+    leaves before applying sharding, since the compiled graph operates on flat
+    tensor args in that canonical order (matching how Dynamo and AOT autograd
+    lay out placeholders).
 
     Args:
-        traced_inputs: The inputs used during tracing (may contain pytrees).
+        traced_inputs: The ``ForwardInputs`` used during tracing.
         input_placements: A placement tuple for each tensor leaf, as determined
             by the solver's solution.
         mesh: The device mesh.
@@ -31,7 +49,9 @@ def _compute_expected_inputs(traced_inputs, input_placements, mesh):
     import torch.utils._pytree as pytree
     from torch.distributed.tensor.placement_types import Shard
 
-    flat_inputs, _ = pytree.tree_flatten(traced_inputs)
+    flat_inputs, _ = pytree.tree_flatten(
+        (tuple(traced_inputs.args), traced_inputs.kwargs)
+    )
 
     result = []
     dynamic_dims: set[tuple[int, int]] = set()
@@ -68,7 +88,7 @@ def _check_forward_args(args, expected_inputs, dynamic_dims=frozenset()):
 
     Args:
         args: The actual forward arguments (flat list).
-        expected_inputs: Expected shapes from _compute_expected_inputs.
+        expected_inputs: Expected shapes from flatten_and_convert_inputs_to_local_shapes.
         dynamic_dims: Set of (arg_index, dim) pairs for dynamic dimensions.
     """
     if len(args) != len(expected_inputs):
@@ -167,37 +187,96 @@ def _extract_input_info(
 
 
 def _make_input_fn(
-    shapes: list[tuple[int, ...]],
-    dtypes: list[torch.dtype],
-    treespec: Any,
-    devices: list[torch.device],
-) -> Callable[[], tuple[Any, ...]]:
-    """
-    Create an input_fn that creates tensors with the given shapes/dtypes/devices.
+    args_shapes: list[tuple[int, ...]],
+    args_dtypes: list[torch.dtype],
+    args_devices: list[torch.device],
+    args_spec: Any,
+    kwargs_shapes: list[tuple[int, ...]],
+    kwargs_dtypes: list[torch.dtype],
+    kwargs_devices: list[torch.device],
+    kwargs_spec: Any,
+) -> Callable[[], ForwardInputs]:
+    """Create an input_fn that returns a ``ForwardInputs(args, kwargs)``.
 
-    The returned function should be called inside FakeTensorMode.
-    It creates new tensors (which will be fake tensors when called in FakeTensorMode).
-
-    Returns:
-        Callable that returns inputs as a tuple.
+    The returned function should be called inside FakeTensorMode; it creates
+    new tensors (which will be fake tensors under that mode). Positional and
+    keyword pytrees are reconstructed separately so that keyword-only
+    ``forward`` parameters survive tracing. The no-kwargs case is just empty
+    ``kwargs_shapes`` / ``kwargs_spec``.
     """
     import torch.utils._pytree as pytree
 
-    def input_fn() -> tuple[Any, ...]:
-        # Create tensors inside FakeTensorMode - they'll be fake tensors
-        tensors = [
+    def input_fn() -> ForwardInputs:
+        args_tensors = [
             torch.empty(shape, dtype=dtype, device=device)
-            for shape, dtype, device in zip(shapes, dtypes, devices)
+            for shape, dtype, device in zip(args_shapes, args_dtypes, args_devices)
         ]
-        result = pytree.tree_unflatten(tensors, treespec)
-
-        # AutoParallel expects input_fn to return a tuple
-        if isinstance(result, tuple):
-            return result
-        else:
-            return (result,)
+        kwargs_tensors = [
+            torch.empty(shape, dtype=dtype, device=device)
+            for shape, dtype, device in zip(
+                kwargs_shapes, kwargs_dtypes, kwargs_devices
+            )
+        ]
+        args = pytree.tree_unflatten(args_tensors, args_spec)
+        kwargs = pytree.tree_unflatten(kwargs_tensors, kwargs_spec)
+        if not isinstance(args, tuple):
+            args = (args,)
+        return ForwardInputs(args=args, kwargs=kwargs)
 
     return input_fn
+
+
+def _normalize_sample_inputs(sample_inputs: Any) -> ForwardInputs:
+    """Coerce ``sample_inputs`` (any legacy shape) into a canonical ``ForwardInputs``.
+
+    - ``ForwardInputs`` is returned as-is.
+    - A ``tuple`` becomes ``ForwardInputs(args=raw)`` (positional pytree).
+    - Anything else becomes ``ForwardInputs(args=(raw,))`` (single positional
+      pytree leaf — preserves the historical dict/tensor handling).
+    """
+    if isinstance(sample_inputs, ForwardInputs):
+        return sample_inputs
+    if isinstance(sample_inputs, tuple):
+        return ForwardInputs(args=sample_inputs)
+    return ForwardInputs(args=(sample_inputs,))
+
+
+def _build_input_fn_from_sample(
+    sample_inputs: Any, mesh: DeviceMesh
+) -> tuple[Callable[[], ForwardInputs], list[tuple[Any, ...]]]:
+    """Extract metadata from ``sample_inputs`` and build a matching ``input_fn``.
+
+    Returns the ``input_fn`` (which produces a ``ForwardInputs`` of fresh
+    tensors under FakeTensorMode) and the flat list of input placements in
+    ``tree_flatten((args, kwargs))`` leaf order (positional first, then kwargs
+    in dict key order — matching how Dynamo and AOT lay out placeholders).
+    """
+    forward_inputs = _normalize_sample_inputs(sample_inputs)
+    (
+        args_shapes,
+        args_dtypes,
+        args_placements,
+        args_spec,
+        args_devices,
+    ) = _extract_input_info(forward_inputs.args, mesh)
+    (
+        kwargs_shapes,
+        kwargs_dtypes,
+        kwargs_placements,
+        kwargs_spec,
+        kwargs_devices,
+    ) = _extract_input_info(forward_inputs.kwargs, mesh)
+    input_fn = _make_input_fn(
+        args_shapes,
+        args_dtypes,
+        args_devices,
+        args_spec,
+        kwargs_shapes,
+        kwargs_dtypes,
+        kwargs_devices,
+        kwargs_spec,
+    )
+    return input_fn, args_placements + kwargs_placements
 
 
 def _flatten_out_shardings(
