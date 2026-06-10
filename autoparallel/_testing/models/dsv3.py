@@ -1581,7 +1581,7 @@ class TransformerBlock(nn.Module):
                 route_norm=moe_cfg.router.route_norm,
                 route_scale=moe_cfg.router.route_scale,
                 score_before_experts=moe_cfg.experts.token_dispatcher.score_before_experts,
-                use_grouped_mm=moe_cfg.experts.use_grouped_mm,
+                use_grouped_mm=getattr(moe_cfg.experts, "use_grouped_mm", True),
                 load_balance_coeff=moe_cfg.load_balance_coeff,
                 mesh=mesh,
                 compute_dtype=compute_dtype,
