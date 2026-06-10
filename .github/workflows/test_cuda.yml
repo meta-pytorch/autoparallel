@@ -35,13 +35,17 @@ jobs:
         # so CI captures which mesh triggers the as_strided dispatch on the
         # real A10G hardware (see tests/diagnose_mesh_identity_ci.py).
         set +e
-        pytest tests
+        pytest tests --ignore=tests/test_diagnose_mesh_identity_pytest.py
         pytest_status=$?
         set -e
         echo "============================================================"
-        echo "  mesh-identity diagnostic (always runs)"
+        echo "  mesh-identity diagnostic (standalone script)"
         echo "============================================================"
         python tests/diagnose_mesh_identity_ci.py || true
+        echo "============================================================"
+        echo "  mesh-identity diagnostic (pytest mode, after other tests)"
+        echo "============================================================"
+        pytest -s tests/test_diagnose_mesh_identity_pytest.py -v || true
         exit $pytest_status
 
   examples-cuda-single-gpu:
