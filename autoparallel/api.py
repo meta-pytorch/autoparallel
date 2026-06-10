@@ -5,9 +5,11 @@
 
 import copy
 import logging
+import operator
 import time
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, Callable, Optional, Union
 
 import torch
@@ -57,7 +59,35 @@ _APPLY_VIEW_MM_VIEW_PATTERN = True
 logger = logging.getLogger(__name__)
 
 
-def _boxed_nop_preserve_node_meta(fx_g, example_inputs):
+def _boxed_nop_preserve_node_meta(fx_g, example_inputs, tag_forward=False):
+    if tag_forward:
+        # Tag the forward graph's OUTPUT values as "must save". These are
+        # the tensors the first min_cut decided to save for backward —
+        # only these should be saved in the second compilation.
+        # Uses the "custom" meta field (not "recompute") to avoid
+        # interfering with ac_joint_pass which uses "recompute" for
+        # activation checkpointing decisions.
+        output_node = next(n for n in fx_g.graph.nodes if n.op == "output")
+        for out in output_node.args[0]:
+            if not isinstance(out, torch.fx.Node) or out.op != "call_function":
+                continue
+            if out.target == operator.getitem:
+                # getitem metadata doesn't survive preserve_node_meta
+                # (Python builtin, not dispatched). Tag the parent
+                # multi-output op instead, keeping the getitem index so the
+                # second partitioner can replay the exact saved output.
+                parent = out.args[0]
+                if isinstance(parent, torch.fx.Node):
+                    custom = parent.meta.setdefault("custom", {})
+                    custom["ap_must_save"] = True
+                    indices = custom.setdefault("ap_must_save_getitem_indices", [])
+                    idx = out.args[1]
+                    if idx not in indices:
+                        indices.append(idx)
+            else:
+                out.meta.setdefault("custom", {})
+                out.meta["custom"]["ap_must_save"] = True
+
     def run(args):
         with torch.fx.traceback.preserve_node_meta():
             return torch.fx.Interpreter(fx_g).boxed_run(args)
@@ -493,9 +523,11 @@ class AutoParallel:
             self.parallel_gm.graph, self.reshard_after_forward
         )
 
+        fw_compiler_fn = partial(self.compiler_fn, tag_forward=True)
+
         self.parallel_model_fn = parallel_model_fn = aot_compile_joint_with_descriptors(
             self.joint_with_descriptors,
-            fw_compiler=self.compiler_fn,
+            fw_compiler=fw_compiler_fn,
             bw_compiler=self.compiler_fn,
         )
 
