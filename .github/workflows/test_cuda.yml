@@ -13,13 +13,13 @@ concurrency:
 
 jobs:
   test-cuda-single-gpu:
-    name: Test CUDA Single GPU (cuda12.6-py3.12)
+    name: Test CUDA Single GPU (cuda13.0-py3.12)
     uses: pytorch/test-infra/.github/workflows/linux_job_v2.yml@main
     with:
       timeout: 60
       runner: linux.g5.4xlarge.nvidia.gpu
       gpu-arch-type: cuda
-      gpu-arch-version: "12.6"
+      gpu-arch-version: "13.0"
       submodules: recursive
       script: |
         conda create --yes --quiet --name py312 python=3.12
@@ -29,18 +29,18 @@ jobs:
         pip install --quiet -r requirements-test.txt
         # For some reason the spec above isnt working
         pip uninstall -y torch
-        pip install --no-input --quiet --pre torch --index-url https://download.pytorch.org/whl/nightly/cu126
+        pip install --no-input --quiet --pre torch --index-url https://download.pytorch.org/whl/nightly/cu130
         pip install --quiet .
         pytest tests
 
   examples-cuda-single-gpu:
-    name: Examples CUDA Single GPU (cuda12.6-py3.12)
+    name: Examples CUDA Single GPU (cuda13.0-py3.12)
     uses: pytorch/test-infra/.github/workflows/linux_job_v2.yml@main
     with:
       timeout: 60
       runner: linux.g5.4xlarge.nvidia.gpu
       gpu-arch-type: cuda
-      gpu-arch-version: "12.6"
+      gpu-arch-version: "13.0"
       submodules: recursive
       script: |
         conda create --yes --quiet --name py312 python=3.12
@@ -50,7 +50,7 @@ jobs:
         pip install --quiet -r requirements-test.txt
         # For some reason the spec above isnt working
         pip uninstall -y torch
-        pip install --no-input --quiet --pre torch --index-url https://download.pytorch.org/whl/nightly/cu126
+        pip install --no-input --quiet --pre torch --index-url https://download.pytorch.org/whl/nightly/cu130
         pip install --quiet .
         run_timed() { local start=$SECONDS; "$@"; echo "$* : $((SECONDS - start))s" >> /tmp/timings.txt; }
         run_timed python examples/example_autoparallel.py
@@ -60,13 +60,13 @@ jobs:
         cat /tmp/timings.txt
 
   test-cuda-multi-gpu:
-    name: Test CUDA Multi GPU (cuda12.6-py3.12)
+    name: Test CUDA Multi GPU (cuda13.0-py3.12)
     uses: pytorch/test-infra/.github/workflows/linux_job_v2.yml@main
     with:
       timeout: 60
       runner: linux.g5.12xlarge.nvidia.gpu
       gpu-arch-type: cuda
-      gpu-arch-version: "12.6"
+      gpu-arch-version: "13.0"
       submodules: recursive
       script: |
         conda create --yes --quiet --name py312 python=3.12
@@ -76,7 +76,7 @@ jobs:
         pip install --quiet -r requirements-test.txt
         # For some reason the spec above isnt working
         pip uninstall -y torch
-        pip install --no-input --quiet --pre torch --index-url https://download.pytorch.org/whl/nightly/cu126
+        pip install --no-input --quiet --pre torch --index-url https://download.pytorch.org/whl/nightly/cu130
         pip install --quiet .
         python examples/example_dcp.py
         torchrun --standalone --nproc-per-node 4 examples/example_ds3_local_map.py
