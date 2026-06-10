@@ -31,7 +31,18 @@ jobs:
         pip uninstall -y torch
         pip install --no-input --quiet --pre torch --index-url https://download.pytorch.org/whl/nightly/cu130
         pip install --quiet .
+        # Run tests but always emit the mesh-identity diagnostic afterward
+        # so CI captures which mesh triggers the as_strided dispatch on the
+        # real A10G hardware (see tests/diagnose_mesh_identity_ci.py).
+        set +e
         pytest tests
+        pytest_status=$?
+        set -e
+        echo "============================================================"
+        echo "  mesh-identity diagnostic (always runs)"
+        echo "============================================================"
+        python tests/diagnose_mesh_identity_ci.py || true
+        exit $pytest_status
 
   examples-cuda-single-gpu:
     name: Examples CUDA Single GPU (cuda13.0-py3.12)
