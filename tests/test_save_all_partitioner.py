@@ -20,6 +20,7 @@ saves FSDP allgather outputs that should be recomputed via prefetch).
 import operator
 
 import torch
+from conftest import apply_cuda_patches
 from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor.placement_types import Replicate, Shard
 from torch.utils.checkpoint import CheckpointPolicy
@@ -769,6 +770,7 @@ def test_patch_partitioner_dce_allows_wait_tensor_elimination():
 # ---------------------------------------------------------------------------
 
 
+@apply_cuda_patches
 def test_save_all_partitioner_does_not_save_fsdp_wait_tensors(device_mesh_2d):
     """The whole point of the machinery: with FSDP allgathers tagged
     MUST_RECOMPUTE, _SaveAllPartitioner should NOT save their wait_tensor
@@ -799,6 +801,7 @@ def test_save_all_partitioner_does_not_save_fsdp_wait_tensors(device_mesh_2d):
     )
 
 
+@apply_cuda_patches
 def test_save_all_partitioner_uses_ap_must_save_tags(device_mesh_2d):
     """_SaveAllPartitioner saves nodes tagged ap_must_save by the first
     compilation."""
@@ -826,6 +829,7 @@ def test_save_all_partitioner_uses_ap_must_save_tags(device_mesh_2d):
     assert len(activation_saves) > 0
 
 
+@apply_cuda_patches
 def test_default_partitioner_diverges_from_save_all_partitioner(device_mesh_2d):
     """The default min-cut partitioner produces a different save list than
     _SaveAllPartitioner when AC is active. This is the motivating reason
@@ -874,6 +878,7 @@ def test_default_partitioner_diverges_from_save_all_partitioner(device_mesh_2d):
     )
 
 
+@apply_cuda_patches
 def test_save_all_partitioner_reproduces_first_partitioner_saves(device_mesh_2d):
     """_SaveAllPartitioner's saved set should approximately match what the
     first partitioner chose. The two operate on different graphs (the first
@@ -939,6 +944,7 @@ def test_save_all_partitioner_reproduces_first_partitioner_saves(device_mesh_2d)
     )
 
 
+@apply_cuda_patches
 def test_save_all_partitioner_runs_end_to_end(device_mesh_2d):
     """Full end-to-end: AutoParallel + torch.compile(autoparallel_backend)
     forward + backward without errors."""
@@ -958,6 +964,7 @@ def test_save_all_partitioner_runs_end_to_end(device_mesh_2d):
     out.backward(torch.randn_like(out))
 
 
+@apply_cuda_patches
 def test_save_all_partitioner_compile_with_ac_enabled(device_mesh_2d):
     """autoparallel_backend(enable_ac=True) runs the AC joint pass before
     the partitioner. The combination should compile end-to-end."""
@@ -978,6 +985,7 @@ def test_save_all_partitioner_compile_with_ac_enabled(device_mesh_2d):
     out.backward(torch.randn_like(out))
 
 
+@apply_cuda_patches
 def test_save_all_partitioner_compile_1d_mesh(device_mesh_1d):
     """The partitioner works with a 1D (FSDP-only) mesh."""
     parallel_mod, batch_size, seqlen, vocab_size = _run_autoparallel(
