@@ -31,18 +31,7 @@ jobs:
         pip uninstall -y torch
         pip install --no-input --quiet --pre torch --index-url https://download.pytorch.org/whl/nightly/cu126
         pip install --quiet .
-        # Run tests, but always emit the _flatten diagnostic afterward so
-        # CI job logs capture which mesh triggers the as_strided dispatch
-        # failure on A10G (see tests/diagnose_flatten_ci.py).
-        set +e
         pytest tests
-        pytest_status=$?
-        set -e
-        echo "============================================================"
-        echo "  _flatten diagnostic (always runs)"
-        echo "============================================================"
-        python tests/diagnose_flatten_ci.py || true
-        exit $pytest_status
 
   examples-cuda-single-gpu:
     name: Examples CUDA Single GPU (cuda12.6-py3.12)
