@@ -19,6 +19,7 @@ saves FSDP allgather outputs that should be recomputed via prefetch).
 
 import operator
 
+import pytest
 import torch
 from conftest import apply_cuda_patches
 from torch.distributed.fsdp import MixedPrecisionPolicy
@@ -93,11 +94,36 @@ def _run_autoparallel(mesh, n_layers=2, batch_size=None, seqlen=128):
     return parallel_mod, batch_size, seqlen, vocab_size
 
 
+# Module-scoped caches for parallel_mod. Each integration test below builds
+# the same one (deterministic for a given mesh shape) — caching saves ~30s
+# per test. The cache is keyed by mesh.ndim since the helper only varies
+# along that dimension; both 1D and 2D meshes get their own entry.
+_parallel_mod_cache: dict = {}
+
+
+@pytest.fixture(scope="module")
+@apply_cuda_patches
+def parallel_mod_2d(device_mesh_2d):
+    if "2d" not in _parallel_mod_cache:
+        _parallel_mod_cache["2d"] = _run_autoparallel(device_mesh_2d, n_layers=2)
+    return _parallel_mod_cache["2d"]
+
+
+@pytest.fixture(scope="module")
+@apply_cuda_patches
+def parallel_mod_1d(device_mesh_1d):
+    if "1d" not in _parallel_mod_cache:
+        _parallel_mod_cache["1d"] = _run_autoparallel(device_mesh_1d, n_layers=2)
+    return _parallel_mod_cache["1d"]
+
+
 def _capture_partitioner_call(
-    parallel_mod, batch_size, seqlen, vocab_size, mesh, backend
+    parallel_mod, batch_size, seqlen, vocab_size, mesh, enable_ac=False
 ):
-    """Compile parallel_mod with `backend`, capture what _SaveAllPartitioner
-    sees and returns, and return the captured info dict.
+    """Run the second compilation with _SaveAllPartitioner as the
+    partition_fn but use identity compilers (no Inductor codegen). This
+    keeps the partitioner under test in the loop while skipping the
+    expensive Triton kernel compilation.
 
     The dict contains:
       - wait_tensor_recompute_tags: count of MUST_RECOMPUTE on wait_tensors
@@ -106,40 +132,68 @@ def _capture_partitioner_call(
       - fw_module, bw_module: the partitioned graph modules
       - saved_activation_names: backward inputs that aren't primals or tangents
     """
-    captured = {}
-    orig_call = _SaveAllPartitioner.__call__
+    from autoparallel.api import _suppress_wait_tensor_side_effect
+    from autoparallel.compile import _make_ac_joint_pass, _patch_partitioner_dce
 
-    def capturing_call(self, gm, joint_inputs, **kwargs):
+    captured = {}
+    partitioner = _SaveAllPartitioner()
+
+    def capturing_partition_fn(
+        joint_module, joint_inputs, *, num_fwd_outputs, **kwargs
+    ):
         captured["wait_tensor_recompute_tags"] = sum(
             1
-            for n in gm.graph.nodes
+            for n in joint_module.graph.nodes
             if "wait_tensor" in n.name
             and n.meta.get("recompute") == CheckpointPolicy.MUST_RECOMPUTE
         )
         captured["allgather_recompute_tags"] = sum(
             1
-            for n in gm.graph.nodes
+            for n in joint_module.graph.nodes
             if "all_gather_into_tensor" in n.name
             and n.meta.get("recompute") == CheckpointPolicy.MUST_RECOMPUTE
         )
         captured["ap_must_save_count"] = sum(
-            1 for n in gm.graph.nodes if n.meta.get("custom", {}).get("ap_must_save")
+            1
+            for n in joint_module.graph.nodes
+            if n.meta.get("custom", {}).get("ap_must_save")
         )
-        fw, bw = orig_call(self, gm, joint_inputs, **kwargs)
+        fw, bw = partitioner(
+            joint_module,
+            joint_inputs,
+            num_fwd_outputs=num_fwd_outputs,
+            **kwargs,
+        )
         captured["fw_module"] = fw
         captured["bw_module"] = bw
         return fw, bw
 
-    _SaveAllPartitioner.__call__ = capturing_call
-    try:
-        compiled = torch.compile(parallel_mod, backend=backend)
+    def capture_only_backend(gm, example_inputs):
+        from torch._functorch.aot_autograd import aot_module_simplified
+
+        return aot_module_simplified(
+            gm,
+            example_inputs,
+            fw_compiler=lambda g, i: g,
+            bw_compiler=lambda g, i: g,
+            partition_fn=capturing_partition_fn,
+        )
+
+    functorch_patches = {}
+    if enable_ac:
+        functorch_patches["joint_custom_pass"] = _make_ac_joint_pass()
+
+    with (
+        _suppress_wait_tensor_side_effect(),
+        _patch_partitioner_dce(),
+        torch._functorch.config.patch(functorch_patches),
+    ):
+        compiled = torch.compile(parallel_mod, backend=capture_only_backend)
         x = torch.randint(
             0, vocab_size, (batch_size // mesh.shape[0], seqlen), device="cuda"
         )
         out = compiled(x)
         out.backward(torch.randn_like(out))
-    finally:
-        _SaveAllPartitioner.__call__ = orig_call
 
     # The backward graph's placeholders (minus tangents and primals) are the
     # saved activations.
@@ -771,18 +825,22 @@ def test_patch_partitioner_dce_allows_wait_tensor_elimination():
 
 
 @apply_cuda_patches
-def test_save_all_partitioner_does_not_save_fsdp_wait_tensors(device_mesh_2d):
+def test_save_all_partitioner_does_not_save_fsdp_wait_tensors(
+    parallel_mod_2d, device_mesh_2d
+):
     """The whole point of the machinery: with FSDP allgathers tagged
     MUST_RECOMPUTE, _SaveAllPartitioner should NOT save their wait_tensor
     outputs in the backward.
     """
-    parallel_mod, batch_size, seqlen, vocab_size = _run_autoparallel(
-        device_mesh_2d, n_layers=2
-    )
-    backend = autoparallel_backend(enable_ac=False, overlap_scheduling=False)
+    parallel_mod, batch_size, seqlen, vocab_size = parallel_mod_2d
 
     captured = _capture_partitioner_call(
-        parallel_mod, batch_size, seqlen, vocab_size, device_mesh_2d, backend
+        parallel_mod,
+        batch_size,
+        seqlen,
+        vocab_size,
+        device_mesh_2d,
+        enable_ac=False,
     )
 
     # FSDP wait_tensor outputs should NOT appear as saved activations
@@ -800,29 +858,12 @@ def test_save_all_partitioner_does_not_save_fsdp_wait_tensors(device_mesh_2d):
         "preserve_node_meta into the second compilation's joint graph"
     )
 
-
-@apply_cuda_patches
-def test_save_all_partitioner_uses_ap_must_save_tags(device_mesh_2d):
-    """_SaveAllPartitioner saves nodes tagged ap_must_save by the first
-    compilation."""
-    parallel_mod, batch_size, seqlen, vocab_size = _run_autoparallel(
-        device_mesh_2d, n_layers=2
-    )
-    backend = autoparallel_backend(enable_ac=False, overlap_scheduling=False)
-
-    captured = _capture_partitioner_call(
-        parallel_mod, batch_size, seqlen, vocab_size, device_mesh_2d, backend
-    )
-
-    # ap_must_save tags should be present in the joint graph (set by
-    # _boxed_nop_preserve_node_meta during first compilation, propagated
-    # via preserve_node_meta)
+    # And ap_must_save tags should be present (sanity check on tag
+    # propagation — used to be a separate test).
     assert captured["ap_must_save_count"] > 0, (
         "Expected ap_must_save tags from first compilation to survive into "
         "second compilation's joint graph"
     )
-
-    # And we should have saved at least some non-trivial activations
     activation_saves = [
         n for n in captured["saved_activation_names"] if not n.startswith("primals")
     ]
@@ -830,7 +871,9 @@ def test_save_all_partitioner_uses_ap_must_save_tags(device_mesh_2d):
 
 
 @apply_cuda_patches
-def test_default_partitioner_diverges_from_save_all_partitioner(device_mesh_2d):
+def test_default_partitioner_diverges_from_save_all_partitioner(
+    parallel_mod_2d, device_mesh_2d
+):
     """The default min-cut partitioner produces a different save list than
     _SaveAllPartitioner when AC is active. This is the motivating reason
     _SaveAllPartitioner exists: min-cut + AC tags can save FSDP allgather
@@ -842,9 +885,7 @@ def test_default_partitioner_diverges_from_save_all_partitioner(device_mesh_2d):
     128 GPUs), the divergence manifests as ~1.2 GB of FSDP wait_tensor outputs
     being saved per 4 layers — see [memory_gap_investigation memory note].
     """
-    parallel_mod, batch_size, seqlen, vocab_size = _run_autoparallel(
-        device_mesh_2d, n_layers=2
-    )
+    parallel_mod, batch_size, seqlen, vocab_size = parallel_mod_2d
 
     # Default partitioner with AC enabled in second compilation (bad case)
     default_saves = _saved_names_from_default_compile(
@@ -857,9 +898,13 @@ def test_default_partitioner_diverges_from_save_all_partitioner(device_mesh_2d):
     )
 
     # _SaveAllPartitioner with AC enabled in second compilation (our fix)
-    backend = autoparallel_backend(enable_ac=True, overlap_scheduling=False)
     save_all_captured = _capture_partitioner_call(
-        parallel_mod, batch_size, seqlen, vocab_size, device_mesh_2d, backend
+        parallel_mod,
+        batch_size,
+        seqlen,
+        vocab_size,
+        device_mesh_2d,
+        enable_ac=True,
     )
     save_all_saves = save_all_captured["saved_activation_names"]
 
@@ -879,7 +924,9 @@ def test_default_partitioner_diverges_from_save_all_partitioner(device_mesh_2d):
 
 
 @apply_cuda_patches
-def test_save_all_partitioner_reproduces_first_partitioner_saves(device_mesh_2d):
+def test_save_all_partitioner_reproduces_first_partitioner_saves(
+    parallel_mod_2d, device_mesh_2d
+):
     """_SaveAllPartitioner's saved set should approximately match what the
     first partitioner chose. The two operate on different graphs (the first
     inside apply_placement, the second inside torch.compile), so we compare
@@ -889,14 +936,16 @@ def test_save_all_partitioner_reproduces_first_partitioner_saves(device_mesh_2d)
     # First partitioner: capture the forward outputs beyond num_fwd_outputs.
     first_saves = _capture_first_partitioner_saves(device_mesh_2d, n_layers=2)
 
-    # Second partitioner: run torch.compile with our backend and capture
-    # the backward inputs (saved values).
-    parallel_mod, batch_size, seqlen, vocab_size = _run_autoparallel(
-        device_mesh_2d, n_layers=2
-    )
-    backend = autoparallel_backend(enable_ac=False, overlap_scheduling=False)
+    # Second partitioner: reuse the cached parallel_mod and capture the
+    # backward inputs (saved values).
+    parallel_mod, batch_size, seqlen, vocab_size = parallel_mod_2d
     captured = _capture_partitioner_call(
-        parallel_mod, batch_size, seqlen, vocab_size, device_mesh_2d, backend
+        parallel_mod,
+        batch_size,
+        seqlen,
+        vocab_size,
+        device_mesh_2d,
+        enable_ac=False,
     )
     bw = captured["bw_module"]
     second_saves = []
@@ -945,32 +994,12 @@ def test_save_all_partitioner_reproduces_first_partitioner_saves(device_mesh_2d)
 
 
 @apply_cuda_patches
-def test_save_all_partitioner_runs_end_to_end(device_mesh_2d):
-    """Full end-to-end: AutoParallel + torch.compile(autoparallel_backend)
-    forward + backward without errors."""
-    parallel_mod, batch_size, seqlen, vocab_size = _run_autoparallel(
-        device_mesh_2d, n_layers=2
-    )
-    backend = autoparallel_backend(enable_ac=False, overlap_scheduling=False)
-
-    compiled = torch.compile(parallel_mod, backend=backend)
-    x = torch.randint(
-        0,
-        vocab_size,
-        (batch_size // device_mesh_2d.shape[0], seqlen),
-        device="cuda",
-    )
-    out = compiled(x)
-    out.backward(torch.randn_like(out))
-
-
-@apply_cuda_patches
-def test_save_all_partitioner_compile_with_ac_enabled(device_mesh_2d):
-    """autoparallel_backend(enable_ac=True) runs the AC joint pass before
-    the partitioner. The combination should compile end-to-end."""
-    parallel_mod, batch_size, seqlen, vocab_size = _run_autoparallel(
-        device_mesh_2d, n_layers=2
-    )
+def test_save_all_partitioner_compile_with_ac_enabled(parallel_mod_2d, device_mesh_2d):
+    """End-to-end smoke test: AutoParallel + torch.compile(autoparallel_backend)
+    with AC enabled. Exercises the full Inductor pipeline including AC joint
+    pass and codegen — kept around so a regression in the backend wiring
+    surfaces here even if the unit tests still pass."""
+    parallel_mod, batch_size, seqlen, vocab_size = parallel_mod_2d
     # AC enabled in the backend → joint_custom_pass adds PREFER_RECOMPUTE
     backend = autoparallel_backend(enable_ac=True, overlap_scheduling=False)
 
@@ -986,11 +1015,9 @@ def test_save_all_partitioner_compile_with_ac_enabled(device_mesh_2d):
 
 
 @apply_cuda_patches
-def test_save_all_partitioner_compile_1d_mesh(device_mesh_1d):
+def test_save_all_partitioner_compile_1d_mesh(parallel_mod_1d, device_mesh_1d):
     """The partitioner works with a 1D (FSDP-only) mesh."""
-    parallel_mod, batch_size, seqlen, vocab_size = _run_autoparallel(
-        device_mesh_1d, n_layers=2
-    )
+    parallel_mod, batch_size, seqlen, vocab_size = parallel_mod_1d
     backend = autoparallel_backend(enable_ac=False, overlap_scheduling=False)
 
     compiled = torch.compile(parallel_mod, backend=backend)
