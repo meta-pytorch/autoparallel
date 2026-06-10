@@ -37,12 +37,10 @@ from .graph_passes.graph_utils import (
 )
 from .input_validation import (
     ForwardInputs,
+    _build_input_fn_from_sample,
     _check_forward_args,
-    _compute_expected_inputs,
-    _extract_input_info,
     _flatten_out_shardings,
-    _make_input_fn,
-    _make_input_fn_with_kwargs,
+    flatten_and_convert_inputs_to_local_shapes,
 )
 from .module_construction import make_parallel_module
 from .optimize_sharding import ShardingOptimizer
@@ -556,7 +554,7 @@ class AutoParallel:
             strategy = sharding_placement[node]
             solved_input_placements.append(tuple(strategy.output_specs.placements))
 
-        expected_inputs, dynamic_dims = _compute_expected_inputs(
+        expected_inputs, dynamic_dims = flatten_and_convert_inputs_to_local_shapes(
             self._traced_inputs,
             solved_input_placements,
             self.mesh,
@@ -706,41 +704,7 @@ def auto_parallel(
     else:
         raw_inputs = sample_inputs
 
-    if isinstance(raw_inputs, ForwardInputs):
-        (
-            args_shapes,
-            args_dtypes,
-            args_placements,
-            args_spec,
-            args_devices,
-        ) = _extract_input_info(raw_inputs.args, mesh)
-        (
-            kwargs_shapes,
-            kwargs_dtypes,
-            kwargs_placements,
-            kwargs_spec,
-            kwargs_devices,
-        ) = _extract_input_info(raw_inputs.kwargs, mesh)
-        input_placements = args_placements + kwargs_placements
-        input_fn: Callable[[], Any] = _make_input_fn_with_kwargs(
-            args_shapes,
-            args_dtypes,
-            args_devices,
-            args_spec,
-            kwargs_shapes,
-            kwargs_dtypes,
-            kwargs_devices,
-            kwargs_spec,
-        )
-    else:
-        # Extract metadata and placements (does not materialize tensors)
-        shapes, dtypes, input_placements, treespec, devices = _extract_input_info(
-            raw_inputs, mesh
-        )
-
-        # Create input_fn that will be called inside FakeTensorMode
-        # It creates fresh tensors (which become fake tensors inside FakeTensorMode)
-        input_fn = _make_input_fn(shapes, dtypes, treespec, devices=devices)
+    input_fn, input_placements = _build_input_fn_from_sample(raw_inputs, mesh)
 
     # Flatten out_shardings to list
     output_placements = _flatten_out_shardings(out_shardings)

@@ -992,8 +992,8 @@ class TestDynamicDimsParameter:
         with pytest.raises(ValueError, match="has shape"):
             _check_forward_args([torch.randn(4, 9)], expected)
 
-    def test_compute_expected_inputs_detects_dynamic_dims(self):
-        """_compute_expected_inputs correctly identifies SymInt dims."""
+    def test_flatten_and_convert_inputs_to_local_shapes_detects_dynamic_dims(self):
+        """flatten_and_convert_inputs_to_local_shapes correctly identifies SymInt dims."""
         from torch._subclasses import FakeTensorMode
         from torch.fx.experimental.symbolic_shapes import (
             DimDynamic,
@@ -1003,7 +1003,7 @@ class TestDynamicDimsParameter:
 
         from autoparallel.input_validation import (
             ForwardInputs,
-            _compute_expected_inputs,
+            flatten_and_convert_inputs_to_local_shapes,
         )
 
         shape_env = ShapeEnv()
@@ -1031,7 +1031,7 @@ class TestDynamicDimsParameter:
             def size(self, dim=0):
                 return 1
 
-        _, dynamic_dims = _compute_expected_inputs(
+        _, dynamic_dims = flatten_and_convert_inputs_to_local_shapes(
             ForwardInputs(args=(t1, t2)), [(), ()], FakeMesh()
         )
         assert (0, 0) in dynamic_dims, "t1 dim 0 should be dynamic"
@@ -1040,7 +1040,7 @@ class TestDynamicDimsParameter:
         assert (1, 1) not in dynamic_dims, "t2 dim 1 should be static"
         assert (1, 2) in dynamic_dims, "t2 dim 2 should be dynamic"
 
-    def test_compute_expected_inputs_non_tensor_indexing(self):
+    def test_flatten_and_convert_inputs_to_local_shapes_non_tensor_indexing(self):
         """Non-tensor inputs don't shift the dynamic_dims arg indices."""
         from torch._subclasses import FakeTensorMode
         from torch.fx.experimental.symbolic_shapes import (
@@ -1051,7 +1051,7 @@ class TestDynamicDimsParameter:
 
         from autoparallel.input_validation import (
             ForwardInputs,
-            _compute_expected_inputs,
+            flatten_and_convert_inputs_to_local_shapes,
         )
 
         shape_env = ShapeEnv()
@@ -1069,7 +1069,7 @@ class TestDynamicDimsParameter:
                 return 1
 
         # Non-tensor followed by tensor: the tensor is result_idx=1
-        _, dynamic_dims = _compute_expected_inputs(
+        _, dynamic_dims = flatten_and_convert_inputs_to_local_shapes(
             ForwardInputs(args=(42, t1)), [()], FakeMesh()
         )
         assert (1, 0) in dynamic_dims, "tensor at result_idx=1, dim 0 should be dynamic"
@@ -1367,7 +1367,7 @@ def test_dynamic_check_forward_args_accepts_different_batch(device_mesh_1d):
     """_check_forward_args should accept different batch sizes with dynamic shapes."""
     from autoparallel.input_validation import (
         _check_forward_args,
-        _compute_expected_inputs,
+        flatten_and_convert_inputs_to_local_shapes,
     )
 
     dim1, dim2 = 1024, 4096
@@ -1385,7 +1385,7 @@ def test_dynamic_check_forward_args_accepts_different_batch(device_mesh_1d):
         autop.add_output_constraints([placement])
         autop.optimize_placement(verbose=False)
 
-        expected, dynamic_dims = _compute_expected_inputs(
+        expected, dynamic_dims = flatten_and_convert_inputs_to_local_shapes(
             autop._traced_inputs,
             autop.input_constraints,
             device_mesh_1d,
