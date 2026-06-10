@@ -40,6 +40,16 @@ def apply_cuda_patches(func):
     return func
 
 
+@pytest.fixture(autouse=True)
+def _reset_placement_options_cache():
+    """The placement-options cache is a process-global; clear it before each test
+    so optimizer builds never reuse stale strategies from a prior test's model."""
+    from autoparallel.shardings.placement_options import reset_placement_options_cache
+
+    reset_placement_options_cache()
+    yield
+
+
 @pytest.fixture(scope="module", autouse=True)
 def init_pg():
     world_size = 256
