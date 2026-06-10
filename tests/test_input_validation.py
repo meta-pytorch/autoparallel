@@ -11,6 +11,7 @@ from torch.distributed.tensor.placement_types import Replicate, Shard
 
 from autoparallel.api import auto_parallel
 from autoparallel.input_validation import (
+    TracedInputs,
     _check_forward_args,
     _compute_expected_inputs,
     _extract_input_info,
@@ -60,7 +61,7 @@ def test_compute_expected_inputs(device_mesh_1d):
     traced = [torch.empty(512, 128, device="meta")]
     placements = [(Shard(0),)]
 
-    result, _dynamic_dims = _compute_expected_inputs(traced, placements, mesh)
+    result, _dynamic_dims = _compute_expected_inputs(traced, {}, placements, mesh)
     assert len(result) == 1
     assert result[0].shape == (512 // world_size, 128)
     assert result[0].dtype == torch.float32
@@ -73,7 +74,7 @@ def test_compute_expected_inputs_replicated(device_mesh_1d):
     traced = [torch.empty(512, 128, device="meta")]
     placements = [(Replicate(),)]
 
-    result, _dynamic_dims = _compute_expected_inputs(traced, placements, mesh)
+    result, _dynamic_dims = _compute_expected_inputs(traced, {}, placements, mesh)
     assert len(result) == 1
     assert result[0].shape == (512, 128)
 
@@ -86,7 +87,7 @@ def test_compute_expected_inputs_uneven(device_mesh_2d):
     traced = [torch.empty(10, 128, device="meta")]
     placements = [(Replicate(), Shard(0))]
 
-    result, _dynamic_dims = _compute_expected_inputs(traced, placements, mesh)
+    result, _dynamic_dims = _compute_expected_inputs(traced, {}, placements, mesh)
     assert len(result) == 1
     expected_dim0 = (10 + tp_size - 1) // tp_size  # ceil(10/8) = 2
     assert result[0].shape == (expected_dim0, 128)
@@ -154,7 +155,7 @@ def test_compute_expected_inputs_dict_pytree(device_mesh_1d):
     ]
     constraints = [(Shard(0),), (Shard(0),)]
 
-    result, _dynamic_dims = _compute_expected_inputs(traced, constraints, mesh)
+    result, _dynamic_dims = _compute_expected_inputs(traced, {}, constraints, mesh)
     assert len(result) == 2
     assert result[0].shape == (512 // world_size, 128)
     assert result[1].shape == (512 // world_size, 64)
@@ -240,3 +241,42 @@ def test_dict_input_integration(device_mesh_1d):
     # Validation should reject wrong shape inside a dict
     with pytest.raises(ValueError, match="shape"):
         parallel_mod({"x": torch.rand(local_batch_size + 1, dim, device="cuda")})
+
+
+def test_traced_inputs_defaults_and_frozen():
+    """TracedInputs has empty defaults and is frozen."""
+    ti = TracedInputs()
+    assert ti.args == ()
+    assert ti.kwargs == {}
+
+    ti2 = TracedInputs(args=(1, 2), kwargs={"k": 3})
+    assert ti2.args == (1, 2)
+    assert ti2.kwargs == {"k": 3}
+
+    with pytest.raises(Exception):
+        ti2.args = (4,)  # frozen dataclass forbids reassignment
+
+
+def test_compute_expected_inputs_with_kwargs(device_mesh_1d):
+    """Kwargs leaves contribute placements after positional leaves in dict order."""
+    mesh = device_mesh_1d
+    world_size = mesh.size()
+
+    traced_args = [torch.empty(512, 128, device="meta")]
+    traced_kwargs = {
+        "mask": torch.empty(512, device="meta"),
+        "positions": torch.empty(512, 64, device="meta"),
+    }
+    # Order matches tree_flatten((args, kwargs)): args first, then kwargs in
+    # dict key order.
+    placements = [
+        (Shard(0),),  # traced_args[0]
+        (Shard(0),),  # mask
+        (Replicate(),),  # positions
+    ]
+
+    result, _ = _compute_expected_inputs(traced_args, traced_kwargs, placements, mesh)
+    assert len(result) == 3
+    assert result[0].shape == (512 // world_size, 128)
+    assert result[1].shape == (512 // world_size,)
+    assert result[2].shape == (512, 64)

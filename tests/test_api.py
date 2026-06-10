@@ -13,6 +13,7 @@ from torch.distributed.tensor.placement_types import Replicate, Shard
 
 from autoparallel.api import AutoParallel, auto_parallel
 from autoparallel.compile import autoparallel_backend
+from autoparallel.input_validation import TracedInputs
 
 
 def test_from_meta_model(device_mesh_1d):
@@ -887,3 +888,174 @@ def test_compile_fullgraph_no_recompilation(device_mesh_1d):
                 compiled(torch.randn(bs, dim, device="cuda"))
     finally:
         torch._dynamo.config.error_on_recompile = False
+
+
+class _KwargOnlyModel(nn.Module):
+    """Model whose forward has keyword-only arguments."""
+
+    def __init__(self, dim):
+        super().__init__()
+        self.linear = nn.Linear(dim, dim)
+
+    def forward(self, tokens, *, attention_masks=None, positions=None):
+        x = self.linear(tokens.to(self.linear.weight.dtype))
+        if attention_masks is not None:
+            x = x + attention_masks.to(x.dtype).unsqueeze(-1)
+        if positions is not None:
+            x = x + positions.to(x.dtype)
+        return x
+
+    def init_weights(self):
+        nn.init.ones_(self.linear.weight)
+        nn.init.zeros_(self.linear.bias)
+
+
+def test_input_fn_traced_inputs_kwargs(device_mesh_1d):
+    """input_fn returning TracedInputs traces a kwarg-only forward end-to-end."""
+    dim = 128
+    batch_size = 512
+    local_bs = batch_size // device_mesh_1d.size()
+
+    with torch.device("meta"):
+        model = _KwargOnlyModel(dim)
+
+    def input_fn():
+        tokens = torch.randn(batch_size, dim, device="cuda")
+        masks = torch.ones(batch_size, device="cuda")
+        positions = torch.zeros(batch_size, dim, device="cuda")
+        return TracedInputs(
+            args=(tokens,),
+            kwargs={"attention_masks": masks, "positions": positions},
+        )
+
+    with AutoParallel(model, input_fn, device_mesh_1d, None) as autop:
+        autop.add_input_constraints([(Shard(0),), (Shard(0),), (Shard(0),)])
+        autop.add_output_constraints([(Shard(0),)])
+        sharding_placement = autop.optimize_placement(verbose=False)
+        parallel_mod = autop.apply_placement(sharding_placement)
+
+    parallel_mod.to_empty(device="cuda")
+    parallel_mod.init_weights()
+
+    tokens = torch.randn(local_bs, dim, device="cuda")
+    masks = torch.ones(local_bs, device="cuda")
+    positions = torch.zeros(local_bs, dim, device="cuda")
+    out = parallel_mod(tokens, attention_masks=masks, positions=positions)
+    assert out.shape == (local_bs, dim)
+
+
+def test_input_fn_traced_inputs_kwargs_reorder(device_mesh_1d):
+    """Caller may pass kwargs in any order; reorder_kwargs aligns them."""
+    dim = 128
+    batch_size = 512
+    local_bs = batch_size // device_mesh_1d.size()
+
+    with torch.device("meta"):
+        model = _KwargOnlyModel(dim)
+
+    def input_fn():
+        return TracedInputs(
+            args=(torch.randn(batch_size, dim, device="cuda"),),
+            kwargs={
+                "attention_masks": torch.ones(batch_size, device="cuda"),
+                "positions": torch.zeros(batch_size, dim, device="cuda"),
+            },
+        )
+
+    with AutoParallel(model, input_fn, device_mesh_1d, None) as autop:
+        autop.add_input_constraints([(Shard(0),), (Shard(0),), (Shard(0),)])
+        autop.add_output_constraints([(Shard(0),)])
+        sharding_placement = autop.optimize_placement(verbose=False)
+        parallel_mod = autop.apply_placement(sharding_placement)
+
+    parallel_mod.to_empty(device="cuda")
+    parallel_mod.init_weights()
+
+    tokens = torch.randn(local_bs, dim, device="cuda")
+    masks = torch.ones(local_bs, device="cuda")
+    positions = torch.zeros(local_bs, dim, device="cuda")
+    # Caller passes kwargs in the opposite order from input_fn.
+    out = parallel_mod(tokens, positions=positions, attention_masks=masks)
+    assert out.shape == (local_bs, dim)
+
+
+def test_input_fn_positional_bc(device_mesh_1d):
+    """Existing positional input_fn return values keep working unchanged."""
+    dim = 128
+    batch_size = 512
+    local_bs = batch_size // device_mesh_1d.size()
+
+    class M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = nn.Linear(dim, dim)
+
+        def forward(self, x):
+            return self.linear(x)
+
+        def init_weights(self):
+            nn.init.ones_(self.linear.weight)
+            nn.init.zeros_(self.linear.bias)
+
+    with torch.device("meta"):
+        model = M()
+
+    def input_fn():
+        return (torch.randn(batch_size, dim, device="cuda"),)
+
+    with AutoParallel(model, input_fn, device_mesh_1d, None) as autop:
+        autop.add_input_constraints([(Shard(0),)])
+        autop.add_output_constraints([(Shard(0),)])
+        sharding_placement = autop.optimize_placement(verbose=False)
+        parallel_mod = autop.apply_placement(sharding_placement)
+
+    parallel_mod.to_empty(device="cuda")
+    parallel_mod.init_weights()
+
+    out = parallel_mod(torch.randn(local_bs, dim, device="cuda"))
+    assert out.shape == (local_bs, dim)
+
+
+def test_auto_parallel_traced_inputs(device_mesh_1d):
+    """Simple auto_parallel(...) accepts TracedInputs sample_inputs."""
+    dim = 128
+    batch_size = 512
+    local_bs = batch_size // device_mesh_1d.size()
+
+    with torch.device("meta"):
+        model = _KwargOnlyModel(dim)
+
+    tokens = DTensor.from_local(
+        torch.randn(local_bs, dim, device="cuda"),
+        device_mesh_1d,
+        [Shard(0)],
+    )
+    masks = DTensor.from_local(
+        torch.ones(local_bs, device="cuda"),
+        device_mesh_1d,
+        [Shard(0)],
+    )
+    positions = DTensor.from_local(
+        torch.zeros(local_bs, dim, device="cuda"),
+        device_mesh_1d,
+        [Shard(0)],
+    )
+
+    parallel_mod = auto_parallel(
+        model,
+        device_mesh_1d,
+        sample_inputs=TracedInputs(
+            args=(tokens,),
+            kwargs={"attention_masks": masks, "positions": positions},
+        ),
+        out_shardings=(Shard(0),),
+    )
+    parallel_mod.to_empty(device="cuda")
+    parallel_mod.init_weights()
+
+    out = parallel_mod(
+        torch.randn(local_bs, dim, device="cuda"),
+        attention_masks=torch.ones(local_bs, device="cuda"),
+        positions=torch.zeros(local_bs, dim, device="cuda"),
+    )
+    assert out.shape == (local_bs, dim)
