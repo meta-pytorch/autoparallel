@@ -36,8 +36,6 @@ from torch.distributed.tensor.placement_types import Replicate, Shard
 
 from autoparallel._testing.models.llama3 import Transformer, TransformerModelArgs
 from autoparallel.api import AutoParallel
-
-
 def _summarize(m) -> str:
     if m is None:
         return "None"
@@ -60,12 +58,20 @@ def _short_traceback() -> str:
     interesting = [
         f"  {f.filename}:{f.lineno} in {f.name}"
         for f in stack
-        if "device_mesh" not in f.filename and "test_mesh_identity" not in f.filename
+        if "device_mesh" not in f.filename
+        and "test_mesh_identity" not in f.filename
     ]
     return "\n".join(interesting[-10:])
 
 
-_diag = {"flatten": 0, "create": 0, "miss": 0, "installed": False}
+_diag = {
+    "flatten": 0,
+    "create": 0,
+    "miss": 0,
+    "installed": False,
+    # id(mesh) → traceback string for every DeviceMesh constructed
+    "init_sites": {},
+}
 
 
 def _install_diag_hooks():
@@ -73,8 +79,22 @@ def _install_diag_hooks():
         return
     _diag["installed"] = True
 
+    _orig_init = DeviceMesh.__init__
     _orig_flatten = DeviceMesh._flatten
     _orig_create = DeviceMesh._create_flatten_mesh
+
+    def _wrapped_init(self, *args, **kwargs):
+        _orig_init(self, *args, **kwargs)
+        stack = traceback.extract_stack()
+        sites = [
+            f"  {f.filename}:{f.lineno} in {f.name}"
+            for f in stack
+            if "device_mesh" not in f.filename
+            and "test_mesh_identity" not in f.filename
+            and "/pluggy/" not in f.filename
+            and "/_pytest/" not in f.filename
+        ]
+        _diag["init_sites"][id(self)] = "\n".join(sites[-10:])
 
     def _wrapped_flatten(self, mesh_dim_name=None, backend_override=None):
         _diag["flatten"] += 1
@@ -92,7 +112,9 @@ def _install_diag_hooks():
             print(f"[_flatten #{n}] OK → {_summarize(result)}", flush=True)
             return result
         except Exception as e:
-            print(f"[_flatten #{n}] RAISED: {type(e).__name__}: {e}", flush=True)
+            print(
+                f"[_flatten #{n}] RAISED: {type(e).__name__}: {e}", flush=True
+            )
             raise
 
     def _wrapped_create(self, mesh_dim_name, backend_override=(None, None)):
@@ -116,8 +138,14 @@ def _install_diag_hooks():
             )
         return _orig_create(self, mesh_dim_name, backend_override)
 
+    DeviceMesh.__init__ = _wrapped_init  # type: ignore[method-assign]
     DeviceMesh._flatten = _wrapped_flatten  # type: ignore[method-assign]
     DeviceMesh._create_flatten_mesh = _wrapped_create  # type: ignore[method-assign]
+
+
+# Install hooks at import time so we capture meshes constructed by
+# fixtures and prior tests (which can leak duplicates into our solution).
+_install_diag_hooks()
 
 
 @apply_cuda_patches
@@ -172,9 +200,7 @@ def test_sharding_solution_meshes_have_warm_flatten_cache(device_mesh_2d):
             model,
             lambda: torch.randint(0, vocab_size, (batch_size, seqlen), device="cuda"),
             device_mesh_2d,
-            MixedPrecisionPolicy(
-                param_dtype=torch.bfloat16, reduce_dtype=torch.float32
-            ),
+            MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32),
             repeated_subgraphs=True,
         ) as autop:
             autop.add_parameter_memory_constraint(low=None, high=None)
@@ -200,6 +226,12 @@ def test_sharding_solution_meshes_have_warm_flatten_cache(device_mesh_2d):
                     if id(m) not in seen:
                         seen[id(m)] = m
                         print(f"  spec mesh: {_summarize(m)}", flush=True)
+                        if id(m) in _diag["init_sites"]:
+                            print(
+                                f"  spec mesh CONSTRUCTION SITE:\n"
+                                f"{_diag['init_sites'][id(m)]}",
+                                flush=True,
+                            )
             print(f"=== TOTAL UNIQUE SPEC MESHES: {len(seen)} ===\n", flush=True)
 
             # apply_placement pre-warms the user mesh's _flatten cache so

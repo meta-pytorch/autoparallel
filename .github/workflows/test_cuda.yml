@@ -31,22 +31,12 @@ jobs:
         pip uninstall -y torch
         pip install --no-input --quiet --pre torch --index-url https://download.pytorch.org/whl/nightly/cu130
         pip install --quiet .
-        # Run tests but always emit the mesh-identity diagnostic afterward
-        # so CI captures which mesh triggers the as_strided dispatch on the
-        # real A10G hardware (see tests/diagnose_mesh_identity_ci.py).
-        set +e
-        pytest tests --ignore=tests/test_diagnose_mesh_identity_pytest.py
-        pytest_status=$?
-        set -e
-        echo "============================================================"
-        echo "  mesh-identity diagnostic (standalone script)"
-        echo "============================================================"
-        python tests/diagnose_mesh_identity_ci.py || true
-        echo "============================================================"
-        echo "  mesh-identity diagnostic (pytest mode, after other tests)"
-        echo "============================================================"
-        pytest -s tests/test_diagnose_mesh_identity_pytest.py -v || true
-        exit $pytest_status
+        # Run test_mesh_identity in a separate invocation FIRST to test
+        # if prior-test pollution is causing the as_strided failure.
+        echo "=== Running test_mesh_identity.py in isolation ==="
+        pytest -s tests/test_mesh_identity.py -v
+        echo "=== Running full test suite ==="
+        pytest -s tests --ignore=tests/test_diagnose_mesh_identity_pytest.py --ignore=tests/test_mesh_identity.py
 
   examples-cuda-single-gpu:
     name: Examples CUDA Single GPU (cuda13.0-py3.12)
@@ -93,5 +83,5 @@ jobs:
         pip uninstall -y torch
         pip install --no-input --quiet --pre torch --index-url https://download.pytorch.org/whl/nightly/cu130
         pip install --quiet .
-        python -m pytest tests/test_dcp_roundtrip.py -v
+        python examples/example_dcp.py
         torchrun --standalone --nproc-per-node 4 examples/example_ds3_local_map.py
