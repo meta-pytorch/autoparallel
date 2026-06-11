@@ -51,6 +51,49 @@ from .dtensor_sharding_helpers import get_op_strategy
 
 logger = logging.getLogger(__name__)
 
+
+def _deepcopy_preserving_mesh(obj):
+    """Like copy.deepcopy, but reuses DeviceMesh instances instead of
+    duplicating them.
+
+    DeviceMesh carries process-group state (rank maps, _flatten_mapping
+    cache, backend overrides) that is logically shared across all callers.
+    Deep-copying it produces a fresh object with an empty _flatten_mapping
+    that misses the cache populated on the original, which later forces
+    DeviceMesh._flatten to dispatch as_strided on the rank_map inside
+    make_fx — failing FakeTensorMode's non-fake-input assertion.
+
+    We pre-populate copy.deepcopy's memo dict with identity mappings for
+    every DeviceMesh reachable from obj. deepcopy returns existing entries
+    from memo without recursing, so the same DeviceMesh instances appear
+    in the copy.
+    """
+    from torch.distributed.device_mesh import DeviceMesh
+
+    memo: dict = {}
+    stack = [obj]
+    seen: set[int] = set()
+    while stack:
+        x = stack.pop()
+        if id(x) in seen:
+            continue
+        seen.add(id(x))
+        if isinstance(x, DeviceMesh):
+            memo[id(x)] = x
+            continue
+        if isinstance(x, (list, tuple, set, frozenset)):
+            stack.extend(x)
+        elif isinstance(x, dict):
+            stack.extend(x.values())
+        elif hasattr(x, "__dict__"):
+            stack.extend(x.__dict__.values())
+        elif hasattr(x, "__slots__"):
+            for slot in x.__slots__:
+                if hasattr(x, slot):
+                    stack.append(getattr(x, slot))
+    return copy.deepcopy(obj, memo)
+
+
 # TODO: move this to PyTorch
 dim_maps[torch.t] = lambda input: dim_transpose(input.ndim, -2, -1)
 
@@ -829,7 +872,7 @@ def expand_rule(mesh, op_schema_):
     from torch._subclasses.fake_tensor import unset_fake_temporarily
 
     with unset_fake_temporarily():
-        op_schema = copy.deepcopy(op_schema_)
+        op_schema = _deepcopy_preserving_mesh(op_schema_)
     input_strat = op_schema.args_schema[0]
     orig_shape = input_strat.strategies[0].output_specs.tensor_meta.shape
     dest_shape = op_schema.args_schema[1]
