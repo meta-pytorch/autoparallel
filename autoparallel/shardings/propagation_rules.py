@@ -18,7 +18,6 @@ Based on PyTorch DTensor implementation:
 """
 
 import collections
-import copy
 import itertools
 import math
 import operator
@@ -546,42 +545,6 @@ def split_rule(mesh, op_schema):
 @register_rule(torch.ops.aten._unsafe_index.Tensor)
 def _unsafe_index_rule(mesh, op_schema):
     raise NotImplementedError()
-
-
-@register_rule(torch.ops.aten.expand.default)
-def expand_rule(mesh, op_schema_):
-    op = torch.ops.aten.expand.default
-    from torch._subclasses.fake_tensor import unset_fake_temporarily
-
-    with unset_fake_temporarily():
-        op_schema = copy.deepcopy(op_schema_)
-    input_strat = op_schema.args_schema[0]
-    orig_shape = input_strat.strategies[0].output_specs.tensor_meta.shape
-    dest_shape = op_schema.args_schema[1]
-    expand_dims = [
-        i
-        for i, (s1, s2) in enumerate(zip(orig_shape, dest_shape))
-        if s1 == 1 and s2 != s1
-    ]
-    if len(expand_dims) == 0:
-        return get_op_strategy(op, op_schema)
-    to_remove = []
-    for expand_dim in expand_dims:
-        for i, ss in enumerate(input_strat.strategies):
-            for plc in ss.output_spec.placements:
-                if plc.is_shard(expand_dim) and i not in to_remove:
-                    # need to remove this and add back afterwards
-                    to_remove.append(i)
-                    break
-
-    removed = []
-    for i in reversed(to_remove):
-        removed.append(input_strat.strategies.pop(i))
-    out_strat = get_op_strategy(op, op_schema)
-    for i, ss in enumerate(out_strat.strategies):
-        for remov in to_remove:
-            ss.redistribute_cost[0].insert(remov, math.inf)
-    return out_strat
 
 
 def _einsum_single_dim_strategy(op, args_schema, kwargs_schema):
