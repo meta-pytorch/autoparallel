@@ -20,7 +20,6 @@ Based on PyTorch DTensor implementation:
 import collections
 import copy
 import itertools
-import logging
 import math
 import operator
 
@@ -45,9 +44,6 @@ from torch.distributed.tensor.placement_types import (
 # need to import this to have the dtype_cast registered
 from ..cast_parametrization import dtype_cast  # noqa
 from .dtensor_sharding_helpers import _try_single_dim_strategy, get_op_strategy
-
-logger = logging.getLogger(__name__)
-
 
 _op_rules = {}
 
@@ -550,21 +546,6 @@ def split_rule(mesh, op_schema):
 @register_rule(torch.ops.aten._unsafe_index.Tensor)
 def _unsafe_index_rule(mesh, op_schema):
     raise NotImplementedError()
-
-
-@register_rule(torch.ops.aten.reshape.default)
-def reshape_rule(mesh, op_schema):
-    op = torch.ops.aten.reshape.default
-    out_strat = get_op_strategy(op, op_schema)
-    if mesh.ndim == 1:
-        # remove duplicate strategy
-        # TODO: hack, fixme
-        if len(out_strat.strategies) > 2 and str(out_strat.strategies[2]) == str(
-            out_strat.strategies[0]
-        ):
-            logger.debug("removing")
-            out_strat.strategies.pop(2)
-    return out_strat
 
 
 @register_rule(torch.ops.aten.expand.default)
