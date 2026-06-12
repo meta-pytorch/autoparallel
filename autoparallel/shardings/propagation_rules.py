@@ -47,7 +47,7 @@ from torch.distributed.tensor.placement_types import (
 
 # need to import this to have the dtype_cast registered
 from ..cast_parametrization import dtype_cast  # noqa
-from .dtensor_sharding_helpers import get_op_strategy
+from .dtensor_sharding_helpers import _try_single_dim_strategy, get_op_strategy
 
 logger = logging.getLogger(__name__)
 
@@ -859,10 +859,44 @@ def expand_rule(mesh, op_schema_):
     return out_strat
 
 
+def _einsum_single_dim_strategy(op, args_schema, kwargs_schema):
+    from torch.distributed.tensor._ops._matrix_ops import (
+        gen_single_dim_einsum_strategies,
+    )
+
+    equation, input_metas = args_schema
+    assert isinstance(equation, str)
+    assert isinstance(input_metas, tuple)
+    assert len(input_metas) == 2, "Only two args to einsum supported for now"
+
+    # ignore strategies with Partial inputs.
+    return [
+        strategy
+        for strategy in gen_single_dim_einsum_strategies(equation)
+        if not any(isinstance(placement, Partial) for placement in strategy[1:])
+    ]
+
+
+def _register_einsum_single_dim_strategy():
+    from torch.distributed.tensor import DTensor
+    from torch.distributed.tensor._ops.single_dim_strategy import (
+        register_single_dim_strategy,
+    )
+
+    op = torch.ops.aten.einsum.default
+    propagator = DTensor._op_dispatcher.sharding_propagator
+    if op not in propagator.op_single_dim_strategy_funcs:
+        register_single_dim_strategy(op, allow_unbacked_sharding=True)(
+            _einsum_single_dim_strategy
+        )
+
+
+_register_einsum_single_dim_strategy()
+
+
 @register_rule(torch.ops.aten.einsum.default)
 def einsum_rule(mesh, op_schema):
     from torch.distributed.tensor._op_schema import TupleStrategy
-    from torch.distributed.tensor._ops._matrix_ops import _mm_like_strategy
 
     mm_equation, mat_strategy = op_schema.args_schema
     assert isinstance(mm_equation, str)
@@ -870,15 +904,9 @@ def einsum_rule(mesh, op_schema):
 
     assert len(mat_strategy.children) == 2, "Only two args to einsum supported for now"
 
-    self_strategy, mat2_strategy = mat_strategy.children
-
-    # dispatch to mm_like_strategy
-    new_op_schema = OpSchema(
-        torch.ops.aten.einsum.default,
-        args_schema=(self_strategy, mat2_strategy),
-        kwargs_schema={},
-    )
-    return _mm_like_strategy(mm_equation, mesh, new_op_schema)
+    out_strat = _try_single_dim_strategy(torch.ops.aten.einsum.default, op_schema)
+    assert out_strat is not None
+    return out_strat
 
 
 @register_rule(torch.ops.aten.scatter.src)
