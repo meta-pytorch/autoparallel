@@ -1025,36 +1025,3 @@ def uniform_strategy(mesh, op_schema: OpSchema):
     return expand_to_full_mesh_op_strategy(
         mesh, op_schema, single_mesh_dim_strategies, input_index=1
     )
-
-
-# ======================================
-# Scatter ops
-
-
-@register_rule(torch.ops.aten.select_scatter.default)
-def select_scatter_strategy(mesh, op_schema: OpSchema):
-    from torch.distributed.tensor._ops.utils import (
-        expand_to_full_mesh_op_strategy,
-        normalize_dim,
-    )
-
-    input_strategy = op_schema.args_schema[0]
-    assert isinstance(input_strategy, OpStrategy)
-    ndim = input_strategy.ndim
-    dim = op_schema.args_schema[2]
-    assert isinstance(dim, int)
-    dim = normalize_dim(dim, ndim)
-
-    # [output, input, src]
-    single_mesh_dim_strategies: list[list[Placement | None]] = [[Replicate()] * 3]
-    for d in range(ndim):
-        if d == dim:
-            continue
-        # src has the select dim removed
-        single_mesh_dim_strategies.append(
-            [Shard(d), Shard(d), Shard(d if d < dim else d - 1)]
-        )
-
-    return expand_to_full_mesh_op_strategy(
-        mesh, op_schema, single_mesh_dim_strategies, input_index=1
-    )
