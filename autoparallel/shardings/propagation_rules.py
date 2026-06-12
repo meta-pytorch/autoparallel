@@ -574,77 +574,7 @@ def factory_rule(mesh, op_schema: OpSchema) -> OpStrategy:
 
 
 # ======================================
-# the following ops require meta_tensor fix
-
-
-@register_rule(torch.ops.aten.native_layer_norm.default)
-def native_layer_norm_rule(mesh, op_schema):
-    from torch.distributed.tensor._ops._math_ops import (
-        Sequence,
-        normalize_to_torch_size,
-    )
-
-    assert len(op_schema.args_schema) == 5
-    (
-        input_strategy,
-        normalized_shape,
-        weight_strategy,
-        bias_strategy,
-        _,
-    ) = op_schema.args_schema
-
-    assert isinstance(input_strategy, OpStrategy)
-    assert isinstance(normalized_shape, (int, Sequence, torch.Size))
-    normalized_size = normalize_to_torch_size(normalized_shape)
-
-    input_ndim = input_strategy.ndim
-    axis = input_ndim - len(normalized_size)
-
-    output_strategy = _pointwise_strategy(mesh, op_schema)
-
-    # now let's remove the cases that are invalid, as they require
-    # reduction on a sharded dimension
-    kept = []
-    for strategy in output_strategy.strategies:
-        is_valid = True
-        for plc in strategy.input_specs[0].placements:
-            if plc.is_shard() and plc.dim >= axis:
-                is_valid = False
-                break
-        if is_valid:
-            output_spec = strategy.output_specs
-            input_spec = strategy.input_specs[0]
-            mesh = strategy.mesh
-
-            # Create output tensor_meta with same shape as input but contiguous strides
-            # (LayerNorm forward returns contiguous tensor even if input was non-contiguous)
-            output_tensor_meta = _gen_tensor_meta(
-                input_spec.tensor_meta.shape, input_spec.tensor_meta.dtype
-            )
-            output_spec = DTensorSpec(
-                mesh=mesh,
-                placements=output_spec.placements,
-                tensor_meta=output_tensor_meta,
-            )
-
-            # the output spec is the same as input spec
-            shape = input_spec.tensor_meta.shape[:axis] + (1,) * len(normalized_size)
-            mean_std_tgt_spec = DTensorSpec(
-                mesh=mesh,
-                placements=output_spec.placements,
-                tensor_meta=_gen_tensor_meta(shape),
-            )
-            output_target_spec = (
-                output_spec,
-                mean_std_tgt_spec,
-                mean_std_tgt_spec,
-            )
-            if len(output_target_spec) == 1:
-                output_target_spec = output_target_spec[0]
-            strategy.output_specs = output_target_spec
-            kept.append(strategy)
-
-    return OpStrategy(kept)
+# native_layer_norm_backward still requires a meta_tensor fix
 
 
 @register_rule(torch.ops.aten.native_layer_norm_backward.default)
