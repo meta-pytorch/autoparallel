@@ -739,40 +739,6 @@ def stack_strategy(mesh, op_schema: OpSchema):
 
 
 # ======================================
-# Convolution ops
-
-
-@register_rule(torch.ops.aten.convolution_backward.default)
-def convolution_backward_strategy(mesh, op_schema: OpSchema):
-    from torch.distributed.tensor._ops.utils import expand_to_full_mesh_op_strategy
-
-    bias_shape_opt = op_schema.args_schema[3]
-    has_bias = bias_shape_opt is not None
-
-    # Outputs: grad_input, grad_weight, grad_bias (3)
-    # Inputs (tensor): grad_output, input, weight (3)
-    # Placement list: [grad_input, grad_weight, grad_bias, grad_output, input, weight]
-    single_mesh_dim_strategies: list[list[Placement | None]] = []
-
-    if has_bias:
-        single_mesh_dim_strategies.append([Replicate()] * 6)
-        single_mesh_dim_strategies.append(
-            [Shard(0), Partial(), Partial(), Shard(0), Shard(0), Replicate()]
-        )
-    else:
-        single_mesh_dim_strategies.append(
-            [Replicate(), Replicate(), None, Replicate(), Replicate(), Replicate()]
-        )
-        single_mesh_dim_strategies.append(
-            [Shard(0), Partial(), None, Shard(0), Shard(0), Replicate()]
-        )
-
-    return expand_to_full_mesh_op_strategy(
-        mesh, op_schema, single_mesh_dim_strategies, input_index=3
-    )
-
-
-# ======================================
 # Random ops
 
 
