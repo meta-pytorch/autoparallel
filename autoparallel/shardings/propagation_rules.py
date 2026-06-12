@@ -28,11 +28,8 @@ import torch
 from torch.distributed._tensor.placement_types import DTensorSpec, TensorMeta
 from torch.distributed.tensor._op_schema import OpSchema, OpSpec, OpStrategy
 from torch.distributed.tensor._ops._view_ops import (
-    RuntimeSchemaInfo,
     dim_maps,
-    dim_transpose,
     propagate_shape_and_sharding,
-    register_op_strategy_map,
 )
 from torch.distributed.tensor._ops.utils import (
     generate_redistribute_costs,
@@ -50,13 +47,6 @@ from ..cast_parametrization import dtype_cast  # noqa
 from .dtensor_sharding_helpers import _try_single_dim_strategy, get_op_strategy
 
 logger = logging.getLogger(__name__)
-
-# TODO: move this to PyTorch
-dim_maps[torch.t] = lambda input: dim_transpose(input.ndim, -2, -1)
-
-register_op_strategy_map(
-    torch.ops.aten.t.default, torch.t, schema_info=RuntimeSchemaInfo(1)
-)
 
 
 def _pointwise_strategy(mesh, op_schema):
