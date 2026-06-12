@@ -723,13 +723,8 @@ def native_layer_norm_backward_rule(mesh, op_schema):
     return OpStrategy(kept)
 
 
-@register_rule(
-    [
-        torch.ops.prims.convert_element_type.default,
-        torch.ops.autoparallel.dtype_cast.default,
-    ]
-)
-def convert_element_type_rule(mesh, op_schema):
+@register_rule(torch.ops.autoparallel.dtype_cast.default)
+def dtype_cast_rule(mesh, op_schema):
     from torch.distributed.tensor._ops._tensor_ops import (
         propagate_single_input_strategy,
     )
