@@ -36,6 +36,8 @@ from torch.distributed.tensor.placement_types import Replicate, Shard
 
 from autoparallel._testing.models.llama3 import Transformer, TransformerModelArgs
 from autoparallel.api import AutoParallel
+
+
 def _summarize(m) -> str:
     if m is None:
         return "None"
@@ -58,8 +60,7 @@ def _short_traceback() -> str:
     interesting = [
         f"  {f.filename}:{f.lineno} in {f.name}"
         for f in stack
-        if "device_mesh" not in f.filename
-        and "test_mesh_identity" not in f.filename
+        if "device_mesh" not in f.filename and "test_mesh_identity" not in f.filename
     ]
     return "\n".join(interesting[-10:])
 
@@ -112,9 +113,7 @@ def _install_diag_hooks():
             print(f"[_flatten #{n}] OK → {_summarize(result)}", flush=True)
             return result
         except Exception as e:
-            print(
-                f"[_flatten #{n}] RAISED: {type(e).__name__}: {e}", flush=True
-            )
+            print(f"[_flatten #{n}] RAISED: {type(e).__name__}: {e}", flush=True)
             raise
 
     def _wrapped_create(self, mesh_dim_name, backend_override=(None, None)):
@@ -200,7 +199,9 @@ def test_sharding_solution_meshes_have_warm_flatten_cache(device_mesh_2d):
             model,
             lambda: torch.randint(0, vocab_size, (batch_size, seqlen), device="cuda"),
             device_mesh_2d,
-            MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32),
+            MixedPrecisionPolicy(
+                param_dtype=torch.bfloat16, reduce_dtype=torch.float32
+            ),
             repeated_subgraphs=True,
         ) as autop:
             autop.add_parameter_memory_constraint(low=None, high=None)
