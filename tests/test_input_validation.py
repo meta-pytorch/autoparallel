@@ -11,10 +11,11 @@ from torch.distributed.tensor.placement_types import Replicate, Shard
 
 from autoparallel.api import auto_parallel
 from autoparallel.input_validation import (
+    ForwardInputs,
     _check_forward_args,
-    _compute_expected_inputs,
     _extract_input_info,
     _make_input_fn,
+    flatten_and_convert_inputs_to_local_shapes,
 )
 
 
@@ -52,7 +53,7 @@ def test_check_forward_args_non_tensor_value():
         _check_forward_args((99,), expected)
 
 
-def test_compute_expected_inputs(device_mesh_1d):
+def test_flatten_and_convert_inputs_to_local_shapes(device_mesh_1d):
     """Test local shape computation from global shape + Shard placement."""
     mesh = device_mesh_1d
     world_size = mesh.size()
@@ -60,25 +61,29 @@ def test_compute_expected_inputs(device_mesh_1d):
     traced = [torch.empty(512, 128, device="meta")]
     placements = [(Shard(0),)]
 
-    result, _dynamic_dims = _compute_expected_inputs(traced, placements, mesh)
+    result, _dynamic_dims = flatten_and_convert_inputs_to_local_shapes(
+        ForwardInputs(args=tuple(traced)), placements, mesh
+    )
     assert len(result) == 1
     assert result[0].shape == (512 // world_size, 128)
     assert result[0].dtype == torch.float32
 
 
-def test_compute_expected_inputs_replicated(device_mesh_1d):
+def test_flatten_and_convert_inputs_to_local_shapes_replicated(device_mesh_1d):
     """Test that Replicate placement leaves shape unchanged."""
     mesh = device_mesh_1d
 
     traced = [torch.empty(512, 128, device="meta")]
     placements = [(Replicate(),)]
 
-    result, _dynamic_dims = _compute_expected_inputs(traced, placements, mesh)
+    result, _dynamic_dims = flatten_and_convert_inputs_to_local_shapes(
+        ForwardInputs(args=tuple(traced)), placements, mesh
+    )
     assert len(result) == 1
     assert result[0].shape == (512, 128)
 
 
-def test_compute_expected_inputs_uneven(device_mesh_2d):
+def test_flatten_and_convert_inputs_to_local_shapes_uneven(device_mesh_2d):
     """Uneven shard uses ceiling division for expected local shape."""
     mesh = device_mesh_2d
     tp_size = mesh.size(1)  # 8
@@ -86,7 +91,9 @@ def test_compute_expected_inputs_uneven(device_mesh_2d):
     traced = [torch.empty(10, 128, device="meta")]
     placements = [(Replicate(), Shard(0))]
 
-    result, _dynamic_dims = _compute_expected_inputs(traced, placements, mesh)
+    result, _dynamic_dims = flatten_and_convert_inputs_to_local_shapes(
+        ForwardInputs(args=tuple(traced)), placements, mesh
+    )
     assert len(result) == 1
     expected_dim0 = (10 + tp_size - 1) // tp_size  # ceil(10/8) = 2
     assert result[0].shape == (expected_dim0, 128)
@@ -139,12 +146,12 @@ def test_forward_input_validation_integration(device_mesh_1d):
         parallel_mod(42)
 
 
-def test_compute_expected_inputs_dict_pytree(device_mesh_1d):
+def test_flatten_and_convert_inputs_to_local_shapes_dict_pytree(device_mesh_1d):
     """Test that dict pytree inputs are flattened before applying sharding."""
     mesh = device_mesh_1d
     world_size = mesh.size()
 
-    # Simulate traced_inputs containing a dict (as produced by build_joint_graph
+    # Simulate traced inputs containing a dict (as produced by build_joint_graph
     # when the model takes a dict argument)
     traced = [
         {
@@ -154,7 +161,9 @@ def test_compute_expected_inputs_dict_pytree(device_mesh_1d):
     ]
     constraints = [(Shard(0),), (Shard(0),)]
 
-    result, _dynamic_dims = _compute_expected_inputs(traced, constraints, mesh)
+    result, _dynamic_dims = flatten_and_convert_inputs_to_local_shapes(
+        ForwardInputs(args=tuple(traced)), constraints, mesh
+    )
     assert len(result) == 2
     assert result[0].shape == (512 // world_size, 128)
     assert result[1].shape == (512 // world_size, 64)
@@ -183,18 +192,39 @@ def test_make_input_fn_dict_roundtrip(device_mesh_1d):
         "a": torch.rand(4, 8),
         "b": torch.rand(4, 16),
     }
-    shapes, dtypes, _, treespec, devices = _extract_input_info(sample, mesh)
-    input_fn = _make_input_fn(shapes, dtypes, treespec, devices)
+    args_shapes, args_dtypes, _, args_spec, args_devices = _extract_input_info(
+        (sample,), mesh
+    )
+    (
+        kwargs_shapes,
+        kwargs_dtypes,
+        _,
+        kwargs_spec,
+        kwargs_devices,
+    ) = _extract_input_info({}, mesh)
+    input_fn = _make_input_fn(
+        args_shapes,
+        args_dtypes,
+        args_devices,
+        args_spec,
+        kwargs_shapes,
+        kwargs_dtypes,
+        kwargs_devices,
+        kwargs_spec,
+    )
     result = input_fn()
-    # Dict is wrapped in a tuple
-    assert isinstance(result, tuple) and len(result) == 1
-    assert isinstance(result[0], dict)
-    assert set(result[0].keys()) == {"a", "b"}
-    assert result[0]["a"].shape == (4, 8)
-    assert result[0]["b"].shape == (4, 16)
+    assert isinstance(result, ForwardInputs)
+    assert result.kwargs == {}
+    # The dict was a single positional pytree leaf, so args is a 1-tuple
+    # wrapping the dict.
+    assert isinstance(result.args, tuple) and len(result.args) == 1
+    assert isinstance(result.args[0], dict)
+    assert set(result.args[0].keys()) == {"a", "b"}
+    assert result.args[0]["a"].shape == (4, 8)
+    assert result.args[0]["b"].shape == (4, 16)
     # Verify per-tensor devices are preserved
-    assert result[0]["a"].device == torch.device("cpu")
-    assert result[0]["b"].device == torch.device("cpu")
+    assert result.args[0]["a"].device == torch.device("cpu")
+    assert result.args[0]["b"].device == torch.device("cpu")
 
 
 def test_dict_input_integration(device_mesh_1d):
@@ -240,3 +270,44 @@ def test_dict_input_integration(device_mesh_1d):
     # Validation should reject wrong shape inside a dict
     with pytest.raises(ValueError, match="shape"):
         parallel_mod({"x": torch.rand(local_batch_size + 1, dim, device="cuda")})
+
+
+def test_forward_inputs_defaults_and_frozen():
+    """ForwardInputs has empty defaults and is frozen."""
+    ti = ForwardInputs()
+    assert ti.args == ()
+    assert ti.kwargs == {}
+
+    ti2 = ForwardInputs(args=(1, 2), kwargs={"k": 3})
+    assert ti2.args == (1, 2)
+    assert ti2.kwargs == {"k": 3}
+
+    with pytest.raises(Exception):
+        ti2.args = (4,)  # frozen dataclass forbids reassignment
+
+
+def test_flatten_and_convert_inputs_to_local_shapes_with_kwargs(device_mesh_1d):
+    """Kwargs leaves contribute placements after positional leaves in dict order."""
+    mesh = device_mesh_1d
+    world_size = mesh.size()
+
+    traced = ForwardInputs(
+        args=(torch.empty(512, 128, device="meta"),),
+        kwargs={
+            "mask": torch.empty(512, device="meta"),
+            "positions": torch.empty(512, 64, device="meta"),
+        },
+    )
+    # Order matches tree_flatten((args, kwargs)): args first, then kwargs in
+    # dict key order.
+    placements = [
+        (Shard(0),),  # args[0]
+        (Shard(0),),  # mask
+        (Replicate(),),  # positions
+    ]
+
+    result, _ = flatten_and_convert_inputs_to_local_shapes(traced, placements, mesh)
+    assert len(result) == 3
+    assert result[0].shape == (512 // world_size, 128)
+    assert result[1].shape == (512 // world_size,)
+    assert result[2].shape == (512, 64)

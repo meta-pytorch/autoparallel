@@ -34,16 +34,12 @@ def _auto_parallel_with_internals(model, mesh, sample_inputs, out_shardings):
     """Like auto_parallel but also returns the AutoParallel instance."""
     from autoparallel.api import (
         AutoParallel,
-        _extract_input_info,
+        _build_input_fn_from_sample,
         _flatten_out_shardings,
-        _make_input_fn,
     )
 
-    shapes, dtypes, input_placements, treespec, devices = _extract_input_info(
-        sample_inputs, mesh
-    )
+    input_fn, input_placements = _build_input_fn_from_sample(sample_inputs, mesh)
     output_placements = _flatten_out_shardings(out_shardings)
-    input_fn = _make_input_fn(shapes, dtypes, treespec, devices)
 
     with AutoParallel(model, input_fn, mesh) as autop:
         autop.add_input_constraints(input_placements)

@@ -315,17 +315,13 @@ def test_flex_attention_block_mask_sharding_matches_shape(device_mesh_1d):
 
     from autoparallel.api import AutoParallel
     from autoparallel.input_validation import (
-        _extract_input_info,
+        _build_input_fn_from_sample,
         _flatten_out_shardings,
-        _make_input_fn,
     )
 
     def _get_flex_attn_strat(model):
         x = _make_input(mesh, DIM)
-        shapes, dtypes, input_placements, treespec, devices = _extract_input_info(
-            (x,), mesh
-        )
-        input_fn = _make_input_fn(shapes, dtypes, treespec, devices)
+        input_fn, input_placements = _build_input_fn_from_sample((x,), mesh)
         output_placements = _flatten_out_shardings(_out_shardings(mesh))
 
         with AutoParallel(model, input_fn, mesh) as autop:
@@ -403,19 +399,15 @@ def test_flex_attention_gqa_head_sharding(device_mesh_2d):
 
     from autoparallel.api import AutoParallel
     from autoparallel.input_validation import (
-        _extract_input_info,
+        _build_input_fn_from_sample,
         _flatten_out_shardings,
-        _make_input_fn,
     )
 
     with torch.device("meta"):
         model = FlexAttnGQAModel(DIM, N_HEADS, n_kv_heads)
 
     x = _make_input(mesh, DIM)
-    shapes, dtypes, input_placements, treespec, devices = _extract_input_info(
-        (x,), mesh
-    )
-    input_fn = _make_input_fn(shapes, dtypes, treespec, devices)
+    input_fn, input_placements = _build_input_fn_from_sample((x,), mesh)
     output_placements = _flatten_out_shardings(_out_shardings(mesh))
 
     with AutoParallel(model, input_fn, mesh) as autop:
@@ -476,16 +468,12 @@ def test_flex_attention_other_buffers_replicated(device_mesh_1d):
 
     from autoparallel.api import AutoParallel
     from autoparallel.input_validation import (
-        _extract_input_info,
+        _build_input_fn_from_sample,
         _flatten_out_shardings,
-        _make_input_fn,
     )
 
     x = _make_input(mesh, DIM)
-    shapes, dtypes, input_placements, treespec, devices = _extract_input_info(
-        (x,), mesh
-    )
-    input_fn = _make_input_fn(shapes, dtypes, treespec, devices)
+    input_fn, input_placements = _build_input_fn_from_sample((x,), mesh)
     output_placements = _flatten_out_shardings(_out_shardings(mesh))
 
     with AutoParallel(model, input_fn, mesh) as autop:

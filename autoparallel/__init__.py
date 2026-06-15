@@ -6,10 +6,12 @@
 from autoparallel.api import AutoParallel, auto_parallel
 from autoparallel.collectives import with_sharding_constraint
 from autoparallel.compile import autoparallel_backend
+from autoparallel.input_validation import ForwardInputs
 
 __all__ = [
     "auto_parallel",
     "AutoParallel",
     "autoparallel_backend",
+    "ForwardInputs",
     "with_sharding_constraint",
 ]
