@@ -65,18 +65,17 @@ def _prepare_op_strategy(op_strategy):
     return str(op_strategy)
 
 
-def _hash_node(node, strategies, input_pickler):
+def _hash_node(node, strategies, input_pickler, op_str):
+    # op_str caches _prepare_op_strategy(strategies[n]) per node: each node's
+    # (large, 3D-mesh) strategy string is otherwise rebuilt once as self plus
+    # once per consumer, dominating clustering time on deep models.
     key = (
         str(node.target),
         node.meta.get("partitioner_tag"),
         node.meta.get("stack_trace"),
         _normalize_args(node),
-        _prepare_op_strategy(strategies[node]),
-        tuple(
-            _prepare_op_strategy(strategies[s])
-            for s in node.all_input_nodes
-            if s in strategies
-        ),
+        op_str[node],
+        tuple(op_str[s] for s in node.all_input_nodes if s in strategies),
     )
     return sha256_hash(input_pickler.dumps(key))
 
@@ -107,6 +106,7 @@ def get_identical_regions(
     hash_to_duplicates: dict[str, IdenticalNodes] = defaultdict(list)
     node_to_duplicates: dict[Node, IdenticalNodes] = {}
     t = time.time()
+    op_str = {n: _prepare_op_strategy(s) for n, s in strategies.items()}
     for node in graph.nodes:
         if node.op == "placeholder":
             continue
@@ -115,7 +115,9 @@ def get_identical_regions(
             # HOP submodule get_attr nodes are not in strategies.
             continue
 
-        duplicates = hash_to_duplicates[_hash_node(node, strategies, input_pickler)]
+        duplicates = hash_to_duplicates[
+            _hash_node(node, strategies, input_pickler, op_str)
+        ]
         duplicates.append(node)
         node_to_duplicates[node] = duplicates
     logger.debug(f"Hashed nodes in {time.time() - t} s")

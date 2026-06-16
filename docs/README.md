@@ -23,5 +23,6 @@ If you're new to the project, use the reading order below.
 
 ## Advanced usage
 
+- [Sharding Annotations and Shardy-like Propagation](sharding_annotations.md)
 - [Using `local_map` for MoE and Custom Communication Patterns](local_map_and_moe.md)
 - [Saving and Loading Optimizer State](save_load.md)

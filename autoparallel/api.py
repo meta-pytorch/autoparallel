@@ -46,6 +46,7 @@ from .input_validation import (
 )
 from .module_construction import make_parallel_module
 from .optimize_sharding import ShardingOptimizer
+from .propagation import ShardingAnnotation, ShardingPropagator
 from .shardings.placement_options import _get_device_from_mesh
 from .tracing import (
     _add_unused_params_and_buffers,
@@ -234,6 +235,11 @@ class AutoParallel:
         The meta model is moved to a fake device based on mesh.device_type.
     """
 
+    # Selectable solvers. "ilp": exact PuLP/CBC. "approx": heuristic TRW-S
+    # (light build, no PuLP). "lp": LP relaxation used directly as the solve
+    # (empirically integral for this problem, so much cheaper than CBC).
+    SOLVER_CHOICES = ("ilp", "approx", "lp")
+
     def __init__(
         self,
         model,
@@ -244,8 +250,20 @@ class AutoParallel:
         dynamic: bool = False,
         cost_model: Any = "nccl",
         repeated_subgraphs: bool = True,
+        solver: str = "ilp",
     ):
         self.stack = ExitStack()
+        # The solver chosen here decides how the optimizer is built: "ilp"/"lp"
+        # build the full PuLP problem (CBC exact solve / LP relaxation solve);
+        # "approx" builds a lighter optimizer (no PuLP variables/constraints),
+        # much faster to construct, solved heuristically. optimize_placement(
+        # solver=...) may override the solve as long as it is compatible with
+        # this build.
+        if solver not in self.SOLVER_CHOICES:
+            raise ValueError(
+                f"Unknown solver={solver!r}; expected one of {self.SOLVER_CHOICES}"
+            )
+        self.solver = solver
         self.fake_mode = (
             FakeTensorMode()
         )  # TODO: maybe need to reuse the model's fake mode
@@ -322,12 +340,15 @@ class AutoParallel:
                 self.mesh,
                 force_grad_reduce_in_higher_precision,
                 repeated_subgraphs=self.repeated_subgraphs,
+                build_pulp=self.solver in ("ilp", "lp"),
             )
 
             self.sharding_optimizer = sharding_optimizer
 
             self.input_constraints = None
             self.output_constraints = None
+            self._annotations: list[tuple[Any, ShardingAnnotation]] = []
+            self.propagation_result = None
 
             self.active = True
 
@@ -397,10 +418,240 @@ class AutoParallel:
         self.sharding_optimizer.add_sharded_output_constraint(constraints)
         self.output_constraints = constraints
 
-    def optimize_placement(self, verbose=True):
-        self._assert_entered()
+    # ---- Sharding annotations (Shardy-like propagation) ----
+    # EXPERIMENTAL: opt-in only. These have no effect unless you call an
+    # annotate_* method and then propagate_annotations() before
+    # optimize_placement(); the default solve path never invokes them. The
+    # propagation may shrink the search space in ways that move the objective off
+    # the full-ILP optimum, so treat results as unstable.
 
-        self.sharding_placement = self.sharding_optimizer.get_solution(verbose=False)
+    def _normalize_placements(self, placements):
+        """Pad/validate a placement tuple to mesh.ndim, leaving missing trailing
+        axes open (``None``)."""
+        placements = tuple(placements)
+        if len(placements) > self.mesh.ndim:
+            raise ValueError(
+                f"annotation has {len(placements)} placements but mesh has "
+                f"{self.mesh.ndim} dims"
+            )
+        return placements + (None,) * (self.mesh.ndim - len(placements))
+
+    def _param_fqn_to_node(self):
+        from torch._functorch._aot_autograd.fx_utils import get_param_and_grad_nodes
+
+        graph = self.sharding_optimizer.graph
+        return {
+            desc.target: node
+            for desc, (node, _grad) in get_param_and_grad_nodes(graph).items()
+        }
+
+    def annotate_parameter(self, fqn, placements, priority=1):
+        """Annotate the sharding of one or more parameters.
+
+        ``fqn`` is a parameter fully-qualified name, optionally a glob pattern
+        (e.g. ``"layers.*.attention.wq.weight"``) to annotate the matching
+        parameter in every layer at once.  ``placements`` is a tuple of
+        :class:`Placement` (or ``None`` to leave a mesh axis open — typical for
+        the data/FSDP axis of a weight).  Weights default to a lower priority
+        than activations so the data-parallel axis wins shared-axis conflicts.
+        """
+        import fnmatch
+
+        placements = self._normalize_placements(placements)
+        fqn_map = self._param_fqn_to_node()
+        matched = [node for name, node in fqn_map.items() if fnmatch.fnmatch(name, fqn)]
+        if not matched:
+            raise ValueError(
+                f"No parameter matches {fqn!r}. Available parameters: "
+                f"{sorted(fqn_map)}"
+            )
+        for node in matched:
+            self._annotations.append((node, ShardingAnnotation(placements, priority)))
+        return matched
+
+    def annotate_input(self, idx, placements, priority=0):
+        """Annotate the sharding of graph input ``idx``."""
+        from torch._functorch._aot_autograd.fx_utils import (
+            get_plain_input_and_grad_nodes,
+        )
+
+        placements = self._normalize_placements(placements)
+        graph = self.sharding_optimizer.graph
+        nodes = {
+            desc.idx: node
+            for desc, (node, _grad) in get_plain_input_and_grad_nodes(graph).items()
+        }
+        if idx not in nodes:
+            raise ValueError(f"No graph input with index {idx}; have {sorted(nodes)}")
+        self._annotations.append((nodes[idx], ShardingAnnotation(placements, priority)))
+        return nodes[idx]
+
+    def annotate_output(self, idx, placements, priority=0):
+        """Annotate the sharding of graph output ``idx``."""
+        from torch._functorch._aot_autograd.fx_utils import (
+            get_plain_output_and_tangent_nodes,
+        )
+
+        placements = self._normalize_placements(placements)
+        graph = self.sharding_optimizer.graph
+        nodes = {
+            desc.idx: node
+            for desc, (node, _t) in get_plain_output_and_tangent_nodes(graph).items()
+        }
+        if idx not in nodes:
+            raise ValueError(f"No graph output with index {idx}; have {sorted(nodes)}")
+        self._annotations.append((nodes[idx], ShardingAnnotation(placements, priority)))
+        return nodes[idx]
+
+    def annotate_node(self, node, placements, priority=0):
+        """Annotate the sharding of an arbitrary graph node."""
+        placements = self._normalize_placements(placements)
+        self._annotations.append((node, ShardingAnnotation(placements, priority)))
+        return node
+
+    def _mirror_annotations_to_backward(self):
+        """Build extra propagation seeds on the backward twins of annotated
+        forward tensors.
+
+        A gradient shares the sharding of the value it is the gradient of, so a
+        forward annotation also pins its twin (parameter->grad, input->grad,
+        output->tangent).  Seeding the twins lets the TP plan propagate through
+        the backward pass too.  These seeds are only used for propagation: the
+        twins themselves stay unconstrained (handled by the forward/backward
+        consistency constraints), but their neighbors get determined.
+        """
+        from torch._functorch._aot_autograd.fx_utils import (
+            get_param_and_grad_nodes,
+            get_plain_input_and_grad_nodes,
+            get_plain_output_and_tangent_nodes,
+        )
+
+        graph = self.sharding_optimizer.graph
+        twin = {}
+        for _d, (node, grad) in get_param_and_grad_nodes(graph).items():
+            if grad is not None:
+                twin[node] = grad
+        for _d, (node, grad) in get_plain_input_and_grad_nodes(graph).items():
+            if grad is not None:
+                twin[node] = grad
+        for _d, (node, tangent) in get_plain_output_and_tangent_nodes(graph).items():
+            if tangent is not None:
+                twin[node] = tangent
+
+        mirrored = []
+        for node, ann in self._annotations:
+            if node in twin:
+                mirrored.append((twin[node], ann))
+        return mirrored
+
+    def propagate_annotations(self, verbose=True, aggressive=False, method="fix"):
+        """EXPERIMENTAL (opt-in, off by default; may be unstable).
+
+        Propagate the registered annotations Shardy-style and turn the
+        unambiguously-determined nodes into ILP constraints, shrinking the
+        search space.  Returns a :class:`PropagationResult`.
+
+        Call this after the ``annotate_*`` / ``add_*_constraint`` calls and
+        before :meth:`optimize_placement`.  The default solve path does not call
+        this; nothing happens unless you invoke it explicitly.
+
+        With ``aggressive=False`` (the default) only genuine ``Shard`` axes are
+        pinned, which keeps the full-ILP optimum reachable.  ``aggressive=True``
+        also pins ``Replicate`` / ``Partial`` axes for a larger reduction at the
+        cost of possibly forbidding cheaper reshard placements (e.g. sequence
+        parallelism), so the objective may move slightly off the optimum.
+
+        ``method`` is how each pin is enforced: ``"fix"`` (default) removes the
+        ruled-out decision variables (shrinks the problem; scales best on large
+        meshes), ``"constraint"`` adds removable ``== 1`` rows instead.
+        """
+        self._assert_entered()
+        propagator = ShardingPropagator(self.sharding_optimizer)
+        seeds = self._annotations + self._mirror_annotations_to_backward()
+        propagator.run(seeds)
+        self.propagation_result = propagator.apply_to_optimizer(
+            aggressive=aggressive, method=method
+        )
+        if verbose:
+            logger.info(
+                "Annotation propagation reduced the output-strategy search "
+                "space by %.1f%% (%d -> %d) via %d per-axis constraints on %d "
+                "nodes",
+                100.0 * self.propagation_result.reduction,
+                self.propagation_result.strategies_before,
+                self.propagation_result.strategies_after,
+                self.propagation_result.axis_constraints,
+                self.propagation_result.nodes_determined,
+            )
+        return self.propagation_result
+
+    def optimize_placement(
+        self,
+        verbose=True,
+        solver=None,
+        approximate_options=None,
+        optimality_check=False,
+    ):
+        """Solve for the optimal placement.
+
+        solver selects how the placement is solved (defaults to the solver chosen
+        at AutoParallel construction):
+          - "ilp":    exact PuLP/CBC solve.
+          - "approx": heuristic TRW-S ApproximateShardingSolver — trades a small
+            objective gap for a much faster solve.
+          - "lp":     solve the LP relaxation and use it directly. This problem is
+            empirically integral, so the relaxation optimum equals the ILP optimum
+            while skipping branch-and-bound; raises if it comes out fractional.
+        approximate_options is forwarded as kwargs to the approximate solver
+        (e.g. candidate_limit, max_sweeps). The requested solver must be
+        compatible with how the optimizer was built: "ilp"/"lp" need a PuLP
+        problem (build with solver="ilp" or "lp").
+
+        optimality_check: after solving, solve the LP relaxation as a lower bound
+        and log the certified gap of the achieved objective from the optimum.
+        Requires a PuLP problem (i.e. an "ilp"/"lp" build).
+        """
+        self._assert_entered()
+        if solver is None:
+            solver = self.solver
+
+        opt = self.sharding_optimizer
+        if solver in ("approx", "approximate"):
+            from .approximate_sharding import ApproximateShardingSolver
+
+            approx = ApproximateShardingSolver(opt, **(approximate_options or {}))
+            self.sharding_placement = approx.get_solution(verbose=verbose)
+        elif solver == "ilp":
+            if opt.prob is None:
+                raise RuntimeError(
+                    "solver='ilp' requires a PuLP problem, but this AutoParallel "
+                    "was constructed without one (e.g. solver='approx'). "
+                    "Construct with solver='ilp' to use the exact solver."
+                )
+            self.sharding_placement = opt.get_solution(verbose=False)
+        elif solver in ("lp", "lp_relax", "lp_relaxation"):
+            if opt.prob is None:
+                raise RuntimeError(
+                    "solver='lp' requires a PuLP problem, but this AutoParallel "
+                    "was constructed without one (e.g. solver='approx'). "
+                    "Construct with solver='lp' or 'ilp' to use the LP solver."
+                )
+            opt._set_objective()
+            res = opt.solve_lp_relaxation(verbose=verbose, extract=True)
+            if res["solution"] is None:
+                raise RuntimeError(
+                    "solver='lp' requires an integral LP relaxation, but it came "
+                    f"out fractional ({res['n_fractional']}/{res['n_vars']} "
+                    "variables). Use solver='ilp' for an exact integral solve."
+                )
+            self.sharding_placement = res["solution"]
+        else:
+            raise ValueError(
+                f"Unknown solver={solver!r}; expected one of {self.SOLVER_CHOICES}"
+            )
+
+        if optimality_check:
+            self._log_optimality_check(solver, verbose=verbose)
 
         if verbose:
             logger.info(self.sharding_optimizer.get_log(verbose=True))
@@ -416,7 +667,10 @@ class AutoParallel:
             ),
         )
 
-        if self.sharding_optimizer.prob.status == -1:
+        if (
+            self.sharding_optimizer.prob is not None
+            and self.sharding_optimizer.prob.status == -1
+        ):
             raise RuntimeError(
                 "The sharding optimizer could not find a feasible solution. "
                 "This typically means the user-specified constraints are "
@@ -427,6 +681,39 @@ class AutoParallel:
             )
 
         return self.sharding_placement
+
+    def _log_optimality_check(self, solver, verbose=False):
+        """Solve the LP relaxation as a lower bound and log the certified gap of
+        the achieved objective from the optimum. Needs a PuLP problem."""
+        import pulp
+
+        opt = self.sharding_optimizer
+        if opt.prob is None:
+            logger.warning(
+                "optimality_check skipped: solver=%r build has no PuLP problem; "
+                "construct with solver='ilp' or 'lp' to enable it.",
+                self.solver,
+            )
+            return
+        achieved = opt._safe_float(pulp.value(opt.prob.objective))
+        lb_res = opt.get_lower_bound(verbose=verbose)
+        lb = lb_res.objective
+        if not lb or lb <= 0 or achieved is None:
+            logger.warning(
+                "optimality_check inconclusive: lower_bound=%s achieved=%s",
+                lb,
+                achieved,
+            )
+            return
+        gap = (achieved - lb) / lb
+        logger.info(
+            "optimality check (solver=%s): objective=%.4f LP lower bound=%.4f "
+            "=> within %.2f%% of optimum (certified)",
+            solver,
+            achieved,
+            lb,
+            gap * 100,
+        )
 
     def _apply_placement_common(self, sharding_placement):
         t0 = time.perf_counter()

@@ -135,7 +135,7 @@ def save_optimizer(opt, path):
     # Re-key strats by node name, saving only root nodes (non-linked).
     # Linked nodes share identical strats with their root and are
     # reconstructed on load from cluster_links.
-    linked_node_names = {opt.nodes[lk[0]].name for lk in opt.cluster_links}
+    linked_node_names = {opt.nodes[c].name for c in opt.cluster_links}
     strats_by_name = {
         node.name: strat
         for node, strat in opt.strats.items()
@@ -193,8 +193,7 @@ def save_optimizer(opt, path):
         "dv_costs_keys": dv_costs_keys,
         "dv_costs_vals": dv_costs_vals,
         "cluster_links_node_by_name": {
-            opt.nodes[lk[0]].name: opt.nodes[rk[0]].name
-            for lk, rk in opt.cluster_links.items()
+            opt.nodes[c].name: opt.nodes[r].name for c, r in opt.cluster_links.items()
         },
         "constraint_log": opt._constraint_log,
         "selected_keys_by_name": selected_keys_by_name,
@@ -257,34 +256,44 @@ def load_optimizer(cls, path):
     opt.strats = strats
     opt.nodes = list(strats.keys())
     opt.node_map = {node: i for i, node in enumerate(opt.nodes)}
+    opt.solver_backend = "ilp"
     opt.force_grad_reduce_in_higher_precision = save_dict[
         "force_grad_reduce_in_higher_precision"
     ]
     opt._constraint_log = []
     opt._memory_constraint = None
     opt._node_constraint_names = {}
+    opt._node_axis_constraints = defaultdict(list)
+    opt._fixed_vars = []
     opt._name_counters = {}
+    # Loaded optimizers rebuild the PuLP problem below but carry no init-time
+    # profiling; an empty profile lets solve-time profile writes/guards no-op.
+    opt.build_pulp = True
+    opt.profile = {"timings": {}}
 
-    # Reconstruct cluster_links by expanding the node-level mapping over
-    # all (argi, out_idx, inp_idx) combinations.
-    opt.cluster_links = {}
-    for linked_name, root_name in cluster_links_node_by_name.items():
-        linked_node = nodes_by_name[linked_name]
-        root_node = nodes_by_name[root_name]
-        linked_idx = opt.node_map[linked_node]
-        root_idx = opt.node_map[root_node]
-        for argi, out_idx, inp_idx in opt.walk_over_options(linked_node):
-            opt.cluster_links[(linked_idx, argi, out_idx, inp_idx)] = (
-                root_idx,
-                argi,
-                out_idx,
-                inp_idx,
-            )
-    opt._cluster_linked_node_idxs = {key[0] for key in opt.cluster_links}
+    # cluster_links is node-level: copy node idx -> root node idx.
+    opt.cluster_links = {
+        opt.node_map[nodes_by_name[linked_name]]: opt.node_map[nodes_by_name[root_name]]
+        for linked_name, root_name in cluster_links_node_by_name.items()
+    }
+    opt._cluster_linked_node_idxs = set(opt.cluster_links)
 
     # Mesh placeholder — provides shape/dim_names for get_json() and ndim
     # for add_node_constraint() default placement, without needing a PG
     opt.mesh = _MeshPlaceholder(save_dict["mesh_shape"], save_dict["mesh_dim_names"])
+
+    # Map saved decision-var keys to loaded node indices. Only these keys had
+    # a finite-cost (valid) strategy edge at save time; invalid edges were
+    # pruned and must not get a variable, so seed _valid_keys before creating
+    # the PuLP variables (see ShardingOptimizer._build_decision_vars).
+    save_node_names = save_dict["dv_costs_node_names"]
+    keys_t = save_dict["dv_costs_keys"].tolist()
+    vals_t = save_dict["dv_costs_vals"].tolist()
+    mapped_keys = [
+        (opt.node_map[nodes_by_name[save_node_names[k[0]]]], k[1], k[2], k[3])
+        for k in keys_t
+    ]
+    opt._valid_keys = set(mapped_keys)
 
     # Rebuild PuLP variables and decision vars from saved costs.
     t2 = time.perf_counter()
@@ -296,19 +305,14 @@ def load_optimizer(cls, path):
         len(opt.pulp_variables),
     )
     # Reconstruct decision_vars from compact tensors.
-    save_node_names = save_dict["dv_costs_node_names"]
-    keys_t = save_dict["dv_costs_keys"].tolist()
-    vals_t = save_dict["dv_costs_vals"].tolist()
     opt.decision_vars = {}
-    for (save_node_idx, argi, out_idx, inp_idx), (
+    for key, (
         compute_cost,
         comm_cost,
         transition_cost,
-    ) in zip(keys_t, vals_t):
-        node_name = save_node_names[save_node_idx]
-        node = nodes_by_name[node_name]
-        node_idx = opt.node_map[node]
-        key = (node_idx, argi, out_idx, inp_idx)
+    ) in zip(mapped_keys, vals_t):
+        node_idx, argi, out_idx, inp_idx = key
+        node = opt.nodes[node_idx]
         strategy = opt.strats[node].strategies[out_idx]
         opt.decision_vars[key] = DecisionVar(
             var=opt.pulp_variables[key],
@@ -329,9 +333,9 @@ def load_optimizer(cls, path):
         len(opt.decision_vars),
     )
 
-    opt._root_to_linked = defaultdict(list)
-    for linked_key, root_key in opt.cluster_links.items():
-        opt._root_to_linked[root_key].append(linked_key)
+    opt._root_to_copies = defaultdict(list)
+    for copy_idx, root_idx in opt.cluster_links.items():
+        opt._root_to_copies[root_idx].append(copy_idx)
 
     opt.prob = pulp.LpProblem("AutoParallel", pulp.LpMinimize)
     opt.add_default_constraints()
@@ -384,7 +388,7 @@ def _restore_solution(opt, selected_keys_by_name, nodes_by_name):
 
     # Expand cluster links
     for root_key in list(opt.selected_keys):
-        opt.selected_keys.extend(opt._root_to_linked.get(root_key, []))
+        opt.selected_keys.extend(opt._linked_option_keys(root_key))
 
 
 def save_placements(opt, path):
