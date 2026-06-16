@@ -36,11 +36,11 @@ from .graph_passes.graph_utils import (
     update_joint_with_descriptors,
 )
 from .input_validation import (
+    ForwardInputs,
+    _build_input_fn_from_sample,
     _check_forward_args,
-    _compute_expected_inputs,
-    _extract_input_info,
     _flatten_out_shardings,
-    _make_input_fn,
+    flatten_and_convert_inputs_to_local_shapes,
 )
 from .module_construction import make_parallel_module
 from .optimize_sharding import ShardingOptimizer
@@ -92,7 +92,7 @@ def _suppress_wait_tensor_side_effect():
 class JointGraphResult:
     gm: torch.fx.GraphModule
     joint_with_descriptors: Any
-    traced_inputs: list[Any]
+    traced_inputs: "ForwardInputs"
 
 
 def _make_inputs_dynamic(
@@ -135,19 +135,29 @@ def build_joint_graph(
     with fake_mode:
         raw_inputs = input_fn()
 
-    formatted_inputs = raw_inputs if isinstance(raw_inputs, tuple) else (raw_inputs,)
+    if isinstance(raw_inputs, ForwardInputs):
+        traced_inputs = ForwardInputs(
+            args=tuple(raw_inputs.args), kwargs=dict(raw_inputs.kwargs)
+        )
+    elif isinstance(raw_inputs, tuple):
+        traced_inputs = ForwardInputs(args=raw_inputs)
+    else:
+        traced_inputs = ForwardInputs(args=(raw_inputs,))
 
     if fake_mode.shape_env is not None:
-        formatted_inputs = _make_inputs_dynamic(formatted_inputs, fake_mode)
-
-    traced_inputs = list(formatted_inputs)
+        args, kwargs = _make_inputs_dynamic(
+            (traced_inputs.args, traced_inputs.kwargs), fake_mode
+        )
+        traced_inputs = ForwardInputs(args=args, kwargs=kwargs)
 
     with (
         set_dtype_cast(True),
         enable_local_map_wrapping(),
         torch._dynamo.utils._disable_saved_tensors_hooks_during_tracing(),
     ):
-        torch_ir_with_fqn = _dynamo_graph_capture_for_export(model)(*formatted_inputs)
+        torch_ir_with_fqn = _dynamo_graph_capture_for_export(model)(
+            *traced_inputs.args, **traced_inputs.kwargs
+        )
         _restore_state_dict(model, torch_ir_with_fqn)
         _add_unused_params_and_buffers(model, torch_ir_with_fqn)
         # TODO Can't use fake mode here because it clashes with the user level
@@ -155,7 +165,8 @@ def build_joint_graph(
         joint_with_descriptors = aot_export_joint_with_descriptors(
             stack,
             torch_ir_with_fqn,
-            formatted_inputs,
+            traced_inputs.args,
+            traced_inputs.kwargs or None,
             decompositions=decomp_table,
         )
     gm = joint_with_descriptors.graph_module
@@ -543,16 +554,34 @@ class AutoParallel:
             strategy = sharding_placement[node]
             solved_input_placements.append(tuple(strategy.output_specs.placements))
 
-        expected_inputs, dynamic_dims = _compute_expected_inputs(
-            self._traced_inputs, solved_input_placements, self.mesh
+        expected_inputs, dynamic_dims = flatten_and_convert_inputs_to_local_shapes(
+            self._traced_inputs,
+            solved_input_placements,
+            self.mesh,
         )
 
+        # Spec of (args, kwargs) at trace time. Used at runtime to reorder
+        # caller-supplied kwargs back into the canonical leaf order that the
+        # compiled graph expects (matches Dynamo+AOT placeholder order).
+        from torch.export._tree_utils import reorder_kwargs
+
+        trace_in_spec = torch.utils._pytree.tree_flatten(
+            (tuple(self._traced_inputs.args), self._traced_inputs.kwargs)
+        )[1]
+        has_traced_kwargs = bool(self._traced_inputs.kwargs)
+
         def forward(self, *args, **kwargs):
-            # Flatten pytree args (e.g. dicts, nested structures) to tensor
-            # leaves, matching how Dynamo flattened the inputs during tracing.
-            flat_args, _ = torch.utils._pytree.tree_flatten(args)
-            if len(flat_args) != len(expected_inputs):
+            if has_traced_kwargs or kwargs:
+                if kwargs:
+                    kwargs = reorder_kwargs(kwargs, trace_in_spec)
                 flat_args, _ = torch.utils._pytree.tree_flatten((args, kwargs))
+            else:
+                # Positional-only fast path. Flatten args directly so that a
+                # single pytree positional (e.g. a dict batch) keeps working
+                # exactly as before.
+                flat_args, _ = torch.utils._pytree.tree_flatten(args)
+                if len(flat_args) != len(expected_inputs):
+                    flat_args, _ = torch.utils._pytree.tree_flatten((args, kwargs))
             _check_forward_args(flat_args, expected_inputs, dynamic_dims)
             # NB: don't close over the parameters/buffers, as the user may
             # reassign the module!
@@ -561,13 +590,22 @@ class AutoParallel:
             params = [
                 self.get_parameter(fqn).to_local() for fqn in graph_param_fqns
             ] + [self.get_buffer(fqn).to_local() for fqn in graph_buffer_fqns]
-            boxed_args = [*params, *flat_args]
-            del params
             if torch.is_grad_enabled():
-                # NB: don't do self.parallel_model_fn work around Dynamo bug
-                out = parallel_model_fn(boxed_args)
+                # parallel_model_fn is AOT's unflattened wrapper; it calls
+                # `reorder_kwargs(kwargs, in_spec)` and re-flattens
+                # `(args, kwargs)`. We must hand it kwargs by name when the
+                # traced graph had them, otherwise the keyword-mismatch check
+                # rejects the call. For the no-kwargs case keep the historical
+                # single-boxed-list shape so behavior is bit-identical.
+                if has_traced_kwargs:
+                    out = parallel_model_fn(*params, *args, **kwargs)
+                else:
+                    boxed_args = [*params, *flat_args]
+                    out = parallel_model_fn(boxed_args)
             else:
+                boxed_args = [*params, *flat_args]
                 out = _inference_fn(boxed_args)
+            del params
             return out
 
         self.parallel_model = make_parallel_module(
@@ -651,6 +689,14 @@ def auto_parallel(
         ...     "attention_mask": DTensor.from_local(mask, mesh, [Shard(0)]),
         ... }
         >>> parallel_model = auto_parallel(model, mesh, sample_inputs, out_shardings=...)
+
+    Example with keyword-only forward args:
+        >>> from autoparallel import ForwardInputs
+        >>> sample_inputs = ForwardInputs(
+        ...     args=(tokens,),
+        ...     kwargs={"attention_masks": mask, "positions": pos},
+        ... )
+        >>> parallel_model = auto_parallel(model, mesh, sample_inputs, out_shardings=...)
     """
     # Handle callable sample_inputs
     if callable(sample_inputs):
@@ -658,17 +704,10 @@ def auto_parallel(
     else:
         raw_inputs = sample_inputs
 
-    # Extract metadata and placements (does not materialize tensors)
-    shapes, dtypes, input_placements, treespec, devices = _extract_input_info(
-        raw_inputs, mesh
-    )
+    input_fn, input_placements = _build_input_fn_from_sample(raw_inputs, mesh)
 
     # Flatten out_shardings to list
     output_placements = _flatten_out_shardings(out_shardings)
-
-    # Create input_fn that will be called inside FakeTensorMode
-    # It creates fresh tensors (which become fake tensors inside FakeTensorMode)
-    input_fn = _make_input_fn(shapes, dtypes, treespec, devices=devices)
 
     # Use AutoParallel context manager
     with AutoParallel(

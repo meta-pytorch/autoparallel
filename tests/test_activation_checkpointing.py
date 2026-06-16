@@ -309,7 +309,10 @@ def _build_parallel_graph(model_cls, mesh, *, context_fn=None):
 def test_ac_joint_pass_marks_recomputable_nodes(device_mesh_1d):
     """ac_joint_pass sets PREFER_RECOMPUTE on recomputable forward nodes
     (excluding getitem and already-tagged nodes)."""
-    from autoparallel.graph_passes.activation_checkpointing import ac_joint_pass
+    from autoparallel.graph_passes.activation_checkpointing import (
+        AP_AC_GRAPH_ID,
+        ac_joint_pass,
+    )
 
     graph = _build_parallel_graph(AttentionBlockNoAC, device_mesh_1d)
     ac_joint_pass(graph, ac_stage_size_in_GiB=None)
@@ -324,13 +327,11 @@ def test_ac_joint_pass_marks_recomputable_nodes(device_mesh_1d):
         recompute = n.meta.get("recompute")
         if recompute is None:
             continue
-        # All-gather nodes are tagged MUST_RECOMPUTE by
-        # mark_fsdp_all_gather_recomputation (runs unconditionally in AP);
-        # skip them so we only assert on tags set by ac_joint_pass.
+        # AP-owned FSDP all-gather regions use MUST_RECOMPUTE.
         if recompute == CheckpointPolicy.MUST_RECOMPUTE:
             assert (
-                "all_gather" in n.name
-            ), f"{n} has MUST_RECOMPUTE but is not an all-gather node"
+                n.meta.get("ac_graph_id") == AP_AC_GRAPH_ID
+            ), f"{n} has unexpected MUST_RECOMPUTE"
             continue
         assert recompute in (
             CheckpointPolicy.PREFER_RECOMPUTE,

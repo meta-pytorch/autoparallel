@@ -6,9 +6,8 @@
 import torch
 from torch.distributed._tensor.placement_types import DTensorSpec, TensorMeta
 from torch.distributed.tensor._op_schema import OpSpec, OpStrategy
+from torch.distributed.tensor._ops._math_ops import common_reduction_strategy
 from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
-
-from autoparallel.shardings.propagation_rules import _fixed_common_reduction_strategy
 
 
 def _make_tensor_meta(shape, dtype=torch.float32):
@@ -32,7 +31,7 @@ def _output_placements(strategy):
 
 
 class TestReductionStrategyCompleteness:
-    """Verify that the fixed reduction strategy generates Partial outputs
+    """Verify that upstream reduction strategy generates Partial outputs
     for all input strategies where the reduced dims are sharded, not just
     the ones that appear before the first Partial(avg) strategy."""
 
@@ -42,7 +41,7 @@ class TestReductionStrategyCompleteness:
         # S(0)S(1): both sharded dims are in the reduction dims [0, 1].
         # The sum should produce P(sum)P(sum).
         input_strategy = _make_input_strategy(mesh, [(Shard(0), Shard(1))], shape)
-        result = _fixed_common_reduction_strategy(
+        result = common_reduction_strategy(
             input_strategy, reduce_dims=[0, 1], reduction_op="sum"
         )
         out = _output_placements(result)
@@ -55,7 +54,7 @@ class TestReductionStrategyCompleteness:
         # Neither shard dim is in reduce_dims, so output should be S(0)S(0)
         # (dims shift after collapsing dims 0 and 1).
         input_strategy = _make_input_strategy(mesh, [(Shard(2), Shard(2))], shape)
-        result = _fixed_common_reduction_strategy(
+        result = common_reduction_strategy(
             input_strategy, reduce_dims=[0, 1], reduction_op="sum"
         )
         out = _output_placements(result)
@@ -79,7 +78,7 @@ class TestReductionStrategyCompleteness:
             ],
             shape,
         )
-        result = _fixed_common_reduction_strategy(
+        result = common_reduction_strategy(
             input_strategy, reduce_dims=[0, 1], reduction_op="sum"
         )
         out = _output_placements(result)
@@ -105,7 +104,7 @@ class TestReductionStrategyCompleteness:
             ],
             shape,
         )
-        result = _fixed_common_reduction_strategy(
+        result = common_reduction_strategy(
             input_strategy, reduce_dims=[0, 1], reduction_op="sum"
         )
         # With the bug, both strategies collapse to the same output (RR),
@@ -128,7 +127,7 @@ class TestReductionStrategyCompleteness:
             ],
             shape,
         )
-        result = _fixed_common_reduction_strategy(
+        result = common_reduction_strategy(
             input_strategy, reduce_dims=[0, 1], reduction_op="avg"
         )
         out = _output_placements(result)
