@@ -25,7 +25,7 @@ _INDUCTOR_OVERLAP_PATCHES = {
 }
 
 
-class _SaveAllPartitioner(CustomPartitionerFn):
+class _ReplaySavesPartitioner(CustomPartitionerFn):
     """Reproduce the first partitioner's save/recompute decisions via tags.
 
     AutoParallel partitions the joint graph twice: once inside apply_placement
@@ -121,7 +121,7 @@ class _SaveAllPartitioner(CustomPartitionerFn):
             # Inference path (no backward nodes from autograd): fall back to
             # the standard partitioner. Our ap_must_save tags are not used
             # here, but inference doesn't have the fwd/bwd-divergence problem
-            # _SaveAllPartitioner exists to solve.
+            # _ReplaySavesPartitioner exists to solve.
             return default_partition(
                 gm,
                 joint_inputs,
@@ -322,7 +322,7 @@ def autoparallel_backend(
         _INDUCTOR_OVERLAP_PATCHES if overlap_scheduling else None
     )
     inductor_fwd_patches: dict[str, Any] = {
-        "custom_partitioner_fn": _SaveAllPartitioner(),
+        "custom_partitioner_fn": _ReplaySavesPartitioner(),
     }
 
     def backend(gm, example_inputs):

@@ -3,14 +3,14 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Tests for the _SaveAllPartitioner mechanism in autoparallel/compile.py.
+"""Tests for the _ReplaySavesPartitioner mechanism in autoparallel/compile.py.
 
 The mechanism reproduces the first partitioner's save/recompute decisions in
 the second compilation (torch.compile with autoparallel_backend) by:
 
 1. Tagging forward outputs with `ap_must_save` in `_boxed_nop_preserve_node_meta`
 2. `preserve_node_meta` propagates the tags to the second compilation's joint graph
-3. `_SaveAllPartitioner` reads the tags and saves only those nodes
+3. `_ReplaySavesPartitioner` reads the tags and saves only those nodes
 
 Without this machinery, the default min-cut partitioner makes independent
 decisions that diverge from the first partitioner (most importantly, it
@@ -30,7 +30,7 @@ from autoparallel._testing.models.llama3 import Transformer, TransformerModelArg
 from autoparallel.api import _boxed_nop_preserve_node_meta
 from autoparallel.compile import (
     _patch_partitioner_dce,
-    _SaveAllPartitioner,
+    _ReplaySavesPartitioner,
     autoparallel_backend,
 )
 
@@ -120,7 +120,7 @@ def parallel_mod_1d(device_mesh_1d):
 def _capture_partitioner_call(
     parallel_mod, batch_size, seqlen, vocab_size, mesh, enable_ac=False
 ):
-    """Run the second compilation with _SaveAllPartitioner as the
+    """Run the second compilation with _ReplaySavesPartitioner as the
     partition_fn but use identity compilers (no Inductor codegen). This
     keeps the partitioner under test in the loop while skipping the
     expensive Triton kernel compilation.
@@ -136,7 +136,7 @@ def _capture_partitioner_call(
     from autoparallel.compile import _make_ac_joint_pass, _patch_partitioner_dce
 
     captured = {}
-    partitioner = _SaveAllPartitioner()
+    partitioner = _ReplaySavesPartitioner()
 
     def capturing_partition_fn(
         joint_module, joint_inputs, *, num_fwd_outputs, **kwargs
@@ -288,9 +288,9 @@ def _capture_first_partitioner_saves(mesh, n_layers=2, seqlen=128):
 def _saved_names_from_default_compile(
     parallel_mod, batch_size, seqlen, vocab_size, mesh, enable_ac=True
 ):
-    """Compile with the default min-cut partitioner (NOT _SaveAllPartitioner)
+    """Compile with the default min-cut partitioner (NOT _ReplaySavesPartitioner)
     and capture which backward inputs are saved. This is the "without the fix"
-    baseline that motivates _SaveAllPartitioner.
+    baseline that motivates _ReplaySavesPartitioner.
 
     By default this enables AC (joint_custom_pass = ac_joint_pass) — the
     motivating bad case is min-cut + AC tags driving force_save_collectives
@@ -358,7 +358,7 @@ def _simple_partition(saved_node_meta):
     output = graph.output((saved, bwd))
     output.meta["desc"] = [None, None]
     gm = torch.fx.GraphModule(torch.nn.Module(), graph)
-    return _SaveAllPartitioner()(
+    return _ReplaySavesPartitioner()(
         gm, [torch.randn(4), torch.randn(4)], num_fwd_outputs=1
     )
 
@@ -369,7 +369,7 @@ def _multi_output_partition(
     extra_parent_consumer=False,
 ):
     """Build a tiny joint graph with a multi-output forward op (split) and
-    run _SaveAllPartitioner on it.
+    run _ReplaySavesPartitioner on it.
 
     parent_meta is merged into the multi-output op's meta. Optionally tag
     saved_indices on the parent (mirroring what tag_forward does). If
@@ -415,7 +415,7 @@ def _multi_output_partition(
     output = graph.output(output_args)
     output.meta["desc"] = [None] * len(output_args)
     gm = torch.fx.GraphModule(torch.nn.Module(), graph)
-    return _SaveAllPartitioner()(
+    return _ReplaySavesPartitioner()(
         gm,
         [torch.randn(6), torch.randn(6)],
         num_fwd_outputs=num_fwd_outputs,
@@ -500,7 +500,7 @@ def test_boxed_nop_no_tag_forward_default():
     assert add.meta.get("custom", {}).get("ap_must_save") is None
 
 
-def test_save_all_partitioner_saves_ap_must_save_despite_prefer_recompute():
+def test_replay_saves_partitioner_saves_ap_must_save_despite_prefer_recompute():
     fw, bw = _simple_partition(
         {
             "custom": {"ap_must_save": True},
@@ -514,7 +514,7 @@ def test_save_all_partitioner_saves_ap_must_save_despite_prefer_recompute():
     assert "add_tensor" in bw_placeholders
 
 
-def test_save_all_partitioner_honors_must_save():
+def test_replay_saves_partitioner_honors_must_save():
     fw, bw = _simple_partition({"recompute": CheckpointPolicy.MUST_SAVE})
 
     fw_outputs = next(n for n in fw.graph.nodes if n.op == "output").args[0]
@@ -523,7 +523,7 @@ def test_save_all_partitioner_honors_must_save():
     assert "add_tensor" in bw_placeholders
 
 
-def test_save_all_partitioner_does_not_save_must_recompute():
+def test_replay_saves_partitioner_does_not_save_must_recompute():
     fw, bw = _simple_partition(
         {
             "custom": {"ap_must_save": True},
@@ -535,7 +535,7 @@ def test_save_all_partitioner_does_not_save_must_recompute():
     assert "add_tensor" not in bw_placeholders
 
 
-def test_save_all_partitioner_must_recompute_blocks_multi_output_save():
+def test_replay_saves_partitioner_must_recompute_blocks_multi_output_save():
     """MUST_RECOMPUTE on a multi-output op blocks saving its getitem
     children, even when ap_must_save is also set. Documents the invariant
     that the first partitioner's recompute decision wins over its own
@@ -555,7 +555,7 @@ def test_save_all_partitioner_must_recompute_blocks_multi_output_save():
     ), f"MUST_RECOMPUTE should block multi-output save, got: {bw_placeholders}"
 
 
-def test_save_all_partitioner_must_recompute_blocks_opaque_save():
+def test_replay_saves_partitioner_must_recompute_blocks_opaque_save():
     """MUST_RECOMPUTE blocks saving even on nodes that would otherwise be
     saved as opaque. The _must_recompute check must run before is_opaque_node
     so the first partitioner's recompute intent is honored uniformly."""
@@ -574,14 +574,14 @@ def test_save_all_partitioner_must_recompute_blocks_opaque_save():
     output.meta["desc"] = [None, None]
     gm = torch.fx.GraphModule(torch.nn.Module(), graph)
 
-    # Force is_opaque_node to return True for our op. _SaveAllPartitioner
+    # Force is_opaque_node to return True for our op. _ReplaySavesPartitioner
     # imports it from torch._functorch.partitioners, so patch there.
     import torch._functorch.partitioners as partitioners
 
     original = partitioners.is_opaque_node
     partitioners.is_opaque_node = lambda n: n.name == "add_tensor"
     try:
-        fw, bw = _SaveAllPartitioner()(
+        fw, bw = _ReplaySavesPartitioner()(
             gm, [torch.randn(4), torch.randn(4)], num_fwd_outputs=1
         )
     finally:
@@ -596,7 +596,7 @@ def test_save_all_partitioner_must_recompute_blocks_opaque_save():
     )
 
 
-def test_save_all_partitioner_multi_output_with_non_getitem_user():
+def test_replay_saves_partitioner_multi_output_with_non_getitem_user():
     """A multi-output op tagged ap_must_save must save its getitem children
     (not the parent tuple) even when it has a non-getitem user. The save
     logic must look at the node's value type, not just its users."""
@@ -624,7 +624,7 @@ def test_save_all_partitioner_multi_output_with_non_getitem_user():
     )
 
 
-def test_save_all_partitioner_replays_only_indexed_getitems():
+def test_replay_saves_partitioner_replays_only_indexed_getitems():
     """When tag_forward records specific getitem indices on a multi-output
     parent, only those indices should appear as saved backward inputs;
     other indices should not be saved (and would be recomputed if needed).
@@ -668,7 +668,7 @@ def test_save_all_partitioner_replays_only_indexed_getitems():
     output = graph.output((add_fw, bwd0, bwd1))
     output.meta["desc"] = [None, None, None]
     gm = torch.fx.GraphModule(torch.nn.Module(), graph)
-    fw, bw = _SaveAllPartitioner()(
+    fw, bw = _ReplaySavesPartitioner()(
         gm,
         [torch.randn(4), torch.randn(2), torch.randn(2)],
         num_fwd_outputs=1,
@@ -686,7 +686,7 @@ def test_save_all_partitioner_replays_only_indexed_getitems():
     )
 
 
-def test_save_all_partitioner_must_save_overrides_getitem_indices():
+def test_replay_saves_partitioner_must_save_overrides_getitem_indices():
     """MUST_SAVE on a multi-output parent should save ALL getitem children
     even if ap_must_save_getitem_indices restricts to a subset. MUST_SAVE
     is a stronger directive than ap_must_save's index-specific replay."""
@@ -721,7 +721,7 @@ def test_save_all_partitioner_must_save_overrides_getitem_indices():
     output = graph.output((add_fw, bwd0, bwd1))
     output.meta["desc"] = [None, None, None]
     gm = torch.fx.GraphModule(torch.nn.Module(), graph)
-    fw, bw = _SaveAllPartitioner()(
+    fw, bw = _ReplaySavesPartitioner()(
         gm,
         [torch.randn(4), torch.randn(2), torch.randn(2)],
         num_fwd_outputs=1,
@@ -861,7 +861,7 @@ def test_patch_partitioner_dce_allows_wait_tensor_elimination():
 # DeviceMesh._flatten() caching or eager-tensor-materialization in __init__
 # that defeats the existing warmup.
 #
-# Cross-check: test_save_all_partitioner_compile_1d_mesh below passes on CI.
+# Cross-check: test_replay_saves_partitioner_compile_1d_mesh below passes on CI.
 # That path hits the `ndim == 1` short-circuit in
 # _optimize_same_nd_sharding_as_1d and never calls `mesh._flatten()`, which
 # is consistent with the diagnosis. The unit tests above (synthetic FX
@@ -877,11 +877,11 @@ _MESH_FLATTEN_FAKE_XFAIL_REASON = (
 
 @pytest.mark.xfail(reason=_MESH_FLATTEN_FAKE_XFAIL_REASON, strict=False)
 @apply_cuda_patches
-def test_save_all_partitioner_does_not_save_fsdp_wait_tensors(
+def test_replay_saves_partitioner_does_not_save_fsdp_wait_tensors(
     parallel_mod_2d, device_mesh_2d
 ):
     """The whole point of the machinery: with FSDP allgathers tagged
-    MUST_RECOMPUTE, _SaveAllPartitioner should NOT save their wait_tensor
+    MUST_RECOMPUTE, _ReplaySavesPartitioner should NOT save their wait_tensor
     outputs in the backward.
     """
     parallel_mod, batch_size, seqlen, vocab_size = parallel_mod_2d
@@ -924,12 +924,12 @@ def test_save_all_partitioner_does_not_save_fsdp_wait_tensors(
 
 @pytest.mark.xfail(reason=_MESH_FLATTEN_FAKE_XFAIL_REASON, strict=False)
 @apply_cuda_patches
-def test_default_partitioner_diverges_from_save_all_partitioner(
+def test_default_partitioner_diverges_from_replay_saves_partitioner(
     parallel_mod_2d, device_mesh_2d
 ):
     """The default min-cut partitioner produces a different save list than
-    _SaveAllPartitioner when AC is active. This is the motivating reason
-    _SaveAllPartitioner exists: min-cut + AC tags can save FSDP allgather
+    _ReplaySavesPartitioner when AC is active. This is the motivating reason
+    _ReplaySavesPartitioner exists: min-cut + AC tags can save FSDP allgather
     outputs (or other tensors that the first partitioner chose to recompute).
 
     We assert "differ" rather than checking for a specific wait_tensor name
@@ -950,8 +950,8 @@ def test_default_partitioner_diverges_from_save_all_partitioner(
         enable_ac=True,
     )
 
-    # _SaveAllPartitioner with AC enabled in second compilation (our fix)
-    save_all_captured = _capture_partitioner_call(
+    # _ReplaySavesPartitioner with AC enabled in second compilation (our fix)
+    captured = _capture_partitioner_call(
         parallel_mod,
         batch_size,
         seqlen,
@@ -959,29 +959,29 @@ def test_default_partitioner_diverges_from_save_all_partitioner(
         device_mesh_2d,
         enable_ac=True,
     )
-    save_all_saves = save_all_captured["saved_activation_names"]
+    replay_saves = captured["saved_activation_names"]
 
     # The two partitioners pick different things. Equal save count would
     # only happen by coincidence — even when counts match the choice of
     # tensors differs.
     default_set = set(default_saves)
-    save_all_set = set(save_all_saves)
-    only_in_default = default_set - save_all_set
-    only_in_save_all = save_all_set - default_set
-    assert only_in_default or only_in_save_all, (
-        f"Default partitioner and _SaveAllPartitioner produced identical "
+    replay_saves_set = set(replay_saves)
+    only_in_default = default_set - replay_saves_set
+    only_in_replay_saves = replay_saves_set - default_set
+    assert only_in_default or only_in_replay_saves, (
+        f"Default partitioner and _ReplaySavesPartitioner produced identical "
         f"saves ({sorted(default_set)}). If this is reproducible, the "
         f"motivating divergence may have been fixed upstream and "
-        f"_SaveAllPartitioner could be reevaluated."
+        f"_ReplaySavesPartitioner could be reevaluated."
     )
 
 
 @pytest.mark.xfail(reason=_MESH_FLATTEN_FAKE_XFAIL_REASON, strict=False)
 @apply_cuda_patches
-def test_save_all_partitioner_reproduces_first_partitioner_saves(
+def test_replay_saves_partitioner_reproduces_first_partitioner_saves(
     parallel_mod_2d, device_mesh_2d
 ):
-    """_SaveAllPartitioner's saved set should approximately match what the
+    """_ReplaySavesPartitioner's saved set should approximately match what the
     first partitioner chose. The two operate on different graphs (the first
     inside apply_placement, the second inside torch.compile), so we compare
     by tensor shape/dtype histograms rather than node names — names will
@@ -1023,7 +1023,7 @@ def test_save_all_partitioner_reproduces_first_partitioner_saves(
     diff = abs(len(first_saves) - len(second_saves))
     assert diff <= 2, (
         f"First partitioner saved {len(first_saves)} values, but "
-        f"_SaveAllPartitioner saved {len(second_saves)} (diff {diff} > 2). "
+        f"_ReplaySavesPartitioner saved {len(second_saves)} (diff {diff} > 2). "
         f"They should match closely."
     )
 
@@ -1049,7 +1049,9 @@ def test_save_all_partitioner_reproduces_first_partitioner_saves(
 
 @pytest.mark.xfail(reason=_MESH_FLATTEN_FAKE_XFAIL_REASON, strict=False)
 @apply_cuda_patches
-def test_save_all_partitioner_compile_with_ac_enabled(parallel_mod_2d, device_mesh_2d):
+def test_replay_saves_partitioner_compile_with_ac_enabled(
+    parallel_mod_2d, device_mesh_2d
+):
     """End-to-end smoke test: AutoParallel + torch.compile(autoparallel_backend)
     with AC enabled. Exercises the full Inductor pipeline including AC joint
     pass and codegen — kept around so a regression in the backend wiring
@@ -1070,7 +1072,7 @@ def test_save_all_partitioner_compile_with_ac_enabled(parallel_mod_2d, device_me
 
 
 @apply_cuda_patches
-def test_save_all_partitioner_compile_1d_mesh(parallel_mod_1d, device_mesh_1d):
+def test_replay_saves_partitioner_compile_1d_mesh(parallel_mod_1d, device_mesh_1d):
     """The partitioner works with a 1D (FSDP-only) mesh."""
     parallel_mod, batch_size, seqlen, vocab_size = parallel_mod_1d
     backend = autoparallel_backend(enable_ac=False, overlap_scheduling=False)
