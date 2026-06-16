@@ -4,7 +4,6 @@
 # LICENSE file in the root directory of this source tree.
 
 import operator
-from contextlib import contextmanager
 from typing import Any, Optional, Sequence, Union
 
 import torch
@@ -247,33 +246,6 @@ class _ReplaySavesPartitioner(CustomPartitionerFn):
         return None
 
 
-@contextmanager
-def _patch_partitioner_dce():
-    """Patch the partitioner's DCE to allow wait_tensor to be eliminated.
-
-    The partitioner uses its own is_not_collective callback that treats all
-    _c10d_functional ops as impure, overriding _suppress_wait_tensor_side_effect.
-    We patch it to let wait_tensor through so unused collectives get DCE'd.
-    """
-    import torch._functorch.partitioners as partitioners
-
-    original = partitioners.is_not_collective
-
-    def patched_is_not_collective(node):
-        if node.target in (
-            torch.ops._c10d_functional.wait_tensor,
-            torch.ops._c10d_functional.wait_tensor.default,
-        ):
-            return False
-        return original(node)
-
-    partitioners.is_not_collective = patched_is_not_collective
-    try:
-        yield
-    finally:
-        partitioners.is_not_collective = original
-
-
 def _make_ac_joint_pass(
     ac_stage_size_in_GiB: Optional[Union[float, str]] = "auto",
 ):
@@ -328,7 +300,6 @@ def autoparallel_backend(
     def backend(gm, example_inputs):
         with (
             _suppress_wait_tensor_side_effect(),
-            _patch_partitioner_dce(),
             torch._functorch.config.patch(functorch_patches),
             torch._inductor.config.patch(inductor_fwd_patches),
         ):

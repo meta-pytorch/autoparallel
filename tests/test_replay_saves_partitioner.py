@@ -28,11 +28,7 @@ from torch.utils.checkpoint import CheckpointPolicy
 
 from autoparallel._testing.models.llama3 import Transformer, TransformerModelArgs
 from autoparallel.api import _boxed_nop_preserve_node_meta
-from autoparallel.compile import (
-    _patch_partitioner_dce,
-    _ReplaySavesPartitioner,
-    autoparallel_backend,
-)
+from autoparallel.compile import _ReplaySavesPartitioner, autoparallel_backend
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -133,7 +129,7 @@ def _capture_partitioner_call(
       - saved_activation_names: backward inputs that aren't primals or tangents
     """
     from autoparallel.api import _suppress_wait_tensor_side_effect
-    from autoparallel.compile import _make_ac_joint_pass, _patch_partitioner_dce
+    from autoparallel.compile import _make_ac_joint_pass
 
     captured = {}
     partitioner = _ReplaySavesPartitioner()
@@ -185,7 +181,6 @@ def _capture_partitioner_call(
 
     with (
         _suppress_wait_tensor_side_effect(),
-        _patch_partitioner_dce(),
         torch._functorch.config.patch(functorch_patches),
     ):
         compiled = torch.compile(parallel_mod, backend=capture_only_backend)
@@ -793,30 +788,6 @@ def test_preserve_node_meta_propagates_recompute_through_collectives():
             assert (
                 node.meta.get("recompute") == CheckpointPolicy.MUST_RECOMPUTE
             ), f"{name} lost MUST_RECOMPUTE tag through preserve_node_meta"
-
-
-def test_patch_partitioner_dce_allows_wait_tensor_elimination():
-    """_patch_partitioner_dce overrides is_not_collective for wait_tensor,
-    and the override is properly reverted on exit."""
-    import torch._functorch.partitioners as partitioners
-
-    graph = torch.fx.Graph()
-    x = graph.placeholder("x")
-    wt = graph.call_function(torch.ops._c10d_functional.wait_tensor.default, args=(x,))
-    graph.output((wt,))
-
-    original_result = partitioners.is_not_collective(wt)
-
-    with _patch_partitioner_dce():
-        patched_result = partitioners.is_not_collective(wt)
-
-    # After exit, the original function is restored
-    restored_result = partitioners.is_not_collective(wt)
-
-    # Inside the patch, wait_tensor goes through our shortcut
-    assert patched_result is False
-    # And the patch is properly restored
-    assert restored_result == original_result
 
 
 # ---------------------------------------------------------------------------
