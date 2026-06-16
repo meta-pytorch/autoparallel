@@ -18,9 +18,7 @@ Based on PyTorch DTensor implementation:
 """
 
 import collections
-import copy
 import itertools
-import logging
 import math
 import operator
 
@@ -28,11 +26,8 @@ import torch
 from torch.distributed._tensor.placement_types import DTensorSpec, TensorMeta
 from torch.distributed.tensor._op_schema import OpSchema, OpSpec, OpStrategy
 from torch.distributed.tensor._ops._view_ops import (
-    RuntimeSchemaInfo,
     dim_maps,
-    dim_transpose,
     propagate_shape_and_sharding,
-    register_op_strategy_map,
 )
 from torch.distributed.tensor._ops.utils import (
     generate_redistribute_costs,
@@ -47,74 +42,7 @@ from torch.distributed.tensor.placement_types import (
 
 # need to import this to have the dtype_cast registered
 from ..cast_parametrization import dtype_cast  # noqa
-from .dtensor_sharding_helpers import get_op_strategy
-
-logger = logging.getLogger(__name__)
-
-# TODO: move this to PyTorch
-dim_maps[torch.t] = lambda input: dim_transpose(input.ndim, -2, -1)
-
-register_op_strategy_map(
-    torch.ops.aten.t.default, torch.t, schema_info=RuntimeSchemaInfo(1)
-)
-
-
-def _pointwise_strategy(mesh, op_schema):
-    """Generate pointwise sharding strategies for an op.
-
-    Replacement for the removed torch.distributed.tensor._ops._pointwise_ops.pointwise_strategy,
-    reimplemented using the new single-dim strategy primitives. Always produces a single
-    output spec per strategy (matching the old pointwise_strategy behavior), even for
-    multi-output ops like native_layer_norm — callers are expected to construct the
-    per-output specs themselves.
-    """
-    from torch.distributed.tensor._ops._pointwise_ops import (
-        _common_pointwise_single_dim_strategy,
-    )
-    from torch.distributed.tensor._ops.single_dim_strategy import (
-        _fill_single_dim_strategy_placeholders,
-        _insert_single_dim_replication_strategy,
-    )
-    from torch.distributed.tensor._ops.utils import expand_to_full_mesh_op_strategy
-
-    num_outputs = sum(
-        1 for r in op_schema.op._schema.returns if "Tensor" in str(r.type)
-    )
-    num_inputs = sum(1 for arg in op_schema.args_schema if isinstance(arg, OpStrategy))
-
-    strategy_fn = _common_pointwise_single_dim_strategy()
-    strategies_with_placeholders = strategy_fn(
-        op_schema.op, op_schema.args_meta, op_schema.kwargs_meta
-    )
-
-    # _common_pointwise_single_dim_strategy produces num_outputs output entries
-    # per row. Collapse to a single output entry so expand_to_full_mesh_op_strategy
-    # returns a single DTensorSpec in output_specs, matching the old behavior.
-    if num_outputs > 1:
-        strategies_with_placeholders = [
-            row[:1] + row[num_outputs:] for row in strategies_with_placeholders
-        ]
-
-    strategies_with_placeholders = _insert_single_dim_replication_strategy(
-        strategies_with_placeholders, 1, num_inputs
-    )
-
-    # _get_unique_placements assumes each OpStrategy has exactly one strategy
-    # (the single-dim path). In autoparallel, inputs have multiple strategies,
-    # so we collect unique placements from all of them.
-    unique_placements = set()
-    for arg in op_schema.args_schema:
-        if isinstance(arg, OpStrategy):
-            for strat in arg.strategies:
-                unique_placements.update(strat.output_spec.placements)
-
-    single_dim_strategies = _fill_single_dim_strategy_placeholders(
-        unique_placements, strategies_with_placeholders
-    )
-    return expand_to_full_mesh_op_strategy(
-        mesh, op_schema, single_dim_strategies, input_index=1
-    )
-
+from .dtensor_sharding_helpers import _try_single_dim_strategy, get_op_strategy
 
 _op_rules = {}
 
@@ -583,156 +511,6 @@ def factory_rule(mesh, op_schema: OpSchema) -> OpStrategy:
     return OpStrategy(all_strategies)
 
 
-# ======================================
-# the following ops require meta_tensor fix
-
-
-@register_rule(torch.ops.aten.native_layer_norm.default)
-def native_layer_norm_rule(mesh, op_schema):
-    from torch.distributed.tensor._ops._math_ops import (
-        Sequence,
-        normalize_to_torch_size,
-    )
-
-    assert len(op_schema.args_schema) == 5
-    (
-        input_strategy,
-        normalized_shape,
-        weight_strategy,
-        bias_strategy,
-        _,
-    ) = op_schema.args_schema
-
-    assert isinstance(input_strategy, OpStrategy)
-    assert isinstance(normalized_shape, (int, Sequence, torch.Size))
-    normalized_size = normalize_to_torch_size(normalized_shape)
-
-    input_ndim = input_strategy.ndim
-    axis = input_ndim - len(normalized_size)
-
-    output_strategy = _pointwise_strategy(mesh, op_schema)
-
-    # now let's remove the cases that are invalid, as they require
-    # reduction on a sharded dimension
-    kept = []
-    for strategy in output_strategy.strategies:
-        is_valid = True
-        for plc in strategy.input_specs[0].placements:
-            if plc.is_shard() and plc.dim >= axis:
-                is_valid = False
-                break
-        if is_valid:
-            output_spec = strategy.output_specs
-            input_spec = strategy.input_specs[0]
-            mesh = strategy.mesh
-
-            # Create output tensor_meta with same shape as input but contiguous strides
-            # (LayerNorm forward returns contiguous tensor even if input was non-contiguous)
-            output_tensor_meta = _gen_tensor_meta(
-                input_spec.tensor_meta.shape, input_spec.tensor_meta.dtype
-            )
-            output_spec = DTensorSpec(
-                mesh=mesh,
-                placements=output_spec.placements,
-                tensor_meta=output_tensor_meta,
-            )
-
-            # the output spec is the same as input spec
-            shape = input_spec.tensor_meta.shape[:axis] + (1,) * len(normalized_size)
-            mean_std_tgt_spec = DTensorSpec(
-                mesh=mesh,
-                placements=output_spec.placements,
-                tensor_meta=_gen_tensor_meta(shape),
-            )
-            output_target_spec = (
-                output_spec,
-                mean_std_tgt_spec,
-                mean_std_tgt_spec,
-            )
-            if len(output_target_spec) == 1:
-                output_target_spec = output_target_spec[0]
-            strategy.output_specs = output_target_spec
-            kept.append(strategy)
-
-    return OpStrategy(kept)
-
-
-@register_rule(torch.ops.aten.native_layer_norm_backward.default)
-def native_layer_norm_backward_rule(mesh, op_schema):
-    from torch.distributed.tensor._ops._math_ops import (
-        Sequence,
-        normalize_to_torch_size,
-    )
-
-    assert len(op_schema.args_schema) == 8
-    (
-        grad_out_strategy,
-        input_strategy,
-        normalized_shape,
-        mean_strategy,
-        rstd_strategy,
-        weight_strategy,
-        bias_strategy,
-        _,
-    ) = op_schema.args_schema
-
-    assert isinstance(input_strategy, OpStrategy)
-    assert isinstance(normalized_shape, (int, Sequence, torch.Size))
-    normalized_size = normalize_to_torch_size(normalized_shape)
-
-    input_ndim = input_strategy.ndim
-    axis = input_ndim - len(normalized_size)
-
-    output_strategy = _pointwise_strategy(mesh, op_schema)
-
-    # now let's remove the cases that are invalid, as they require
-    # reduction on a sharded dimension
-    kept = []
-    for strategy in output_strategy.strategies:
-        is_valid = True
-        input_spec = strategy.input_specs[1]
-        for plc in input_spec.placements:
-            if plc.is_shard() and plc.dim >= axis:
-                is_valid = False
-                break
-        if is_valid:
-            mesh = strategy.mesh
-            # Create grad_input tensor_meta with same shape as input but contiguous strides
-            # (LayerNorm backward returns contiguous gradient even if input was non-contiguous)
-            grad_input_tensor_meta = _gen_tensor_meta(
-                input_spec.tensor_meta.shape, input_spec.tensor_meta.dtype
-            )
-            grad_input_spec = DTensorSpec(
-                mesh=mesh,
-                placements=strategy.output_specs.placements,
-                tensor_meta=grad_input_tensor_meta,
-            )
-            assert grad_input_spec.tensor_meta is not None
-            weight_spec = strategy.input_specs[4]
-            bias_spec = strategy.input_specs[5]
-            weight_tgt_spec = DTensorSpec(
-                mesh=mesh,
-                placements=weight_spec.placements,
-                tensor_meta=weight_spec.tensor_meta,
-            )
-            bias_tgt_spec = DTensorSpec(
-                mesh=mesh,
-                placements=bias_spec.placements,
-                tensor_meta=bias_spec.tensor_meta,
-            )
-            output_target_spec = (
-                grad_input_spec,
-                weight_tgt_spec,
-                bias_tgt_spec,
-            )
-            if len(output_target_spec) == 1:
-                output_target_spec = output_target_spec[0]
-            strategy.output_specs = output_target_spec
-            kept.append(strategy)
-
-    return OpStrategy(kept)
-
-
 @register_rule(
     [
         torch.ops.prims.convert_element_type.default,
@@ -746,40 +524,6 @@ def convert_element_type_rule(mesh, op_schema):
 
     out_strat = propagate_single_input_strategy(op_schema)
     return out_strat
-
-
-@register_rule(torch.ops.aten.constant_pad_nd.default)
-def constant_pad_nd_rule(mesh, op_schema):
-    from torch.distributed.tensor._ops._tensor_ops import (
-        propagate_single_input_strategy,
-    )
-
-    out_strat = propagate_single_input_strategy(op_schema)
-    pad = op_schema.args_schema[1]
-    ndim = len(out_strat.strategies[0].output_specs.tensor_meta.shape)
-    dims_to_remove = [
-        ndim - i - 1
-        for i in range(len(pad) // 2)
-        if pad[i * 2] != 0 or pad[i * 2 + 1] != 0
-    ]
-
-    to_remove = []
-    filtered_strats = []
-    for idx, strat in enumerate(out_strat.strategies):
-        remove_this = False
-        for plc in strat.output_specs.placements:
-            if plc.is_shard() and plc.dim in dims_to_remove:
-                to_remove.append(idx)
-                remove_this = True
-                break
-        if not remove_this:
-            filtered_strats.append(strat)
-
-    for strat in filtered_strats:
-        for idx in to_remove:
-            strat.redistribute_cost[0][idx] = math.inf
-
-    return OpStrategy(filtered_strats)
 
 
 @register_rule(torch.ops.aten.split.Tensor)
@@ -808,61 +552,44 @@ def _unsafe_index_rule(mesh, op_schema):
     raise NotImplementedError()
 
 
-@register_rule(torch.ops.aten.reshape.default)
-def reshape_rule(mesh, op_schema):
-    op = torch.ops.aten.reshape.default
-    out_strat = get_op_strategy(op, op_schema)
-    if mesh.ndim == 1:
-        # remove duplicate strategy
-        # TODO: hack, fixme
-        if len(out_strat.strategies) > 2 and str(out_strat.strategies[2]) == str(
-            out_strat.strategies[0]
-        ):
-            logger.debug("removing")
-            out_strat.strategies.pop(2)
-    return out_strat
+def _einsum_single_dim_strategy(op, args_schema, kwargs_schema):
+    from torch.distributed.tensor._ops._matrix_ops import (
+        gen_single_dim_einsum_strategies,
+    )
 
+    equation, input_metas = args_schema
+    assert isinstance(equation, str)
+    assert isinstance(input_metas, tuple)
+    assert len(input_metas) == 2, "Only two args to einsum supported for now"
 
-@register_rule(torch.ops.aten.expand.default)
-def expand_rule(mesh, op_schema_):
-    op = torch.ops.aten.expand.default
-    from torch._subclasses.fake_tensor import unset_fake_temporarily
-
-    with unset_fake_temporarily():
-        op_schema = copy.deepcopy(op_schema_)
-    input_strat = op_schema.args_schema[0]
-    orig_shape = input_strat.strategies[0].output_specs.tensor_meta.shape
-    dest_shape = op_schema.args_schema[1]
-    expand_dims = [
-        i
-        for i, (s1, s2) in enumerate(zip(orig_shape, dest_shape))
-        if s1 == 1 and s2 != s1
+    # ignore strategies with Partial inputs.
+    return [
+        strategy
+        for strategy in gen_single_dim_einsum_strategies(equation)
+        if not any(isinstance(placement, Partial) for placement in strategy[1:])
     ]
-    if len(expand_dims) == 0:
-        return get_op_strategy(op, op_schema)
-    to_remove = []
-    for expand_dim in expand_dims:
-        for i, ss in enumerate(input_strat.strategies):
-            for plc in ss.output_spec.placements:
-                if plc.is_shard(expand_dim) and i not in to_remove:
-                    # need to remove this and add back afterwards
-                    to_remove.append(i)
-                    break
 
-    removed = []
-    for i in reversed(to_remove):
-        removed.append(input_strat.strategies.pop(i))
-    out_strat = get_op_strategy(op, op_schema)
-    for i, ss in enumerate(out_strat.strategies):
-        for remov in to_remove:
-            ss.redistribute_cost[0].insert(remov, math.inf)
-    return out_strat
+
+def _register_einsum_single_dim_strategy():
+    from torch.distributed.tensor import DTensor
+    from torch.distributed.tensor._ops.single_dim_strategy import (
+        register_single_dim_strategy,
+    )
+
+    op = torch.ops.aten.einsum.default
+    propagator = DTensor._op_dispatcher.sharding_propagator
+    if op not in propagator.op_single_dim_strategy_funcs:
+        register_single_dim_strategy(op, allow_unbacked_sharding=True)(
+            _einsum_single_dim_strategy
+        )
+
+
+_register_einsum_single_dim_strategy()
 
 
 @register_rule(torch.ops.aten.einsum.default)
 def einsum_rule(mesh, op_schema):
     from torch.distributed.tensor._op_schema import TupleStrategy
-    from torch.distributed.tensor._ops._matrix_ops import _mm_like_strategy
 
     mm_equation, mat_strategy = op_schema.args_schema
     assert isinstance(mm_equation, str)
@@ -870,54 +597,9 @@ def einsum_rule(mesh, op_schema):
 
     assert len(mat_strategy.children) == 2, "Only two args to einsum supported for now"
 
-    self_strategy, mat2_strategy = mat_strategy.children
-
-    # dispatch to mm_like_strategy
-    new_op_schema = OpSchema(
-        torch.ops.aten.einsum.default,
-        args_schema=(self_strategy, mat2_strategy),
-        kwargs_schema={},
-    )
-    return _mm_like_strategy(mm_equation, mesh, new_op_schema)
-
-
-@register_rule(torch.ops.aten.scatter.src)
-def scatter_strategy(mesh, op_schema: OpSchema):
-    # taken from scatter_add strategy from PyTorch
-    from torch.distributed.tensor._ops._tensor_ops import (
-        PlacementList,
-        expand_to_full_mesh_op_strategy,
-        normalize_dim,
-    )
-
-    input_strategy = op_schema.args_schema[0]
-    dim = op_schema.args_schema[1]
-    index_strategy = op_schema.args_schema[2]
-
-    assert isinstance(input_strategy, OpStrategy)
-    assert isinstance(index_strategy, OpStrategy)
-    assert isinstance(dim, int)
-    dim = normalize_dim(dim, input_strategy.ndim)
-    mesh = input_strategy.mesh
-    input_shape = input_strategy.shape
-    index_shape = index_strategy.shape
-
-    single_mesh_dim_strategies = []
-
-    # placement list stores placements of [output, input, index, src]
-    # first we always have replicate all for inputs and output
-    all_replicate: PlacementList = [Replicate()] * 4
-    single_mesh_dim_strategies.append(all_replicate)
-
-    if len(input_shape) == len(index_shape):
-        for d in range(len(input_shape)):
-            if d != dim and input_shape[d] == index_shape[d]:
-                sharding: PlacementList = [Shard(d), Shard(d), Shard(d), Shard(d)]
-                single_mesh_dim_strategies.append(sharding)
-
-    return expand_to_full_mesh_op_strategy(
-        mesh, op_schema, single_mesh_dim_strategies, input_index=1
-    )
+    out_strat = _try_single_dim_strategy(torch.ops.aten.einsum.default, op_schema)
+    assert out_strat is not None
+    return out_strat
 
 
 @register_rule(torch.ops.aten.stack.default)
@@ -967,64 +649,6 @@ def stack_strategy(mesh, op_schema: OpSchema):
 
 
 # ======================================
-# Convolution ops
-
-
-@register_rule(torch.ops.aten.convolution.default)
-def convolution_strategy(mesh, op_schema: OpSchema):
-    from torch.distributed.tensor._ops.utils import expand_to_full_mesh_op_strategy
-
-    bias_strategy = op_schema.args_schema[2]
-    has_bias = isinstance(bias_strategy, OpStrategy)
-
-    # Placement list: [output, input, weight, (bias)]
-    single_mesh_dim_strategies: list[list[Placement | None]] = []
-
-    n = 4 if has_bias else 3
-    single_mesh_dim_strategies.append([Replicate()] * n)
-
-    # Batch shard: input/output on dim 0, weight/bias replicated
-    batch_shard: list[Placement | None] = [Shard(0), Shard(0), Replicate()]
-    if has_bias:
-        batch_shard.append(Replicate())
-    single_mesh_dim_strategies.append(batch_shard)
-
-    return expand_to_full_mesh_op_strategy(
-        mesh, op_schema, single_mesh_dim_strategies, input_index=1
-    )
-
-
-@register_rule(torch.ops.aten.convolution_backward.default)
-def convolution_backward_strategy(mesh, op_schema: OpSchema):
-    from torch.distributed.tensor._ops.utils import expand_to_full_mesh_op_strategy
-
-    bias_shape_opt = op_schema.args_schema[3]
-    has_bias = bias_shape_opt is not None
-
-    # Outputs: grad_input, grad_weight, grad_bias (3)
-    # Inputs (tensor): grad_output, input, weight (3)
-    # Placement list: [grad_input, grad_weight, grad_bias, grad_output, input, weight]
-    single_mesh_dim_strategies: list[list[Placement | None]] = []
-
-    if has_bias:
-        single_mesh_dim_strategies.append([Replicate()] * 6)
-        single_mesh_dim_strategies.append(
-            [Shard(0), Partial(), Partial(), Shard(0), Shard(0), Replicate()]
-        )
-    else:
-        single_mesh_dim_strategies.append(
-            [Replicate(), Replicate(), None, Replicate(), Replicate(), Replicate()]
-        )
-        single_mesh_dim_strategies.append(
-            [Shard(0), Partial(), None, Shard(0), Shard(0), Replicate()]
-        )
-
-    return expand_to_full_mesh_op_strategy(
-        mesh, op_schema, single_mesh_dim_strategies, input_index=3
-    )
-
-
-# ======================================
 # Random ops
 
 
@@ -1046,249 +670,3 @@ def uniform_strategy(mesh, op_schema: OpSchema):
     return expand_to_full_mesh_op_strategy(
         mesh, op_schema, single_mesh_dim_strategies, input_index=1
     )
-
-
-# ======================================
-# Scatter ops
-
-
-@register_rule(torch.ops.aten.diagonal_scatter.default)
-def diagonal_scatter_strategy(mesh, op_schema: OpSchema):
-    from torch.distributed.tensor._ops.utils import (
-        expand_to_full_mesh_op_strategy,
-        normalize_dim,
-    )
-
-    input_strategy = op_schema.args_schema[0]
-    assert isinstance(input_strategy, OpStrategy)
-    ndim = input_strategy.ndim
-
-    dim1 = op_schema.args_schema[3] if len(op_schema.args_schema) > 3 else 0
-    dim2 = op_schema.args_schema[4] if len(op_schema.args_schema) > 4 else 1
-    assert isinstance(dim1, int)
-    assert isinstance(dim2, int)
-    dim1 = normalize_dim(dim1, ndim)
-    dim2 = normalize_dim(dim2, ndim)
-    min_d, max_d = min(dim1, dim2), max(dim1, dim2)
-
-    # [output, input, src]
-    single_mesh_dim_strategies: list[list[Placement | None]] = [[Replicate()] * 3]
-    for d in range(ndim):
-        if d == dim1 or d == dim2:
-            continue
-        # src shape has dim1/dim2 removed, diagonal appended
-        removed = (1 if d > min_d else 0) + (1 if d > max_d else 0)
-        single_mesh_dim_strategies.append([Shard(d), Shard(d), Shard(d - removed)])
-
-    return expand_to_full_mesh_op_strategy(
-        mesh, op_schema, single_mesh_dim_strategies, input_index=1
-    )
-
-
-@register_rule(torch.ops.aten.select_scatter.default)
-def select_scatter_strategy(mesh, op_schema: OpSchema):
-    from torch.distributed.tensor._ops.utils import (
-        expand_to_full_mesh_op_strategy,
-        normalize_dim,
-    )
-
-    input_strategy = op_schema.args_schema[0]
-    assert isinstance(input_strategy, OpStrategy)
-    ndim = input_strategy.ndim
-    dim = op_schema.args_schema[2]
-    assert isinstance(dim, int)
-    dim = normalize_dim(dim, ndim)
-
-    # [output, input, src]
-    single_mesh_dim_strategies: list[list[Placement | None]] = [[Replicate()] * 3]
-    for d in range(ndim):
-        if d == dim:
-            continue
-        # src has the select dim removed
-        single_mesh_dim_strategies.append(
-            [Shard(d), Shard(d), Shard(d if d < dim else d - 1)]
-        )
-
-    return expand_to_full_mesh_op_strategy(
-        mesh, op_schema, single_mesh_dim_strategies, input_index=1
-    )
-
-
-# ======================================
-# Indexing ops
-
-
-@register_rule(torch.ops.aten.index.Tensor)
-def index_strategy(mesh, op_schema: OpSchema):
-    from torch.distributed.tensor._op_schema import TupleStrategy
-    from torch.distributed.tensor._ops.utils import expand_to_full_mesh_op_strategy
-
-    self_strategy = op_schema.args_schema[0]
-    indices_schema = op_schema.args_schema[1]
-    assert isinstance(self_strategy, OpStrategy)
-    ndim = self_strategy.ndim
-
-    if not isinstance(indices_schema, TupleStrategy):
-        n_inputs = len(op_schema.args_strategy)
-        strats: list[list[Placement | None]] = [[Replicate()] * (1 + n_inputs)]
-        return expand_to_full_mesh_op_strategy(mesh, op_schema, strats, input_index=1)
-
-    indexed_dims = []
-    index_strategies = []
-    for i, child in enumerate(indices_schema.children):
-        if isinstance(child, OpStrategy):
-            indexed_dims.append(i)
-            index_strategies.append(child)
-
-    n_idx = len(index_strategies)
-    consecutive = len(indexed_dims) <= 1 or all(
-        indexed_dims[i + 1] - indexed_dims[i] == 1 for i in range(len(indexed_dims) - 1)
-    )
-    broadcast_ndim = max(s.ndim for s in index_strategies)
-    insert_at = indexed_dims[0] if consecutive else 0
-
-    # [output, self, idx1, idx2, ...]
-    n_entries = 2 + n_idx
-    single_mesh_dim_strategies: list[list[Placement | None]] = [
-        [Replicate()] * n_entries
-    ]
-
-    for d in range(ndim):
-        if d in indexed_dims:
-            continue
-
-        # Map self dim d to output dim
-        if consecutive:
-            if d < insert_at:
-                out_d = d
-            else:
-                out_d = d - len(indexed_dims) + broadcast_ndim
-        else:
-            shift = sum(1 for idx_d in indexed_dims if idx_d < d)
-            out_d = broadcast_ndim + d - shift
-
-        single_mesh_dim_strategies.append(
-            [Shard(out_d), Shard(d)] + [Replicate()] * n_idx
-        )
-
-    return expand_to_full_mesh_op_strategy(
-        mesh, op_schema, single_mesh_dim_strategies, input_index=1
-    )
-
-
-# ---------------------------------------------------------------------------
-# Workaround for upstream DTensor bug in common_reduction_strategy:
-# the `reduction_linear` flag is cumulative across strategies — once a
-# Partial(avg) strategy flips it to False, all subsequent strategies
-# (including valid ones like S(0)S(1)) are forced through
-# replicate_reduction_dims and collapse to RR.  This prevents the
-# optimizer from discovering the cheap reduce-scatter path for weight
-# gradient reductions.
-#
-# We re-register the linear-reduction ops with a fixed version that
-# resets reduction_linear per strategy.
-# ---------------------------------------------------------------------------
-
-
-def _fixed_common_reduction_strategy(
-    input_strategy,
-    reduce_dims,
-    keep_dim=False,
-    reduction_linear=True,
-    reduction_op="sum",
-):
-    from torch.distributed.tensor._ops._math_ops import (
-        _infer_reduce_dims_map,
-        map_placements_after_reduction,
-        replicate_reduction_dims,
-    )
-
-    reduction_strategy = OpStrategy([])
-
-    for op_spec in input_strategy.strategies:
-        # Per-strategy reset: the flag should not leak across strategies.
-        spec_reduction_linear = reduction_linear
-
-        if reduction_op == "avg":
-            from torch.distributed.tensor._ops.utils import (
-                is_tensor_evenly_shardable_on_dim,
-            )
-
-            output_spec = op_spec.output_spec
-            local_shape = list(output_spec.tensor_meta.shape)
-            for dim in reduce_dims:
-                if not is_tensor_evenly_shardable_on_dim(local_shape, output_spec, dim):
-                    spec_reduction_linear = False
-                    break
-
-        for p in op_spec.output_spec.placements:
-            if isinstance(p, Partial) and p.reduce_op != reduction_op:
-                spec_reduction_linear = False
-                break
-
-        if not spec_reduction_linear:
-            input_placements = replicate_reduction_dims(
-                op_spec.output_spec.placements, reduce_dims
-            )
-        else:
-            input_placements = op_spec.output_spec.placements
-
-        input_spec = DTensorSpec(
-            mesh=input_strategy.mesh,
-            placements=input_placements,
-            tensor_meta=op_spec.output_spec.tensor_meta,
-        )
-
-        reduce_dims_map = _infer_reduce_dims_map(reduce_dims, input_spec.ndim, keep_dim)
-        out_placements = map_placements_after_reduction(
-            input_spec.placements, reduce_dims, reduce_dims_map, reduction_op
-        )
-        redistribute_cost = [generate_redistribute_costs(input_strategy, input_spec)]
-        reduction_strategy.strategies.append(
-            OpSpec(
-                output_specs=DTensorSpec(
-                    mesh=input_strategy.mesh,
-                    placements=out_placements,
-                ),
-                input_specs=(input_spec,),
-                redistribute_cost=redistribute_cost,
-            )
-        )
-
-    return reduction_strategy
-
-
-def _fixed_linear_reduction_rule(mesh, op_schema):
-    from torch.distributed.tensor._ops._math_ops import (
-        LINEAR_REDUCTION_OP_MAP,
-        _infer_reduction_dims,
-    )
-
-    args_schema = op_schema.args_schema
-    input_strategy = args_schema[0]
-
-    dims = None
-    if len(args_schema) > 1:
-        dims = _infer_reduction_dims(args_schema[1], input_strategy.ndim)
-
-    reduce_dims = list(range(input_strategy.ndim)) if dims is None else dims
-    keep_dim = len(args_schema) > 2 and bool(args_schema[2])
-    reduction_op = LINEAR_REDUCTION_OP_MAP[op_schema.op]
-
-    return _fixed_common_reduction_strategy(
-        input_strategy,
-        reduce_dims,
-        keep_dim=keep_dim,
-        reduction_linear=True,
-        reduction_op=reduction_op,
-    )
-
-
-def _register_fixed_reduction_rules():
-    from torch.distributed.tensor._ops._math_ops import LINEAR_REDUCTION_OP_MAP
-
-    for op in LINEAR_REDUCTION_OP_MAP:
-        _op_rules[op] = _fixed_linear_reduction_rule
-
-
-_register_fixed_reduction_rules()

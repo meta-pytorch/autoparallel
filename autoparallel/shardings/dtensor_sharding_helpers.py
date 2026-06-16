@@ -306,6 +306,8 @@ def _try_single_dim_strategy(
         resolved,
         input_index=num_outputs,
         output_tensor_meta=out_tensor_meta,
+        allow_unbacked_sharding=single_dim_info.allow_unbacked_sharding,
+        allow_uneven_sharding=single_dim_info.allow_uneven_sharding,
     )
 
     # Recompute redistribute costs against autoparallel's multi-entry input

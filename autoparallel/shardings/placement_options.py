@@ -317,7 +317,12 @@ def get_placement_options(mesh, op, specs, user_args, user_kwargs):
             strat.append(spec)
     strat = tuple(strat)
 
-    op_schema = OpSchema(op, strat, {}, RuntimeSchemaInfo(needs_pytree=needs_pytree))
+    op_schema = OpSchema(
+        op,
+        strat,
+        dict(user_kwargs),
+        RuntimeSchemaInfo(needs_pytree=needs_pytree),
+    )
 
     t0 = time.perf_counter()
     if op in _op_rules:
