@@ -4,6 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import copy
+import json
 import logging
 import operator
 import time
@@ -397,7 +398,7 @@ class AutoParallel:
         self.sharding_optimizer.add_sharded_output_constraint(constraints)
         self.output_constraints = constraints
 
-    def optimize_placement(self, verbose=True):
+    def optimize_placement(self, verbose=False):
         self._assert_entered()
 
         self.sharding_placement = self.sharding_optimizer.get_solution(verbose=False)
@@ -425,6 +426,15 @@ class AutoParallel:
                 "constraints, and consider relaxing input/output constraints or "
                 "using a larger mesh."
             )
+
+        trace_structured(
+            "artifact",
+            metadata_fn=lambda: {
+                "name": "autoparallel_solution",
+                "encoding": "json",
+            },
+            payload_fn=lambda: json.dumps(self.sharding_optimizer.get_json()),
+        )
 
         return self.sharding_placement
 
