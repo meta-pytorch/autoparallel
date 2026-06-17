@@ -23,6 +23,7 @@ Usage:
 import argparse
 import logging
 import math
+import os
 import time
 
 import torch
@@ -170,7 +171,9 @@ def main():
         autop.add_input_constraints(input_constraints)
         autop.add_parameter_memory_constraint(low=None, high=None)
 
-        sharding_placement = autop.optimize_placement(verbose=True)
+        sharding_placement = autop.optimize_placement(
+            verbose=bool(int(os.environ.get("AUTOPARALLEL_VERBOSE", "0")))
+        )
         parallel_mod = autop.apply_placement(sharding_placement)
 
     print(f"\nAutoParallel pipeline completed in {time.time() - t0:.2f}s")

@@ -4,6 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
+import os
 import time
 from functools import partial
 
@@ -259,7 +260,9 @@ with AutoParallel(model, input_fn, mesh, mp_policy, repeated_subgraphs=True) as 
         torch._inductor.config.post_grad_custom_post_pass = _pass
 
     t = time.time()
-    sharding_placement = autop.optimize_placement(verbose=True)
+    sharding_placement = autop.optimize_placement(
+        verbose=bool(int(os.environ.get("AUTOPARALLEL_VERBOSE", "0")))
+    )
     print(f"Took {time.time() - t:.2f} s")
     parallel_mod = autop.apply_placement(sharding_placement)
 

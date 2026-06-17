@@ -54,7 +54,7 @@ jobs:
         pip install --quiet .
         run_timed() { local start=$SECONDS; "$@"; echo "$* : $((SECONDS - start))s" >> /tmp/timings.txt; }
         run_timed python examples/example_autoparallel.py
-        run_timed python examples/example_llama3.py
+        run_timed env AUTOPARALLEL_VERBOSE=1 python examples/example_llama3.py
         run_timed python examples/example_local_map.py
         echo "========== Timings =========="
         cat /tmp/timings.txt
