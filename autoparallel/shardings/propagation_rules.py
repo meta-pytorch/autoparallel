@@ -21,17 +21,26 @@ import collections
 import itertools
 import math
 import operator
+from typing import cast
 
 import torch
 from torch.distributed._tensor.placement_types import DTensorSpec, TensorMeta
-from torch.distributed.tensor._op_schema import OpSchema, OpSpec, OpStrategy
+from torch.distributed.tensor._op_schema import (
+    OpSchema,
+    OpSpec,
+    OpStrategy,
+    PlacementList,
+    TupleStrategy,
+)
 from torch.distributed.tensor._ops._view_ops import (
     dim_maps,
     propagate_shape_and_sharding,
 )
 from torch.distributed.tensor._ops.utils import (
+    expand_to_full_mesh_op_strategy,
     generate_redistribute_costs,
     is_tensor_shardable,
+    normalize_dim,
 )
 from torch.distributed.tensor.placement_types import (
     Partial,
@@ -78,6 +87,40 @@ def _gen_tensor_meta(shape, dtype=None):
 def _build_meta_tensor(tensor_meta):
     return torch.empty_strided(
         tensor_meta.shape, tensor_meta.stride, dtype=tensor_meta.dtype, device="meta"
+    )
+
+
+def propagate_single_input_strategy(op_schema):
+    if len([s for s in op_schema.args_schema if isinstance(s, OpStrategy)]) != 1:
+        raise AssertionError(
+            "propagate_single_input_strategy only works for single-tensor-input ops"
+        )
+    first_input_strategy = op_schema.args_schema[0]
+    if not isinstance(first_input_strategy, OpStrategy):
+        raise AssertionError(f"Expected OpStrategy, got {type(first_input_strategy)}")
+    return OpStrategy(
+        [
+            OpSpec(
+                output_specs=DTensorSpec(
+                    mesh=first_input_strategy.mesh,
+                    placements=strategy.output_spec.placements,
+                    tensor_meta=strategy.output_spec.tensor_meta,
+                ),
+                input_specs=[
+                    DTensorSpec(
+                        mesh=first_input_strategy.mesh,
+                        placements=strategy.output_spec.placements,
+                        tensor_meta=strategy.output_spec.tensor_meta,
+                    )
+                ],
+                redistribute_cost=[
+                    generate_redistribute_costs(
+                        first_input_strategy, strategy.output_spec
+                    )
+                ],
+            )
+            for strategy in first_input_strategy.strategies
+        ]
     )
 
 
@@ -518,32 +561,7 @@ def factory_rule(mesh, op_schema: OpSchema) -> OpStrategy:
     ]
 )
 def convert_element_type_rule(mesh, op_schema):
-    from torch.distributed.tensor._ops._tensor_ops import (
-        propagate_single_input_strategy,
-    )
-
     out_strat = propagate_single_input_strategy(op_schema)
-    return out_strat
-
-
-@register_rule(torch.ops.aten.split.Tensor)
-def split_rule(mesh, op_schema):
-    strat = op_schema.args_schema
-    op = torch.ops.aten.split.Tensor
-    from torch.distributed.tensor._ops._tensor_ops import split_strategy
-
-    op_schema = OpSchema(op, (strat[0], strat[1], strat[2]), {})
-    upstream_strat = split_strategy(op_schema)
-
-    res = []
-    n_input_strats = len(strat[0].strategies)
-    for i, os in enumerate(upstream_strat.strategies):
-        s = OpSpec(os.output_specs, input_specs=os.input_specs)
-        s.redistribute_cost = [[math.inf] * n_input_strats]
-        s.redistribute_cost[0][i] = 0.0
-        res.append(s)
-
-    out_strat = OpStrategy(res)
     return out_strat
 
 
@@ -589,8 +607,6 @@ _register_einsum_single_dim_strategy()
 
 @register_rule(torch.ops.aten.einsum.default)
 def einsum_rule(mesh, op_schema):
-    from torch.distributed.tensor._op_schema import TupleStrategy
-
     mm_equation, mat_strategy = op_schema.args_schema
     assert isinstance(mm_equation, str)
     assert isinstance(mat_strategy, TupleStrategy)
@@ -604,14 +620,6 @@ def einsum_rule(mesh, op_schema):
 
 @register_rule(torch.ops.aten.stack.default)
 def stack_strategy(mesh, op_schema: OpSchema):
-    from torch.distributed.tensor._ops._tensor_ops import (
-        PlacementList,
-        TupleStrategy,
-        cast,
-        expand_to_full_mesh_op_strategy,
-        normalize_dim,
-    )
-
     input_tuple_strategy = op_schema.args_schema[0]
     assert isinstance(input_tuple_strategy, TupleStrategy)
 
