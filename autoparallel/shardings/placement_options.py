@@ -30,7 +30,14 @@ from torch.utils._pytree import tree_flatten, tree_map_only
 from autoparallel.shardings.propagation_rules import generate_dummy_redistribute_costs
 
 from .dtensor_sharding_helpers import get_op_strategy, with_implicit_strategies
-from .propagation_rules import _op_rules, remove_invalid_configs
+from .propagation_rules import (
+    _op_rules,
+    get_current_seed_node,
+    get_strategy_radius,
+    get_strategy_seed,
+    remove_invalid_configs,
+    within_strategy_seed_ball,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -276,19 +283,53 @@ def reset_placement_options_timer():
     _placement_options_timer = PlacementOptionsTimer()
 
 
+def _seed_cache_key():
+    seed = get_strategy_seed()
+    if seed is None:
+        return None
+    node_name = get_current_seed_node()
+    placements = seed.get(node_name) if node_name is not None else None
+    placement_key = None if placements is None else tuple(str(p) for p in placements)
+    return node_name, placement_key, get_strategy_radius()
+
+
+def _filter_by_strategy_seed(out_strat):
+    if get_strategy_seed() is None:
+        return out_strat
+
+    kept = []
+    for strategy in out_strat.strategies:
+        specs = strategy.output_specs
+        placements = None
+        if isinstance(specs, DTensorSpec):
+            placements = specs.placements
+        elif isinstance(specs, (tuple, list)):
+            for spec in specs:
+                if isinstance(spec, DTensorSpec):
+                    placements = spec.placements
+                    break
+        if placements is None or within_strategy_seed_ball(placements):
+            kept.append(strategy)
+
+    return out_strat if not kept else OpStrategy(kept)
+
+
 def get_placement_options(mesh, op, specs, user_args, user_kwargs):
     assert len(specs) == len(user_args)
     timer = _placement_options_timer
     t_start = time.perf_counter()
 
     try:
+        mesh_key = (id(mesh), mesh.device_type, tuple(mesh.shape), mesh.ndim)
         cache_key = (
+            mesh_key,
             op,
             tuple(_fingerprint_arg(s) for s in specs),
             tuple(_fingerprint_arg(a) for a in user_args),
             tuple(_fingerprint_arg(v) for v in user_kwargs.values())
             if user_kwargs
             else (),
+            _seed_cache_key(),
         )
         hash(cache_key)  # fail fast if key contains unhashable types (e.g. SymInts)
     except TypeError:
@@ -330,6 +371,7 @@ def get_placement_options(mesh, op, specs, user_args, user_kwargs):
     else:
         with with_implicit_strategies():
             out_strat = get_op_strategy(op, op_schema)
+    out_strat = _filter_by_strategy_seed(out_strat)
     t1 = time.perf_counter()
 
     # operator.getitem is self-contained: its input is a tuple of tensors
@@ -397,9 +439,7 @@ def get_local_map_placement_option(
         mesh,
         None,
     ), "Not yet implemented"
-    assert "call_local_map" in str(node.target) or "call_local_map_backward" in str(
-        node.target
-    )
+    assert "local_map" in str(node.target)
     in_specs = []
     num_activation_inputs = len(user_args) - len(in_placements)
     # activations are always replicated

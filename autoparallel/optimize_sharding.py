@@ -102,8 +102,11 @@ from .graph_passes.graph_utils import (
     build_param_derived_set,
     build_terminal_derived_set,
 )
-from .shardings.placement_options import get_placement_options_for_node
-from .shardings.propagation_rules import _create_all_options
+from .shardings.placement_options import (
+    get_placement_options_for_node,
+    reset_placement_options_cache,
+)
+from .shardings.propagation_rules import _create_all_options, set_current_seed_node
 
 logger = logging.getLogger(__name__)
 
@@ -224,6 +227,8 @@ class ShardingOptimizer:
         mesh,
         force_grad_reduce_in_higher_precision=False,
         repeated_subgraphs=False,
+        strategy_seed=None,
+        strategy_radius=None,
     ):
         self.orig_gm = gm
         # The optimizer works on a concretized copy of the graph where all
@@ -239,6 +244,8 @@ class ShardingOptimizer:
         self.force_grad_reduce_in_higher_precision = (
             force_grad_reduce_in_higher_precision
         )
+        self.strategy_seed = strategy_seed
+        self.strategy_radius = strategy_radius
         self._constraint_log: list[tuple[str, dict]] = []
         self._memory_constraint: tuple[float, float] | None = None
         # Maps ILP constraint name → node_name for active node constraints,
@@ -247,7 +254,21 @@ class ShardingOptimizer:
         self._node_constraint_names: dict[str, str] = {}
         self._name_counters: dict[str, int] = {}
         t0 = time.perf_counter()
-        self.strats = self.build_sharding_metadata()
+        if self.strategy_seed is None:
+            self.strats = self.build_sharding_metadata()
+        else:
+            from .shardings import propagation_rules as _propagation_rules
+
+            _propagation_rules.set_strategy_seed(
+                self.strategy_seed, self.strategy_radius
+            )
+            reset_placement_options_cache()
+            try:
+                self.strats = self.build_sharding_metadata()
+            finally:
+                _propagation_rules.set_strategy_seed(None, None)
+                set_current_seed_node(None)
+                reset_placement_options_cache()
         # nodes/node_map are derived from strats (not graph.nodes) so that
         # shape-computation nodes skipped by build_sharding_metadata don't
         # appear and indices stay consistent.
@@ -306,6 +327,7 @@ class ShardingOptimizer:
     def build_sharding_metadata(self):
         strats = {}
         for node in self.graph.nodes:
+            set_current_seed_node(node.name)
             if node.op in ("placeholder", "get_attr"):
                 val = node.meta.get("val")
                 if isinstance(val, torch.Tensor):
@@ -351,6 +373,7 @@ class ShardingOptimizer:
                 strats[node] = user_strats
             else:
                 raise ValueError(f"Unexpected node op: {node.op}")
+        set_current_seed_node(None)
         return strats
 
     def create_cluster_links(self, clusters):
@@ -961,6 +984,68 @@ class ShardingOptimizer:
             "ILP solve took %.3fs (objective=%.4f)", time.perf_counter() - t0, obj_value
         )
         return self._to_orig_solution(self._extract_and_validate_solution())
+
+    def solve_lp_relaxation(self, verbose=False, frac_tol=1e-6, extract=False):
+        """Solve the LP relaxation and return objective, status, and fractionality.
+
+        Args:
+            verbose: Whether to print solver output.
+            frac_tol: Tolerance for counting a variable as fractional.
+            extract: Return a sharding solution when the relaxation is integral.
+        """
+        old_objective = self.prob.objective
+        if old_objective is None:
+            self._set_objective()
+        self._apply_memory_constraint()
+
+        variables = self.prob.variables()
+        original_cats = [v.cat for v in variables]
+        t0 = time.perf_counter()
+        solution = None
+        try:
+            for v in variables:
+                v.cat = pulp.LpContinuous
+
+            solver = pulp.PULP_CBC_CMD(msg=verbose)
+            with tempfile.TemporaryDirectory() as tmpdir:
+                solver.tmpDir = tmpdir
+                self.prob.solve(solver)
+
+            objective = pulp.value(self.prob.objective)
+            n_fractional = 0
+            n_vars = 0
+            for v in variables:
+                val = v.value()
+                if val is None:
+                    continue
+                n_vars += 1
+                if frac_tol < val < 1.0 - frac_tol:
+                    n_fractional += 1
+
+            status = pulp.LpStatus[self.prob.status]
+            if extract and status == "Optimal" and n_fractional == 0:
+                self.selected_keys = [
+                    key
+                    for key, dv in self.decision_vars.items()
+                    if dv.var.value() is not None and dv.var.value() > 0.5
+                ]
+                for root_key in list(self.selected_keys):
+                    self.selected_keys.extend(self._root_to_linked.get(root_key, []))
+                solution = self._to_orig_solution(self._extract_and_validate_solution())
+        finally:
+            for v, cat in zip(variables, original_cats):
+                v.cat = cat
+            if old_objective is None:
+                self.prob.objective = None
+
+        return {
+            "objective": objective,
+            "solve_time": time.perf_counter() - t0,
+            "n_fractional": n_fractional,
+            "n_vars": n_vars,
+            "status": status,
+            "solution": solution,
+        }
 
     def resolve(self, verbose=False):
         """Re-solve the ILP after adding or removing constraints.

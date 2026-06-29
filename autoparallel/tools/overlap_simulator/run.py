@@ -252,7 +252,9 @@ class NodeEstimator:
         if isinstance(x, int):
             return x
         if hasattr(x, "node") and hasattr(x.node, "hint"):
-            return x.node.hint
+            hint = x.node.hint
+            if isinstance(hint, int):
+                return hint
         return None
 
     @staticmethod

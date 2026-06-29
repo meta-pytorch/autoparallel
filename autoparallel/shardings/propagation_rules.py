@@ -53,6 +53,55 @@ from torch.distributed.tensor.placement_types import (
 from ..cast_parametrization import dtype_cast  # noqa
 from .dtensor_sharding_helpers import _try_single_dim_strategy, get_op_strategy
 
+_strategy_seed: "dict[str, tuple[Placement, ...]] | None" = None
+_strategy_radius: "int | dict[str, int] | None" = None
+_current_seed_node: "str | None" = None
+
+
+def set_strategy_seed(seed, radius):
+    global _strategy_seed, _strategy_radius
+    _strategy_seed = seed
+    _strategy_radius = radius
+
+
+def get_strategy_seed():
+    return _strategy_seed
+
+
+def get_strategy_radius():
+    return _strategy_radius
+
+
+def set_current_seed_node(name):
+    global _current_seed_node
+    _current_seed_node = name
+
+
+def get_current_seed_node():
+    return _current_seed_node
+
+
+def within_strategy_seed_ball(placements) -> bool:
+    if _strategy_seed is None:
+        return True
+    node_name = _current_seed_node
+    if node_name is None:
+        return True
+    seed_placements = _strategy_seed.get(node_name)
+    if seed_placements is None:
+        return True
+
+    radius = _strategy_radius
+    if isinstance(radius, dict):
+        radius = radius.get(node_name, 0)
+    if radius is None:
+        radius = 0
+
+    distance = abs(len(placements) - len(seed_placements))
+    distance += sum(1 for a, b in zip(placements, seed_placements) if a != b)
+    return distance <= radius
+
+
 _op_rules = {}
 
 
@@ -194,6 +243,8 @@ def _create_all_options(mesh, shape, tensor_meta=None, tensor=None):
     all_options = list(itertools.product(*[possible_options for _ in range(mesh.ndim)]))
     strats = []
     for placement in all_options:
+        if not within_strategy_seed_ball(placement):
+            continue
         spec = DTensorSpec(mesh, placement, tensor_meta=tensor_meta)
         strats.append(OpSpec(spec, input_specs=[spec], redistribute_cost=[[0.0]]))
     out_strats = OpStrategy(strats)
