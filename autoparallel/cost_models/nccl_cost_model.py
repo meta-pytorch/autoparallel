@@ -80,6 +80,7 @@ class NCCLTopoConfig:
     has_collnet: bool = False  # Enables CollNet Direct/Chain (SHARP)
     # Additional network latency beyond base hw latency (us)
     net_latency: float = 0.0
+    mesh_dim_topo_override: "MeshDimTopo | None" = None
 
 
 @dataclass
@@ -1005,6 +1006,15 @@ def derive_mesh_dim_topo(
 ) -> MeshDimTopo:
     """Derive per-mesh-dimension NCCL topology parameters."""
     dim_size = mesh_shape[dim_idx]
+    if config.mesh_dim_topo_override is not None:
+        if len(mesh_shape) != 1 or dim_idx != 0:
+            raise ValueError("mesh_dim_topo_override can only be used for 1D dim0")
+        if config.mesh_dim_topo_override.n_ranks != dim_size:
+            raise ValueError(
+                "mesh_dim_topo_override.n_ranks must match the 1D mesh size"
+            )
+        return config.mesh_dim_topo_override
+
     inner_product = math.prod(mesh_shape[dim_idx + 1 :])
     ppn = max(1, min(config.gpus_per_node // inner_product, dim_size))
     n_nodes = dim_size // ppn

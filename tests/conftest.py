@@ -27,6 +27,7 @@ _CUDA_PATCHES = [
                 "name": "H100",
                 "total_memory": 80 * 1024**3,
                 "multi_processor_count": 132,
+                "L2_cache_size": 50 * 1024**2,
             },
         )(),
     ),
