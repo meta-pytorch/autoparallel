@@ -50,6 +50,7 @@ from .optimize_sharding import ShardingOptimizer
 from .shardings.placement_options import _get_device_from_mesh
 from .tracing import (
     _add_unused_params_and_buffers,
+    _enable_local_map_in_grad_placements,
     _get_decomp_table,
     enable_local_map_wrapping,
     move_to_fake,
@@ -461,7 +462,7 @@ class AutoParallel:
             mesh = self.mesh
             if mesh.ndim != 1:
                 mesh._flatten()
-        with self.fake_mode:
+        with self.fake_mode, _enable_local_map_in_grad_placements():
             (
                 parallel_gm,
                 sharded_param_dict,

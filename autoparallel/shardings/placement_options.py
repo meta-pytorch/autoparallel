@@ -390,16 +390,11 @@ def get_local_map_placement_option(
     out_placements = local_map_kwargs["out_placements"]
     assert in_placements is not None
     assert out_placements is not None
-    assert (
-        local_map_kwargs.get("in_grad_placements", None) is None
-    ), "Not yet implemented"
     assert local_map_kwargs.get("device_mesh", None) in (
         mesh,
         None,
     ), "Not yet implemented"
-    assert "call_local_map" in str(node.target) or "call_local_map_backward" in str(
-        node.target
-    )
+    assert "local_map" in str(node.target)
     in_specs = []
     num_activation_inputs = len(user_args) - len(in_placements)
     # activations are always replicated

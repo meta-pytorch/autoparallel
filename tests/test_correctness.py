@@ -42,7 +42,7 @@ from torch.distributed._local_tensor import (
 )
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.distributed_c10d import ProcessGroup
-from torch.distributed.tensor.placement_types import Replicate, Shard
+from torch.distributed.tensor.placement_types import Placement, Replicate, Shard
 from torch.testing._internal.distributed.fake_pg import FakeStore
 
 from autoparallel.api import AutoParallel
@@ -215,21 +215,41 @@ def _patch_local_tensor_for_compile_on_one_rank():
 
 
 @apply_cuda_patches
-def _get_parallel_graph_and_placements(model_fn, input_fn, mesh):
+def _get_parallel_graph_and_placements(
+    model_fn,
+    input_fn,
+    mesh,
+    input_placements=None,
+    output_placements=None,
+    parameter_memory_constraint=True,
+):
     """Run AutoParallel and extract the parallel graph + placement info.
 
-    Always uses dynamic=True (required for compile_on_one_rank) and adds
+    Always uses dynamic=True (required for compile_on_one_rank). Tests may add
     a parameter memory constraint to force parameter sharding.
     """
     with torch.device("meta"):
         meta_model = model_fn()
 
-    x_sharding = (Shard(0),) + (Replicate(),) * (mesh.ndim - 1)
+    if input_placements is None:
+        input_constraints = [(Shard(0),) + (Replicate(),) * (mesh.ndim - 1)]
+    elif isinstance(input_placements[0], Placement):
+        input_constraints = [input_placements]
+    else:
+        input_constraints = list(input_placements)
+
+    if output_placements is None:
+        output_constraints = [(Shard(0),) + (Replicate(),) * (mesh.ndim - 1)]
+    elif isinstance(output_placements[0], Placement):
+        output_constraints = [output_placements]
+    else:
+        output_constraints = list(output_placements)
 
     with AutoParallel(meta_model, input_fn, mesh, dynamic=True) as autop:
-        autop.add_input_constraints([x_sharding])
-        autop.add_output_constraints([x_sharding])
-        autop.add_parameter_memory_constraint()
+        autop.add_input_constraints(input_constraints)
+        autop.add_output_constraints(output_constraints)
+        if parameter_memory_constraint:
+            autop.add_parameter_memory_constraint()
         sharding_placement = autop.optimize_placement(verbose=False)
         autop._apply_placement_common(sharding_placement)
 
@@ -268,10 +288,15 @@ def _get_parallel_graph_and_placements(model_fn, input_fn, mesh):
     )
 
 
-def _run_correctness_test(
+def run_correctness_test(
     model_fn,
     input_fn,
     mesh_shape,
+    mesh_dim_names=None,
+    input_placements=None,
+    output_placements=None,
+    reference_model_fn=None,
+    parameter_memory_constraint=True,
     atol=1e-5,
     rtol=1e-5,
 ):
@@ -294,7 +319,11 @@ def _run_correctness_test(
             "fake", store=fake_store, rank=0, world_size=256
         )
 
-    if len(mesh_shape) == 1:
+    if mesh_dim_names is not None:
+        mesh = torch.distributed.device_mesh.init_device_mesh(
+            "cuda", mesh_shape, mesh_dim_names=mesh_dim_names
+        )
+    elif len(mesh_shape) == 1:
         mesh = torch.distributed.device_mesh.init_device_mesh(
             "cuda", mesh_shape, mesh_dim_names=("dp",)
         )
@@ -305,7 +334,8 @@ def _run_correctness_test(
 
     # --- Reference forward + backward on CUDA ---
     torch.manual_seed(42)
-    model = model_fn().cuda()
+    ref_model_fn = reference_model_fn or model_fn
+    model = ref_model_fn().cuda()
     ref_inputs = input_fn()
     if not isinstance(ref_inputs, (tuple, list)):
         ref_inputs = (ref_inputs,)
@@ -331,7 +361,14 @@ def _run_correctness_test(
             param_fqns,
             buffer_fqns,
             num_user_inputs,
-        ) = _get_parallel_graph_and_placements(model_fn, tracing_input_fn, mesh)
+        ) = _get_parallel_graph_and_placements(
+            model_fn,
+            tracing_input_fn,
+            mesh,
+            input_placements=input_placements,
+            output_placements=output_placements,
+            parameter_memory_constraint=parameter_memory_constraint,
+        )
 
     # --- Build LocalTensor primals and tangents ---
     num_params = len(param_fqns)
@@ -361,8 +398,8 @@ def _run_correctness_test(
         local_primals.append(LocalTensor(shards))
 
     # Tangents: the grad_output sharded like the forward output.
-    # The forward output placements match the output constraints (Shard(0) on dp, R on tp).
-    output_placements = (Shard(0),) + (Replicate(),) * (len(mesh_shape) - 1)
+    if output_placements is None:
+        output_placements = (Shard(0),) + (Replicate(),) * (len(mesh_shape) - 1)
 
     # Build tangent LocalTensors — one per forward output.
     # The joint graph may have multiple tangent placeholders; we look at parallel_gm.
@@ -458,7 +495,7 @@ def test_correctness_linear():
     def input_fn():
         return torch.randn(batch, dim, device="cuda")
 
-    _run_correctness_test(model_fn, input_fn, mesh_shape=(4, 2))
+    run_correctness_test(model_fn, input_fn, mesh_shape=(4, 2))
 
 
 def test_correctness_linear_with_bias():
@@ -471,7 +508,7 @@ def test_correctness_linear_with_bias():
     def input_fn():
         return torch.randn(batch, dim, device="cuda")
 
-    _run_correctness_test(model_fn, input_fn, mesh_shape=(4, 2))
+    run_correctness_test(model_fn, input_fn, mesh_shape=(4, 2))
 
 
 def test_correctness_linear_1d_mesh():
@@ -484,7 +521,7 @@ def test_correctness_linear_1d_mesh():
     def input_fn():
         return torch.randn(batch, dim, device="cuda")
 
-    _run_correctness_test(model_fn, input_fn, mesh_shape=(8,))
+    run_correctness_test(model_fn, input_fn, mesh_shape=(8,))
 
 
 def test_correctness_mlp():
@@ -507,7 +544,7 @@ def test_correctness_mlp():
     def input_fn():
         return torch.randn(batch, dim, device="cuda")
 
-    _run_correctness_test(model_fn, input_fn, mesh_shape=(4, 2))
+    run_correctness_test(model_fn, input_fn, mesh_shape=(4, 2))
 
 
 def test_correctness_attention():
@@ -539,4 +576,4 @@ def test_correctness_attention():
     def input_fn():
         return torch.randn(batch, seq_len, dim, device="cuda")
 
-    _run_correctness_test(model_fn, input_fn, mesh_shape=(4, 2))
+    run_correctness_test(model_fn, input_fn, mesh_shape=(4, 2))
