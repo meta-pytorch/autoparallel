@@ -86,13 +86,67 @@ def move_to_fake(model: torch.nn.Module, mode: FakeTensorMode, device: torch.dev
 
 
 @contextmanager
+def _enable_local_map_in_grad_placements():
+    from torch._higher_order_ops import local_map as local_map_module
+
+    autograd_key = torch._C.DispatchKey.Autograd
+    local_map_hop = local_map_module.local_map_hop
+    orig_autograd_impl = local_map_hop.py_kernels[autograd_key]
+    orig_create_hop_fw_bw = local_map_module.create_hop_fw_bw
+
+    def create_hop_fw_bw_with_in_grad(fw_gm, *args):
+        result = orig_create_hop_fw_bw(fw_gm, *args)
+        _fw_gm, bw_gm, *_rest = result
+        local_map_kwargs = fw_gm.meta["local_map_kwargs"]
+        in_grad_placements = local_map_kwargs.get("in_grad_placements")
+        if in_grad_placements is not None:
+            bw_gm.meta["local_map_kwargs"]["out_placements"] = in_grad_placements
+        return result
+
+    def autograd_impl_with_in_grad(fw_gm, *args, **kwargs):
+        if local_map_module._DEFER_INLINING:
+            (
+                fw_gm,
+                bw_gm,
+                num_fw_ins,
+                num_fw_outs,
+                filtered_grads_idx,
+            ) = local_map_module.create_hop_fw_bw(fw_gm, *args)
+            return local_map_module.LocalMapAutogradOp.apply(
+                fw_gm,
+                bw_gm,
+                num_fw_ins,
+                num_fw_outs,
+                filtered_grads_idx,
+                *args,
+                **kwargs,
+            )
+
+        return torch.fx.Interpreter(fw_gm).run(*args, **kwargs)
+
+    try:
+        local_map_module.create_hop_fw_bw = create_hop_fw_bw_with_in_grad
+        local_map_hop.py_kernels[autograd_key] = autograd_impl_with_in_grad
+        local_map_hop._dispatch_cache.clear()
+        yield
+    finally:
+        local_map_module.create_hop_fw_bw = orig_create_hop_fw_bw
+        local_map_hop.py_kernels[autograd_key] = orig_autograd_impl
+        local_map_hop._dispatch_cache.clear()
+
+
+@contextmanager
 def enable_local_map_wrapping():
     from torch._dynamo.variables.higher_order_ops import (
         LocalMapWrappedHigherOrderVariable as vt_cls,
     )
     from torch._higher_order_ops import local_map as local_map_module
 
-    with vt_cls.enable(), local_map_module.defer_inlining():
+    with (
+        vt_cls.enable(),
+        local_map_module.defer_inlining(),
+        _enable_local_map_in_grad_placements(),
+    ):
         yield
 
 
