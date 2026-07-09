@@ -9,6 +9,7 @@ from typing import ClassVar, Literal, Optional
 
 import torch
 import torch.nn.functional as F
+from torch.distributed.device_mesh import DeviceMesh
 from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
@@ -55,20 +56,31 @@ class ScaledDotProductAttention(torch.nn.Module):
 
 
 def build_attention(
-    use_flex_attn: bool, attn_mask_type: str, fixed_block_size: Optional[int] = None
+    use_flex_attn: bool,
+    attn_mask_type: str,
+    fixed_block_size: Optional[int] = None,
+    context_parallel_mesh: Optional[DeviceMesh] = None,
 ):
+    if context_parallel_mesh is not None:
+        if use_flex_attn:
+            raise ValueError("FlexAttention is not compatible with CP yet.")
+        if fixed_block_size is not None:
+            raise ValueError("SDPA currently does not support fixed_block_size.")
+        if attn_mask_type != "causal":
+            raise ValueError("SDPA currently only supports causal mask.")
+
+        from autoparallel import make_context_parallel_sdpa
+
+        return make_context_parallel_sdpa(context_parallel_mesh, is_causal=True)
+
     if use_flex_attn:
         raise NotImplementedError()
         # return FlexAttention(attn_mask_type, fixed_block_size)
     else:
         if fixed_block_size is not None:
-            raise ValueError(
-                "TorchTitan with SDPA currently does not support fixed_block_size."
-            )
+            raise ValueError("SDPA currently does not support fixed_block_size.")
         if attn_mask_type != "causal":
-            raise ValueError(
-                "TorchTitan with SDPA currently only supports causal mask."
-            )
+            raise ValueError("SDPA currently only supports causal mask.")
         return ScaledDotProductAttention(attn_mask_type)
 
 
@@ -91,6 +103,7 @@ class TransformerModelArgs:
 
     use_flex_attn: bool = False
     attn_mask_type: str = "causal"
+    context_parallel_mesh: Optional[DeviceMesh] = None
     eos_id: int = 0
 
     def update_from_config(self, job_config, tokenizer) -> None:
@@ -178,9 +191,15 @@ def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor) -> torch.Ten
     ndim = x.ndim
     assert ndim > 1
     seqlen = x.shape[1]
-    freqs_cis = freqs_cis[0:seqlen]
-    assert freqs_cis.shape == (seqlen, x.shape[-1])
-    shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
+    if freqs_cis.ndim == 2:
+        freqs_cis = freqs_cis[0:seqlen]
+        assert freqs_cis.shape == (seqlen, x.shape[-1])
+        shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
+        return freqs_cis.view(*shape)
+
+    assert freqs_cis.ndim == 3
+    assert freqs_cis.shape == (x.shape[0], x.shape[1], x.shape[-1])
+    shape = [d if i in (0, 1, ndim - 1) else 1 for i, d in enumerate(x.shape)]
     return freqs_cis.view(*shape)
 
 
@@ -263,7 +282,11 @@ class Attention(nn.Module):
         self.wo = nn.Linear(
             model_args.n_heads * self.head_dim, model_args.dim, bias=False
         )
-        self.sdpa = build_attention(model_args.use_flex_attn, model_args.attn_mask_type)
+        self.sdpa = build_attention(
+            model_args.use_flex_attn,
+            model_args.attn_mask_type,
+            context_parallel_mesh=model_args.context_parallel_mesh,
+        )
 
     def init_weights(self, init_std: float):
         for linear in (self.wq, self.wk, self.wv):
@@ -518,7 +541,12 @@ class Transformer(nn.Module):
             self.model_args.rope_theta,
         )
 
-    def forward(self, tokens: torch.Tensor, input_batch: Optional[torch.Tensor] = None):
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        positions: Optional[torch.Tensor] = None,
+        input_batch: Optional[torch.Tensor] = None,
+    ):
         """
         Perform a forward pass through the Transformer model.
 
@@ -531,6 +559,7 @@ class Transformer(nn.Module):
                 This will always be the input batch regardless of the pipeline stage.
                 This field is required for non-first PP stages to perform document
                 masking attention (to analyze the boundary of the document).
+            positions (torch.Tensor): Token positions for rotary embeddings.
 
         Returns:
             torch.Tensor: Output logits after applying the Transformer model.
@@ -538,9 +567,10 @@ class Transformer(nn.Module):
         """
         # passthrough for nonexistent layers, allows easy configuration of pipeline parallel stages
         h = self.tok_embeddings(tokens) if self.tok_embeddings else tokens
+        freqs_cis = self.freqs_cis if positions is None else self.freqs_cis[positions]
 
         for layer in self.layers.values():
-            h = layer(h, self.freqs_cis)
+            h = layer(h, freqs_cis)
 
         h = self.norm(h) if self.norm else h
         output = self.output(h) if self.output else h

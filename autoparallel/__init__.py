@@ -6,6 +6,12 @@
 from autoparallel.api import AutoParallel, auto_parallel
 from autoparallel.collectives import with_sharding_constraint
 from autoparallel.compile import autoparallel_backend
+from autoparallel._context_parallel import (
+    ContextParallelPlacements,
+    context_parallel_attention_placements,
+    context_parallel_local_map,
+    make_context_parallel_sdpa,
+)
 from autoparallel.input_validation import ForwardInputs
 from autoparallel.moe import (
     MoEMeshRoles,
@@ -16,10 +22,14 @@ from autoparallel.moe import (
 __all__ = [
     "auto_parallel",
     "AutoParallel",
+    "ContextParallelPlacements",
     "autoparallel_backend",
+    "context_parallel_attention_placements",
+    "context_parallel_local_map",
     "ForwardInputs",
     "MoEMeshRoles",
     "build_moe_local_map_placements",
     "build_moe_mesh",
+    "make_context_parallel_sdpa",
     "with_sharding_constraint",
 ]
