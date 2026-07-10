@@ -9,7 +9,6 @@ from autoparallel.compile import autoparallel_backend
 from autoparallel._context_parallel import (
     ContextParallelPlacements,
     context_parallel_attention_placements,
-    context_parallel_local_map,
     make_context_parallel,
     make_context_parallel_sdpa,
 )
@@ -26,7 +25,6 @@ __all__ = [
     "ContextParallelPlacements",
     "autoparallel_backend",
     "context_parallel_attention_placements",
-    "context_parallel_local_map",
     "ForwardInputs",
     "MoEMeshRoles",
     "build_moe_local_map_placements",

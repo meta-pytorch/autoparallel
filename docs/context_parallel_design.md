@@ -80,7 +80,6 @@ The user-facing APIs are exported from `autoparallel`:
 - `make_context_parallel`
 - `make_context_parallel_sdpa`
 - `context_parallel_attention_placements`
-- `context_parallel_local_map`
 - `ContextParallelPlacements`
 
 The implementation lives in a private module so model code can depend on the

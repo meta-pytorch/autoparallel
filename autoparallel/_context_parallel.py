@@ -247,79 +247,6 @@ def context_parallel_attention_placements(
     return ContextParallelPlacements(qkv=qkv_t, out=qkv_t)
 
 
-def context_parallel_local_map(
-    fn: Callable | None = None,
-    *,
-    mesh: DeviceMesh,
-    batch_dim: int = 0,
-    seq_dim: int = 1,
-    head_dim: int = 2,
-    extra_args: tuple[object, ...] = (),
-    extra_in_placements: tuple[object, ...] = (),
-    redistribute_inputs: bool = True,
-):
-    """Wrap an attention callable for context-parallel execution.
-
-    Args:
-        fn: Callable whose first three arguments are Q, K, and V tensors.
-        mesh: Device mesh with named DP, CP, and/or TP dimensions.
-        batch_dim: Batch dimension in Q/K/V tensors.
-        seq_dim: Sequence dimension in Q/K/V tensors.
-        head_dim: Head dimension in Q/K/V tensors.
-        extra_args: Additional arguments passed to the wrapped callable.
-        extra_in_placements: Placements for additional tensor arguments.
-        redistribute_inputs: Whether to redistribute inputs to the requested
-            placements.
-    """
-    if len(extra_args) != len(extra_in_placements):
-        raise ValueError("extra_args and extra_in_placements must have the same length.")
-
-    placements = context_parallel_attention_placements(
-        mesh, batch_dim=batch_dim, seq_dim=seq_dim, head_dim=head_dim
-    )
-    cp_axis = _cp_axis_name(mesh)
-
-    def wrap(inner_fn: Callable):
-        def _with_kv_all_gather(
-            q: torch.Tensor,
-            k: torch.Tensor,
-            v: torch.Tensor,
-            *extra: object,
-        ):
-            if cp_axis is not None:
-                k = all_gather(k, seq_dim, cp_axis)
-                v = all_gather(v, seq_dim, cp_axis)
-            return inner_fn(q, k, v, *extra)
-
-        mapped = local_map(
-            _with_kv_all_gather,
-            out_placements=placements.out_placements,
-            in_placements=placements.in_placements + tuple(extra_in_placements),
-            redistribute_inputs=redistribute_inputs,
-            device_mesh=mesh,
-        )
-
-        def call(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
-            has_dtensor_input = any(isinstance(arg, DTensor) for arg in (q, k, v))
-            mapped_extra_args = []
-            for arg, placement in zip(extra_args, extra_in_placements):
-                if (
-                    has_dtensor_input
-                    and isinstance(arg, torch.Tensor)
-                    and placement is not None
-                    and not isinstance(arg, DTensor)
-                ):
-                    arg = distribute_tensor(arg, mesh, placement)
-                mapped_extra_args.append(arg)
-            return mapped(q, k, v, *mapped_extra_args)
-
-        return call
-
-    if fn is None:
-        return wrap
-    return wrap(fn)
-
-
 def make_context_parallel(
     mesh: DeviceMesh,
     *,
@@ -393,31 +320,37 @@ def _make_context_parallel_sdpa(
     if cp_axis is not None and dropout_p != 0.0:
         raise ValueError("Context-parallel SDPA does not support dropout.")
 
-    @context_parallel_local_map(
-        mesh=mesh,
-        batch_dim=batch_dim,
-        seq_dim=seq_dim,
-        head_dim=head_dim,
+    placements = context_parallel_attention_placements(
+        mesh, batch_dim=batch_dim, seq_dim=seq_dim, head_dim=head_dim
     )
-    def _context_parallel_sdpa(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
-        kwargs = {
-            "dropout_p": dropout_p,
-            "enable_gqa": enable_gqa,
-        }
+
+    def cp_sdpa(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
+        kwargs = {"dropout_p": dropout_p, "enable_gqa": enable_gqa}
         if scale is not None:
             kwargs["scale"] = scale
 
+        if cp_axis is not None:
+            k = all_gather(k, seq_dim, cp_axis)
+            v = all_gather(v, seq_dim, cp_axis)
+
+        # Causal CP gathers Q too, computes the full attention on every rank,
+        # then reduce-scatters back to the sequence shard (reduce_scatter's
+        # backward is all-gather, keeping gradients on the same contract).
         if is_causal and cp_axis is not None and axis_size(cp_axis) > 1:
             cp_size = axis_size(cp_axis)
             q = all_gather(q, seq_dim, cp_axis)
-            kwargs["is_causal"] = True
-            out = F.scaled_dot_product_attention(q, k, v, **kwargs)
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=True, **kwargs)
             return reduce_scatter(out / cp_size, seq_dim, cp_axis)
 
-        kwargs["is_causal"] = is_causal
-        return F.scaled_dot_product_attention(q, k, v, **kwargs)
+        return F.scaled_dot_product_attention(q, k, v, is_causal=is_causal, **kwargs)
 
-    return _context_parallel_sdpa
+    return local_map(
+        cp_sdpa,
+        out_placements=placements.out_placements,
+        in_placements=placements.in_placements,
+        redistribute_inputs=True,
+        device_mesh=mesh,
+    )
 
 
 def _make_context_parallel_flex_attention(
@@ -438,6 +371,10 @@ def _make_context_parallel_flex_attention(
             "FlexAttention score_mod is not supported with context parallel."
         )
 
+    placements = context_parallel_attention_placements(
+        mesh, batch_dim=batch_dim, seq_dim=seq_dim, head_dim=head_dim
+    )
+
     block_mask_args: tuple[object, ...] = ()
     block_mask_placements: tuple[object, ...] = ()
     cp_block_mask: _ContextParallelBlockMask | None = None
@@ -451,20 +388,16 @@ def _make_context_parallel_flex_attention(
         block_mask_args = cp_block_mask.args()
         block_mask_placements = cp_block_mask.placements(mesh, cp_axis)
 
-    @context_parallel_local_map(
-        mesh=mesh,
-        batch_dim=batch_dim,
-        seq_dim=seq_dim,
-        head_dim=head_dim,
-        extra_args=block_mask_args,
-        extra_in_placements=block_mask_placements,
-    )
-    def _context_parallel_flex_attention(
+    def cp_flex(
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
         *mask_args: object,
     ):
+        if cp_axis is not None:
+            k = all_gather(k, seq_dim, cp_axis)
+            v = all_gather(v, seq_dim, cp_axis)
+
         local_block_mask = None
         if cp_block_mask is not None:
             local_block_mask = cp_block_mask.rebuild(*mask_args)
@@ -480,7 +413,35 @@ def _make_context_parallel_flex_attention(
             kernel_options=kernel_options,
         )
 
-    return _context_parallel_flex_attention
+    mapped = local_map(
+        cp_flex,
+        out_placements=placements.out_placements,
+        in_placements=placements.in_placements + tuple(block_mask_placements),
+        redistribute_inputs=True,
+        device_mesh=mesh,
+    )
+
+    if not block_mask_args:
+        return mapped
+
+    def call(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
+        # The block-mask tensors are captured as plain tensors; when Q/K/V are
+        # DTensors, distribute them to matching placements so local_map can
+        # redistribute every input consistently.
+        has_dtensor_input = any(isinstance(arg, DTensor) for arg in (q, k, v))
+        mask_args = []
+        for arg, placement in zip(block_mask_args, block_mask_placements):
+            if (
+                has_dtensor_input
+                and isinstance(arg, torch.Tensor)
+                and placement is not None
+                and not isinstance(arg, DTensor)
+            ):
+                arg = distribute_tensor(arg, mesh, placement)
+            mask_args.append(arg)
+        return mapped(q, k, v, *mask_args)
+
+    return call
 
 
 def make_context_parallel_sdpa(mesh: DeviceMesh, **kwargs):

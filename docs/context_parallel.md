@@ -51,10 +51,6 @@ Important arguments:
 placements for a mesh. Use it when you need to add matching AutoParallel input
 or output constraints.
 
-`context_parallel_local_map(...)` wraps a custom attention callable whose first
-three arguments are Q, K, and V tensors. Prefer `make_context_parallel` unless
-the model uses a different attention kernel.
-
 ## Mesh Names
 
 Supported mesh axis names:
@@ -68,19 +64,6 @@ Supported mesh axis names:
 
 For 1D and 2D meshes, pass `mesh_dim_names` explicitly so AutoParallel can
 identify the CP axis unambiguously.
-
-## Custom Attention
-
-```python
-from autoparallel import context_parallel_local_map
-
-@context_parallel_local_map(mesh=mesh, batch_dim=0, head_dim=1, seq_dim=2)
-def attention(q, k, v):
-    return my_attention_kernel(q, k, v)
-```
-
-The wrapped callable should return an output tensor with the same logical
-layout as Q.
 
 ## Notes
 

@@ -36,7 +36,6 @@ def _fake_mesh(mesh_dim_names=None, ndim=None):
 def test_context_parallel_api_is_exported_from_autoparallel():
     assert hasattr(autoparallel, "ContextParallelPlacements")
     assert callable(autoparallel.context_parallel_attention_placements)
-    assert callable(autoparallel.context_parallel_local_map)
     assert callable(autoparallel.make_context_parallel)
     assert callable(autoparallel.make_context_parallel_sdpa)
 
