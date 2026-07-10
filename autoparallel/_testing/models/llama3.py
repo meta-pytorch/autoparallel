@@ -69,9 +69,9 @@ def build_attention(
         if attn_mask_type != "causal":
             raise ValueError("SDPA currently only supports causal mask.")
 
-        from autoparallel import make_context_parallel_sdpa
+        from autoparallel import make_context_parallel
 
-        return make_context_parallel_sdpa(context_parallel_mesh, is_causal=True)
+        return make_context_parallel(context_parallel_mesh, kind="sdpa", is_causal=True)
 
     if use_flex_attn:
         raise NotImplementedError()

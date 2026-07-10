@@ -36,9 +36,9 @@ The helper uses `local_map` as the boundary between AutoParallel placement
 optimization and the attention kernel. The wrapped function receives local
 tensor shards and can use `autoparallel.collectives` directly.
 
-For non-causal SDPA:
+For non-causal SDPA and FlexAttention:
 
-- K and V are gathered across the CP axis before SDPA runs.
+- K and V are gathered across the CP axis before the attention kernel runs.
 - Q remains sequence-local.
 - The output remains sequence-local.
 
@@ -51,6 +51,17 @@ For causal SDPA:
 The causal path uses duplicate full attention computation to preserve the
 simple Q/K/V-sharded boundary without requiring rank-dependent masks in the
 traced local_map body.
+
+For FlexAttention with a `BlockMask`:
+
+- The block mask tensors are sharded on the query-block dimension for the CP
+  axis.
+- Broadcast batch/head mask dimensions stay replicated; explicit batch/head
+  mask dimensions follow the matching DP/TP mesh axes.
+- The local mask keeps global query positions when evaluating the original
+  `mask_mod`.
+- `score_mod` is rejected when a CP axis is present, matching TorchTitan's
+  current CP FlexAttention support boundary.
 
 ## Gradient Behavior
 
@@ -66,6 +77,7 @@ contract. No `in_grad_placements` are required on the local_map call.
 
 The user-facing APIs are exported from `autoparallel`:
 
+- `make_context_parallel`
 - `make_context_parallel_sdpa`
 - `context_parallel_attention_placements`
 - `context_parallel_local_map`
@@ -79,8 +91,8 @@ stable package-level API instead of an implementation file name.
 The in-repo Llama model can opt in through
 `TransformerModelArgs.context_parallel_mesh`. When this field is set,
 `build_attention` constructs SDPA through the package-level
-`make_context_parallel_sdpa` API. When it is unset, the existing non-CP SDPA
-path is unchanged.
+`make_context_parallel` API. When it is unset, the existing non-CP SDPA path is
+unchanged.
 
 ## Test Coverage
 
@@ -91,3 +103,5 @@ The tests cover:
 - Public package-level imports.
 - In-repo Llama attention construction through the public API.
 - End-to-end LocalTensor correctness for causal and non-causal SDPA.
+- Real distributed FlexAttention correctness for CP2 and CP2TP2, including
+  forward and backward comparisons against full-tensor FlexAttention.

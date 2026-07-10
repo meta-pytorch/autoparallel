@@ -10,6 +10,7 @@ from autoparallel._context_parallel import (
     ContextParallelPlacements,
     context_parallel_attention_placements,
     context_parallel_local_map,
+    make_context_parallel,
     make_context_parallel_sdpa,
 )
 from autoparallel.input_validation import ForwardInputs
@@ -30,6 +31,7 @@ __all__ = [
     "MoEMeshRoles",
     "build_moe_local_map_placements",
     "build_moe_mesh",
+    "make_context_parallel",
     "make_context_parallel_sdpa",
     "with_sharding_constraint",
 ]

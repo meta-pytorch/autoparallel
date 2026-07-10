@@ -9,7 +9,7 @@ normal placement flow. The public entry points are exported from
 
 ```python
 import torch
-from autoparallel import make_context_parallel_sdpa
+from autoparallel import make_context_parallel
 
 mesh = torch.distributed.device_mesh.init_device_mesh(
     "cuda",
@@ -17,7 +17,7 @@ mesh = torch.distributed.device_mesh.init_device_mesh(
     mesh_dim_names=("dp_shard", "cp", "tp"),
 )
 
-cp_sdpa = make_context_parallel_sdpa(mesh, is_causal=True)
+cp_sdpa = make_context_parallel(mesh, is_causal=True)
 out = cp_sdpa(q, k, v)
 ```
 
@@ -32,23 +32,28 @@ dimension arguments are:
 
 ## Public API
 
-`make_context_parallel_sdpa(...)` builds a callable with the same call shape as
-`torch.nn.functional.scaled_dot_product_attention(q, k, v, ...)`.
+`make_context_parallel(...)` builds an attention callable for CP. SDPA is the
+default attention kind.
 
 Important arguments:
 
 - `mesh`: Device mesh with named DP, CP, and/or TP dimensions.
-- `is_causal`: Whether attention uses causal masking.
-- `dropout_p`, `scale`, `enable_gqa`: Passed through to SDPA.
+- `kind`: `"sdpa"` or `"flex_attention"`.
+- `is_causal`: Whether SDPA uses causal masking.
+- `dropout_p`: Dropout probability for SDPA.
+- `scale`, `enable_gqa`: Passed through to the selected attention kind.
+- `block_mask`, `score_mod`, `kernel_options`: FlexAttention options.
 - `batch_dim`, `seq_dim`, `head_dim`: Tensor dimensions used for placement.
+
+`make_context_parallel_sdpa(...)` is a compatibility alias for SDPA callers.
 
 `context_parallel_attention_placements(...)` returns the Q/K/V and output
 placements for a mesh. Use it when you need to add matching AutoParallel input
 or output constraints.
 
 `context_parallel_local_map(...)` wraps a custom attention callable whose first
-three arguments are Q, K, and V tensors. Prefer `make_context_parallel_sdpa`
-unless the model uses a different attention kernel.
+three arguments are Q, K, and V tensors. Prefer `make_context_parallel` unless
+the model uses a different attention kernel.
 
 ## Mesh Names
 
@@ -84,5 +89,6 @@ layout as Q.
   `TransformerModelArgs`.
 - Q, K, V, and attention output use matching placement tuples at the
   AutoParallel boundary.
-- FlexAttention is not covered by this SDPA helper.
-- Dropout is not supported when a CP axis is present.
+- FlexAttention CP supports `block_mask`, `scale`, and `enable_gqa`.
+- FlexAttention `score_mod` is not supported when a CP axis is present.
+- SDPA dropout is not supported when a CP axis is present.
