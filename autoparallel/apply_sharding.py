@@ -140,8 +140,11 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
         return curr_shard_order, tgt_shard_order
 
     def redistribute_tensor(self, arg, curr_spec, tgt_spec, node):
+        # Preserve Partial -> Partial; only coerce unsupported transitions that
+        # would need to create a Partial value from a non-Partial source.
         tgt_placements = tuple(
-            p if not p.is_partial() else Replicate() for p in tgt_spec.placements
+            tgt_p if not tgt_p.is_partial() or curr_p.is_partial() else Replicate()
+            for curr_p, tgt_p in zip(curr_spec.placements, tgt_spec.placements)
         )
         x = arg
         if node in self.param_placement_order and self.param_placement_order[node][1]:
