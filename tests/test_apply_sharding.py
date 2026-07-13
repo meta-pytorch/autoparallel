@@ -50,13 +50,20 @@ class TestComputeShardOrder:
 
 def _count_collectives(gm):
     """Count collective ops in a traced graph by type."""
-    counts = {"all_gather": 0, "reduce_scatter": 0, "alltoall": 0}
+    counts = {
+        "all_gather": 0,
+        "all_reduce": 0,
+        "reduce_scatter": 0,
+        "alltoall": 0,
+    }
     for n in gm.graph.nodes:
         if n.op != "call_function":
             continue
         name = getattr(n.target, "__name__", "")
         if "all_gather" in name:
             counts["all_gather"] += 1
+        elif "all_reduce" in name:
+            counts["all_reduce"] += 1
         elif "reduce_scatter" in name:
             counts["reduce_scatter"] += 1
         elif "alltoall" in name:
@@ -175,6 +182,40 @@ class TestOrderedRedistributeFusion:
         gm = make_fx(trace_fn, tracing_mode="real")(local)
         counts = _count_collectives(gm)
         assert counts["all_gather"] >= 1
+
+
+class TestPartialRedistribution:
+    def test_partial_to_partial_does_not_reduce(self, device_mesh_2d):
+        """Redistributing another mesh dim must preserve an unchanged Partial.
+
+        This models a CP weight-gradient edge where (R, P) -> (S(1), P).
+        Materializing the CP Partial as Replicate here would insert an early
+        all-reduce, and the planned P -> R transition would reduce it again.
+        """
+        from autoparallel.apply_sharding import ApplyShardingInterpreter
+
+        tm = _make_tensor_meta([512, 128])
+        curr_spec = DTensorSpec(
+            device_mesh_2d, (Replicate(), Partial()), tensor_meta=tm
+        )
+        tgt_spec = DTensorSpec(
+            device_mesh_2d, (Shard(1), Partial()), tensor_meta=tm
+        )
+
+        graph = torch.fx.Graph()
+        node = graph.placeholder("grad")
+        graph.output(node)
+        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+        interp = ApplyShardingInterpreter(gm, {}, param_placement_order={})
+
+        local = torch.randn(512, 128, device="meta")
+
+        def trace_fn(x):
+            return interp.redistribute_tensor(x, curr_spec, tgt_spec, node)
+
+        traced = make_fx(trace_fn, tracing_mode="real")(local)
+        counts = _count_collectives(traced)
+        assert counts["all_reduce"] == 0
 
 
 class TestShardOrderSpecIsolation:
