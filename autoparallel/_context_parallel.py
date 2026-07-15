@@ -16,7 +16,15 @@ from torch.nn.attention.flex_attention import BlockMask, flex_attention
 from .collectives import all_gather, axis_size, local_map, reduce_scatter
 
 _DP_REPLICATE_NAMES = {"dp_replicate", "ddp"}
-_DP_SHARD_NAMES = {"dp", "dp_shard", "fsdp", "data", "data_parallel"}
+_DP_SHARD_NAMES = {
+    "dp",
+    "dp_shard",
+    "dp_shard_mod_ep",
+    "dp_shard_in_ep",
+    "fsdp",
+    "data",
+    "data_parallel",
+}
 _CP_NAMES = {"cp", "context", "context_parallel"}
 _TP_NAMES = {"tp", "tensor", "tensor_parallel"}
 
@@ -183,6 +191,8 @@ def _mesh_dim_names(mesh: DeviceMesh) -> tuple[str, ...]:
         return ("dp_shard", "cp", "tp")
     if mesh.ndim == 4:
         return ("dp_replicate", "dp_shard", "cp", "tp")
+    if mesh.ndim == 5:
+        return ("dp_replicate", "dp_shard_mod_ep", "dp_shard_in_ep", "cp", "tp")
     raise ValueError(
         "context_parallel_attention_placements requires mesh_dim_names for "
         "1-D/2-D meshes. Use names such as ('dp_shard', 'cp') or "

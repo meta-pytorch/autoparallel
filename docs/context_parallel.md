@@ -57,7 +57,7 @@ Supported mesh axis names:
 
 | Role | Names |
 | --- | --- |
-| DP shard | `dp`, `dp_shard`, `fsdp`, `data`, `data_parallel` |
+| DP shard | `dp`, `dp_shard`, `dp_shard_mod_ep`, `dp_shard_in_ep`, `fsdp`, `data`, `data_parallel` |
 | CP | `cp`, `context`, `context_parallel` |
 | TP | `tp`, `tensor`, `tensor_parallel` |
 | Extra DP axis | `dp_replicate`, `ddp` |
