@@ -1191,7 +1191,11 @@ class ScaledDotProductAttention(torch.nn.Module):
 
 
 def build_attention(
-    use_flex_attn: bool, attn_mask_type: str, fixed_block_size: int | None = None
+    use_flex_attn: bool,
+    attn_mask_type: str,
+    fixed_block_size: int | None = None,
+    context_parallel_mesh: DeviceMesh | None = None,
+    scale: float | None = None,
 ):
     if fixed_block_size is not None:
         raise ValueError(
@@ -1199,6 +1203,15 @@ def build_attention(
         )
     if attn_mask_type != "causal":
         raise ValueError("TorchTitan with SDPA currently only supports causal mask.")
+    if context_parallel_mesh is not None:
+        if use_flex_attn:
+            raise ValueError("FlexAttention is not compatible with CP yet.")
+        from autoparallel import make_context_parallel
+
+        # scale is baked in here since the CP callable takes only (q, k, v).
+        return make_context_parallel(
+            context_parallel_mesh, kind="sdpa", is_causal=True, scale=scale
+        )
     return ScaledDotProductAttention(attn_mask_type)
 
 
@@ -1509,6 +1522,7 @@ class Attention(nn.Module):
         attn_config,
         model_config,
         compute_dtype: torch.dtype | None = None,
+        mesh: DeviceMesh | None = None,
     ):
         super().__init__()
         self.dim = model_config.dim
@@ -1548,8 +1562,20 @@ class Attention(nn.Module):
             mscale = 0.1 * attn_config.mscale * math.log(rope_cfg.rope_factor) + 1.0
             self.softmax_scale = self.softmax_scale * mscale * mscale
 
+        # Context parallel follows the mesh: when it has a "cp" axis, run
+        # attention through the CP local_map (cp shards sequence).
+        self.context_parallel = (
+            mesh is not None
+            and mesh.mesh_dim_names is not None
+            and "cp" in mesh.mesh_dim_names
+        )
         use_flex_attn = "FlexAttention" in type(attn_config.inner_attention).__name__
-        self.sdpa = build_attention(use_flex_attn, attn_config.mask_type)
+        self.sdpa = build_attention(
+            use_flex_attn,
+            attn_config.mask_type,
+            context_parallel_mesh=mesh if self.context_parallel else None,
+            scale=self.softmax_scale,
+        )
 
     def forward(
         self,
@@ -1631,7 +1657,11 @@ class Attention(nn.Module):
         k = _to_compute_dtype(k, self.compute_dtype)
         v = _to_compute_dtype(v, self.compute_dtype)
 
-        output = self.sdpa(q, k, v, scale=self.softmax_scale)
+        if self.context_parallel:
+            # CP callable bakes in scale at build time and takes only (q, k, v).
+            output = self.sdpa(q, k, v)
+        else:
+            output = self.sdpa(q, k, v, scale=self.softmax_scale)
 
         # Reshape and project output
         output = output.transpose(
@@ -1685,6 +1715,7 @@ class TransformerBlock(nn.Module):
             layer_config.attention,
             model_config,
             compute_dtype=compute_dtype,
+            mesh=mesh,
         )
         self.attention_norm = nn.RMSNorm(dim, eps=layer_config.attention_norm.eps)
         self.ffn_norm = nn.RMSNorm(dim, eps=layer_config.ffn_norm.eps)
