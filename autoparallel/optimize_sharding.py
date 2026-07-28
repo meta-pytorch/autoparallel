@@ -69,6 +69,7 @@ The solver finds the globally optimal sharding strategy that minimizes total
 runtime cost while satisfying all constraints.
 """
 
+import contextlib
 import logging
 import math
 import operator
@@ -102,10 +103,39 @@ from .graph_passes.graph_utils import (
     build_param_derived_set,
     build_terminal_derived_set,
 )
-from .shardings.placement_options import get_placement_options_for_node
-from .shardings.propagation_rules import _create_all_options
+from .shardings.placement_options import (
+    get_placement_options_for_node,
+    reset_placement_options_cache,
+)
+from .shardings.propagation_rules import _create_all_options, set_current_seed_node
 
 logger = logging.getLogger(__name__)
+
+# Strategy enumeration fills each OpSpec's redistribute_cost via torch's
+# generate_redistribute_costs (an expensive per-strategy redistribute-plan
+# computation, the dominant cost of build on large/3D meshes). But
+# _build_decision_vars overwrites every edge with the NCCL-aware
+# estimate_strategy_comms_cost, and nothing reads the enumeration costs in
+# between (remove_invalid_configs / keep_unique_configs select on placements/
+# shapes only). So during enumeration we replace torch's redistribute_cost with
+# a structure-preserving dummy to skip the wasted work; the final decision_vars
+# are byte-identical. Autoparallel's own cost model uses a separate
+# redistribute_cost (collective_runtime_estimation) and is unaffected.
+
+
+@contextlib.contextmanager
+def _skip_enumeration_redistribute_cost(enabled):
+    if not enabled:
+        yield
+        return
+    import torch.distributed.tensor._ops.utils as _dt_utils
+
+    orig = _dt_utils.redistribute_cost
+    _dt_utils.redistribute_cost = lambda *args, **kwargs: 0.0
+    try:
+        yield
+    finally:
+        _dt_utils.redistribute_cost = orig
 
 
 def concretize_symint(val):
@@ -188,10 +218,13 @@ def concretize_gm(gm):
     return concrete_gm, orig_to_concrete, concrete_to_orig
 
 
-@dataclass
+@dataclass(slots=True)
 class DecisionVar:
     """A decision variable in the ILP, representing one (node, arg, output_placement,
-    input_placement) choice with its associated costs and strategy metadata."""
+    input_placement) choice with its associated costs and strategy metadata.
+
+    slots=True: there are millions of these on large/3D meshes, so dropping the
+    per-instance __dict__ materially cuts both build time and memory."""
 
     var: Any  # pulp.LpVariable
     cost: float
@@ -201,6 +234,14 @@ class DecisionVar:
     strategy: Any  # OpSpec
     output_spec: Any  # DTensorSpec or tuple[DTensorSpec | None, ...]
     input_spec: Any  # DTensorSpec
+
+
+@dataclass
+class LPRelaxationResult:
+    objective: float
+    status: str
+    solve_s: float
+    total_s: float
 
 
 def _assert_has_tensor_meta(spec_or_specs, node, label):
@@ -224,8 +265,28 @@ class ShardingOptimizer:
         mesh,
         force_grad_reduce_in_higher_precision=False,
         repeated_subgraphs=False,
+        fast_build=True,
+        build_pulp=True,
+        build_costs=True,
+        strategy_seed=None,
+        strategy_radius=None,
     ):
         self.orig_gm = gm
+        self.fast_build = fast_build
+        # When False, skip building the per-edge decision-var costs (Phase A of
+        # _build_decision_vars, the comm-cost estimate over millions of edges that
+        # dominates build). Strategies + cluster_links are still built; the
+        # approximate solver computes the costs it needs on demand (lazy build),
+        # only for the branches TRW-S actually touches. Implies build_pulp=False
+        # (a PuLP problem needs the costs in its objective).
+        self.build_costs = build_costs
+        # When False, skip creating PuLP variables and constraints entirely.
+        # decision_var costs + strategies + cluster_links are still built, which
+        # is all the approximate solver needs (it derives the constraint topology
+        # directly). This avoids constructing millions of PuLP objects on large /
+        # 3D meshes, where that dominates build time.
+        self.build_pulp = build_pulp and build_costs
+        self.prob = None
         # The optimizer works on a concretized copy of the graph where all
         # symbolic shapes are replaced with their concrete hint values. This
         # centralizes dynamic-shape handling: the optimization pipeline
@@ -239,6 +300,8 @@ class ShardingOptimizer:
         self.force_grad_reduce_in_higher_precision = (
             force_grad_reduce_in_higher_precision
         )
+        self.strategy_seed = strategy_seed
+        self.strategy_radius = strategy_radius
         self._constraint_log: list[tuple[str, dict]] = []
         self._memory_constraint: tuple[float, float] | None = None
         # Maps ILP constraint name → node_name for active node constraints,
@@ -246,19 +309,47 @@ class ShardingOptimizer:
         # remove_constraints can keep this in sync.
         self._node_constraint_names: dict[str, str] = {}
         self._name_counters: dict[str, int] = {}
+        # Set by _build_decision_vars: the (node, arg, out, inp) keys whose
+        # strategy edge has finite cost. Invalid (infinite-cost) edges are
+        # pruned and get no variable. None means "no pruning filter".
+        self._valid_keys: set[tuple] | None = None
+        self.profile: dict[str, Any] = {"timings": {}}
+        t_init_start = time.perf_counter()
         t0 = time.perf_counter()
-        self.strats = self.build_sharding_metadata()
+        if self.strategy_seed is None:
+            self.strats = self.build_sharding_metadata()
+        else:
+            from .shardings import propagation_rules as _propagation_rules
+
+            _propagation_rules.set_strategy_seed(
+                self.strategy_seed, self.strategy_radius
+            )
+            reset_placement_options_cache()
+            try:
+                self.strats = self.build_sharding_metadata()
+            finally:
+                _propagation_rules.set_strategy_seed(None, None)
+                set_current_seed_node(None)
+                reset_placement_options_cache()
+        t_strategy = time.perf_counter() - t0
+        self.profile["timings"]["strategy_enumeration_s"] = t_strategy
+        logger.info("ShardingOptimizer: strategy enumeration took %.3fs", t_strategy)
         # nodes/node_map are derived from strats (not graph.nodes) so that
         # shape-computation nodes skipped by build_sharding_metadata don't
         # appear and indices stay consistent.
         self.nodes = list(self.strats.keys())
         self.node_map = {node: i for i, node in enumerate(self.nodes)}
-        logger.debug("Placement options took %.3fs", time.perf_counter() - t0)
+        logger.debug("Placement options took %.3fs", t_strategy)
         from autoparallel.shardings.placement_options import get_placement_options_timer
 
         get_placement_options_timer().report()
 
-        self.cluster_links: dict[tuple, tuple] = {}
+        # Node-level: cluster-copy node idx -> root node idx (option indices are
+        # identical between copy and root; resolved on demand via
+        # _cluster_root_key / _linked_option_keys).
+        self.cluster_links: dict[int, int] = {}
+        self._root_to_copies: dict[int, list[int]] = defaultdict(list)
+
         if repeated_subgraphs:
             t = time.time()
             clusters = get_identical_regions(self.gm.graph, self.strats)
@@ -270,25 +361,34 @@ class ShardingOptimizer:
         t1 = time.perf_counter()
         self.validate()
         t2 = time.perf_counter()
-        self.prob = pulp.LpProblem("AutoParallel", pulp.LpMinimize)
-        self.add_default_constraints()
+        if self.build_pulp:
+            self.prob = pulp.LpProblem("AutoParallel", pulp.LpMinimize)
+            self.add_default_constraints()
         t3 = time.perf_counter()
-        n_unique_vars = len(self.pulp_variables)
-        n_constraints = len(self.prob.constraints)
-        logger.debug(
-            "ILP construction took %.3fs "
-            "(decision_vars=%.3fs, validate=%.3fs, constraints=%.3fs)",
-            t3 - t0,
-            t1 - t0,
-            t2 - t1,
-            t3 - t2,
+        self.profile["timings"].update(
+            {
+                "decision_var_build_s": t1 - t0,
+                "validation_s": t2 - t1,
+                "constraint_construction_s": t3 - t2,
+                "init_total_s": t3 - t_init_start,
+            }
         )
-        logger.debug(
-            "ILP problem size: %d unique vars, %d decision vars, %d constraints",
-            n_unique_vars,
+        n_constraints = len(self.prob.constraints) if self.prob is not None else 0
+        logger.info(
+            "ShardingOptimizer: build done in %.3fs (%d unique vars, %d decision "
+            "vars, %d constraints)",
+            t3 - t_init_start,
+            len(self.pulp_variables),
             len(self.decision_vars),
             n_constraints,
         )
+
+    @staticmethod
+    def _safe_float(value):
+        try:
+            return float(value)
+        except Exception:
+            return math.nan
 
     def _get_next_name(self, prefix):
         idx = self._name_counters.setdefault(prefix, 0)
@@ -305,77 +405,97 @@ class ShardingOptimizer:
 
     def build_sharding_metadata(self):
         strats = {}
-        for node in self.graph.nodes:
-            if node.op in ("placeholder", "get_attr"):
-                val = node.meta.get("val")
-                if isinstance(val, torch.Tensor):
-                    strats[node] = _create_all_options(self.mesh, val.shape, tensor=val)
-                elif node.op == "placeholder":
-                    # Non-tensor placeholders (e.g. baked-in booleans/strings):
-                    # keep them in strats with empty-shape replicate options
-                    # so the constraint system can reference them.
-                    strats[node] = _create_all_options(self.mesh, ())
+        # Enumeration's redistribute_cost matrices are overwritten with real
+        # costs in _build_decision_vars, so skip computing them here (see
+        # _skip_enumeration_redistribute_cost).
+        with _skip_enumeration_redistribute_cost(self.fast_build):
+            for node in self.graph.nodes:
+                set_current_seed_node(node.name)
+                if node.op in ("placeholder", "get_attr"):
+                    val = node.meta.get("val")
+                    if isinstance(val, torch.Tensor):
+                        strats[node] = _create_all_options(
+                            self.mesh, val.shape, tensor=val
+                        )
+                    elif node.op == "placeholder":
+                        # Non-tensor placeholders (e.g. baked-in booleans/strings):
+                        # keep them in strats with empty-shape replicate options
+                        # so the constraint system can reference them.
+                        strats[node] = _create_all_options(self.mesh, ())
+                    else:
+                        # Non-tensor get_attr: GraphModule submodules used by
+                        # HOPs — not added to strats, invisible to the ILP.
+                        # _all_input_nodes filters them.
+                        assert node.op == "get_attr"
+                        assert any(
+                            isinstance(u.target, torch._ops.HigherOrderOperator)
+                            or "local_map" in u.name
+                            for u in node.users
+                        ), f"Non-tensor get_attr {node} is not used by a HOP"
+                elif node.op == "call_function":
+                    if not _produces_tensor(node.meta.get("val")):
+                        # Shape-computation nodes (sym_size, operator.mul, etc.)
+                        # produce scalars, not tensors — skip sharding.
+                        continue
+                    user_strats = tree_map_only(
+                        torch.fx.Node,
+                        lambda x: strats.get(x, x.meta.get("val")),
+                        node.args,
+                    )
+                    user_args = tree_map_only(
+                        torch.fx.Node, lambda x: x.meta.get("val"), node.args
+                    )
+                    user_kwargs = tree_map_only(
+                        torch.fx.Node, lambda x: x.meta.get("val"), node.kwargs
+                    )
+                    strats[node] = get_placement_options_for_node(
+                        self.mesh, node, user_strats, user_args, user_kwargs
+                    )
+                elif node.op == "output":
+                    user_strats = tree_map_only(
+                        torch.fx.Node, lambda x: strats[x], node.args
+                    )
+                    strats[node] = user_strats
                 else:
-                    # Non-tensor get_attr: GraphModule submodules used by
-                    # HOPs — not added to strats, invisible to the ILP.
-                    # _all_input_nodes filters them.
-                    assert node.op == "get_attr"
-                    assert any(
-                        isinstance(u.target, torch._ops.HigherOrderOperator)
-                        or "local_map" in u.name
-                        for u in node.users
-                    ), f"Non-tensor get_attr {node} is not used by a HOP"
-            elif node.op == "call_function":
-                if not _produces_tensor(node.meta.get("val")):
-                    # Shape-computation nodes (sym_size, operator.mul, etc.)
-                    # produce scalars, not tensors — skip sharding.
-                    continue
-                user_strats = tree_map_only(
-                    torch.fx.Node,
-                    lambda x: strats.get(x, x.meta.get("val")),
-                    node.args,
-                )
-                user_args = tree_map_only(
-                    torch.fx.Node, lambda x: x.meta.get("val"), node.args
-                )
-                user_kwargs = tree_map_only(
-                    torch.fx.Node, lambda x: x.meta.get("val"), node.kwargs
-                )
-                strats[node] = get_placement_options_for_node(
-                    self.mesh, node, user_strats, user_args, user_kwargs
-                )
-            elif node.op == "output":
-                user_strats = tree_map_only(
-                    torch.fx.Node, lambda x: strats[x], node.args
-                )
-                strats[node] = user_strats
-            else:
-                raise ValueError(f"Unexpected node op: {node.op}")
+                    raise ValueError(f"Unexpected node op: {node.op}")
+        set_current_seed_node(None)
         return strats
 
     def create_cluster_links(self, clusters):
-        """Create a mapping between identical optimization nodes to reduce the
-        optimization space. If cluster_links[key1] == key2, the optimization
-        problem uses key2's variable in place of key1."""
+        """Map each cluster-copy node to its root node (node-level). The optimizer
+        reuses the root's decision variable for every copy, and the per-(arg, out,
+        inp) option index is identical between a copy and its root, so we store
+        only the node->node map and reconstruct option keys on demand (see
+        _cluster_root_key / _linked_option_keys). Materializing one dict entry per
+        option-tuple instead costs tens of millions of entries (and seconds of
+        build time) on large/3D meshes."""
         for cluster_group in clusters:
             cluster0 = cluster_group[0]
             for cluster_i in cluster_group[1:]:
                 for n0, ni in zip(cluster0, cluster_i):
-                    idx0 = self.node_map[n0]
-                    idx1 = self.node_map[ni]
-                    options_n0 = list(self.walk_over_options(n0))
-                    options_ni = list(self.walk_over_options(ni))
-                    assert options_n0 == options_ni, (
-                        f"Problem with graph clustering: {n0} and {ni} don't have the same number "
-                        "of input/output placements. Please report a bug"
+                    assert len(self.strats[n0].strategies) == len(
+                        self.strats[ni].strategies
+                    ), (
+                        f"Problem with graph clustering: {n0} and {ni} don't have "
+                        "the same number of strategies. Please report a bug"
                     )
-                    for argi, out_idx, inp_idx in options_n0:
-                        self.cluster_links[(idx1, argi, out_idx, inp_idx)] = (
-                            idx0,
-                            argi,
-                            out_idx,
-                            inp_idx,
-                        )
+                    self.cluster_links[self.node_map[ni]] = self.node_map[n0]
+
+    def _cluster_root_key(self, key):
+        """Resolve an option key to its cluster-root option key, or return it
+        unchanged when the node is not a cluster copy. The (arg, out, inp) indices
+        are identical between a copy and its root."""
+        root_idx = self.cluster_links.get(key[0])
+        return key if root_idx is None else (root_idx, key[1], key[2], key[3])
+
+    def _linked_option_keys(self, root_key):
+        """The option keys on the cluster copies of root_key's node (each a mirror
+        of root_key with the copy's node index). A copy mirrors its root's
+        per-option validity, so callers pass valid root keys only."""
+        copies = self._root_to_copies.get(root_key[0])
+        if not copies:
+            return ()
+        return [(c, root_key[1], root_key[2], root_key[3]) for c in copies]
 
     def _all_input_nodes(self, node):
         """Variant of node.all_input_nodes that preserves duplicate nodes.
@@ -409,15 +529,26 @@ class ShardingOptimizer:
                 for inp_idx in range(len(strategy.redistribute_cost[argi])):
                     yield argi, out_idx, inp_idx
 
-    def _create_pulp_variables(self):
-        """Create PuLP binary variables for all decision points, resolving
-        cluster links so that identical nodes share the same variable.
+    def _create_pulp_variables(self, variable_category=pulp.LpBinary):
+        """Create PuLP variables for all decision points, resolving cluster
+        links so that identical nodes share the same variable.
 
         Returns a dict mapping root (node_idx, argi, out_idx, inp_idx) keys
         to their PuLP variables. Linked keys are not stored; use
         _get_pulp_variable() to resolve them through cluster_links.
+
+        Keys whose strategy is invalid (infinite cost) are pruned: if
+        self._valid_keys is set, only those keys get a variable. These
+        variables would otherwise be forced to zero by an inf-cost
+        constraint, so skipping them shrinks the ILP without changing the
+        optimum (see _build_decision_vars).
         """
-        cluster_linked_node_idxs = {key[0] for key in self.cluster_links}
+        if variable_category not in {pulp.LpBinary, pulp.LpContinuous}:
+            raise ValueError(
+                f"Unsupported variable_category={variable_category!r}; "
+                "expected pulp.LpBinary or pulp.LpContinuous"
+            )
+        cluster_linked_node_idxs = set(self.cluster_links)
 
         pulp_variables = {}
         for node, _ in self.strats.items():
@@ -428,20 +559,31 @@ class ShardingOptimizer:
                 continue
             for argi, out_idx, inp_idx in self.walk_over_options(node):
                 key = (node_idx, argi, out_idx, inp_idx)
+                if self._valid_keys is not None and key not in self._valid_keys:
+                    continue
                 root_node = self.nodes[node_idx]
+                bounds = (
+                    {"lowBound": 0, "upBound": 1}
+                    if variable_category == pulp.LpContinuous
+                    else {}
+                )
                 pulp_variables[key] = pulp.LpVariable(
                     f"n={root_node},s={node_idx},arg={argi},"
                     f"output_p={out_idx},input_p={inp_idx}",
-                    cat=pulp.LpBinary,
+                    cat=variable_category,
+                    **bounds,
                 )
 
         return pulp_variables
 
     def _get_pulp_variable(self, key):
         """Look up the PuLP variable for a key, resolving through
-        cluster_links if the key belongs to a linked node."""
-        root_key = self.cluster_links.get(key, key)
-        return self.pulp_variables[root_key]
+        cluster_links if the key belongs to a linked node.
+
+        Returns None if the key was pruned (invalid/infinite-cost strategy).
+        """
+        root_key = self._cluster_root_key(key)
+        return self.pulp_variables.get(root_key)
 
     def _compute_edge_costs(
         self,
@@ -480,74 +622,95 @@ class ShardingOptimizer:
 
     def _build_decision_vars(self):
         """Build DecisionVar entries for every (node_idx, argi, out_idx, inp_idx)
-        combination in the strategy space."""
-        t_pulp_start = time.perf_counter()
-        self.pulp_variables = self._create_pulp_variables()
-        t_pulp_end = time.perf_counter()
+        combination in the strategy space.
+
+        Strategy edges whose total cost is infinite (invalid redistributions)
+        are pruned: no variable is created for them. Such a variable would be
+        forced to zero by an inf-cost constraint anyway, so dropping it leaves
+        the optimum unchanged while removing ~30% of the variables and the
+        corresponding ~80% of constraints that are pure ``var == 0`` bounds.
+
+        When ``build_pulp`` is False (approximate solver only) no PuLP variables
+        are created (``DecisionVar.var`` is None); the valid-key set is still
+        built so the approximate solver can treat a key absent from
+        ``decision_vars`` as forbidden.
+        """
+        if not self.build_costs:
+            return self._build_decision_vars_lazy()
 
         # Precompute which node indices are cluster-linked so we can
         # copy costs from the root instead of recomputing them.
-        self._cluster_linked_node_idxs = {key[0] for key in self.cluster_links}
+        self._cluster_linked_node_idxs = set(self.cluster_links)
 
         t_compute = 0.0
         t_edge = 0.0
         n_vars = 0
+        n_pruned = 0
         n_cluster_copied = 0
 
+        t_pulp_start = time.perf_counter()
+        self.pulp_variables = {}
+        self._valid_keys = set()
         decision_vars = {}
         strats_items = [
             (self.node_map[node], node, strat) for node, strat in self.strats.items()
         ]
 
-        # Build DVs for root nodes only (not cluster-linked).
-        for node_idx, node, op_strategy in strats_items:
-            if node.op == "output":
-                continue
-            if node_idx in self._cluster_linked_node_idxs:
-                continue
+        # Phase A: compute every root node's per-edge costs.
+        root_idxs = [
+            node_idx
+            for node_idx, node, _ in strats_items
+            if node.op != "output" and node_idx not in self._cluster_linked_node_idxs
+        ]
+        tc0 = time.perf_counter()
+        node_results = [self._compute_node_edge_costs(idx) for idx in root_idxs]
+        t_edge = time.perf_counter() - tc0
 
-            num_args = len(op_strategy.strategies[0].input_specs)
-
-            for out_idx, output_strategy in enumerate(op_strategy.strategies):
-                tc0 = time.perf_counter()
-                compute_cost = estimate_strategy_runtime_cost(node, output_strategy)
-                tc1 = time.perf_counter()
-                t_compute += tc1 - tc0
-                per_arg_compute = compute_cost / num_args
-
+        # Phase B: assemble decision vars (and PuLP variables) from the computed
+        # costs. Serial because PuLP vars and DecisionVars hold parent-owned
+        # strategy objects; byte-identical to computing the costs inline. This
+        # also writes the real costs back into each strat's redistribute_cost
+        # (overwriting the enumeration dummies) for the cluster batch-copy and
+        # _compute_solution_cost readers below.
+        for node_idx, out_data in node_results:
+            node = self.nodes[node_idx]
+            op_strategy = self.strats[node]
+            for out_idx, (per_arg_compute, arg_rows) in enumerate(out_data):
+                output_strategy = op_strategy.strategies[out_idx]
                 for argi, redist_costs in enumerate(output_strategy.redistribute_cost):
-                    for inp_idx, default_comm_cost in enumerate(redist_costs):
-                        key = (node_idx, argi, out_idx, inp_idx)
-
-                        all_input_nodes = self._all_input_nodes(node)
-                        producer_strategy = (
-                            self.strats[all_input_nodes[argi]]
-                            if all_input_nodes
-                            else None
-                        )
-                        te0 = time.perf_counter()
-                        comm_cost, transition_cost = self._compute_edge_costs(
-                            node,
-                            output_strategy,
-                            argi,
-                            inp_idx,
-                            default_comm_cost,
-                            producer_strategy,
-                        )
-                        te1 = time.perf_counter()
-                        t_edge += te1 - te0
-
+                    input_spec = output_strategy.input_specs[argi]
+                    for inp_idx, (comm_cost, transition_cost) in enumerate(
+                        arg_rows[argi]
+                    ):
                         redist_costs[inp_idx] = comm_cost
+                        cost = comm_cost + per_arg_compute + transition_cost
+                        # Prune invalid (infinite-cost) edges: no variable, no
+                        # DecisionVar. A key absent from decision_vars is treated
+                        # as forbidden by both the ILP and the approximate solver.
+                        if not math.isfinite(cost):
+                            n_pruned += 1
+                            continue
 
+                        key = (node_idx, argi, out_idx, inp_idx)
+                        if self.build_pulp:
+                            var = pulp.LpVariable(
+                                f"n={node},s={node_idx},arg={argi},"
+                                f"output_p={out_idx},input_p={inp_idx}",
+                                cat=pulp.LpBinary,
+                            )
+                            self.pulp_variables[key] = var
+                        else:
+                            var = None
+                        self._valid_keys.add(key)
                         decision_vars[key] = DecisionVar(
-                            var=self.pulp_variables[key],
-                            cost=comm_cost + per_arg_compute + transition_cost,
+                            var=var,
+                            cost=cost,
                             compute_cost=per_arg_compute,
                             comm_cost=comm_cost,
                             sharding_transition_cost=transition_cost,
                             strategy=output_strategy,
                             output_spec=output_strategy.output_specs,
-                            input_spec=output_strategy.input_specs[argi],
+                            input_spec=input_spec,
                         )
                         n_vars += 1
 
@@ -555,10 +718,7 @@ class ShardingOptimizer:
         # The root pass above updated redistribute_cost in place with
         # edge-computed costs; linked strats need the same values for
         # _compute_solution_cost and other readers.
-        linked_node_to_root_node: dict[int, int] = {}
-        for linked_key, root_key in self.cluster_links.items():
-            linked_node_to_root_node[linked_key[0]] = root_key[0]
-        for linked_node_idx, root_node_idx in linked_node_to_root_node.items():
+        for linked_node_idx, root_node_idx in self.cluster_links.items():
             linked_node = self.nodes[linked_node_idx]
             root_node = self.nodes[root_node_idx]
             linked_op = self.strats[linked_node]
@@ -570,34 +730,108 @@ class ShardingOptimizer:
                     list(costs) for costs in root_spec.redistribute_cost
                 ]
         n_cluster_copied = len(self.cluster_links)
-        n_vars += n_cluster_copied
 
-        self._root_to_linked: dict[tuple, list[tuple]] = defaultdict(list)
-        for linked_key, root_key in self.cluster_links.items():
-            self._root_to_linked[root_key].append(linked_key)
+        # Root node idx -> [copy node idxs]. Option keys are reconstructed on
+        # demand (see _linked_option_keys); a copy mirrors its root's per-option
+        # validity, so no per-option filtering is needed here.
+        self._root_to_copies = defaultdict(list)
+        for copy_idx, root_idx in self.cluster_links.items():
+            self._root_to_copies[root_idx].append(copy_idx)
 
+        t_pulp_end = time.perf_counter()
         logger.debug(
-            "_build_decision_vars breakdown (%d vars, %d cluster-copied): "
-            "pulp_vars=%.3fs, compute_cost=%.3fs, edge_cost=%.3fs",
-            n_vars,
+            "_build_decision_vars breakdown (%d vars, %d pruned-inf, %d cluster-copied): "
+            "build=%.3fs, compute_cost=%.3fs, edge_cost=%.3fs",
+            len(decision_vars),
+            n_pruned,
             n_cluster_copied,
             t_pulp_end - t_pulp_start,
             t_compute,
             t_edge,
         )
+        self.profile["timings"]["cost_estimation_s"] = t_compute + t_edge
         return decision_vars
+
+    def _build_decision_vars_lazy(self):
+        """Lazy build (build_costs=False): skip the expensive per-edge cost
+        estimation (Phase A) and the DecisionVar/PuLP materialization (Phase B).
+
+        Strategies, cluster_links and the redistribute_cost *shape* (the
+        enumeration dummies) are preserved, which is all the approximate solver
+        needs to derive the topology; it computes the comm/compute costs it
+        actually uses on demand. Returns an empty decision_vars dict — callers
+        that read it (the approx solver) must route through their lazy provider.
+        """
+        self._cluster_linked_node_idxs = set(self.cluster_links)
+        self.pulp_variables = {}
+        self._valid_keys = None
+        self._root_to_copies = defaultdict(list)
+        for copy_idx, root_idx in self.cluster_links.items():
+            self._root_to_copies[root_idx].append(copy_idx)
+        self.profile["timings"]["cost_estimation_s"] = 0.0
+        return {}
+
+    def _compute_node_edge_costs(self, node_idx):
+        """Compute per-edge costs for one root node."""
+        node = self.nodes[node_idx]
+        op_strategy = self.strats[node]
+        num_args = len(op_strategy.strategies[0].input_specs)
+        input_nodes = self._all_input_nodes(node)
+        producer_strategies = [self.strats[n] for n in input_nodes]
+        out_data = []
+        for output_strategy in op_strategy.strategies:
+            per_arg_compute = (
+                estimate_strategy_runtime_cost(node, output_strategy) / num_args
+            )
+            arg_rows = []
+            for argi, redist_costs in enumerate(output_strategy.redistribute_cost):
+                producer_strategy = (
+                    producer_strategies[argi]
+                    if argi < len(producer_strategies)
+                    else None
+                )
+                arg_rows.append(
+                    [
+                        self._compute_edge_costs(
+                            node,
+                            output_strategy,
+                            argi,
+                            inp_idx,
+                            default_comm_cost,
+                            producer_strategy,
+                        )
+                        for inp_idx, default_comm_cost in enumerate(redist_costs)
+                    ]
+                )
+            out_data.append((per_arg_compute, arg_rows))
+        return node_idx, out_data
 
     def _resolve_decision_var(self, key):
         """Return a DecisionVar for key, reconstructing on the fly for linked keys."""
         dv = self.decision_vars.get(key)
         if dv is not None:
             return dv
-        root_key = self.cluster_links[key]
-        root_dv = self.decision_vars[root_key]
         node_idx, argi, out_idx, _ = key
         strategy = self.strats[self.nodes[node_idx]].strategies[out_idx]
+        root_key = self._cluster_root_key(key)
+        root_dv = self.decision_vars.get(root_key)
+        if root_dv is None:
+            # Lazy build (build_costs=False): no DecisionVars were materialized.
+            # The approximate solver scores via its own lazy cost provider; here
+            # only .strategy / specs are needed (solution extraction), so the
+            # cost fields are zero placeholders.
+            return DecisionVar(
+                var=None,
+                cost=0.0,
+                compute_cost=0.0,
+                comm_cost=0.0,
+                sharding_transition_cost=0.0,
+                strategy=strategy,
+                output_spec=strategy.output_specs,
+                input_spec=strategy.input_specs[argi],
+            )
         return DecisionVar(
-            var=self._get_pulp_variable(key),
+            var=self._get_pulp_variable(key) if self.pulp_variables else None,
             cost=root_dv.cost,
             compute_cost=root_dv.compute_cost,
             comm_cost=root_dv.comm_cost,
@@ -606,6 +840,28 @@ class ShardingOptimizer:
             output_spec=strategy.output_specs,
             input_spec=strategy.input_specs[argi],
         )
+
+    def _find_decision_var(self, node_idx, argi, out_idx):
+        """Return a DecisionVar for any surviving inp_idx of (node, arg, out),
+        or None if every edge for that output strategy was pruned.
+
+        compute_cost is identical across inp_idx for a given out_idx, so callers
+        that only need per-strategy costs can use whichever edge survived.
+        """
+        strategy = self.strats[self.nodes[node_idx]].strategies[out_idx]
+        n_inp = (
+            len(strategy.redistribute_cost[argi]) if strategy.redistribute_cost else 1
+        )
+        for inp_idx in range(n_inp):
+            key = (node_idx, argi, out_idx, inp_idx)
+            if key in self.decision_vars:
+                return self._resolve_decision_var(key)
+            if (
+                key[0] in self.cluster_links
+                and self._cluster_root_key(key) in self.decision_vars
+            ):
+                return self._resolve_decision_var(key)
+        return None
 
     def _collect_vars(self, node, node_idx, argi, group_by, resolve_clusters=False):
         """Collect PuLP variables for a node's options, grouped by strategy index.
@@ -619,12 +875,14 @@ class ShardingOptimizer:
         result = {}
         for _, out_idx, inp_idx in self.walk_over_options(node, argi):
             key = (node_idx, argi, out_idx, inp_idx)
-            if key in self.cluster_links:
+            if key[0] in self.cluster_links:
                 if not resolve_clusters:
                     continue
-                var = self.pulp_variables[self.cluster_links[key]]
+                var = self.pulp_variables.get(self._cluster_root_key(key))
             else:
-                var = self.pulp_variables[key]
+                var = self.pulp_variables.get(key)
+            if var is None:  # pruned (invalid/infinite-cost) strategy edge
+                continue
             group_key = out_idx if group_by == "out_idx" else inp_idx
             result.setdefault(group_key, []).append(var)
         return result
@@ -634,6 +892,11 @@ class ShardingOptimizer:
             if node.op != "call_function":
                 continue
             if node not in self.strats:
+                continue
+            # Cluster copies are structurally identical to their root (same
+            # strategies and input structure, asserted in create_cluster_links),
+            # so validating the root covers them.
+            if self.node_map[node] in self.cluster_links:
                 continue
             strat = self.strats[node]
             strat0 = strat.strategies[0]
@@ -679,7 +942,9 @@ class ShardingOptimizer:
             arg_vars = {}
             for argi, out_idx, inp_idx in self.walk_over_options(node):
                 key = (node_idx, argi, out_idx, inp_idx)
-                var = self.pulp_variables[key]
+                var = self.pulp_variables.get(key)
+                if var is None:  # pruned (invalid) strategy edge
+                    continue
                 arg_vars.setdefault(argi, []).append(var)
             for eqs in arg_vars.values():
                 self.prob += (
@@ -703,20 +968,24 @@ class ShardingOptimizer:
                 continue
             if len(self._all_input_nodes(node)) <= 1:
                 continue
-            vars_per_output = {}
+            # Group vars by (argi, out_idx). Pruning can leave an arg with no
+            # vars for a given out_idx, so we key explicitly by out_idx rather
+            # than relying on positional alignment: a missing entry means an
+            # empty sum (== 0), which correctly forbids that output strategy.
+            num_args = len(self._all_input_nodes(node))
+            vars_per_output: dict[tuple[int, int], list] = {}
             for argi, out_idx, inp_idx in self.walk_over_options(node):
                 key = (node_idx, argi, out_idx, inp_idx)
-                var = self.pulp_variables[key]
+                var = self.pulp_variables.get(key)
+                if var is None:  # pruned (invalid) strategy edge
+                    continue
                 vars_per_output.setdefault((argi, out_idx), []).append(var)
-            eqs_per_arg = [[] for _ in self._all_input_nodes(node)]
-            for (argi, out_idx), value in vars_per_output.items():
-                eqs_per_arg[argi].append(pulp.lpSum(value))
-            arg0 = eqs_per_arg[0]
-            for arg_eqs in eqs_per_arg[1:]:
-                assert len(arg0) == len(arg_eqs)
-                for i in range(len(arg0)):
+            all_out_idxs = {oi for (_, oi) in vars_per_output}
+            for out_idx in all_out_idxs:
+                arg0_eq = pulp.lpSum(vars_per_output.get((0, out_idx), []))
+                for argi in range(1, num_args):
                     self.prob += (
-                        arg0[i] == arg_eqs[i],
+                        arg0_eq == pulp.lpSum(vars_per_output.get((argi, out_idx), [])),
                         self._get_next_name("same_across_args"),
                     )
 
@@ -790,13 +1059,15 @@ class ShardingOptimizer:
                     )
                     continue
 
-                assert (
-                    vars_producer.keys() == vars_consumer.keys()
-                ), f"{vars_producer}, {vars_consumer}"
-
-                for k in vars_producer:
+                # Pruning can leave a producer output strategy with no matching
+                # consumer var (the consumer cannot accept that placement) or
+                # vice versa. Iterate the union and treat a missing side as an
+                # empty sum (== 0): this forbids the unmatched output strategy,
+                # exactly as the old inf-cost (== 0) variables did.
+                for k in vars_producer.keys() | vars_consumer.keys():
                     self.prob += (
-                        pulp.lpSum(vars_producer[k]) == pulp.lpSum(vars_consumer[k]),
+                        pulp.lpSum(vars_producer.get(k, []))
+                        == pulp.lpSum(vars_consumer.get(k, [])),
                         self._get_next_name("output_input_consistent"),
                     )
 
@@ -805,6 +1076,11 @@ class ShardingOptimizer:
         are forced to zero.
 
         ∀i,a,o,j: c_{i,a,o,j} = ∞ ⟹ x_{i,a,o,j} = 0
+
+        Freshly built optimizers prune these edges in _build_decision_vars, so
+        no variable exists and this is a no-op. It still runs for optimizers
+        loaded from save files produced before pruning was introduced, whose
+        decision_vars may still contain infinite-cost entries.
         """
         for key, dv in self.decision_vars.items():
             if not math.isfinite(dv.cost):
@@ -877,28 +1153,122 @@ class ShardingOptimizer:
     # ---- Solution ----
 
     def _set_objective(self):
-        """Add the cost minimization objective to the ILP."""
+        """Add the cost minimization objective to the ILP.
+
+        Idempotent: a no-op if the objective has already been set. This lets the
+        approximate solver populate ``prob.objective`` (so its assignment can be
+        scored with ``pulp.value(prob.objective)``) without clobbering or
+        double-adding it, and keeps repeated get_solution() calls safe.
+        """
+        if self.prob.objective is not None:
+            return
         terms = []
         for key, dv in self.decision_vars.items():
-            multiplier = 1 + len(self._root_to_linked.get(key, []))
+            multiplier = 1 + len(self._root_to_copies.get(key[0], ()))
             terms.append(dv.var * dv.cost * multiplier)
         self.prob += pulp.lpSum(terms)
 
+    def get_lower_bound(self, verbose=False):
+        """Solve the LP relaxation and return a lower bound on the ILP objective.
+
+        This relaxes the existing binary PuLP variables to continuous variables
+        in [0, 1], solves the current problem with all constraints already added,
+        then restores the optimizer state. The result is a certificate only:
+        fractional LP values are not valid sharding placements.
+        """
+        t0 = time.perf_counter()
+        old_objective = self.prob.objective
+        old_status = self.prob.status
+        old_sol_status = getattr(self.prob, "sol_status", None)
+        old_selected_keys_marker = object()
+        old_selected_keys = getattr(self, "selected_keys", old_selected_keys_marker)
+        var_states = {
+            var: (var.cat, var.lowBound, var.upBound, var.varValue)
+            for var in self.pulp_variables.values()
+        }
+
+        try:
+            if self.prob.objective is None:
+                self._set_objective()
+            # The relaxation must include the parameter-memory constraint, or it
+            # is a lower bound on a different (unconstrained) problem and can fall
+            # below the true ILP optimum.
+            self._apply_memory_constraint()
+
+            for var in self.pulp_variables.values():
+                var.cat = pulp.LpContinuous
+                var.lowBound = 0
+                var.upBound = 1
+                var.varValue = None
+
+            solver = pulp.PULP_CBC_CMD(msg=verbose)
+            t_solve0 = time.perf_counter()
+            with tempfile.TemporaryDirectory() as tmpdir:
+                solver.tmpDir = tmpdir
+                self.prob.solve(solver)
+            solve_s = time.perf_counter() - t_solve0
+
+            status = pulp.LpStatus.get(self.prob.status, self.prob.status)
+            objective = self._safe_float(pulp.value(self.prob.objective))
+            result = LPRelaxationResult(
+                objective=objective,
+                status=status,
+                solve_s=solve_s,
+                total_s=time.perf_counter() - t0,
+            )
+            logger.info(
+                "ShardingOptimizer LP relaxation: status=%s objective=%.4f "
+                "solve=%.3fs",
+                result.status,
+                result.objective,
+                result.solve_s,
+            )
+            return result
+        finally:
+            for var, (cat, low_bound, up_bound, value) in var_states.items():
+                var.cat = cat
+                var.lowBound = low_bound
+                var.upBound = up_bound
+                var.varValue = value
+            self.prob.objective = old_objective
+            self.prob.status = old_status
+            if old_sol_status is None:
+                if hasattr(self.prob, "sol_status"):
+                    delattr(self.prob, "sol_status")
+            else:
+                self.prob.sol_status = old_sol_status
+            if old_selected_keys is old_selected_keys_marker:
+                if hasattr(self, "selected_keys"):
+                    delattr(self, "selected_keys")
+            else:
+                self.selected_keys = old_selected_keys
+
     def _solve(self, verbose=False):
         self._apply_memory_constraint()
-        solver = pulp.PULP_CBC_CMD(msg=verbose)
+        # The sharding ILP has a near-totally-unimodular (flow-like) structure:
+        # CBC's LP relaxation is naturally integral, so it solves in seconds
+        # with zero branch-and-bound. CBC's integer *preprocessing* (probing,
+        # substitutions over hundreds of thousands of binary columns) is then
+        # pure overhead — it dominates the solve. Disabling it (correctness is
+        # unaffected; CBC still does full branch-and-bound if the relaxation is
+        # fractional) makes the solve ~10x faster on large graphs.
+        # Pass as a single string: PuLP prefixes each options entry with "-",
+        # so this becomes the CBC flag "-preprocess off".
+        solver = pulp.PULP_CBC_CMD(msg=verbose, options=["preprocess off"])
         # Use a dedicated temp directory for PuLP's intermediate files (.mps,
         # .sol, etc.) so they are always cleaned up, even if the process is
         # killed.  Without this, leftover files can fill up /tmp (tmpfs).
+        t0 = time.perf_counter()
         with tempfile.TemporaryDirectory() as tmpdir:
             solver.tmpDir = tmpdir
             self.prob.solve(solver)
+        solve_s = time.perf_counter() - t0
 
         self.selected_keys = [
             key for key, dv in self.decision_vars.items() if dv.var.value() == 1
         ]
         for root_key in list(self.selected_keys):
-            self.selected_keys.extend(self._root_to_linked.get(root_key, []))
+            self.selected_keys.extend(self._linked_option_keys(root_key))
 
         if self.prob.status == -1:
             logger.warning(self.get_violated_constraints_log())
@@ -910,6 +1280,77 @@ class ShardingOptimizer:
                 "constraints, and consider relaxing input/output constraints or "
                 "using a larger mesh."
             )
+        return solve_s
+
+    def solve_lp_relaxation(self, verbose=False, frac_tol=1e-6, extract=False):
+        """Solve the continuous relaxation of the ILP (binary variables relaxed
+        to [0, 1]) and report diagnostics, restoring the binary categories on
+        exit so a later ILP solve is unaffected.
+
+        Returns a dict with the relaxation objective (a lower bound on the ILP
+        optimum), the solve time, the number/fraction of decision variables that
+        came out fractional, and the solver status.  This is the lens for
+        understanding why constraints (e.g. propagated annotations) speed up the
+        ILP: a relaxation that is tighter (objective closer to the ILP optimum)
+        and less fractional leaves branch-and-bound far less work.
+
+        For this sharding problem the relaxation is empirically integral, so the
+        relaxation optimum equals the ILP optimum.  With ``extract=True`` and an
+        integral solution, the dict also contains a ``"solution"`` key with the
+        per-node strategy dict (same form as :meth:`get_solution`) — i.e. the LP
+        relaxation can be used as a much cheaper exact solve, skipping
+        branch-and-bound.  ``"solution"`` is ``None`` when the relaxation came
+        out fractional.
+
+        The objective is initialized on demand and its prior state is restored.
+        """
+        old_objective = self.prob.objective
+        if old_objective is None:
+            self._set_objective()
+        variables = self.prob.variables()
+        original_cats = [v.cat for v in variables]
+        self._apply_memory_constraint()
+        t0 = time.perf_counter()
+        try:
+            for v in variables:
+                v.cat = pulp.LpContinuous  # bounds are already [0, 1] for binaries
+            solver = pulp.PULP_CBC_CMD(msg=verbose)
+            with tempfile.TemporaryDirectory() as tmpdir:
+                solver.tmpDir = tmpdir
+                self.prob.solve(solver)
+            solve_time = time.perf_counter() - t0
+            objective = pulp.value(self.prob.objective)
+            n_fractional = 0
+            n_vars = 0
+            for v in variables:
+                val = v.value()
+                if val is None:
+                    continue
+                n_vars += 1
+                if min(val, 1.0 - val) > frac_tol:
+                    n_fractional += 1
+            solution = None
+            if extract and n_fractional == 0:
+                self.selected_keys = [
+                    key
+                    for key, dv in self.decision_vars.items()
+                    if dv.var.value() is not None and dv.var.value() > 0.5
+                ]
+                for root_key in list(self.selected_keys):
+                    self.selected_keys.extend(self._linked_option_keys(root_key))
+                solution = self._to_orig_solution(self._extract_and_validate_solution())
+        finally:
+            for v, cat in zip(variables, original_cats):
+                v.cat = cat
+            self.prob.objective = old_objective
+        return {
+            "objective": objective,
+            "solve_time": solve_time,
+            "n_fractional": n_fractional,
+            "n_vars": n_vars,
+            "status": pulp.LpStatus[self.prob.status],
+            "solution": solution,
+        }
 
     def _extract_and_validate_solution(self):
         """Validate the ILP solution and return the optimal strategy per node."""
@@ -956,11 +1397,12 @@ class ShardingOptimizer:
         t0 = time.perf_counter()
         self._set_objective()
         self._solve(verbose)
-        obj_value = pulp.value(self.prob.objective)
-        logger.debug(
+        obj_value = self._safe_float(pulp.value(self.prob.objective))
+        solution = self._to_orig_solution(self._extract_and_validate_solution())
+        logger.info(
             "ILP solve took %.3fs (objective=%.4f)", time.perf_counter() - t0, obj_value
         )
-        return self._to_orig_solution(self._extract_and_validate_solution())
+        return solution
 
     def resolve(self, verbose=False):
         """Re-solve the ILP after adding or removing constraints.
@@ -970,13 +1412,14 @@ class ShardingOptimizer:
         """
         t0 = time.perf_counter()
         self._solve(verbose)
-        obj_value = pulp.value(self.prob.objective)
-        logger.debug(
+        obj_value = self._safe_float(pulp.value(self.prob.objective))
+        solution = self._to_orig_solution(self._extract_and_validate_solution())
+        logger.info(
             "ILP re-solve took %.3fs (objective=%.4f)",
             time.perf_counter() - t0,
             obj_value,
         )
-        return self._to_orig_solution(self._extract_and_validate_solution())
+        return solution
 
     def remove_constraints(self, names):
         """Remove constraints by name, allowing re-solve to revert to the
@@ -1072,8 +1515,12 @@ class ShardingOptimizer:
 
             # Use pre-computed costs from decision vars instead of
             # estimate_strategy_runtime_cost, which needs node.meta["val"]
-            # (absent on loaded optimizers).
-            dv = self._resolve_decision_var((node_idx, 0, out_idx, 0))
+            # (absent on loaded optimizers). The (.,0,out_idx,0) edge may be
+            # pruned, so find any surviving inp_idx for arg 0 (compute_cost is
+            # identical across inp_idx for a given out_idx).
+            dv = self._find_decision_var(node_idx, 0, out_idx)
+            if dv is None:
+                continue
             num_args = max(len(strategy.input_specs), 1)
             total_compute += dv.compute_cost * num_args
 
@@ -1113,6 +1560,8 @@ class ShardingOptimizer:
     # ---- Logging ----
 
     def get_violated_constraints_log(self):
+        if self.prob is None:
+            return "Violated constraints: [] (no PuLP problem; lite build)"
         violated_constraints = [
             (k, c) for k, c in self.prob.constraints.items() if not c.valid()
         ]
@@ -1158,10 +1607,8 @@ class ShardingOptimizer:
 
         # Build node-level cluster mapping: linked_node -> root_node
         cluster_roots: dict[torch.fx.Node, torch.fx.Node] = {}
-        for linked_key, root_key in self.cluster_links.items():
-            linked_node = self.nodes[linked_key[0]]
-            root_node = self.nodes[root_key[0]]
-            cluster_roots[linked_node] = root_node
+        for copy_idx, root_idx in self.cluster_links.items():
+            cluster_roots[self.nodes[copy_idx]] = self.nodes[root_idx]
 
         _normalize_cluster_layer(cluster_roots)
 
@@ -1408,6 +1855,8 @@ class ShardingOptimizer:
         for argi, out_idx, inp_idx in self.walk_over_options(node):
             if out_idx in output_constraint_indices:
                 var = self._get_pulp_variable((node_idx, argi, out_idx, inp_idx))
+                if var is None:  # pruned (invalid) strategy edge
+                    continue
                 vars_per_arg.setdefault(argi, []).append(var)
         names = []
         for eqs in vars_per_arg.values():
@@ -1435,8 +1884,10 @@ class ShardingOptimizer:
                 # This placement exists in node_a but not in node_b.
                 # Disable it: force sum of its decision variables to 0.
                 v_a = [
-                    self._get_pulp_variable((idx_a, 0, out_idx, inp_idx))
+                    v
                     for inp_idx in range(num_inp_a)
+                    if (v := self._get_pulp_variable((idx_a, 0, out_idx, inp_idx)))
+                    is not None
                 ]
                 self.prob += (
                     pulp.lpSum(v_a) == 0,
@@ -1445,12 +1896,16 @@ class ShardingOptimizer:
                 continue
             out_idx_b = strat_b.index(sp)
             v_a = [
-                self._get_pulp_variable((idx_a, 0, out_idx, inp_idx))
+                v
                 for inp_idx in range(num_inp_a)
+                if (v := self._get_pulp_variable((idx_a, 0, out_idx, inp_idx)))
+                is not None
             ]
             v_b = [
-                self._get_pulp_variable((idx_b, 0, out_idx_b, inp_idx))
+                v
                 for inp_idx in range(num_inp_b)
+                if (v := self._get_pulp_variable((idx_b, 0, out_idx_b, inp_idx)))
+                is not None
             ]
             self.prob += (
                 pulp.lpSum(v_b) == pulp.lpSum(v_a),
@@ -1634,6 +2089,8 @@ class ShardingOptimizer:
         """
         if self._memory_constraint is None:
             return
+        if self.prob is None:
+            return  # approx (lite) build reads the factors from _constraint_log
         memory_factor_low, memory_factor_high = self._memory_constraint
 
         # Remove previous memory constraints before rebuilding
@@ -1653,7 +2110,9 @@ class ShardingOptimizer:
             num_out_strat = len(self.strats[node].strategies)
             ratios: list[float] = []
             for out_idx in range(num_out_strat):
-                dv = self._resolve_decision_var((node_idx, 0, out_idx, 0))
+                dv = self._find_decision_var(node_idx, 0, out_idx)
+                if dv is None:  # every edge for this strategy was pruned
+                    continue
                 spec: DTensorSpec = dv.input_spec
                 assert spec.tensor_meta is not None
                 tensor_shape: torch.Size = spec.tensor_meta.shape
@@ -1708,6 +2167,8 @@ class ShardingOptimizer:
             raise RuntimeError(
                 f"Couldn't find appropriate constraint {node} {constraint_name} {placement}"
             )
+        if self.prob is None:
+            return []  # approx (lite) build replays this from _constraint_log
         names = self._add_node_constraint(
             node,
             output_constraint_indices=output_constraint_indices,

@@ -27,6 +27,7 @@ _CUDA_PATCHES = [
                 "name": "H100",
                 "total_memory": 80 * 1024**3,
                 "multi_processor_count": 132,
+                "L2_cache_size": 50 * 1024**2,
             },
         )(),
     ),
@@ -38,6 +39,16 @@ def apply_cuda_patches(func):
     for p in reversed(_CUDA_PATCHES):
         func = p(func)
     return func
+
+
+@pytest.fixture(autouse=True)
+def _reset_placement_options_cache():
+    """The placement-options cache is a process-global; clear it before each test
+    so optimizer builds never reuse stale strategies from a prior test's model."""
+    from autoparallel.shardings.placement_options import reset_placement_options_cache
+
+    reset_placement_options_cache()
+    yield
 
 
 @pytest.fixture(scope="module", autouse=True)
