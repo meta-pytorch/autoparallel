@@ -10,11 +10,8 @@ import torch
 from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
-from autoparallel._testing.models.dsv3 import (
-    DeepSeekV3Model,
-    MoEMeshRoles,
-    make_dsv3_config,
-)
+from autoparallel import MoEMeshRoles
+from autoparallel._testing.models.dsv3 import DeepSeekV3Model, make_dsv3_config
 from autoparallel._testing.models.llama3 import Transformer, TransformerModelArgs
 from autoparallel.api import AutoParallel
 from autoparallel.export_json import _get_layer_index

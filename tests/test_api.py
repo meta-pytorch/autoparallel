@@ -9,11 +9,87 @@ import torch._inductor.config
 import torch.fx.traceback as fx_traceback
 from torch import nn
 from torch.distributed.tensor import DTensor
-from torch.distributed.tensor.placement_types import Replicate, Shard
+from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
 
+from autoparallel import MoEMeshRoles, build_moe_local_map_placements, build_moe_mesh
 from autoparallel.api import AutoParallel, auto_parallel
 from autoparallel.compile import autoparallel_backend
 from autoparallel.input_validation import ForwardInputs
+
+
+def test_moe_public_exports_preserve_legacy_imports():
+    from autoparallel import moe
+    from autoparallel._testing.models import dsv3
+
+    assert MoEMeshRoles is moe.MoEMeshRoles
+    assert build_moe_mesh is moe.build_moe_mesh
+    assert build_moe_local_map_placements is moe.build_moe_local_map_placements
+    assert dsv3.MoEMeshRoles is MoEMeshRoles
+    assert dsv3.build_moe_mesh is build_moe_mesh
+    assert dsv3.build_moe_local_map_placements is build_moe_local_map_placements
+
+
+@pytest.mark.parametrize(
+    "degrees, expected_shape, expected_names, expected_ep_axes",
+    [
+        (
+            {"dp_replicate": 2, "dp_shard": 2, "cp": 1, "tp": 1, "ep": 2},
+            (2, 2),
+            ("dp_replicate", "dp_shard_in_ep"),
+            ("dp_shard_in_ep",),
+        ),
+        (
+            {"dp_replicate": 1, "dp_shard": 4, "cp": 1, "tp": 2, "ep": 4},
+            (2, 2, 2),
+            ("dp_shard_mod_ep", "dp_shard_in_ep", "tp"),
+            ("dp_shard_in_ep", "tp"),
+        ),
+        (
+            {"dp_replicate": 1, "dp_shard": 64, "cp": 2, "tp": 2, "ep": 8},
+            (32, 2, 2, 2),
+            ("dp_shard_mod_ep", "dp_shard_in_ep", "cp", "tp"),
+            ("dp_shard_in_ep", "cp", "tp"),
+        ),
+    ],
+)
+def test_moe_public_mesh_and_placements(
+    degrees, expected_shape, expected_names, expected_ep_axes
+):
+    mesh, roles = build_moe_mesh(**degrees, device_type="cpu")
+
+    assert tuple(mesh.shape) == expected_shape
+    assert mesh.mesh_dim_names == expected_names
+    ep_group_name = expected_ep_axes[0] if len(expected_ep_axes) == 1 else "ep"
+    assert roles == MoEMeshRoles(expected_ep_axes, ep_group_name)
+
+    token, weight, count = build_moe_local_map_placements(expected_names, roles)
+    assert token == (Shard(0),) * len(expected_names)
+    assert weight == tuple(
+        Shard(0) if name in expected_ep_axes else Replicate() for name in expected_names
+    )
+    assert count == (Partial("sum"),) * len(expected_names)
+
+
+@pytest.mark.parametrize(
+    "degrees, message",
+    [
+        (
+            {"dp_replicate": 1, "dp_shard": 1, "cp": 1, "tp": 1, "ep": 1},
+            "requires ep >= 2",
+        ),
+        (
+            {"dp_replicate": 1, "dp_shard": 2, "cp": 2, "tp": 2, "ep": 2},
+            "must be a multiple of cp\\*tp",
+        ),
+        (
+            {"dp_replicate": 1, "dp_shard": 3, "cp": 1, "tp": 1, "ep": 2},
+            "must divide dp_shard",
+        ),
+    ],
+)
+def test_moe_public_mesh_preserves_validation(degrees, message):
+    with pytest.raises(ValueError, match=message):
+        build_moe_mesh(**degrees, device_type="cpu")
 
 
 def test_from_meta_model(device_mesh_1d):

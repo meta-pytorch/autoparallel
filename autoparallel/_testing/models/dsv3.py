@@ -13,19 +13,15 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 from torch import nn
-from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DeviceMesh, DTensor
-from torch.distributed.tensor.placement_types import (
-    Partial,
-    Placement,
-    Replicate,
-    Shard,
-)
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from autoparallel.collectives import all_to_all, axis_size, local_map
+from autoparallel.moe import MoEMeshRoles, build_moe_local_map_placements
+from autoparallel.moe import build_moe_mesh as _build_moe_mesh
 
 _MODULE_FQN = "module_fqn"
+build_moe_mesh = _build_moe_mesh
 
 
 def _to_compute_dtype(
@@ -802,103 +798,9 @@ def _(
 # )
 
 
-@dataclass(frozen=True)
-class MoEMeshRoles:
-    """Which ``DeviceMesh`` axes are expert-parallel inside the MoE ``local_map``.
-
-    ``ep_axis_names``: the axes whose flatten forms the all-to-all (EP) group.
-    ``ep_group_name``: the (possibly flattened) mesh-dim name the region's
-    collectives run over.
-    """
-
-    ep_axis_names: tuple[str, ...]
-    ep_group_name: str
-
-
 def _default_moe_mesh_roles() -> MoEMeshRoles:
     """Backward-compatible 2D default: EP on ``"ep"``."""
     return MoEMeshRoles(ep_axis_names=("ep",), ep_group_name="ep")
-
-
-def build_moe_local_map_placements(
-    mesh_dim_names: tuple[str, ...], roles: MoEMeshRoles
-) -> tuple[tuple[Placement, ...], tuple[Placement, ...], tuple[Placement, ...]]:
-    """Per-axis placements for the region's tokens, expert weights, and counts."""
-    token: list[Placement] = []
-    weight: list[Placement] = []
-    count: list[Placement] = []
-    for name in mesh_dim_names:
-        token.append(Shard(0))
-        count.append(Partial(reduce_op="sum"))
-        weight.append(Shard(0) if name in roles.ep_axis_names else Replicate())
-    return tuple(token), tuple(weight), tuple(count)
-
-
-def build_moe_mesh(
-    *,
-    dp_replicate: int,
-    dp_shard: int,
-    cp: int,
-    tp: int,
-    ep: int,
-    device_type: str = "cuda",
-) -> tuple[DeviceMesh, MoEMeshRoles]:
-    """Build a single AutoParallel mesh + role map for an *aligned* MoE config.
-
-    Only aligned configs are supported: ``ep >= 2`` and ``ep`` must be a multiple of
-    ``cp*tp`` with ``ep/(cp*tp)`` dividing ``dp_shard`` (so no dense axis is split
-    and ``efsdp = dp_shard*cp*tp/ep``, TorchTitan-consistent). Size-1 axes are
-    dropped, so 2D/3D/4D configs yield different atom sets. Returns the mesh and the
-    ``MoEMeshRoles`` naming its EP axes.
-
-    Caller must also ensure ``num_experts`` is divisible by ``ep`` (``MoE.__init__``
-    validates it); this builder cannot see ``num_experts``.
-    """
-    if ep < 2:
-        raise ValueError(
-            f"build_moe_mesh requires ep >= 2 (expert parallelism); got ep={ep}. "
-            "Use the dense path for models without expert parallelism."
-        )
-    if ep % (cp * tp) != 0:
-        raise ValueError(
-            f"Non-aligned MoE config: ep({ep}) must be a multiple of cp*tp "
-            f"({cp}*{tp}); splitting cp/tp across ep is not supported."
-        )
-    dp_shard_in_ep = ep // (cp * tp)
-    if dp_shard % dp_shard_in_ep != 0:
-        raise ValueError(
-            f"Non-aligned MoE config: ep/(cp*tp)={dp_shard_in_ep} must divide "
-            f"dp_shard({dp_shard})."
-        )
-    dp_shard_mod_ep = dp_shard // dp_shard_in_ep  # == efsdp == dp_shard*cp*tp/ep
-
-    # dp outermost, ep-constituents contiguous innermost so the EP group is
-    # contiguous (matches TorchTitan's world unflatten).
-    ordered = [
-        ("dp_replicate", dp_replicate),
-        ("dp_shard_mod_ep", dp_shard_mod_ep),
-        ("dp_shard_in_ep", dp_shard_in_ep),
-        ("cp", cp),
-        ("tp", tp),
-    ]
-    atoms = [(n, d) for n, d in ordered if d > 1]
-    if not atoms:
-        raise ValueError("Degenerate MoE config: all parallelism degrees are 1.")
-    names = tuple(n for n, _ in atoms)
-    mesh = init_device_mesh(
-        device_type, tuple(d for _, d in atoms), mesh_dim_names=names
-    )
-
-    ep_atoms = tuple(n for n in ("dp_shard_in_ep", "cp", "tp") if n in names)
-    assert ep_atoms, "aligned config with ep>1 always keeps >=1 ep atom"
-    if len(ep_atoms) == 1:
-        ep_group_name = ep_atoms[0]
-    else:
-        ep_group_name = "ep"
-        mesh[ep_atoms]._flatten(ep_group_name)
-
-    roles = MoEMeshRoles(ep_axis_names=ep_atoms, ep_group_name=ep_group_name)
-    return mesh, roles
 
 
 def _validate_moe_sharding(mesh, roles, *, num_experts):
