@@ -26,6 +26,10 @@ _LOCAL_BATCH_SIZE = 1
 _SEED = 0
 _OUTPUT_RTOL = 5e-3
 _GRAD_RTOL = 2e-2
+_DTYPES = {
+    "bfloat16": torch.bfloat16,
+    "float32": torch.float32,
+}
 
 _CASES: dict[str, dict[str, int]] = {
     "efsdp_boundary": dict(dp_replicate=1, dp_shard=4, cp=1, tp=1, ep=2),
@@ -34,14 +38,21 @@ _CASES: dict[str, dict[str, int]] = {
 }
 
 
-def _relative_error(actual: torch.Tensor, expected: torch.Tensor) -> float:
+def _error_stats(actual: torch.Tensor, expected: torch.Tensor) -> dict[str, float]:
     actual = actual.float()
     expected = expected.float()
-    diff_norm = torch.linalg.vector_norm(actual - expected)
+    diff = actual - expected
+    diff_norm = torch.linalg.vector_norm(diff)
     expected_norm = torch.linalg.vector_norm(expected)
-    if expected_norm == 0:
-        return diff_norm.item()
-    return (diff_norm / expected_norm).item()
+    relative_error = (
+        diff_norm.item() if expected_norm == 0 else (diff_norm / expected_norm).item()
+    )
+    return {
+        "diff_norm": diff_norm.item(),
+        "max_abs": diff.abs().max().item(),
+        "reference_norm": expected_norm.item(),
+        "relative_error": relative_error,
+    }
 
 
 def _gather_state_dict(model: torch.nn.Module, rank: int) -> dict[str, torch.Tensor]:
@@ -59,6 +70,7 @@ def _run_reference(
     tokens: torch.Tensor,
     device: torch.device,
     reference_mesh,
+    compute_dtype: torch.dtype,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     roles = MoEMeshRoles(ep_axis_names=("ep",), ep_group_name="ep")
     with torch.device("meta"):
@@ -66,7 +78,7 @@ def _run_reference(
             config,
             mesh=reference_mesh,
             roles=roles,
-            compute_dtype=torch.bfloat16,
+            compute_dtype=compute_dtype,
         )
     model.to_empty(device=device)
     model.init_weights(buffer_device=device, seed=_SEED)
@@ -87,10 +99,11 @@ def _run_reference(
     return output, gradients
 
 
-def run_numerics_test(case: str):
+def run_numerics_test(case: str, dtype_name: str):
     rank = torch.distributed.get_rank()
     local_rank = int(os.environ["LOCAL_RANK"])
     device = torch.device("cuda", local_rank)
+    compute_dtype = _DTYPES[dtype_name]
     degrees = _CASES[case]
     mesh, roles = build_moe_mesh(
         dp_replicate=degrees["dp_replicate"],
@@ -107,7 +120,7 @@ def run_numerics_test(case: str):
             config,
             mesh=mesh,
             roles=roles,
-            compute_dtype=torch.bfloat16,
+            compute_dtype=compute_dtype,
         )
 
     sample_input = torch.empty(
@@ -118,7 +131,7 @@ def run_numerics_test(case: str):
         return sample_input
 
     mp_policy = MixedPrecisionPolicy(
-        param_dtype=torch.bfloat16,
+        param_dtype=compute_dtype,
         reduce_dtype=torch.float32,
     )
     with AutoParallel(
@@ -156,7 +169,12 @@ def run_numerics_test(case: str):
     if rank == 0:
         assert global_tokens is not None
         reference_output, reference_gradients = _run_reference(
-            config, reference_state, global_tokens, device, reference_mesh
+            config,
+            reference_state,
+            global_tokens,
+            device,
+            reference_mesh,
+            compute_dtype,
         )
     else:
         reference_output = None
@@ -171,10 +189,12 @@ def run_numerics_test(case: str):
         output.detach(), mesh, input_placements, run_check=False
     ).full_tensor()
     output_error = None
+    output_stats: dict[str, float] = {}
     output_finite = False
     if rank == 0:
         assert reference_output is not None
-        output_error = _relative_error(full_output.cpu(), reference_output)
+        output_stats = _error_stats(full_output.cpu(), reference_output)
+        output_error = output_stats["relative_error"]
         output_finite = bool(torch.isfinite(full_output).all()) and bool(
             torch.isfinite(reference_output).all()
         )
@@ -190,6 +210,7 @@ def run_numerics_test(case: str):
     reference_names = cast(list[str], objects[0])
     assert set(parallel_parameters) == set(reference_names)
     gradient_errors: dict[str, float] = {}
+    gradient_error_stats: dict[str, dict[str, float]] = {}
     nonfinite_gradients: list[str] = []
     for name in parallel_parameters:
         gradient = parallel_parameters[name].grad
@@ -199,8 +220,9 @@ def run_numerics_test(case: str):
         )
         if rank == 0:
             assert reference_gradients is not None
-            error = _relative_error(full_gradient.cpu(), reference_gradients[name])
-            gradient_errors[name] = error
+            stats = _error_stats(full_gradient.cpu(), reference_gradients[name])
+            gradient_errors[name] = stats["relative_error"]
+            gradient_error_stats[name] = stats
             if (
                 not torch.isfinite(full_gradient).all()
                 or not torch.isfinite(reference_gradients[name]).all()
@@ -214,7 +236,9 @@ def run_numerics_test(case: str):
         result = {
             "case": case,
             "degrees": degrees,
+            "dtype": dtype_name,
             "gradient_count": len(reference_gradients),
+            "gradient_error_stats": gradient_error_stats,
             "gradient_relative_errors": gradient_errors,
             "model": {
                 "global_batch_size": global_batch_size,
@@ -224,6 +248,7 @@ def run_numerics_test(case: str):
             },
             "nonfinite_gradients": nonfinite_gradients,
             "output_finite": output_finite,
+            "output_error_stats": output_stats,
             "output_relative_error": output_error,
             "thresholds": {
                 "gradient_relative_error": _GRAD_RTOL,
@@ -263,6 +288,7 @@ def run_numerics_test(case: str):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--case", required=True, choices=_CASES)
+    parser.add_argument("--dtype", required=True, choices=_DTYPES)
     args = parser.parse_args()
 
     if (
@@ -275,8 +301,11 @@ def main():
     torch.cuda.set_device(device)
     torch.distributed.init_process_group("nccl", device_id=device)
     torch.use_deterministic_algorithms(True)
+    torch.set_float32_matmul_precision("highest")
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
     try:
-        run_numerics_test(args.case)
+        run_numerics_test(args.case, args.dtype)
     finally:
         torch.distributed.barrier(device_ids=[local_rank])
         torch.distributed.destroy_process_group()

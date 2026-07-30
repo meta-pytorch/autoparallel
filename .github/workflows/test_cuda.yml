@@ -80,4 +80,4 @@ jobs:
         pip install --quiet .
         python -m pytest tests/test_dcp_roundtrip.py -v
         torchrun --standalone --nproc-per-node 4 examples/example_ds3_local_map.py
-        PYTHONPATH=. torchrun --standalone --nproc-per-node 4 tests/test_ds3_local_map_numerics.py --case legacy_2d
+        PYTHONPATH=. torchrun --standalone --nproc-per-node 4 tests/test_ds3_local_map_numerics.py --case legacy_2d --dtype bfloat16
