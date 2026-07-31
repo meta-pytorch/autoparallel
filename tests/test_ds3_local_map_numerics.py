@@ -210,6 +210,8 @@ def run_numerics_test(case: str, dtype_name: str) -> None:
     reference_names = cast(list[str], objects[0])
     assert set(parallel_parameters) == set(reference_names)
     gradient_error_stats: dict[str, dict[str, float]] = {}
+    parallel_gradient_dtypes: set[str] = set()
+    reference_gradient_dtypes: set[str] = set()
     nonfinite_gradients: list[str] = []
     for name in parallel_parameters:
         gradient = parallel_parameters[name].grad
@@ -221,6 +223,8 @@ def run_numerics_test(case: str, dtype_name: str) -> None:
             assert reference_gradients is not None
             stats = _error_stats(full_gradient.cpu(), reference_gradients[name])
             gradient_error_stats[name] = stats
+            parallel_gradient_dtypes.add(str(full_gradient.dtype))
+            reference_gradient_dtypes.add(str(reference_gradients[name].dtype))
             if (
                 not torch.isfinite(full_gradient).all()
                 or not torch.isfinite(reference_gradients[name]).all()
@@ -229,6 +233,7 @@ def run_numerics_test(case: str, dtype_name: str) -> None:
 
     if rank == 0:
         assert reference_gradients is not None
+        assert reference_output is not None
         assert output_error is not None
         gradient_errors = {
             name: stats["relative_error"]
@@ -249,6 +254,26 @@ def run_numerics_test(case: str, dtype_name: str) -> None:
                 "seq_len": _SEQ_LEN,
             },
             "nonfinite_gradients": nonfinite_gradients,
+            "observed_dtypes": {
+                "compute": str(compute_dtype),
+                "parallel_gradients": sorted(parallel_gradient_dtypes),
+                "parallel_output": str(full_output.dtype),
+                "parallel_parameters": sorted(
+                    {
+                        str(
+                            parameter.to_local().dtype
+                            if isinstance(parameter, DTensor)
+                            else parameter.dtype
+                        )
+                        for parameter in parallel_parameters.values()
+                    }
+                ),
+                "reference_gradients": sorted(reference_gradient_dtypes),
+                "reference_output": str(reference_output.dtype),
+                "reference_parameters": sorted(
+                    {str(value.dtype) for value in reference_state.values()}
+                ),
+            },
             "output_finite": output_finite,
             "output_error_stats": output_stats,
             "output_relative_error": output_error,

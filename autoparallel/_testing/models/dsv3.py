@@ -290,6 +290,18 @@ def _run_experts_grouped_mm(
     offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
     # grouped mm between a 2D tensor and a 3D tensor
     assert x.dim() == 2
+    if x.dtype == torch.float32:
+        positions = torch.arange(x.shape[0], dtype=offsets.dtype, device=x.device)
+        out = torch.zeros_like(x)
+        for expert_idx in range(w1.shape[0]):
+            h = F.silu(F.linear(x, w1[expert_idx]))
+            h = h * F.linear(x, w3[expert_idx])
+            expert_out = F.linear(h, w2[expert_idx])
+            mask = positions < offsets[expert_idx]
+            if expert_idx > 0:
+                mask = mask & (positions >= offsets[expert_idx - 1])
+            out = out + expert_out * mask.unsqueeze(-1)
+        return out
 
     h = F.silu(
         torch._grouped_mm(x.bfloat16(), w1.bfloat16().transpose(-2, -1), offs=offsets)
