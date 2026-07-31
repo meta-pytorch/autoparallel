@@ -24,8 +24,8 @@ _WORLD_SIZE = 4
 _SEQ_LEN = 2048
 _LOCAL_BATCH_SIZE = 1
 _SEED = 0
-_OUTPUT_RTOL = 5e-3
-_GRAD_RTOL = 2e-2
+_OUTPUT_ERROR_LIMIT = 5e-3
+_GRADIENT_ERROR_LIMIT = 2e-2
 _DTYPES = {
     "bfloat16": torch.bfloat16,
     "float32": torch.float32,
@@ -99,7 +99,7 @@ def _run_reference(
     return output, gradients
 
 
-def run_numerics_test(case: str, dtype_name: str):
+def run_numerics_test(case: str, dtype_name: str) -> None:
     rank = torch.distributed.get_rank()
     local_rank = int(os.environ["LOCAL_RANK"])
     device = torch.device("cuda", local_rank)
@@ -209,7 +209,6 @@ def run_numerics_test(case: str, dtype_name: str):
     torch.distributed.broadcast_object_list(objects, src=0, device=device)
     reference_names = cast(list[str], objects[0])
     assert set(parallel_parameters) == set(reference_names)
-    gradient_errors: dict[str, float] = {}
     gradient_error_stats: dict[str, dict[str, float]] = {}
     nonfinite_gradients: list[str] = []
     for name in parallel_parameters:
@@ -221,7 +220,6 @@ def run_numerics_test(case: str, dtype_name: str):
         if rank == 0:
             assert reference_gradients is not None
             stats = _error_stats(full_gradient.cpu(), reference_gradients[name])
-            gradient_errors[name] = stats["relative_error"]
             gradient_error_stats[name] = stats
             if (
                 not torch.isfinite(full_gradient).all()
@@ -232,6 +230,10 @@ def run_numerics_test(case: str, dtype_name: str):
     if rank == 0:
         assert reference_gradients is not None
         assert output_error is not None
+        gradient_errors = {
+            name: stats["relative_error"]
+            for name, stats in gradient_error_stats.items()
+        }
         worst_name, worst_error = max(gradient_errors.items(), key=lambda item: item[1])
         result = {
             "case": case,
@@ -251,8 +253,8 @@ def run_numerics_test(case: str, dtype_name: str):
             "output_error_stats": output_stats,
             "output_relative_error": output_error,
             "thresholds": {
-                "gradient_relative_error": _GRAD_RTOL,
-                "output_relative_error": _OUTPUT_RTOL,
+                "gradient_relative_error": _GRADIENT_ERROR_LIMIT,
+                "output_relative_error": _OUTPUT_ERROR_LIMIT,
             },
             "worst_gradient": {
                 "name": worst_name,
@@ -265,12 +267,15 @@ def run_numerics_test(case: str, dtype_name: str):
             failures.append("non-finite output")
         if nonfinite_gradients:
             failures.append(f"non-finite gradients: {', '.join(nonfinite_gradients)}")
-        if output_error >= _OUTPUT_RTOL:
-            failures.append(f"output relative error {output_error} >= {_OUTPUT_RTOL}")
+        if output_error >= _OUTPUT_ERROR_LIMIT:
+            failures.append(
+                f"output relative error {output_error} >= {_OUTPUT_ERROR_LIMIT}"
+            )
         for name, error in gradient_errors.items():
-            if error >= _GRAD_RTOL:
+            if error >= _GRADIENT_ERROR_LIMIT:
                 failures.append(
-                    f"gradient {name} relative error {error} >= {_GRAD_RTOL}"
+                    f"gradient {name} relative error {error} "
+                    f">= {_GRADIENT_ERROR_LIMIT}"
                 )
         failure = "\n".join(failures) if failures else None
     else:
