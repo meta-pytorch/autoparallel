@@ -74,6 +74,20 @@ def build_moe_mesh(
         The shared ``DeviceMesh`` and the ``MoEMeshRoles`` describing its EP
         axes and collective group.
     """
+    degrees = {
+        "dp_replicate": dp_replicate,
+        "dp_shard": dp_shard,
+        "cp": cp,
+        "tp": tp,
+        "ep": ep,
+    }
+    for name, degree in degrees.items():
+        if isinstance(degree, bool) or not isinstance(degree, int) or degree < 1:
+            raise ValueError(
+                f"build_moe_mesh requires {name} to be a positive integer; "
+                f"got {degree!r}."
+            )
+
     if ep < 2:
         raise ValueError(
             f"build_moe_mesh requires ep >= 2 (expert parallelism); got ep={ep}. "

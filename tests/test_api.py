@@ -74,6 +74,22 @@ def test_moe_public_mesh_and_placements(
     "degrees, message",
     [
         (
+            {"dp_replicate": 0, "dp_shard": 2, "cp": 1, "tp": 1, "ep": 2},
+            "dp_replicate to be a positive integer",
+        ),
+        (
+            {"dp_replicate": 1, "dp_shard": -1, "cp": 1, "tp": 1, "ep": 2},
+            "dp_shard to be a positive integer",
+        ),
+        (
+            {"dp_replicate": 1, "dp_shard": 2, "cp": 0, "tp": 1, "ep": 2},
+            "cp to be a positive integer",
+        ),
+        (
+            {"dp_replicate": 1, "dp_shard": 2, "cp": 1, "tp": -1, "ep": 2},
+            "tp to be a positive integer",
+        ),
+        (
             {"dp_replicate": 1, "dp_shard": 1, "cp": 1, "tp": 1, "ep": 1},
             "requires ep >= 2",
         ),
