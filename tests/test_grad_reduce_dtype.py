@@ -100,7 +100,7 @@ def _assert_no_pre_cast_redistribution(
                 continue
             dv = opt._resolve_decision_var(key)
             validated_pre_cast_keys += 1
-            if key in opt.cluster_links:
+            if node_idx in opt.cluster_links:
                 validated_linked_keys += 1
             assert dv.comm_cost == 0, (
                 f"Pre-cast node {opt.nodes[node_idx].name} has chosen decision var "
@@ -265,7 +265,7 @@ def _assert_no_fwd_pre_cast_redistribution(
                 continue
             dv = opt._resolve_decision_var(key)
             validated_keys += 1
-            if key in opt.cluster_links:
+            if node_idx in opt.cluster_links:
                 validated_linked_keys += 1
             assert dv.comm_cost == 0, (
                 f"Forward pre-cast node {opt.nodes[node_idx].name} has chosen "

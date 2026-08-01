@@ -6,6 +6,8 @@
 import json
 import tempfile
 
+import pulp
+import pytest
 import torch
 from conftest import apply_cuda_patches
 from torch import nn
@@ -86,8 +88,6 @@ def test_resolve_target_aten_op():
 
 
 def test_resolve_target_unknown_raises():
-    import pytest
-
     with pytest.raises(RuntimeError, match="Cannot resolve"):
         _resolve_target("nonexistent.op.name")
 
@@ -158,6 +158,7 @@ def test_save_load_preserves_solution(device_mesh_1d):
         autop.add_output_constraints([(Shard(0),)])
         opt = autop.sharding_optimizer
         opt.get_solution()
+        objective = pulp.value(opt.prob.objective)
 
     with tempfile.NamedTemporaryFile(suffix=".ap") as f:
         opt.save(f.name)
@@ -165,6 +166,33 @@ def test_save_load_preserves_solution(device_mesh_1d):
 
     assert hasattr(loaded, "selected_keys")
     assert len(loaded.selected_keys) > 0
+    assert loaded.prob.status == pulp.LpStatusOptimal
+    assert loaded.prob.sol_status == pulp.LpSolutionOptimal
+    assert all(var.varValue in (0.0, 1.0) for var in loaded.pulp_variables.values())
+    assert pulp.value(loaded.prob.objective) == pytest.approx(objective)
+    assert all(constraint.valid() for constraint in loaded.prob.constraints.values())
+    assert loaded.get_log()
+
+
+@apply_cuda_patches
+def test_save_load_preserves_unsolved_state(device_mesh_1d):
+    dim = 64
+    with torch.device("meta"):
+        model = _SimpleModel(dim)
+
+    autop = _setup_autop(model, dim, device_mesh_1d)
+    with autop:
+        autop.add_input_constraints([(Shard(0),)])
+        autop.add_output_constraints([(Shard(0),)])
+        opt = autop.sharding_optimizer
+
+    with tempfile.NamedTemporaryFile(suffix=".ap") as f:
+        opt.save(f.name)
+        loaded = type(opt).load(f.name)
+
+    assert not hasattr(loaded, "selected_keys")
+    assert loaded.prob.status == pulp.LpStatusNotSolved
+    assert loaded.get_solution()
 
 
 @apply_cuda_patches

@@ -233,6 +233,7 @@ class AutoParallel:
     Args:
         mesh: Defines placement options.
         The meta model is moved to a fake device based on mesh.device_type.
+        fast_build: Skip DTensor enumeration costs that AutoParallel recomputes.
     """
 
     def __init__(
@@ -245,6 +246,7 @@ class AutoParallel:
         dynamic: bool = False,
         cost_model: Any = "nccl",
         repeated_subgraphs: bool = True,
+        fast_build: bool = True,
     ):
         self.stack = ExitStack()
         self.fake_mode = (
@@ -257,6 +259,7 @@ class AutoParallel:
         self.mp_policy = mp_policy
         self.cost_model = cost_model
         self.repeated_subgraphs = repeated_subgraphs
+        self.fast_build = fast_build
         # copy user model to avoid modifying it in-place
         # in dtype casting and move_to_fake
         model = copy.deepcopy(model)
@@ -323,6 +326,7 @@ class AutoParallel:
                 self.mesh,
                 force_grad_reduce_in_higher_precision,
                 repeated_subgraphs=self.repeated_subgraphs,
+                fast_build=self.fast_build,
             )
 
             self.sharding_optimizer = sharding_optimizer

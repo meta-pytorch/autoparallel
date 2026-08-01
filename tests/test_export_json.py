@@ -96,9 +96,9 @@ def test_normalize_cluster_layer_swaps_backward_roots(device_mesh_1d):
 
     # Build cluster_roots from cluster_links
     cluster_roots = {}
-    for linked_key, root_key in opt.cluster_links.items():
-        linked_node = opt.nodes[linked_key[0]]
-        root_node = opt.nodes[root_key[0]]
+    for linked_idx, root_idx in opt.cluster_links.items():
+        linked_node = opt.nodes[linked_idx]
+        root_node = opt.nodes[root_idx]
         cluster_roots[linked_node] = root_node
 
     if not cluster_roots:

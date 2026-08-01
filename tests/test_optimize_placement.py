@@ -14,6 +14,8 @@ from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
 
 from autoparallel.api import AutoParallel, auto_parallel
 from autoparallel.collectives import local_map
+from autoparallel.optimize_sharding import _skip_enumeration_redistribute_cost
+from autoparallel.shardings.placement_options import reset_placement_options_cache
 
 
 class FFN(nn.Module):
@@ -164,7 +166,6 @@ def test_optimization_finds_fsdp_and_ddp_1d(device_mesh_1d, high_mem, model_type
         assert p.output_specs.placements == (Shard(0),)
         # weight is replicated, mimicing DDP
         assert p.input_specs[1].placements == (Replicate(),)
-
     # bwd grad weight
     # For mm: [N, B*S] @ [B*S, K] → batch dim is at position 1 for input 0
     # For einsum: bsn,bsk->nk → batch dim is at position 0 for both inputs
@@ -181,6 +182,67 @@ def test_optimization_finds_fsdp_and_ddp_1d(device_mesh_1d, high_mem, model_type
         assert p.input_specs[0].placements == (Shard(0),)
         assert p.output_specs.placements == (Shard(0),)
         assert p.input_specs[1].placements == (Replicate(),)
+
+
+@apply_cuda_patches
+def test_fast_build_falls_back_without_torch_cost(monkeypatch):
+    import torch.distributed.tensor._ops.utils as dt_utils
+
+    monkeypatch.delattr(dt_utils, "redistribute_cost")
+    with _skip_enumeration_redistribute_cost(True):
+        pass
+
+
+@apply_cuda_patches
+def test_fast_build_preserves_optimizer_solution(device_mesh_1d, monkeypatch):
+    import torch.distributed.tensor._ops.utils as dt_utils
+
+    original_redistribute_cost = dt_utils.redistribute_cost
+    redistribute_cost_calls = 0
+
+    def counted_redistribute_cost(*args, **kwargs):
+        nonlocal redistribute_cost_calls
+        redistribute_cost_calls += 1
+        return original_redistribute_cost(*args, **kwargs)
+
+    monkeypatch.setattr(dt_utils, "redistribute_cost", counted_redistribute_cost)
+
+    def solve(fast_build):
+        reset_placement_options_cache()
+        model_fn, input_fn = _make_model_and_input_fn(
+            device_mesh_1d, "transformer_block"
+        )
+        with torch.device("meta"):
+            model = model_fn()
+        with AutoParallel(
+            model, input_fn, device_mesh_1d, fast_build=fast_build
+        ) as autop:
+            autop.add_input_constraints([(Shard(0),)])
+            autop.add_output_constraints([(Shard(0),)])
+            autop.add_parameter_memory_constraint(low=None, high=None)
+            solution = autop.optimize_placement()
+            objective = autop.sharding_optimizer.prob.objective.value()
+        return (
+            {
+                node.name: tuple(str(p) for p in strategy.output_specs.placements)
+                for node, strategy in solution.items()
+                if not isinstance(strategy.output_specs, (tuple, list))
+            },
+            objective,
+        )
+
+    try:
+        baseline_solution, baseline_objective = solve(False)
+        baseline_calls = redistribute_cost_calls
+        fast_solution, fast_objective = solve(True)
+
+        assert baseline_calls > 0
+        assert redistribute_cost_calls == baseline_calls
+        assert dt_utils.redistribute_cost is counted_redistribute_cost
+        assert fast_solution == baseline_solution
+        assert fast_objective == pytest.approx(baseline_objective)
+    finally:
+        reset_placement_options_cache()
 
 
 _expected_param_placements_ffn = [(Shard(0), Shard(0)), (Shard(0), Shard(1))]
@@ -844,3 +906,36 @@ def test_remove_node_constraint_restores_memory_budget(device_mesh_1d):
         # With memory budget enforced and no node constraint, the optimizer
         # should shard this param again
         assert solution[orig_node].output_specs.placements == (Shard(0),)
+
+
+@apply_cuda_patches
+def test_invalid_strategies_are_pruned(device_mesh_2d):
+    """Infinite-cost (invalid) strategy edges must not be materialized as
+    variables or constraints, and pruning them must not change the optimum."""
+    import math
+
+    mesh = device_mesh_2d
+    model_fn, input_fn = _make_model_and_input_fn(mesh, "transformer_block")
+    with torch.device("meta"):
+        model = model_fn()
+
+    with AutoParallel(model, input_fn, mesh) as autop:
+        autop.add_input_constraints([(Shard(0), Replicate())])
+        autop.add_output_constraints([(Shard(0), Replicate())])
+        autop.add_parameter_memory_constraint(low=None, high=None)
+        opt = autop.sharding_optimizer
+
+        # Invariant: every materialized decision var is finite-cost, and the
+        # PuLP variable set is exactly the set of valid (finite) keys.
+        assert all(math.isfinite(dv.cost) for dv in opt.decision_vars.values())
+        assert set(opt.pulp_variables) == opt._valid_keys
+        assert all(k in opt._valid_keys for k in opt.decision_vars)
+
+        # No inf-cost (== 0) constraints should be emitted any more.
+        assert not any(name.startswith("inf_cases") for name in opt.prob.constraints)
+
+        # The pruned problem must still solve to a valid solution.
+        solution = autop.optimize_placement()
+        param_nodes = get_param_nodes(autop.gm.graph)
+        for node in param_nodes:
+            assert node in solution
