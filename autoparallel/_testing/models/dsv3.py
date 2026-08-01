@@ -14,12 +14,14 @@ import triton
 import triton.language as tl
 from torch import nn
 from torch.distributed.tensor import DeviceMesh, DTensor
-from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from autoparallel.collectives import all_to_all, axis_size, local_map
+from autoparallel.moe import MoEMeshRoles, build_moe_local_map_placements
+from autoparallel.moe import build_moe_mesh as _build_moe_mesh
 
 _MODULE_FQN = "module_fqn"
+build_moe_mesh = _build_moe_mesh
 
 
 def _to_compute_dtype(
@@ -288,6 +290,18 @@ def _run_experts_grouped_mm(
     offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
     # grouped mm between a 2D tensor and a 3D tensor
     assert x.dim() == 2
+    if x.dtype == torch.float32:
+        positions = torch.arange(x.shape[0], dtype=offsets.dtype, device=x.device)
+        out = torch.zeros_like(x)
+        for expert_idx in range(w1.shape[0]):
+            h = F.silu(F.linear(x, w1[expert_idx]))
+            h = h * F.linear(x, w3[expert_idx])
+            expert_out = F.linear(h, w2[expert_idx])
+            mask = positions < offsets[expert_idx]
+            if expert_idx > 0:
+                mask = mask & (positions >= offsets[expert_idx - 1])
+            out = out + expert_out * mask.unsqueeze(-1)
+        return out
 
     h = F.silu(
         torch._grouped_mm(x.bfloat16(), w1.bfloat16().transpose(-2, -1), offs=offsets)
@@ -671,6 +685,7 @@ def local_mapped_region(
         output_splits,
     ) = _token_dispatch(routed_input, num_tokens_per_expert, axis_name)
 
+    # Expert weights arrive complete per EP shard; FSDP over them is external.
     routed_output = _run_experts_grouped_mm(
         experts_w1,
         experts_w2,
@@ -795,6 +810,28 @@ def _(
 # )
 
 
+def _default_moe_mesh_roles() -> MoEMeshRoles:
+    """Backward-compatible 2D default: EP on ``"ep"``."""
+    return MoEMeshRoles(ep_axis_names=("ep",), ep_group_name="ep")
+
+
+def _validate_moe_sharding(mesh, roles, *, num_experts):
+    """Raise unless num_experts is divisible by the EP group size. No-op when the
+    mesh or its axis names are unavailable."""
+    if mesh is None or mesh.mesh_dim_names is None:
+        return
+    dim_names = mesh.mesh_dim_names
+    ep_size = 1
+    for axis in roles.ep_axis_names:
+        if axis in dim_names:
+            ep_size *= mesh.size(dim_names.index(axis))
+    if num_experts % ep_size != 0:
+        raise ValueError(
+            f"num_experts ({num_experts}) must be divisible by the EP group size "
+            f"({ep_size}) over axes {roles.ep_axis_names}."
+        )
+
+
 def _moe_forward(
     x: torch.Tensor,
     router_gate_weight: torch.Tensor,
@@ -808,7 +845,7 @@ def _moe_forward(
     router: TokenChoiceTopKRouter,
     reorderer: TokenReorderer,
     mesh: Optional[DeviceMesh],
-    axis_name: str,
+    roles: MoEMeshRoles,
     score_before_experts: bool,
     compute_dtype: torch.dtype | None = None,
 ):
@@ -855,35 +892,29 @@ def _moe_forward(
     # This is in the local_map region
     ######################################################
 
-    # expert_placements = ((Replicate(), Shard(0)),) * 3
-    # in_placements = (
-    #     (Shard(0), Shard(0)),
-    #     (Shard(0), Shard(0)),
-    #     (Shard(0), Shard(0)),
-    #     (Shard(0), Shard(0)),
-    # )
+    assert mesh is not None and mesh.mesh_dim_names is not None
+    token_p, weight_p, count_p = build_moe_local_map_placements(
+        mesh.mesh_dim_names, roles
+    )
     # Dynamo reorders captured variables (lifted freevars) before explicit
     # arguments, so x must come first in the input order and placements.
     reordered_placements = (
-        (Shard(0), Shard(0)),
-        (Shard(0), Shard(0)),
-        (Shard(0), Shard(0)),
-        (Replicate(), Shard(0)),
-        (Replicate(), Shard(0)),
-        (Replicate(), Shard(0)),
-        (Shard(0), Shard(0)),
-        None,
-        None,
-        None,
-        None,
+        token_p,  # x
+        token_p,  # selected_experts_indices
+        token_p,  # top_scores
+        weight_p,  # experts_w1
+        weight_p,  # experts_w3
+        weight_p,  # experts_w2
+        token_p,  # out
+        None,  # top_k
+        None,  # num_experts
+        None,  # score_before_experts
+        None,  # axis_name (EP group)
     )
 
     out, num_tokens_per_expert = local_map(
         local_mapped_region,
-        out_placements=(
-            (Shard(0), Shard(0)),
-            (Partial(reduce_op="sum"), Partial(reduce_op="sum")),
-        ),
+        out_placements=(token_p, count_p),
         in_placements=reordered_placements,
         redistribute_inputs=True,
         in_grad_placements=None,
@@ -899,7 +930,7 @@ def _moe_forward(
         router.top_k,
         router.num_experts,
         score_before_experts,
-        axis_name,
+        roles.ep_group_name,
     )
     # assert False, f"there: {out.shape}, {num_tokens_per_expert.shape}"
 
@@ -933,12 +964,15 @@ class MoE(nn.Module):
         use_grouped_mm: bool = True,
         load_balance_coeff: float | None = 1e-3,
         mesh: DeviceMesh | None = None,
+        roles: MoEMeshRoles | None = None,
         compute_dtype: torch.dtype | None = None,
     ):
         super().__init__()
 
         self.mesh = mesh
-        self.axis_name = "ep"
+        # Default roles: EP on "ep" (the pre-roles 2D behavior).
+        self.roles = roles if roles is not None else _default_moe_mesh_roles()
+        _validate_moe_sharding(mesh, self.roles, num_experts=num_experts)
         self.compute_dtype = compute_dtype
         self.experts = GroupedExperts(
             dim=dim,
@@ -998,7 +1032,7 @@ class MoE(nn.Module):
             self.router,
             self.reorderer,
             self.mesh,
-            self.axis_name,
+            self.roles,
             self.score_before_experts,
             self.compute_dtype,
         )
@@ -1555,6 +1589,7 @@ class TransformerBlock(nn.Module):
         layer_config,
         model_config,
         mesh: DeviceMesh | None = None,
+        roles: MoEMeshRoles | None = None,
         compute_dtype: torch.dtype | None = None,
     ):
         super().__init__()
@@ -1584,6 +1619,7 @@ class TransformerBlock(nn.Module):
                 use_grouped_mm=moe_cfg.experts.use_grouped_mm,
                 load_balance_coeff=moe_cfg.load_balance_coeff,
                 mesh=mesh,
+                roles=roles,
                 compute_dtype=compute_dtype,
             )
         else:
@@ -1639,6 +1675,7 @@ class DeepSeekV3Model(nn.Module):
         self,
         config,
         mesh: DeviceMesh | None = None,
+        roles: MoEMeshRoles | None = None,
         compute_dtype: torch.dtype | None = None,
     ):
         # Explicitly call nn.Module.__init__ to avoid MRO issues when this class
@@ -1658,6 +1695,7 @@ class DeepSeekV3Model(nn.Module):
                 layer_config,
                 config,
                 mesh,
+                roles=roles,
                 compute_dtype=compute_dtype,
             )
 

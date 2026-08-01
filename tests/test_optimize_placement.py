@@ -460,11 +460,14 @@ def test_local_map_placement_respected(device_mesh_2d, device="cuda"):
     for act_spec in act_specs:
         assert act_spec.placements == (Replicate(), Replicate())
 
-    # Check bw outputs
+    # Check bw outputs. k/v are Replicate on mesh axis 1 in the forward, so their
+    # gradient is Partial(sum) there (autograd duality), reduced at the boundary.
     assert len(bw_spec.output_specs) == 3  # query, key, value
     grad_q_spec, grad_k_spec, grad_v_spec = bw_spec.output_specs
     assert grad_q_spec.placements == (Shard(dim=0), Shard(dim=2))
-    assert grad_k_spec.placements == grad_v_spec.placements == (Shard(0), Replicate())
+    assert (
+        grad_k_spec.placements == grad_v_spec.placements == (Shard(0), Partial("sum"))
+    )
 
 
 @apply_cuda_patches

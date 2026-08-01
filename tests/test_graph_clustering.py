@@ -9,6 +9,7 @@ import torch
 from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
+from autoparallel import MoEMeshRoles
 from autoparallel._testing.models.dsv3 import DeepSeekV3Model, make_dsv3_config
 from autoparallel._testing.models.llama3 import Transformer, TransformerModelArgs
 from autoparallel.api import AutoParallel
@@ -207,15 +208,17 @@ def _setup_ds3_local_map_autop(device_mesh_2d):
         local_batch_size * device_mesh_2d.shape[0] * device_mesh_2d.shape[1]
     )
     config = make_dsv3_config(max_seq_len=seq_len)
+    # EP on the 2nd mesh axis (matches the pre-roles behavior of setting
+    # MoE.axis_name = mesh_dim_names[1]).
+    ep_name = device_mesh_2d.mesh_dim_names[1]
+    roles = MoEMeshRoles(ep_axis_names=(ep_name,), ep_group_name=ep_name)
     with torch.device("meta"):
         model = DeepSeekV3Model(
             config,
             mesh=device_mesh_2d,
+            roles=roles,
             compute_dtype=torch.bfloat16,
         )
-    for module in model.modules():
-        if hasattr(module, "axis_name"):
-            module.axis_name = device_mesh_2d.mesh_dim_names[1]
 
     def input_fn():
         return torch.randint(

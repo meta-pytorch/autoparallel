@@ -13,6 +13,7 @@ from typing import Any, Iterable
 
 import torch
 import torch.utils._pytree as pytree
+from torch._functorch.partitioners import _has_tag_is_backward
 from torch.distributed._tensor.placement_types import Placement, TensorMeta
 from torch.distributed.device_mesh import _get_device_handle
 from torch.distributed.tensor._dtensor_spec import DTensorSpec
@@ -24,7 +25,7 @@ from torch.distributed.tensor._op_schema import (
     TupleStrategy,
 )
 from torch.distributed.tensor._ops.utils import generate_redistribute_costs
-from torch.distributed.tensor.placement_types import Replicate, Shard
+from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
 from torch.utils._pytree import tree_flatten, tree_map_only
 
 from autoparallel.shardings.propagation_rules import generate_dummy_redistribute_costs
@@ -379,6 +380,16 @@ def _concretize_tensor_meta(t: torch.Tensor) -> "TensorMeta | None":
     return TensorMeta(torch.Size(t.shape), tuple(t.stride()), t.dtype)
 
 
+def _grad_placement(p: Placement) -> Placement:
+    """Placement of a local_map input's gradient (autograd duality): Replicate ->
+    Partial(sum), Partial -> Replicate, Shard unchanged."""
+    if isinstance(p, Replicate):
+        return Partial(reduce_op="sum")
+    if isinstance(p, Partial):
+        return Replicate()
+    return p
+
+
 def get_local_map_placement_option(
     mesh,
     specs,
@@ -397,9 +408,10 @@ def get_local_map_placement_option(
         mesh,
         None,
     ), "Not yet implemented"
-    assert "call_local_map" in str(node.target) or "call_local_map_backward" in str(
-        node.target
-    )
+    # Substring match tolerates torch's local_map HOP renames across versions
+    # ("call_local_map"/"call_local_map_backward" pre-2.14, "local_map_hop" in
+    # 2.14+); everything below keys off node.meta["local_map_kwargs"].
+    assert "local_map" in str(node.target)
     in_specs = []
     num_activation_inputs = len(user_args) - len(in_placements)
     # activations are always replicated
@@ -431,6 +443,10 @@ def get_local_map_placement_option(
 
         in_specs.append(DTensorSpec(mesh=mesh, placements=placement, tensor_meta=tm))
 
+    # A backward node's outputs are gradients of the forward inputs, whose
+    # placements the HOP mirrors from the forward in_placements; take their dual.
+    is_backward = _has_tag_is_backward(node)
+
     out_specs = []
     output_val = node.meta["val"]
     assert isinstance(output_val, (torch.Tensor, list, tuple))
@@ -448,6 +464,8 @@ def get_local_map_placement_option(
             placement = [placement]
 
         assert isinstance(placement, (list, tuple)), "Not implemented"
+        if is_backward:
+            placement = [_grad_placement(p) for p in placement]
         tm = _concretize_tensor_meta(example)
         if tm is None:
             out_specs.append(None)
