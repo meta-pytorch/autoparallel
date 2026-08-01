@@ -76,6 +76,7 @@ def parse_args(argv=None):
     parser.add_argument("--mesh", help="Comma-separated LLaMA mesh dimensions")
     parser.add_argument("--moe-layout", choices=("2d",))
     parser.add_argument("--solver", choices=AutoParallel.SOLVER_CHOICES, required=True)
+    parser.add_argument("--lazy-costs", choices=("true", "false"))
     parser.add_argument("--revision-label", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--detailed-solution", action="store_true")
@@ -110,8 +111,12 @@ def fake_cuda_context(stack):
 def make_llama(model_name, mesh_shape):
     from autoparallel._testing.models.llama3 import Transformer, TransformerModelArgs
 
-    if len(mesh_shape) != 2:
-        raise ValueError(f"PR521 LLaMA profiles require a 2D mesh, got {mesh_shape}")
+    names = {
+        2: ("dp", "tp"),
+        3: ("dp", "cp", "tp"),
+    }.get(len(mesh_shape))
+    if names is None:
+        raise ValueError(f"LLaMA profiles require a 2D or 3D mesh, got {mesh_shape}")
     seq_len = 2048
     vocab_size = 128256
     config = {
@@ -122,17 +127,16 @@ def make_llama(model_name, mesh_shape):
     }
     with torch.device("meta"):
         model = Transformer(TransformerModelArgs(**config))
-    names = ("dp", "tp")
     mesh = torch.distributed.device_mesh.init_device_mesh(
         "cuda", mesh_shape, mesh_dim_names=names
     )
-    batch_size = 2 * mesh_shape[0]
+    batch_size = 16
 
     def input_fn():
         return torch.randint(0, vocab_size, (batch_size, seq_len), device="cuda")
 
-    input_placement = (Shard(0), Replicate())
-    output_placement = (Shard(0), Shard(2))
+    input_placement = (Shard(0),) + (Replicate(),) * (len(mesh_shape) - 1)
+    output_placement = (Shard(0), Shard(2)) if len(mesh_shape) == 2 else input_placement
     expanded = {
         "family": "llama3",
         "config": config,
@@ -312,6 +316,8 @@ def cpu_model():
 
 
 def validate_args(args):
+    if args.lazy_costs is not None and args.solver != "approx":
+        raise ValueError("--lazy-costs is supported only with --solver approx")
     if args.model == "dsv3":
         if args.moe_layout != "2d" or args.mesh is not None:
             raise ValueError("dsv3 requires --moe-layout 2d and no --mesh")
@@ -319,6 +325,8 @@ def validate_args(args):
     if args.mesh is None or args.moe_layout is not None:
         raise ValueError("LLaMA requires --mesh and no --moe-layout")
     mesh_shape = tuple(int(part) for part in args.mesh.split(","))
+    if len(mesh_shape) not in (2, 3):
+        raise ValueError(f"LLaMA requires a 2D or 3D mesh, got {mesh_shape}")
     world_size = math.prod(mesh_shape)
     if world_size != 64:
         raise ValueError(f"world size must be 64, got {world_size}")
@@ -398,6 +406,9 @@ def main(argv=None):
                 repeated_subgraphs=True,
                 dynamic=args.model == "dsv3",
                 solver=args.solver,
+                lazy_costs=(
+                    None if args.lazy_costs is None else args.lazy_costs == "true"
+                ),
             )
             enter_started = time.perf_counter()
             stack.enter_context(autop)
@@ -447,17 +458,28 @@ def main(argv=None):
             )
 
             fingerprint, solution_nodes = solution_fingerprint(solution)
-            objective = finite(pulp.value(opt.prob.objective))
-            violations = [
-                name
-                for name, constraint in opt.prob.constraints.items()
-                if not constraint.valid(1e-6)
-            ]
-            pulp_status = pulp.LpStatus.get(opt.prob.status, str(opt.prob.status))
-            solution_status = pulp.LpSolution.get(
-                getattr(opt.prob, "sol_status", None),
-                str(getattr(opt.prob, "sol_status", None)),
-            )
+            objective = finite(solver_profile["objective"])
+            violations = []
+            pulp_status = None
+            solution_status = None
+            if opt.prob is not None:
+                objective = finite(pulp.value(opt.prob.objective))
+                violations = [
+                    name
+                    for name, constraint in opt.prob.constraints.items()
+                    if not constraint.valid(1e-6)
+                ]
+                pulp_status = pulp.LpStatus.get(opt.prob.status, str(opt.prob.status))
+                solution_status = pulp.LpSolution.get(
+                    getattr(opt.prob, "sol_status", None),
+                    str(getattr(opt.prob, "sol_status", None)),
+                )
+            elif args.solver == "approx":
+                solution_status = (
+                    "Solution Found"
+                    if solver_profile["status"] == "Heuristic"
+                    else "No Solution Found"
+                )
             validation = {
                 "solver_status": solver_profile["status"],
                 "pulp_status": pulp_status,
@@ -477,7 +499,9 @@ def main(argv=None):
                         "strategy_nodes": len(opt.strats),
                         "decision_vars": len(opt.decision_vars),
                         "pulp_variables": len(opt.pulp_variables),
-                        "constraints": len(opt.prob.constraints),
+                        "constraints": (
+                            len(opt.prob.constraints) if opt.prob is not None else 0
+                        ),
                         "selected_keys": len(opt.selected_keys),
                     },
                 }
@@ -492,12 +516,13 @@ def main(argv=None):
             )
 
             if args.detailed_solution:
-                contributions = cost_contributions(opt)
                 result["solution_detail"] = solution_details(solution, autop.gm.graph)
-                result["cost_contributions"] = contributions
-                result["cost_contribution_sum"] = sum(
-                    row["total"] for row in contributions
-                )
+                if opt.decision_vars:
+                    contributions = cost_contributions(opt)
+                    result["cost_contributions"] = contributions
+                    result["cost_contribution_sum"] = sum(
+                        row["total"] for row in contributions
+                    )
             result["status"] = "success"
     except Exception as error:
         result["error"] = {

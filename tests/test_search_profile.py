@@ -57,6 +57,7 @@ def _args(*values):
     ("values", "expected"),
     [
         (("--model", "llama1b", "--mesh", "8,8"), (64, (8, 8))),
+        (("--model", "llama1b", "--mesh", "2,4,8"), (64, (2, 4, 8))),
         (("--model", "dsv3", "--moe-layout", "2d"), (64, None)),
     ],
 )
@@ -69,6 +70,7 @@ def test_validate_search_profile_args(values, expected):
     [
         ("--model", "llama1b"),
         ("--model", "llama1b", "--mesh", "4,4"),
+        ("--model", "llama1b", "--mesh", "1,1,1,64"),
         ("--model", "llama1b", "--mesh", "8,8", "--moe-layout", "2d"),
         ("--model", "dsv3", "--moe-layout", "2d", "--mesh", "8,8"),
     ],
@@ -76,6 +78,27 @@ def test_validate_search_profile_args(values, expected):
 def test_validate_search_profile_args_rejects_invalid_combinations(values):
     with pytest.raises(ValueError):
         validate_args(_args(*values))
+
+
+def test_validate_search_profile_args_rejects_lazy_non_approx():
+    args = parse_args(
+        [
+            "--model",
+            "llama1b",
+            "--mesh",
+            "8,8",
+            "--solver",
+            "ilp",
+            "--lazy-costs",
+            "true",
+            "--revision-label",
+            "test",
+            "--output",
+            "unused.json",
+        ]
+    )
+    with pytest.raises(ValueError, match="only with --solver approx"):
+        validate_args(args)
 
 
 @pytest.mark.parametrize(
@@ -161,6 +184,9 @@ def test_llama1b_approx_search_e2e(tmp_path):
     assert math.isfinite(result["objective"])
     assert result["solution_nodes"] > 0
     assert len(result["placement_sha256"]) == 64
+    assert result["counts"]["decision_vars"] == 0
+    assert result["counts"]["pulp_variables"] == 0
+    assert result["counts"]["constraints"] == 0
     for name in (
         "graph_trace_s",
         "optimizer_init_s",
@@ -281,17 +307,30 @@ class TestRealDsv3SolverE2E(DTensorTestBase):
             )
 
         fingerprint, solution_nodes = solution_fingerprint(solution)
-        objective = finite(pulp.value(opt.prob.objective))
-        violations = [
-            name
-            for name, constraint in opt.prob.constraints.items()
-            if not constraint.valid(1e-6)
-        ]
-        pulp_status = pulp.LpStatus.get(opt.prob.status, str(opt.prob.status))
-        solution_status = pulp.LpSolution.get(
-            getattr(opt.prob, "sol_status", None),
-            str(getattr(opt.prob, "sol_status", None)),
-        )
+        profile_key = "approximate" if solver == "approx" else solver
+        solver_profile = opt.profile[profile_key]
+        objective = finite(solver_profile["objective"])
+        violations = []
+        pulp_status = None
+        solution_status = None
+        if opt.prob is not None:
+            objective = finite(pulp.value(opt.prob.objective))
+            violations = [
+                name
+                for name, constraint in opt.prob.constraints.items()
+                if not constraint.valid(1e-6)
+            ]
+            pulp_status = pulp.LpStatus.get(opt.prob.status, str(opt.prob.status))
+            solution_status = pulp.LpSolution.get(
+                getattr(opt.prob, "sol_status", None),
+                str(getattr(opt.prob, "sol_status", None)),
+            )
+        elif solver == "approx":
+            solution_status = (
+                "Solution Found"
+                if solver_profile["status"] == "Heuristic"
+                else "No Solution Found"
+            )
         validate_solution(
             solver,
             objective,
@@ -300,8 +339,6 @@ class TestRealDsv3SolverE2E(DTensorTestBase):
             pulp_status,
             solution_status,
         )
-        profile_key = "approximate" if solver == "approx" else solver
-        solver_profile = opt.profile[profile_key]
         result = {
             "solver": solver,
             "objective": objective,

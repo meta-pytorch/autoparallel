@@ -993,3 +993,93 @@ def test_approx_uses_active_cost_and_memory_state(device_mesh_2d):
         assert solution
         assert solver._memory is None
         assert all(name not in opt.prob.constraints for name in memory_names)
+
+
+@apply_cuda_patches
+def test_approx_lazy_build_matches_eager_example(device_mesh_2d, tmp_path):
+    mesh = device_mesh_2d
+
+    def solve(lazy_costs):
+        reset_placement_options_cache()
+        model_fn, input_fn = _make_model_and_input_fn(mesh, "transformer_block")
+        with torch.device("meta"):
+            model = model_fn()
+
+        with AutoParallel(
+            model,
+            input_fn,
+            mesh,
+            solver="approx",
+            lazy_costs=lazy_costs,
+        ) as autop:
+            autop.add_input_constraints([(Shard(0), Replicate())])
+            autop.add_output_constraints([(Shard(0), Replicate())])
+            autop.add_parameter_memory_constraint(low=None, high=None)
+            opt = autop.sharding_optimizer
+
+            if not lazy_costs:
+                baseline = ApproximateShardingSolver(opt)
+                baseline._build_problem()
+                key = next(
+                    key
+                    for key in opt.decision_vars
+                    if key not in baseline.forbidden
+                    and key[2] in baseline.allowed_out[key[0]]
+                )
+                original_cost = opt.decision_vars[key].cost
+                opt.decision_vars[key].cost = 10000.0
+                valid_solver = ApproximateShardingSolver(opt)
+                valid_solver._build_problem()
+                assert key not in valid_solver.forbidden
+                opt.decision_vars[key].cost = original_cost
+
+            solution = autop.optimize_placement(verbose=False)
+
+            assert solution
+            assert opt.prob is None
+            assert not opt.pulp_variables
+            assert bool(opt.decision_vars) is not lazy_costs
+
+            selected_keys = set(opt.selected_keys)
+            objective = opt.profile["approximate"]["objective"]
+
+            if lazy_costs:
+                opt.remove_constraints(
+                    ["memory_constraint_high", "memory_constraint_low"]
+                )
+                no_memory_solver = ApproximateShardingSolver(opt)
+                assert no_memory_solver.get_solution(verbose=False)
+                assert no_memory_solver._memory is None
+
+                with pytest.raises(RuntimeError, match="requires an ILP/LP build"):
+                    opt.save(tmp_path / "optimizer.ap")
+                placements = tmp_path / "placements.json"
+                opt.save_placements(placements)
+                assert opt.load_placements(placements)
+
+            return selected_keys, objective
+
+    try:
+        eager_keys, eager_objective = solve(False)
+        lazy_keys, lazy_objective = solve(True)
+        assert lazy_keys == eager_keys
+        assert lazy_objective == pytest.approx(eager_objective, rel=1e-9)
+    finally:
+        reset_placement_options_cache()
+
+
+@apply_cuda_patches
+@pytest.mark.parametrize("solver", ["ilp", "lp"])
+def test_lazy_costs_requires_approx_solver(device_mesh_2d, solver):
+    model_fn, input_fn = _make_model_and_input_fn(device_mesh_2d, "transformer_block")
+    with torch.device("meta"):
+        model = model_fn()
+
+    with pytest.raises(ValueError, match="lazy_costs=True requires solver='approx'"):
+        AutoParallel(
+            model,
+            input_fn,
+            device_mesh_2d,
+            solver=solver,
+            lazy_costs=True,
+        )

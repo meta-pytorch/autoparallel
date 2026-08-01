@@ -272,9 +272,25 @@ class ShardingOptimizer:
         force_grad_reduce_in_higher_precision=False,
         repeated_subgraphs=False,
         fast_build=True,
+        build_pulp=True,
+        build_costs=True,
     ):
         self.orig_gm = gm
         self.fast_build = fast_build
+        # When False, skip building the per-edge decision-var costs (Phase A of
+        # _build_decision_vars, the comm-cost estimate over millions of edges that
+        # dominates build). Strategies + cluster_links are still built; the
+        # approximate solver computes the costs it needs on demand (lazy build),
+        # only for the branches TRW-S actually touches. Implies build_pulp=False
+        # (a PuLP problem needs the costs in its objective).
+        self.build_costs = build_costs
+        # When False, skip creating PuLP variables and constraints entirely.
+        # decision_var costs + strategies + cluster_links are still built, which
+        # is all the approximate solver needs (it derives the constraint topology
+        # directly). This avoids constructing millions of PuLP objects on large /
+        # 3D meshes, where that dominates build time.
+        self.build_pulp = build_pulp and build_costs
+        self.prob = None
         # The optimizer works on a concretized copy of the graph where all
         # symbolic shapes are replaced with their concrete hint values. This
         # centralizes dynamic-shape handling: the optimization pipeline
@@ -333,8 +349,9 @@ class ShardingOptimizer:
         t1 = time.perf_counter()
         self.validate()
         t2 = time.perf_counter()
-        self.prob = pulp.LpProblem("AutoParallel", pulp.LpMinimize)
-        self.add_default_constraints()
+        if self.build_pulp:
+            self.prob = pulp.LpProblem("AutoParallel", pulp.LpMinimize)
+            self.add_default_constraints()
         t3 = time.perf_counter()
         self.profile["timings"].update(
             {
@@ -344,7 +361,7 @@ class ShardingOptimizer:
                 "init_total_s": t3 - t_init_start,
             }
         )
-        n_constraints = len(self.prob.constraints)
+        n_constraints = len(self.prob.constraints) if self.prob is not None else 0
         logger.info(
             "ShardingOptimizer: build done in %.3fs (%d unique vars, %d decision "
             "vars, %d constraints)",
@@ -599,7 +616,14 @@ class ShardingOptimizer:
         the optimum unchanged while removing ~30% of the variables and the
         corresponding ~80% of constraints that are pure ``var == 0`` bounds.
 
+        When ``build_pulp`` is False (approximate solver only) no PuLP variables
+        are created (``DecisionVar.var`` is None); the valid-key set is still
+        built so the approximate solver can treat a key absent from
+        ``decision_vars`` as forbidden.
         """
+        if not self.build_costs:
+            return self._build_decision_vars_lazy()
+
         # Precompute which node indices are cluster-linked so we can
         # copy costs from the root instead of recomputing them.
         self._cluster_linked_node_idxs = set(self.cluster_links)
@@ -654,12 +678,15 @@ class ShardingOptimizer:
                             continue
 
                         key = (node_idx, argi, out_idx, inp_idx)
-                        var = pulp.LpVariable(
-                            f"n={node},s={node_idx},arg={argi},"
-                            f"output_p={out_idx},input_p={inp_idx}",
-                            cat=pulp.LpBinary,
-                        )
-                        self.pulp_variables[key] = var
+                        if self.build_pulp:
+                            var = pulp.LpVariable(
+                                f"n={node},s={node_idx},arg={argi},"
+                                f"output_p={out_idx},input_p={inp_idx}",
+                                cat=pulp.LpBinary,
+                            )
+                            self.pulp_variables[key] = var
+                        else:
+                            var = None
                         self._valid_keys.add(key)
                         decision_vars[key] = DecisionVar(
                             var=var,
@@ -711,6 +738,25 @@ class ShardingOptimizer:
         self.profile["timings"]["cost_estimation_s"] = t_compute + t_edge
         return decision_vars
 
+    def _build_decision_vars_lazy(self):
+        """Lazy build (build_costs=False): skip the expensive per-edge cost
+        estimation (Phase A) and the DecisionVar/PuLP materialization (Phase B).
+
+        Strategies, cluster_links and the redistribute_cost *shape* (the
+        enumeration dummies) are preserved, which is all the approximate solver
+        needs to derive the topology; it computes the comm/compute costs it
+        actually uses on demand. Returns an empty decision_vars dict — callers
+        that read it (the approx solver) must route through their lazy provider.
+        """
+        self._cluster_linked_node_idxs = set(self.cluster_links)
+        self.pulp_variables = {}
+        self._valid_keys = None
+        self._root_to_copies = defaultdict(list)
+        for copy_idx, root_idx in self.cluster_links.items():
+            self._root_to_copies[root_idx].append(copy_idx)
+        self.profile["timings"]["cost_estimation_s"] = 0.0
+        return {}
+
     def _compute_node_edge_costs(self, node_idx):
         """Compute per-edge costs for one root node."""
         node = self.nodes[node_idx]
@@ -754,9 +800,24 @@ class ShardingOptimizer:
         node_idx, argi, out_idx, _ = key
         strategy = self.strats[self.nodes[node_idx]].strategies[out_idx]
         root_key = self._cluster_root_key(key)
-        root_dv = self.decision_vars[root_key]
+        root_dv = self.decision_vars.get(root_key)
+        if root_dv is None:
+            # Lazy build (build_costs=False): no DecisionVars were materialized.
+            # The approximate solver scores via its own lazy cost provider; here
+            # only .strategy / specs are needed (solution extraction), so the
+            # cost fields are zero placeholders.
+            return DecisionVar(
+                var=None,
+                cost=0.0,
+                compute_cost=0.0,
+                comm_cost=0.0,
+                sharding_transition_cost=0.0,
+                strategy=strategy,
+                output_spec=strategy.output_specs,
+                input_spec=strategy.input_specs[argi],
+            )
         return DecisionVar(
-            var=self._get_pulp_variable(key),
+            var=self._get_pulp_variable(key) if self.pulp_variables else None,
             cost=root_dv.cost,
             compute_cost=root_dv.compute_cost,
             comm_cost=root_dv.comm_cost,
@@ -1402,7 +1463,10 @@ class ShardingOptimizer:
         unconstrained optimum."""
         memory_names = {"memory_constraint_high", "memory_constraint_low"}
         for name in names:
-            del self.prob.constraints[name]
+            if self.prob is not None:
+                del self.prob.constraints[name]
+            elif name not in memory_names:
+                raise RuntimeError("Named constraint removal requires an ILP/LP build")
             self._node_constraint_names.pop(name, None)
             if name in memory_names:
                 self._memory_constraint = None
@@ -1541,6 +1605,8 @@ class ShardingOptimizer:
     # ---- Logging ----
 
     def get_violated_constraints_log(self):
+        if self.prob is None:
+            return "Violated constraints: [] (no PuLP problem; lite build)"
         violated_constraints = [
             (k, c) for k, c in self.prob.constraints.items() if not c.valid()
         ]
@@ -1613,7 +1679,7 @@ class ShardingOptimizer:
     # ---- Serialization ----
 
     def save(self, path):
-        """Save the full optimizer state for later interactive exploration."""
+        """Save the full ILP/LP optimizer state for interactive exploration."""
         from autoparallel.serialization import save_optimizer
 
         save_optimizer(self, path)
@@ -2068,6 +2134,8 @@ class ShardingOptimizer:
         """
         if self._memory_constraint is None:
             return
+        if self.prob is None:
+            return  # approx-only builds read the active memory state directly
         memory_factor_low, memory_factor_high = self._memory_constraint
 
         # Remove previous memory constraints before rebuilding
@@ -2144,6 +2212,8 @@ class ShardingOptimizer:
             raise RuntimeError(
                 f"Couldn't find appropriate constraint {node} {constraint_name} {placement}"
             )
+        if self.prob is None:
+            return []  # approx (lite) build replays this from _constraint_log
         names = self._add_node_constraint(
             node,
             output_constraint_indices=output_constraint_indices,

@@ -102,13 +102,20 @@ _SAVE_META_KEYS = {
 
 
 def save_optimizer(opt, path):
-    """Save the full optimizer state for later interactive exploration.
+    """Save a full ILP/LP optimizer state for later interactive exploration.
 
     The saved file contains everything needed to rebuild the ILP and
     re-solve without the original model code, DeviceMesh, or process group.
     Can be called before or after solving — if unsolved, the loaded
     optimizer can be solved in a notebook via get_solution() or resolve().
+    Approximate-only builds should use save_placements() instead.
     """
+    if opt.prob is None:
+        raise RuntimeError(
+            "Full optimizer serialization requires an ILP/LP build; "
+            "use save_placements() for an approximate-only optimizer."
+        )
+
     import copy
 
     import numpy as np
