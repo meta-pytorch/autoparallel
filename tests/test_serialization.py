@@ -287,3 +287,33 @@ def test_loaded_optimizer_resolve_without_memory_constraint(device_mesh_1d):
 
     solution = loaded.resolve()
     assert len(solution) > 0
+
+
+@apply_cuda_patches
+def test_removed_memory_constraint_stays_removed_after_load(device_mesh_1d):
+    dim = 64
+    with torch.device("meta"):
+        model = _SimpleModel(dim)
+
+    autop = _setup_autop(model, dim, device_mesh_1d)
+    with autop:
+        autop.add_input_constraints([(Shard(0),)])
+        autop.add_output_constraints([(Shard(0),)])
+        autop.add_parameter_memory_constraint(low=None, high=None)
+        opt = autop.sharding_optimizer
+        opt.get_solution()
+        memory_names = ["memory_constraint_high", "memory_constraint_low"]
+        opt.remove_constraints(memory_names)
+
+    with tempfile.NamedTemporaryFile(suffix=".ap") as f:
+        opt.save(f.name)
+        loaded = type(opt).load(f.name)
+
+    solution = loaded.resolve()
+    assert solution
+    assert loaded._memory_constraint is None
+    assert all(
+        name != "add_parameter_memory_constraint"
+        for name, _kwargs in loaded._constraint_log
+    )
+    assert all(name not in loaded.prob.constraints for name in memory_names)

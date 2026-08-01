@@ -13,8 +13,12 @@ from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
 
 from autoparallel.api import AutoParallel, auto_parallel
+from autoparallel.approximate_sharding import ApproximateShardingSolver
 from autoparallel.collectives import local_map
-from autoparallel.optimize_sharding import _skip_enumeration_redistribute_cost
+from autoparallel.optimize_sharding import (
+    _INVALID_COST,
+    _skip_enumeration_redistribute_cost,
+)
 from autoparallel.shardings.placement_options import reset_placement_options_cache
 
 
@@ -939,3 +943,53 @@ def test_invalid_strategies_are_pruned(device_mesh_2d):
         param_nodes = get_param_nodes(autop.gm.graph)
         for node in param_nodes:
             assert node in solution
+        expected_nodes = {
+            opt._concrete_to_orig.get(node, node)
+            for node in opt.strats
+            if node.op != "output"
+        }
+        assert set(solution) == expected_nodes
+
+
+@apply_cuda_patches
+def test_approx_uses_active_cost_and_memory_state(device_mesh_2d):
+    mesh = device_mesh_2d
+    model_fn, input_fn = _make_model_and_input_fn(mesh, "transformer_block")
+    with torch.device("meta"):
+        model = model_fn()
+
+    with AutoParallel(model, input_fn, mesh) as autop:
+        autop.add_input_constraints([(Shard(0), Replicate())])
+        autop.add_output_constraints([(Shard(0), Replicate())])
+        autop.add_parameter_memory_constraint(low=None, high=None)
+        opt = autop.sharding_optimizer
+
+        baseline = ApproximateShardingSolver(opt)
+        baseline._build_problem()
+        key = next(
+            key
+            for key in opt.decision_vars
+            if key not in baseline.forbidden and key[2] in baseline.allowed_out[key[0]]
+        )
+        original_cost = opt.decision_vars[key].cost
+
+        opt.decision_vars[key].cost = 10000.0
+        valid_solver = ApproximateShardingSolver(opt)
+        valid_solver._build_problem()
+        assert key not in valid_solver.forbidden
+
+        opt.decision_vars[key].cost = _INVALID_COST
+        invalid_solver = ApproximateShardingSolver(opt)
+        invalid_solver._build_problem()
+        assert key in invalid_solver.forbidden
+        opt.decision_vars[key].cost = original_cost
+
+        autop.optimize_placement(verbose=False, solver="ilp")
+        memory_names = ["memory_constraint_high", "memory_constraint_low"]
+        opt.remove_constraints(memory_names)
+        solver = ApproximateShardingSolver(opt)
+        solution = solver.get_solution(verbose=False)
+
+        assert solution
+        assert solver._memory is None
+        assert all(name not in opt.prob.constraints for name in memory_names)

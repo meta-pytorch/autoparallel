@@ -6,6 +6,7 @@
 import copy
 import json
 import logging
+import math
 import operator
 import time
 from contextlib import ExitStack, contextmanager
@@ -236,6 +237,9 @@ class AutoParallel:
         fast_build: Skip DTensor enumeration costs that AutoParallel recomputes.
     """
 
+    # Selectable solvers over the eagerly built optimizer problem.
+    SOLVER_CHOICES = ("ilp", "approx", "lp")
+
     def __init__(
         self,
         model,
@@ -247,8 +251,14 @@ class AutoParallel:
         cost_model: Any = "nccl",
         repeated_subgraphs: bool = True,
         fast_build: bool = True,
+        solver: str = "ilp",
     ):
         self.stack = ExitStack()
+        if solver not in self.SOLVER_CHOICES:
+            raise ValueError(
+                f"Unknown solver={solver!r}; expected one of {self.SOLVER_CHOICES}"
+            )
+        self.solver = solver
         self.fake_mode = (
             FakeTensorMode()
         )  # TODO: maybe need to reuse the model's fake mode
@@ -402,10 +412,57 @@ class AutoParallel:
         self.sharding_optimizer.add_sharded_output_constraint(constraints)
         self.output_constraints = constraints
 
-    def optimize_placement(self, verbose=False):
-        self._assert_entered()
+    def optimize_placement(
+        self,
+        verbose=False,
+        solver=None,
+        approximate_options=None,
+        optimality_check=False,
+    ):
+        """Solve for the optimal placement.
 
-        self.sharding_placement = self.sharding_optimizer.get_solution(verbose=False)
+        solver selects how the placement is solved (defaults to the solver chosen
+        at AutoParallel construction):
+          - "ilp":    exact PuLP/CBC solve.
+          - "approx": heuristic TRW-S ApproximateShardingSolver.
+          - "lp":     solve the LP relaxation and use it directly. This problem is
+            empirically integral, so the relaxation optimum equals the ILP optimum
+            while skipping branch-and-bound; raises if it comes out fractional.
+        approximate_options is forwarded as kwargs to the approximate solver
+        (e.g. candidate_limit, max_sweeps).
+
+        optimality_check: after solving, solve the LP relaxation as a lower bound
+        and log the certified gap of the achieved objective from the optimum.
+        Requires a PuLP problem (i.e. an "ilp"/"lp" build).
+        """
+        self._assert_entered()
+        if solver is None:
+            solver = self.solver
+        if solver not in self.SOLVER_CHOICES:
+            raise ValueError(
+                f"Unknown solver={solver!r}; expected one of {self.SOLVER_CHOICES}"
+            )
+
+        opt = self.sharding_optimizer
+        if solver == "approx":
+            from .approximate_sharding import ApproximateShardingSolver
+
+            approx = ApproximateShardingSolver(opt, **(approximate_options or {}))
+            self.sharding_placement = approx.get_solution(verbose=verbose)
+        elif solver == "ilp":
+            self.sharding_placement = opt.get_solution(verbose=False)
+        elif solver == "lp":
+            opt._set_objective()
+            res = opt.solve_lp_relaxation(verbose=verbose, extract=True)
+            if res["solution"] is None:
+                raise RuntimeError(
+                    "solver='lp' requires an integral LP relaxation, but it came "
+                    f"out fractional ({res['n_fractional']}/{res['n_vars']} "
+                    "variables). Use solver='ilp' for an exact integral solve."
+                )
+            self.sharding_placement = res["solution"]
+        if optimality_check:
+            self._log_optimality_check(solver, verbose=verbose)
 
         if verbose:
             logger.info(self.sharding_optimizer.get_log(verbose=True))
@@ -421,7 +478,10 @@ class AutoParallel:
             ),
         )
 
-        if self.sharding_optimizer.prob.status == -1:
+        if (
+            self.sharding_optimizer.prob is not None
+            and self.sharding_optimizer.prob.status == -1
+        ):
             raise RuntimeError(
                 "The sharding optimizer could not find a feasible solution. "
                 "This typically means the user-specified constraints are "
@@ -441,6 +501,45 @@ class AutoParallel:
         )
 
         return self.sharding_placement
+
+    def _log_optimality_check(self, solver, verbose=False):
+        """Solve the LP relaxation as a lower bound and log the certified gap of
+        the achieved objective from the optimum. Needs a PuLP problem."""
+        import pulp
+
+        opt = self.sharding_optimizer
+        if opt.prob is None:
+            logger.warning(
+                "optimality_check skipped: solver=%r build has no PuLP problem; "
+                "construct with solver='ilp' or 'lp' to enable it.",
+                solver,
+            )
+            return
+        achieved = opt._safe_float(pulp.value(opt.prob.objective))
+        lb_res = opt.get_lower_bound(verbose=verbose)
+        lb = lb_res.objective
+        if (
+            lb_res.status != "Optimal"
+            or not math.isfinite(lb)
+            or lb <= 0
+            or not math.isfinite(achieved)
+        ):
+            logger.warning(
+                "optimality_check inconclusive: status=%s lower_bound=%s achieved=%s",
+                lb_res.status,
+                lb,
+                achieved,
+            )
+            return
+        gap = max((achieved - lb) / lb, 0.0)
+        logger.info(
+            "optimality check (solver=%s): objective=%.4f LP lower bound=%.4f "
+            "=> within %.2f%% of optimum (certified)",
+            solver,
+            achieved,
+            lb,
+            gap * 100,
+        )
 
     def _apply_placement_common(self, sharding_placement):
         t0 = time.perf_counter()
