@@ -101,7 +101,7 @@ class ApproximateShardingSolver:
     def __init__(
         self,
         optimizer,
-        candidate_limit: Optional[int] = 64,
+        candidate_limit: Optional[int] = 128,
         bp_iters: int = 400,
         bp_tol: float = 1e-3,
         max_sweeps: int = 12,

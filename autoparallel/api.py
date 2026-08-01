@@ -9,6 +9,7 @@ import logging
 import math
 import operator
 import time
+import warnings
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from functools import partial
@@ -237,6 +238,11 @@ class AutoParallel:
         fast_build: Skip DTensor enumeration costs that AutoParallel recomputes.
         lazy_costs: Compute approximate-solver costs on demand. Only supported
             with ``solver="approx"``; ``False`` retains eager costs for A/B checks.
+        strategy_radius: For approximate search on meshes with more than two
+            dimensions, restrict final strategy enumeration to a best-effort
+            Hamming ball around independently solved per-dimension placements.
+            Defaults to 2. Use 0 or None to retain unrestricted search. Values
+            greater than 2 are not recommended because they may be slow.
     """
 
     # Selectable solvers. "ilp": exact PuLP/CBC. "approx": heuristic TRW-S
@@ -256,6 +262,7 @@ class AutoParallel:
         repeated_subgraphs: bool = True,
         fast_build: bool = True,
         solver: str = "ilp",
+        strategy_radius: Optional[int] = 2,
         lazy_costs: Optional[bool] = None,
     ):
         self.stack = ExitStack()
@@ -283,6 +290,9 @@ class AutoParallel:
         self.cost_model = cost_model
         self.repeated_subgraphs = repeated_subgraphs
         self.fast_build = fast_build
+        self.mesh = mesh
+        self.strategy_radius = strategy_radius
+        self._split_dim_search = self._validate_strategy_radius()
         # None => default per solver: approx builds lazy (no eager per-edge cost
         # estimation; the TRW-S solver computes costs on demand), ilp/lp build
         # eager (a PuLP objective needs the costs). True/False forces lazy/eager.
@@ -296,7 +306,6 @@ class AutoParallel:
 
         self.model = move_to_fake(model, self.fake_mode, device)
         self.input_fn = input_fn
-        self.mesh = mesh
         self.compiler_fn = _boxed_nop_preserve_node_meta  # type: ignore[assignment]
         self.reshard_after_forward = reshard_after_forward
 
@@ -306,6 +315,74 @@ class AutoParallel:
 
         # NB: rest of the construction happens in __enter__
         self.active = False
+
+    def _validate_strategy_radius(self) -> bool:
+        if self.solver != "approx" or self.mesh.ndim <= 2:
+            return False
+        radius = self.strategy_radius
+        if radius is None:
+            return False
+        if isinstance(radius, bool) or not isinstance(radius, int):
+            raise ValueError("strategy_radius must be an integer, 0, or None")
+        if radius == 0:
+            return False
+        if radius < 0:
+            raise ValueError("strategy_radius must be non-negative")
+        if radius >= self.mesh.ndim:
+            raise ValueError(
+                "strategy_radius must be smaller than the mesh dimensionality"
+            )
+        if radius > 2:
+            warnings.warn(
+                "strategy_radius values greater than 2 may make approximate "
+                "search slow",
+                UserWarning,
+                stacklevel=2,
+            )
+        return True
+
+    def _new_sharding_optimizer(self, strategy_seed=None):
+        return ShardingOptimizer(
+            self.gm,
+            self.mesh,
+            self.force_grad_reduce_in_higher_precision,
+            repeated_subgraphs=self.repeated_subgraphs,
+            fast_build=self.fast_build,
+            build_pulp=self.solver in ("ilp", "lp"),
+            build_costs=(
+                (self.solver != "approx")
+                if self.lazy_costs is None
+                else (not self.lazy_costs)
+            ),
+            strategy_seed=strategy_seed,
+            strategy_radius=self.strategy_radius if strategy_seed is not None else None,
+        )
+
+    def _build_split_dim_optimizer(self):
+        from .mesh_search import _build_split_dim_seed
+
+        strategy_seed = _build_split_dim_seed(
+            self.gm,
+            tuple(self.mesh.shape),
+            input_constraints=self.input_constraints,
+            output_constraints=self.output_constraints,
+            cost_model=self.cost_model,
+            force_grad_reduce_in_higher_precision=self.force_grad_reduce_in_higher_precision,
+            repeated_subgraphs=self.repeated_subgraphs,
+            fast_build=self.fast_build,
+            device_type=self.mesh.device_type,
+        )
+        self.sharding_optimizer = self._new_sharding_optimizer(strategy_seed)
+        for kind, args in self._pending_constraints:
+            if kind == "parameter_memory":
+                self.sharding_optimizer.add_parameter_memory_constraint(*args)
+            elif kind == "input":
+                self.sharding_optimizer.add_sharded_input_constraint(*args)
+            elif kind == "output":
+                self.sharding_optimizer.add_sharded_output_constraint(*args)
+            else:
+                raise AssertionError(f"Unknown pending constraint kind: {kind}")
+        self._pending_constraints.clear()
 
     def __enter__(self):
         assert self.active is False
@@ -341,31 +418,19 @@ class AutoParallel:
             )
             torch._inductor.config.comprehensive_padding = False
 
-            force_grad_reduce_in_higher_precision = (
+            self.force_grad_reduce_in_higher_precision = (
                 self.mp_policy is not None
                 and self.mp_policy.reduce_dtype is not None
                 and self.mp_policy.param_dtype is not None
                 and self.mp_policy.reduce_dtype.itemsize
                 > self.mp_policy.param_dtype.itemsize
             )
-            sharding_optimizer = ShardingOptimizer(
-                self.gm,
-                self.mesh,
-                force_grad_reduce_in_higher_precision,
-                repeated_subgraphs=self.repeated_subgraphs,
-                fast_build=self.fast_build,
-                build_pulp=self.solver in ("ilp", "lp"),
-                build_costs=(
-                    (self.solver != "approx")
-                    if self.lazy_costs is None
-                    else (not self.lazy_costs)
-                ),
-            )
-
-            self.sharding_optimizer = sharding_optimizer
-
             self.input_constraints = None
             self.output_constraints = None
+            self._pending_constraints = []
+            self.sharding_optimizer = (
+                None if self._split_dim_search else self._new_sharding_optimizer()
+            )
 
             self.active = True
 
@@ -416,14 +481,20 @@ class AutoParallel:
 
         assert low <= high, f"low should be <= high, got low{low}, high={high}"
 
-        self.sharding_optimizer.add_parameter_memory_constraint(low, high)
+        if self.sharding_optimizer is None:
+            self._pending_constraints.append(("parameter_memory", (low, high)))
+        else:
+            self.sharding_optimizer.add_parameter_memory_constraint(low, high)
 
     def add_input_constraints(self, constraints):
         self._assert_entered()
 
         assert self.input_constraints is None, "Input constraints have already been set"
-        self.sharding_optimizer.add_sharded_input_constraint(constraints)
         self.input_constraints = constraints
+        if self.sharding_optimizer is None:
+            self._pending_constraints.append(("input", (constraints,)))
+        else:
+            self.sharding_optimizer.add_sharded_input_constraint(constraints)
 
     def add_output_constraints(self, constraints):
         self._assert_entered()
@@ -432,8 +503,11 @@ class AutoParallel:
             self.output_constraints is None
         ), "Output constraints have already been set"
         # forces sharding of fwd output to be S(0) on first dimension and R on others
-        self.sharding_optimizer.add_sharded_output_constraint(constraints)
         self.output_constraints = constraints
+        if self.sharding_optimizer is None:
+            self._pending_constraints.append(("output", (constraints,)))
+        else:
+            self.sharding_optimizer.add_sharded_output_constraint(constraints)
 
     def optimize_placement(
         self,
@@ -468,6 +542,9 @@ class AutoParallel:
             raise ValueError(
                 f"Unknown solver={solver!r}; expected one of {self.SOLVER_CHOICES}"
             )
+
+        if self.sharding_optimizer is None:
+            self._build_split_dim_optimizer()
 
         opt = self.sharding_optimizer
         if solver == "approx":

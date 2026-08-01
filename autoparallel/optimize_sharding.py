@@ -89,6 +89,7 @@ from torch._functorch._aot_autograd.fx_utils import (
     get_plain_output_and_tangent_nodes,
 )
 from torch.distributed.tensor._dtensor_spec import DTensorSpec
+from torch.distributed.tensor._op_schema import OpSpec, OpStrategy
 from torch.distributed.tensor.placement_types import Placement, Replicate, Shard
 from torch.utils._pytree import tree_map_only
 
@@ -103,8 +104,17 @@ from .graph_passes.graph_utils import (
     build_param_derived_set,
     build_terminal_derived_set,
 )
-from .shardings.placement_options import get_placement_options_for_node
-from .shardings.propagation_rules import _create_all_options
+from .shardings.placement_options import (
+    get_placement_options_for_node,
+    reset_placement_options_cache,
+)
+from .shardings.propagation_rules import (
+    DTensorSpecSeed,
+    OpSpecSeed,
+    _create_all_options,
+    remove_invalid_configs,
+    set_current_seed_node,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -193,6 +203,55 @@ def _produces_tensor(val):
     return False
 
 
+def _materialize_seed_spec(spec, mesh):
+    if spec is None:
+        return None
+    if isinstance(spec, DTensorSpecSeed):
+        return DTensorSpec(mesh, spec.placements, tensor_meta=spec.tensor_meta)
+    return tuple(_materialize_seed_spec(item, mesh) for item in spec)
+
+
+def _spec_matches_seed(spec, seed) -> bool:
+    if seed is None:
+        return spec is None
+    if isinstance(seed, DTensorSpecSeed):
+        return isinstance(spec, DTensorSpec) and spec.placements == seed.placements
+    return (
+        isinstance(spec, (tuple, list))
+        and len(spec) == len(seed)
+        and all(
+            _spec_matches_seed(actual, expected) for actual, expected in zip(spec, seed)
+        )
+    )
+
+
+def _strategy_matches_seed(strategy: OpSpec, seed: OpSpecSeed) -> bool:
+    return _spec_matches_seed(
+        strategy.output_specs, seed.output_specs
+    ) and _spec_matches_seed(strategy.input_specs, seed.input_specs)
+
+
+def _first_seed_output(seed: OpSpecSeed) -> DTensorSpecSeed | None:
+    if isinstance(seed.output_specs, DTensorSpecSeed):
+        return seed.output_specs
+    if isinstance(seed.output_specs, tuple):
+        return next(
+            (spec for spec in seed.output_specs if isinstance(spec, DTensorSpecSeed)),
+            None,
+        )
+    return None
+
+
+def _seed_spec_is_well_formed(spec: DTensorSpecSeed, mesh_ndim: int) -> bool:
+    if len(spec.placements) != mesh_ndim or spec.tensor_meta is None:
+        return False
+    rank = len(spec.tensor_meta.shape)
+    return all(
+        not isinstance(placement, Shard) or -rank <= placement.dim < rank
+        for placement in spec.placements
+    )
+
+
 def concretize_gm(gm):
     """Create a structural copy of gm with all symbolic shapes concretized.
 
@@ -274,6 +333,8 @@ class ShardingOptimizer:
         fast_build=True,
         build_pulp=True,
         build_costs=True,
+        strategy_seed=None,
+        strategy_radius=None,
     ):
         self.orig_gm = gm
         self.fast_build = fast_build
@@ -304,6 +365,8 @@ class ShardingOptimizer:
         self.force_grad_reduce_in_higher_precision = (
             force_grad_reduce_in_higher_precision
         )
+        self.strategy_seed = strategy_seed
+        self.strategy_radius = strategy_radius
         self._constraint_log: list[tuple[str, dict]] = []
         self._memory_constraint: tuple[float, float] | None = None
         # Maps ILP constraint name → node_name for active node constraints,
@@ -318,7 +381,21 @@ class ShardingOptimizer:
         self.profile: dict[str, Any] = {"timings": {}}
         t_init_start = time.perf_counter()
         t0 = time.perf_counter()
-        self.strats = self.build_sharding_metadata()
+        if self.strategy_seed is None:
+            self.strats = self.build_sharding_metadata()
+        else:
+            from .shardings import propagation_rules as _propagation_rules
+
+            _propagation_rules.set_strategy_seed(
+                self.strategy_seed, self.strategy_radius
+            )
+            reset_placement_options_cache()
+            try:
+                self.strats = self.build_sharding_metadata()
+            finally:
+                _propagation_rules.set_strategy_seed(None, None)
+                set_current_seed_node(None)
+                reset_placement_options_cache()
         t_strategy = time.perf_counter() - t0
         self.profile["timings"]["strategy_enumeration_s"] = t_strategy
         logger.info("ShardingOptimizer: strategy enumeration took %.3fs", t_strategy)
@@ -391,6 +468,83 @@ class ShardingOptimizer:
         """
         return self._orig_to_concrete.get(node, node)
 
+    def _built_input_nodes(self, node, strats):
+        result = []
+        for input_node in all_input_nodes(node):
+            if input_node in strats:
+                result.append(input_node)
+            elif input_node.op != "get_attr":
+                value = input_node.meta.get("val")
+                assert not isinstance(value, torch.Tensor), (
+                    f"Tensor-producing node {input_node} (op={input_node.op}) "
+                    "unexpectedly missing from strats"
+                )
+        return result
+
+    def _ensure_seed_witness(self, node, op_strategy, strats):
+        if self.strategy_seed is None:
+            return op_strategy
+        node_seed = self.strategy_seed.get(node.name)
+        if node_seed is None or node_seed.witness is None:
+            return op_strategy
+        witness = node_seed.witness
+        if any(
+            _strategy_matches_seed(strategy, witness)
+            for strategy in op_strategy.strategies
+        ):
+            return op_strategy
+
+        first_output = _first_seed_output(witness)
+        if (
+            first_output is None
+            or first_output.placements != node_seed.output_placements
+            or not all(
+                _seed_spec_is_well_formed(spec, self.mesh.ndim)
+                for spec in self._seeded_specs(witness)
+            )
+        ):
+            logger.debug("Skipping structurally invalid strategy seed for %s", node)
+            return op_strategy
+
+        input_nodes = self._built_input_nodes(node, strats)
+        input_specs = witness.input_specs
+        if input_nodes:
+            if input_specs is None or len(input_specs) != len(input_nodes):
+                logger.debug("Skipping input-incompatible strategy seed for %s", node)
+                return op_strategy
+            redistribute_cost = [
+                [0.0] * len(strats[input_node].strategies) for input_node in input_nodes
+            ]
+        elif input_specs:
+            if len(input_specs) != 1:
+                logger.debug("Skipping input-incompatible strategy seed for %s", node)
+                return op_strategy
+            redistribute_cost = [[0.0]]
+        else:
+            redistribute_cost = []
+
+        candidate = OpSpec(
+            output_specs=_materialize_seed_spec(witness.output_specs, self.mesh),
+            input_specs=_materialize_seed_spec(input_specs, self.mesh),
+            redistribute_cost=redistribute_cost,
+        )
+        valid = remove_invalid_configs(OpStrategy([candidate]), self.mesh)
+        if not valid.strategies:
+            logger.debug("Skipping unshardable strategy seed for %s", node)
+            return op_strategy
+        op_strategy.strategies.append(candidate)
+        return op_strategy
+
+    @staticmethod
+    def _seeded_specs(witness):
+        output_specs = witness.output_specs
+        if isinstance(output_specs, DTensorSpecSeed):
+            yield output_specs
+        elif isinstance(output_specs, tuple):
+            yield from (spec for spec in output_specs if spec is not None)
+        if witness.input_specs is not None:
+            yield from (spec for spec in witness.input_specs if spec is not None)
+
     def build_sharding_metadata(self):
         strats = {}
         # Enumeration's redistribute_cost matrices are overwritten with real
@@ -398,6 +552,7 @@ class ShardingOptimizer:
         # _skip_enumeration_redistribute_cost).
         with _skip_enumeration_redistribute_cost(self.fast_build):
             for node in self.graph.nodes:
+                set_current_seed_node(node.name)
                 if node.op in ("placeholder", "get_attr"):
                     val = node.meta.get("val")
                     if isinstance(val, torch.Tensor):
@@ -445,6 +600,9 @@ class ShardingOptimizer:
                     strats[node] = user_strats
                 else:
                     raise ValueError(f"Unexpected node op: {node.op}")
+                if node in strats and node.op != "output":
+                    strats[node] = self._ensure_seed_witness(node, strats[node], strats)
+        set_current_seed_node(None)
         return strats
 
     def create_cluster_links(self, clusters):
@@ -491,17 +649,7 @@ class ShardingOptimizer:
         - call_function producing non-tensors: shape-computation nodes
           (sym_size, operator.mul, etc.)
         """
-        result = []
-        for x in all_input_nodes(node):
-            if x in self.strats:
-                result.append(x)
-            elif x.op != "get_attr":
-                val = x.meta.get("val")
-                assert not isinstance(val, torch.Tensor), (
-                    f"Tensor-producing node {x} (op={x.op}) unexpectedly "
-                    f"missing from strats"
-                )
-        return result
+        return self._built_input_nodes(node, self.strats)
 
     def walk_over_options(self, node, constrain_arg=None):
         """Yield (argi, out_idx, inp_idx) for all valid strategy combinations."""

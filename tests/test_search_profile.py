@@ -59,6 +59,8 @@ def _args(*values):
         (("--model", "llama1b", "--mesh", "8,8"), (64, (8, 8))),
         (("--model", "llama1b", "--mesh", "2,4,8"), (64, (2, 4, 8))),
         (("--model", "dsv3", "--moe-layout", "2d"), (64, None)),
+        (("--model", "dsv3", "--moe-layout", "3d"), (64, None)),
+        (("--model", "dsv3", "--moe-layout", "4d"), (64, None)),
     ],
 )
 def test_validate_search_profile_args(values, expected):
@@ -91,6 +93,26 @@ def test_validate_search_profile_args_rejects_lazy_non_approx():
             "ilp",
             "--lazy-costs",
             "true",
+            "--revision-label",
+            "test",
+            "--output",
+            "unused.json",
+        ]
+    )
+    with pytest.raises(ValueError, match="only with --solver approx"):
+        validate_args(args)
+
+
+def test_validate_search_profile_args_rejects_seeded_non_approx():
+    args = parse_args(
+        [
+            "--model",
+            "llama1b",
+            "--mesh",
+            "2,4,8",
+            "--solver",
+            "ilp",
+            "--seeded",
             "--revision-label",
             "test",
             "--output",
