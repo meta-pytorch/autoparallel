@@ -3,15 +3,15 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
-from autoparallel.api import AutoParallel, auto_parallel
-from autoparallel.collectives import with_sharding_constraint
-from autoparallel.compile import autoparallel_backend
 from autoparallel._context_parallel import (
     ContextParallelPlacements,
     context_parallel_attention_placements,
     make_context_parallel,
     make_context_parallel_sdpa,
 )
+from autoparallel.api import AutoParallel, auto_parallel
+from autoparallel.collectives import with_sharding_constraint
+from autoparallel.compile import autoparallel_backend
 from autoparallel.input_validation import ForwardInputs
 from autoparallel.moe import (
     MoEMeshRoles,

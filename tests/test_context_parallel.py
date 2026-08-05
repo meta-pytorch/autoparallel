@@ -10,11 +10,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.distributed as dist
+import torch.multiprocessing as mp
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.multiprocessing as mp
 from conftest import apply_cuda_patches
-from test_correctness import _run_correctness_test
+from test_correctness import _get_parallel_graph_and_placements, _run_correctness_test
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import Shard
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
@@ -251,36 +251,6 @@ def _causal_block_mask(seq_len, *, batch_size=None, nheads=None, device="cuda"):
     (
         (
             (2, 2),
-            ("dp_shard", "cp"),
-            (Shard(0), Shard(2)),
-            False,
-        ),
-        (
-            (2, 2),
-            ("dp_shard", "cp"),
-            (Shard(0), Shard(2)),
-            True,
-        ),
-        (
-            (2, 2),
-            ("cp", "tp"),
-            (Shard(2), Shard(1)),
-            False,
-        ),
-        (
-            (2, 2),
-            ("cp", "tp"),
-            (Shard(2), Shard(1)),
-            True,
-        ),
-        (
-            (2, 2, 2),
-            ("dp_shard", "cp", "tp"),
-            (Shard(0), Shard(2), Shard(1)),
-            True,
-        ),
-        (
-            (2, 2),
             ("dp_shard", "tp"),
             (Shard(0), Shard(1)),
             False,
@@ -357,6 +327,206 @@ def _local_shard_for_placements(tensor, placements, mesh_shape, coordinate):
             coordinate[mesh_dim]
         ].contiguous()
     return local
+
+
+def _context_parallel_sdpa_worker(rank, case, init_file):
+    world_size = case["world_size"]
+    torch.cuda.set_device(rank)
+    dist.init_process_group(
+        "nccl", init_method=f"file://{init_file}", rank=rank, world_size=world_size
+    )
+    try:
+        import torch.distributed.config as dist_config
+
+        mesh_shape = case["mesh_shape"]
+        mesh = torch.distributed.device_mesh.init_device_mesh(
+            "cuda", mesh_shape, mesh_dim_names=case["mesh_dim_names"]
+        )
+        coordinate = mesh.get_coordinate()
+        assert coordinate is not None
+        placements = tuple(Shard(dim) for dim in case["placement_dims"])
+
+        class CPAttention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.sdpa = make_context_parallel_sdpa(
+                    mesh,
+                    is_causal=case["is_causal"],
+                    scale=case["scale"],
+                    enable_gqa=case["enable_gqa"],
+                )
+
+            def forward(self, q, k, v):
+                return self.sdpa(q, k, v)
+
+        batch_size = 2
+        seq_len = 8
+        head_dim = 4
+
+        def model_fn():
+            return CPAttention()
+
+        def input_fn():
+            return (
+                torch.randn(
+                    batch_size,
+                    case["nheads"],
+                    seq_len,
+                    head_dim,
+                    device="cuda",
+                    requires_grad=True,
+                ),
+                torch.randn(
+                    batch_size,
+                    case["nkv_heads"],
+                    seq_len,
+                    head_dim,
+                    device="cuda",
+                    requires_grad=True,
+                ),
+                torch.randn(
+                    batch_size,
+                    case["nkv_heads"],
+                    seq_len,
+                    head_dim,
+                    device="cuda",
+                    requires_grad=True,
+                ),
+            )
+
+        with dist_config.patch(compile_on_one_rank=True):
+            parallel_gm = _get_parallel_graph_and_placements(
+                model_fn,
+                input_fn,
+                mesh,
+                input_placements=(placements,) * 3,
+                output_placements=placements,
+                parameter_memory_constraint=False,
+            )[0]
+
+        torch.manual_seed(0)
+        q, k, v = input_fn()
+        ref = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            is_causal=case["is_causal"],
+            scale=case["scale"],
+            enable_gqa=case["enable_gqa"],
+        )
+        grad_out = torch.randn_like(ref)
+        ref.backward(grad_out)
+
+        local_inputs = tuple(
+            _local_shard_for_placements(
+                tensor.detach(), placements, mesh_shape, coordinate
+            )
+            .clone()
+            .requires_grad_()
+            for tensor in (q, k, v)
+        )
+        local_grad_out = _local_shard_for_placements(
+            grad_out, placements, mesh_shape, coordinate
+        )
+        local_outputs, local_grads = parallel_gm(*local_inputs, local_grad_out)
+
+        expected_output = _local_shard_for_placements(
+            ref.detach(), placements, mesh_shape, coordinate
+        )
+        torch.testing.assert_close(
+            local_outputs[0], expected_output, atol=1e-4, rtol=1e-4
+        )
+        for actual, full_input in zip(local_grads, (q, k, v)):
+            expected = _local_shard_for_placements(
+                full_input.grad, placements, mesh_shape, coordinate
+            )
+            torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-4)
+
+        eager_local_inputs = tuple(
+            _local_shard_for_placements(
+                tensor.detach(), placements, mesh_shape, coordinate
+            )
+            .clone()
+            .requires_grad_()
+            for tensor in (q, k, v)
+        )
+        eager_dtensors = tuple(
+            DTensor.from_local(tensor, mesh, placements, run_check=False)
+            for tensor in eager_local_inputs
+        )
+        eager_sdpa = make_context_parallel_sdpa(
+            mesh,
+            is_causal=case["is_causal"],
+            scale=case["scale"],
+            enable_gqa=case["enable_gqa"],
+        )
+        eager_output = eager_sdpa(*eager_dtensors)
+        torch.testing.assert_close(
+            eager_output.full_tensor(), ref.detach(), atol=1e-4, rtol=1e-4
+        )
+        eager_output.to_local().backward(local_grad_out)
+        for local_input, full_input in zip(eager_local_inputs, (q, k, v)):
+            expected = _local_shard_for_placements(
+                full_input.grad, placements, mesh_shape, coordinate
+            )
+            torch.testing.assert_close(local_input.grad, expected, atol=1e-4, rtol=1e-4)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        {
+            "world_size": 2,
+            "mesh_shape": (2,),
+            "mesh_dim_names": ("cp",),
+            "placement_dims": (2,),
+            "is_causal": True,
+            "scale": None,
+            "enable_gqa": False,
+            "nheads": 4,
+            "nkv_heads": 4,
+        },
+        {
+            "world_size": 2,
+            "mesh_shape": (2,),
+            "mesh_dim_names": ("cp",),
+            "placement_dims": (2,),
+            "is_causal": False,
+            "scale": None,
+            "enable_gqa": False,
+            "nheads": 4,
+            "nkv_heads": 4,
+        },
+        {
+            "world_size": 4,
+            "mesh_shape": (2, 2),
+            "mesh_dim_names": ("cp", "tp"),
+            "placement_dims": (2, 1),
+            "is_causal": True,
+            "scale": 0.5,
+            "enable_gqa": True,
+            "nheads": 4,
+            "nkv_heads": 2,
+        },
+    ),
+    ids=("cp2_causal", "cp2_noncausal", "cp2_tp2_causal_gqa"),
+)
+def test_context_parallel_sdpa_real_distributed_correctness(case):
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    if torch.cuda.device_count() < case["world_size"]:
+        pytest.skip(f"requires {case['world_size']} CUDA devices")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        init_file = os.path.join(tmpdir, "init")
+        mp.spawn(
+            _context_parallel_sdpa_worker,
+            args=(case, init_file),
+            nprocs=case["world_size"],
+            join=True,
+        )
 
 
 def _context_parallel_flex_worker(rank, case, init_file):

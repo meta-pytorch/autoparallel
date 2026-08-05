@@ -7,13 +7,14 @@ from dataclasses import dataclass
 from typing import Callable, Literal
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, distribute_tensor
 from torch.distributed.tensor.placement_types import Placement, Replicate, Shard
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
 
-from .collectives import all_gather, axis_size, local_map, reduce_scatter
+from .collectives import local_map
 
 _DP_REPLICATE_NAMES = {"dp_replicate", "ddp"}
 _DP_SHARD_NAMES = {
@@ -163,6 +164,7 @@ class _ContextParallelBlockMask:
     ) -> BlockMask:
         q_offset = q_offsets.reshape(())
         mask_mod = self.mask_mod
+        shifted_mask_mod: Callable | None
         if mask_mod is not None:
 
             def shifted_mask_mod(b, h, q_idx, kv_idx):
@@ -217,9 +219,7 @@ def _mesh_axis_role(name: str) -> str:
 
 
 def _cp_axis_name(mesh: DeviceMesh) -> str | None:
-    cp_names = [
-        name for name in _mesh_dim_names(mesh) if _mesh_axis_role(name) == "cp"
-    ]
+    cp_names = [name for name in _mesh_dim_names(mesh) if _mesh_axis_role(name) == "cp"]
     if not cp_names:
         return None
     if len(cp_names) > 1:
@@ -334,33 +334,77 @@ def _make_context_parallel_sdpa(
         mesh, batch_dim=batch_dim, seq_dim=seq_dim, head_dim=head_dim
     )
 
-    def cp_sdpa(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
-        kwargs = {"dropout_p": dropout_p, "enable_gqa": enable_gqa}
+    cp_allgather = None
+    cp_group_name = None
+    cp_size = None
+    rank_placements = None
+    if cp_axis is not None:
+        from torch.distributed.tensor.experimental._context_parallel._attention import (
+            flex_cp_allgather,
+        )
+
+        cp_mesh = mesh[cp_axis]
+        cp_allgather = flex_cp_allgather
+        cp_group_name = dist._get_process_group_name(cp_mesh.get_group())
+        cp_dim = _mesh_dim_names(mesh).index(cp_axis)
+        cp_size = mesh.size(cp_dim)
+        rank_placements = tuple(
+            Shard(0) if mesh_dim == cp_dim else Replicate()
+            for mesh_dim in range(mesh.ndim)
+        )
+
+    def cp_sdpa(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *rank_args: torch.Tensor,
+    ):
+        if cp_allgather is not None:
+            k, v = cp_allgather(k.contiguous(), v.contiguous(), seq_dim, cp_group_name)
+
+        attn_mask = None
+        sdpa_is_causal = is_causal
+        if rank_args:
+            rank_index = rank_args[0].reshape(())
+            local_q_len = q.size(seq_dim)
+            q_positions = (
+                torch.arange(local_q_len, device=q.device) + rank_index * local_q_len
+            )
+            kv_positions = torch.arange(k.size(seq_dim), device=q.device)
+            attn_mask = q_positions[:, None] >= kv_positions[None, :]
+            sdpa_is_causal = False
+
+        kwargs = {
+            "attn_mask": attn_mask,
+            "dropout_p": dropout_p,
+            "enable_gqa": enable_gqa,
+            "is_causal": sdpa_is_causal,
+        }
         if scale is not None:
             kwargs["scale"] = scale
 
-        if cp_axis is not None:
-            k = all_gather(k, seq_dim, cp_axis)
-            v = all_gather(v, seq_dim, cp_axis)
+        return F.scaled_dot_product_attention(q, k, v, **kwargs)
 
-        # Causal CP gathers Q too, computes the full attention on every rank,
-        # then reduce-scatters back to the sequence shard (reduce_scatter's
-        # backward is all-gather, keeping gradients on the same contract).
-        if is_causal and cp_axis is not None and axis_size(cp_axis) > 1:
-            cp_size = axis_size(cp_axis)
-            q = all_gather(q, seq_dim, cp_axis)
-            out = F.scaled_dot_product_attention(q, k, v, is_causal=True, **kwargs)
-            return reduce_scatter(out / cp_size, seq_dim, cp_axis)
-
-        return F.scaled_dot_product_attention(q, k, v, is_causal=is_causal, **kwargs)
-
-    return local_map(
+    mapped = local_map(
         cp_sdpa,
         out_placements=placements.out_placements,
-        in_placements=placements.in_placements,
+        in_placements=placements.in_placements
+        + ((rank_placements,) if rank_placements is not None and is_causal else ()),
         redistribute_inputs=True,
         device_mesh=mesh,
     )
+
+    if cp_size is None or not is_causal:
+        return mapped
+    assert rank_placements is not None
+
+    def call(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
+        rank_indices = torch.arange(cp_size, device=q.device)
+        if isinstance(q, DTensor):
+            rank_indices = distribute_tensor(rank_indices, mesh, rank_placements)
+        return mapped(q, k, v, rank_indices)
+
+    return call
 
 
 def _make_context_parallel_flex_attention(
@@ -385,6 +429,17 @@ def _make_context_parallel_flex_attention(
         mesh, batch_dim=batch_dim, seq_dim=seq_dim, head_dim=head_dim
     )
 
+    cp_allgather = None
+    cp_group_name = None
+    if cp_axis is not None:
+        from torch.distributed.tensor.experimental._context_parallel._attention import (
+            flex_cp_allgather,
+        )
+
+        cp_mesh = mesh[cp_axis]
+        cp_allgather = flex_cp_allgather
+        cp_group_name = dist._get_process_group_name(cp_mesh.get_group())
+
     block_mask_args: tuple[object, ...] = ()
     block_mask_placements: tuple[object, ...] = ()
     cp_block_mask: _ContextParallelBlockMask | None = None
@@ -404,9 +459,8 @@ def _make_context_parallel_flex_attention(
         v: torch.Tensor,
         *mask_args: object,
     ):
-        if cp_axis is not None:
-            k = all_gather(k, seq_dim, cp_axis)
-            v = all_gather(v, seq_dim, cp_axis)
+        if cp_allgather is not None:
+            k, v = cp_allgather(k.contiguous(), v.contiguous(), seq_dim, cp_group_name)
 
         local_block_mask = None
         if cp_block_mask is not None:

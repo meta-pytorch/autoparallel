@@ -9,8 +9,8 @@ from typing import ClassVar, Literal, Optional
 
 import torch
 import torch.nn.functional as F
-from torch.distributed.device_mesh import DeviceMesh
 from torch import nn
+from torch.distributed.device_mesh import DeviceMesh
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 
