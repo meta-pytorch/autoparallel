@@ -3,6 +3,7 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+import math
 import os
 import tempfile
 from types import SimpleNamespace
@@ -89,14 +90,24 @@ def test_llama_build_attention_rejects_unsupported_context_parallel_modes(
 @pytest.mark.parametrize(
     "mesh_dim_names,expected_placements",
     (
-        (("dp", "context", "tensor"), (Shard(0), Shard(2), Shard(1))),
+        (("dp", "cp", "tp"), (Shard(0), Shard(2), Shard(1))),
         (
-            ("fsdp", "context_parallel", "tensor_parallel"),
-            (Shard(0), Shard(2), Shard(1)),
+            ("dp_replicate", "dp_shard", "cp", "tp"),
+            (Shard(0), Shard(0), Shard(2), Shard(1)),
         ),
         (
-            ("ddp", "data_parallel", "cp", "tp"),
+            ("dp_shard_mod_ep", "dp_shard_in_ep", "cp", "tp"),
             (Shard(0), Shard(0), Shard(2), Shard(1)),
+        ),
+        (
+            (
+                "dp_replicate",
+                "dp_shard_mod_ep",
+                "dp_shard_in_ep",
+                "cp",
+                "tp",
+            ),
+            (Shard(0), Shard(0), Shard(0), Shard(2), Shard(1)),
         ),
         (("cp", "tp"), (Shard(2), Shard(1))),
         (("tp", "cp"), (Shard(1), Shard(2))),
@@ -119,31 +130,32 @@ def test_context_parallel_attention_placement_names(
 
 
 @pytest.mark.parametrize(
-    "mesh,expected_placements",
+    "axis_name",
     (
-        (_fake_mesh(None, ndim=3), (Shard(0), Shard(2), Shard(1))),
-        (_fake_mesh(None, ndim=4), (Shard(0), Shard(0), Shard(2), Shard(1))),
+        "bad",
+        "context",
+        "context_parallel",
+        "tensor",
+        "tensor_parallel",
+        "ddp",
+        "data",
+        "data_parallel",
+        "fsdp",
     ),
 )
-def test_context_parallel_attention_placement_defaults(mesh, expected_placements):
-    placements = context_parallel_attention_placements(
-        mesh,
-        batch_dim=0,
-        seq_dim=2,
-        head_dim=1,
-    )
-
-    assert placements.qkv == expected_placements
-
-
-def test_context_parallel_attention_placements_reject_invalid_axis():
+def test_context_parallel_attention_placements_reject_noncanonical_axis(axis_name):
     with pytest.raises(ValueError, match="Unsupported mesh axis"):
-        context_parallel_attention_placements(_fake_mesh(("dp", "bad")))
+        context_parallel_attention_placements(_fake_mesh(("dp", axis_name)))
 
 
-@pytest.mark.parametrize("ndim", (1, 2))
-def test_context_parallel_attention_placements_reject_unnamed_ambiguous_meshes(ndim):
-    with pytest.raises(ValueError, match="requires mesh_dim_names"):
+def test_context_parallel_body_rejects_noncanonical_axis():
+    with pytest.raises(ValueError, match="Unsupported mesh axis"):
+        make_context_parallel_body(_fake_mesh(("context", "tp")))
+
+
+@pytest.mark.parametrize("ndim", (1, 2, 3, 4, 5))
+def test_context_parallel_attention_placements_reject_unnamed_meshes(ndim):
+    with pytest.raises(ValueError, match="requires named mesh axes"):
         context_parallel_attention_placements(_fake_mesh(None, ndim=ndim))
 
 
@@ -197,6 +209,22 @@ def test_make_context_parallel_flex_rejects_context_parallel_score_mod():
             (2, 2, 2, 2),
             ("dp_replicate", "dp_shard", "cp", "tp"),
             (Shard(0), Shard(0), Shard(2), Shard(1)),
+        ),
+        (
+            (2, 2, 2, 2),
+            ("dp_shard_mod_ep", "dp_shard_in_ep", "cp", "tp"),
+            (Shard(0), Shard(0), Shard(2), Shard(1)),
+        ),
+        (
+            (2, 2, 2, 2, 2),
+            (
+                "dp_replicate",
+                "dp_shard_mod_ep",
+                "dp_shard_in_ep",
+                "cp",
+                "tp",
+            ),
+            (Shard(0), Shard(0), Shard(0), Shard(2), Shard(1)),
         ),
     ),
 )
@@ -369,7 +397,9 @@ def _context_parallel_sdpa_worker(rank, case, init_file):
         )
         coordinate = mesh.get_coordinate()
         assert coordinate is not None
-        placements = tuple(Shard(dim) for dim in case["placement_dims"])
+        placements = context_parallel_attention_placements(
+            mesh, batch_dim=0, seq_dim=2, head_dim=1
+        ).qkv
 
         class CPAttention(nn.Module):
             def __init__(self):
@@ -537,38 +567,126 @@ def _context_parallel_sdpa_worker(rank, case, init_file):
         dist.destroy_process_group()
 
 
+def _sdpa_case(mesh_shape, mesh_dim_names, *, is_causal=True):
+    return {
+        "world_size": math.prod(mesh_shape),
+        "mesh_shape": mesh_shape,
+        "mesh_dim_names": mesh_dim_names,
+        "is_causal": is_causal,
+        "scale": None,
+        "enable_gqa": False,
+    }
+
+
 @pytest.mark.parametrize(
     "case",
     (
-        {
-            "world_size": 2,
-            "mesh_shape": (2,),
-            "mesh_dim_names": ("cp",),
-            "placement_dims": (2,),
-            "is_causal": True,
-            "scale": None,
-            "enable_gqa": False,
-        },
-        {
-            "world_size": 2,
-            "mesh_shape": (2,),
-            "mesh_dim_names": ("cp",),
-            "placement_dims": (2,),
-            "is_causal": False,
-            "scale": None,
-            "enable_gqa": False,
-        },
-        {
-            "world_size": 4,
-            "mesh_shape": (2, 2),
-            "mesh_dim_names": ("cp", "tp"),
-            "placement_dims": (2, 1),
-            "is_causal": True,
-            "scale": None,
-            "enable_gqa": False,
-        },
+        _sdpa_case((2,), ("cp",)),
+        _sdpa_case((2,), ("cp",), is_causal=False),
+        _sdpa_case((2, 2), ("cp", "tp")),
+        _sdpa_case((2, 2, 2), ("dp", "cp", "tp")),
+        _sdpa_case((2, 2, 2), ("dp_shard", "cp", "tp")),
+        _sdpa_case(
+            (2, 2, 2, 1), ("dp_replicate", "dp_shard", "cp", "tp")
+        ),
+        _sdpa_case(
+            (2, 1, 2, 2), ("dp_replicate", "dp_shard", "cp", "tp")
+        ),
+        _sdpa_case(
+            (1, 2, 2, 2), ("dp_replicate", "dp_shard", "cp", "tp")
+        ),
+        _sdpa_case(
+            (2, 2, 2, 1),
+            ("dp_shard_mod_ep", "dp_shard_in_ep", "cp", "tp"),
+        ),
+        _sdpa_case(
+            (2, 1, 2, 2),
+            ("dp_shard_mod_ep", "dp_shard_in_ep", "cp", "tp"),
+        ),
+        _sdpa_case(
+            (1, 2, 2, 2),
+            ("dp_shard_mod_ep", "dp_shard_in_ep", "cp", "tp"),
+        ),
+        _sdpa_case(
+            (2, 2, 1, 2, 1),
+            (
+                "dp_replicate",
+                "dp_shard_mod_ep",
+                "dp_shard_in_ep",
+                "cp",
+                "tp",
+            ),
+        ),
+        _sdpa_case(
+            (2, 1, 2, 2, 1),
+            (
+                "dp_replicate",
+                "dp_shard_mod_ep",
+                "dp_shard_in_ep",
+                "cp",
+                "tp",
+            ),
+        ),
+        _sdpa_case(
+            (1, 2, 2, 2, 1),
+            (
+                "dp_replicate",
+                "dp_shard_mod_ep",
+                "dp_shard_in_ep",
+                "cp",
+                "tp",
+            ),
+        ),
+        _sdpa_case(
+            (2, 1, 1, 2, 2),
+            (
+                "dp_replicate",
+                "dp_shard_mod_ep",
+                "dp_shard_in_ep",
+                "cp",
+                "tp",
+            ),
+        ),
+        _sdpa_case(
+            (1, 2, 1, 2, 2),
+            (
+                "dp_replicate",
+                "dp_shard_mod_ep",
+                "dp_shard_in_ep",
+                "cp",
+                "tp",
+            ),
+        ),
+        _sdpa_case(
+            (1, 1, 2, 2, 2),
+            (
+                "dp_replicate",
+                "dp_shard_mod_ep",
+                "dp_shard_in_ep",
+                "cp",
+                "tp",
+            ),
+        ),
     ),
-    ids=("cp2_causal", "cp2_noncausal", "cp2_tp2_causal"),
+    ids=(
+        "cp2_causal",
+        "cp2_noncausal",
+        "cp2_tp2_causal",
+        "dp2_cp2_tp2",
+        "dp_shard2_cp2_tp2",
+        "dp_replicate2_dp_shard2_cp2_tp1",
+        "dp_replicate2_dp_shard1_cp2_tp2",
+        "dp_replicate1_dp_shard2_cp2_tp2",
+        "dp_mod2_dp_in2_cp2_tp1",
+        "dp_mod2_dp_in1_cp2_tp2",
+        "dp_mod1_dp_in2_cp2_tp2",
+        "dp_replicate2_dp_mod2_dp_in1_cp2_tp1",
+        "dp_replicate2_dp_mod1_dp_in2_cp2_tp1",
+        "dp_replicate1_dp_mod2_dp_in2_cp2_tp1",
+        "dp_replicate2_dp_mod1_dp_in1_cp2_tp2",
+        "dp_replicate1_dp_mod2_dp_in1_cp2_tp2",
+        "dp_replicate1_dp_mod1_dp_in2_cp2_tp2",
+    ),
 )
 def test_context_parallel_sdpa_real_distributed_correctness(case):
     if not torch.cuda.is_available():

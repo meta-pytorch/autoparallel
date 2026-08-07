@@ -17,19 +17,6 @@ from torch.nn.attention.flex_attention import BlockMask, flex_attention
 from ._local_map_regions import _DeferredLocalMapBody
 from .collectives import local_map
 
-_DP_REPLICATE_NAMES = {"dp_replicate", "ddp"}
-_DP_SHARD_NAMES = {
-    "dp",
-    "dp_shard",
-    "dp_shard_mod_ep",
-    "dp_shard_in_ep",
-    "fsdp",
-    "data",
-    "data_parallel",
-}
-_CP_NAMES = {"cp", "context", "context_parallel"}
-_TP_NAMES = {"tp", "tensor", "tensor_parallel"}
-
 
 @dataclass(frozen=True)
 class ContextParallelPlacements:
@@ -108,19 +95,13 @@ class _ContextParallelBlockMask:
     def _tensor_placements(
         self, tensor: torch.Tensor, mesh: DeviceMesh
     ) -> tuple[Placement, ...]:
+        base_placements = context_parallel_attention_placements(
+            mesh, batch_dim=0, seq_dim=2, head_dim=1
+        ).qkv
         placements: list[Placement] = []
-        for mesh_dim, name in enumerate(_mesh_dim_names(mesh)):
-            role = _mesh_axis_role(name)
+        for mesh_dim, base_placement in enumerate(base_placements):
             mesh_size = mesh.size(mesh_dim)
-            if role in ("dp_replicate", "dp_shard"):
-                dim = 0
-            elif role == "tp":
-                dim = 1
-            elif role == "cp":
-                dim = 2
-            else:
-                placements.append(Replicate())
-                continue
+            dim = base_placement.dim
 
             if tensor.size(dim) == 1:
                 placements.append(Replicate())
@@ -187,40 +168,17 @@ class _ContextParallelBlockMask:
 
 def _mesh_dim_names(mesh: DeviceMesh) -> tuple[str, ...]:
     names = getattr(mesh, "mesh_dim_names", None)
-    if names is not None and all(name is not None for name in names):
-        return tuple(names)
-
-    if mesh.ndim == 3:
-        return ("dp_shard", "cp", "tp")
-    if mesh.ndim == 4:
-        return ("dp_replicate", "dp_shard", "cp", "tp")
-    if mesh.ndim == 5:
-        return ("dp_replicate", "dp_shard_mod_ep", "dp_shard_in_ep", "cp", "tp")
-    raise ValueError(
-        "context_parallel_attention_placements requires mesh_dim_names for "
-        "1-D/2-D meshes. Use names such as ('dp_shard', 'cp') or "
-        "('dp_shard', 'tp')."
-    )
-
-
-def _mesh_axis_role(name: str) -> str:
-    normalized = name.lower()
-    if normalized in _DP_REPLICATE_NAMES:
-        return "dp_replicate"
-    if normalized in _DP_SHARD_NAMES:
-        return "dp_shard"
-    if normalized in _CP_NAMES:
-        return "cp"
-    if normalized in _TP_NAMES:
-        return "tp"
-    raise ValueError(
-        f"Unsupported mesh axis {name!r} for context parallel attention. "
-        "Expected axes like dp_shard/dp, cp, tp, and optionally dp_replicate."
-    )
+    if names is None or any(name is None for name in names):
+        raise ValueError(
+            "context_parallel_attention_placements requires named mesh axes."
+        )
+    return tuple(names)
 
 
 def _cp_axis_name(mesh: DeviceMesh) -> str | None:
-    cp_names = [name for name in _mesh_dim_names(mesh) if _mesh_axis_role(name) == "cp"]
+    names = _mesh_dim_names(mesh)
+    context_parallel_attention_placements(mesh)
+    cp_names = [name for name in names if name == "cp"]
     if not cp_names:
         return None
     if len(cp_names) > 1:
@@ -245,14 +203,22 @@ def context_parallel_attention_placements(
     """
 
     qkv: list[Placement] = []
-    for name in _mesh_dim_names(mesh):
-        role = _mesh_axis_role(name)
-        if role in ("dp_replicate", "dp_shard"):
-            qkv.append(Shard(batch_dim))
-        elif role == "cp":
-            qkv.append(Shard(seq_dim))
-        elif role == "tp":
-            qkv.append(Shard(head_dim))
+    for axis_name in _mesh_dim_names(mesh):
+        match axis_name:
+            case "dp" | "dp_replicate" | "dp_shard":
+                placement = Shard(batch_dim)
+            case "dp_shard_mod_ep" | "dp_shard_in_ep":
+                placement = Shard(batch_dim)
+            case "cp":
+                placement = Shard(seq_dim)
+            case "tp":
+                placement = Shard(head_dim)
+            case _:
+                raise ValueError(
+                    f"Unsupported mesh axis {axis_name!r} for context parallel "
+                    "attention."
+                )
+        qkv.append(placement)
 
     qkv_t = tuple(qkv)
     return ContextParallelPlacements(qkv=qkv_t, out=qkv_t)
