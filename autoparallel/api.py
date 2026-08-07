@@ -14,6 +14,7 @@ from functools import partial
 from typing import Any, Callable, Optional, Union
 
 import torch
+import torch._functorch.config
 from torch._dynamo.functional_export import _dynamo_graph_capture_for_export
 from torch._dynamo.utils import warn_once
 from torch._functorch.aot_autograd import (
@@ -511,6 +512,11 @@ class AutoParallel:
                 },
             )
         t_apply = time.perf_counter()
+        if torch._functorch.config.cse:
+            from torch._functorch.partitioners import fx_graph_cse
+
+            parallel_gm.graph = fx_graph_cse(parallel_gm.graph)
+            parallel_gm.recompile()
         # clean it up by removing the added aliases from previous pass
         # as well as redundant views
         cleanup_graph(parallel_gm, aggressive=True)
