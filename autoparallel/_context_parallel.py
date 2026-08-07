@@ -14,6 +14,7 @@ from torch.distributed.tensor import DTensor, distribute_tensor
 from torch.distributed.tensor.placement_types import Placement, Replicate, Shard
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
 
+from ._local_map_regions import _DeferredLocalMapBody
 from .collectives import local_map
 
 _DP_REPLICATE_NAMES = {"dp_replicate", "ddp"}
@@ -315,6 +316,63 @@ def make_context_parallel(
     raise ValueError(f"Unsupported context-parallel attention kind: {kind!r}")
 
 
+def make_context_parallel_body(
+    mesh: DeviceMesh,
+    *,
+    kind: Literal["sdpa"] = "sdpa",
+    seq_dim: int = 2,
+    is_causal: bool = True,
+    dropout_p: float = 0.0,
+    scale: float | None = None,
+    enable_gqa: bool = False,
+):
+    """Build an unwrapped local-tensor context-parallel attention body.
+
+    The returned callable can be passed to ``local_map``. During eager execution
+    it runs the same DTensor context-parallel dispatcher path as TorchTitan.
+    """
+    if kind != "sdpa":
+        raise ValueError(f"Unsupported context-parallel attention kind: {kind!r}")
+
+    cp_axis = _cp_axis_name(mesh)
+    if cp_axis is not None and dropout_p != 0.0:
+        raise ValueError("Context-parallel SDPA does not support dropout.")
+
+    kwargs = {
+        "dropout_p": dropout_p,
+        "enable_gqa": enable_gqa,
+        "is_causal": is_causal,
+    }
+    if scale is not None:
+        kwargs["scale"] = scale
+
+    def local_sdpa(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
+        return F.scaled_dot_product_attention(q, k, v, **kwargs)
+
+    if cp_axis is None:
+        return local_sdpa
+
+    from torch.distributed.tensor.experimental._attention import (
+        _enable_context_parallel_dispatcher,
+    )
+
+    _enable_context_parallel_dispatcher()
+    cp_mesh = mesh[cp_axis]
+    cp_placements = (Shard(seq_dim),)
+
+    def runtime_sdpa(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
+        q = DTensor.from_local(q, cp_mesh, cp_placements, run_check=False)
+        k = DTensor.from_local(k, cp_mesh, cp_placements, run_check=False)
+        v = DTensor.from_local(v, cp_mesh, cp_placements, run_check=False)
+        out = F.scaled_dot_product_attention(q, k, v, **kwargs)
+        return out.to_local()
+
+    return _DeferredLocalMapBody(
+        surrogate_fn=local_sdpa,
+        runtime_fn=runtime_sdpa,
+    )
+
+
 def _make_context_parallel_sdpa(
     mesh: DeviceMesh,
     *,
@@ -326,85 +384,25 @@ def _make_context_parallel_sdpa(
     scale: float | None = None,
     enable_gqa: bool = False,
 ):
-    cp_axis = _cp_axis_name(mesh)
-    if cp_axis is not None and dropout_p != 0.0:
-        raise ValueError("Context-parallel SDPA does not support dropout.")
-
     placements = context_parallel_attention_placements(
         mesh, batch_dim=batch_dim, seq_dim=seq_dim, head_dim=head_dim
     )
-
-    cp_allgather = None
-    cp_group_name = None
-    cp_size = None
-    rank_placements = None
-    if cp_axis is not None:
-        from torch.distributed.tensor.experimental._context_parallel._attention import (
-            flex_cp_allgather,
-        )
-
-        cp_mesh = mesh[cp_axis]
-        cp_allgather = flex_cp_allgather
-        cp_group_name = dist._get_process_group_name(cp_mesh.get_group())
-        cp_dim = _mesh_dim_names(mesh).index(cp_axis)
-        cp_size = mesh.size(cp_dim)
-        rank_placements = tuple(
-            Shard(0) if mesh_dim == cp_dim else Replicate()
-            for mesh_dim in range(mesh.ndim)
-        )
-
-    def cp_sdpa(
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        *rank_args: torch.Tensor,
-    ):
-        if cp_allgather is not None:
-            k, v = cp_allgather(k.contiguous(), v.contiguous(), seq_dim, cp_group_name)
-
-        attn_mask = None
-        sdpa_is_causal = is_causal
-        if rank_args:
-            rank_index = rank_args[0].reshape(())
-            local_q_len = q.size(seq_dim)
-            q_positions = (
-                torch.arange(local_q_len, device=q.device) + rank_index * local_q_len
-            )
-            kv_positions = torch.arange(k.size(seq_dim), device=q.device)
-            attn_mask = q_positions[:, None] >= kv_positions[None, :]
-            sdpa_is_causal = False
-
-        kwargs = {
-            "attn_mask": attn_mask,
-            "dropout_p": dropout_p,
-            "enable_gqa": enable_gqa,
-            "is_causal": sdpa_is_causal,
-        }
-        if scale is not None:
-            kwargs["scale"] = scale
-
-        return F.scaled_dot_product_attention(q, k, v, **kwargs)
-
-    mapped = local_map(
-        cp_sdpa,
+    body = make_context_parallel_body(
+        mesh,
+        kind="sdpa",
+        seq_dim=seq_dim,
+        is_causal=is_causal,
+        dropout_p=dropout_p,
+        scale=scale,
+        enable_gqa=enable_gqa,
+    )
+    return local_map(
+        body,
         out_placements=placements.out_placements,
-        in_placements=placements.in_placements
-        + ((rank_placements,) if rank_placements is not None and is_causal else ()),
+        in_placements=placements.in_placements,
         redistribute_inputs=True,
         device_mesh=mesh,
     )
-
-    if cp_size is None or not is_causal:
-        return mapped
-    assert rank_placements is not None
-
-    def call(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
-        rank_indices = torch.arange(cp_size, device=q.device)
-        if isinstance(q, DTensor):
-            rank_indices = distribute_tensor(rank_indices, mesh, rank_placements)
-        return mapped(q, k, v, rank_indices)
-
-    return call
 
 
 def _make_context_parallel_flex_attention(

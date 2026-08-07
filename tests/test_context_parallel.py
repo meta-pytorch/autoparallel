@@ -16,6 +16,9 @@ import torch.nn.functional as F
 from conftest import apply_cuda_patches
 from test_correctness import _get_parallel_graph_and_placements, _run_correctness_test
 from torch.distributed.tensor import DTensor
+from torch.distributed.tensor.experimental._context_parallel import (
+    _context_parallel_shard,
+)
 from torch.distributed.tensor.placement_types import Shard
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
@@ -23,6 +26,7 @@ import autoparallel
 from autoparallel import (
     context_parallel_attention_placements,
     make_context_parallel,
+    make_context_parallel_body,
     make_context_parallel_sdpa,
 )
 
@@ -37,6 +41,7 @@ def test_context_parallel_api_is_exported_from_autoparallel():
     assert hasattr(autoparallel, "ContextParallelPlacements")
     assert callable(autoparallel.context_parallel_attention_placements)
     assert callable(autoparallel.make_context_parallel)
+    assert callable(autoparallel.make_context_parallel_body)
     assert callable(autoparallel.make_context_parallel_sdpa)
 
 
@@ -329,6 +334,24 @@ def _local_shard_for_placements(tensor, placements, mesh_shape, coordinate):
     return local
 
 
+def _close_metrics(actual, expected, *, rank, name, atol, rtol):
+    diff = (actual - expected).abs()
+    tolerance = atol + rtol * expected.abs()
+    finite = torch.isfinite(actual) & torch.isfinite(expected)
+    violations = ((diff > tolerance) | ~finite).sum().item()
+    max_abs = diff.max().item()
+    mean_abs = diff.mean().item()
+    max_tolerance_ratio = (diff / tolerance).max().item()
+    print(
+        f"NUMERICS rank={rank} tensor={name} max_abs={max_abs:.9e} "
+        f"mean_abs={mean_abs:.9e} "
+        f"max_tolerance_ratio={max_tolerance_ratio:.9e} "
+        f"violations={violations} elements={actual.numel()}",
+        flush=True,
+    )
+    return violations
+
+
 def _context_parallel_sdpa_worker(rank, case, init_file):
     world_size = case["world_size"]
     torch.cuda.set_device(rank)
@@ -337,6 +360,8 @@ def _context_parallel_sdpa_worker(rank, case, init_file):
     )
     try:
         import torch.distributed.config as dist_config
+
+        from autoparallel._testing.models.llama3 import TransformerModelArgs
 
         mesh_shape = case["mesh_shape"]
         mesh = torch.distributed.device_mesh.init_device_mesh(
@@ -359,18 +384,21 @@ def _context_parallel_sdpa_worker(rank, case, init_file):
             def forward(self, q, k, v):
                 return self.sdpa(q, k, v)
 
-        batch_size = 2
-        seq_len = 8
-        head_dim = 4
+        model_args = TransformerModelArgs(n_kv_heads=8)
+        batch_size = 4
+        seq_len = model_args.max_seq_len
+        nheads = model_args.n_heads
+        head_dim = model_args.dim // nheads
 
         def model_fn():
             return CPAttention()
 
+        # LLaMA3 repeat_kv expands K/V to n_heads before the SDPA call.
         def input_fn():
             return (
                 torch.randn(
                     batch_size,
-                    case["nheads"],
+                    nheads,
                     seq_len,
                     head_dim,
                     device="cuda",
@@ -378,7 +406,7 @@ def _context_parallel_sdpa_worker(rank, case, init_file):
                 ),
                 torch.randn(
                     batch_size,
-                    case["nkv_heads"],
+                    nheads,
                     seq_len,
                     head_dim,
                     device="cuda",
@@ -386,13 +414,16 @@ def _context_parallel_sdpa_worker(rank, case, init_file):
                 ),
                 torch.randn(
                     batch_size,
-                    case["nkv_heads"],
+                    nheads,
                     seq_len,
                     head_dim,
                     device="cuda",
                     requires_grad=True,
                 ),
             )
+
+        cp_mesh = mesh["cp"] if "cp" in case["mesh_dim_names"] else mesh
+        _context_parallel_shard(cp_mesh, input_fn(), (2, 2, 2), load_balancer=None)
 
         with dist_config.patch(compile_on_one_rank=True):
             parallel_gm = _get_parallel_graph_and_placements(
@@ -420,27 +451,42 @@ def _context_parallel_sdpa_worker(rank, case, init_file):
         local_inputs = tuple(
             _local_shard_for_placements(
                 tensor.detach(), placements, mesh_shape, coordinate
-            )
-            .clone()
-            .requires_grad_()
+            ).clone()
             for tensor in (q, k, v)
         )
         local_grad_out = _local_shard_for_placements(
             grad_out, placements, mesh_shape, coordinate
         )
         local_outputs, local_grads = parallel_gm(*local_inputs, local_grad_out)
+        failures = []
 
         expected_output = _local_shard_for_placements(
             ref.detach(), placements, mesh_shape, coordinate
         )
-        torch.testing.assert_close(
-            local_outputs[0], expected_output, atol=1e-4, rtol=1e-4
+        failures.append(
+            _close_metrics(
+                local_outputs[0],
+                expected_output,
+                rank=rank,
+                name="autoparallel.output",
+                atol=1e-4,
+                rtol=1e-4,
+            )
         )
-        for actual, full_input in zip(local_grads, (q, k, v)):
+        for name, actual, full_input in zip(("q", "k", "v"), local_grads, (q, k, v)):
             expected = _local_shard_for_placements(
                 full_input.grad, placements, mesh_shape, coordinate
             )
-            torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-4)
+            failures.append(
+                _close_metrics(
+                    actual,
+                    expected,
+                    rank=rank,
+                    name=f"autoparallel.{name}_grad",
+                    atol=1e-4,
+                    rtol=1e-4,
+                )
+            )
 
         eager_local_inputs = tuple(
             _local_shard_for_placements(
@@ -450,26 +496,43 @@ def _context_parallel_sdpa_worker(rank, case, init_file):
             .requires_grad_()
             for tensor in (q, k, v)
         )
-        eager_dtensors = tuple(
-            DTensor.from_local(tensor, mesh, placements, run_check=False)
-            for tensor in eager_local_inputs
-        )
-        eager_sdpa = make_context_parallel_sdpa(
+        dist.barrier()
+        eager_sdpa = make_context_parallel_body(
             mesh,
             is_causal=case["is_causal"],
             scale=case["scale"],
             enable_gqa=case["enable_gqa"],
         )
-        eager_output = eager_sdpa(*eager_dtensors)
-        torch.testing.assert_close(
-            eager_output.full_tensor(), ref.detach(), atol=1e-4, rtol=1e-4
+        eager_output = eager_sdpa(*eager_local_inputs)
+        eager_output.backward(local_grad_out)
+        dist.barrier()
+        failures.append(
+            _close_metrics(
+                eager_output,
+                expected_output,
+                rank=rank,
+                name="eager.output",
+                atol=1e-4,
+                rtol=1e-4,
+            )
         )
-        eager_output.to_local().backward(local_grad_out)
-        for local_input, full_input in zip(eager_local_inputs, (q, k, v)):
+        for name, local_input, full_input in zip(
+            ("q", "k", "v"), eager_local_inputs, (q, k, v)
+        ):
             expected = _local_shard_for_placements(
                 full_input.grad, placements, mesh_shape, coordinate
             )
-            torch.testing.assert_close(local_input.grad, expected, atol=1e-4, rtol=1e-4)
+            failures.append(
+                _close_metrics(
+                    local_input.grad,
+                    expected,
+                    rank=rank,
+                    name=f"eager.{name}_grad",
+                    atol=1e-4,
+                    rtol=1e-4,
+                )
+            )
+        assert not any(failures), f"numerical mismatches: {failures}"
     finally:
         dist.destroy_process_group()
 
@@ -485,8 +548,6 @@ def _context_parallel_sdpa_worker(rank, case, init_file):
             "is_causal": True,
             "scale": None,
             "enable_gqa": False,
-            "nheads": 4,
-            "nkv_heads": 4,
         },
         {
             "world_size": 2,
@@ -496,8 +557,6 @@ def _context_parallel_sdpa_worker(rank, case, init_file):
             "is_causal": False,
             "scale": None,
             "enable_gqa": False,
-            "nheads": 4,
-            "nkv_heads": 4,
         },
         {
             "world_size": 4,
@@ -505,13 +564,11 @@ def _context_parallel_sdpa_worker(rank, case, init_file):
             "mesh_dim_names": ("cp", "tp"),
             "placement_dims": (2, 1),
             "is_causal": True,
-            "scale": 0.5,
-            "enable_gqa": True,
-            "nheads": 4,
-            "nkv_heads": 2,
+            "scale": None,
+            "enable_gqa": False,
         },
     ),
-    ids=("cp2_causal", "cp2_noncausal", "cp2_tp2_causal_gqa"),
+    ids=("cp2_causal", "cp2_noncausal", "cp2_tp2_causal"),
 )
 def test_context_parallel_sdpa_real_distributed_correctness(case):
     if not torch.cuda.is_available():

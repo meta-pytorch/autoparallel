@@ -3,6 +3,7 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+import functools
 from typing import Any, Optional, Tuple
 
 import torch
@@ -11,6 +12,12 @@ from torch.distributed._tensor.experimental import local_map as _local_map
 from torch.distributed.device_mesh import DeviceMesh, _mesh_resources
 from torch.distributed.distributed_c10d import GroupName
 from torch.distributed.tensor.placement_types import Placement
+
+from ._local_map_regions import (
+    _DeferredLocalMapBody,
+    deferred_local_map_out_placements,
+    is_tracing_deferred_local_map_bodies,
+)
 
 
 def with_sharding_constraint(
@@ -56,12 +63,62 @@ def with_sharding_constraint(
     return identity(x)
 
 
-def local_map(*args, **kwargs):
+def local_map(
+    func=None,
+    out_placements=None,
+    in_placements=None,
+    in_grad_placements=None,
+    device_mesh=None,
+    *,
+    redistribute_inputs=False,
+):
     # TODO: upstream this fallback into PyTorch's local_map, matching
     # DTensor.from_local and distribute_tensor which already do this.
-    if kwargs.get("device_mesh", None) is None:
-        kwargs["device_mesh"] = _mesh_resources.get_current_mesh()
-    return _local_map(*args, **kwargs)
+    if device_mesh is None:
+        device_mesh = _mesh_resources.get_current_mesh()
+    if func is None:
+        return functools.partial(
+            local_map,
+            out_placements=out_placements,
+            in_placements=in_placements,
+            in_grad_placements=in_grad_placements,
+            device_mesh=device_mesh,
+            redistribute_inputs=redistribute_inputs,
+        )
+    if not isinstance(func, _DeferredLocalMapBody):
+        return _local_map(
+            func,
+            out_placements,
+            in_placements,
+            in_grad_placements,
+            device_mesh,
+            redistribute_inputs=redistribute_inputs,
+        )
+
+    trace_mapped = _local_map(
+        func.surrogate_fn,
+        deferred_local_map_out_placements(out_placements, func),
+        in_placements,
+        in_grad_placements,
+        device_mesh,
+        redistribute_inputs=redistribute_inputs,
+    )
+    runtime_mapped = _local_map(
+        func.runtime_fn,
+        out_placements,
+        in_placements,
+        in_grad_placements,
+        device_mesh,
+        redistribute_inputs=redistribute_inputs,
+    )
+
+    def mapped(*args, **kwargs):
+        target = (
+            trace_mapped if is_tracing_deferred_local_map_bodies() else runtime_mapped
+        )
+        return target(*args, **kwargs)
+
+    return mapped
 
 
 def get_mesh_from_global():

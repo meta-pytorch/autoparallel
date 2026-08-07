@@ -28,6 +28,11 @@ from torch.distributed.tensor import DeviceMesh
 from torch.export._trace import _restore_state_dict
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
+from ._local_map_regions import (
+    finalize_deferred_local_maps,
+    prepare_deferred_local_maps,
+    trace_deferred_local_map_bodies,
+)
 from .apply_sharding import apply_sharding_to_model
 from .cast_parametrization import apply_dtype_cast, canonicalize_mp, set_dtype_cast
 from .graph_passes.activation_checkpointing import mark_fsdp_all_gather_recomputation
@@ -186,6 +191,7 @@ def build_joint_graph(
     with (
         set_dtype_cast(True),
         enable_local_map_wrapping(),
+        trace_deferred_local_map_bodies(),
         torch._dynamo.utils._disable_saved_tensors_hooks_during_tracing(),
     ):
         torch_ir_with_fqn = _dynamo_graph_capture_for_export(model)(
@@ -193,6 +199,7 @@ def build_joint_graph(
         )
         _restore_state_dict(model, torch_ir_with_fqn)
         _add_unused_params_and_buffers(model, torch_ir_with_fqn)
+        prepare_deferred_local_maps(torch_ir_with_fqn)
         # TODO Can't use fake mode here because it clashes with the user level
         # fake mode. Ideally dynamo should reuse the user level fake mode.
         joint_with_descriptors = aot_export_joint_with_descriptors(
@@ -659,6 +666,7 @@ class AutoParallel:
     def _apply_placement_common(self, sharding_placement):
         t0 = time.perf_counter()
         self._assert_entered()
+        finalize_deferred_local_maps(self.gm, sharding_placement, self.mesh)
 
         # TODO: what kind of updates do we have to do?
         #  - graph obvs
