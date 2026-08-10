@@ -8,6 +8,7 @@ from typing import Dict, Tuple
 
 import torch
 from torch._subclasses.fake_tensor import unset_fake_temporarily
+from torch.fx.experimental.symbolic_shapes import free_unbacked_symbols
 from torch.utils._mode_utils import no_dispatch
 from torch.utils._pytree import tree_flatten, tree_map_only
 from torch.utils.flop_counter import FlopCounterMode, register_flop_formula
@@ -42,6 +43,12 @@ def einsum_flop(equation, tensors, out=None, **kwargs) -> int:
         return batch_size * n * k * 2
     else:
         raise NotImplementedError(f"Unsupported einsum shapes: {a_shape} {b_shape}")
+
+
+@register_flop_formula(torch.ops.aten._grouped_mm, get_raw=True)
+def grouped_mm_flop(mat1, mat2, offs=None, bias=None, out_dtype=None, **kwargs) -> int:
+    groups = offs.shape[0] if mat1.ndim == mat2.ndim == 2 else 1
+    return 2 * groups * mat1.numel() * mat2.shape[-1]
 
 
 @dataclass
@@ -331,11 +338,72 @@ def compute_memory_cost(op, args, outs):
     return read_bytes + write_bytes
 
 
-def _shard_args_for_node(node, strategy=None, rand_init=False):
-    args = tree_map_only(torch.fx.Node, lambda x: x.meta["val"], node.args)
-    kwargs = tree_map_only(torch.fx.Node, lambda x: x.meta["val"], node.kwargs)
+def _node_value(node):
+    for key in ("val", "example_value"):
+        if key in node.meta:
+            return node.meta[key]
+    raise RuntimeError(f"FX node {node.name} has no example value")
+
+
+def _concretize_unbacked_dim(value, balanced_tokens):
+    if not isinstance(value, torch.SymInt) or value.node.hint is not None:
+        return value
+    symbols = free_unbacked_symbols(value)
+    if not symbols:
+        return value
+    per_symbol = (balanced_tokens + len(symbols) - 1) // len(symbols)
+    return value.node.shape_env.optimization_hint(value.node.expr, fallback=per_symbol)
+
+
+def _concretize_unbacked_tensor(value, balanced_tokens):
+    if not any(
+        isinstance(dim, torch.SymInt) and free_unbacked_symbols(dim)
+        for dim in value.shape
+    ):
+        return value
+    shape = tuple(_concretize_unbacked_dim(dim, balanced_tokens) for dim in value.shape)
+    return torch.empty(
+        shape,
+        dtype=value.dtype,
+        device=value.device,
+        requires_grad=value.requires_grad,
+    )
+
+
+def _concretize_unbacked_numel(value, balanced_tokens):
+    shape = (_concretize_unbacked_dim(dim, balanced_tokens) for dim in value.shape)
+    result = 1
+    for dim in shape:
+        result *= dim
+    return int(result)
+
+
+def _shard_args_for_node(node, strategy=None, rand_init=False, balanced_tokens=None):
+    args = tree_map_only(torch.fx.Node, _node_value, node.args)
+    kwargs = tree_map_only(torch.fx.Node, _node_value, node.kwargs)
 
     if strategy is None:
+        if balanced_tokens is not None:
+            args = tree_map_only(
+                torch.SymInt,
+                lambda value: _concretize_unbacked_dim(value, balanced_tokens),
+                args,
+            )
+            kwargs = tree_map_only(
+                torch.SymInt,
+                lambda value: _concretize_unbacked_dim(value, balanced_tokens),
+                kwargs,
+            )
+            args = tree_map_only(
+                torch.Tensor,
+                lambda value: _concretize_unbacked_tensor(value, balanced_tokens),
+                args,
+            )
+            kwargs = tree_map_only(
+                torch.Tensor,
+                lambda value: _concretize_unbacked_tensor(value, balanced_tokens),
+                kwargs,
+            )
         return args, kwargs
 
     # TODO: handle kwargs as well, for now we assume all tensors are
@@ -365,7 +433,19 @@ def _shard_args_for_node(node, strategy=None, rand_init=False):
     return args, kwargs
 
 
+def _is_flex_local_map_hop(node):
+    local_map_kwargs = node.meta.get("local_map_kwargs", {})
+    return (
+        node.op == "call_function"
+        and isinstance(node.target, torch._ops.HigherOrderOperator)
+        and local_map_kwargs.get("alternatives") is not None
+    )
+
+
 def _has_zero_cost(node):
+    if _is_flex_local_map_hop(node):
+        return False
+
     if node.op != "call_function":
         return True
 
@@ -435,7 +515,7 @@ def _make_hashable(x):
     return x
 
 
-def estimate_strategy_runtime_cost(node, strategy):
+def estimate_strategy_runtime_cost(node, strategy, balanced_tokens=None):
     """
     This function estimates the runtime cost of a given strategy
     for a given node. It does this by computing the flop count
@@ -443,6 +523,11 @@ def estimate_strategy_runtime_cost(node, strategy):
     inputs according to the strategy. It then uses the device
     specifications to estimate the runtime cost of the node.
     """
+    if _is_flex_local_map_hop(node):
+        raise RuntimeError(
+            f"local_map node {node.name} requires optimizer-owned body cost"
+        )
+
     if _has_zero_cost(node):
         return 0
 
@@ -466,7 +551,7 @@ def estimate_strategy_runtime_cost(node, strategy):
             if cached is not None:
                 return cached
 
-    args, kwargs = _shard_args_for_node(node, strategy)
+    args, kwargs = _shard_args_for_node(node, strategy, balanced_tokens=balanced_tokens)
 
     flops, out = _compute_flops(node.target, *args, **kwargs)
 
@@ -493,6 +578,44 @@ def estimate_strategy_runtime_cost(node, strategy):
     return result
 
 
+def _local_map_body_balanced_tokens(body):
+    for node in body.graph.nodes:
+        if node.target != torch.ops._c10d_functional.all_to_all_single.default:
+            continue
+        output = _node_value(node)
+        if not any(
+            isinstance(dim, torch.SymInt) and free_unbacked_symbols(dim)
+            for dim in output.shape
+        ):
+            continue
+        tensor = _node_value(node.args[0])
+        if isinstance(tensor, torch.Tensor) and tensor.ndim:
+            return int(tensor.shape[0])
+    return None
+
+
+def estimate_local_map_body_runtime_cost(body, mesh, balanced_tokens=None):
+    from .collective_runtime_estimation import estimate_local_map_collective_cost
+
+    if balanced_tokens is None:
+        balanced_tokens = _local_map_body_balanced_tokens(body)
+
+    cost = 0.0
+    for node in body.graph.nodes:
+        if node.op in ("placeholder", "get_attr", "output"):
+            continue
+        collective_cost = estimate_local_map_collective_cost(
+            node, mesh, balanced_tokens=balanced_tokens
+        )
+        if collective_cost is not None:
+            cost += collective_cost
+            continue
+        cost += estimate_strategy_runtime_cost(
+            node, strategy=None, balanced_tokens=balanced_tokens
+        )
+    return cost
+
+
 def benchmark_strategy_runtime_cost(node, strategy):
     """
     This is the counterpart for estimate_strategy_runtime_cost
@@ -500,6 +623,9 @@ def benchmark_strategy_runtime_cost(node, strategy):
     cost. This is useful for debugging the cost model and for
     cases where estimate_strategy_runtime_cost is not accurate.
     """
+    if _is_flex_local_map_hop(node):
+        raise RuntimeError(f"Cannot benchmark local_map node {node.name} directly")
+
     if _has_zero_cost(node):
         return 0
 

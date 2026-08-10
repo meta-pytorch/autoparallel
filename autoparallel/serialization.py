@@ -329,6 +329,8 @@ def load_optimizer(cls, path):
         len(opt.decision_vars),
     )
 
+    opt.flex_local_map_costs = {}
+
     opt._root_to_linked = defaultdict(list)
     for linked_key, root_key in opt.cluster_links.items():
         opt._root_to_linked[root_key].append(linked_key)

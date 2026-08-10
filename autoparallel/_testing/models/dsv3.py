@@ -703,6 +703,41 @@ def local_mapped_region(
     return out, total_tokens_per_expert
 
 
+def _local_mapped_region_no_ep(
+    x: torch.Tensor,
+    selected_experts_indices: torch.Tensor,
+    top_scores: torch.Tensor,
+    experts_w1: torch.Tensor,
+    experts_w3: torch.Tensor,
+    experts_w2: torch.Tensor,
+    out: torch.Tensor,
+    top_k: int,
+    num_experts: int,
+    score_before_experts: bool,
+    axis_name: str,
+) -> torch.Tensor:
+    routed_output = torch.zeros_like(x)
+    for expert_index in range(num_experts):
+        score = torch.where(
+            selected_experts_indices == expert_index,
+            top_scores,
+            torch.zeros_like(top_scores),
+        ).sum(dim=-1, keepdim=True)
+        expert_input = x
+        if score_before_experts:
+            expert_input = (x.to(torch.float32) * score).to(x.dtype)
+        expert_output = functional_feed_forward(
+            experts_w1[expert_index],
+            experts_w2[expert_index],
+            experts_w3[expert_index],
+            expert_input,
+        )
+        if not score_before_experts:
+            expert_output = (expert_output.to(torch.float32) * score).to(x.dtype)
+        routed_output = routed_output + expert_output
+    return out + routed_output
+
+
 # @local_mapped_region.register_fake
 def _(
     routed_input: torch.Tensor,

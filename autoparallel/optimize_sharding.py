@@ -91,7 +91,7 @@ from torch.distributed.tensor._dtensor_spec import DTensorSpec
 from torch.distributed.tensor.placement_types import Placement, Replicate, Shard
 from torch.utils._pytree import tree_map_only
 
-from ._flex_local_map import flex_local_map_pairs
+from ._flex_local_map import estimate_flex_local_map_costs, flex_local_map_pairs
 from .collectives import get_flex_local_map_alternatives
 from .cost_models.collective_runtime_estimation import estimate_strategy_comms_cost
 from .cost_models.compute_estimation import (
@@ -150,15 +150,6 @@ def concretize_args(args):
     return tree_map_only((torch.SymInt, FakeTensor), concretize, args)
 
 
-def _get_flex_local_map_cost_hint(node, out_idx):
-    alternatives = get_flex_local_map_alternatives(
-        node.meta.get("local_map_kwargs", {})
-    )
-    if alternatives is None:
-        return 0.0
-    return float(alternatives[out_idx].get("cost_hint", 0.0))
-
-
 def _freeze_flex_local_map_contract(value):
     if isinstance(value, (tuple, list)):
         return tuple(_freeze_flex_local_map_contract(item) for item in value)
@@ -176,7 +167,11 @@ def _get_flex_local_map_contract(node):
                 alternative.get("name"),
                 _freeze_flex_local_map_contract(alternative["in_placements"]),
                 _freeze_flex_local_map_contract(alternative["out_placements"]),
-                float(alternative.get("cost_hint", 0.0)),
+                (
+                    float(alternative["cost_hint"])
+                    if "cost_hint" in alternative
+                    else None
+                ),
             )
             for alternative in alternatives
         ),
@@ -285,6 +280,9 @@ class ShardingOptimizer:
         self._name_counters: dict[str, int] = {}
         t0 = time.perf_counter()
         self.strats = self.build_sharding_metadata()
+        self.flex_local_map_costs = estimate_flex_local_map_costs(
+            self.gm, self.strats, self.mesh
+        )
         # nodes/node_map are derived from strats (not graph.nodes) so that
         # shape-computation nodes skipped by build_sharding_metadata don't
         # appear and indices stay consistent.
@@ -406,6 +404,23 @@ class ShardingOptimizer:
                             f"flex alternatives: {n0} has {contract0}, {ni} has "
                             f"{contracti}"
                         )
+                    if any(
+                        (n0, index) in self.flex_local_map_costs
+                        for index in range(len(self.strats[n0].strategies))
+                    ):
+                        costs0 = tuple(
+                            self.flex_local_map_costs[(n0, index)]
+                            for index in range(len(self.strats[n0].strategies))
+                        )
+                        costsi = tuple(
+                            self.flex_local_map_costs[(ni, index)]
+                            for index in range(len(self.strats[ni].strategies))
+                        )
+                        if costs0 != costsi:
+                            raise RuntimeError(
+                                "Repeated subgraph local_map nodes must have the same "
+                                f"estimated costs: {n0} has {costs0}, {ni} has {costsi}"
+                            )
                     idx0 = self.node_map[n0]
                     idx1 = self.node_map[ni]
                     options_n0 = list(self.walk_over_options(n0))
@@ -441,6 +456,20 @@ class ShardingOptimizer:
                     f"missing from strats"
                 )
         return result
+
+    def _get_strategy_compute_cost(self, node, out_idx, strategy):
+        cost = self.flex_local_map_costs.get((node, out_idx))
+        if cost is not None:
+            return cost
+        if (
+            get_flex_local_map_alternatives(node.meta.get("local_map_kwargs", {}))
+            is not None
+        ):
+            raise RuntimeError(
+                f"Missing cost for flex_local_map node {node.name} "
+                f"alternative {out_idx}"
+            )
+        return estimate_strategy_runtime_cost(node, strategy)
 
     def walk_over_options(self, node, constrain_arg=None):
         """Yield (argi, out_idx, inp_idx) for all valid strategy combinations."""
@@ -555,8 +584,9 @@ class ShardingOptimizer:
 
             for out_idx, output_strategy in enumerate(op_strategy.strategies):
                 tc0 = time.perf_counter()
-                compute_cost = estimate_strategy_runtime_cost(node, output_strategy)
-                compute_cost += _get_flex_local_map_cost_hint(node, out_idx)
+                compute_cost = self._get_strategy_compute_cost(
+                    node, out_idx, output_strategy
+                )
                 tc1 = time.perf_counter()
                 t_compute += tc1 - tc0
                 per_arg_compute = compute_cost / num_args
@@ -1353,7 +1383,9 @@ class ShardingOptimizer:
                 continue
 
             chosen_placement_str = _pretty_print_spec(chosen_spec)
-            chosen_compute = estimate_strategy_runtime_cost(node, chosen_strategy)
+            chosen_compute = self._get_strategy_compute_cost(
+                node, out_idx, chosen_strategy
+            )
 
             # Compute communication cost for the chosen strategy: sum
             # redistribute_cost across all args using predecessors' chosen
@@ -1374,7 +1406,9 @@ class ShardingOptimizer:
 
             if target_out_idx is not None:
                 target_strategy = op_strategy.strategies[target_out_idx]
-                target_compute = estimate_strategy_runtime_cost(node, target_strategy)
+                target_compute = self._get_strategy_compute_cost(
+                    node, target_out_idx, target_strategy
+                )
 
                 # Compute communication cost for the target strategy:
                 # assume each predecessor also uses target_placement. If a

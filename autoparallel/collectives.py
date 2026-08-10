@@ -15,27 +15,27 @@ from torch.distributed.device_mesh import DeviceMesh, _mesh_resources
 from torch.distributed.distributed_c10d import GroupName
 from torch.distributed.tensor.placement_types import Placement
 
-_FLEX_LOCAL_MAP_ALTERNATIVES_ATTR = "_autoparallel_flex_local_map_alternatives"
-
 
 # Dynamo's local_map HOP only preserves placement kwargs in FX metadata.
 # Carry flex metadata on out_placements so slicing in the HOP wrapper keeps it.
 class _FlexLocalMapOutPlacements(tuple):
+    alternatives: tuple[dict[str, Any], ...]
+
     def __new__(cls, values, alternatives):
         obj = super().__new__(cls, values)
-        setattr(obj, _FLEX_LOCAL_MAP_ALTERNATIVES_ATTR, alternatives)
+        obj.alternatives = alternatives
         return obj
 
     def __getnewargs__(self):
         # AutoParallel deep-copies the user model (api.py), which reconstructs
         # this tuple subclass via copyreg.__newobj__ -> __new__(cls, *args).
         # The two-arg __new__ requires we surface `alternatives` here too.
-        return (tuple(self), getattr(self, _FLEX_LOCAL_MAP_ALTERNATIVES_ATTR))
+        return (tuple(self), self.alternatives)
 
     def __getitem__(self, item):
         result = super().__getitem__(item)
         if isinstance(item, slice):
-            return type(self)(result, getattr(self, _FLEX_LOCAL_MAP_ALTERNATIVES_ATTR))
+            return type(self)(result, self.alternatives)
         return result
 
 
@@ -46,9 +46,8 @@ def get_flex_local_map_alternatives(local_map_kwargs):
 
     for key in ("out_placements", "in_placements"):
         placements = local_map_kwargs.get(key)
-        alternatives = getattr(placements, _FLEX_LOCAL_MAP_ALTERNATIVES_ATTR, None)
-        if alternatives is not None:
-            return alternatives
+        if isinstance(placements, _FlexLocalMapOutPlacements):
+            return placements.alternatives
 
     return None
 
@@ -56,6 +55,7 @@ def get_flex_local_map_alternatives(local_map_kwargs):
 def _normalize_flex_local_map_alternatives(
     default_fn: Callable,
     alternatives: Sequence[dict[str, Any]],
+    auto_cost: bool,
 ):
     if not alternatives:
         raise ValueError("flex_local_map requires at least one alternative")
@@ -78,25 +78,27 @@ def _normalize_flex_local_map_alternatives(
         fn = alternative.get("fn", default_fn)
         if not callable(fn):
             raise TypeError(f"flex_local_map alternative {idx} fn must be callable")
-        try:
-            cost_hint = float(alternative.get("cost_hint", 0.0))
-        except (TypeError, ValueError) as error:
-            raise TypeError(
-                f"flex_local_map alternative {idx} cost_hint must be a number"
-            ) from error
-        if not math.isfinite(cost_hint) or cost_hint < 0:
-            raise ValueError(
-                f"flex_local_map alternative {idx} cost_hint must be finite and "
-                "non-negative"
-            )
-        normalized.append(
-            {
-                **alternative,
-                "fn": fn,
-                "cost_hint": cost_hint,
-                "name": alternative.get("name", getattr(fn, "__name__", f"alt_{idx}")),
-            }
-        )
+        normalized_alternative = {
+            **alternative,
+            "fn": fn,
+            "name": alternative.get("name", getattr(fn, "__name__", f"alt_{idx}")),
+        }
+        if "cost_hint" in alternative:
+            try:
+                cost_hint = float(alternative["cost_hint"])
+            except (TypeError, ValueError) as error:
+                raise TypeError(
+                    f"flex_local_map alternative {idx} cost_hint must be a number"
+                ) from error
+            if not math.isfinite(cost_hint) or cost_hint < 0:
+                raise ValueError(
+                    f"flex_local_map alternative {idx} cost_hint must be finite and "
+                    "non-negative"
+                )
+            normalized_alternative["cost_hint"] = cost_hint
+        elif not auto_cost:
+            normalized_alternative["cost_hint"] = 0.0
+        normalized.append(normalized_alternative)
 
     input_arity = len(normalized[0]["in_placements"])
     output_arity = len(normalized[0]["out_placements"])
@@ -120,13 +122,15 @@ def flex_local_map(
     device_mesh: DeviceMesh,
     in_grad_placements=None,
     redistribute_inputs: bool = False,
+    auto_cost: bool = True,
 ):
     """Like ``local_map``, but declares several placement alternatives for one region so
     the AutoParallel solver can choose among them (e.g. MoE DP->EP vs DP+TP->EP+ETP).
 
     Each entry of ``alternatives`` is a dict with ``in_placements`` and ``out_placements``
     (required) and optional ``fn`` (defaults to ``func``), ``name``, and ``cost_hint`` (a
-    non-negative solver cost hint, default 0.0). ``device_mesh`` must be explicit.
+    non-negative solver cost overriding automatic estimation). ``device_mesh`` must be
+    explicit. ``auto_cost`` estimates alternatives without a ``cost_hint`` by default.
     ``in_grad_placements`` is reserved for parity with ``local_map`` but is not yet
     supported by AutoParallel.
 
@@ -137,6 +141,8 @@ def flex_local_map(
         raise NotImplementedError(
             "flex_local_map does not yet support in_grad_placements"
         )
+    if not isinstance(auto_cost, bool):
+        raise TypeError("flex_local_map auto_cost must be a bool")
 
     if func is None:
         return functools.partial(
@@ -145,9 +151,12 @@ def flex_local_map(
             device_mesh=device_mesh,
             in_grad_placements=in_grad_placements,
             redistribute_inputs=redistribute_inputs,
+            auto_cost=auto_cost,
         )
 
-    normalized_alternatives = _normalize_flex_local_map_alternatives(func, alternatives)
+    normalized_alternatives = _normalize_flex_local_map_alternatives(
+        func, alternatives, auto_cost
+    )
     default_alternative = normalized_alternatives[0]
     out_placements = _FlexLocalMapOutPlacements(
         tuple(default_alternative["out_placements"]),

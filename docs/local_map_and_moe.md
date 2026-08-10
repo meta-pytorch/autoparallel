@@ -393,8 +393,11 @@ self.moe = flex_local_map(
 
 Each alternative is a dict with required `in_placements` and `out_placements`.
 `fn` defaults to the first argument, while `name` and the non-negative `cost_hint`
-are optional. The hint is added to the solver cost; it is not a measured runtime.
-AutoParallel emits one solver strategy per alternative.
+are optional. By default, AutoParallel traces each alternative with its local tensor
+shapes and estimates its compute and collective latency with the existing cost models.
+An explicitly provided `cost_hint`, including `0.0`, overrides that estimate for the
+alternative. Set `auto_cost=False` on `flex_local_map` to retain zero cost for
+alternatives without a hint. AutoParallel emits one solver strategy per alternative.
 
 Usage constraint: apply `flex_local_map` **outside** `forward` and pass an explicit
 `device_mesh`, then call the stored callable inside `forward`. The alternatives are
@@ -408,8 +411,10 @@ backward nodes to the same index. This is the only ILP solve. It then captures t
 selected `fn` through the normal `local_map` Dynamo/AOT path and replaces that callsite's
 forward body, saved activations, and backward body in place. After finalization the node
 is an ordinary single-strategy `local_map` and follows the existing apply path. Only the
-selected function is captured. Alternative functions must preserve the same user-visible
-tensor contract and differentiable outputs; their internal saved activations may differ.
+selected function is installed in the final graph; alternatives without explicit hints
+are also captured with FakeTensors during cost estimation. Alternative functions must
+preserve the same user-visible tensor contract and differentiable outputs; their internal
+saved activations may differ.
 
 ## `with_sharding_constraint` for simpler cases
 

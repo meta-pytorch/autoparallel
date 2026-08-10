@@ -4,18 +4,30 @@
 # LICENSE file in the root directory of this source tree.
 
 import operator
+from contextlib import ExitStack
 
 import torch
 from torch._dynamo.functional_export import _dynamo_graph_capture_for_export
-from torch._subclasses.fake_tensor import FakeTensor, unset_fake_temporarily
+from torch._functorch.aot_autograd import aot_export_joint_with_descriptors
+from torch._subclasses.fake_tensor import (
+    FakeTensor,
+    FakeTensorMode,
+    unset_fake_temporarily,
+)
 from torch.distributed.tensor._dtensor_spec import DTensorSpec
 from torch.distributed.tensor._op_schema import OpSpec
 from torch.distributed.tensor.placement_types import Replicate
+from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
 from .cast_parametrization import set_dtype_cast
 from .collectives import get_flex_local_map_alternatives, local_map
+from .graph_passes.graph_utils import (
+    _add_alias,
+    _replace_view_mm_view_with_einsum,
+    cleanup_graph,
+)
 from .shardings.placement_options import _concretize_tensor_meta
-from .tracing import enable_local_map_wrapping
+from .tracing import _get_decomp_table, enable_local_map_wrapping
 
 _TRACE_INFO = "_autoparallel_flex_trace_info"
 
@@ -151,6 +163,20 @@ def _as_tuple(value):
     return tuple(value) if isinstance(value, (tuple, list)) else (value,)
 
 
+def _selected_kwargs(kwargs, alternative, mesh):
+    selected = {
+        key: value
+        for key, value in kwargs.items()
+        if key not in ("alternatives", _TRACE_INFO)
+    }
+    selected.update(
+        in_placements=alternative["in_placements"],
+        out_placements=alternative["out_placements"],
+        device_mesh=mesh,
+    )
+    return selected
+
+
 def _activation_spec(mesh, value):
     if not isinstance(value, torch.Tensor):
         return None
@@ -280,6 +306,108 @@ def _example_args(forward, trace_info):
     return tuple(args)
 
 
+def _trace_alternative_cost_graph(forward, alternative, mesh, stack):
+    trace_info = forward.meta["local_map_kwargs"][_TRACE_INFO]
+    example_args = _example_args(forward, trace_info)
+    fake_mode = FakeTensorMode(shape_env=ShapeEnv())
+    with unset_fake_temporarily(), fake_mode:
+        example_args = torch.utils._pytree.tree_map_only(
+            torch.Tensor,
+            lambda value: torch.empty_strided(
+                tuple(int(dim) for dim in value.shape),
+                tuple(int(stride) for stride in value.stride()),
+                dtype=value.dtype,
+                device=value.device,
+                requires_grad=value.requires_grad,
+            ),
+            example_args,
+        )
+    selected_kwargs = _selected_kwargs(
+        forward.meta["local_map_kwargs"], alternative, mesh
+    )
+    selected_body, selected_output = _trace_body(
+        alternative["fn"], selected_kwargs, example_args
+    )
+    if len(_as_tuple(selected_output)) != len(selected_kwargs["out_placements"]):
+        raise RuntimeError(
+            f"flex_local_map node {forward.name} alternative "
+            f"{alternative['name']!r} changed its output arity"
+        )
+    grad_indices = {
+        index
+        for index, output in enumerate(_as_tuple(selected_output))
+        if isinstance(output, torch.Tensor) and output.requires_grad
+    }
+    if grad_indices != set(trace_info["grad_output_indices"]):
+        raise RuntimeError(
+            f"flex_local_map node {forward.name} alternative "
+            f"{alternative['name']!r} changed its differentiable outputs"
+        )
+
+    local_args = tuple(
+        _value(node) for node in selected_body.graph.nodes if node.op == "placeholder"
+    )
+    fake_mode = next(
+        value.fake_mode for value in local_args if isinstance(value, FakeTensor)
+    )
+    with fake_mode:
+        joint = aot_export_joint_with_descriptors(
+            stack,
+            selected_body,
+            local_args,
+            decompositions=_get_decomp_table(),
+        ).graph_module
+    cleanup_graph(joint)
+    _replace_view_mm_view_with_einsum(joint)
+    _add_alias(joint, version="v2")
+    return joint
+
+
+def estimate_flex_local_map_costs(gm, strategies, mesh):
+    from .cost_models.compute_estimation import estimate_local_map_body_runtime_cost
+
+    costs = {}
+    with (
+        set_dtype_cast(True),
+        enable_local_map_wrapping(),
+        torch._dynamo.utils._disable_saved_tensors_hooks_during_tracing(),
+    ):
+        for forward, backward in flex_local_map_pairs(gm.graph.nodes):
+            kwargs = forward.meta["local_map_kwargs"]
+            alternatives = tuple(get_flex_local_map_alternatives(kwargs))
+            if len(strategies[forward].strategies) != len(alternatives):
+                raise RuntimeError(
+                    f"flex_local_map node {forward.name} has mismatched alternatives "
+                    "and strategies"
+                )
+            for index, alternative in enumerate(alternatives):
+                if "cost_hint" in alternative:
+                    cost = float(alternative["cost_hint"])
+                    costs[(forward, index)] = cost
+                    if backward is not None:
+                        costs[(backward, index)] = cost
+                    continue
+                try:
+                    with ExitStack() as stack:
+                        cost_graph = _trace_alternative_cost_graph(
+                            forward, alternative, mesh, stack
+                        )
+                        cost = estimate_local_map_body_runtime_cost(cost_graph, mesh)
+                    if backward is None:
+                        costs[(forward, index)] = cost
+                    else:
+                        pair_cost = cost / 2
+                        costs[(forward, index)] = pair_cost
+                        costs[(backward, index)] = pair_cost
+                except Exception as error:
+                    raise RuntimeError(
+                        f"Failed to estimate flex_local_map node {forward.name} "
+                        f"alternative {index} ({alternative['name']!r})"
+                    ) from error
+
+    return costs
+
+
 def finalize_flex_local_maps(gm, solution, mesh):
     from torch._higher_order_ops.local_map import create_hop_fw_bw
 
@@ -300,16 +428,7 @@ def finalize_flex_local_maps(gm, solution, mesh):
                     f"flex_local_map node {forward.name} has no selected alternative"
                 )
             alternative = alternatives[alternative_index]
-            selected_kwargs = {
-                key: value
-                for key, value in kwargs.items()
-                if key not in ("alternatives", _TRACE_INFO)
-            }
-            selected_kwargs.update(
-                in_placements=alternative["in_placements"],
-                out_placements=alternative["out_placements"],
-                device_mesh=mesh,
-            )
+            selected_kwargs = _selected_kwargs(kwargs, alternative, mesh)
 
             if alternative_index == 0:
                 forward.meta["local_map_kwargs"] = selected_kwargs

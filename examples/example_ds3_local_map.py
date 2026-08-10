@@ -18,6 +18,7 @@ from torch.testing._internal.distributed.fake_pg import FakeStore
 from autoparallel._testing.models.dsv3 import (
     DeepSeekV3Model,
     MoE,
+    _local_mapped_region_no_ep,
     _moe_local_map_kwargs,
     local_mapped_region,
     make_dsv3_config,
@@ -37,6 +38,7 @@ _LOCAL_MAP_CASES = (
     "plain-replicated-counts",
     "flex-default",
     "flex-replicated-counts",
+    "flex-auto",
 )
 
 
@@ -102,6 +104,43 @@ def _moe_implementation_2(
     )
 
 
+def _moe_implementation_no_ep(
+    x,
+    selected_experts_indices,
+    top_scores,
+    experts_w1,
+    experts_w3,
+    experts_w2,
+    out,
+    *,
+    top_k,
+    num_experts,
+    score_before_experts,
+    axis_name,
+):
+    return _local_mapped_region_no_ep(
+        x,
+        selected_experts_indices,
+        top_scores,
+        experts_w1,
+        experts_w3,
+        experts_w2,
+        out,
+        top_k,
+        num_experts,
+        score_before_experts,
+        axis_name,
+    )
+
+
+def _moe_implementation_ep_output(*args, **kwargs):
+    return (_moe_implementation_2(*args, **kwargs)[0],)
+
+
+def _moe_implementation_no_ep_output(*args, **kwargs):
+    return (_moe_implementation_no_ep(*args, **kwargs),)
+
+
 def _unused_default_moe_implementation(*args):
     raise AssertionError("flex_local_map alternatives must provide their own fn")
 
@@ -117,7 +156,30 @@ def _replicated_counts_moe_local_map_kwargs(mesh):
     }
 
 
-class _FlexMoELocalMap(torch.nn.Module):
+def _no_ep_moe_local_map_kwargs(mesh):
+    kwargs = _moe_local_map_kwargs(mesh)
+    token_placements = (Shard(0), Replicate())
+    weight_placements = (Replicate(), Replicate())
+    return {
+        **kwargs,
+        "in_placements": (
+            token_placements,
+            token_placements,
+            token_placements,
+            weight_placements,
+            weight_placements,
+            weight_placements,
+            token_placements,
+            *kwargs["in_placements"][7:],
+        ),
+        "out_placements": (
+            token_placements,
+            (Partial(reduce_op="sum"), Replicate()),
+        ),
+    }
+
+
+class _ForcedFlexMoELocalMap(torch.nn.Module):
     def __init__(self, moe, mesh, selected_index):
         super().__init__()
         sharded_kwargs = _moe_local_map_kwargs(mesh)
@@ -176,10 +238,81 @@ class _FlexMoELocalMap(torch.nn.Module):
         )
 
 
-def _enable_flex_local_map(model, mesh, selected_index):
+class _FlexMoELocalMap(torch.nn.Module):
+    def __init__(self, moe, mesh):
+        super().__init__()
+        no_ep_kwargs = _no_ep_moe_local_map_kwargs(mesh)
+        ep_kwargs = _moe_local_map_kwargs(mesh)
+        static_kwargs = {
+            "top_k": moe.router.top_k,
+            "num_experts": moe.router.num_experts,
+            "score_before_experts": moe.score_before_experts,
+            "axis_name": moe.axis_name,
+        }
+        self.mapped_region = flex_local_map(
+            _unused_default_moe_implementation,
+            alternatives=[
+                {
+                    "name": "ep",
+                    "fn": partial(_moe_implementation_ep_output, **static_kwargs),
+                    "in_placements": ep_kwargs["in_placements"][:7],
+                    "out_placements": (ep_kwargs["out_placements"][0],),
+                },
+                {
+                    "name": "no_ep",
+                    "fn": partial(_moe_implementation_no_ep_output, **static_kwargs),
+                    "in_placements": no_ep_kwargs["in_placements"][:7],
+                    "out_placements": (no_ep_kwargs["out_placements"][0],),
+                },
+            ],
+            device_mesh=mesh,
+            redistribute_inputs=ep_kwargs["redistribute_inputs"],
+        )
+
+    def forward(
+        self,
+        x,
+        selected_experts_indices,
+        top_scores,
+        experts_w1,
+        experts_w3,
+        experts_w2,
+        out,
+        top_k,
+        num_experts,
+        score_before_experts,
+        axis_name,
+    ):
+        mapped_output = self.mapped_region(
+            x,
+            selected_experts_indices,
+            top_scores,
+            experts_w1,
+            experts_w3,
+            experts_w2,
+            out,
+        )
+        tokens_per_expert = torch.histc(
+            selected_experts_indices.flatten(),
+            bins=num_experts,
+            min=0,
+            max=num_experts,
+        )
+        return mapped_output[0], tokens_per_expert
+
+
+def _enable_forced_flex_local_map(model, mesh, selected_index):
     for module in list(model.modules()):
         if isinstance(module, MoE):
-            module.local_mapped_region = _FlexMoELocalMap(module, mesh, selected_index)
+            module.local_mapped_region = _ForcedFlexMoELocalMap(
+                module, mesh, selected_index
+            )
+
+
+def _enable_flex_local_map(model, mesh):
+    for module in list(model.modules()):
+        if isinstance(module, MoE):
+            module.local_mapped_region = _FlexMoELocalMap(module, mesh)
 
 
 def _enable_replicated_counts_local_map(model, mesh):
@@ -268,9 +401,11 @@ def run_test(
     if local_map_case == "plain-replicated-counts":
         _enable_replicated_counts_local_map(model, mesh)
     elif local_map_case == "flex-default":
-        _enable_flex_local_map(model, mesh, selected_index=0)
+        _enable_forced_flex_local_map(model, mesh, selected_index=0)
     elif local_map_case == "flex-replicated-counts":
-        _enable_flex_local_map(model, mesh, selected_index=1)
+        _enable_forced_flex_local_map(model, mesh, selected_index=1)
+    elif local_map_case == "flex-auto":
+        _enable_flex_local_map(model, mesh)
 
     def input_fn():
         return torch.randint(
@@ -297,17 +432,21 @@ def run_test(
         autop.add_input_constraints([x_sharding])
         autop.add_output_constraints([x_sharding])
 
-        flex_nodes = [
-            node
-            for node in autop.gm.graph.nodes
-            if get_flex_local_map_alternatives(node.meta.get("local_map_kwargs", {}))
-            is not None
-        ]
         selected_index = {
             "flex-default": 0,
             "flex-replicated-counts": 1,
         }.get(local_map_case)
-        assert bool(flex_nodes) == (selected_index is not None)
+        flex_nodes = []
+        if selected_index is not None:
+            flex_nodes = [
+                node
+                for node in autop.gm.graph.nodes
+                if get_flex_local_map_alternatives(
+                    node.meta.get("local_map_kwargs", {})
+                )
+                is not None
+            ]
+            assert flex_nodes
         sharding_placement = autop.optimize_placement(verbose=False)
         if selected_index is not None:
             for node in flex_nodes:
@@ -462,7 +601,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--flex-local-map",
         action="store_true",
-        help="Compatibility alias for --local-map-case flex-replicated-counts.",
+        help="Compatibility alias for --local-map-case flex-auto.",
     )
     parser.add_argument(
         "--local-map-case",
@@ -478,9 +617,7 @@ if __name__ == "__main__":
     if args.flex_local_map and args.local_map_case is not None:
         parser.error("--flex-local-map and --local-map-case cannot be used together")
     local_map_case = (
-        "flex-replicated-counts"
-        if args.flex_local_map
-        else (args.local_map_case or "plain-sharded")
+        "flex-auto" if args.flex_local_map else (args.local_map_case or "plain-sharded")
     )
 
     run_test(

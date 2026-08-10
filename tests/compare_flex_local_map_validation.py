@@ -17,6 +17,7 @@ CASES = (
     "plain-replicated-counts",
     "flex-default",
     "flex-replicated-counts",
+    "flex-auto",
 )
 PYTEST_STAGES = (
     ("placement_options", "Public interface and placement"),
@@ -427,6 +428,20 @@ def main():
         _compare_pair(
             args.results_dir,
             "plain-replicated-counts",
+            "plain-sharded",
+            exact=False,
+            world_size=world_size,
+            component_names=(
+                "global_model_state",
+                "full_batch",
+                "outputs",
+                "global_gradients",
+                "global_final_buffers",
+            ),
+        ),
+        _compare_pair(
+            args.results_dir,
+            "flex-auto",
             "plain-sharded",
             exact=False,
             world_size=world_size,

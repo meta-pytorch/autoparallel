@@ -267,6 +267,20 @@ class TestFlexLocalMapPlacementOptions:
                 in_grad_placements=((Replicate(),),),
             )
 
+    def test_rejects_non_bool_auto_cost(self, device_mesh_1d):
+        with pytest.raises(TypeError, match="auto_cost must be a bool"):
+            flex_local_map(
+                call_local_map,
+                alternatives=[
+                    {
+                        "in_placements": ((Replicate(),),),
+                        "out_placements": ((Replicate(),),),
+                    }
+                ],
+                device_mesh=device_mesh_1d,
+                auto_cost="yes",
+            )
+
     def test_generates_one_strategy_per_alternative(self, device_mesh_1d):
         gm, local_map_node = _make_flex_local_map_graph(
             [

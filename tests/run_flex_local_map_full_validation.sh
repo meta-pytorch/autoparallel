@@ -176,6 +176,7 @@ config = {
         "plain-replicated-counts",
         "flex-default",
         "flex-replicated-counts",
+        "flex-auto",
     ],
 }
 with open(sys.argv[1], "w") as output:
@@ -212,7 +213,7 @@ run_stage serialization \
 run_stage pointwise_4gpu \
   "$PYTHON_BIN" -m pytest -q tests/test_flex_local_map_e2e.py -v
 
-for case in plain-sharded plain-replicated-counts flex-default flex-replicated-counts; do
+for case in plain-sharded plain-replicated-counts flex-default flex-replicated-counts flex-auto; do
   run_stage "moe_${case}" \
     "$TORCHRUN_BIN" --standalone --nproc-per-node 4 \
     examples/example_ds3_local_map.py \

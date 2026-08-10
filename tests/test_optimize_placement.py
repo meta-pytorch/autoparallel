@@ -13,6 +13,7 @@ from torch import nn
 from torch._functorch._aot_autograd.fx_utils import get_param_nodes
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
+from torch.distributed.tensor._collective_utils import MeshTopoInfo
 from torch.distributed.tensor.placement_types import (
     Partial,
     Placement,
@@ -21,12 +22,23 @@ from torch.distributed.tensor.placement_types import (
 )
 
 from autoparallel._flex_local_map import _body
+from autoparallel._testing.models.dsv3 import (
+    _run_experts_grouped_mm,
+    functional_feed_forward,
+)
 from autoparallel.api import AutoParallel, auto_parallel
 from autoparallel.collectives import (
+    all_gather,
+    all_reduce,
+    all_to_all,
+    axis_size,
     flex_local_map,
     get_flex_local_map_alternatives,
     local_map,
+    reduce_scatter,
 )
+from autoparallel.cost_models.collective_runtime_estimation import collective_comm_cost
+from autoparallel.cost_models.compute_estimation import estimate_strategy_runtime_cost
 
 
 class FFN(nn.Module):
@@ -519,32 +531,33 @@ def _make_flex_pointwise(
     *,
     names=("default", "alternative"),
     cost_hints=(100.0, 0.0),
+    auto_cost=True,
 ):
     in_placements = ((Replicate(),),)
+    default = {
+        "name": names[0],
+        "in_placements": in_placements,
+        "out_placements": out_placements,
+    }
+    alternative = {
+        "name": names[1],
+        "fn": alternative_fn,
+        "in_placements": in_placements,
+        "out_placements": out_placements,
+    }
+    if cost_hints is not None:
+        default["cost_hint"], alternative["cost_hint"] = cost_hints
     return flex_local_map(
         default_fn,
-        alternatives=[
-            {
-                "name": names[0],
-                "in_placements": in_placements,
-                "out_placements": out_placements,
-                "cost_hint": cost_hints[0],
-            },
-            {
-                "name": names[1],
-                "fn": alternative_fn,
-                "in_placements": in_placements,
-                "out_placements": out_placements,
-                "cost_hint": cost_hints[1],
-            },
-        ],
+        alternatives=[default, alternative],
         device_mesh=mesh,
         redistribute_inputs=True,
+        auto_cost=auto_cost,
     )
 
 
 class FlexLocalMapDifferentActivations(nn.Module):
-    def __init__(self, mesh, cost_hints=(100.0, 0.0)):
+    def __init__(self, mesh, cost_hints=(100.0, 0.0), auto_cost=True):
         super().__init__()
         self.scale = nn.Parameter(torch.empty(()))
         placements = ((Replicate(),),)
@@ -554,6 +567,7 @@ class FlexLocalMapDifferentActivations(nn.Module):
             _flex_where_identity_body,
             placements,
             cost_hints=cost_hints,
+            auto_cost=auto_cost,
         )
 
     def forward(self, x):
@@ -677,6 +691,211 @@ class FlexLocalMapDifferentPlacements(nn.Module):
 
     def forward(self, x):
         return self.pointwise(x)[0]
+
+
+def _flex_all_gather_body(x):
+    return (all_gather(x, 0, "dp"),)
+
+
+def _flex_reduce_scatter_body(x):
+    return (reduce_scatter(x, 0, "dp"),)
+
+
+def _flex_all_reduce_body(x):
+    return (all_reduce(x, "dp"),)
+
+
+def _flex_all_reduce_identity_body(x):
+    return (all_reduce(x, "dp") / axis_size("dp"),)
+
+
+def _flex_all_to_all_body(x):
+    return (all_to_all(x, None, None, "dp"),)
+
+
+class FlexLocalMapCollective(nn.Module):
+    def __init__(self, mesh, fn, in_placement, out_placement):
+        super().__init__()
+        self.mapped = flex_local_map(
+            fn,
+            alternatives=[
+                {
+                    "name": fn.__name__,
+                    "in_placements": (in_placement,),
+                    "out_placements": (out_placement,),
+                }
+            ],
+            device_mesh=mesh,
+        )
+
+    def forward(self, x):
+        return self.mapped(x)[0]
+
+
+class FlexLocalMapCollectiveChoice(nn.Module):
+    def __init__(self, mesh):
+        super().__init__()
+        placements = ((Replicate(),),)
+        self.mapped = flex_local_map(
+            _flex_clone_body,
+            alternatives=[
+                {
+                    "name": "clone",
+                    "in_placements": placements,
+                    "out_placements": placements,
+                },
+                {
+                    "name": "all_reduce",
+                    "fn": _flex_all_reduce_identity_body,
+                    "in_placements": placements,
+                    "out_placements": placements,
+                },
+            ],
+            device_mesh=mesh,
+        )
+
+    def forward(self, x):
+        return self.mapped(x)[0]
+
+
+def _flex_feed_forward_body(w1, w2, w3, x):
+    return (functional_feed_forward(w1, w2, w3, x),)
+
+
+class FlexLocalMapFeedForwardCostParity(nn.Module):
+    def __init__(self, mesh, data_placement):
+        super().__init__()
+        replicated = (Replicate(),)
+        self.mapped = flex_local_map(
+            _flex_feed_forward_body,
+            alternatives=[
+                {
+                    "name": "feed_forward",
+                    "in_placements": (
+                        replicated,
+                        replicated,
+                        replicated,
+                        data_placement,
+                    ),
+                    "out_placements": (data_placement,),
+                }
+            ],
+            device_mesh=mesh,
+        )
+
+    def forward(self, w1, w2, w3, x):
+        return self.mapped(w1, w2, w3, x)[0]
+
+
+class FeedForwardCostReference(nn.Module):
+    def forward(self, w1, w2, w3, x):
+        return functional_feed_forward(w1, w2, w3, x)
+
+
+class FlexLocalMapAttentionCostParity(nn.Module):
+    def __init__(self, mesh, in_placements, out_placement):
+        super().__init__()
+        self.mapped = flex_local_map(
+            _flex_attention_body,
+            alternatives=[
+                {
+                    "name": "attention",
+                    "in_placements": in_placements,
+                    "out_placements": (out_placement,),
+                }
+            ],
+            device_mesh=mesh,
+        )
+
+    def forward(self, query, key, value):
+        return self.mapped(query, key, value)[0]
+
+
+class AttentionCostReference(nn.Module):
+    def forward(self, query, key, value):
+        return F.scaled_dot_product_attention(
+            query=query, key=key, value=value, is_causal=False
+        )
+
+
+def _balanced_expert_ffn(x, w1, w3, w2):
+    num_tokens = x.shape[1]
+    tokens_per_expert = torch.full(
+        (x.shape[0],), num_tokens, dtype=torch.int32, device=x.device
+    )
+    return _run_experts_grouped_mm(
+        w1,
+        w2,
+        w3,
+        x.flatten(0, 1),
+        tokens_per_expert,
+    ).view_as(x)
+
+
+def _balanced_moe_no_ep_body(x, w1, w3, w2):
+    return (_balanced_expert_ffn(x, w1, w3, w2),)
+
+
+def _balanced_moe_ep_local(x, w1, w3, w2, ep_size):
+    local_experts = w1.shape[0]
+    x = x.view(ep_size, local_experts, -1, x.shape[-1])
+    x = x.permute(1, 0, 2, 3).flatten(1, 2)
+    x = _balanced_expert_ffn(x, w1, w3, w2)
+    return x.unflatten(1, (ep_size, -1)).permute(1, 0, 2, 3).flatten(0, 2)
+
+
+def _balanced_moe_ep_body(x, w1, w3, w2):
+    original_shape = x.shape
+    ep_size = axis_size("tp")
+    x = all_to_all(x.flatten(0, 1), None, None, "tp")
+    x = _balanced_moe_ep_local(x, w1, w3, w2, ep_size)
+    x = all_to_all(x, None, None, "tp")
+    return (x.view(original_shape),)
+
+
+class FlexLocalMapBalancedMoECostParity(nn.Module):
+    def __init__(self, mesh):
+        super().__init__()
+        replicated = (Replicate(), Replicate())
+        no_ep_data = (Shard(1), Replicate())
+        ep_data = (Shard(1), Shard(1))
+        ep_weights = (Replicate(), Shard(0))
+        self.mapped = flex_local_map(
+            _balanced_moe_no_ep_body,
+            alternatives=[
+                {
+                    "name": "no_ep",
+                    "in_placements": (no_ep_data, replicated, replicated, replicated),
+                    "out_placements": (no_ep_data,),
+                },
+                {
+                    "name": "ep",
+                    "fn": _balanced_moe_ep_body,
+                    "in_placements": (ep_data, ep_weights, ep_weights, ep_weights),
+                    "out_placements": (ep_data,),
+                },
+            ],
+            device_mesh=mesh,
+        )
+
+    def forward(self, x, w1, w3, w2):
+        return self.mapped(x, w1, w3, w2)[0]
+
+
+class BalancedExpertFFNCostReference(nn.Module):
+    def forward(self, x, w1, w3, w2):
+        return _balanced_expert_ffn(x, w1, w3, w2)
+
+
+class BalancedExpertFFNEPCostReference(nn.Module):
+    def __init__(self, ep_size):
+        super().__init__()
+        self.ep_size = ep_size
+
+    def forward(self, x, w1, w3, w2):
+        original_shape = x.shape
+        x = _balanced_moe_ep_local(x.flatten(0, 1), w1, w3, w2, self.ep_size)
+        return x.view(original_shape)
 
 
 class PlainLocalMapReference(nn.Module):
@@ -984,6 +1203,476 @@ def test_flex_local_map_selected_body_forward_backward(
     torch.testing.assert_close(
         parallel_model.scale.grad.to_local(), expected_scale.grad
     )
+
+
+def _flatten_specs(value):
+    if isinstance(value, (tuple, list)):
+        return [spec for item in value for spec in _flatten_specs(item)]
+    return [value]
+
+
+def _is_replicated_strategy(strategy):
+    specs = _flatten_specs(strategy.input_specs) + _flatten_specs(strategy.output_specs)
+    return all(
+        spec is None
+        or all(isinstance(placement, Replicate) for placement in spec.placements)
+        for spec in specs
+    )
+
+
+def _reference_graph_cost(opt):
+    cost = 0.0
+    breakdown = []
+    for node in opt.strats:
+        if node.op != "call_function":
+            continue
+        strategies = [
+            strategy
+            for strategy in opt.strats[node].strategies
+            if _is_replicated_strategy(strategy)
+        ]
+        assert (
+            len(strategies) == 1
+        ), f"reference node {node} has {len(strategies)} replicated strategies"
+        node_cost = estimate_strategy_runtime_cost(node, strategies[0])
+        cost += node_cost
+        breakdown.append(
+            (
+                node.name,
+                str(node.target),
+                node.meta.get("partitioner_tag"),
+                node_cost,
+            )
+        )
+    return cost, breakdown
+
+
+def _unsharded_graph_cost(model, input_fn, mesh):
+    autop = AutoParallel(model, input_fn, mesh)
+    try:
+        autop.build_model_graph()
+        cost = 0.0
+        breakdown = []
+        for node in autop.gm.graph.nodes:
+            if node.op != "call_function":
+                continue
+            node_cost = estimate_strategy_runtime_cost(node, strategy=None)
+            cost += node_cost
+            breakdown.append((node.name, str(node.target), node_cost))
+        return cost, breakdown
+    finally:
+        autop.stack.close()
+
+
+def _local_shape(shape, placements, mesh_shape):
+    shape = list(shape)
+    for mesh_size, placement in zip(mesh_shape, placements):
+        if placement.is_shard():
+            shape[placement.dim] = (shape[placement.dim] + mesh_size - 1) // mesh_size
+    return tuple(shape)
+
+
+def _single_flex_forward(opt):
+    nodes = [
+        node
+        for node in opt.strats
+        if get_flex_local_map_alternatives(node.meta.get("local_map_kwargs", {}))
+        is not None
+        and node.meta.get("partitioner_tag") != "is_backward"
+    ]
+    assert len(nodes) == 1
+    return nodes[0]
+
+
+@apply_cuda_patches
+@pytest.mark.parametrize("data_placement", ((Replicate(),), (Shard(0),)))
+def test_flex_local_map_feed_forward_cost_matches_plain_region(
+    device_mesh_1d, data_placement, device="cuda"
+):
+    dim = 6144
+    hidden_dim = dim * 4
+    batch = 8 * device_mesh_1d.size()
+    seq_len = 256
+
+    def flex_input_fn():
+        return (
+            torch.randn(hidden_dim, dim, device=device, requires_grad=True),
+            torch.randn(dim, hidden_dim, device=device, requires_grad=True),
+            torch.randn(hidden_dim, dim, device=device, requires_grad=True),
+            torch.randn(batch, seq_len, dim, device=device, requires_grad=True),
+        )
+
+    local_batch = _local_shape(
+        (batch, seq_len, dim), data_placement, device_mesh_1d.shape
+    )[0]
+
+    def reference_input_fn():
+        return (
+            torch.randn(hidden_dim, dim, device=device, requires_grad=True),
+            torch.randn(dim, hidden_dim, device=device, requires_grad=True),
+            torch.randn(hidden_dim, dim, device=device, requires_grad=True),
+            torch.randn(local_batch, seq_len, dim, device=device, requires_grad=True),
+        )
+
+    with torch.device("meta"):
+        reference_model = FeedForwardCostReference()
+        flex_model = FlexLocalMapFeedForwardCostParity(device_mesh_1d, data_placement)
+
+    with AutoParallel(
+        reference_model, reference_input_fn, device_mesh_1d
+    ) as reference_autop:
+        expected, plain_breakdown = _reference_graph_cost(
+            reference_autop.sharding_optimizer
+        )
+
+    with AutoParallel(flex_model, flex_input_fn, device_mesh_1d) as flex_autop:
+        opt = flex_autop.sharding_optimizer
+        _single_flex_forward(opt)
+        assert len(opt.flex_local_map_costs) == 2
+        flex_breakdown = tuple(
+            (node.name, node.meta.get("partitioner_tag"), cost)
+            for (node, _), cost in opt.flex_local_map_costs.items()
+        )
+        actual = sum(opt.flex_local_map_costs.values())
+
+    assert actual == pytest.approx(
+        expected, rel=1e-9, abs=1e-9
+    ), f"plain={plain_breakdown}, flex={flex_breakdown}"
+
+
+@apply_cuda_patches
+@pytest.mark.parametrize(
+    ("in_placements", "out_placement"),
+    (
+        (
+            (
+                (Shard(0), Shard(2)),
+                (Shard(0), Replicate()),
+                (Shard(0), Replicate()),
+            ),
+            (Shard(0), Shard(2)),
+        ),
+        (
+            (
+                (Shard(0), Replicate()),
+                (Shard(0), Replicate()),
+                (Shard(0), Replicate()),
+            ),
+            (Shard(0), Replicate()),
+        ),
+    ),
+)
+def test_flex_local_map_attention_cost_matches_plain_region(
+    device_mesh_2d, in_placements, out_placement, device="cuda"
+):
+    batch = 8 * device_mesh_2d.shape[0]
+    nheads = 48
+    seq_len = 256
+    head_dim = 128
+
+    def flex_input_fn():
+        shape = (batch, nheads, seq_len, head_dim)
+        return tuple(
+            torch.randn(*shape, device=device, requires_grad=True) for _ in range(3)
+        )
+
+    global_shape = (batch, nheads, seq_len, head_dim)
+
+    def reference_input_fn():
+        return tuple(
+            torch.randn(
+                *_local_shape(global_shape, placements, device_mesh_2d.shape),
+                device=device,
+                requires_grad=True,
+            )
+            for placements in in_placements
+        )
+
+    with torch.device("meta"):
+        reference_model = AttentionCostReference()
+        flex_model = FlexLocalMapAttentionCostParity(
+            device_mesh_2d, in_placements, out_placement
+        )
+
+    with AutoParallel(
+        reference_model, reference_input_fn, device_mesh_2d
+    ) as reference_autop:
+        expected, plain_breakdown = _reference_graph_cost(
+            reference_autop.sharding_optimizer
+        )
+
+    with AutoParallel(flex_model, flex_input_fn, device_mesh_2d) as flex_autop:
+        opt = flex_autop.sharding_optimizer
+        _single_flex_forward(opt)
+        assert len(opt.flex_local_map_costs) == 2
+        flex_breakdown = tuple(
+            (node.name, node.meta.get("partitioner_tag"), cost)
+            for (node, _), cost in opt.flex_local_map_costs.items()
+        )
+        actual = sum(opt.flex_local_map_costs.values())
+
+    assert actual == pytest.approx(
+        expected, rel=1e-9, abs=1e-9
+    ), f"plain={plain_breakdown}, flex={flex_breakdown}"
+
+
+@apply_cuda_patches
+def test_flex_local_map_balanced_moe_cost_matches_plain_regions(
+    device_mesh_2d, device="cuda"
+):
+    num_experts = 64
+    tokens_per_expert = 196608
+    dim = 256
+    hidden_dim = 256
+    dtype = torch.bfloat16
+    dp_size, ep_size = device_mesh_2d.shape
+
+    def input_tensors(data_experts, tokens, weight_experts=None):
+        if weight_experts is None:
+            weight_experts = data_experts
+        shapes = (
+            (data_experts, tokens, dim),
+            (weight_experts, hidden_dim, dim),
+            (weight_experts, hidden_dim, dim),
+            (weight_experts, dim, hidden_dim),
+        )
+        return tuple(
+            torch.randn(*shape, dtype=dtype, device=device, requires_grad=True)
+            for shape in shapes
+        )
+
+    def flex_input_fn():
+        return input_tensors(num_experts, tokens_per_expert)
+
+    reference_costs = {}
+    reference_breakdowns = {}
+    reference_cases = (
+        (
+            "no_ep",
+            BalancedExpertFFNCostReference(),
+            tokens_per_expert // dp_size,
+            num_experts,
+        ),
+        (
+            "ep",
+            BalancedExpertFFNEPCostReference(ep_size),
+            tokens_per_expert // (dp_size * ep_size),
+            num_experts // ep_size,
+        ),
+    )
+    for name, reference_model, local_tokens, local_experts in reference_cases:
+
+        def reference_input_fn(local_tokens=local_tokens, local_experts=local_experts):
+            return input_tensors(num_experts, local_tokens, local_experts)
+
+        reference_costs[name], reference_breakdowns[name] = _unsharded_graph_cost(
+            reference_model, reference_input_fn, device_mesh_2d
+        )
+
+    with torch.device("meta"):
+        flex_model = FlexLocalMapBalancedMoECostParity(device_mesh_2d)
+    with AutoParallel(flex_model, flex_input_fn, device_mesh_2d) as flex_autop:
+        opt = flex_autop.sharding_optimizer
+        forward, backward = _flex_fw_bw_nodes(list(opt.strats))
+        costs = opt.flex_local_map_costs
+        actual = {
+            name: costs[(forward, index)] + costs[(backward, index)]
+            for index, name in enumerate(("no_ep", "ep"))
+        }
+        comm_bytes = (
+            num_experts
+            * (tokens_per_expert // (dp_size * ep_size))
+            * dim
+            * dtype.itemsize
+        )
+        communication = 4 * collective_comm_cost(
+            "all_to_all",
+            comm_bytes,
+            tuple(device_mesh_2d.shape),
+            1,
+            MeshTopoInfo.build_from_mesh(device_mesh_2d),
+        )
+
+    expected = {
+        "no_ep": reference_costs["no_ep"],
+        "ep": reference_costs["ep"] + communication,
+    }
+    assert communication > 0
+    assert actual == pytest.approx(
+        expected, rel=1e-9, abs=1e-9
+    ), f"plain={reference_breakdowns}, communication={communication}, flex={costs}"
+
+
+@apply_cuda_patches
+def test_flex_local_map_estimates_alternative_body_costs(device_mesh_1d, device="cuda"):
+    shape = (512, 128)
+
+    def input_fn():
+        return torch.randn(*shape, device=device, requires_grad=True)
+
+    with torch.device("meta"):
+        model = FlexLocalMapDifferentActivations(device_mesh_1d, cost_hints=None)
+
+    with AutoParallel(model, input_fn, device_mesh_1d) as autop:
+        replicated = (Replicate(),)
+        autop.add_input_constraints([replicated])
+        autop.add_output_constraints([replicated])
+        solution = autop.optimize_placement()
+        selected = {
+            spec.flex_local_map_alternative_index
+            for node, spec in solution.items()
+            if get_flex_local_map_alternatives(node.meta.get("local_map_kwargs", {}))
+            is not None
+        }
+
+        assert selected == {0}
+        flex_costs = autop.sharding_optimizer.flex_local_map_costs
+        forward, backward = _flex_fw_bw_nodes(list(autop.sharding_optimizer.strats))
+        alternatives = get_flex_local_map_alternatives(forward.meta["local_map_kwargs"])
+        assert all("cost_hint" not in alternative for alternative in alternatives)
+        assert flex_costs[(forward, 0)] == flex_costs[(backward, 0)]
+        assert flex_costs[(forward, 0)] < flex_costs[(forward, 1)]
+
+
+@apply_cuda_patches
+def test_flex_local_map_can_disable_automatic_cost(device_mesh_1d, device="cuda"):
+    def input_fn():
+        return torch.randn(512, 128, device=device, requires_grad=True)
+
+    with torch.device("meta"):
+        model = FlexLocalMapDifferentActivations(
+            device_mesh_1d, cost_hints=None, auto_cost=False
+        )
+
+    with AutoParallel(model, input_fn, device_mesh_1d) as autop:
+        forward, _ = _flex_fw_bw_nodes(list(autop.sharding_optimizer.strats))
+        alternatives = get_flex_local_map_alternatives(forward.meta["local_map_kwargs"])
+        assert {alternative["cost_hint"] for alternative in alternatives} == {0.0}
+        assert set(autop.sharding_optimizer.flex_local_map_costs.values()) == {0.0}
+
+
+@apply_cuda_patches
+@pytest.mark.parametrize(
+    ("fn", "in_placement", "out_placement"),
+    (
+        (_flex_all_gather_body, (Shard(0),), (Replicate(),)),
+        (_flex_reduce_scatter_body, (Replicate(),), (Shard(0),)),
+        (_flex_all_reduce_body, (Replicate(),), (Replicate(),)),
+        (_flex_all_to_all_body, (Replicate(),), (Replicate(),)),
+    ),
+)
+def test_flex_local_map_estimates_collective_cost(
+    device_mesh_1d, fn, in_placement, out_placement, device="cuda"
+):
+    def input_fn():
+        return torch.randn(512, 128, device=device, requires_grad=True)
+
+    with torch.device("meta"):
+        model = FlexLocalMapCollective(device_mesh_1d, fn, in_placement, out_placement)
+
+    with AutoParallel(model, input_fn, device_mesh_1d) as autop:
+        costs = autop.sharding_optimizer.flex_local_map_costs
+        assert len(costs) == 2
+        assert len(set(costs.values())) == 1
+        assert next(iter(costs.values())) > 0
+
+
+@apply_cuda_patches
+@pytest.mark.parametrize(
+    (
+        "fn",
+        "in_placement",
+        "out_placement",
+        "forward_collective",
+        "backward_collective",
+    ),
+    (
+        (
+            _flex_all_gather_body,
+            (Shard(0),),
+            (Replicate(),),
+            "allgather",
+            "reduce_scatter",
+        ),
+        (
+            _flex_reduce_scatter_body,
+            (Replicate(),),
+            (Shard(0),),
+            "reduce_scatter",
+            "allgather",
+        ),
+        (
+            _flex_all_reduce_body,
+            (Replicate(),),
+            (Replicate(),),
+            "allreduce",
+            "allreduce",
+        ),
+        (
+            _flex_all_to_all_body,
+            (Replicate(),),
+            (Replicate(),),
+            "all_to_all",
+            "all_to_all",
+        ),
+    ),
+)
+def test_flex_local_map_collective_cost_matches_cost_model(
+    device_mesh_1d,
+    fn,
+    in_placement,
+    out_placement,
+    forward_collective,
+    backward_collective,
+    device="cuda",
+):
+    shape = (512, 128)
+
+    def input_fn():
+        return torch.randn(*shape, device=device, requires_grad=True)
+
+    with torch.device("meta"):
+        model = FlexLocalMapCollective(device_mesh_1d, fn, in_placement, out_placement)
+
+    with AutoParallel(model, input_fn, device_mesh_1d) as autop:
+        costs = autop.sharding_optimizer.flex_local_map_costs
+        assert len(costs) == 2
+        actual = sum(costs.values())
+        comm_bytes = torch.Size(shape).numel() * torch.float32.itemsize
+        expected = sum(
+            collective_comm_cost(
+                collective,
+                comm_bytes,
+                tuple(device_mesh_1d.shape),
+                0,
+                MeshTopoInfo.build_from_mesh(device_mesh_1d),
+            )
+            for collective in (forward_collective, backward_collective)
+        )
+
+    assert actual == pytest.approx(expected, rel=1e-9, abs=1e-9)
+
+
+@apply_cuda_patches
+def test_flex_local_map_collective_cost_drives_choice(device_mesh_1d, device="cuda"):
+    def input_fn():
+        return torch.randn(512, 128, device=device, requires_grad=True)
+
+    with torch.device("meta"):
+        model = FlexLocalMapCollectiveChoice(device_mesh_1d)
+
+    with AutoParallel(model, input_fn, device_mesh_1d) as autop:
+        replicated = (Replicate(),)
+        autop.add_input_constraints([replicated])
+        autop.add_output_constraints([replicated])
+        solution = autop.optimize_placement()
+        selected = {
+            spec.flex_local_map_alternative_index
+            for node, spec in solution.items()
+            if get_flex_local_map_alternatives(node.meta.get("local_map_kwargs", {}))
+            is not None
+        }
+        assert selected == {0}
 
 
 @apply_cuda_patches
