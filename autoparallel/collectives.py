@@ -3,6 +3,9 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+import functools
+import math
+from collections.abc import Callable, Sequence
 from typing import Any, Optional, Tuple
 
 import torch
@@ -11,6 +14,154 @@ from torch.distributed._tensor.experimental import local_map as _local_map
 from torch.distributed.device_mesh import DeviceMesh, _mesh_resources
 from torch.distributed.distributed_c10d import GroupName
 from torch.distributed.tensor.placement_types import Placement
+
+_FLEX_LOCAL_MAP_ALTERNATIVES_ATTR = "_autoparallel_flex_local_map_alternatives"
+
+
+# Dynamo's local_map HOP only preserves placement kwargs in FX metadata.
+# Carry flex metadata on out_placements so slicing in the HOP wrapper keeps it.
+class _FlexLocalMapOutPlacements(tuple):
+    def __new__(cls, values, alternatives):
+        obj = super().__new__(cls, values)
+        setattr(obj, _FLEX_LOCAL_MAP_ALTERNATIVES_ATTR, alternatives)
+        return obj
+
+    def __getnewargs__(self):
+        # AutoParallel deep-copies the user model (api.py), which reconstructs
+        # this tuple subclass via copyreg.__newobj__ -> __new__(cls, *args).
+        # The two-arg __new__ requires we surface `alternatives` here too.
+        return (tuple(self), getattr(self, _FLEX_LOCAL_MAP_ALTERNATIVES_ATTR))
+
+    def __getitem__(self, item):
+        result = super().__getitem__(item)
+        if isinstance(item, slice):
+            return type(self)(result, getattr(self, _FLEX_LOCAL_MAP_ALTERNATIVES_ATTR))
+        return result
+
+
+def get_flex_local_map_alternatives(local_map_kwargs):
+    alternatives = local_map_kwargs.get("alternatives")
+    if alternatives is not None:
+        return alternatives
+
+    for key in ("out_placements", "in_placements"):
+        placements = local_map_kwargs.get(key)
+        alternatives = getattr(placements, _FLEX_LOCAL_MAP_ALTERNATIVES_ATTR, None)
+        if alternatives is not None:
+            return alternatives
+
+    return None
+
+
+def _normalize_flex_local_map_alternatives(
+    default_fn: Callable,
+    alternatives: Sequence[dict[str, Any]],
+):
+    if not alternatives:
+        raise ValueError("flex_local_map requires at least one alternative")
+
+    normalized = []
+    for idx, alternative in enumerate(alternatives):
+        if not isinstance(alternative, dict):
+            raise TypeError(
+                f"flex_local_map alternative {idx} must be a dict, got "
+                f"{type(alternative).__name__}"
+            )
+        for key in ("in_placements", "out_placements"):
+            if key not in alternative:
+                raise ValueError(f"flex_local_map alternative {idx} requires {key}")
+            if alternative[key] is None:
+                raise ValueError(
+                    f"flex_local_map alternative {idx} {key} must not be None"
+                )
+
+        fn = alternative.get("fn", default_fn)
+        if not callable(fn):
+            raise TypeError(f"flex_local_map alternative {idx} fn must be callable")
+        try:
+            cost_hint = float(alternative.get("cost_hint", 0.0))
+        except (TypeError, ValueError) as error:
+            raise TypeError(
+                f"flex_local_map alternative {idx} cost_hint must be a number"
+            ) from error
+        if not math.isfinite(cost_hint) or cost_hint < 0:
+            raise ValueError(
+                f"flex_local_map alternative {idx} cost_hint must be finite and "
+                "non-negative"
+            )
+        normalized.append(
+            {
+                **alternative,
+                "fn": fn,
+                "cost_hint": cost_hint,
+                "name": alternative.get("name", getattr(fn, "__name__", f"alt_{idx}")),
+            }
+        )
+
+    input_arity = len(normalized[0]["in_placements"])
+    output_arity = len(normalized[0]["out_placements"])
+    for idx, alternative in enumerate(normalized[1:], start=1):
+        if len(alternative["in_placements"]) != input_arity:
+            raise ValueError(
+                f"flex_local_map alternative {idx} has a different input arity"
+            )
+        if len(alternative["out_placements"]) != output_arity:
+            raise ValueError(
+                f"flex_local_map alternative {idx} has a different output arity"
+            )
+
+    return tuple(normalized)
+
+
+def flex_local_map(
+    func: Callable | None = None,
+    *,
+    alternatives: Sequence[dict[str, Any]],
+    device_mesh: DeviceMesh,
+    in_grad_placements=None,
+    redistribute_inputs: bool = False,
+):
+    """Like ``local_map``, but declares several placement alternatives for one region so
+    the AutoParallel solver can choose among them (e.g. MoE DP->EP vs DP+TP->EP+ETP).
+
+    Each entry of ``alternatives`` is a dict with ``in_placements`` and ``out_placements``
+    (required) and optional ``fn`` (defaults to ``func``), ``name``, and ``cost_hint`` (a
+    non-negative solver cost hint, default 0.0). ``device_mesh`` must be explicit.
+    ``in_grad_placements`` is reserved for parity with ``local_map`` but is not yet
+    supported by AutoParallel.
+
+    Apply it outside ``forward`` (e.g. in ``__init__``) with an explicit ``device_mesh``,
+    and call the returned callable inside ``forward``.
+    """
+    if in_grad_placements is not None:
+        raise NotImplementedError(
+            "flex_local_map does not yet support in_grad_placements"
+        )
+
+    if func is None:
+        return functools.partial(
+            flex_local_map,
+            alternatives=alternatives,
+            device_mesh=device_mesh,
+            in_grad_placements=in_grad_placements,
+            redistribute_inputs=redistribute_inputs,
+        )
+
+    normalized_alternatives = _normalize_flex_local_map_alternatives(func, alternatives)
+    default_alternative = normalized_alternatives[0]
+    out_placements = _FlexLocalMapOutPlacements(
+        tuple(default_alternative["out_placements"]),
+        normalized_alternatives,
+    )
+
+    return local_map(
+        default_alternative["fn"],
+        out_placements=out_placements,
+        in_placements=default_alternative["in_placements"],
+        in_grad_placements=in_grad_placements,
+        device_mesh=device_mesh,
+        redistribute_inputs=redistribute_inputs,
+    )
 
 
 def with_sharding_constraint(

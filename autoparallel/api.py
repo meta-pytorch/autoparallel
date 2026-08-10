@@ -26,6 +26,11 @@ from torch.distributed.tensor import DeviceMesh
 from torch.export._trace import _restore_state_dict
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
+from ._flex_local_map import (
+    finalize_flex_local_maps,
+    normalize_flex_local_map_backward,
+    prepare_flex_local_maps,
+)
 from .apply_sharding import apply_sharding_to_model
 from .cast_parametrization import apply_dtype_cast, canonicalize_mp, set_dtype_cast
 from .graph_passes.activation_checkpointing import mark_fsdp_all_gather_recomputation
@@ -191,6 +196,7 @@ def build_joint_graph(
         )
         _restore_state_dict(model, torch_ir_with_fqn)
         _add_unused_params_and_buffers(model, torch_ir_with_fqn)
+        prepare_flex_local_maps(torch_ir_with_fqn)
         # TODO Can't use fake mode here because it clashes with the user level
         # fake mode. Ideally dynamo should reuse the user level fake mode.
         joint_with_descriptors = aot_export_joint_with_descriptors(
@@ -209,6 +215,9 @@ def build_joint_graph(
     # now add aliases nodes to the graph to
     # give more room for optimizations
     _add_alias(gm, version="v2")
+    # Make backward local_map nodes alternative-aware (flex_local_map only traces the
+    # default alternative, so torch's fw/bw split drops the alternatives from the bw node).
+    normalize_flex_local_map_backward(gm)
     trace_structured(
         "artifact",
         metadata_fn=lambda: {
@@ -441,6 +450,7 @@ class AutoParallel:
     def _apply_placement_common(self, sharding_placement):
         t0 = time.perf_counter()
         self._assert_entered()
+        finalize_flex_local_maps(self.gm, sharding_placement, self.mesh)
 
         # TODO: what kind of updates do we have to do?
         #  - graph obvs

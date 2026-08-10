@@ -91,6 +91,8 @@ from torch.distributed.tensor._dtensor_spec import DTensorSpec
 from torch.distributed.tensor.placement_types import Placement, Replicate, Shard
 from torch.utils._pytree import tree_map_only
 
+from ._flex_local_map import flex_local_map_pairs
+from .collectives import get_flex_local_map_alternatives
 from .cost_models.collective_runtime_estimation import estimate_strategy_comms_cost
 from .cost_models.compute_estimation import (
     _get_sharded_shape_stride,
@@ -146,6 +148,41 @@ def concretize_args(args):
         return x
 
     return tree_map_only((torch.SymInt, FakeTensor), concretize, args)
+
+
+def _get_flex_local_map_cost_hint(node, out_idx):
+    alternatives = get_flex_local_map_alternatives(
+        node.meta.get("local_map_kwargs", {})
+    )
+    if alternatives is None:
+        return 0.0
+    return float(alternatives[out_idx].get("cost_hint", 0.0))
+
+
+def _freeze_flex_local_map_contract(value):
+    if isinstance(value, (tuple, list)):
+        return tuple(_freeze_flex_local_map_contract(item) for item in value)
+    return value
+
+
+def _get_flex_local_map_contract(node):
+    kwargs = node.meta.get("local_map_kwargs", {})
+    alternatives = get_flex_local_map_alternatives(kwargs)
+    if alternatives is None:
+        return None
+    return (
+        tuple(
+            (
+                alternative.get("name"),
+                _freeze_flex_local_map_contract(alternative["in_placements"]),
+                _freeze_flex_local_map_contract(alternative["out_placements"]),
+                float(alternative.get("cost_hint", 0.0)),
+            )
+            for alternative in alternatives
+        ),
+        _freeze_flex_local_map_contract(kwargs.get("in_grad_placements")),
+        bool(kwargs.get("redistribute_inputs", False)),
+    )
 
 
 def _produces_tensor(val):
@@ -361,6 +398,14 @@ class ShardingOptimizer:
             cluster0 = cluster_group[0]
             for cluster_i in cluster_group[1:]:
                 for n0, ni in zip(cluster0, cluster_i):
+                    contract0 = _get_flex_local_map_contract(n0)
+                    contracti = _get_flex_local_map_contract(ni)
+                    if contract0 != contracti:
+                        raise RuntimeError(
+                            "Repeated subgraph local_map nodes must declare the same "
+                            f"flex alternatives: {n0} has {contract0}, {ni} has "
+                            f"{contracti}"
+                        )
                     idx0 = self.node_map[n0]
                     idx1 = self.node_map[ni]
                     options_n0 = list(self.walk_over_options(n0))
@@ -511,6 +556,7 @@ class ShardingOptimizer:
             for out_idx, output_strategy in enumerate(op_strategy.strategies):
                 tc0 = time.perf_counter()
                 compute_cost = estimate_strategy_runtime_cost(node, output_strategy)
+                compute_cost += _get_flex_local_map_cost_hint(node, out_idx)
                 tc1 = time.perf_counter()
                 t_compute += tc1 - tc0
                 per_arg_compute = compute_cost / num_args
@@ -816,6 +862,7 @@ class ShardingOptimizer:
         self.add_same_output_across_args_constraint()
         self.add_output_input_consistent_constraint()
         self.add_inf_cost_constraint()
+        self.add_flex_local_map_consistency_constraints()
         self.add_forward_backward_consistency_constraints()
         self.add_grad_reduce_dtype_constraints()
 
@@ -1456,6 +1503,44 @@ class ShardingOptimizer:
                 pulp.lpSum(v_b) == pulp.lpSum(v_a),
                 self._get_next_name(constraint_name),
             )
+
+    def add_flex_local_map_consistency_constraints(self):
+        """Force each flex callsite's forward and backward to use one alternative."""
+        for forward, backward in flex_local_map_pairs(self.strats):
+            if backward is None:
+                continue
+            forward_strategies = self.strats[forward].strategies
+            backward_strategies = self.strats[backward].strategies
+            forward_indices = [
+                getattr(strategy, "flex_local_map_alternative_index", None)
+                for strategy in forward_strategies
+            ]
+            backward_indices = [
+                getattr(strategy, "flex_local_map_alternative_index", None)
+                for strategy in backward_strategies
+            ]
+            if None in forward_indices or forward_indices != backward_indices:
+                raise RuntimeError(
+                    f"flex_local_map seq_nr={forward.meta.get('seq_nr')} has "
+                    "inconsistent forward and backward alternatives"
+                )
+
+            for alternative_index in forward_indices:
+                expressions = []
+                for node in (forward, backward):
+                    node_idx = self.node_map[node]
+                    variables = [
+                        self._get_pulp_variable((node_idx, argi, candidate, inp_idx))
+                        for argi, candidate, inp_idx in self.walk_over_options(
+                            node, constrain_arg=0
+                        )
+                        if candidate == alternative_index
+                    ]
+                    expressions.append(pulp.lpSum(variables))
+                self.prob += (
+                    expressions[0] == expressions[1],
+                    self._get_next_name("flex_local_map_fw_bw"),
+                )
 
     def add_forward_backward_consistency_constraints(self):
         """USER (Category 5c): Forward-backward consistency constraints.

@@ -394,13 +394,20 @@ def save_placements(opt, path):
     placements = {}
     solution = opt._extract_and_validate_solution()
     for node, strategy in solution.items():
-        placements[node.name] = {
+        entry = {
             "output": _pretty_print_spec(strategy.output_specs),
             "inputs": [_pretty_print_spec(s) for s in strategy.input_specs],
         }
+        alternative_index = getattr(strategy, "flex_local_map_alternative_index", None)
+        if alternative_index is not None:
+            entry["flex_local_map_alternative_index"] = alternative_index
+            entry["flex_local_map_alternative_name"] = getattr(
+                strategy, "flex_local_map_alternative_name", None
+            )
+        placements[node.name] = entry
 
     save_dict = {
-        "version": 1,
+        "version": 2,
         "mesh_shape": list(opt.mesh.shape),
         "mesh_dim_names": (
             list(opt.mesh.mesh_dim_names) if opt.mesh.mesh_dim_names else None
@@ -422,7 +429,7 @@ def load_placements(opt, path):
     with open(path) as f:
         save_dict = json.load(f)
 
-    if save_dict["version"] != 1:
+    if save_dict["version"] != 2:
         raise RuntimeError(
             f"Unsupported placements file version: {save_dict['version']}"
         )
@@ -457,14 +464,66 @@ def load_placements(opt, path):
 
         node = nodes_by_name[node_name]
         strat = opt.strats[node]
-        matched = None
-        for s in strat.strategies:
-            if _pretty_print_spec(s.output_specs) != output_str:
-                continue
-            if [_pretty_print_spec(sp) for sp in s.input_specs] != input_strs:
-                continue
-            matched = s
-            break
+        flex_strategies = [
+            s
+            for s in strat.strategies
+            if getattr(s, "flex_local_map_alternative_index", None) is not None
+        ]
+        if flex_strategies:
+            if "flex_local_map_alternative_index" not in entry:
+                raise RuntimeError(
+                    f"Flex local_map node '{node_name}' has no serialized "
+                    "alternative index"
+                )
+            alternative_index = entry["flex_local_map_alternative_index"]
+            if (
+                not isinstance(alternative_index, int)
+                or isinstance(alternative_index, bool)
+                or not (0 <= alternative_index < len(strat.strategies))
+            ):
+                raise RuntimeError(
+                    f"Invalid flex local_map alternative index {alternative_index!r} "
+                    f"for node '{node_name}'"
+                )
+            matched = strat.strategies[alternative_index]
+            if (
+                getattr(matched, "flex_local_map_alternative_index", None)
+                != alternative_index
+            ):
+                raise RuntimeError(
+                    f"Strategy {alternative_index} for flex local_map node "
+                    f"'{node_name}' has a mismatched alternative index"
+                )
+            saved_name = entry.get("flex_local_map_alternative_name")
+            current_name = getattr(matched, "flex_local_map_alternative_name", None)
+            if saved_name != current_name:
+                raise RuntimeError(
+                    f"Flex local_map alternative {alternative_index} for node "
+                    f"'{node_name}' changed name from {saved_name!r} to "
+                    f"{current_name!r}"
+                )
+        else:
+            if "flex_local_map_alternative_index" in entry:
+                raise RuntimeError(
+                    f"Non-flex node '{node_name}' has a serialized flex local_map "
+                    "alternative"
+                )
+            matched = None
+            for s in strat.strategies:
+                if _pretty_print_spec(s.output_specs) != output_str:
+                    continue
+                if [_pretty_print_spec(sp) for sp in s.input_specs] != input_strs:
+                    continue
+                matched = s
+                break
+        if matched is not None and (
+            _pretty_print_spec(matched.output_specs) != output_str
+            or [_pretty_print_spec(sp) for sp in matched.input_specs] != input_strs
+        ):
+            raise RuntimeError(
+                f"Placement for flex local_map alternative at node '{node_name}' "
+                "does not match the saved placement"
+            )
         if matched is None:
             raise RuntimeError(
                 f"Placement '{output_str}' for node '{node_name}' not found "

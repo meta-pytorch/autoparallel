@@ -285,6 +285,62 @@ The MoE dispatch is a fixed cost in the optimization: AutoParallel doesn't
 try to optimize the communication inside `local_map`, but it does account
 for the redistribution cost to get inputs into the required placements.
 
+## EP `local_map` design space
+
+The 2D `(dp, ep)` example above is the smallest useful EP `local_map`
+contract, not the only one. Higher-rank meshes do not imply a single
+placement policy per rank. A 3D, 4D, or 5D mesh can support multiple EP
+variants depending on which axes are used for token sharding, expert
+ownership, expert compute, and parameter storage.
+
+The EP `local_map` boundary should keep the same semantic shape across those
+variants:
+
+1. Inputs enter the region already redistributed to the declared dense and
+   routing placements.
+2. The local body reorders tokens, dispatches them across the EP axis, runs
+   local expert compute, combines outputs across the EP axis, and restores
+   the original token order.
+3. The output leaves the region with a static DTensor placement, often as a
+   `Partial` value that is reduced or redistributed at the MoE boundary.
+
+The axes in a larger mesh have distinct roles:
+
+| Axis | Role inside or around EP `local_map` |
+|---|---|
+| `dp` | Logical batch or token sharding axis. |
+| `dp_replicate` | Data-parallel replica axis; usually replicated at the local_map boundary. |
+| `dp_shard`, `fsdp`, `efsdp` | Parameter storage/FSDP axes; usually not the token-exchange axis. |
+| `cp` | Context or sequence sharding axis. |
+| `tp` | Dense tensor-parallel or sequence-parallel axis; can also be an expert-compute axis if the expert kernels support it. |
+| `ep` | Expert ownership and token all-to-all axis. |
+| `pp` | Pipeline axis; it should stay outside an intra-stage `local_map` boundary. |
+
+This gives several useful mesh-rank variants:
+
+| Mesh axes | Variant | Status |
+|---|---|---|
+| `(dp, tp, ep)` | Logical DP + TP/SP + EP. `dp` shards batch or tokens, `tp` shards sequence or hidden state, and `ep` owns experts. | Near-term design target. |
+| `(dp, cp, ep)` | DP + CP + EP without TP. `cp` shards sequence/context, and `ep` owns experts. | Near-term design target. |
+| `(dp_replicate, efsdp, ep)` | Sparse EP view. `dp_replicate` and `efsdp` are replica/storage axes, while `ep` shards the expert dimension. | Canonical sparse EP view. |
+| `(dp, cp, tp, ep)` | Full logical dense + EP view. `dp` shards batch, `cp` and `tp` can jointly shard sequence, and `ep` owns experts. | Best general reasoning model. |
+| `(dp_replicate, dp_shard, tp, ep)` | Explicit data replicate/shard split without CP. | Useful when storage axes must remain visible. |
+| `(dp_replicate, efsdp, tp, ep)` | Sparse EP plus visible expert-compute TP axis. | Future gated; requires an explicit expert-kernel layout. |
+| `(dp_replicate, dp_shard, cp, tp, ep)` | Complete logical dense/sparse view. Dense activations use the non-EP axes, while sparse experts are usually represented by folding into `efsdp`. | Future design target. |
+
+For structured activations shaped `(batch, seq, hidden)`, sequence sharding is
+usually expressed as `Shard(1)`. For flattened MoE dispatch inputs shaped
+`(tokens, hidden)`, batch and sequence sharding both appear as token-dimension
+`Shard(0)`. Keep this distinction explicit when translating a high-level
+parallel-dims design into concrete `in_placements` and `out_placements`.
+
+Expert tensor parallelism is a separate design axis from expert parallelism.
+EP decides which rank owns each expert and exchanges tokens with all-to-all.
+Expert tensor parallelism shards the expert MLP computation itself. Adding a
+separate `etp` axis, or treating `tp` as expert tensor parallel inside the EP
+region, requires a matching expert weight layout, grouped-GEMM contract, and
+combine rule. It should not be modeled as a placement-only change.
+
 ## Helpers in `autoparallel.collectives`
 
 AutoParallel provides collective wrappers that work inside `local_map`
@@ -302,6 +358,58 @@ These use `axis_name` (a mesh dimension name like `"ep"` or `"dp"`) to
 resolve the process group from the current mesh context. The
 `torch.autograd.Function` wrappers ensure gradients flow correctly through
 the collectives during backward.
+
+## `flex_local_map`: give the solver placement alternatives
+
+A plain `local_map` fixes one input/output placement contract, so the solver's
+only freedom is the redistribution cost to reach it. `flex_local_map` instead
+declares several *semantically equivalent* contracts for the same region (e.g.
+MoE `DP->EP` vs `DP+TP->EP+ETP`) and lets the solver choose:
+
+```python
+from autoparallel import flex_local_map
+
+# Built OUTSIDE forward (e.g. in __init__), with an explicit device_mesh.
+self.moe = flex_local_map(
+    moe_body,
+    alternatives=[
+        {
+            "name": "dp_ep",
+            "in_placements": ...,
+            "out_placements": ...,
+        },
+        {
+            "name": "dp_tp_ep_etp",
+            "fn": moe_body_with_tp,
+            "in_placements": ...,
+            "out_placements": ...,
+            "cost_hint": 1.0,
+        },
+    ],
+    device_mesh=mesh,
+    redistribute_inputs=True,
+)
+```
+
+Each alternative is a dict with required `in_placements` and `out_placements`.
+`fn` defaults to the first argument, while `name` and the non-negative `cost_hint`
+are optional. The hint is added to the solver cost; it is not a measured runtime.
+AutoParallel emits one solver strategy per alternative.
+
+Usage constraint: apply `flex_local_map` **outside** `forward` and pass an explicit
+`device_mesh`, then call the stored callable inside `forward`. The alternatives are
+carried on a tuple-subclass that Dynamo only preserves when it is a pre-existing
+(sourced) object; constructing the wrapper inside `forward` traces it as empty.
+`in_grad_placements` is reserved for parity with `local_map`; passing a non-`None`
+value currently raises `NotImplementedError`.
+
+`optimize_placement()` first selects an alternative while constraining the forward and
+backward nodes to the same index. This is the only ILP solve. It then captures the
+selected `fn` through the normal `local_map` Dynamo/AOT path and replaces that callsite's
+forward body, saved activations, and backward body in place. After finalization the node
+is an ordinary single-strategy `local_map` and follows the existing apply path. Only the
+selected function is captured. Alternative functions must preserve the same user-visible
+tensor contract and differentiable outputs; their internal saved activations may differ.
 
 ## `with_sharding_constraint` for simpler cases
 

@@ -795,6 +795,31 @@ def _(
 # )
 
 
+def _moe_local_map_kwargs(mesh):
+    return {
+        "out_placements": (
+            (Shard(0), Shard(0)),
+            (Partial(reduce_op="sum"), Partial(reduce_op="sum")),
+        ),
+        "in_placements": (
+            (Shard(0), Shard(0)),
+            (Shard(0), Shard(0)),
+            (Shard(0), Shard(0)),
+            (Replicate(), Shard(0)),
+            (Replicate(), Shard(0)),
+            (Replicate(), Shard(0)),
+            (Shard(0), Shard(0)),
+            None,
+            None,
+            None,
+            None,
+        ),
+        "redistribute_inputs": True,
+        "in_grad_placements": None,
+        "device_mesh": mesh,
+    }
+
+
 def _moe_forward(
     x: torch.Tensor,
     router_gate_weight: torch.Tensor,
@@ -807,9 +832,9 @@ def _moe_forward(
     shared_w2: torch.Tensor,
     router: TokenChoiceTopKRouter,
     reorderer: TokenReorderer,
-    mesh: Optional[DeviceMesh],
     axis_name: str,
     score_before_experts: bool,
+    mapped_region: Callable,
     compute_dtype: torch.dtype | None = None,
 ):
     # x: 64, 2048, 256
@@ -851,44 +876,7 @@ def _moe_forward(
 
     out = functional_feed_forward(shared_w1, shared_w2, shared_w3, x, compute_dtype)
 
-    ######################################################
-    # This is in the local_map region
-    ######################################################
-
-    # expert_placements = ((Replicate(), Shard(0)),) * 3
-    # in_placements = (
-    #     (Shard(0), Shard(0)),
-    #     (Shard(0), Shard(0)),
-    #     (Shard(0), Shard(0)),
-    #     (Shard(0), Shard(0)),
-    # )
-    # Dynamo reorders captured variables (lifted freevars) before explicit
-    # arguments, so x must come first in the input order and placements.
-    reordered_placements = (
-        (Shard(0), Shard(0)),
-        (Shard(0), Shard(0)),
-        (Shard(0), Shard(0)),
-        (Replicate(), Shard(0)),
-        (Replicate(), Shard(0)),
-        (Replicate(), Shard(0)),
-        (Shard(0), Shard(0)),
-        None,
-        None,
-        None,
-        None,
-    )
-
-    out, num_tokens_per_expert = local_map(
-        local_mapped_region,
-        out_placements=(
-            (Shard(0), Shard(0)),
-            (Partial(reduce_op="sum"), Partial(reduce_op="sum")),
-        ),
-        in_placements=reordered_placements,
-        redistribute_inputs=True,
-        in_grad_placements=None,
-        device_mesh=mesh,
-    )(
+    out, num_tokens_per_expert = mapped_region(
         x,
         selected_experts_indices,
         top_scores,
@@ -901,11 +889,6 @@ def _moe_forward(
         score_before_experts,
         axis_name,
     )
-    # assert False, f"there: {out.shape}, {num_tokens_per_expert.shape}"
-
-    ######################################################
-    # end of the local_map region
-    ######################################################
 
     # shared expert
     # if shared_experts is not None:
@@ -937,9 +920,11 @@ class MoE(nn.Module):
     ):
         super().__init__()
 
-        self.mesh = mesh
         self.axis_name = "ep"
         self.compute_dtype = compute_dtype
+        self.local_mapped_region = local_map(
+            local_mapped_region, **_moe_local_map_kwargs(mesh)
+        )
         self.experts = GroupedExperts(
             dim=dim,
             hidden_dim=hidden_dim,
@@ -997,9 +982,9 @@ class MoE(nn.Module):
             shared_w2,
             self.router,
             self.reorderer,
-            self.mesh,
             self.axis_name,
             self.score_before_experts,
+            self.local_mapped_region,
             self.compute_dtype,
         )
 

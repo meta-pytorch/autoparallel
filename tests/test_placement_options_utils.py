@@ -5,12 +5,16 @@
 
 import pytest
 import torch
+from torch._functorch._aot_autograd.descriptors import PlainAOTInput, PlainAOTOutput
 from torch.distributed._tensor.placement_types import DTensorSpec, TensorMeta
 from torch.distributed.tensor._op_schema import OpSpec, OpStrategy
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
+from autoparallel.collectives import flex_local_map
+from autoparallel.optimize_sharding import ShardingOptimizer
 from autoparallel.shardings.placement_options import (
     fill_missing_redistribute_cost,
+    get_placement_options_for_node,
     keep_unique_configs,
     propagate_tensor_meta,
 )
@@ -20,6 +24,29 @@ from autoparallel.shardings.propagation_rules import remove_invalid_configs
 def _make_tensor_meta(shape, dtype=torch.float32):
     t = torch.empty(shape, dtype=dtype, device="meta")
     return TensorMeta(t.shape, t.stride(), t.dtype)
+
+
+def call_local_map(x):
+    return x
+
+
+def _make_flex_local_map_graph(alternatives):
+    return _make_local_map_graph_with_kwargs({"alternatives": alternatives})
+
+
+def _make_local_map_graph_with_kwargs(local_map_kwargs):
+    graph = torch.fx.Graph()
+    x = graph.placeholder("x")
+    x.meta["val"] = torch.empty(512, 128, device="meta")
+    x.meta["desc"] = PlainAOTInput(0)
+
+    local_map_node = graph.call_function(call_local_map, (x,))
+    local_map_node.meta["val"] = torch.empty(512, 128, device="meta")
+    local_map_node.meta["local_map_kwargs"] = local_map_kwargs
+
+    output = graph.output((local_map_node,))
+    output.meta["desc"] = (PlainAOTOutput(0),)
+    return torch.fx.GraphModule(torch.nn.Module(), graph), local_map_node
 
 
 # ===== remove_invalid_configs =====
@@ -145,6 +172,235 @@ class TestKeepUniqueConfigs:
         )
         result = keep_unique_configs(strat)
         assert len(result.strategies) == 2
+
+
+# ===== flex local_map placement options =====
+
+
+class TestFlexLocalMapPlacementOptions:
+    """Component-level tests: these hand-build the fx graph / local_map_kwargs and do
+    NOT run Dynamo/AOTAutograd, so they do not prove the alternatives survive real
+    tracing. End-to-end trace coverage lives in
+    ``test_optimize_placement.py::test_flex_local_map_alternatives_visible_to_solver``.
+    """
+
+    @pytest.mark.parametrize(
+        ("alternatives", "exception", "error"),
+        (
+            ([], ValueError, "requires at least one alternative"),
+            ([None], TypeError, "must be a dict"),
+            (
+                [{"out_placements": ((Replicate(),),)}],
+                ValueError,
+                "requires in_placements",
+            ),
+            (
+                [{"in_placements": ((Replicate(),),)}],
+                ValueError,
+                "requires out_placements",
+            ),
+            (
+                [
+                    {
+                        "fn": None,
+                        "in_placements": ((Replicate(),),),
+                        "out_placements": ((Replicate(),),),
+                    }
+                ],
+                TypeError,
+                "fn must be callable",
+            ),
+            (
+                [
+                    {
+                        "in_placements": ((Replicate(),),),
+                        "out_placements": ((Replicate(),),),
+                        "cost_hint": float("inf"),
+                    }
+                ],
+                ValueError,
+                "cost_hint must be finite and non-negative",
+            ),
+        ),
+    )
+    def test_rejects_invalid_alternatives(
+        self, device_mesh_1d, alternatives, exception, error
+    ):
+        with pytest.raises(exception, match=error):
+            flex_local_map(
+                call_local_map,
+                alternatives=alternatives,
+                device_mesh=device_mesh_1d,
+            )
+
+    def test_rejects_mismatched_alternative_arity(self, device_mesh_1d):
+        with pytest.raises(ValueError, match="different input arity"):
+            flex_local_map(
+                call_local_map,
+                alternatives=[
+                    {
+                        "in_placements": ((Replicate(),),),
+                        "out_placements": ((Replicate(),),),
+                    },
+                    {
+                        "in_placements": (
+                            (Replicate(),),
+                            (Replicate(),),
+                        ),
+                        "out_placements": ((Replicate(),),),
+                    },
+                ],
+                device_mesh=device_mesh_1d,
+            )
+
+    def test_rejects_in_grad_placements(self, device_mesh_1d):
+        with pytest.raises(NotImplementedError, match="in_grad_placements"):
+            flex_local_map(
+                call_local_map,
+                alternatives=[
+                    {
+                        "in_placements": ((Replicate(),),),
+                        "out_placements": ((Replicate(),),),
+                    }
+                ],
+                device_mesh=device_mesh_1d,
+                in_grad_placements=((Replicate(),),),
+            )
+
+    def test_generates_one_strategy_per_alternative(self, device_mesh_1d):
+        gm, local_map_node = _make_flex_local_map_graph(
+            [
+                {
+                    "in_placements": ((Replicate(),),),
+                    "out_placements": ((Replicate(),),),
+                },
+                {
+                    "in_placements": ((Shard(0),),),
+                    "out_placements": ((Shard(0),),),
+                },
+            ]
+        )
+        input_value = gm.graph.find_nodes(op="placeholder")[0].meta["val"]
+        tensor_meta = _make_tensor_meta(input_value.shape)
+        replicate_spec = DTensorSpec(
+            device_mesh_1d, (Replicate(),), tensor_meta=tensor_meta
+        )
+        shard_spec = DTensorSpec(device_mesh_1d, (Shard(0),), tensor_meta=tensor_meta)
+        input_strategy = OpStrategy(
+            [
+                OpSpec(
+                    replicate_spec,
+                    input_specs=[replicate_spec],
+                    redistribute_cost=[[0.0]],
+                ),
+                OpSpec(shard_spec, input_specs=[shard_spec], redistribute_cost=[[0.0]]),
+            ]
+        )
+
+        result = get_placement_options_for_node(
+            device_mesh_1d, local_map_node, [input_strategy], [input_value], {}
+        )
+
+        assert len(result.strategies) == 2
+        assert result.strategies[0].input_specs[0].placements == (Replicate(),)
+        assert result.strategies[0].output_specs[0].placements == (Replicate(),)
+        assert result.strategies[1].input_specs[0].placements == (Shard(0),)
+        assert result.strategies[1].output_specs[0].placements == (Shard(0),)
+
+    def test_wrapper_metadata_generates_one_strategy_per_alternative(
+        self, device_mesh_1d
+    ):
+        # Checks only that flex_local_map's returned partial exposes recoverable
+        # alternatives metadata off wrapped.args; it injects that into a hand-built
+        # graph and does NOT trace, so it does not exercise the Dynamo path where the
+        # carrier must survive (covered by the e2e trace test noted in the class
+        # docstring).
+        wrapped = flex_local_map(
+            call_local_map,
+            alternatives=[
+                {
+                    "in_placements": ((Replicate(),),),
+                    "out_placements": ((Replicate(),),),
+                },
+                {
+                    "in_placements": ((Shard(0),),),
+                    "out_placements": ((Shard(0),),),
+                },
+            ],
+            device_mesh=device_mesh_1d,
+            redistribute_inputs=True,
+        )
+        local_map_kwargs = {
+            "out_placements": wrapped.args[1],
+            "in_placements": wrapped.args[2],
+            "in_grad_placements": wrapped.args[3],
+            "device_mesh": wrapped.args[4],
+        }
+        gm, local_map_node = _make_local_map_graph_with_kwargs(local_map_kwargs)
+        input_value = gm.graph.find_nodes(op="placeholder")[0].meta["val"]
+        tensor_meta = _make_tensor_meta(input_value.shape)
+        input_spec = DTensorSpec(
+            device_mesh_1d, (Replicate(),), tensor_meta=tensor_meta
+        )
+        input_strategy = OpStrategy(
+            [
+                OpSpec(
+                    input_spec,
+                    input_specs=[input_spec],
+                    redistribute_cost=[[0.0]],
+                )
+            ]
+        )
+
+        result = get_placement_options_for_node(
+            device_mesh_1d, local_map_node, [input_strategy], [input_value], {}
+        )
+
+        assert len(result.strategies) == 2
+        assert result.strategies[0].output_specs[0].placements == (Replicate(),)
+        assert result.strategies[1].output_specs[0].placements == (Shard(0),)
+
+    def test_cost_hint_drives_solver_choice(self, device_mesh_1d):
+        gm, local_map_node = _make_flex_local_map_graph(
+            [
+                {
+                    "in_placements": ((Replicate(),),),
+                    "out_placements": ((Shard(0),),),
+                    "cost_hint": 10.0,
+                },
+                {
+                    "in_placements": ((Replicate(),),),
+                    "out_placements": ((Replicate(),),),
+                    "cost_hint": 0.0,
+                },
+            ]
+        )
+
+        solution = ShardingOptimizer(gm, device_mesh_1d).get_solution()
+
+        assert solution[local_map_node].output_specs[0].placements == (Replicate(),)
+
+    def test_zero_cost_hints_leave_redistribution_to_drive_choice(self, device_mesh_1d):
+        gm, local_map_node = _make_flex_local_map_graph(
+            [
+                {
+                    "in_placements": ((Replicate(),),),
+                    "out_placements": ((Replicate(),),),
+                    "cost_hint": 0.0,
+                },
+                {
+                    "in_placements": ((Shard(0),),),
+                    "out_placements": ((Shard(0),),),
+                    "cost_hint": 0.0,
+                },
+            ]
+        )
+        optimizer = ShardingOptimizer(gm, device_mesh_1d)
+        optimizer.add_sharded_input_constraint([(Shard(0),)])
+
+        solution = optimizer.get_solution()
+
+        assert solution[local_map_node].output_specs[0].placements == (Shard(0),)
 
 
 # ===== fill_missing_redistribute_cost =====

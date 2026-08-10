@@ -27,6 +27,7 @@ from torch.distributed.tensor._ops.utils import generate_redistribute_costs
 from torch.distributed.tensor.placement_types import Replicate, Shard
 from torch.utils._pytree import tree_flatten, tree_map_only
 
+from autoparallel.collectives import get_flex_local_map_alternatives
 from autoparallel.shardings.propagation_rules import generate_dummy_redistribute_costs
 
 from .dtensor_sharding_helpers import get_op_strategy, with_implicit_strategies
@@ -379,27 +380,16 @@ def _concretize_tensor_meta(t: torch.Tensor) -> "TensorMeta | None":
     return TensorMeta(torch.Size(t.shape), tuple(t.stride()), t.dtype)
 
 
-def get_local_map_placement_option(
+def _build_local_map_op_spec(
     mesh,
     specs,
     user_args,
     node,
-    local_map_kwargs,
+    in_placements,
+    out_placements,
 ):
-    in_placements = local_map_kwargs["in_placements"]
-    out_placements = local_map_kwargs["out_placements"]
     assert in_placements is not None
     assert out_placements is not None
-    assert (
-        local_map_kwargs.get("in_grad_placements", None) is None
-    ), "Not yet implemented"
-    assert local_map_kwargs.get("device_mesh", None) in (
-        mesh,
-        None,
-    ), "Not yet implemented"
-    assert "call_local_map" in str(node.target) or "call_local_map_backward" in str(
-        node.target
-    )
     in_specs = []
     num_activation_inputs = len(user_args) - len(in_placements)
     # activations are always replicated
@@ -479,15 +469,78 @@ def get_local_map_placement_option(
         filtered_in_specs.append(input_spec)
         redistribute_costs.append(costs)
 
+    return OpSpec(
+        output_specs=tuple(out_specs),
+        input_specs=tuple(filtered_in_specs),
+        redistribute_cost=redistribute_costs,
+    )
+
+
+def _validate_local_map_kwargs(mesh, node, local_map_kwargs):
+    assert (
+        local_map_kwargs.get("in_grad_placements", None) is None
+    ), "Not yet implemented"
+    assert local_map_kwargs.get("device_mesh", None) in (
+        mesh,
+        None,
+    ), "Not yet implemented"
+    target = str(node.target)
+    assert (
+        "call_local_map" in target
+        or "call_local_map_backward" in target
+        or "local_map_hop" in target
+    )
+
+
+def get_local_map_placement_option(
+    mesh,
+    specs,
+    user_args,
+    node,
+    local_map_kwargs,
+):
+    _validate_local_map_kwargs(mesh, node, local_map_kwargs)
     return OpStrategy(
         [
-            OpSpec(
-                output_specs=tuple(out_specs),
-                input_specs=tuple(filtered_in_specs),
-                redistribute_cost=redistribute_costs,
+            _build_local_map_op_spec(
+                mesh,
+                specs,
+                user_args,
+                node,
+                local_map_kwargs["in_placements"],
+                local_map_kwargs["out_placements"],
             )
         ]
     )
+
+
+def get_flex_local_map_placement_option(
+    mesh,
+    specs,
+    user_args,
+    node,
+    local_map_kwargs,
+):
+    _validate_local_map_kwargs(mesh, node, local_map_kwargs)
+    alternatives = get_flex_local_map_alternatives(local_map_kwargs)
+    assert alternatives is not None
+    assert len(alternatives) > 0, "flex local_map requires at least one alternative"
+
+    strategies = []
+    for idx, alternative in enumerate(alternatives):
+        op_spec = _build_local_map_op_spec(
+            mesh,
+            specs,
+            user_args,
+            node,
+            alternative["in_placements"],
+            alternative["out_placements"],
+        )
+        op_spec.flex_local_map_alternative_index = idx
+        op_spec.flex_local_map_alternative_name = alternative.get("name")
+        strategies.append(op_spec)
+
+    return OpStrategy(strategies)
 
 
 def _is_flex_attention_hop(node):
@@ -652,6 +705,10 @@ def get_flex_attention_placement_option(mesh, specs, user_args, node):
 def get_placement_options_for_node(mesh, node, specs, user_args, user_kwargs):
     if local_map_kwargs := node.meta.get("local_map_kwargs", {}):
         assert not user_kwargs
+        if get_flex_local_map_alternatives(local_map_kwargs) is not None:
+            return get_flex_local_map_placement_option(
+                mesh, specs, user_args, node, local_map_kwargs
+            )
         return get_local_map_placement_option(
             mesh, specs, user_args, node, local_map_kwargs
         )

@@ -79,4 +79,6 @@ jobs:
         pip install --no-input --quiet --pre torch --index-url https://download.pytorch.org/whl/nightly/cu130
         pip install --quiet .
         python -m pytest tests/test_dcp_roundtrip.py -v
+        python -m pytest tests/test_flex_local_map_e2e.py -v
         torchrun --standalone --nproc-per-node 4 examples/example_ds3_local_map.py
+        torchrun --standalone --nproc-per-node 4 examples/example_ds3_local_map.py --flex-local-map
