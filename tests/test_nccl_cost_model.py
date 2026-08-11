@@ -1033,6 +1033,42 @@ class TestNVSwitchEmpiricalPath:
 
 
 class TestNICAggregation:
+    @pytest.mark.parametrize("algo", [NCCLAlgo.RING, NCCLAlgo.TREE])
+    def test_sparse_two_node_bw_is_inter_node_limited(self, algo):
+        config_50 = h100_topo_config(num_nodes=2, bw_inter=50.0)
+        config_25 = h100_topo_config(num_nodes=2, bw_inter=25.0)
+        topo_50 = derive_mesh_dim_topo(config_50, (2, 8), 0)
+        topo_25 = derive_mesh_dim_topo(config_25, (2, 8), 0)
+
+        bw_50 = _compute_algo_bw(
+            NCCLFunc.ALLREDUCE, algo, NCCLProto.SIMPLE, topo_50, config_50
+        )
+        bw_25 = _compute_algo_bw(
+            NCCLFunc.ALLREDUCE, algo, NCCLProto.SIMPLE, topo_25, config_25
+        )
+
+        assert topo_50.n_nodes == 2
+        assert topo_50.ppn == 1
+        assert bw_50 == pytest.approx(2 * bw_25)
+
+    @pytest.mark.parametrize("algo", [NCCLAlgo.RING, NCCLAlgo.TREE])
+    def test_dense_two_node_bw_saturates_at_intra_node_limit(self, algo):
+        config_50 = h100_topo_config(num_nodes=2, bw_inter=50.0)
+        config_80 = h100_topo_config(num_nodes=2, bw_inter=80.0)
+        topo_50 = derive_mesh_dim_topo(config_50, (16,), 0)
+        topo_80 = derive_mesh_dim_topo(config_80, (16,), 0)
+
+        bw_50 = _compute_algo_bw(
+            NCCLFunc.ALLREDUCE, algo, NCCLProto.SIMPLE, topo_50, config_50
+        )
+        bw_80 = _compute_algo_bw(
+            NCCLFunc.ALLREDUCE, algo, NCCLProto.SIMPLE, topo_80, config_80
+        )
+
+        assert topo_50.n_nodes == 2
+        assert topo_50.ppn == 8
+        assert bw_50 == pytest.approx(bw_80)
+
     def test_ring_bw_increases_with_nvswitch_multi_node(self):
         """Ring BW should increase when NVSwitch aggregates NICs at 4+ nodes."""
         config_nvs = h100_topo_config(num_nodes=4)
