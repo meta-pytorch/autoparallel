@@ -363,13 +363,13 @@ def _compute_algo_bw(
     # --- Phase 1: compute raw bus BW per algorithm ---
 
     if algo == NCCLAlgo.RING:
-        bw = bw_intra if n_nodes <= 2 else bw_inter_agg
+        bw = bw_intra if n_nodes == 1 else bw_inter_agg
         bus_bw = n_ch * bw
 
     elif algo == NCCLAlgo.TREE:
         if func != NCCLFunc.ALLREDUCE:
             return 0.0
-        bw = bw_intra if n_nodes <= 2 else bw_inter_agg
+        bw = bw_intra if n_nodes == 1 else bw_inter_agg
         bus_bw = n_ch * bw
 
     elif algo == NCCLAlgo.NVLS:
