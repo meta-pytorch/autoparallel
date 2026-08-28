@@ -3,13 +3,21 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+import json
+
 import torch
 from conftest import apply_cuda_patches
 from torch import nn
+from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.distributed.tensor.placement_types import Shard
+from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
 from autoparallel.api import AutoParallel
-from autoparallel.export_json import _get_layer_index, _normalize_cluster_layer
+from autoparallel.export_json import (
+    _extract_shape_dtype,
+    _get_layer_index,
+    _normalize_cluster_layer,
+)
 
 
 class _RepeatedLayerModel(nn.Module):
@@ -125,6 +133,23 @@ def test_normalize_cluster_layer_empty():
 
 
 # ---- export_sharding_json tests ----
+
+
+def test_extract_shape_dtype_is_json_serializable_with_symbolic_shape():
+    shape_env = ShapeEnv()
+    symbolic_dim = shape_env.create_unbacked_symint()
+    with FakeTensorMode(shape_env=shape_env):
+        value = torch.empty((symbolic_dim, 4))
+
+    graph = torch.fx.Graph()
+    node = graph.placeholder("x")
+    node.meta["val"] = value
+
+    shape, dtype = _extract_shape_dtype(node)
+
+    assert shape == [str(symbolic_dim), 4]
+    assert dtype == "float32"
+    assert json.loads(json.dumps({"shape": shape})) == {"shape": shape}
 
 
 @apply_cuda_patches

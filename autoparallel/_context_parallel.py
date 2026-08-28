@@ -4,7 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 
 from dataclasses import dataclass
-from typing import Callable, Literal
+from typing import Any, Callable, Literal
 
 import torch
 import torch.distributed as dist
@@ -13,9 +13,19 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, distribute_tensor
 from torch.distributed.tensor.placement_types import Placement, Replicate, Shard
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
+from torch.utils import _pytree
 
 from ._local_map_regions import _DeferredLocalMapBody
 from .collectives import local_map
+
+
+if BlockMask not in _pytree.SUPPORTED_NODES:
+    _pytree.register_pytree_node(
+        BlockMask,
+        BlockMask._flatten,
+        BlockMask._unflatten,
+        flatten_with_keys_fn=BlockMask._flatten_with_keys,
+    )
 
 
 @dataclass(frozen=True)
@@ -36,13 +46,13 @@ class ContextParallelPlacements:
 
 @dataclass(frozen=True)
 class _ContextParallelBlockMask:
-    kv_num_blocks: torch.Tensor
-    kv_indices: torch.Tensor
-    full_kv_num_blocks: torch.Tensor | None
-    full_kv_indices: torch.Tensor | None
+    leaves: tuple[torch.Tensor, ...]
+    tree_spec: Any
+    leaf_placements: tuple[tuple[Placement, ...], ...]
+    tensor_attrs: tuple[str, ...]
+    num_regular_leaves: int
     q_offsets: torch.Tensor
     block_size: int | tuple[int, int]
-    mask_mod: Callable | None
     local_seq_len: int
     kv_seq_len: int
 
@@ -51,6 +61,7 @@ class _ContextParallelBlockMask:
         cls,
         block_mask: BlockMask,
         *,
+        mesh: DeviceMesh,
         cp_size: int,
         device: torch.device,
     ) -> "_ContextParallelBlockMask":
@@ -71,29 +82,51 @@ class _ContextParallelBlockMask:
 
         q_offsets = torch.arange(cp_size, device=device, dtype=torch.int64)
         q_offsets = q_offsets * local_seq_len
+        leaves, tree_spec = _pytree.tree_flatten(block_mask)
+        if not all(isinstance(leaf, torch.Tensor) for leaf in leaves):
+            raise TypeError(
+                "Context-parallel FlexAttention requires BlockMask pytree leaves "
+                "to be tensors."
+            )
+
+        optional_attrs = {
+            attr
+            for attr in BlockMask._TENSOR_ATTRS
+            if getattr(block_mask, attr) is None
+        }
+        tensor_attrs = [
+            attr for attr in BlockMask._TENSOR_ATTRS if attr not in optional_attrs
+        ]
+        replicated = tuple(Replicate() for _ in range(mesh.ndim))
+        leaf_placements = []
+        for index, leaf in enumerate(leaves):
+            if index < len(tensor_attrs) and tensor_attrs[index] in {
+                "kv_num_blocks",
+                "kv_indices",
+                "full_kv_num_blocks",
+                "full_kv_indices",
+            }:
+                leaf_placements.append(cls._placements_for_tensor(leaf, mesh))
+            else:
+                leaf_placements.append(replicated)
         return cls(
-            kv_num_blocks=block_mask.kv_num_blocks,
-            kv_indices=block_mask.kv_indices,
-            full_kv_num_blocks=block_mask.full_kv_num_blocks,
-            full_kv_indices=block_mask.full_kv_indices,
+            leaves=tuple(leaves),
+            tree_spec=tree_spec,
+            leaf_placements=tuple(leaf_placements),
+            tensor_attrs=tuple(tensor_attrs),
+            num_regular_leaves=len(tensor_attrs),
             q_offsets=q_offsets,
             block_size=block_mask.BLOCK_SIZE,
-            mask_mod=block_mask.mask_mod,
             local_seq_len=local_seq_len,
             kv_seq_len=kv_seq_len,
         )
 
     def args(self) -> tuple[object, ...]:
-        return (
-            self.kv_num_blocks,
-            self.kv_indices,
-            self.full_kv_num_blocks,
-            self.full_kv_indices,
-            self.q_offsets,
-        )
+        return (*self.leaves, self.q_offsets)
 
-    def _tensor_placements(
-        self, tensor: torch.Tensor, mesh: DeviceMesh
+    @staticmethod
+    def _placements_for_tensor(
+        tensor: torch.Tensor, mesh: DeviceMesh
     ) -> tuple[Placement, ...]:
         base_placements = context_parallel_attention_placements(
             mesh, batch_dim=0, seq_dim=2, head_dim=1
@@ -120,50 +153,47 @@ class _ContextParallelBlockMask:
         if cp_axis is not None:
             cp_dim = _mesh_dim_names(mesh).index(cp_axis)
             offset_placements[cp_dim] = Shard(0)
-        return (
-            self._tensor_placements(self.kv_num_blocks, mesh),
-            self._tensor_placements(self.kv_indices, mesh),
-            (
-                self._tensor_placements(self.full_kv_num_blocks, mesh)
-                if self.full_kv_num_blocks is not None
-                else None
-            ),
-            (
-                self._tensor_placements(self.full_kv_indices, mesh)
-                if self.full_kv_indices is not None
-                else None
-            ),
-            tuple(offset_placements),
-        )
+        return (*self.leaf_placements, tuple(offset_placements))
 
-    def rebuild(
-        self,
-        kv_num_blocks: torch.Tensor,
-        kv_indices: torch.Tensor,
-        full_kv_num_blocks: torch.Tensor | None,
-        full_kv_indices: torch.Tensor | None,
-        q_offsets: torch.Tensor,
-    ) -> BlockMask:
-        q_offset = q_offsets.reshape(())
-        mask_mod = self.mask_mod
-        shifted_mask_mod: Callable | None
-        if mask_mod is not None:
 
-            def shifted_mask_mod(b, h, q_idx, kv_idx):
-                return mask_mod(b, h, q_idx + q_offset, kv_idx)
+def _rebuild_context_parallel_block_mask(
+    args: tuple[object, ...],
+    *,
+    tree_spec: Any,
+    num_regular_leaves: int,
+    block_size: int | tuple[int, int],
+    local_seq_len: int,
+    kv_seq_len: int,
+) -> BlockMask:
+    *leaves, q_offsets = args
+    leaves = [
+        leaf if index < num_regular_leaves else leaf.clone()
+        for index, leaf in enumerate(leaves)
+    ]
+    block_mask = _pytree.tree_unflatten(list(leaves), tree_spec)
+    if not isinstance(block_mask, BlockMask):
+        raise TypeError("Expected the BlockMask pytree to rebuild a BlockMask.")
+    assert isinstance(q_offsets, torch.Tensor)
+    q_offset = q_offsets.reshape(())
+    mask_mod = block_mask.mask_mod
+    shifted_mask_mod: Callable | None
+    if mask_mod is not None:
 
-        else:
-            shifted_mask_mod = None
+        def shifted_mask_mod(b, h, q_idx, kv_idx):
+            return mask_mod(b, h, q_idx + q_offset, kv_idx)
 
-        return BlockMask.from_kv_blocks(
-            kv_num_blocks,
-            kv_indices,
-            full_kv_num_blocks,
-            full_kv_indices,
-            BLOCK_SIZE=self.block_size,
-            mask_mod=shifted_mask_mod,
-            seq_lengths=(self.local_seq_len, self.kv_seq_len),
-        )
+    else:
+        shifted_mask_mod = None
+
+    return BlockMask.from_kv_blocks(
+        block_mask.kv_num_blocks,
+        block_mask.kv_indices,
+        block_mask.full_kv_num_blocks,
+        block_mask.full_kv_indices,
+        BLOCK_SIZE=block_size,
+        mask_mod=shifted_mask_mod,
+        seq_lengths=(local_seq_len, kv_seq_len),
+    )
 
 
 def _mesh_dim_names(mesh: DeviceMesh) -> tuple[str, ...]:
@@ -404,58 +434,107 @@ def _make_context_parallel_flex_attention(
         cp_allgather = flex_cp_allgather
         cp_group_name = dist._get_process_group_name(cp_mesh.get_group())
 
-    block_mask_args: tuple[object, ...] = ()
-    block_mask_placements: tuple[object, ...] = ()
-    cp_block_mask: _ContextParallelBlockMask | None = None
-    if block_mask is not None:
-        cp_size = mesh.size(_mesh_dim_names(mesh).index(cp_axis)) if cp_axis else 1
-        cp_block_mask = _ContextParallelBlockMask.from_block_mask(
-            block_mask,
-            cp_size=cp_size,
-            device=block_mask.kv_indices.device,
-        )
-        block_mask_args = cp_block_mask.args()
-        block_mask_placements = cp_block_mask.placements(mesh, cp_axis)
+    def build_mapped(
+        active_block_mask: BlockMask | None,
+    ) -> tuple[
+        Callable,
+        tuple[object, ...],
+        tuple[object, ...],
+        _ContextParallelBlockMask | None,
+    ]:
+        block_mask_args: tuple[object, ...] = ()
+        block_mask_placements: tuple[object, ...] = ()
+        cp_block_mask: _ContextParallelBlockMask | None = None
+        if active_block_mask is not None:
+            cp_size = mesh.size(_mesh_dim_names(mesh).index(cp_axis)) if cp_axis else 1
+            cp_block_mask = _ContextParallelBlockMask.from_block_mask(
+                active_block_mask,
+                mesh=mesh,
+                cp_size=cp_size,
+                device=active_block_mask.kv_indices.device,
+            )
+            block_mask_args = cp_block_mask.args()
+            block_mask_placements = cp_block_mask.placements(mesh, cp_axis)
+            tree_spec = cp_block_mask.tree_spec
+            num_regular_leaves = cp_block_mask.num_regular_leaves
+            block_size = cp_block_mask.block_size
+            local_seq_len = cp_block_mask.local_seq_len
+            kv_seq_len = cp_block_mask.kv_seq_len
+        else:
+            tree_spec = None
+            num_regular_leaves = 0
+            block_size = 0
+            local_seq_len = 0
+            kv_seq_len = 0
 
-    def cp_flex(
+        def run_flex(
+            q: torch.Tensor,
+            k: torch.Tensor,
+            v: torch.Tensor,
+            mask_args: tuple[object, ...],
+        ):
+            if cp_allgather is not None:
+                k, v = cp_allgather(
+                    k.contiguous(), v.contiguous(), seq_dim, cp_group_name
+                )
+
+            local_block_mask = None
+            if tree_spec is not None:
+                local_block_mask = _rebuild_context_parallel_block_mask(
+                    mask_args,
+                    tree_spec=tree_spec,
+                    num_regular_leaves=num_regular_leaves,
+                    block_size=block_size,
+                    local_seq_len=local_seq_len,
+                    kv_seq_len=kv_seq_len,
+                )
+
+            return flex_attention(
+                q,
+                k,
+                v,
+                score_mod=score_mod,
+                block_mask=local_block_mask,
+                scale=scale,
+                enable_gqa=enable_gqa,
+                kernel_options=kernel_options,
+            )
+
+        def cp_flex(q, k, v, *mask_args):
+            return run_flex(q, k, v, mask_args)
+
+        def surrogate_flex(q, k, v, *mask_args):
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=scale)
+            for arg in mask_args:
+                if isinstance(arg, torch.Tensor):
+                    out = out + arg.reshape(-1)[0].to(out.dtype) * 0
+            return out
+
+        mapped = local_map(
+            _DeferredLocalMapBody(
+                surrogate_fn=surrogate_flex,
+                runtime_fn=cp_flex,
+            ),
+            out_placements=placements.out_placements,
+            in_placements=placements.in_placements + tuple(block_mask_placements),
+            redistribute_inputs=True,
+            device_mesh=mesh,
+        )
+        return mapped, block_mask_args, block_mask_placements, cp_block_mask
+
+    def invoke(
+        mapped: Callable,
+        block_mask_args: tuple[object, ...],
+        block_mask_placements: tuple[object, ...],
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        *mask_args: object,
     ):
-        if cp_allgather is not None:
-            k, v = cp_allgather(k.contiguous(), v.contiguous(), seq_dim, cp_group_name)
+        if not block_mask_args:
+            return mapped(q, k, v)
 
-        local_block_mask = None
-        if cp_block_mask is not None:
-            local_block_mask = cp_block_mask.rebuild(*mask_args)
-
-        return flex_attention(
-            q,
-            k,
-            v,
-            score_mod=score_mod,
-            block_mask=local_block_mask,
-            scale=scale,
-            enable_gqa=enable_gqa,
-            kernel_options=kernel_options,
-        )
-
-    mapped = local_map(
-        cp_flex,
-        out_placements=placements.out_placements,
-        in_placements=placements.in_placements + tuple(block_mask_placements),
-        redistribute_inputs=True,
-        device_mesh=mesh,
-    )
-
-    if not block_mask_args:
-        return mapped
-
-    def call(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
-        # The block-mask tensors are captured as plain tensors; when Q/K/V are
-        # DTensors, distribute them to matching placements so local_map can
-        # redistribute every input consistently.
+        # When Q/K/V are DTensors, distribute the BlockMask tensor leaves to
+        # matching placements so local_map can redistribute every input.
         has_dtensor_input = any(isinstance(arg, DTensor) for arg in (q, k, v))
         mask_args = []
         for arg, placement in zip(block_mask_args, block_mask_placements):
@@ -468,6 +547,78 @@ def _make_context_parallel_flex_attention(
                 arg = distribute_tensor(arg, mesh, placement)
             mask_args.append(arg)
         return mapped(q, k, v, *mask_args)
+
+    (
+        factory_mapped,
+        factory_args,
+        factory_placements,
+        factory_block_mask,
+    ) = build_mapped(block_mask)
+    has_factory_block_mask = factory_block_mask is not None
+    factory_tensor_attrs = (
+        factory_block_mask.tensor_attrs if factory_block_mask is not None else ()
+    )
+    factory_num_regular_leaves = (
+        factory_block_mask.num_regular_leaves if factory_block_mask is not None else 0
+    )
+    factory_closure_count = (
+        len(factory_block_mask.leaves) - factory_num_regular_leaves
+        if factory_block_mask is not None
+        else 0
+    )
+
+    def call(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        block_mask: BlockMask | None = None,
+        mask_mod_buffers: tuple[torch.Tensor, ...] | None = None,
+    ):
+        if block_mask is None:
+            return invoke(
+                factory_mapped,
+                factory_args,
+                factory_placements,
+                q,
+                k,
+                v,
+            )
+
+        if has_factory_block_mask:
+            regular_leaves = tuple(
+                getattr(block_mask, attr) for attr in factory_tensor_attrs
+            )
+            if mask_mod_buffers is None:
+                runtime_leaves, _ = _pytree.tree_flatten(block_mask)
+                mask_mod_buffers = tuple(runtime_leaves[factory_num_regular_leaves:])
+            if len(mask_mod_buffers) != factory_closure_count:
+                raise ValueError(
+                    "Runtime mask_mod_buffers must match the factory-time "
+                    "BlockMask closure tensor count."
+                )
+            return invoke(
+                factory_mapped,
+                (*regular_leaves, *mask_mod_buffers, factory_args[-1]),
+                factory_placements,
+                q,
+                k,
+                v,
+            )
+
+        if mask_mod_buffers is not None:
+            raise ValueError(
+                "mask_mod_buffers requires a factory-time BlockMask template."
+            )
+        runtime_mapped, runtime_args, runtime_placements, _ = build_mapped(block_mask)
+        return invoke(
+            runtime_mapped,
+            runtime_args,
+            runtime_placements,
+            q,
+            k,
+            v,
+        )
 
     return call
 

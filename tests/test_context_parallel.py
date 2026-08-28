@@ -586,15 +586,9 @@ def _sdpa_case(mesh_shape, mesh_dim_names, *, is_causal=True):
         _sdpa_case((2, 2), ("cp", "tp")),
         _sdpa_case((2, 2, 2), ("dp", "cp", "tp")),
         _sdpa_case((2, 2, 2), ("dp_shard", "cp", "tp")),
-        _sdpa_case(
-            (2, 2, 2, 1), ("dp_replicate", "dp_shard", "cp", "tp")
-        ),
-        _sdpa_case(
-            (2, 1, 2, 2), ("dp_replicate", "dp_shard", "cp", "tp")
-        ),
-        _sdpa_case(
-            (1, 2, 2, 2), ("dp_replicate", "dp_shard", "cp", "tp")
-        ),
+        _sdpa_case((2, 2, 2, 1), ("dp_replicate", "dp_shard", "cp", "tp")),
+        _sdpa_case((2, 1, 2, 2), ("dp_replicate", "dp_shard", "cp", "tp")),
+        _sdpa_case((1, 2, 2, 2), ("dp_replicate", "dp_shard", "cp", "tp")),
         _sdpa_case(
             (2, 2, 2, 1),
             ("dp_shard_mod_ep", "dp_shard_in_ep", "cp", "tp"),
@@ -778,15 +772,49 @@ def _context_parallel_flex_worker(rank, case, init_file):
         k_dtensor = DTensor.from_local(k_local, mesh, placements, run_check=False)
         v_dtensor = DTensor.from_local(v_local, mesh, placements, run_check=False)
 
-        cp_flex = make_context_parallel(
-            mesh,
-            kind="flex_attention",
-            block_mask=block_mask,
-            scale=case["scale"],
-            enable_gqa=case["enable_gqa"],
-        )
         with mesh:
-            out = cp_flex(q_dtensor, k_dtensor, v_dtensor)
+            if block_mask is None:
+                cp_flex = make_context_parallel(
+                    mesh,
+                    kind="flex_attention",
+                    scale=case["scale"],
+                    enable_gqa=case["enable_gqa"],
+                )
+                out = cp_flex(q_dtensor, k_dtensor, v_dtensor)
+            else:
+                cp_flex = make_context_parallel(
+                    mesh,
+                    kind="flex_attention",
+                    scale=case["scale"],
+                    enable_gqa=case["enable_gqa"],
+                )
+                out = cp_flex(
+                    q_dtensor,
+                    k_dtensor,
+                    v_dtensor,
+                    block_mask=block_mask,
+                )
+
+                factory_mask_flex = make_context_parallel(
+                    mesh,
+                    kind="flex_attention",
+                    block_mask=block_mask,
+                    scale=case["scale"],
+                    enable_gqa=case["enable_gqa"],
+                )
+                with torch.no_grad():
+                    factory_out = factory_mask_flex(
+                        q_dtensor.detach(),
+                        k_dtensor.detach(),
+                        v_dtensor.detach(),
+                        block_mask=block_mask,
+                    )
+                torch.testing.assert_close(
+                    factory_out.full_tensor(),
+                    out.full_tensor(),
+                    atol=1e-4,
+                    rtol=1e-4,
+                )
 
         ref = flex_attention(
             q,

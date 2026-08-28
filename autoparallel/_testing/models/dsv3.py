@@ -3,6 +3,7 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+import copy
 import math
 from dataclasses import dataclass, field
 from typing import Callable, ClassVar, Literal, Optional, Tuple
@@ -15,6 +16,12 @@ import triton.language as tl
 from torch import nn
 from torch.distributed.tensor import DeviceMesh, DTensor
 from torch.nn.attention import SDPBackend, sdpa_kernel
+from torch.nn.attention.flex_attention import (
+    and_masks,
+    BlockMask,
+    create_block_mask,
+    flex_attention,
+)
 
 from autoparallel.collectives import all_to_all, axis_size, local_map
 from autoparallel.moe import MoEMeshRoles, build_moe_local_map_placements
@@ -22,6 +29,7 @@ from autoparallel.moe import build_moe_mesh as _build_moe_mesh
 
 _MODULE_FQN = "module_fqn"
 build_moe_mesh = _build_moe_mesh
+_compiled_create_block_mask = torch.compile(create_block_mask)
 
 
 def _to_compute_dtype(
@@ -1110,23 +1118,74 @@ def build_attention(
     fixed_block_size: int | None = None,
     context_parallel_mesh: DeviceMesh | None = None,
     scale: float | None = None,
+    kernel_options: dict | None = None,
+    block_mask: BlockMask | None = None,
 ):
-    if fixed_block_size is not None:
+    if fixed_block_size is not None and not use_flex_attn:
         raise ValueError(
             "TorchTitan with SDPA currently does not support fixed_block_size."
         )
     if attn_mask_type != "causal":
         raise ValueError("TorchTitan with SDPA currently only supports causal mask.")
     if context_parallel_mesh is not None:
-        if use_flex_attn:
-            raise ValueError("FlexAttention is not compatible with CP yet.")
         from autoparallel import make_context_parallel
 
-        # scale is baked in here since the CP callable takes only (q, k, v).
         return make_context_parallel(
-            context_parallel_mesh, kind="sdpa", is_causal=True, scale=scale
+            context_parallel_mesh,
+            kind="flex_attention" if use_flex_attn else "sdpa",
+            is_causal=True,
+            scale=scale,
+            block_mask=block_mask,
+            kernel_options=kernel_options,
         )
+    if use_flex_attn:
+
+        def flex(
+            q: torch.Tensor,
+            k: torch.Tensor,
+            v: torch.Tensor,
+            *,
+            block_mask: BlockMask,
+        ) -> torch.Tensor:
+            return flex_attention(
+                q,
+                k,
+                v,
+                block_mask=block_mask,
+                scale=scale,
+                kernel_options=kernel_options,
+            )
+
+        return flex
     return ScaledDotProductAttention(attn_mask_type)
+
+
+def _causal_mask(b, h, q_idx, kv_idx):
+    return q_idx >= kv_idx
+
+
+def _document_mask(document_ids: torch.Tensor):
+    def mask(b, h, q_idx, kv_idx):
+        return document_ids[b, q_idx] == document_ids[b, kv_idx]
+
+    return mask
+
+
+def _create_document_block_mask(
+    positions: torch.Tensor,
+    block_size: int | tuple[int, int],
+) -> BlockMask:
+    batch_size, seq_len = positions.shape
+    document_ids = torch.cumsum((positions == 0).int(), dim=1) - 1
+    return _compiled_create_block_mask(
+        and_masks(_causal_mask, _document_mask(document_ids)),
+        batch_size,
+        None,
+        seq_len,
+        seq_len,
+        device=positions.device,
+        BLOCK_SIZE=block_size,
+    )
 
 
 @dataclass
@@ -1157,6 +1216,12 @@ class SDPAConfig:
 
 
 @dataclass
+class FlexAttentionConfig:
+    block_size: int | tuple[int, int] = 128
+    kernel_options: dict = field(default_factory=dict)
+
+
+@dataclass
 class AttentionConfig:
     n_heads: int = 16
     q_lora_rank: int = 0
@@ -1166,7 +1231,9 @@ class AttentionConfig:
     v_head_dim: int = 128
     mscale: float = 1.0
     mask_type: str = "causal"
-    inner_attention: SDPAConfig = field(default_factory=SDPAConfig)
+    inner_attention: SDPAConfig | FlexAttentionConfig = field(
+        default_factory=SDPAConfig
+    )
 
 
 @dataclass
@@ -1256,6 +1323,7 @@ def make_dsv3_config(
     beta_slow: float = 1.0,
     original_seq_len: int = 4096,
     load_balance_coeff: float | None = 1e-3,
+    inner_attention: SDPAConfig | FlexAttentionConfig | None = None,
 ) -> DeepSeekV3Config:
     layers = []
     for layer_id in range(n_layers):
@@ -1267,6 +1335,11 @@ def make_dsv3_config(
             qk_rope_head_dim=qk_rope_head_dim,
             v_head_dim=v_head_dim,
             mscale=mscale,
+            inner_attention=(
+                copy.deepcopy(inner_attention)
+                if inner_attention is not None
+                else SDPAConfig()
+            ),
         )
         if layer_id < n_dense_layers:
             ff = FeedForwardConfig(w1=LinearConfig(out_features=dense_hidden_dim))
@@ -1421,7 +1494,15 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     """
     dtype = x.dtype
     x = torch.view_as_complex(x.float().view(*x.shape[:-1], -1, 2))
-    freqs_cis = freqs_cis.view(1, x.size(1), 1, x.size(-1))
+    if freqs_cis.ndim == 2:
+        freqs_cis = freqs_cis.view(1, x.size(1), 1, x.size(-1))
+    elif freqs_cis.ndim == 3:
+        freqs_cis = freqs_cis.view(x.size(0), x.size(1), 1, x.size(-1))
+    else:
+        raise ValueError(
+            "RoPE frequencies must have shape [sequence, dim] or "
+            "[batch, sequence, dim]."
+        )
     y = torch.view_as_real(x * freqs_cis).flatten(3)
     return y.to(dtype)
 
@@ -1483,18 +1564,42 @@ class Attention(nn.Module):
             and mesh.mesh_dim_names is not None
             and "cp" in mesh.mesh_dim_names
         )
-        use_flex_attn = "FlexAttention" in type(attn_config.inner_attention).__name__
-        self.sdpa = build_attention(
-            use_flex_attn,
-            attn_config.mask_type,
-            context_parallel_mesh=mesh if self.context_parallel else None,
-            scale=self.softmax_scale,
+        self.use_flex_attn = isinstance(
+            attn_config.inner_attention, FlexAttentionConfig
         )
+        fixed_block_size = (
+            attn_config.inner_attention.block_size if self.use_flex_attn else None
+        )
+        kernel_options = (
+            attn_config.inner_attention.kernel_options if self.use_flex_attn else None
+        )
+
+        def build_inner_attention(block_mask: BlockMask | None = None):
+            return build_attention(
+                self.use_flex_attn,
+                attn_config.mask_type,
+                fixed_block_size=fixed_block_size,
+                context_parallel_mesh=mesh if self.context_parallel else None,
+                scale=self.softmax_scale,
+                kernel_options=kernel_options,
+                block_mask=block_mask,
+            )
+
+        self._build_inner_attention = build_inner_attention
+        self.inner_attention = build_inner_attention()
+
+    def set_context_parallel_block_mask_template(self, block_mask: BlockMask) -> None:
+        if not self.context_parallel or not self.use_flex_attn:
+            return
+        self.inner_attention = self._build_inner_attention(block_mask)
+        self._build_inner_attention = None
 
     def forward(
         self,
         x: torch.Tensor,
         freqs_cis: torch.Tensor,
+        attention_masks: BlockMask | None = None,
+        document_ids: torch.Tensor | None = None,
     ):
         """
         Forward pass for the Multi-Head Latent Attention (MLA) Layer.
@@ -1571,11 +1676,27 @@ class Attention(nn.Module):
         k = _to_compute_dtype(k, self.compute_dtype)
         v = _to_compute_dtype(v, self.compute_dtype)
 
-        if self.context_parallel:
-            # CP callable bakes in scale at build time and takes only (q, k, v).
-            output = self.sdpa(q, k, v)
+        if self.use_flex_attn:
+            if attention_masks is None:
+                raise ValueError("FlexAttention requires a BlockMask.")
+            if self.context_parallel:
+                if document_ids is None:
+                    raise ValueError(
+                        "Context-parallel FlexAttention requires document IDs."
+                    )
+                output = self.inner_attention(
+                    q,
+                    k,
+                    v,
+                    block_mask=attention_masks,
+                    mask_mod_buffers=(document_ids,),
+                )
+            else:
+                output = self.inner_attention(q, k, v, block_mask=attention_masks)
+        elif self.context_parallel:
+            output = self.inner_attention(q, k, v)
         else:
-            output = self.sdpa(q, k, v, scale=self.softmax_scale)
+            output = self.inner_attention(q, k, v, scale=self.softmax_scale)
 
         # Reshape and project output
         output = output.transpose(
@@ -1664,7 +1785,13 @@ class TransformerBlock(nn.Module):
         self.weight_init_std = 0.02 / (2 * (layer_id + 1)) ** 0.5
         self.layer_id = layer_id
 
-    def forward(self, x: torch.Tensor, freqs_cis: torch.Tensor):
+    def forward(
+        self,
+        x: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        attention_masks: BlockMask | None = None,
+        document_ids: torch.Tensor | None = None,
+    ):
         """
         Forward pass for the Transformer block.
 
@@ -1678,6 +1805,8 @@ class TransformerBlock(nn.Module):
         x = x + self.attention(
             _rms_norm_compute(x, self.attention_norm, self.compute_dtype),
             freqs_cis,
+            attention_masks,
+            document_ids,
         )
         if self.moe_enabled:
             x = x + self.moe(_rms_norm_compute(x, self.ffn_norm, self.compute_dtype))
@@ -1749,7 +1878,8 @@ class DeepSeekV3Model(nn.Module):
     def forward(
         self,
         tokens: torch.Tensor,
-        input_batch: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
+        attention_masks: BlockMask | None = None,
     ):
         """
         Forward pass for the Transformer model.
@@ -1759,10 +1889,9 @@ class DeepSeekV3Model(nn.Module):
                 If pipeline parallelism is enabled, this will be the input token indices
                 for the ranks on the first pipeline stage. This will be the activation of the
                 previous pipeline stage if the current rank is not on the first stage.
-            input_batch (torch.Tensor): The input batch read from the dataloader.
-                This will always be the input batch regardless of the pipeline stage.
-                This field is required for non-first PP stages to perform document
-                masking attention (to analyze the boundary of the document).
+            positions (torch.Tensor): Per-token positions, reset at packed-document
+                boundaries.
+            attention_masks (BlockMask): FlexAttention mask for the input batch.
 
         Returns:
             torch.Tensor: Logits tensor of shape (batch_size, vocab_size).
@@ -1770,9 +1899,19 @@ class DeepSeekV3Model(nn.Module):
 
         h = self.tok_embeddings(tokens) if self.tok_embeddings is not None else tokens
         h = _to_compute_dtype(h, self.compute_dtype)
+        freqs_cis = (
+            self.freqs_cis[: tokens.size(1)]
+            if positions is None
+            else self.freqs_cis[positions]
+        )
+        document_ids = (
+            torch.cumsum((positions == 0).int(), dim=1) - 1
+            if attention_masks is not None and positions is not None
+            else None
+        )
 
         for layer in self.layers.values():
-            h = layer(h, self.freqs_cis)
+            h = layer(h, freqs_cis, attention_masks, document_ids)
         h = (
             _rms_norm_compute(h, self.norm, self.compute_dtype)
             if self.norm is not None
@@ -1789,6 +1928,19 @@ class DeepSeekV3Model(nn.Module):
             else h
         )
         return output
+
+    def get_attention_masks(self, positions: torch.Tensor) -> BlockMask | None:
+        inner_attention = self.model_args.layers[0].attention.inner_attention
+        if isinstance(inner_attention, SDPAConfig):
+            return None
+        return _create_document_block_mask(
+            positions,
+            inner_attention.block_size,
+        )
+
+    def set_context_parallel_block_mask_template(self, block_mask: BlockMask) -> None:
+        for layer in self.layers.values():
+            layer.attention.set_context_parallel_block_mask_template(block_mask)
 
 
 def _init_weights_tok_embeddings(self: DeepSeekV3Model, seed: int | None = None):
