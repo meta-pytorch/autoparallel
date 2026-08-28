@@ -52,6 +52,28 @@ def test_params_and_buffers_registered():
     assert "buf" in buffer_names
 
 
+def test_lifted_buffer_absent_from_reference_is_non_persistent():
+    """Compiler-lifted closure buffers must not become checkpoint state."""
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.empty(4))
+
+        def forward(self, x):
+            return x * self.weight
+
+    with torch.device("meta"):
+        model = Model()
+
+    param_dict, buffer_dict = _make_param_and_buffer_dicts(model)
+    buffer_dict["self___forward___closure___0_cell_contents"] = torch.ones(4)
+    mod = make_parallel_module(model, param_dict, buffer_dict)
+
+    assert "self___forward___closure___0_cell_contents" in dict(mod.named_buffers())
+    assert "self___forward___closure___0_cell_contents" not in mod.state_dict()
+
+
 def test_isinstance_user_class():
     """Parallel module is an instance of the user's model class."""
     dim = 16
