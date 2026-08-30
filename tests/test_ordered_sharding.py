@@ -10,12 +10,14 @@ from conftest import apply_cuda_patches
 from torch import nn
 from torch._functorch._aot_autograd.fx_utils import get_param_and_grad_nodes
 from torch._functorch.aot_autograd import aot_export_joint_with_descriptors
-from torch.distributed._tensor.placement_types import DTensorSpec
+from torch.distributed.tensor._dtensor_spec import DTensorSpec, ShardOrderEntry
 from torch.distributed.tensor._op_schema import OpSpec
 from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
 
 from autoparallel.api import AutoParallel
 from autoparallel.shardings.ordered_sharding import (
+    _infer_fsdplike_storage_order,
+    _matches_inverse_gradient_pattern,
     build_param_grad_linear_chains,
     compute_optimal_placement_order_for_parameters,
     get_redistributed_input_placements,
@@ -572,25 +574,13 @@ def test_compute_optimal_placement_order_ss_to_rs(device_mesh_2d):
     assert param in placement_order
     assert grad in placement_order
 
-    # Verify OrderInfo values for param chain nodes
-    # param: first in chain, before target → is_target_reversed_order=True, need_reorder=False
-    assert placement_order[param].is_target_reversed_order is True
-    assert placement_order[param].need_reorder is False
+    expected_order = (ShardOrderEntry(tensor_dim=0, mesh_dims=(1, 0)),)
 
-    # t_node: target of param chain → is_target_reversed_order=False, need_reorder=True
-    assert placement_order[t_node].is_target_reversed_order is False
-    assert placement_order[t_node].need_reorder is True
-
-    # Verify OrderInfo values for grad chain nodes
-    # The last node in the grad chain is where redistribution happens (need_reorder=True)
-    grad_redistrib_target = grad_chain[-1]
-    assert placement_order[grad_redistrib_target].is_target_reversed_order is True
-    assert placement_order[grad_redistrib_target].need_reorder is True
-
-    # All earlier nodes in grad chain should have need_reorder=False
-    for node in grad_chain[:-1]:
-        assert placement_order[node].is_target_reversed_order is True
-        assert placement_order[node].need_reorder is False
+    # Forward and backward chains preserve the same parameter storage order.
+    assert placement_order[param].preferred_shard_order == expected_order
+    assert placement_order[t_node].preferred_shard_order == expected_order
+    for node in grad_chain:
+        assert placement_order[node].preferred_shard_order == expected_order
 
     # All nodes in placement_order should have shard_order metadata
     for node in placement_order:
@@ -673,14 +663,142 @@ def test_compute_optimal_placement_order_ss_to_rs_with_grad_chain_redistribution
     )
     assert grad_alias in placement_order
 
-    # Verify forward chain ordering
-    assert placement_order[param].need_reorder is False
-    assert placement_order[dtype_cast_fwd].need_reorder is False
-    assert placement_order[permute_fwd].need_reorder is True
+    expected_order = (ShardOrderEntry(tensor_dim=0, mesh_dims=(1, 0)),)
+    assert placement_order[param].preferred_shard_order == expected_order
+    assert placement_order[dtype_cast_fwd].preferred_shard_order == expected_order
+    assert placement_order[permute_fwd].preferred_shard_order == expected_order
+    assert placement_order[grad_alias].preferred_shard_order == expected_order
 
-    # Verify backward chain ordering
-    assert placement_order[grad_alias].need_reorder is True
-    assert placement_order[grad_alias].is_target_reversed_order is True
+
+def test_infer_fsdplike_storage_order_3d():
+    source = (Shard(0), Shard(0), Shard(0))
+    target = (Replicate(), Replicate(), Shard(0))
+
+    assert _infer_fsdplike_storage_order(source, target) == (
+        ShardOrderEntry(tensor_dim=0, mesh_dims=(2, 1, 0)),
+    )
+
+
+def test_infer_fsdplike_storage_order_4d():
+    source = (Shard(0), Shard(0), Shard(0), Shard(0))
+    target = (Replicate(), Shard(0), Replicate(), Shard(0))
+
+    assert _infer_fsdplike_storage_order(source, target) == (
+        ShardOrderEntry(tensor_dim=0, mesh_dims=(1, 3, 2, 0)),
+    )
+
+
+def test_infer_fsdplike_storage_order_multiple_tensor_dims():
+    source = (Shard(0), Shard(1), Shard(0), Shard(1))
+    target = (Replicate(), Shard(1), Shard(0), Replicate())
+
+    assert _infer_fsdplike_storage_order(source, target) == (
+        ShardOrderEntry(tensor_dim=0, mesh_dims=(2, 0)),
+        ShardOrderEntry(tensor_dim=1, mesh_dims=(1, 3)),
+    )
+
+
+def test_infer_fsdplike_storage_order_rejects_unsupported_patterns():
+    assert (
+        _infer_fsdplike_storage_order(
+            (Shard(0), Shard(0)),
+            (Replicate(), Replicate()),
+        )
+        is None
+    )
+    assert (
+        _infer_fsdplike_storage_order(
+            (Shard(0), Replicate()),
+            (Replicate(), Shard(0)),
+        )
+        is None
+    )
+    assert (
+        _infer_fsdplike_storage_order(
+            (Shard(0), Shard(0)),
+            (Replicate(), Shard(1)),
+        )
+        is None
+    )
+    assert (
+        _infer_fsdplike_storage_order(
+            (Partial(), Shard(0)),
+            (Replicate(), Shard(0)),
+        )
+        is None
+    )
+
+
+def test_matches_inverse_gradient_pattern_3d():
+    param_source = (Shard(0), Shard(0), Shard(0))
+    param_target = (Replicate(), Replicate(), Shard(0))
+
+    assert _matches_inverse_gradient_pattern(
+        param_source,
+        param_target,
+        (Partial(), Partial(), Shard(0)),
+        param_source,
+    )
+    assert not _matches_inverse_gradient_pattern(
+        param_source,
+        param_target,
+        (Partial(), Replicate(), Shard(0)),
+        param_source,
+    )
+    assert not _matches_inverse_gradient_pattern(
+        param_source,
+        param_target,
+        (Partial(), Partial(), Shard(0)),
+        (Replicate(), Shard(0), Shard(0)),
+    )
+
+
+def test_compute_optimal_placement_order_3d(device_mesh_3d):
+    graph = torch.fx.Graph()
+    param = graph.placeholder("param")
+    x = graph.placeholder("x")
+    dtype_cast_fwd = graph.call_function(torch.ops.aten.clone.default, (param,))
+    permute_fwd = graph.call_function(torch.ops.aten.t.default, (dtype_cast_fwd,))
+    mm_fwd = graph.call_function(torch.ops.aten.mm.default, (x, permute_fwd))
+
+    grad_out = graph.placeholder("grad_out")
+    mm_bwd = graph.call_function(torch.ops.aten.mm.default, (x, grad_out))
+    permute_bwd = graph.call_function(torch.ops.aten.t.default, (mm_bwd,))
+    dtype_cast_bwd = graph.call_function(torch.ops.aten.clone.default, (permute_bwd,))
+    grad_alias = graph.call_function(torch.ops.aten.clone.default, (dtype_cast_bwd,))
+    graph.output((mm_fwd, grad_alias))
+    gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+
+    storage = DTensorSpec(device_mesh_3d, (Shard(0), Shard(0), Shard(0)))
+    compute = DTensorSpec(device_mesh_3d, (Replicate(), Replicate(), Shard(0)))
+    grad_compute = DTensorSpec(device_mesh_3d, (Partial(), Partial(), Shard(0)))
+
+    sharding_placement = {
+        param: OpSpec(output_specs=storage, input_specs=[storage]),
+        x: OpSpec(output_specs=compute),
+        dtype_cast_fwd: OpSpec(output_specs=storage, input_specs=[storage]),
+        permute_fwd: OpSpec(output_specs=compute, input_specs=[compute]),
+        mm_fwd: OpSpec(output_specs=compute, input_specs=[compute, compute]),
+        grad_out: OpSpec(output_specs=compute),
+        mm_bwd: OpSpec(output_specs=compute, input_specs=[compute, compute]),
+        permute_bwd: OpSpec(output_specs=grad_compute, input_specs=[grad_compute]),
+        dtype_cast_bwd: OpSpec(output_specs=grad_compute, input_specs=[grad_compute]),
+        grad_alias: OpSpec(output_specs=storage, input_specs=[storage]),
+    }
+
+    import unittest.mock as mock
+
+    with mock.patch(
+        "autoparallel.shardings.ordered_sharding.get_param_and_grad_nodes"
+    ) as get_pairs:
+        get_pairs.return_value = {0: (param, grad_alias)}
+        placement_order = compute_optimal_placement_order_for_parameters(
+            gm, sharding_placement
+        )
+
+    expected_order = (ShardOrderEntry(tensor_dim=0, mesh_dims=(2, 1, 0)),)
+    assert placement_order[permute_fwd].preferred_shard_order == expected_order
+    assert placement_order[grad_alias].preferred_shard_order == expected_order
 
 
 def test_compute_optimal_placement_order_verifies_redistribution_map(device_mesh_2d):
