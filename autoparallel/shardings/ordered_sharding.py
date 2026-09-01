@@ -4,12 +4,17 @@
 # LICENSE file in the root directory of this source tree.
 
 import operator
-from collections import namedtuple
+from collections import defaultdict
+from dataclasses import dataclass
 from typing import Optional, Union
 
 import torch
 from torch._functorch._aot_autograd.fx_utils import get_param_and_grad_nodes
-from torch.distributed._tensor.placement_types import DTensorSpec
+from torch.distributed.tensor._dtensor_spec import (
+    DTensorSpec,
+    ShardOrder,
+    ShardOrderEntry,
+)
 from torch.distributed.tensor._op_schema import OpSpec
 from torch.distributed.tensor._redistribute import redistribute_local_tensor
 from torch.distributed.tensor.placement_types import (  # noqa
@@ -20,14 +25,74 @@ from torch.distributed.tensor.placement_types import (  # noqa
 )
 from torch.utils._pytree import tree_flatten
 
-# Supported placement patterns for the ordered sharding optimization
-_PARAM_PLACEMENT = (Shard(0), Shard(0))
-_PARAM_TARGET_PLACEMENT = (Replicate(), Shard(0))
-_GRAD_PLACEMENT = (Partial(), Shard(0))
-_GRAD_TARGET_PLACEMENT = (Shard(0), Shard(0))
 
-# Stores ordering information for nodes that need redistribution
-OrderInfo = namedtuple("OrderInfo", ["is_target_reversed_order", "need_reorder"])
+@dataclass(frozen=True)
+class OrderInfo:
+    """Preferred physical shard order for a parameter and its gradient."""
+
+    preferred_shard_order: ShardOrder
+
+
+def _infer_fsdplike_storage_order(
+    source: tuple[Placement, ...],
+    target: tuple[Placement, ...],
+) -> Optional[ShardOrder]:
+    """Infer an order that keeps retained shards outside released shards."""
+    if len(source) != len(target):
+        return None
+
+    retained: dict[int, list[int]] = defaultdict(list)
+    released: dict[int, list[int]] = defaultdict(list)
+
+    for mesh_dim, (src, dst) in enumerate(zip(source, target)):
+        if isinstance(src, Shard) and isinstance(dst, Shard):
+            if src.dim != dst.dim:
+                return None
+            retained[src.dim].append(mesh_dim)
+        elif isinstance(src, Shard) and isinstance(dst, Replicate):
+            released[src.dim].append(mesh_dim)
+        elif isinstance(src, Replicate) and isinstance(dst, Replicate):
+            continue
+        else:
+            return None
+
+    if not released or any(not retained[tensor_dim] for tensor_dim in released):
+        return None
+
+    preferred_order = tuple(
+        ShardOrderEntry(
+            tensor_dim=tensor_dim,
+            mesh_dims=tuple(
+                sorted(retained[tensor_dim])
+                + sorted(released[tensor_dim], reverse=True)
+            ),
+        )
+        for tensor_dim in sorted(set(retained) | set(released))
+        if retained[tensor_dim] or released[tensor_dim]
+    )
+    default_order = DTensorSpec.compute_default_shard_order(source)
+    return preferred_order if preferred_order != default_order else None
+
+
+def _matches_inverse_gradient_pattern(
+    param_source: tuple[Placement, ...],
+    param_target: tuple[Placement, ...],
+    grad_source: tuple[Placement, ...],
+    grad_target: tuple[Placement, ...],
+) -> bool:
+    """Check that the gradient redistribution reverses the parameter gather."""
+    if grad_target != param_source:
+        return False
+
+    expected_grad_source = tuple(
+        (
+            Partial()
+            if isinstance(param_src, Shard) and isinstance(param_dst, Replicate)
+            else param_src
+        )
+        for param_src, param_dst in zip(param_source, param_target)
+    )
+    return grad_source == expected_grad_source
 
 
 def _optimize_same_nd_sharding_as_1d(
@@ -222,31 +287,24 @@ def build_param_grad_linear_chains(
 def _assign_order_info_to_chain(
     chain: list[torch.fx.Node],
     target_node: torch.fx.Node,
-    target_reversed_order: bool,
+    preferred_shard_order: ShardOrder,
     order_map: dict[torch.fx.Node, OrderInfo],
 ) -> None:
     """
     Assign OrderInfo to nodes in a chain up to and including the target node.
 
-    For nodes before the target, they maintain their current order (need_reorder=False).
-    The target node itself needs reordering (need_reorder=True).
-
     Args:
         chain: List of nodes in the dependency chain.
-        target_node: The node where reordering should occur.
-        target_reversed_order: The is_target_reversed_order value for the target node.
+        target_node: The redistribution boundary for this chain.
+        preferred_shard_order: Parameter storage order to preserve along the chain.
         order_map: Dictionary to populate with OrderInfo for each node.
     """
     for node in chain:
+        order_map[node] = OrderInfo(
+            preferred_shard_order=preferred_shard_order,
+        )
         if node == target_node:
-            order_map[node] = OrderInfo(
-                is_target_reversed_order=target_reversed_order, need_reorder=True
-            )
             break
-        else:
-            order_map[node] = OrderInfo(
-                is_target_reversed_order=True, need_reorder=False
-            )
 
 
 def compute_optimal_placement_order_for_parameters(
@@ -256,21 +314,15 @@ def compute_optimal_placement_order_for_parameters(
     """
     Compute the optimal placement order for parameters and gradients.
 
-    The optimal placement order minimizes the number of communication steps
-    by determining which nodes need their shard order reversed during
-    redistribution.
-
-    Currently only optimizes the case where:
-    - Parameters: S(0)S(0) -> RS(0) (forward pass)
-    - Gradients: PS(0) -> S(0)S(0) (backward pass)
+    The optimal placement order minimizes communication needed to remove a
+    subset of same-tensor-dimension parameter shards while retaining the rest.
 
     Args:
         module: The FX GraphModule containing parameter and gradient nodes.
         sharding_placement: Mapping from nodes to their sharding OpSpec.
 
     Returns:
-        Dictionary mapping nodes to their OrderInfo, indicating whether
-        they need reordering and their target order.
+        Dictionary mapping nodes to the preferred parameter storage order.
     """
     param_and_grad_nodes = list(get_param_and_grad_nodes(module.graph).values())
 
@@ -329,46 +381,43 @@ def compute_optimal_placement_order_for_parameters(
         if param_curr_plc != grad_tgt_plc:
             continue
 
-        # Only support S(0)S(0) -> RS(0) and PS(0) -> S(0)S(0) optimizations
-        is_supported_param_pattern = (
-            param_curr_plc == _PARAM_PLACEMENT
-            and param_tgt_plc == _PARAM_TARGET_PLACEMENT
+        preferred_shard_order = _infer_fsdplike_storage_order(
+            param_curr_plc, param_tgt_plc
         )
-        is_supported_grad_pattern = (
-            grad_curr_plc == _GRAD_PLACEMENT and grad_tgt_plc == _GRAD_TARGET_PLACEMENT
-        )
-
-        if not (is_supported_param_pattern and is_supported_grad_pattern):
+        if preferred_shard_order is None or not _matches_inverse_gradient_pattern(
+            param_curr_plc,
+            param_tgt_plc,
+            grad_curr_plc,
+            grad_tgt_plc,
+        ):
             continue
 
         # Get the user nodes where redistribution occurs
         param_redistrib_node = redistribution_map[param_node][0]
         grad_redistrib_node = redistribution_map[grad_node][0]
 
-        # Handle forward pass: assign order info to param chain
-        # Nodes need order reversed from (1,0) to (0,1) at the redistribution point
+        # Preserve the chosen storage order through the forward parameter chain.
         param_source = node_to_source[param_redistrib_node]
         param_chain = source_to_chain[param_source]
         _assign_order_info_to_chain(
             param_chain,
             target_node=param_redistrib_node,
-            target_reversed_order=False,
+            preferred_shard_order=preferred_shard_order,
             order_map=redistribute_node_order,
         )
 
-        # Handle backward pass: assign order info to grad chain
-        # Nodes need order reversed from (0,1) to (1,0) at the redistribution point
+        # Restore gradients to the same storage order in the backward chain.
         grad_source = node_to_source[grad_redistrib_node]
         grad_chain = source_to_chain[grad_source]
         _assign_order_info_to_chain(
             grad_chain,
             target_node=grad_redistrib_node,
-            target_reversed_order=True,
+            preferred_shard_order=preferred_shard_order,
             order_map=redistribute_node_order,
         )
 
     # Apply shard_order metadata to nodes
     for node, order_info in redistribute_node_order.items():
-        node.meta["shard_order"] = order_info.is_target_reversed_order
+        node.meta["shard_order"] = order_info.preferred_shard_order
 
     return redistribute_node_order
