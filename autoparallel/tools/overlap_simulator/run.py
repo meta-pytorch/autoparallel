@@ -252,7 +252,8 @@ class NodeEstimator:
         if isinstance(x, int):
             return x
         if hasattr(x, "node") and hasattr(x.node, "hint"):
-            return x.node.hint
+            hint = x.node.hint
+            return hint if isinstance(hint, int) else None
         return None
 
     @staticmethod
@@ -399,7 +400,9 @@ class ExperimentRunner:
             if info["size"] == world_size:
                 pgs[name] = default_pg
             else:
-                pgs[name] = dist.new_group(list(range(info["size"])))
+                pg = dist.new_group(list(range(info["size"])))
+                assert isinstance(pg, dist.ProcessGroup)
+                pgs[name] = pg
 
         # Re-register under the desired names
         torch._C._distributed_c10d._unregister_all_process_groups()

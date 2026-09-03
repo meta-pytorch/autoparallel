@@ -13,6 +13,7 @@ from typing import Any, Iterable
 
 import torch
 import torch.utils._pytree as pytree
+from torch._higher_order_ops.local_map import local_map_hop
 from torch.distributed._tensor.placement_types import Placement, TensorMeta
 from torch.distributed.device_mesh import _get_device_handle
 from torch.distributed.tensor._dtensor_spec import DTensorSpec
@@ -397,9 +398,7 @@ def get_local_map_placement_option(
         mesh,
         None,
     ), "Not yet implemented"
-    assert "call_local_map" in str(node.target) or "call_local_map_backward" in str(
-        node.target
-    )
+    assert node.target is local_map_hop
     in_specs = []
     num_activation_inputs = len(user_args) - len(in_placements)
     # activations are always replicated
