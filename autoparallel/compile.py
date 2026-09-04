@@ -153,6 +153,17 @@ class _ReplaySavesPartitioner(CustomPartitionerFn):
         def _must_save(node: torch.fx.Node) -> bool:
             return node.meta.get("recompute") is CheckpointPolicy.MUST_SAVE
 
+        def _replay_must_save(node: torch.fx.Node) -> bool:
+            # AOTAutograd propagates custom metadata to generated backward
+            # nodes. Only treat the tag as a first-forward save decision when
+            # the node does not explicitly originate from backward.
+            return node.meta.get("custom", {}).get(
+                "ap_must_save", False
+            ) and node.meta.get("partitioner_tag") not in (
+                "is_backward",
+                "must_be_in_backward",
+            )
+
         def _maybe_save(node: torch.fx.Node) -> None:
             # MUST_RECOMPUTE wins over everything else. Check before any
             # save branch (including opaque) so the first compilation's
@@ -169,7 +180,7 @@ class _ReplaySavesPartitioner(CustomPartitionerFn):
                 return
             if _is_multi_output(node):
                 custom = node.meta.get("custom", {})
-                if _must_save(node) or custom.get("ap_must_save"):
+                if _must_save(node) or _replay_must_save(node):
                     # getitem metadata does not survive preserve_node_meta, so
                     # the first partitioner tags the parent multi-output op. If
                     # only ap_must_save is set and it recorded specific getitem
@@ -198,7 +209,7 @@ class _ReplaySavesPartitioner(CustomPartitionerFn):
             # partitioner — reproducing its save/recompute decisions.
             if node.op == "placeholder":
                 saved_values.append(node)
-            elif node.meta.get("custom", {}).get("ap_must_save") or _must_save(node):
+            elif _replay_must_save(node) or _must_save(node):
                 saved_values.append(node)
 
         for node in node_info.required_fw_nodes:
