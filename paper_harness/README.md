@@ -10,6 +10,8 @@ TorchTitan and AutoParallel are external inputs. The harness never checks out, p
 
 Clean checkouts are required by default. A campaign may explicitly select `dirty_policy = "snapshot"`; that records the base commit, porcelain status, binary diff, untracked-file hashes, complete source-tree hash, and packaged-tree hash. This mode is intended for evaluating a change before submitting it upstream, not for silently bypassing provenance checks.
 
+The vendored snapshot and the clean AutoParallel/TorchTitan submission stacks are recorded in [UPSTREAM.md](UPSTREAM.md). Historical campaign pins were intentionally left unchanged; a new campaign must explicitly pin the submission commits when it opts into this stack.
+
 ## Stable arm profiles
 
 | Profile | Meaning |
@@ -22,7 +24,29 @@ Clean checkouts are required by default. A campaign may explicitly select `dirty
 
 For the current `apgt_v1` contract, both GraphTrainer arms serialize the same compile settings except for `compile.enable_autoparallel`. The manual arm keeps GraphTrainer's joint transformer-block bucketing pass. The AutoParallel arm is selected by the source pass builder, skips that manual pass, and passes the fixed AutoParallel overlap/bucketing settings to terminal full Inductor. A source checkout that does not prove this contract is rejected; changing the contract requires a new profile version and explicit review.
 
-The solver, model-specific input/output constraints, memory constraints, and placement solve/save/load mode remain declared experiment variables.
+The model adapters, model-specific input/output constraints, memory constraints, tracing path, and placement application are fixed by the `apgt_v1` source contract. The solver and placement solve/save/load mode remain declared experiment variables.
+
+## AutoParallel solver settings
+
+The companion TorchTitan submission branch accepts the following fields under `[compile]`. These are forwarded to the existing PR523 AutoParallel constructor or `optimize_placement`; the harness does not patch either source tree.
+
+| Field | Default | AutoParallel destination |
+| --- | --- | --- |
+| `autoparallel_solver` | `"ilp"` | `solver` |
+| `autoparallel_fast_build` | `true` | `fast_build` |
+| `autoparallel_lazy_costs` | `"auto"` | `lazy_costs=None`; `"lazy"` and `"eager"` map to `True` and `False` |
+| `autoparallel_strategy_radius` | `2` | `strategy_radius`; placement replay forces `0` |
+| `autoparallel_optimality_check` | `false` | `optimality_check` |
+| `autoparallel_approx_candidate_limit` | `128` | `approximate_options.candidate_limit` |
+| `autoparallel_approx_bp_iters` | `400` | `approximate_options.bp_iters` |
+| `autoparallel_approx_bp_tol` | `0.001` | `approximate_options.bp_tol` |
+| `autoparallel_approx_max_sweeps` | `12` | `approximate_options.max_sweeps` |
+| `autoparallel_approx_max_time_s` | `60.0` | `approximate_options.max_time_s` |
+| `autoparallel_approx_star_passes` | `2` | `approximate_options.star_passes` |
+| `autoparallel_approx_max_star_children` | `32` | `approximate_options.max_star_children` |
+| `autoparallel_approx_group_domain_limit` | `512` | `approximate_options.group_domain_limit` |
+
+`autoparallel_placements_save_path` and `autoparallel_placements_load_path` retain the prior placement JSON behavior and are mutually exclusive. Approximate-only options are forwarded only when `autoparallel_solver = "approx"`. The integration deliberately does not expose `dynamic`, `cost_model`, repeated-subgraph handling, graph adapters, constraints, or lowering hooks as campaign knobs.
 
 ## Campaign format
 

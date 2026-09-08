@@ -109,6 +109,53 @@ class CampaignTests(unittest.TestCase):
             ],
         )
 
+    def test_autoparallel_solver_argument_rendering(self) -> None:
+        self.assertEqual(
+            settings_to_argv(
+                {
+                    "compile.autoparallel_solver": "approx",
+                    "compile.autoparallel_fast_build": False,
+                    "compile.autoparallel_lazy_costs": "eager",
+                    "compile.autoparallel_strategy_radius": 1,
+                    "compile.autoparallel_optimality_check": True,
+                    "compile.autoparallel_approx_candidate_limit": 64,
+                    "compile.autoparallel_approx_bp_iters": 80,
+                    "compile.autoparallel_approx_bp_tol": 0.002,
+                    "compile.autoparallel_approx_max_sweeps": 6,
+                    "compile.autoparallel_approx_max_time_s": 30.0,
+                    "compile.autoparallel_approx_star_passes": 3,
+                    "compile.autoparallel_approx_max_star_children": 16,
+                    "compile.autoparallel_approx_group_domain_limit": 256,
+                }
+            ),
+            [
+                "--compile.autoparallel-approx-bp-iters",
+                "80",
+                "--compile.autoparallel-approx-bp-tol",
+                "0.002",
+                "--compile.autoparallel-approx-candidate-limit",
+                "64",
+                "--compile.autoparallel-approx-group-domain-limit",
+                "256",
+                "--compile.autoparallel-approx-max-star-children",
+                "16",
+                "--compile.autoparallel-approx-max-sweeps",
+                "6",
+                "--compile.autoparallel-approx-max-time-s",
+                "30.0",
+                "--compile.autoparallel-approx-star-passes",
+                "3",
+                "--compile.no-autoparallel-fast-build",
+                "--compile.autoparallel-lazy-costs",
+                "eager",
+                "--compile.autoparallel-optimality-check",
+                "--compile.autoparallel-solver",
+                "approx",
+                "--compile.autoparallel-strategy-radius",
+                "1",
+            ],
+        )
+
     def test_parity_rejects_undeclared_difference(self) -> None:
         with self.assertRaisesRegex(CampaignError, "outside declared"):
             validate_pair(
