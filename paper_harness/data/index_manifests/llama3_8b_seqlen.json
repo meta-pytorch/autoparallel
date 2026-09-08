@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "kind": "deterministic_stream_index_schedule",
+  "dataset": "allenai/c4",
+  "revision": "1588ec454efa1a09f29cd18ddd04fe05fc8653a2",
+  "rank_to_shard": "dp_rank with dp_world_size 4",
+  "preloaded_batches_per_dp_rank": 10,
+  "measured_batch_schedule": "zero-based step modulo 10",
+  "sequence_lengths": [2048, 4096, 8192, 16384, 32768],
+  "tokenization": "pinned LLaMA tokenizer",
+  "timed_loop_tensor_hashing": false,
+  "timed_loop_manifest_io": false
+}

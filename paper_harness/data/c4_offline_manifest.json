@@ -1,0 +1,88 @@
+{
+  "repo_id": "allenai/c4",
+  "revision": "1588ec454efa1a09f29cd18ddd04fe05fc8653a2",
+  "repo_type": "dataset",
+  "files": [
+    {
+      "path": "en/c4-train.00000-of-01024.json.gz",
+      "size": 319308785,
+      "sha256": "8ef8d75b0e045dec4aa5123a671b4564466b0707086a7ed1ba8721626dfffbc9"
+    },
+    {
+      "path": "en/c4-train.00001-of-01024.json.gz",
+      "size": 318039285,
+      "sha256": "b945059cd1a343cabe311881b7840a6f0363f570e745a0eff0e687e266f6b55d"
+    },
+    {
+      "path": "en/c4-train.00002-of-01024.json.gz",
+      "size": 319748667,
+      "sha256": "2967dc7e587ced6ecb9ba617ad2d4c44901467969de5bf5b0f5a9e5b70555d75"
+    },
+    {
+      "path": "en/c4-train.00003-of-01024.json.gz",
+      "size": 318564193,
+      "sha256": "b79d9abef5741578929be0d59db9ca652a8276207ef18a944b7a5f11fef5beb6"
+    },
+    {
+      "path": "en/c4-train.00004-of-01024.json.gz",
+      "size": 318579884,
+      "sha256": "cd9f98eac2bc6062f55d9a36bd744cc924a78ea2fd998830e0034e4456f5d014"
+    },
+    {
+      "path": "en/c4-train.00005-of-01024.json.gz",
+      "size": 318003681,
+      "sha256": "8ac5907a54dbc7ab9c14624448c7c3f6afed33af9d0a855f1eae955e62e255b9"
+    },
+    {
+      "path": "en/c4-train.00006-of-01024.json.gz",
+      "size": 318495137,
+      "sha256": "8fd9b9a4b74c9414466b245ebda7db041e7bd8603971de51b5db782bd758aac7"
+    },
+    {
+      "path": "en/c4-train.00007-of-01024.json.gz",
+      "size": 318417273,
+      "sha256": "41dd377a1ba6b72eab0260c39c626fe45ab6b649d42d57b311d3ba21a0337cd0"
+    },
+    {
+      "path": "en/c4-train.00008-of-01024.json.gz",
+      "size": 318131845,
+      "sha256": "64da652c235f089a0b52f6db5883ef5f1e9c31edc4c950332b34dd12439c99a5"
+    },
+    {
+      "path": "en/c4-train.00009-of-01024.json.gz",
+      "size": 318185592,
+      "sha256": "807a548efbb10153c9eff0df5733a97a1b51ab1743242530de1b02a8ea17ace7"
+    },
+    {
+      "path": "en/c4-train.00010-of-01024.json.gz",
+      "size": 319045292,
+      "sha256": "3bd0f6f664069c3bd964ce48ceae60ba47b55b54745a4b00c207bdb3a1926b17"
+    },
+    {
+      "path": "en/c4-train.00011-of-01024.json.gz",
+      "size": 319686980,
+      "sha256": "5baa0c010083459ba58e34b4e93bb758caa878f7db6fba0528921329fa1a6cc5"
+    },
+    {
+      "path": "en/c4-train.00012-of-01024.json.gz",
+      "size": 320119088,
+      "sha256": "fdee7442c06856e2c4b7665cc51978e9011b5e0a2112c30dd15bc9e53818842d"
+    },
+    {
+      "path": "en/c4-train.00013-of-01024.json.gz",
+      "size": 319474856,
+      "sha256": "a4ab3b24087781c3577945492525696e182ffd7ca5265b958f49803a02867ecf"
+    },
+    {
+      "path": "en/c4-train.00014-of-01024.json.gz",
+      "size": 319693210,
+      "sha256": "62215b2451e71b117018ef73570c944aff890624b384c538950b64c37f184c49"
+    },
+    {
+      "path": "en/c4-train.00015-of-01024.json.gz",
+      "size": 318427305,
+      "sha256": "9893c9f413a1223e7b535527829bcd6df3219929fb1abf8f2a114dd8f6ea0919"
+    }
+  ],
+  "total_bytes": 5101921073
+}

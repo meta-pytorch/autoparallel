@@ -1,0 +1,137 @@
+schema_version = 1
+name = "llama3-8b-apgt-seqlen-fresh-vs-2k"
+description = "Canonical AP+GT sequence-length sweep, fresh solve versus canonical-2K placement"
+workload = "llama3_8b_seqlen"
+
+[sources.torchtitan]
+remote = "https://github.com/AlbedoWang/torchtitan.git"
+commit = "8eec9e6ffd22b881adc96e7dddea66f2ff12b4ab"
+dirty_policy = "forbid"
+
+[sources.autoparallel]
+remote = "https://github.com/meta-pytorch/autoparallel.git"
+commit = "b8ace2a55d465787840aa41466f50be4fd9f73c1"
+dirty_policy = "forbid"
+
+[model]
+flavor = "8B"
+attention_backend = "sdpa"
+
+[data]
+mode = "streaming"
+identity = "index_manifest"
+dataset = "allenai/c4"
+revision = "1588ec454efa1a09f29cd18ddd04fe05fc8653a2"
+identity_manifest = "{harness}/data/index_manifests/llama3_8b_seqlen.json"
+identity_manifest_sha256 = "096e7c916f929de31673c58bc5df808e59b0e028e0cdc169626470d026f29d4f"
+
+[training]
+local_batch_size = 2
+global_batch_size = 8
+seq_len = 2048
+
+[parallelism]
+data_parallel_replicate_degree = 1
+data_parallel_shard_degree = 4
+tensor_parallel_degree = 8
+context_parallel_degree = 1
+pipeline_parallel_degree = 1
+
+[comparison]
+declared_variable = "autoparallel_fresh_solve_vs_canonical_2k_placement_replay"
+allowed_config_paths = []
+allowed_environment_keys = ["AP_STRATEGY_MODE", "EXPERIMENT_ARM"]
+pairs = [["fresh", "replay_2k"]]
+
+[mast]
+nodes = 4
+nproc_per_node = 8
+hardware = "grandteton_80g_roce"
+locality = "dc;pci1"
+gpu_name_contains = "H100"
+conda_fbpkg = "torchtitan_conda_prod:902"
+retries = 0
+master_port = 29500
+phase_timeout_seconds = 7200
+
+[mast.environment]
+BENCHMARK_WORLD_SIZE = "32"
+BENCHMARK_TP_DEGREE = "8"
+BENCHMARK_SEQ_LEN = "2048"
+BENCHMARK_CONFIGURATION = "autoparallel_graphtrainer"
+AP_CANONICAL_PLACEMENT = "{asset:canonical_2k}/canonical_2k.json"
+EXPECTED_CANONICAL_SHA256 = "2db48469d247bd9d547044b67c49b06c87ffa3c1c6426d0fcfe68586f128f0c2"
+C4_SHARD_ROOT = "{asset:offline_c4}"
+LLAMA_TOKENIZER_DIR = "{asset:llama_tokenizer}"
+FIXED_REPLAY_BATCHES = "10"
+AP_COLLECTIVE_MUST_SAVE_EXPECTATION = "off"
+HF_HUB_OFFLINE = "1"
+HF_DATASETS_OFFLINE = "1"
+HF_HUB_DISABLE_XET = "1"
+PYTORCH_ALLOC_CONF = "expandable_segments:True"
+
+[artifacts]
+required_assets = ["canonical_2k", "offline_c4", "llama_tokenizer"]
+warmup_steps = 5
+
+[legacy]
+instrumentation_note = "Historical runs hashed and appended each yielded batch; imported end-to-end latency retains that overhead."
+evidence_globs = ["reports/final/*.md", "reports/final/*.json"]
+
+[[arms]]
+name = "fresh"
+profile = "apgt_v1"
+module = "workloads.llama3_seqlen.perf_configs"
+config = "autoparallel_graphtrainer_seqlen_8b"
+[arms.environment]
+AP_STRATEGY_MODE = "fresh"
+EXPERIMENT_ARM = "fresh"
+
+[[arms]]
+name = "replay_2k"
+profile = "apgt_v1"
+module = "workloads.llama3_seqlen.perf_configs"
+config = "autoparallel_graphtrainer_seqlen_8b"
+[arms.environment]
+AP_STRATEGY_MODE = "replay_2k"
+EXPERIMENT_ARM = "replay_2k"
+
+[[phases]]
+name = "performance"
+kind = "performance"
+arms = ["fresh", "replay_2k"]
+[phases.overrides]
+"training.steps" = 25
+"profiler.enable_profiling" = false
+"profiler.enable_memory_snapshot" = false
+"metrics.log_freq" = 5
+
+[[matrix.points]]
+name = "2k"
+[matrix.points.settings]
+"training.seq_len" = 2048
+"mast.environment.BENCHMARK_SEQ_LEN" = "2048"
+
+[[matrix.points]]
+name = "4k"
+[matrix.points.settings]
+"training.seq_len" = 4096
+"mast.environment.BENCHMARK_SEQ_LEN" = "4096"
+
+[[matrix.points]]
+name = "8k"
+[matrix.points.settings]
+"training.seq_len" = 8192
+"mast.environment.BENCHMARK_SEQ_LEN" = "8192"
+
+[[matrix.points]]
+name = "16k"
+[matrix.points.settings]
+"training.seq_len" = 16384
+"mast.environment.BENCHMARK_SEQ_LEN" = "16384"
+
+[[matrix.points]]
+name = "32k"
+[matrix.points.settings]
+"training.seq_len" = 32768
+"mast.environment.BENCHMARK_SEQ_LEN" = "32768"

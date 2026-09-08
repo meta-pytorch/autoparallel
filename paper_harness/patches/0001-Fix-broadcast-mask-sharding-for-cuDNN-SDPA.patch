@@ -1,0 +1,272 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Kaijian Wang <wangkj@meta.com>
+Date: Fri, 21 Aug 2026 01:55:44 -0700
+Subject: [PATCH] Fix broadcast mask sharding for cuDNN SDPA
+
+---
+ .../shardings/dtensor_sharding_helpers.py     |  65 +++++++-
+ tests/test_propagation_rules.py               | 151 +++++++++++++++++-
+ 2 files changed, 212 insertions(+), 4 deletions(-)
+
+diff --git a/autoparallel/shardings/dtensor_sharding_helpers.py b/autoparallel/shardings/dtensor_sharding_helpers.py
+index b2ec50d..44bab0f 100644
+--- a/autoparallel/shardings/dtensor_sharding_helpers.py
++++ b/autoparallel/shardings/dtensor_sharding_helpers.py
+@@ -249,11 +249,71 @@ def _try_single_dim_strategy(
+     if single_dim_info is None:
+         return None
+ 
++    from torch.distributed.tensor._dtensor_spec import TensorMeta
+     from torch.distributed.tensor._ops.single_dim_strategy import (
+         _insert_single_dim_replication_strategy,
+         _ShardingPlaceholder,
+     )
+-    from torch.distributed.tensor._ops.utils import expand_to_full_mesh_op_strategy
++    from torch.distributed.tensor._ops.utils import (
++        expand_to_full_mesh_op_strategy,
++        infer_broadcast_dims_map,
++        map_placements_after_broadcast,
++    )
++
++    def _project_cudnn_attn_bias_placements(
++        strategies: list[list[Placement | _ShardingPlaceholder | None]],
++        num_outputs: int,
++    ) -> None:
++        """Project score-domain sharding onto a broadcast attention bias."""
++        cudnn_sdpa_ops = (
++            aten._scaled_dot_product_cudnn_attention.default,
++            aten._scaled_dot_product_cudnn_attention_backward.default,
++        )
++        if op not in cudnn_sdpa_ops:
++            return
++
++        arg_indices = {
++            argument.name: index for index, argument in enumerate(op._schema.arguments)
++        }
++        query_index = arg_indices["query"]
++        key_index = arg_indices["key"]
++        bias_index = arg_indices["attn_bias"]
++        if bias_index >= len(op_schema.args_schema) or not isinstance(
++            op_schema.args_schema[bias_index], OpStrategy
++        ):
++            return
++
++        args_meta = op_schema.args_meta
++        query_meta = args_meta[query_index]
++        key_meta = args_meta[key_index]
++        bias_meta = args_meta[bias_index]
++        if (
++            not isinstance(query_meta, TensorMeta)
++            or not isinstance(key_meta, TensorMeta)
++            or not isinstance(bias_meta, TensorMeta)
++        ):
++            return
++
++        score_shape = torch.Size((*query_meta.shape[:-1], key_meta.shape[-2]))
++        broadcast_dims_map = infer_broadcast_dims_map(score_shape, bias_meta.shape)
++        bias_input_index = sum(
++            isinstance(arg, OpStrategy) for arg in op_schema.args_schema[:bias_index]
++        )
++        bias_placement_index = num_outputs + bias_input_index
++
++        for strategy in strategies:
++            placement = strategy[bias_placement_index]
++            if not isinstance(placement, (_ShardingPlaceholder, Shard)):
++                continue
++            mapped = map_placements_after_broadcast(
++                (Shard(placement.dim),), score_shape, broadcast_dims_map
++            )[0]
++            strategy[bias_placement_index] = (
++                _ShardingPlaceholder(mapped.dim)
++                if isinstance(placement, _ShardingPlaceholder)
++                and isinstance(mapped, Shard)
++                else mapped
++            )
+ 
+     mesh = op_schema.args_strategy[0].mesh
+ 
+@@ -281,8 +341,6 @@ def _try_single_dim_strategy(
+     # using shard types found in the runtime input placements. Since autoparallel
+     # explores all placements (not a single runtime one), we always resolve
+     # _ShardingPlaceholder(d) -> Shard(d).
+-    from torch.distributed.tensor._dtensor_spec import TensorMeta
+-
+     if out_tensor_meta is None:
+         num_outputs = 0
+     elif isinstance(out_tensor_meta, TensorMeta):
+@@ -294,6 +352,7 @@ def _try_single_dim_strategy(
+     strategies = _insert_single_dim_replication_strategy(
+         strategies, num_outputs, num_inputs
+     )
++    _project_cudnn_attn_bias_placements(strategies, num_outputs)
+     resolved: list[list[Placement | None]] = []
+     for s in strategies:
+         resolved.append(
+diff --git a/tests/test_propagation_rules.py b/tests/test_propagation_rules.py
+index 571aa70..1db4cc5 100644
+--- a/tests/test_propagation_rules.py
++++ b/tests/test_propagation_rules.py
+@@ -3,13 +3,162 @@
+ # This source code is licensed under the BSD license found in the
+ # LICENSE file in the root directory of this source tree.
+ 
++import pytest
+ import torch
++from conftest import apply_cuda_patches
+ from torch import nn
+ from torch.distributed.fsdp import MixedPrecisionPolicy
+-from torch.distributed.tensor.placement_types import Shard
++from torch.distributed.tensor._dtensor_spec import DTensorSpec, TensorMeta
++from torch.distributed.tensor._op_schema import OpSpec, OpStrategy
++from torch.distributed.tensor.placement_types import Replicate, Shard
+ 
+ from autoparallel.api import AutoParallel
+ from autoparallel.compile import autoparallel_backend
++from autoparallel.shardings.placement_options import get_placement_options
++
++
++def _replicated_meta_input(mesh, shape, dtype=torch.bfloat16):
++    tensor = torch.empty(shape, dtype=dtype, device="meta")
++    tensor_meta = TensorMeta(tensor.shape, tensor.stride(), tensor.dtype)
++    spec = DTensorSpec(mesh, (Replicate(), Replicate()), tensor_meta=tensor_meta)
++    return tensor, OpStrategy([OpSpec(spec)])
++
++
++def _muse_cudnn_forward_options(mesh, bias_shape):
++    query, query_strategy = _replicated_meta_input(mesh, (8, 32, 8192, 128))
++    key, key_strategy = _replicated_meta_input(mesh, (8, 2, 8192, 128))
++    value, value_strategy = _replicated_meta_input(mesh, (8, 2, 8192, 128))
++    if bias_shape is None:
++        bias = bias_strategy = None
++    else:
++        bias, bias_strategy = _replicated_meta_input(mesh, bias_shape, torch.bool)
++
++    args = (query, key, value, bias, True, 0.0, False, False)
++    specs = (
++        query_strategy,
++        key_strategy,
++        value_strategy,
++        bias_strategy,
++        True,
++        0.0,
++        False,
++        False,
++    )
++    return get_placement_options(
++        mesh,
++        torch.ops.aten._scaled_dot_product_cudnn_attention.default,
++        specs,
++        args,
++        {"scale": 128**-0.5},
++    )
++
++
++def _find_muse_dp_tp_head_strategy(options):
++    placement = (Shard(0), Shard(1))
++    return [
++        strategy
++        for strategy in options.strategies
++        if all(spec.placements == placement for spec in strategy.input_specs[:3])
++    ]
++
++
++@apply_cuda_patches
++@pytest.mark.parametrize(
++    "bias_shape,expected_bias_placement",
++    [
++        ((8, 1, 8192, 8192), (Shard(0), Replicate())),
++        ((8, 32, 8192, 8192), (Shard(0), Shard(1))),
++        ((8192, 8192), (Replicate(), Replicate())),
++        (None, None),
++    ],
++)
++def test_cudnn_sdpa_projects_score_sharding_onto_broadcast_bias(
++    bias_shape, expected_bias_placement
++):
++    mesh = torch.distributed.device_mesh.init_device_mesh(
++        "cuda", (8, 2), mesh_dim_names=("dp", "tp")
++    )
++    matches = _find_muse_dp_tp_head_strategy(
++        _muse_cudnn_forward_options(mesh, bias_shape)
++    )
++
++    assert len(matches) == 1
++    strategy = matches[0]
++    if expected_bias_placement is None:
++        assert len(strategy.input_specs) == 3
++    else:
++        assert strategy.input_specs[3].placements == expected_bias_placement
++    assert strategy.output_specs[0].placements == (Shard(0), Shard(1))
++
++
++@apply_cuda_patches
++def test_cudnn_sdpa_backward_projects_broadcast_bias():
++    mesh = torch.distributed.device_mesh.init_device_mesh(
++        "cuda", (8, 2), mesh_dim_names=("dp", "tp")
++    )
++    input_shapes_and_dtypes = [
++        ((8, 32, 8192, 128), torch.bfloat16),  # grad_out
++        ((8, 32, 8192, 128), torch.bfloat16),  # query
++        ((8, 2, 8192, 128), torch.bfloat16),  # key
++        ((8, 2, 8192, 128), torch.bfloat16),  # value
++        ((8, 32, 8192, 128), torch.bfloat16),  # output
++        ((8, 32, 8192, 1), torch.float32),  # logsumexp
++        ((), torch.int64),  # philox_seed
++        ((), torch.int64),  # philox_offset
++        ((8, 1, 8192, 8192), torch.bool),  # attn_bias
++    ]
++    inputs = [
++        _replicated_meta_input(mesh, shape, dtype)
++        for shape, dtype in input_shapes_and_dtypes
++    ]
++    args = tuple(tensor for tensor, _ in inputs) + (
++        None,
++        None,
++        8192,
++        8192,
++        0.0,
++        False,
++    )
++    specs = tuple(strategy for _, strategy in inputs) + (
++        None,
++        None,
++        8192,
++        8192,
++        0.0,
++        False,
++    )
++    options = get_placement_options(
++        mesh,
++        torch.ops.aten._scaled_dot_product_cudnn_attention_backward.default,
++        specs,
++        args,
++        {"scale": 128**-0.5},
++    )
++
++    matches = _find_muse_dp_tp_head_strategy(options)
++    assert len(matches) == 1
++    strategy = matches[0]
++    assert all(
++        spec.placements == (Shard(0), Shard(1)) for spec in strategy.input_specs[:6]
++    )
++    assert all(
++        spec.placements == (Replicate(), Replicate())
++        for spec in strategy.input_specs[6:8]
++    )
++    assert strategy.input_specs[8].placements == (Shard(0), Replicate())
++    assert all(
++        spec.placements == (Shard(0), Shard(1)) for spec in strategy.output_specs
++    )
++
++
++@apply_cuda_patches
++def test_cudnn_sdpa_rejects_tp_larger_than_kv_heads():
++    mesh = torch.distributed.device_mesh.init_device_mesh(
++        "cuda", (8, 4), mesh_dim_names=("dp", "tp")
++    )
++    options = _muse_cudnn_forward_options(mesh, (8, 1, 8192, 8192))
++
++    assert not _find_muse_dp_tp_head_strategy(options)
+ 
+ 
+ def test_permute_layernorm_stride_handling(device_mesh_1d):

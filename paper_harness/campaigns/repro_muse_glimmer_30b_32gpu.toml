@@ -1,0 +1,144 @@
+schema_version = 1
+name = "muse-glimmer-30b-manual-vs-apgt-repro-32gpu"
+description = "32-GPU reproduction of Muse Glimmer GraphTrainer manual versus AutoParallel"
+workload = "muse_glimmer_30b_sdpa"
+
+[sources.torchtitan]
+remote = "https://github.com/AlbedoWang/torchtitan.git"
+commit = "c59ce51a6fc4f2340d320fe914a7c2049b747c8f"
+dirty_policy = "forbid"
+
+[sources.autoparallel]
+remote = "https://github.com/meta-pytorch/autoparallel.git"
+commit = "570bf07207e7257267498f9db7af34dcafdc0d7a"
+dirty_policy = "forbid"
+
+[model]
+flavor = "30B"
+attention_backend = "packed_document_cudnn_sdpa"
+
+[data]
+mode = "streaming"
+identity = "batch_hash_manifest"
+dataset = "allenai/c4"
+revision = "1588ec454efa1a09f29cd18ddd04fe05fc8653a2"
+identity_manifest = "{asset:muse_input_manifests}/c4_input_manifest_lb2_s4096_dp16.jsonl"
+identity_manifest_sha256 = "11a5a5e9ac2f706ae9428a6ffb3e4fcc1a56e9ce270f092d9704b56aff9cf934"
+preflight_auditor = "workloads.muse_glimmer.input_preflight"
+
+[training]
+local_batch_size = 2
+global_batch_size = -1
+seq_len = 4096
+
+[parallelism]
+data_parallel_replicate_degree = 1
+data_parallel_shard_degree = 16
+tensor_parallel_degree = 2
+context_parallel_degree = 1
+pipeline_parallel_degree = 1
+
+[comm]
+init_timeout_seconds = 1800
+
+[compile]
+enable = true
+backend = "aot_eager"
+components = ["model", "loss"]
+mode = "aot_fx_trace"
+memory_policy = "eager"
+inductor_compilation = "full"
+numerics_changing_optim = false
+disable_passes = ["cudagraph_pass"]
+enable_fsdp_ag_rs_overlap = false
+enable_fsdp_dense_region_overlap = false
+use_autoparallel_defaults = true
+
+[comparison]
+declared_variable = "manual_vs_autoparallel_parallelization_and_scheduler"
+allowed_config_paths = ["compile.enable_autoparallel"]
+pairs = [["gt_manual", "apgt"]]
+
+[comparison.acceptance]
+metric = "primary_latency"
+baseline = "gt_manual"
+treatment = "apgt"
+reference_gap_percent = 0.7818266337
+tolerance_percentage_points = 2.0
+
+[measurement.primary]
+source = "tensorboard"
+steps = [10, 15, 20, 25]
+rank_selector = "rank0"
+value = "time_metrics/end_to_end(s)"
+unit_scale_to_ms = 1000
+throughput_tag = "throughput(tps)"
+active_memory_tag = "memory/max_active(GiB)"
+reserved_memory_tag = "memory/max_reserved(GiB)"
+
+[mast]
+nodes = 4
+nproc_per_node = 8
+hardware = "grandteton_80g_roce"
+locality = "dc;pci1"
+gpu_name_contains = "H100"
+conda_fbpkg = "torchtitan_conda_prod:902"
+retries = 0
+master_port = 29500
+phase_timeout_seconds = 7200
+
+[mast.environment]
+HF_HUB_CACHE = "{asset:c4_hf_cache}"
+HF_HUB_OFFLINE = "1"
+HF_DATASETS_OFFLINE = "1"
+HF_HUB_DISABLE_XET = "1"
+PYTORCH_ALLOC_CONF = "expandable_segments:True"
+
+[artifacts]
+required_assets = ["muse_glimmer", "muse_input_manifests", "c4_hf_cache"]
+warmup_steps = 5
+
+[[arms]]
+name = "gt_manual"
+profile = "gt_manual_aot_v1"
+module = "graph_trainer.muse_glimmer"
+config = "graph_trainer_muse_glimmer_30b_sdpa_c4_4x2"
+args = ["--hf-assets-path", "{asset:muse_glimmer}"]
+[arms.overrides]
+"compile.enable_autoparallel" = false
+
+[[arms]]
+name = "apgt"
+profile = "apgt_v1"
+module = "graph_trainer.muse_glimmer"
+config = "graph_trainer_muse_glimmer_30b_sdpa_c4_autoparallel_4x2"
+args = ["--hf-assets-path", "{asset:muse_glimmer}"]
+[arms.overrides]
+"compile.enable_autoparallel" = true
+
+[[phases]]
+name = "performance"
+kind = "performance"
+arms = ["gt_manual", "apgt"]
+[phases.overrides]
+"training.steps" = 25
+"profiler.enable_profiling" = false
+"profiler.enable_memory_snapshot" = false
+"metrics.enable_tensorboard" = true
+"metrics.log_freq" = 5
+
+[[phases]]
+name = "trace"
+kind = "trace"
+arms = ["gt_manual", "apgt"]
+trace_ranks = [0]
+[phases.overrides]
+"training.steps" = 6
+"profiler.enable_profiling" = true
+"profiler.enable_memory_snapshot" = false
+"profiler.profile_freq" = 6
+"profiler.profiler_warmup" = 0
+"profiler.profiler_active" = 3
+"profiler.profiler_repeat" = 1
+"metrics.enable_tensorboard" = true
+"metrics.log_freq" = 1

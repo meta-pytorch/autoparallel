@@ -1,0 +1,173 @@
+schema_version = 1
+name = "llama3-8b-apgt-4k-fresh-vs-2k-replay-repro-32gpu"
+description = "32-GPU 4K reproduction of fresh solve versus canonical-2K placement replay"
+workload = "llama3_8b_seqlen"
+
+[sources.torchtitan]
+remote = "https://github.com/AlbedoWang/torchtitan.git"
+commit = "8eec9e6ffd22b881adc96e7dddea66f2ff12b4ab"
+dirty_policy = "forbid"
+
+[sources.autoparallel]
+remote = "https://github.com/meta-pytorch/autoparallel.git"
+commit = "b8ace2a55d465787840aa41466f50be4fd9f73c1"
+dirty_policy = "forbid"
+
+[model]
+flavor = "8B"
+attention_backend = "sdpa"
+
+[data]
+mode = "streaming"
+identity = "batch_hash_manifest"
+dataset = "allenai/c4"
+revision = "1588ec454efa1a09f29cd18ddd04fe05fc8653a2"
+identity_manifest = "{harness}/data/input_manifests/llama3_8b_seqlen_4k_dp4.jsonl"
+identity_manifest_sha256 = "bd8cb20bc325687e266eae088fd19aa4384d1b9d1659e4c6fed64e13b9a1e6fd"
+preflight_auditor = "workloads.llama3_seqlen.input_preflight"
+
+[training]
+local_batch_size = 2
+global_batch_size = 8
+seq_len = 4096
+
+[parallelism]
+data_parallel_replicate_degree = 1
+data_parallel_shard_degree = 4
+tensor_parallel_degree = 8
+context_parallel_degree = 1
+pipeline_parallel_degree = 1
+
+[comm]
+init_timeout_seconds = 1200
+
+[comparison]
+declared_variable = "autoparallel_fresh_solve_vs_canonical_2k_placement_replay"
+allowed_config_paths = []
+allowed_environment_keys = ["AP_STRATEGY_MODE", "EXPERIMENT_ARM"]
+pairs = [["replay_2k", "fresh"]]
+
+[comparison.performance_phase_by_arm]
+fresh = "00_fresh_measure"
+replay_2k = "02_replay_2k_measure"
+
+[comparison.acceptance]
+metric = "primary_latency"
+baseline = "replay_2k"
+treatment = "fresh"
+# Recomputed from the historical rank-0 TensorBoard end-to-end windows at the
+# same steps.  The legacy +5.012% post-fetch metric excluded timed-path input
+# hashing/file I/O and is retained only in the immutable historical report.
+reference_gap_percent = 2.7157989308851604
+tolerance_percentage_points = 2.0
+
+[measurement.primary]
+source = "tensorboard"
+steps = [10, 15, 20, 25]
+rank_selector = "rank0"
+value = "time_metrics/end_to_end(s)"
+unit_scale_to_ms = 1000
+throughput_tag = "throughput(tps)"
+active_memory_tag = "memory/max_active(GiB)"
+reserved_memory_tag = "memory/max_reserved(GiB)"
+
+[mast]
+nodes = 4
+nproc_per_node = 8
+hardware = "grandteton_80g_roce"
+locality = "dc;pci1"
+gpu_name_contains = "H100"
+conda_fbpkg = "torchtitan_conda_prod:902"
+retries = 0
+master_port = 29500
+phase_timeout_seconds = 7200
+
+[mast.environment]
+BENCHMARK_WORLD_SIZE = "32"
+BENCHMARK_TP_DEGREE = "8"
+BENCHMARK_SEQ_LEN = "4096"
+BENCHMARK_CONFIGURATION = "autoparallel_graphtrainer"
+AP_CANONICAL_PLACEMENT = "{asset:canonical_2k}/canonical_2k.json"
+EXPECTED_CANONICAL_SHA256 = "2db48469d247bd9d547044b67c49b06c87ffa3c1c6426d0fcfe68586f128f0c2"
+C4_SHARD_ROOT = "{asset:offline_c4}"
+LLAMA_TOKENIZER_DIR = "{asset:llama_tokenizer}"
+FIXED_REPLAY_BATCHES = "10"
+AP_COLLECTIVE_MUST_SAVE_EXPECTATION = "off"
+HF_HUB_OFFLINE = "1"
+HF_DATASETS_OFFLINE = "1"
+HF_HUB_DISABLE_XET = "1"
+PYTORCH_ALLOC_CONF = "expandable_segments:True"
+
+[artifacts]
+required_assets = ["canonical_2k", "offline_c4", "llama_tokenizer"]
+warmup_steps = 5
+
+[[arms]]
+name = "fresh"
+profile = "apgt_v1"
+module = "workloads.llama3_seqlen.perf_configs"
+config = "autoparallel_graphtrainer_seqlen_8b"
+[arms.environment]
+AP_STRATEGY_MODE = "fresh"
+EXPERIMENT_ARM = "fresh"
+
+[[arms]]
+name = "replay_2k"
+profile = "apgt_v1"
+module = "workloads.llama3_seqlen.perf_configs"
+config = "autoparallel_graphtrainer_seqlen_8b"
+[arms.environment]
+AP_STRATEGY_MODE = "replay_2k"
+EXPERIMENT_ARM = "replay_2k"
+
+[[phases]]
+name = "00_fresh_measure"
+kind = "performance"
+arms = ["fresh"]
+[phases.overrides]
+"training.steps" = 25
+"profiler.enable_profiling" = false
+"profiler.enable_memory_snapshot" = false
+"metrics.log_freq" = 5
+
+[[phases]]
+name = "01_fresh_trace"
+kind = "trace"
+arms = ["fresh"]
+trace_ranks = [0]
+[phases.overrides]
+"training.steps" = 25
+"profiler.enable_profiling" = true
+"profiler.enable_memory_snapshot" = false
+"profiler.profile_freq" = 25
+"profiler.profiler_warmup" = 0
+"profiler.profiler_active" = 3
+"profiler.profiler_repeat" = 1
+"metrics.log_freq" = 5
+"compile.debug_graph_passes" = true
+
+[[phases]]
+name = "02_replay_2k_measure"
+kind = "performance"
+arms = ["replay_2k"]
+[phases.overrides]
+"training.steps" = 25
+"profiler.enable_profiling" = false
+"profiler.enable_memory_snapshot" = false
+"metrics.log_freq" = 5
+
+[[phases]]
+name = "03_replay_2k_trace"
+kind = "trace"
+arms = ["replay_2k"]
+trace_ranks = [0]
+[phases.overrides]
+"training.steps" = 25
+"profiler.enable_profiling" = true
+"profiler.enable_memory_snapshot" = false
+"profiler.profile_freq" = 25
+"profiler.profiler_warmup" = 0
+"profiler.profiler_active" = 3
+"profiler.profiler_repeat" = 1
+"metrics.log_freq" = 5
+"compile.debug_graph_passes" = true

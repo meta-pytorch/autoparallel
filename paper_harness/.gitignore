@@ -1,0 +1,30 @@
+**/__pycache__/
+**/*.pyc
+**/.pytest_cache/
+**/.ruff_cache/
+**/.mypy_cache/
+**/.fbpkg.tmp/
+**/.venv/
+**/tools/oilfs/
+
+# External source and data payloads.
+**/source/
+**/runner/assets/
+**/c4_hf_cache/
+
+# Submission and result artifacts.
+**/job/
+**/artifacts/
+**/reports/
+**/analysis/*/
+**/analysis/*.json
+**/analysis/*.md
+**/analysis/*.log
+**/analysis/*.returncode
+**/preflight/*.log
+**/preflight/*.stdout
+**/preflight/*.stderr
+**/preflight/*.returncode
+**/preflight/local_*/
+**/preflight/serialized_configs/
+**/preflight/native_serialized_configs_v1/

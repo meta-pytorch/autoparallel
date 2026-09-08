@@ -1,0 +1,133 @@
+schema_version = 1
+name = "deepseek-v3-16b-tt-main-vs-apgt"
+description = "DeepSeek V3 16B permanent-harness functional/performance template"
+workload = "deepseek_v3_16b"
+
+[sources.torchtitan]
+remote = "https://github.com/AlbedoWang/torchtitan.git"
+commit = "f75694db12e8200126d3fbeccea647e3c54c7ba4"
+dirty_policy = "forbid"
+
+[sources.autoparallel]
+remote = "https://github.com/meta-pytorch/autoparallel.git"
+commit = "b6865e7ce874c08e548177a78d2c96f21b65fa36"
+dirty_policy = "forbid"
+
+[model]
+flavor = "16B"
+attention_backend = "sdpa"
+
+[data]
+mode = "streaming"
+identity = "index_manifest"
+dataset = "allenai/c4"
+revision = "1588ec454efa1a09f29cd18ddd04fe05fc8653a2"
+identity_manifest = "{harness}/data/index_manifests/deepseek_v3_16b.json"
+identity_manifest_sha256 = "5b385bdd7478ecdc2578ff9627d2aa9f30c715ba760608f9134305944f8af2cc"
+
+[training]
+local_batch_size = 4
+global_batch_size = 64
+seq_len = 4096
+
+[parallelism]
+data_parallel_replicate_degree = 1
+data_parallel_shard_degree = 16
+tensor_parallel_degree = 1
+context_parallel_degree = 1
+pipeline_parallel_degree = 1
+
+[comparison]
+declared_variable = "training_parallelization_compile_stack"
+allowed_config_paths = ["compile.*", "model_spec.name"]
+allowed_environment_keys = ["BENCHMARK_CONFIGURATION", "EXPERIMENT_ARM"]
+pairs = [["tt_main", "apgt"]]
+
+[mast]
+nodes = 2
+nproc_per_node = 8
+hardware = "grandteton_80g_roce"
+locality = "dc;pci1"
+gpu_name_contains = "H100"
+conda_fbpkg = "torchtitan_conda_prod:902"
+retries = 0
+master_port = 29500
+phase_timeout_seconds = 7200
+
+[mast.environment]
+BENCHMARK_WORLD_SIZE = "16"
+BENCHMARK_EP_DEGREE = "8"
+C4_SHARD_ROOT = "{asset:offline_c4}/en"
+DEEPSEEK_TOKENIZER_DIR = "{asset:deepseek_tokenizer}"
+FIXED_REPLAY_BATCHES = "10"
+AP_COLLECTIVE_MUST_SAVE_EXPECTATION = "off"
+HF_HUB_OFFLINE = "1"
+HF_DATASETS_OFFLINE = "1"
+PYTORCH_ALLOC_CONF = "expandable_segments:True"
+
+[artifacts]
+required_assets = ["offline_c4", "deepseek_tokenizer"]
+warmup_steps = 5
+
+[legacy]
+instrumentation_note = "The old four-arm runner hashed and appended each yielded batch; no valid final comparison was produced."
+evidence_globs = ["reports/*.md", "reports/*.json"]
+
+[[arms]]
+name = "tt_main"
+profile = "tt_main_manual_jit_v1"
+module = "workloads.deepseek_v3.perf_configs"
+config = "torchtitan_baseline_16b"
+[arms.environment]
+BENCHMARK_CONFIGURATION = "torchtitan_baseline"
+EXPERIMENT_ARM = "T"
+
+[[arms]]
+name = "apgt"
+profile = "apgt_v1"
+module = "workloads.deepseek_v3.perf_configs"
+config = "autoparallel_graphtrainer_full_inductor_16b"
+[arms.environment]
+BENCHMARK_CONFIGURATION = "autoparallel_graphtrainer"
+EXPERIMENT_ARM = "G"
+
+[[phases]]
+name = "performance"
+kind = "performance"
+arms = ["tt_main", "apgt"]
+[phases.overrides]
+"training.steps" = 25
+"profiler.enable_profiling" = false
+"profiler.enable_memory_snapshot" = false
+"metrics.log_freq" = 5
+
+[[phases]]
+name = "trace"
+kind = "trace"
+arms = ["tt_main", "apgt"]
+trace_ranks = [0]
+[phases.overrides]
+"training.steps" = 6
+"profiler.enable_profiling" = true
+"profiler.enable_memory_snapshot" = false
+"profiler.profile_freq" = 6
+"profiler.profiler_warmup" = 0
+"profiler.profiler_active" = 3
+"profiler.profiler_repeat" = 1
+"metrics.log_freq" = 1
+
+[[matrix.points]]
+name = "16gpu"
+[matrix.points.settings]
+"mast.nodes" = 2
+"parallelism.data_parallel_shard_degree" = 16
+"training.global_batch_size" = 64
+"mast.environment.BENCHMARK_WORLD_SIZE" = "16"
+
+[[matrix.points]]
+name = "32gpu"
+[matrix.points.settings]
+"mast.nodes" = 4
+"parallelism.data_parallel_shard_degree" = 32
+"training.global_batch_size" = 128
+"mast.environment.BENCHMARK_WORLD_SIZE" = "32"

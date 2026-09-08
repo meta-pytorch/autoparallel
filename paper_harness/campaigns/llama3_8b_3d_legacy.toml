@@ -1,0 +1,126 @@
+schema_version = 1
+name = "llama3-8b-3d-final-fairness-legacy"
+description = "Frozen final fair DP2 x CP2 x TP2 GraphTrainer manual/AP comparison"
+workload = "llama3_8b_3d_legacy"
+
+[sources.torchtitan]
+remote = "https://github.com/pytorch/torchtitan.git"
+commit = "3f0b04753a1603c13b64ce387a61028a3729322a"
+dirty_policy = "forbid"
+
+[sources.autoparallel]
+remote = "https://github.com/meta-pytorch/autoparallel.git"
+commit = "4b6c31bc1525c59ea999bdef390d308266cf7c01"
+dirty_policy = "forbid"
+
+[model]
+flavor = "8B"
+attention_backend = "flash_sdpa"
+
+[data]
+mode = "replay"
+identity = "manifest"
+dataset = "allenai/c4"
+revision = "1588ec454efa1a09f29cd18ddd04fe05fc8653a2"
+identity_manifest = "{asset:llama3_3d_replay}/manifest.json"
+identity_manifest_sha256 = "ce6443edb25565ae69db1f49f549d6ba25a2e2405923f23aa7503ee9a257ba78"
+
+[training]
+local_batch_size = 2
+global_batch_size = 4
+seq_len = 8192
+
+[parallelism]
+data_parallel_replicate_degree = 1
+data_parallel_shard_degree = 2
+tensor_parallel_degree = 2
+context_parallel_degree = 2
+pipeline_parallel_degree = 1
+
+[comparison]
+declared_variable = "manual_vs_autoparallel_3d_parallelization"
+allowed_config_paths = ["compile.enable_autoparallel", "compile.autoparallel_placements_save_path", "compile.autoparallel_placements_load_path"]
+allowed_environment_keys = ["BENCHMARK_ARM"]
+pairs = [["gt_manual_cp", "apgt_cp"]]
+
+[mast]
+nodes = 1
+nproc_per_node = 8
+hardware = "grandteton_80g_roce"
+locality = "dc;pci1"
+gpu_name_contains = "H100"
+conda_fbpkg = "torchtitan_conda_prod:902"
+retries = 0
+master_port = 29500
+phase_timeout_seconds = 7200
+
+[mast.environment]
+BENCHMARK_WORLD_SIZE = "8"
+BENCHMARK_DP_DEGREE = "2"
+BENCHMARK_CP_DEGREE = "2"
+BENCHMARK_TP_DEGREE = "2"
+BENCHMARK_LOCAL_BATCH_SIZE = "2"
+BENCHMARK_SEQ_LEN = "8192"
+BENCHMARK_AP_PLACEMENTS_MODE = "load"
+BENCHMARK_AP_PLACEMENTS_PATH = "{asset:llama3_3d_placements}/autoparallel_placements.json"
+BENCHMARK_REPLAY_ROOT = "{asset:llama3_3d_replay}"
+BENCHMARK_REPLAY_MANIFEST_SHA256 = "ce6443edb25565ae69db1f49f549d6ba25a2e2405923f23aa7503ee9a257ba78"
+BENCHMARK_SEED_CHECKPOINT = "{asset:llama3_3d_seed_checkpoint}"
+LLAMA_TOKENIZER_DIR = "{asset:llama_tokenizer}"
+PYTORCH_ALLOC_CONF = "expandable_segments:True"
+
+[artifacts]
+required_assets = ["llama3_3d_placements", "llama3_3d_replay", "llama3_3d_seed_checkpoint", "llama_tokenizer"]
+warmup_steps = 5
+
+[legacy]
+cross_profile_comparison_allowed = false
+evidence_globs = ["reports/final_report.md", "reports/final_report.json", "sources.lock.json"]
+
+[[arms]]
+name = "gt_manual_cp"
+profile = "gt_manual_cp_legacy_v1"
+module = "workloads.llama3_3d_legacy.config_registry"
+config = "graph_manual"
+[arms.environment]
+BENCHMARK_ARM = "graph_manual"
+
+[[arms]]
+name = "apgt_cp"
+profile = "apgt_cp_legacy_v1"
+module = "workloads.llama3_3d_legacy.config_registry"
+config = "graph_autoparallel"
+[arms.environment]
+BENCHMARK_ARM = "graph_autoparallel"
+
+[[phases]]
+name = "performance"
+kind = "performance"
+arms = ["gt_manual_cp", "apgt_cp"]
+[phases.environment]
+BENCHMARK_PHASE = "steady"
+BENCHMARK_TOTAL_STEPS = "25"
+BENCHMARK_LOG_FREQ = "1"
+BENCHMARK_ENABLE_KINETO = "0"
+BENCHMARK_ENABLE_MEMORY_SNAPSHOT = "0"
+BENCHMARK_STRUCTURED_LOGGING = "1"
+BENCHMARK_PROFILE_FREQ = "25"
+BENCHMARK_PROFILE_ACTIVE = "1"
+BENCHMARK_PROFILE_WARMUP = "0"
+
+[[phases]]
+name = "trace"
+kind = "trace"
+arms = ["gt_manual_cp", "apgt_cp"]
+trace_ranks = [2]
+[phases.environment]
+BENCHMARK_PHASE = "profile"
+BENCHMARK_TOTAL_STEPS = "18"
+BENCHMARK_LOG_FREQ = "1"
+BENCHMARK_ENABLE_KINETO = "1"
+BENCHMARK_ENABLE_MEMORY_SNAPSHOT = "0"
+BENCHMARK_STRUCTURED_LOGGING = "1"
+BENCHMARK_PROFILE_RANK = "2"
+BENCHMARK_PROFILE_FREQ = "18"
+BENCHMARK_PROFILE_ACTIVE = "3"
+BENCHMARK_PROFILE_WARMUP = "0"

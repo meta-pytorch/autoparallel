@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "kind": "deterministic_stream_index_schedule",
+  "dataset": "allenai/c4",
+  "revision": "1588ec454efa1a09f29cd18ddd04fe05fc8653a2",
+  "rank_to_shard": "dp_rank modulo 16",
+  "preloaded_batches_per_dp_rank": 10,
+  "measured_batch_schedule": "zero-based step modulo 10",
+  "tokenization": "pinned workload tokenizer and sequence length",
+  "timed_loop_tensor_hashing": false,
+  "timed_loop_manifest_io": false
+}
