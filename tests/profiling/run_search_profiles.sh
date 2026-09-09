@@ -3,7 +3,7 @@
 set -u
 
 if [[ $# -lt 2 ]]; then
-    printf 'usage: %s [heuristic|lp] results-dir\n' "$0" >&2
+    printf 'usage: %s [heuristic|lp|paper-llama8b] results-dir\n' "$0" >&2
     exit 2
 fi
 
@@ -64,8 +64,27 @@ elif [[ "$mode" == lp ]]; then
         --model llama8b --mesh 2,4,8 --solver lp
     run_profile dsv3_3d_lp "" \
         --model dsv3 --moe-layout 3d --solver lp
+elif [[ "$mode" == paper-llama8b ]]; then
+    for repeat in 1 2 3; do
+        run_profile "llama8b_1d_ilp_r${repeat}" 6h \
+            --model llama8b --mesh 8 --solver ilp
+        run_profile "llama8b_1d_lp_r${repeat}" 6h \
+            --model llama8b --mesh 8 --solver lp
+        run_profile "llama8b_2d_ilp_r${repeat}" 6h \
+            --model llama8b --mesh 4,8 --solver ilp
+        run_profile "llama8b_2d_lp_r${repeat}" 6h \
+            --model llama8b --mesh 4,8 --solver lp
+        run_profile "llama8b_3d_approx_r${repeat}" 6h \
+            --model llama8b --mesh 4,2,4 --solver approx --lazy-costs true --seeded
+        run_profile "llama8b_3d_lp_r${repeat}" 6h \
+            --model llama8b --mesh 4,2,4 --solver lp
+        run_profile "llama8b_4d_approx_r${repeat}" 6h \
+            --model llama8b --mesh 2,2,2,4 --solver approx --lazy-costs true --seeded
+        run_profile "llama8b_4d_lp_r${repeat}" 6h \
+            --model llama8b --mesh 2,2,2,4 --solver lp
+    done
 else
-    printf 'usage: %s [heuristic|lp] results-dir\n' "$0" >&2
+    printf 'usage: %s [heuristic|lp|paper-llama8b] results-dir\n' "$0" >&2
     exit 2
 fi
 

@@ -56,8 +56,15 @@ def _args(*values):
 @pytest.mark.parametrize(
     ("values", "expected"),
     [
+        (("--model", "llama1b", "--mesh", "8"), (8, (8,))),
+        (("--model", "llama1b", "--mesh", "4,8"), (32, (4, 8))),
         (("--model", "llama1b", "--mesh", "8,8"), (64, (8, 8))),
+        (("--model", "llama1b", "--mesh", "4,2,4"), (32, (4, 2, 4))),
         (("--model", "llama1b", "--mesh", "2,4,8"), (64, (2, 4, 8))),
+        (
+            ("--model", "llama1b", "--mesh", "2,2,2,4"),
+            (32, (2, 2, 2, 4)),
+        ),
         (("--model", "dsv3", "--moe-layout", "2d"), (64, None)),
         (("--model", "dsv3", "--moe-layout", "3d"), (64, None)),
         (("--model", "dsv3", "--moe-layout", "4d"), (64, None)),
@@ -71,8 +78,8 @@ def test_validate_search_profile_args(values, expected):
     "values",
     [
         ("--model", "llama1b"),
-        ("--model", "llama1b", "--mesh", "4,4"),
-        ("--model", "llama1b", "--mesh", "1,1,1,64"),
+        ("--model", "llama1b", "--mesh", "0,8"),
+        ("--model", "llama1b", "--mesh", "1,1,1,1,64"),
         ("--model", "llama1b", "--mesh", "8,8", "--moe-layout", "2d"),
         ("--model", "dsv3", "--moe-layout", "2d", "--mesh", "8,8"),
     ],

@@ -111,31 +111,48 @@ def make_llama(model_name, mesh_shape):
     from autoparallel._testing.models.llama3 import Transformer, TransformerModelArgs
 
     names = {
-        2: ("dp", "tp"),
-        3: ("dp", "cp", "tp"),
+        1: ("fsdp",),
+        2: ("fsdp", "tp"),
+        3: ("dp_shard", "cp", "tp"),
+        4: ("dp_replicate", "dp_shard", "cp", "tp"),
     }.get(len(mesh_shape))
     if names is None:
-        raise ValueError(f"LLaMA profiles require a 2D or 3D mesh, got {mesh_shape}")
+        raise ValueError(f"LLaMA profiles require a 1D to 4D mesh, got {mesh_shape}")
     seq_len = 2048
     vocab_size = 128256
+    mesh = torch.distributed.device_mesh.init_device_mesh(
+        "cuda", mesh_shape, mesh_dim_names=names
+    )
     config = {
         **LLAMA_CONFIGS[model_name],
         "rope_theta": 500000,
         "vocab_size": vocab_size,
         "max_seq_len": seq_len,
+        "context_parallel_mesh": mesh if "cp" in names else None,
     }
     with torch.device("meta"):
         model = Transformer(TransformerModelArgs(**config))
-    mesh = torch.distributed.device_mesh.init_device_mesh(
-        "cuda", mesh_shape, mesh_dim_names=names
-    )
     batch_size = 16
 
     def input_fn():
         return torch.randint(0, vocab_size, (batch_size, seq_len), device="cuda")
 
-    input_placement = (Shard(0),) + (Replicate(),) * (len(mesh_shape) - 1)
-    output_placement = (Shard(0), Shard(2)) if len(mesh_shape) == 2 else input_placement
+    input_placement = tuple(
+        Shard(1)
+        if name == "cp"
+        else Replicate()
+        if name == "tp"
+        else Shard(0)
+        for name in names
+    )
+    output_placement = tuple(
+        Shard(1)
+        if name == "cp"
+        else Shard(2)
+        if name == "tp"
+        else Shard(0)
+        for name in names
+    )
     expanded = {
         "family": "llama3",
         "config": config,
@@ -333,11 +350,11 @@ def validate_args(args):
     if args.mesh is None or args.moe_layout is not None:
         raise ValueError("LLaMA requires --mesh and no --moe-layout")
     mesh_shape = tuple(int(part) for part in args.mesh.split(","))
-    if len(mesh_shape) not in (2, 3):
-        raise ValueError(f"LLaMA requires a 2D or 3D mesh, got {mesh_shape}")
+    if len(mesh_shape) not in (1, 2, 3, 4):
+        raise ValueError(f"LLaMA requires a 1D to 4D mesh, got {mesh_shape}")
+    if any(degree < 1 for degree in mesh_shape):
+        raise ValueError(f"mesh dimensions must be positive, got {mesh_shape}")
     world_size = math.prod(mesh_shape)
-    if world_size != 64:
-        raise ValueError(f"world size must be 64, got {world_size}")
     return world_size, mesh_shape
 
 
@@ -431,10 +448,19 @@ def main(argv=None):
             constraint_s = time.perf_counter() - constraint_started
 
             solve_started = time.perf_counter()
-            solution = autop.optimize_placement(verbose=False)
+            lp_result = None
+            if args.solver == "lp":
+                opt = autop.sharding_optimizer
+                if opt is None or opt.prob is None:
+                    raise RuntimeError("LP profiling requires a full PuLP optimizer")
+                lp_result = opt.solve_lp_relaxation(verbose=False, extract=False)
+                solution = None
+            else:
+                solution = autop.optimize_placement(verbose=False)
+                opt = autop.sharding_optimizer
             solve_call_s = time.perf_counter() - solve_started
             search_total_s = time.perf_counter() - enter_started
-            opt = autop.sharding_optimizer
+            assert opt is not None
             optimizer_init_s = opt.profile["timings"]["init_total_s"]
             profile_key = {
                 "approx": "approximate",
@@ -469,7 +495,9 @@ def main(argv=None):
                 }
             )
 
-            fingerprint, solution_nodes = solution_fingerprint(solution)
+            fingerprint, solution_nodes = (
+                (None, 0) if solution is None else solution_fingerprint(solution)
+            )
             objective = finite(solver_profile["objective"])
             violations = []
             pulp_status = None
@@ -518,16 +546,24 @@ def main(argv=None):
                     },
                 }
             )
-            validate_solution(
-                args.solver,
-                objective,
-                solution_nodes,
-                violations,
-                pulp_status,
-                solution_status,
-            )
+            if args.solver == "lp":
+                assert lp_result is not None
+                if lp_result["status"] != "Optimal" or objective is None:
+                    raise RuntimeError(
+                        "LP relaxation did not produce an optimal finite bound: "
+                        f"status={lp_result['status']!r}, objective={objective!r}"
+                    )
+            else:
+                validate_solution(
+                    args.solver,
+                    objective,
+                    solution_nodes,
+                    violations,
+                    pulp_status,
+                    solution_status,
+                )
 
-            if args.detailed_solution:
+            if args.detailed_solution and solution is not None:
                 result["solution_detail"] = solution_details(solution, autop.gm.graph)
                 if opt.decision_vars:
                     contributions = cost_contributions(opt)
