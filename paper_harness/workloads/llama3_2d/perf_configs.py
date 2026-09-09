@@ -160,7 +160,12 @@ def _write_inductor_path_audit() -> None:
     patch_active = all("_patch_fsdp_bucketing" in value for value in functions.values())
     custom_post_pass = torch._inductor.config.post_grad_custom_post_pass
     configuration = os.environ["BENCHMARK_CONFIGURATION"]
-    expected_patch_active = configuration != "torchtitan_baseline"
+    expected_patch_active = configuration in {
+        "graphtrainer_manual",
+        "autoparallel_backend_example_scheduling",
+        "autoparallel_graphtrainer",
+        "autoparallel_graphtrainer_current",
+    }
     if patch_active != expected_patch_active:
         raise RuntimeError(
             "Unexpected AutoParallel bucketing hook state for "
@@ -664,12 +669,14 @@ def _graph_config(
     enable_remat: bool = True,
     enable_autoparallel: bool = True,
     pass_pipeline: str = "default",
+    use_historical_ap_batch_adapter: bool = True,
 ):
     config = to_graph_trainer_config(_base_config(), model_registry)
-    config.model_spec = replace(
-        config.model_spec,
-        parallelize_fn=parallelize_graphtrainer_autoparallel_llama,
-    )
+    if use_historical_ap_batch_adapter:
+        config.model_spec = replace(
+            config.model_spec,
+            parallelize_fn=parallelize_graphtrainer_autoparallel_llama,
+        )
     # ``to_graph_trainer_config`` installs a cudagraph-only trace annotator.
     # Cudagraphs are disabled in this experiment, so keep the profiler config
     # identical to the backend configuration instead of serializing a no-op callback.
@@ -719,6 +726,21 @@ def graphtrainer_manual_full_inductor_8b():
     return _graph_config(inductor_compilation="full", enable_autoparallel=False)
 
 
+def autoparallel_graphtrainer_full_inductor_current_8b():
+    return _graph_config(
+        inductor_compilation="full",
+        use_historical_ap_batch_adapter=False,
+    )
+
+
+def graphtrainer_manual_full_inductor_current_8b():
+    return _graph_config(
+        inductor_compilation="full",
+        enable_autoparallel=False,
+        use_historical_ap_batch_adapter=False,
+    )
+
+
 def torchtitan_baseline_8b():
     if "autoparallel.graph_passes.auto_bucketing" in sys.modules:
         raise RuntimeError("Native TorchTitan baseline was polluted by AutoParallel")
@@ -741,6 +763,8 @@ def torchtitan_baseline_8b():
 EXPERIMENT_CONFIGS = (
     "torchtitan_baseline_8b",
     "graphtrainer_manual_full_inductor_8b",
+    "graphtrainer_manual_full_inductor_current_8b",
     "autoparallel_backend_example_scheduling_8b",
     "autoparallel_graphtrainer_full_inductor_8b",
+    "autoparallel_graphtrainer_full_inductor_current_8b",
 )
