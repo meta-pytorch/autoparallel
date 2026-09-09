@@ -5,7 +5,7 @@ workload = "llama3_8b_3d_current"
 
 [sources.torchtitan]
 remote = "https://github.com/AlbedoWang/torchtitan.git"
-commit = "8a2d0c5d2d52f57300e8f31a15b613f062797317"
+commit = "0dc14f57b93ec830f395d024718d351d04305fdb"
 dirty_policy = "forbid"
 
 [sources.autoparallel]
