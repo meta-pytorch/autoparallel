@@ -68,7 +68,7 @@ Optional `[measurement.primary]` settings select an exact historical metric from
 
 Common TorchTitan config sections use their native names. Less common settings go in `[torchtitan.overrides]` as dotted paths. Unknown upstream fields fail when the exact pinned source parses the generated arguments. An arm or phase may override a common dotted path; the resulting serialized configs are compared before submission.
 
-`training.local_batch_size` is the microbatch per data-parallel replica. TP and CP ranks share or shard that logical batch; they do not multiply global batch.
+`training.local_batch_size` is the microbatch per data-parallel replica. `global_batch_size = local_batch_size * data_parallel_replicate_degree * data_parallel_shard_degree * gradient_accumulation_steps`; TP, CP, PP, and EP ranks do not multiply global batch.
 
 Scaling and sequence sweeps use `[[matrix.points]]`. Select one immutable point per MAST allocation with `--point`.
 

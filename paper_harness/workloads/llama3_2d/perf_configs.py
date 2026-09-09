@@ -128,13 +128,11 @@ DP_DEGREE = WORLD_SIZE // TP_DEGREE
 LOCAL_BATCH_SIZE = 2
 SEQ_LEN = 8192
 GLOBAL_BATCH_SIZE = int(os.environ["BENCHMARK_GLOBAL_BATCH_SIZE"])
-if GLOBAL_BATCH_SIZE != LOCAL_BATCH_SIZE * WORLD_SIZE:
-    raise ValueError(
-        f"Expected global batch {LOCAL_BATCH_SIZE * WORLD_SIZE}, "
-        f"got {GLOBAL_BATCH_SIZE}"
-    )
 if GLOBAL_BATCH_SIZE % (LOCAL_BATCH_SIZE * DP_DEGREE) != 0:
-    raise ValueError("Global batch is incompatible with the data-parallel degree")
+    raise ValueError(
+        "Global batch must equal local batch per DP rank * DP degree * "
+        "an integer gradient accumulation count"
+    )
 GRADIENT_ACCUMULATION_STEPS = GLOBAL_BATCH_SIZE // (
     LOCAL_BATCH_SIZE * DP_DEGREE
 )

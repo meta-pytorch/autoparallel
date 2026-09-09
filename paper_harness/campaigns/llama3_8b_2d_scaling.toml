@@ -28,8 +28,8 @@ preflight_auditor = "workloads.llama3_2d.input_preflight"
 
 [training]
 local_batch_size = 2
-global_batch_size = 16
-gradient_accumulation_steps = 4
+global_batch_size = 4
+gradient_accumulation_steps = 1
 seq_len = 8192
 
 [parallelism]
@@ -60,7 +60,7 @@ phase_timeout_seconds = 7200
 BENCHMARK_MODEL = "8B"
 BENCHMARK_WORLD_SIZE = "8"
 BENCHMARK_TP_DEGREE = "4"
-BENCHMARK_GLOBAL_BATCH_SIZE = "16"
+BENCHMARK_GLOBAL_BATCH_SIZE = "4"
 LLAMA_TOKENIZER_DIR = "{asset:llama_tokenizer}"
 REPLAY_TENSORS_PATH = "{asset:llama_replay}/replay_tokens.pt"
 REPLAY_MANIFEST_PATH = "{asset:llama_replay}/manifest.json"
@@ -137,11 +137,11 @@ name = "8gpu"
 "mast.nodes" = 1
 "parallelism.data_parallel_shard_degree" = 2
 "parallelism.tensor_parallel_degree" = 4
-"training.global_batch_size" = 16
-"training.gradient_accumulation_steps" = 4
+"training.global_batch_size" = 4
+"training.gradient_accumulation_steps" = 1
 "mast.environment.BENCHMARK_WORLD_SIZE" = "8"
 "mast.environment.BENCHMARK_TP_DEGREE" = "4"
-"mast.environment.BENCHMARK_GLOBAL_BATCH_SIZE" = "16"
+"mast.environment.BENCHMARK_GLOBAL_BATCH_SIZE" = "4"
 
 [[matrix.points]]
 name = "16gpu"
@@ -149,11 +149,11 @@ name = "16gpu"
 "mast.nodes" = 2
 "parallelism.data_parallel_shard_degree" = 2
 "parallelism.tensor_parallel_degree" = 8
-"training.global_batch_size" = 32
-"training.gradient_accumulation_steps" = 8
+"training.global_batch_size" = 4
+"training.gradient_accumulation_steps" = 1
 "mast.environment.BENCHMARK_WORLD_SIZE" = "16"
 "mast.environment.BENCHMARK_TP_DEGREE" = "8"
-"mast.environment.BENCHMARK_GLOBAL_BATCH_SIZE" = "32"
+"mast.environment.BENCHMARK_GLOBAL_BATCH_SIZE" = "4"
 
 [[matrix.points]]
 name = "32gpu"
@@ -161,11 +161,11 @@ name = "32gpu"
 "mast.nodes" = 4
 "parallelism.data_parallel_shard_degree" = 4
 "parallelism.tensor_parallel_degree" = 8
-"training.global_batch_size" = 64
-"training.gradient_accumulation_steps" = 8
+"training.global_batch_size" = 8
+"training.gradient_accumulation_steps" = 1
 "mast.environment.BENCHMARK_WORLD_SIZE" = "32"
 "mast.environment.BENCHMARK_TP_DEGREE" = "8"
-"mast.environment.BENCHMARK_GLOBAL_BATCH_SIZE" = "64"
+"mast.environment.BENCHMARK_GLOBAL_BATCH_SIZE" = "8"
 
 [[matrix.points]]
 name = "64gpu"
@@ -173,11 +173,11 @@ name = "64gpu"
 "mast.nodes" = 8
 "parallelism.data_parallel_shard_degree" = 8
 "parallelism.tensor_parallel_degree" = 8
-"training.global_batch_size" = 128
-"training.gradient_accumulation_steps" = 8
+"training.global_batch_size" = 16
+"training.gradient_accumulation_steps" = 1
 "mast.environment.BENCHMARK_WORLD_SIZE" = "64"
 "mast.environment.BENCHMARK_TP_DEGREE" = "8"
-"mast.environment.BENCHMARK_GLOBAL_BATCH_SIZE" = "128"
+"mast.environment.BENCHMARK_GLOBAL_BATCH_SIZE" = "16"
 
 [[matrix.points]]
 name = "128gpu"
@@ -185,8 +185,8 @@ name = "128gpu"
 "mast.nodes" = 16
 "parallelism.data_parallel_shard_degree" = 16
 "parallelism.tensor_parallel_degree" = 8
-"training.global_batch_size" = 256
-"training.gradient_accumulation_steps" = 8
+"training.global_batch_size" = 32
+"training.gradient_accumulation_steps" = 1
 "mast.environment.BENCHMARK_WORLD_SIZE" = "128"
 "mast.environment.BENCHMARK_TP_DEGREE" = "8"
-"mast.environment.BENCHMARK_GLOBAL_BATCH_SIZE" = "256"
+"mast.environment.BENCHMARK_GLOBAL_BATCH_SIZE" = "32"
