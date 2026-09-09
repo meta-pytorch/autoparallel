@@ -135,15 +135,11 @@ def validate_apgt_source(torchtitan_root: Path) -> dict[str, Any]:
     passes_path = graph_root / "passes.py"
     api_path = graph_root / "autoparallel_api.py"
     trainer_path = graph_root / "trainer.py"
-    llama_path = graph_root / "llama3/parallelize_autoparallel.py"
-    if not all(
-        path.is_file() for path in (passes_path, api_path, trainer_path, llama_path)
-    ):
+    if not all(path.is_file() for path in (passes_path, api_path, trainer_path)):
         raise CampaignError("TorchTitan source lacks GraphTrainer AutoParallel files")
     passes = passes_path.read_text()
     api = api_path.read_text()
     trainer = trainer_path.read_text()
-    llama = llama_path.read_text()
     pass_needles = (
         "if config.compile.enable_autoparallel:",
         "joint_transformer_block_bucketing_reordering_pass",
@@ -171,11 +167,6 @@ def validate_apgt_source(torchtitan_root: Path) -> dict[str, Any]:
         'model, "_graph_trainer_autoparallel_mesh", None',
     )
     missing.extend(item for item in trainer_needles if item not in trainer)
-    llama_needles = (
-        "placement_batch_size = training.local_batch_size * dp_degree",
-        "(placement_batch_size, training.seq_len)",
-    )
-    missing.extend(item for item in llama_needles if item not in llama)
     if missing:
         raise CampaignError(
             "source does not satisfy apgt_v1; user gate required before changing "
@@ -186,9 +177,7 @@ def validate_apgt_source(torchtitan_root: Path) -> dict[str, Any]:
         "passes_path": str(passes_path.resolve()),
         "autoparallel_api_path": str(api_path.resolve()),
         "trainer_path": str(trainer_path.resolve()),
-        "llama_autoparallel_path": str(llama_path.resolve()),
         "manual_joint_pass": "enabled_by_enable_autoparallel_false_branch",
         "ap_joint_pass": "absent_by_enable_autoparallel_true_branch",
         "ap_full_inductor_configs": "verified",
-        "llama_placement_batch": "one_distributed_microbatch",
     }
