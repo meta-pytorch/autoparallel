@@ -249,11 +249,71 @@ def _try_single_dim_strategy(
     if single_dim_info is None:
         return None
 
+    from torch.distributed.tensor._dtensor_spec import TensorMeta
     from torch.distributed.tensor._ops.single_dim_strategy import (
         _insert_single_dim_replication_strategy,
         _ShardingPlaceholder,
     )
-    from torch.distributed.tensor._ops.utils import expand_to_full_mesh_op_strategy
+    from torch.distributed.tensor._ops.utils import (
+        expand_to_full_mesh_op_strategy,
+        infer_broadcast_dims_map,
+        map_placements_after_broadcast,
+    )
+
+    def _project_cudnn_attn_bias_placements(
+        strategies: list[list[Placement | _ShardingPlaceholder | None]],
+        num_outputs: int,
+    ) -> None:
+        """Project score-domain sharding onto a broadcast attention bias."""
+        cudnn_sdpa_ops = (
+            aten._scaled_dot_product_cudnn_attention.default,
+            aten._scaled_dot_product_cudnn_attention_backward.default,
+        )
+        if op not in cudnn_sdpa_ops:
+            return
+
+        arg_indices = {
+            argument.name: index for index, argument in enumerate(op._schema.arguments)
+        }
+        query_index = arg_indices["query"]
+        key_index = arg_indices["key"]
+        bias_index = arg_indices["attn_bias"]
+        if bias_index >= len(op_schema.args_schema) or not isinstance(
+            op_schema.args_schema[bias_index], OpStrategy
+        ):
+            return
+
+        args_meta = op_schema.args_meta
+        query_meta = args_meta[query_index]
+        key_meta = args_meta[key_index]
+        bias_meta = args_meta[bias_index]
+        if (
+            not isinstance(query_meta, TensorMeta)
+            or not isinstance(key_meta, TensorMeta)
+            or not isinstance(bias_meta, TensorMeta)
+        ):
+            return
+
+        score_shape = torch.Size((*query_meta.shape[:-1], key_meta.shape[-2]))
+        broadcast_dims_map = infer_broadcast_dims_map(score_shape, bias_meta.shape)
+        bias_input_index = sum(
+            isinstance(arg, OpStrategy) for arg in op_schema.args_schema[:bias_index]
+        )
+        bias_placement_index = num_outputs + bias_input_index
+
+        for strategy in strategies:
+            placement = strategy[bias_placement_index]
+            if not isinstance(placement, (_ShardingPlaceholder, Shard)):
+                continue
+            mapped = map_placements_after_broadcast(
+                (Shard(placement.dim),), score_shape, broadcast_dims_map
+            )[0]
+            strategy[bias_placement_index] = (
+                _ShardingPlaceholder(mapped.dim)
+                if isinstance(placement, _ShardingPlaceholder)
+                and isinstance(mapped, Shard)
+                else mapped
+            )
 
     mesh = op_schema.args_strategy[0].mesh
 
@@ -281,8 +341,6 @@ def _try_single_dim_strategy(
     # using shard types found in the runtime input placements. Since autoparallel
     # explores all placements (not a single runtime one), we always resolve
     # _ShardingPlaceholder(d) -> Shard(d).
-    from torch.distributed.tensor._dtensor_spec import TensorMeta
-
     if out_tensor_meta is None:
         num_outputs = 0
     elif isinstance(out_tensor_meta, TensorMeta):
@@ -294,6 +352,7 @@ def _try_single_dim_strategy(
     strategies = _insert_single_dim_replication_strategy(
         strategies, num_outputs, num_inputs
     )
+    _project_cudnn_attn_bias_placements(strategies, num_outputs)
     resolved: list[list[Placement | None]] = []
     for s in strategies:
         resolved.append(

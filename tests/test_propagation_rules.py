@@ -3,13 +3,162 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+import pytest
 import torch
+from conftest import apply_cuda_patches
 from torch import nn
 from torch.distributed.fsdp import MixedPrecisionPolicy
-from torch.distributed.tensor.placement_types import Shard
+from torch.distributed.tensor._dtensor_spec import DTensorSpec, TensorMeta
+from torch.distributed.tensor._op_schema import OpSpec, OpStrategy
+from torch.distributed.tensor.placement_types import Replicate, Shard
 
 from autoparallel.api import AutoParallel
 from autoparallel.compile import autoparallel_backend
+from autoparallel.shardings.placement_options import get_placement_options
+
+
+def _replicated_meta_input(mesh, shape, dtype=torch.bfloat16):
+    tensor = torch.empty(shape, dtype=dtype, device="meta")
+    tensor_meta = TensorMeta(tensor.shape, tensor.stride(), tensor.dtype)
+    spec = DTensorSpec(mesh, (Replicate(), Replicate()), tensor_meta=tensor_meta)
+    return tensor, OpStrategy([OpSpec(spec)])
+
+
+def _muse_cudnn_forward_options(mesh, bias_shape):
+    query, query_strategy = _replicated_meta_input(mesh, (8, 32, 8192, 128))
+    key, key_strategy = _replicated_meta_input(mesh, (8, 2, 8192, 128))
+    value, value_strategy = _replicated_meta_input(mesh, (8, 2, 8192, 128))
+    if bias_shape is None:
+        bias = bias_strategy = None
+    else:
+        bias, bias_strategy = _replicated_meta_input(mesh, bias_shape, torch.bool)
+
+    args = (query, key, value, bias, True, 0.0, False, False)
+    specs = (
+        query_strategy,
+        key_strategy,
+        value_strategy,
+        bias_strategy,
+        True,
+        0.0,
+        False,
+        False,
+    )
+    return get_placement_options(
+        mesh,
+        torch.ops.aten._scaled_dot_product_cudnn_attention.default,
+        specs,
+        args,
+        {"scale": 128**-0.5},
+    )
+
+
+def _find_muse_dp_tp_head_strategy(options):
+    placement = (Shard(0), Shard(1))
+    return [
+        strategy
+        for strategy in options.strategies
+        if all(spec.placements == placement for spec in strategy.input_specs[:3])
+    ]
+
+
+@apply_cuda_patches
+@pytest.mark.parametrize(
+    "bias_shape,expected_bias_placement",
+    [
+        ((8, 1, 8192, 8192), (Shard(0), Replicate())),
+        ((8, 32, 8192, 8192), (Shard(0), Shard(1))),
+        ((8192, 8192), (Replicate(), Replicate())),
+        (None, None),
+    ],
+)
+def test_cudnn_sdpa_projects_score_sharding_onto_broadcast_bias(
+    bias_shape, expected_bias_placement
+):
+    mesh = torch.distributed.device_mesh.init_device_mesh(
+        "cuda", (8, 2), mesh_dim_names=("dp", "tp")
+    )
+    matches = _find_muse_dp_tp_head_strategy(
+        _muse_cudnn_forward_options(mesh, bias_shape)
+    )
+
+    assert len(matches) == 1
+    strategy = matches[0]
+    if expected_bias_placement is None:
+        assert len(strategy.input_specs) == 3
+    else:
+        assert strategy.input_specs[3].placements == expected_bias_placement
+    assert strategy.output_specs[0].placements == (Shard(0), Shard(1))
+
+
+@apply_cuda_patches
+def test_cudnn_sdpa_backward_projects_broadcast_bias():
+    mesh = torch.distributed.device_mesh.init_device_mesh(
+        "cuda", (8, 2), mesh_dim_names=("dp", "tp")
+    )
+    input_shapes_and_dtypes = [
+        ((8, 32, 8192, 128), torch.bfloat16),
+        ((8, 32, 8192, 128), torch.bfloat16),
+        ((8, 2, 8192, 128), torch.bfloat16),
+        ((8, 2, 8192, 128), torch.bfloat16),
+        ((8, 32, 8192, 128), torch.bfloat16),
+        ((8, 32, 8192, 1), torch.float32),
+        ((), torch.int64),
+        ((), torch.int64),
+        ((8, 1, 8192, 8192), torch.bool),
+    ]
+    inputs = [
+        _replicated_meta_input(mesh, shape, dtype)
+        for shape, dtype in input_shapes_and_dtypes
+    ]
+    args = tuple(tensor for tensor, _ in inputs) + (
+        None,
+        None,
+        8192,
+        8192,
+        0.0,
+        False,
+    )
+    specs = tuple(strategy for _, strategy in inputs) + (
+        None,
+        None,
+        8192,
+        8192,
+        0.0,
+        False,
+    )
+    options = get_placement_options(
+        mesh,
+        torch.ops.aten._scaled_dot_product_cudnn_attention_backward.default,
+        specs,
+        args,
+        {"scale": 128**-0.5},
+    )
+
+    matches = _find_muse_dp_tp_head_strategy(options)
+    assert len(matches) == 1
+    strategy = matches[0]
+    assert all(
+        spec.placements == (Shard(0), Shard(1)) for spec in strategy.input_specs[:6]
+    )
+    assert all(
+        spec.placements == (Replicate(), Replicate())
+        for spec in strategy.input_specs[6:8]
+    )
+    assert strategy.input_specs[8].placements == (Shard(0), Replicate())
+    assert all(
+        spec.placements == (Shard(0), Shard(1)) for spec in strategy.output_specs
+    )
+
+
+@apply_cuda_patches
+def test_cudnn_sdpa_rejects_tp_larger_than_kv_heads():
+    mesh = torch.distributed.device_mesh.init_device_mesh(
+        "cuda", (8, 4), mesh_dim_names=("dp", "tp")
+    )
+    options = _muse_cudnn_forward_options(mesh, (8, 1, 8192, 8192))
+
+    assert not _find_muse_dp_tp_head_strategy(options)
 
 
 def test_permute_layernorm_stride_handling(device_mesh_1d):
