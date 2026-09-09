@@ -77,6 +77,15 @@ def audit(
     tensors = torch.load(replay_path, map_location="cpu", mmap=True, weights_only=True)
     observed_hashes = {}
     expected_shape = tuple(entry["shape"])
+    runtime_shape = (
+        manifest.get("slots"),
+        expected["global_batch_size"],
+        expected["seq_len"],
+    )
+    if expected_shape != runtime_shape:
+        raise RuntimeError(
+            f"Replay shape {expected_shape} does not match runtime {runtime_shape}"
+        )
     for name in ("input", "positions", "labels"):
         tensor = tensors.get(name)
         if (

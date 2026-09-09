@@ -100,6 +100,15 @@ class FixedC4ReplayDataLoader(BaseDataLoader):
             replay_path, map_location="cpu", mmap=True, weights_only=True
         )
         expected_shape = tuple(entry["shape"])
+        runtime_shape = (
+            manifest.get("slots"),
+            dp_world_size * local_batch_size,
+            seq_len,
+        )
+        if expected_shape != runtime_shape:
+            raise RuntimeError(
+                f"Replay shape {expected_shape} does not match runtime {runtime_shape}"
+            )
         for name in ("input", "positions", "labels"):
             tensor = tensors.get(name)
             if (
