@@ -15,7 +15,7 @@ from .sources import manifest_digest, tree_manifest
 from .validation import validate_campaign
 
 
-MAST_HANDLE_PATTERN = re.compile(r"mast_conda://[^/\s]+/([^\s]+)")
+MAST_HANDLE_PATTERN = re.compile(r"mast_conda://[^/\s`]+/([^\s`]+)")
 
 
 def _asset_roots(values: list[str]) -> dict[str, Path]:

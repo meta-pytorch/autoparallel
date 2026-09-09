@@ -19,6 +19,7 @@ class CampaignTests(unittest.TestCase):
         output = """Current Session ID: session-id
 
 mast_conda://torchx/llama3-paper-wangkj-grfhpnvn
+launched app: `mast_conda://torchx/llama3-paper-wangkj-grfhpnvn`
 """
         self.assertEqual(
             _submitted_job_id(output), "llama3-paper-wangkj-grfhpnvn"
