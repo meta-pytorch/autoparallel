@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 from pathlib import Path
 
@@ -123,7 +122,7 @@ def audit(
     return {
         "status": "passed",
         "manifest": str(manifest_path),
-        "manifest_sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+        "manifest_sha256": file_sha256(manifest_path),
         "tokenizer_tree_sha256": tokenizer_hash,
         "case": selected_case,
         "replay": {
