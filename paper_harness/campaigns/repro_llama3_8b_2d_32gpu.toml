@@ -1,6 +1,6 @@
 schema_version = 1
 name = "llama3-8b-2d-tt-vs-apgt-repro-32gpu"
-description = "32-GPU reproduction of native TorchTitan versus AutoParallel GraphTrainer"
+description = "32-GPU corrected-batch comparison of native TorchTitan versus AutoParallel GraphTrainer"
 workload = "llama3_8b_2d"
 
 [sources.torchtitan]
@@ -28,8 +28,8 @@ preflight_auditor = "workloads.llama3_2d.input_preflight"
 
 [training]
 local_batch_size = 2
-global_batch_size = 64
-gradient_accumulation_steps = 8
+global_batch_size = 8
+gradient_accumulation_steps = 1
 seq_len = 8192
 
 [parallelism]
@@ -47,13 +47,6 @@ declared_variable = "training_parallelization_compile_stack"
 allowed_config_paths = ["compile.*", "model_spec.name", "parallelism.*"]
 allowed_environment_keys = ["BENCHMARK_CONFIGURATION", "EXPERIMENT_ARM"]
 pairs = [["tt_main_tp", "apgt"]]
-
-[comparison.acceptance]
-metric = "primary_latency"
-baseline = "tt_main_tp"
-treatment = "apgt"
-reference_gap_percent = 0.4644307608
-tolerance_percentage_points = 2.0
 
 [measurement.primary]
 source = "structured_logs"
@@ -76,7 +69,7 @@ phase_timeout_seconds = 7200
 BENCHMARK_MODEL = "8B"
 BENCHMARK_WORLD_SIZE = "32"
 BENCHMARK_TP_DEGREE = "8"
-BENCHMARK_GLOBAL_BATCH_SIZE = "64"
+BENCHMARK_GLOBAL_BATCH_SIZE = "8"
 LLAMA_TOKENIZER_DIR = "{asset:llama_tokenizer}"
 REPLAY_TENSORS_PATH = "{asset:llama_replay}/replay_tokens.pt"
 REPLAY_MANIFEST_PATH = "{asset:llama_replay}/manifest.json"

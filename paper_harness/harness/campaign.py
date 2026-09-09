@@ -606,6 +606,23 @@ def _validate_campaign(campaign: Campaign) -> None:
                         f"{global_batch} != local batch {local_batch} * DP "
                         f"{degrees[0] * degrees[1]} * gradient accumulation {grad_accum}"
                     )
+                environment = {
+                    **mast.get("environment", {}),
+                    **campaign.phase_arm_environment(phase, arm),
+                }
+                expected_environment = {
+                    "BENCHMARK_WORLD_SIZE": campaign.world_size,
+                    "BENCHMARK_DP_DEGREE": degrees[0] * degrees[1],
+                    "BENCHMARK_TP_DEGREE": degrees[3],
+                    "BENCHMARK_LOCAL_BATCH_SIZE": local_batch,
+                    "BENCHMARK_GLOBAL_BATCH_SIZE": global_batch,
+                }
+                for key, expected_value in expected_environment.items():
+                    if key in environment and int(environment[key]) != expected_value:
+                        raise CampaignError(
+                            f"phase {phase.name!r} arm {arm_name!r} {key} "
+                            f"{environment[key]} != resolved setting {expected_value}"
+                        )
 
 
 def _apply_matrix(raw: dict[str, Any], point: str | None) -> dict[str, Any]:

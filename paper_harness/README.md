@@ -123,7 +123,7 @@ Performance phases keep Kineto and TORCH_TRACE disabled. Trace phases run after 
 - `campaigns/llama3_8b_seqlen.toml`: 2K through 32K at 32 GPUs.
 - `campaigns/muse_glimmer_30b_scaling.toml`: 16 through 128 GPUs.
 - `campaigns/deepseek_v3_16b.toml`: 16/32-GPU workload; historical failed runs remain non-comparative.
-- `campaigns/repro_*.toml`: fixed 32-GPU reproduction presets with explicit historical metric and relative-gap acceptance definitions.
+- `campaigns/repro_*.toml`: fixed 32-GPU reproduction presets with explicit historical metrics; relative-gap acceptance is retained only when the reference used the campaign's current batch semantics.
 
 Legacy evidence is imported read-only with `analyze`; missing or failed artifacts never become a performance conclusion.
 

@@ -36,13 +36,19 @@ launched app: `mast_conda://torchx/llama3-paper-wangkj-grfhpnvn`
                 campaign = load_campaign(path)
                 self.assertEqual(campaign.world_size, 32)
                 self.assertIn("primary", campaign.raw["measurement"])
-                self.assertIn("acceptance", campaign.raw["comparison"])
+                if path.name == "repro_llama3_8b_2d_32gpu.toml":
+                    self.assertNotIn("acceptance", campaign.raw["comparison"])
+                else:
+                    self.assertIn("acceptance", campaign.raw["comparison"])
                 self.assertEqual(
                     campaign.raw["comm"]["init_timeout_seconds"],
                     expected_init_timeouts[path.name],
                 )
         llama = load_campaign(REPO_ROOT / "campaigns/repro_llama3_8b_2d_32gpu.toml")
         self.assertEqual(llama.arm_names, {"tt_main_tp", "apgt"})
+        self.assertEqual(llama.raw["training"]["local_batch_size"], 2)
+        self.assertEqual(llama.raw["training"]["global_batch_size"], 8)
+        self.assertEqual(llama.raw["training"]["gradient_accumulation_steps"], 1)
 
     def test_gate_mode_keeps_all_arms_for_interleaved_formal_phases(self) -> None:
         campaign = load_campaign(
@@ -66,6 +72,18 @@ launched app: `mast_conda://torchx/llama3-paper-wangkj-grfhpnvn`
             path = Path(temporary) / "campaign.toml"
             path.write_text(invalid)
             with self.assertRaisesRegex(CampaignError, "parallel mesh product"):
+                load_campaign(path)
+
+    def test_batch_environment_cannot_disagree_with_structured_settings(self) -> None:
+        source = (REPO_ROOT / "campaigns/repro_llama3_8b_2d_32gpu.toml").read_text()
+        invalid = source.replace(
+            'BENCHMARK_GLOBAL_BATCH_SIZE = "8"',
+            'BENCHMARK_GLOBAL_BATCH_SIZE = "64"',
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "campaign.toml"
+            path.write_text(invalid)
+            with self.assertRaisesRegex(CampaignError, "BENCHMARK_GLOBAL_BATCH_SIZE"):
                 load_campaign(path)
 
     def test_canonical_matrix_points(self) -> None:
