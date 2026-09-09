@@ -1,0 +1,122 @@
+schema_version = 1
+name = "llama3-8b-replanning-canonical-4x8"
+description = "Generate and profile the canonical 2K/LB2 ILP placement on 4x8"
+workload = "llama3_8b_replanning_canonical"
+
+[sources.torchtitan]
+remote = "https://github.com/pytorch/torchtitan.git"
+commit = "TO_BE_PINNED_TORCHTITAN_CURRENT_HEAD"
+dirty_policy = "forbid"
+
+[sources.autoparallel]
+remote = "https://github.com/meta-pytorch/autoparallel.git"
+commit = "TO_BE_PINNED_AUTOPARALLEL_CURRENT_HEAD"
+dirty_policy = "forbid"
+
+[model]
+flavor = "8B"
+attention_backend = "sdpa"
+
+[data]
+mode = "replay"
+identity = "batch_hash_manifest"
+dataset = "allenai/c4"
+revision = "1588ec454efa1a09f29cd18ddd04fe05fc8653a2"
+identity_manifest = "{asset:llama_replanning_inputs}/manifest.json"
+identity_manifest_sha256 = "TO_BE_PINNED_AFTER_REPLAY_ASSET_BUILD"
+preflight_auditor = "workloads.llama3_replanning.input_preflight"
+
+[training]
+local_batch_size = 2
+global_batch_size = 8
+gradient_accumulation_steps = 1
+seq_len = 2048
+dtype = "float32"
+mixed_precision_param = "bfloat16"
+mixed_precision_reduce = "float32"
+max_norm = 1.0
+
+[parallelism]
+data_parallel_replicate_degree = 1
+data_parallel_shard_degree = 4
+tensor_parallel_degree = 8
+context_parallel_degree = 1
+pipeline_parallel_degree = 1
+expert_parallel_degree = 1
+enable_sequence_parallel = true
+fsdp_reshard_after_forward = "default"
+
+[comm]
+init_timeout_seconds = 1200
+
+[measurement.primary]
+source = "structured_logs"
+steps = [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25]
+rank_selector = "max_step_end"
+value = "step_end_duration"
+
+[mast]
+nodes = 4
+nproc_per_node = 8
+hardware = "grandteton_80g_roce"
+locality = "region;eag"
+gpu_name_contains = "H100"
+conda_fbpkg = "torchtitan_conda_prod:902"
+retries = 0
+master_port = 29500
+phase_timeout_seconds = 7200
+
+[mast.environment]
+BENCHMARK_WORLD_SIZE = "32"
+BENCHMARK_DP_DEGREE = "4"
+BENCHMARK_TP_DEGREE = "8"
+BENCHMARK_SEQ_LEN = "2048"
+BENCHMARK_LOCAL_BATCH_SIZE = "2"
+BENCHMARK_GLOBAL_BATCH_SIZE = "8"
+BENCHMARK_REPLAY_ROOT = "{asset:llama_replanning_inputs}"
+BENCHMARK_REPLAY_CASE = "s2048_lb2"
+LLAMA_TOKENIZER_DIR = "{asset:llama_tokenizer}"
+HF_HUB_OFFLINE = "1"
+HF_DATASETS_OFFLINE = "1"
+HF_HUB_DISABLE_XET = "1"
+PYTORCH_ALLOC_CONF = "expandable_segments:True"
+
+[artifacts]
+required_assets = ["llama_tokenizer", "llama_replanning_inputs"]
+warmup_steps = 5
+
+[[arms]]
+name = "canonical_fresh"
+profile = "apgt_v1"
+module = "workloads.llama3_replanning.perf_configs"
+config = "autoparallel_graphtrainer_replanning_8b"
+[arms.overrides]
+"compile.autoparallel_solver" = "ilp"
+"compile.autoparallel_placements_save_path" = "{output}/canonical_2k.json"
+[arms.environment]
+EXPERIMENT_ARM = "canonical_fresh"
+
+[[phases]]
+name = "performance"
+kind = "performance"
+arms = ["canonical_fresh"]
+[phases.overrides]
+"training.steps" = 25
+"profiler.enable_profiling" = false
+"profiler.enable_memory_snapshot" = false
+"metrics.log_freq" = 5
+
+[[phases]]
+name = "trace"
+kind = "trace"
+arms = ["canonical_fresh"]
+trace_ranks = [0]
+[phases.overrides]
+"training.steps" = 6
+"profiler.enable_profiling" = true
+"profiler.enable_memory_snapshot" = false
+"profiler.profile_freq" = 6
+"profiler.profiler_warmup" = 0
+"profiler.profiler_active" = 3
+"profiler.profiler_repeat" = 1
+"metrics.log_freq" = 1

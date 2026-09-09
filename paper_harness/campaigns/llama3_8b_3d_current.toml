@@ -5,12 +5,12 @@ workload = "llama3_8b_3d_current"
 
 [sources.torchtitan]
 remote = "https://github.com/AlbedoWang/torchtitan.git"
-commit = "REPLACE_WITH_FINAL_TORCHTITAN_SHA"
+commit = "8a2d0c5d2d52f57300e8f31a15b613f062797317"
 dirty_policy = "forbid"
 
 [sources.autoparallel]
 remote = "https://github.com/meta-pytorch/autoparallel.git"
-commit = "REPLACE_WITH_FINAL_AUTOPARALLEL_SHA"
+commit = "5102d629c0a97ec604b12c328b40147d214ecbe7"
 dirty_policy = "forbid"
 
 [model]

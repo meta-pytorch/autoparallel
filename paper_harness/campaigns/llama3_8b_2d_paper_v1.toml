@@ -4,13 +4,13 @@ description = "Current-head LLaMA 3 8B 2D A/B/C scale-up for the paper"
 workload = "llama3_8b_2d_current"
 
 [sources.torchtitan]
-remote = "https://github.com/pytorch/torchtitan.git"
-commit = "TO_BE_PINNED_TORCHTITAN_CURRENT_HEAD"
+remote = "https://github.com/AlbedoWang/torchtitan.git"
+commit = "8a2d0c5d2d52f57300e8f31a15b613f062797317"
 dirty_policy = "forbid"
 
 [sources.autoparallel]
 remote = "https://github.com/meta-pytorch/autoparallel.git"
-commit = "TO_BE_PINNED_AUTOPARALLEL_CURRENT_HEAD"
+commit = "5102d629c0a97ec604b12c328b40147d214ecbe7"
 dirty_policy = "forbid"
 
 [model]
