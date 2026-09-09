@@ -23,7 +23,7 @@ identity = "batch_hash_manifest"
 dataset = "allenai/c4"
 revision = "1588ec454efa1a09f29cd18ddd04fe05fc8653a2"
 identity_manifest = "{asset:llama_replanning_inputs}/manifest.json"
-identity_manifest_sha256 = "TO_BE_PINNED_AFTER_REPLAY_ASSET_BUILD"
+identity_manifest_sha256 = "e67a1320391eda3ecc746c3d7e7bc1e9101119037291e07f06d820bfe5871323"
 preflight_auditor = "workloads.llama3_replanning.input_preflight"
 
 [training]
