@@ -503,13 +503,21 @@ def main(argv=None):
             pulp_status = None
             solution_status = None
             if opt.prob is not None:
-                objective = finite(pulp.value(opt.prob.objective))
+                objective = (
+                    finite(lp_result["objective"])
+                    if lp_result is not None
+                    else finite(pulp.value(opt.prob.objective))
+                )
                 violations = [
                     name
                     for name, constraint in opt.prob.constraints.items()
                     if not constraint.valid(1e-6)
                 ]
-                pulp_status = pulp.LpStatus.get(opt.prob.status, str(opt.prob.status))
+                pulp_status = (
+                    lp_result["status"]
+                    if lp_result is not None
+                    else pulp.LpStatus.get(opt.prob.status, str(opt.prob.status))
+                )
                 solution_status = pulp.LpSolution.get(
                     getattr(opt.prob, "sol_status", None),
                     str(getattr(opt.prob, "sol_status", None)),
