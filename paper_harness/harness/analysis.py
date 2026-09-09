@@ -417,6 +417,176 @@ def _allocation_audit(campaign: Campaign, run_root: Path) -> dict[str, Any]:
     }
 
 
+def _canonical_parameter_name(name: str) -> str:
+    for wrapper in ("._checkpoint_wrapped_module.", "._orig_mod."):
+        while wrapper in name:
+            name = name.replace(wrapper, ".")
+    return name
+
+
+def _parameter_state_audit(campaign: Campaign, run_root: Path) -> dict[str, Any]:
+    """Fail closed when emitted initialized-parameter moments differ across arms."""
+    runs: dict[str, Any] = {}
+    errors: list[dict[str, Any]] = []
+    reference_key: str | None = None
+    reference: dict[tuple[int, str], dict[str, Any]] | None = None
+    saw_audit = False
+
+    for phase in campaign.phases:
+        for arm in phase.arms:
+            key = f"{phase.name}/{arm}"
+            root = run_root / phase.name / arm / "parameter_audit"
+            paths = sorted(root.glob("rank_*.json"))
+            if not paths:
+                runs[key] = {"files": [], "parameters": {}}
+                continue
+            saw_audit = True
+            if len(paths) != campaign.world_size:
+                errors.append(
+                    {
+                        "run": key,
+                        "error": "parameter audit rank count mismatch",
+                        "expected": campaign.world_size,
+                        "observed": len(paths),
+                    }
+                )
+
+            values: dict[tuple[int, str], dict[str, Any]] = {}
+            for path in paths:
+                try:
+                    records = json.loads(path.read_text())
+                    if not isinstance(records, list):
+                        raise TypeError("parameter audit must be a JSON list")
+                    for record in records:
+                        parameter_key = (
+                            int(record["part"]),
+                            _canonical_parameter_name(str(record["name"])),
+                        )
+                        current = values.setdefault(
+                            parameter_key,
+                            {
+                                "global_shape": list(record["global_shape"]),
+                                "dtype": str(record["dtype"]),
+                                "local_numel": 0,
+                                "sums": [],
+                                "square_sums": [],
+                            },
+                        )
+                        if current["global_shape"] != list(record["global_shape"]):
+                            raise ValueError(
+                                f"inconsistent global shape for {parameter_key}"
+                            )
+                        if current["dtype"] != str(record["dtype"]):
+                            raise ValueError(f"inconsistent dtype for {parameter_key}")
+                        current["local_numel"] += math.prod(record["local_shape"])
+                        current["sums"].append(float(record["sum"]))
+                        current["square_sums"].append(float(record["square_sum"]))
+                except Exception as error:
+                    errors.append({"run": key, "path": str(path), "error": str(error)})
+
+            aggregated = {}
+            for parameter_key, value in values.items():
+                global_numel = math.prod(value["global_shape"])
+                local_numel = value["local_numel"]
+                if global_numel <= 0 or local_numel % global_numel:
+                    errors.append(
+                        {
+                            "run": key,
+                            "parameter": f"{parameter_key[0]}:{parameter_key[1]}",
+                            "error": "parameter audit has a non-integral replication factor",
+                            "global_numel": global_numel,
+                            "local_numel": local_numel,
+                        }
+                    )
+                    continue
+                replication_factor = local_numel // global_numel
+                if replication_factor < 1:
+                    errors.append(
+                        {
+                            "run": key,
+                            "parameter": f"{parameter_key[0]}:{parameter_key[1]}",
+                            "error": "parameter audit has no complete global tensor",
+                            "global_numel": global_numel,
+                            "local_numel": local_numel,
+                        }
+                    )
+                    continue
+                aggregated[parameter_key] = {
+                    "global_shape": value["global_shape"],
+                    "dtype": value["dtype"],
+                    "local_numel": local_numel,
+                    "replication_factor": replication_factor,
+                    "sum": math.fsum(value["sums"]) / replication_factor,
+                    "square_sum": math.fsum(value["square_sums"]) / replication_factor,
+                }
+            runs[key] = {
+                "files": [str(path) for path in paths],
+                "parameters": {
+                    f"{part}:{name}": value
+                    for (part, name), value in sorted(aggregated.items())
+                },
+            }
+            if reference is None:
+                reference_key = key
+                reference = aggregated
+                continue
+
+            if set(aggregated) != set(reference):
+                errors.append(
+                    {
+                        "run": key,
+                        "reference_run": reference_key,
+                        "error": "parameter name set mismatch",
+                        "missing": sorted(
+                            f"{part}:{name}"
+                            for part, name in set(reference) - set(aggregated)
+                        ),
+                        "extra": sorted(
+                            f"{part}:{name}"
+                            for part, name in set(aggregated) - set(reference)
+                        ),
+                    }
+                )
+            for parameter_key in sorted(set(reference) & set(aggregated)):
+                expected = reference[parameter_key]
+                current = aggregated[parameter_key]
+                differences = {
+                    field: {"reference": expected[field], "current": current[field]}
+                    for field in (
+                        "global_shape",
+                        "dtype",
+                        "sum",
+                        "square_sum",
+                    )
+                    if expected[field] != current[field]
+                }
+                if differences:
+                    errors.append(
+                        {
+                            "run": key,
+                            "reference_run": reference_key,
+                            "parameter": f"{parameter_key[0]}:{parameter_key[1]}",
+                            "differences": differences,
+                        }
+                    )
+
+    if saw_audit:
+        for key, run in runs.items():
+            if not run["files"]:
+                errors.append({"run": key, "error": "missing parameter audit files"})
+    return {
+        "status": "passed" if not errors else "failed",
+        "required": saw_audit,
+        "reference_run": reference_key,
+        "runs": runs,
+        "errors": errors,
+        "limitation": (
+            "matching aggregate moments detect observed initialization mismatches but do "
+            "not prove elementwise tensor identity"
+        ),
+    }
+
+
 def _load_audit(path: Path, description: str) -> dict[str, Any]:
     if not path.is_file():
         return {"status": "failed", "error": f"missing {description}: {path}"}
@@ -894,6 +1064,7 @@ def analyze_campaign(
             run_root / "runtime/configs/report.json", "runtime config parity report"
         ),
         "allocation": _allocation_audit(campaign, run_root),
+        "parameter_state_moments": _parameter_state_audit(campaign, run_root),
     }
     if campaign.raw.get("data", {}).get("preflight_auditor"):
         audits["input_preflight"] = _load_audit(

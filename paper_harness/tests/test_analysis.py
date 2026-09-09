@@ -5,7 +5,99 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from harness.analysis import _primary_for_structured
+from harness.analysis import _parameter_state_audit, _primary_for_structured
+
+
+class _Phase:
+    name = "performance"
+    arms = ("baseline", "treatment")
+
+
+class _Campaign:
+    phases = (_Phase(),)
+    world_size = 2
+
+
+def _write_parameter_audit(
+    root: Path,
+    arm: str,
+    rows: tuple[tuple[list[int], float, float], tuple[list[int], float, float]],
+    *,
+    checkpoint_wrapped: bool = False,
+) -> None:
+    output = root / "performance" / arm / "parameter_audit"
+    output.mkdir(parents=True)
+    for rank, (local_shape, total, square_total) in enumerate(rows):
+        name = "layers.0.attention.wo.weight"
+        if checkpoint_wrapped:
+            name = "layers.0._checkpoint_wrapped_module.attention.wo.weight"
+        record = {
+            "part": 0,
+            "name": name,
+            "raw_name": "model.layers.0.attention.wo.weight",
+            "global_shape": [2, 2],
+            "local_shape": local_shape,
+            "dtype": "torch.bfloat16",
+            "sample_sha256": "unused-by-global-moment-audit",
+            "sum": total,
+            "square_sum": square_total,
+        }
+        (output / f"rank_{rank:02d}.json").write_text(
+            json.dumps([record], indent=2, sort_keys=True) + "\n"
+        )
+
+
+class ParameterStateAuditTests(unittest.TestCase):
+    def test_matching_global_moments_pass_across_different_local_layouts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _write_parameter_audit(
+                root,
+                "baseline",
+                (([2, 2], 2.0, 6.0), ([2, 2], 4.0, 8.0)),
+                checkpoint_wrapped=True,
+            )
+            _write_parameter_audit(
+                root, "treatment", (([1, 2], 2.5, 5.0), ([1, 2], 0.5, 2.0))
+            )
+
+            result = _parameter_state_audit(_Campaign(), root)
+
+            self.assertEqual(result["status"], "passed")
+            self.assertTrue(result["required"])
+
+    def test_mismatched_global_moments_fail(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _write_parameter_audit(
+                root, "baseline", (([2, 1], 1.0, 3.0), ([2, 1], 2.0, 4.0))
+            )
+            _write_parameter_audit(
+                root, "treatment", (([1, 2], 2.5, 5.0), ([1, 2], 1.5, 2.0))
+            )
+
+            result = _parameter_state_audit(_Campaign(), root)
+
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(
+                result["errors"][0]["parameter"], "0:layers.0.attention.wo.weight"
+            )
+            self.assertIn("sum", result["errors"][0]["differences"])
+
+    def test_partial_parameter_audit_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _write_parameter_audit(
+                root, "baseline", (([2, 1], 1.0, 3.0), ([2, 1], 2.0, 4.0))
+            )
+
+            result = _parameter_state_audit(_Campaign(), root)
+
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(result["errors"][-1]["run"], "performance/treatment")
+            self.assertEqual(
+                result["errors"][-1]["error"], "missing parameter audit files"
+            )
 
 
 class PrimaryMeasurementTests(unittest.TestCase):
