@@ -155,7 +155,10 @@ def make_llama(model_name, mesh_shape):
     )
     expanded = {
         "family": "llama3",
-        "config": config,
+        "config": {
+            key: value for key, value in config.items() if key != "context_parallel_mesh"
+        },
+        "context_parallel_attention": "cp" in names,
         "batch_size": batch_size,
         "sequence_length": seq_len,
         "mesh_shape": list(mesh_shape),
