@@ -28,8 +28,11 @@ def _expect(config: dict[str, Any], expected: dict[str, Any]) -> None:
 
 def validate_profile(arm: Arm, config: dict[str, Any]) -> dict[str, Any]:
     if arm.profile == "tt_main_manual_jit_v1":
-        if arm.module.startswith("graph_trainer"):
-            raise CampaignError("tt_main_manual_jit_v1 cannot use a graph_trainer module")
+        model_spec_name = str(_get(config, "model_spec.name"))
+        if "graphtrainer" in model_spec_name.replace("_", "").lower():
+            raise CampaignError(
+                "tt_main_manual_jit_v1 cannot use a GraphTrainer model spec"
+            )
         _expect(
             config,
             {

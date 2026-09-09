@@ -1,0 +1,175 @@
+schema_version = 1
+name = "muse-glimmer-30b-paper-v1"
+description = "Current-head Muse Glimmer 30B packed-SDPA A/B/C scale-up"
+workload = "muse_glimmer_30b_current"
+
+[sources.torchtitan]
+remote = "https://github.com/AlbedoWang/torchtitan.git"
+commit = "TO_BE_PINNED_TORCHTITAN_CURRENT_HEAD"
+dirty_policy = "forbid"
+
+[sources.autoparallel]
+remote = "https://github.com/meta-pytorch/autoparallel.git"
+commit = "5102d629c0a97ec604b12c328b40147d214ecbe7"
+dirty_policy = "forbid"
+
+[model]
+flavor = "30B"
+attention_backend = "packed_document_sdpa"
+
+[data]
+mode = "streaming"
+identity = "batch_hash_manifest"
+dataset = "allenai/c4"
+revision = "1588ec454efa1a09f29cd18ddd04fe05fc8653a2"
+identity_manifest = "{asset:muse_input_manifests}/c4_input_manifest_lb2_s4096_dp4.jsonl"
+identity_manifest_sha256 = "6b529f2d7164f456a792ccf6d61488eba893ad6805df5c4e6731fef240d02cb1"
+preflight_auditor = "workloads.muse_glimmer.input_preflight"
+
+[training]
+local_batch_size = 2
+global_batch_size = 8
+gradient_accumulation_steps = 1
+seq_len = 4096
+
+[parallelism]
+data_parallel_replicate_degree = 1
+data_parallel_shard_degree = 4
+tensor_parallel_degree = 2
+context_parallel_degree = 1
+pipeline_parallel_degree = 1
+expert_parallel_degree = 1
+
+[metrics]
+save_for_all_ranks = true
+
+[comparison]
+declared_variable = "trainer_parallelization_and_compile_stack"
+allowed_config_paths = [
+  "compile.*",
+  "model_spec.name",
+]
+allowed_environment_keys = []
+pairs = [
+  ["tt_main", "gt_manual"],
+  ["tt_main", "apgt"],
+  ["gt_manual", "apgt"],
+]
+
+[measurement.primary]
+source = "tensorboard"
+steps = [10, 15, 20, 25]
+rank_selector = "rank0"
+value = "time_metrics/end_to_end(s)"
+unit_scale_to_ms = 1000
+throughput_tag = "throughput(tps)"
+active_memory_tag = "memory/max_active(GiB)"
+reserved_memory_tag = "memory/max_reserved(GiB)"
+
+[mast]
+nodes = 1
+nproc_per_node = 8
+hardware = "grandteton_80g_roce"
+locality = "region;eag"
+gpu_name_contains = "H100"
+conda_fbpkg = "torchtitan_conda_prod:902"
+retries = 0
+master_port = 29500
+phase_timeout_seconds = 10800
+
+[mast.environment]
+HF_HUB_CACHE = "{asset:c4_hf_cache}"
+HF_HUB_OFFLINE = "1"
+HF_DATASETS_OFFLINE = "1"
+HF_HUB_DISABLE_XET = "1"
+PYTORCH_ALLOC_CONF = "expandable_segments:True"
+
+[artifacts]
+required_assets = ["muse_glimmer", "muse_input_manifests", "c4_hf_cache"]
+warmup_steps = 5
+
+[[arms]]
+name = "tt_main"
+profile = "tt_main_manual_jit_v1"
+module = "graph_trainer.muse_glimmer"
+config = "muse_glimmer_30b_sdpa_c4_torchtitan_4x2"
+args = ["--hf-assets-path", "{asset:muse_glimmer}"]
+[arms.overrides]
+"compile.enable" = true
+"compile.backend" = "inductor"
+"compile.components" = ["model", "loss"]
+
+[[arms]]
+name = "gt_manual"
+profile = "gt_manual_aot_v1"
+module = "graph_trainer.muse_glimmer"
+config = "graph_trainer_muse_glimmer_30b_sdpa_c4_4x2"
+args = ["--hf-assets-path", "{asset:muse_glimmer}"]
+
+[[arms]]
+name = "apgt"
+profile = "apgt_v1"
+module = "graph_trainer.muse_glimmer"
+config = "graph_trainer_muse_glimmer_30b_sdpa_c4_autoparallel_4x2"
+args = ["--hf-assets-path", "{asset:muse_glimmer}"]
+
+[[phases]]
+name = "performance"
+kind = "performance"
+arms = ["tt_main", "gt_manual", "apgt"]
+[phases.overrides]
+"training.steps" = 25
+"profiler.enable_profiling" = false
+"profiler.enable_memory_snapshot" = false
+"metrics.log_freq" = 5
+
+[[phases]]
+name = "trace"
+kind = "trace"
+arms = ["tt_main", "gt_manual", "apgt"]
+trace_ranks = [0]
+[phases.overrides]
+"training.steps" = 6
+"profiler.enable_profiling" = true
+"profiler.enable_memory_snapshot" = false
+"profiler.profile_freq" = 6
+"profiler.profiler_warmup" = 0
+"profiler.profiler_active" = 3
+"profiler.profiler_repeat" = 1
+"metrics.log_freq" = 1
+
+[[matrix.points]]
+name = "4x2"
+[matrix.points.settings]
+"mast.nodes" = 1
+"parallelism.data_parallel_shard_degree" = 4
+"training.global_batch_size" = 8
+"data.identity_manifest" = "{asset:muse_input_manifests}/c4_input_manifest_lb2_s4096_dp4.jsonl"
+"data.identity_manifest_sha256" = "6b529f2d7164f456a792ccf6d61488eba893ad6805df5c4e6731fef240d02cb1"
+
+[[matrix.points]]
+name = "8x2"
+[matrix.points.settings]
+"mast.nodes" = 2
+"parallelism.data_parallel_shard_degree" = 8
+"training.global_batch_size" = 16
+"data.identity_manifest" = "{asset:muse_input_manifests}/c4_input_manifest_lb2_s4096_dp8.jsonl"
+"data.identity_manifest_sha256" = "4fda638c406cb949694e6007b404f026b1c37a33b94511aefdf2e78b14520f71"
+
+[[matrix.points]]
+name = "16x2"
+[matrix.points.settings]
+"mast.nodes" = 4
+"parallelism.data_parallel_shard_degree" = 16
+"training.global_batch_size" = 32
+"data.identity_manifest" = "{asset:muse_input_manifests}/c4_input_manifest_lb2_s4096_dp16.jsonl"
+"data.identity_manifest_sha256" = "11a5a5e9ac2f706ae9428a6ffb3e4fcc1a56e9ce270f092d9704b56aff9cf934"
+
+[[matrix.points]]
+name = "32x2"
+[matrix.points.settings]
+"mast.nodes" = 8
+"parallelism.data_parallel_shard_degree" = 32
+"training.global_batch_size" = 64
+"data.identity_manifest" = "{asset:muse_input_manifests}/c4_input_manifest_lb2_s4096_dp32.jsonl"
+"data.identity_manifest_sha256" = "4f339171083a62a51ebd4b6a53e2f28d8abeeeb629907047b580628e175158b1"
