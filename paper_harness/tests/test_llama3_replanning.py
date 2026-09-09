@@ -15,7 +15,7 @@ class Llama3ReplanningCampaignTests(unittest.TestCase):
     def test_canonical_generator_is_fixed_to_4x8_ilp(self) -> None:
         campaign = load_campaign(CAMPAIGNS / "llama3_8b_replanning_canonical.toml")
         self.assertEqual(campaign.world_size, 32)
-        self.assertEqual(campaign.raw["mast"]["locality"], "region;eag")
+        self.assertEqual(campaign.raw["mast"]["locality"], "dc;pci1")
         self.assertEqual(campaign.raw["training"]["seq_len"], 2048)
         self.assertEqual(campaign.raw["training"]["local_batch_size"], 2)
         arm = campaign.arm("canonical_fresh")
@@ -41,7 +41,7 @@ class Llama3ReplanningCampaignTests(unittest.TestCase):
                 campaign = load_campaign(path, point=point)
                 seq_len, local_batch, global_batch, replay_case = values
                 self.assertEqual(campaign.world_size, 32)
-                self.assertEqual(campaign.raw["mast"]["locality"], "region;eag")
+                self.assertEqual(campaign.raw["mast"]["locality"], "dc;pci1")
                 self.assertEqual(campaign.raw["training"]["seq_len"], seq_len)
                 self.assertEqual(
                     campaign.raw["training"]["local_batch_size"], local_batch
