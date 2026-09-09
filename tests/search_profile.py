@@ -550,7 +550,7 @@ def main(argv=None):
                         "constraints": (
                             len(opt.prob.constraints) if opt.prob is not None else 0
                         ),
-                        "selected_keys": len(opt.selected_keys),
+                        "selected_keys": len(getattr(opt, "selected_keys", ())),
                     },
                 }
             )
