@@ -10,12 +10,12 @@ git = False
 hpcJobOncall = meta_conda
 modelTypeName = gen_ai_conda
 hpcClusterUuid = MastGenAICluster
-localityConstraints = dc;pci1
+localityConstraints = region;eag
 forceSingleRegion = False
 use_caf = False
 
 [component:mast.py:train]
-name = permanent-harness-pci1
+name = permanent-harness-eag
 h = grandteton_80g_roce
 run_as_root = True
 

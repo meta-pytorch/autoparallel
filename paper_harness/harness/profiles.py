@@ -44,6 +44,7 @@ def validate_profile(arm: Arm, config: dict[str, Any]) -> dict[str, Any]:
         "apgt_v1",
         "gt_manual_cp_legacy_v1",
         "apgt_cp_legacy_v1",
+        "apgt_3d_exact_mesh_flash_v1",
     }:
         legacy_cp = arm.profile in {"gt_manual_cp_legacy_v1", "apgt_cp_legacy_v1"}
         model_spec_name = _get(config, "model_spec.name")
@@ -55,7 +56,11 @@ def validate_profile(arm: Arm, config: dict[str, Any]) -> dict[str, Any]:
                 f"{arm.profile} requires a GraphTrainer model spec, got "
                 f"{model_spec_name!r}"
             )
-        expected_ap = arm.profile in {"apgt_v1", "apgt_cp_legacy_v1"}
+        expected_ap = arm.profile in {
+            "apgt_v1",
+            "apgt_cp_legacy_v1",
+            "apgt_3d_exact_mesh_flash_v1",
+        }
         _expect(
             config,
             {
@@ -87,6 +92,13 @@ def validate_profile(arm: Arm, config: dict[str, Any]) -> dict[str, Any]:
             raise CampaignError(
                 f"{arm.profile} requires only cudagraph_pass disabled, got {sorted(disabled)}"
             )
+        if arm.profile == "apgt_3d_exact_mesh_flash_v1" and not arm.module.startswith(
+            "workloads.llama3_3d_current."
+        ):
+            raise CampaignError(
+                "apgt_3d_exact_mesh_flash_v1 requires the fixed current-head "
+                "LLaMA3 3D workload"
+            )
     elif arm.profile == "ap_backend_legacy_v1":
         if "autoparallel" not in arm.config and "autoparallel" not in arm.module:
             raise CampaignError("ap_backend_legacy_v1 must name an AutoParallel config/module")
@@ -99,9 +111,9 @@ def validate_profile_pair(
     treatment_arm: Arm,
     treatment: dict[str, Any],
 ) -> dict[str, Any] | None:
-    if {baseline_arm.profile, treatment_arm.profile} == {
-        "gt_manual_aot_v1",
+    if baseline_arm.profile == "gt_manual_aot_v1" and treatment_arm.profile in {
         "apgt_v1",
+        "apgt_3d_exact_mesh_flash_v1",
     }:
         check = validate_pair(
             baseline_arm.name,
@@ -119,17 +131,22 @@ def validate_apgt_source(torchtitan_root: Path) -> dict[str, Any]:
     graph_root = torchtitan_root / "torchtitan/experiments/graph_trainer"
     passes_path = graph_root / "passes.py"
     api_path = graph_root / "autoparallel_api.py"
-    if not passes_path.is_file() or not api_path.is_file():
+    trainer_path = graph_root / "trainer.py"
+    if not passes_path.is_file() or not api_path.is_file() or not trainer_path.is_file():
         raise CampaignError("TorchTitan source lacks GraphTrainer AutoParallel files")
     passes = passes_path.read_text()
     api = api_path.read_text()
+    trainer = trainer_path.read_text()
     pass_needles = (
         "if config.compile.enable_autoparallel:",
         "joint_transformer_block_bucketing_reordering_pass",
         "_autoparallel_inductor_configs",
         "full_inductor_configs=full_inductor_configs",
+        "autoparallel_mesh=autoparallel_mesh",
+        "AutoParallel full Inductor compilation requires its runtime mesh",
     )
     api_needles = (
+        "_graph_trainer_autoparallel_mesh",
         "aten_distributed_optimizations.enable_overlap_scheduling",
         "aten_distributed_optimizations.collective_bucketing",
         "aten_distributed_optimizations.insert_overlap_deps",
@@ -141,6 +158,14 @@ def validate_apgt_source(torchtitan_root: Path) -> dict[str, Any]:
     )
     missing = [item for item in pass_needles if item not in passes]
     missing.extend(item for item in api_needles if item not in api)
+    missing.extend(
+        item
+        for item in (
+            'getattr(model, "_graph_trainer_autoparallel_mesh", None)',
+            "autoparallel_mesh=autoparallel_mesh",
+        )
+        if item not in trainer
+    )
     if missing:
         raise CampaignError(
             "source does not satisfy apgt_v1; user gate required before changing "
@@ -150,6 +175,7 @@ def validate_apgt_source(torchtitan_root: Path) -> dict[str, Any]:
         "status": "passed",
         "passes_path": str(passes_path.resolve()),
         "autoparallel_api_path": str(api_path.resolve()),
+        "trainer_path": str(trainer_path.resolve()),
         "manual_joint_pass": "enabled_by_enable_autoparallel_false_branch",
         "ap_joint_pass": "absent_by_enable_autoparallel_true_branch",
         "ap_full_inductor_configs": "verified",

@@ -19,6 +19,7 @@ PROFILES = {
     "apgt_v1",
     "gt_manual_cp_legacy_v1",
     "apgt_cp_legacy_v1",
+    "apgt_3d_exact_mesh_flash_v1",
     "ap_backend_legacy_v1",
 }
 PHASE_KINDS = {"correctness", "performance", "kineto", "torch_trace", "trace"}
@@ -397,6 +398,11 @@ def _validate_campaign(campaign: Campaign) -> None:
         raise CampaignError("MAST node and process counts must be positive")
     if int(mast.get("retries", 0)) != 0:
         raise CampaignError("paired permanent-harness campaigns require mast.retries = 0")
+    locality = str(mast["locality"]).split(";", 1)
+    if len(locality) != 2 or locality[0] not in {"dc", "region"} or not locality[1]:
+        raise CampaignError(
+            "mast.locality must be an explicit 'dc;NAME' or 'region;NAME' constraint"
+        )
 
     environment_maps = [("mast.environment", mast.get("environment", {}))]
     environment_maps.extend(

@@ -17,6 +17,10 @@ PAYLOAD_PACKAGE = "torchtitan_additional_packages:"
 HARDWARE_SERVER_SUBTYPES = {
     "grandteton_80g_roce": "LogicalServerSubType.T20_GRAND_TETON_HBM3_ROCE",
 }
+LOCALITY_SCOPES = {
+    "dc": "Locality.DC",
+    "region": "Locality.REGION",
+}
 
 
 def _argument(arguments: list[str], option: str) -> str | None:
@@ -183,15 +187,33 @@ def audit_dryrun(
         and "/packages/conda_mast_core/tee/torchx_tee.sh" in str(spec.get("command", "")),
         checks,
     )
-    expected_locality = str(mast["locality"]).split(";", 1)[-1]
+    locality_parts = str(mast["locality"]).split(";", 1)
+    expected_scope = LOCALITY_SCOPES.get(locality_parts[0])
+    expected_locality = locality_parts[1] if len(locality_parts) == 2 else None
+    observed_locality = definition.get("localityConstraints", {})
     _check(
-        "locality",
-        definition.get("localityConstraints", {}).get("options")
-        == [expected_locality],
+        "locality_scope",
+        expected_scope is not None
+        and observed_locality.get("locality") == expected_scope,
         checks,
     )
-    _check("zero_role_retries", spec.get("restartPolicy", {}).get("maxTotalFailures") == int(mast.get("retries", 0)), checks)
-    _check("zero_job_retries", definition.get("maxJobFailures") == int(mast.get("retries", 0)), checks)
+    _check(
+        "locality_option",
+        expected_locality is not None
+        and observed_locality.get("options") == [expected_locality],
+        checks,
+    )
+    _check(
+        "zero_role_retries",
+        spec.get("restartPolicy", {}).get("maxTotalFailures")
+        == int(mast.get("retries", 0)),
+        checks,
+    )
+    _check(
+        "zero_job_retries",
+        definition.get("maxJobFailures") == int(mast.get("retries", 0)),
+        checks,
+    )
     _check("ttls", spec.get("ttlsConfig", {}).get("enable") is True, checks)
     _check("conda", mast["conda_fbpkg"] in packages, checks)
     _check("oilfs", "oil.oilfs:stable" in packages, checks)
