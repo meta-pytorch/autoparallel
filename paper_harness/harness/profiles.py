@@ -158,14 +158,12 @@ def validate_apgt_source(torchtitan_root: Path) -> dict[str, Any]:
     )
     missing = [item for item in pass_needles if item not in passes]
     missing.extend(item for item in api_needles if item not in api)
-    missing.extend(
-        item
-        for item in (
-            'getattr(model, "_graph_trainer_autoparallel_mesh", None)',
-            "autoparallel_mesh=autoparallel_mesh",
-        )
-        if item not in trainer
+    trainer_needles = (
+        "pipeline_fn is construct_default_graph_passes",
+        "autoparallel_mesh=getattr(",
+        'model, "_graph_trainer_autoparallel_mesh", None',
     )
+    missing.extend(item for item in trainer_needles if item not in trainer)
     if missing:
         raise CampaignError(
             "source does not satisfy apgt_v1; user gate required before changing "
