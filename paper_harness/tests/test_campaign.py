@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 from harness.campaign import CampaignError, load_campaign, settings_to_argv
+from harness.cli import _submitted_job_id
 from harness.parity import validate_pair
 from harness.sources import inspect_source
 
@@ -14,6 +15,15 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class CampaignTests(unittest.TestCase):
+    def test_submitted_job_id_uses_torchx_mast_handle(self) -> None:
+        output = """Current Session ID: session-id
+
+mast_conda://torchx/llama3-paper-wangkj-grfhpnvn
+"""
+        self.assertEqual(
+            _submitted_job_id(output), "llama3-paper-wangkj-grfhpnvn"
+        )
+
     def test_reproduction_campaigns_are_fixed_to_32_gpus(self) -> None:
         expected_init_timeouts = {
             "repro_llama3_8b_2d_32gpu.toml": 1200,

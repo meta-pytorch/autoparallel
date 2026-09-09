@@ -39,6 +39,12 @@ ALLOCATION_IDENTITY_FIELDS = (
     "device_network_id",
     "device_backend_network_topology",
 )
+MEMORY_TAGS = (
+    "memory/max_active(GiB)",
+    "memory/max_reserved(GiB)",
+    "memory/num_alloc_retries",
+    "memory/num_ooms",
+)
 
 
 def _sha256(path: Path) -> str:
@@ -184,6 +190,65 @@ def _tensorboard_scalars(event_path: Path) -> dict[str, dict[int, float]]:
                         struct.unpack("<f", scalar)[0]
                     )
     return result
+
+
+def _all_rank_memory(
+    phase_root: Path, warmup_steps: int, world_size: int
+) -> dict[str, Any]:
+    paths = sorted((phase_root / "job/tb").glob("**/rank_*/events.out.tfevents.*"))
+    by_rank: dict[int, Path] = {}
+    errors = []
+    for path in paths:
+        try:
+            rank = int(path.parent.name.removeprefix("rank_"))
+        except ValueError:
+            errors.append(f"cannot parse TensorBoard rank from {path}")
+            continue
+        if rank in by_rank:
+            errors.append(f"multiple TensorBoard event files for rank {rank}")
+        by_rank[rank] = path
+
+    expected_ranks = set(range(world_size))
+    if set(by_rank) != expected_ranks:
+        errors.append(
+            "TensorBoard rank set mismatch: "
+            f"expected={sorted(expected_ranks)}, observed={sorted(by_rank)}"
+        )
+
+    values: dict[str, list[dict[str, float | int]]] = {
+        tag: [] for tag in MEMORY_TAGS
+    }
+    for rank, path in sorted(by_rank.items()):
+        scalars = _tensorboard_scalars(path)
+        for tag in MEMORY_TAGS:
+            samples = {
+                step: value
+                for step, value in scalars.get(tag, {}).items()
+                if step > warmup_steps
+            }
+            if not samples:
+                errors.append(f"rank {rank} has no post-warmup samples for {tag}")
+                continue
+            values[tag].extend(
+                {"rank": rank, "step": step, "value": float(value)}
+                for step, value in sorted(samples.items())
+            )
+
+    summaries = {}
+    for tag, rows in values.items():
+        samples = [float(row["value"]) for row in rows]
+        peak_row = max(rows, key=lambda row: float(row["value"])) if rows else None
+        summaries[tag] = {
+            "all_rank_samples": _summary(samples),
+            "peak": peak_row,
+        }
+    return {
+        "status": "passed" if not errors else "failed",
+        "measurement_method": "maximum across every rank and post-warmup log window",
+        "files": [str(path) for path in paths],
+        "metrics": summaries,
+        "errors": errors,
+    }
 
 
 def _structured_metrics(
@@ -795,6 +860,11 @@ def analyze_campaign(
                 if phase.kind == "performance"
                 else None
             )
+            memory = (
+                _all_rank_memory(root, warmup, campaign.world_size)
+                if phase.kind == "performance"
+                else None
+            )
             trace = (
                 _trace_audit(phase.kind, root, phase.trace_ranks)
                 if phase.kind in {"trace", "kineto", "torch_trace"}
@@ -803,12 +873,14 @@ def analyze_campaign(
             arm_passed = (
                 exit_audit["status"] == "passed"
                 and (metrics is None or metrics["status"] == "passed")
+                and (memory is None or memory["status"] == "passed")
                 and (trace is None or trace["status"] == "passed")
             )
             arms[arm] = {
                 "status": "passed" if arm_passed else "failed",
                 "exit_audit": exit_audit,
                 "structured_metrics": metrics,
+                "all_rank_memory": memory,
                 "trace_audit": trace,
             }
         phases[phase.name] = {"kind": phase.kind, "arms": arms}

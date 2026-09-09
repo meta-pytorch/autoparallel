@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -12,6 +13,9 @@ from .dryrun import audit_dryrun
 from .packaging import package_campaign
 from .sources import manifest_digest, tree_manifest
 from .validation import validate_campaign
+
+
+MAST_HANDLE_PATTERN = re.compile(r"mast_conda://[^/\s]+/([^\s]+)")
 
 
 def _asset_roots(values: list[str]) -> dict[str, Path]:
@@ -73,6 +77,15 @@ def _verify_sealed_attempt(attempt: Path) -> dict:
     return package_report
 
 
+def _submitted_job_id(output: str) -> str:
+    matches = sorted(set(MAST_HANDLE_PATTERN.findall(output)))
+    if len(matches) != 1:
+        raise CampaignError(
+            f"expected one submitted MAST job handle, found {len(matches)}"
+        )
+    return matches[0]
+
+
 def _run_torchx(attempt: Path, *, dryrun: bool) -> dict:
     package_report = _verify_sealed_attempt(attempt)
     if not package_report["validation"].get("probe_configs"):
@@ -123,7 +136,20 @@ def _run_torchx(attempt: Path, *, dryrun: bool) -> dict:
             stderr=completed.stderr,
             launcher_root=Path(__file__).resolve().parents[1] / "launcher",
         )
-    return {"status": "submitted", "command": command, "stdout": completed.stdout}
+    job_id = _submitted_job_id(completed.stdout + "\n" + completed.stderr)
+    handle = f"mast_conda://torchx/{job_id}"
+    (attempt / "job_id.txt").write_text(f"{job_id}\n")
+    result = {
+        "status": "submitted",
+        "command": command,
+        "job_id": job_id,
+        "handle": handle,
+        "stdout": completed.stdout,
+    }
+    (attempt / "submission.json").write_text(
+        json.dumps(result, indent=2, sort_keys=True) + "\n"
+    )
+    return result
 
 
 def build_parser() -> argparse.ArgumentParser:
