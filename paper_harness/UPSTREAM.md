@@ -16,9 +16,9 @@ Current AutoParallel `main` is not merged implicitly. This keeps the paper stack
 
 ## TorchTitan
 
-The companion `AlbedoWang/torchtitan` branch `kaijian/paper-submission` ends at `d0ced23d8b41895bfb2e2d8a0c0305d18ed08ccb`. Its stack contains the prior GraphTrainer AutoParallel integration, the validated LLaMA3/DeepSeek V3 3D integration snapshot, and the solver configuration bridge consumed by this harness.
+The companion `AlbedoWang/torchtitan` branch `kaijian/paper-submission` ends at `7f480ff1a9ba04296b297a19b0b1614f26b47bb8`. Its stack contains the prior GraphTrainer AutoParallel integration, the validated LLaMA3/DeepSeek V3 3D integration snapshot, the solver configuration bridge, and the AP+GraphTrainer full-Inductor contract used by the fixed LLaMA3 reproduction.
 
-The snapshot-restoration commit is `5f032d1337ddf2cf6ee1c334a3dd1a9816490ed3`. It reconstructs the final retained 3D integration source atop the available Git history because the original local final commit object was no longer available. The next commit, `d0ced23d8b41895bfb2e2d8a0c0305d18ed08ccb`, adds only the typed solver configuration and shared forwarding logic.
+The snapshot-restoration commit is `5f032d1337ddf2cf6ee1c334a3dd1a9816490ed3`. It reconstructs the final retained 3D integration source atop the available Git history because the original local final commit object was no longer available. Commit `d0ced23d8b41895bfb2e2d8a0c0305d18ed08ccb` adds the typed solver configuration and shared forwarding logic. Commit `7f480ff1a9ba04296b297a19b0b1614f26b47bb8` restores the source contract from the successful `383cae9f9c59845565963f1c9d7796c13d20fcd7` reproduction: AP-specific overlap and collective bucketing, no manual joint pass on the AP arm, and those settings forwarded into full Inductor.
 
 ## Pinning policy
 
