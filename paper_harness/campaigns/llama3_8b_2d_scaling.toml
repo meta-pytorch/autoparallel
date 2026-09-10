@@ -54,6 +54,12 @@ allowed_config_paths = ["compile.*", "model_spec.name", "parallelism.*"]
 allowed_environment_keys = ["BENCHMARK_CONFIGURATION", "EXPERIMENT_ARM", "BENCHMARK_TP_DEGREE"]
 pairs = [["gt_manual", "apgt"], ["tt_main_tp", "apgt"]]
 
+[measurement.primary]
+source = "structured_logs"
+steps = [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25]
+rank_selector = "max_step_end"
+value = "step_end_duration"
+
 [mast]
 nodes = 1
 nproc_per_node = 8
