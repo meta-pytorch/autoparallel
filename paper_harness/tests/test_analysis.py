@@ -16,6 +16,7 @@ class _Phase:
 class _Campaign:
     phases = (_Phase(),)
     world_size = 2
+    raw = {"comparison": {"pairs": [["baseline", "treatment"]]}}
 
 
 def _write_parameter_audit(
@@ -98,6 +99,14 @@ class ParameterStateAuditTests(unittest.TestCase):
             self.assertEqual(
                 result["errors"][-1]["error"], "missing parameter audit files"
             )
+
+    def test_missing_parameter_audits_fail_for_comparison(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            result = _parameter_state_audit(_Campaign(), Path(temporary))
+
+            self.assertEqual(result["status"], "failed")
+            self.assertTrue(result["required"])
+            self.assertEqual(len(result["errors"]), 2)
 
 
 class PrimaryMeasurementTests(unittest.TestCase):

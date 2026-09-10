@@ -70,6 +70,8 @@ Common TorchTitan config sections use their native names. Less common settings g
 
 `training.local_batch_size` is the microbatch per data-parallel replica. `global_batch_size = local_batch_size * data_parallel_replicate_degree * data_parallel_shard_degree * gradient_accumulation_steps`; TP, CP, PP, and EP ranks do not multiply global batch.
 
+Every declared paired comparison must emit a complete all-rank parameter-state audit for every arm and phase. Missing audits, partial rank coverage, or unequal normalized global moments make the analysis non-comparative.
+
 Scaling and sequence sweeps use `[[matrix.points]]`. Select one immutable point per MAST allocation with `--point`.
 
 ## Data path

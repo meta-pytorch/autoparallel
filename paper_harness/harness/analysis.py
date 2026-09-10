@@ -425,7 +425,7 @@ def _canonical_parameter_name(name: str) -> str:
 
 
 def _parameter_state_audit(campaign: Campaign, run_root: Path) -> dict[str, Any]:
-    """Fail closed when emitted initialized-parameter moments differ across arms."""
+    """Require and compare initialized-parameter moments for paired runs."""
     runs: dict[str, Any] = {}
     errors: list[dict[str, Any]] = []
     reference_key: str | None = None
@@ -570,13 +570,14 @@ def _parameter_state_audit(campaign: Campaign, run_root: Path) -> dict[str, Any]
                         }
                     )
 
-    if saw_audit:
+    required = bool(campaign.raw.get("comparison", {}).get("pairs"))
+    if required or saw_audit:
         for key, run in runs.items():
             if not run["files"]:
                 errors.append({"run": key, "error": "missing parameter audit files"})
     return {
         "status": "passed" if not errors else "failed",
-        "required": saw_audit,
+        "required": required,
         "reference_run": reference_key,
         "runs": runs,
         "errors": errors,
@@ -1113,7 +1114,8 @@ def analyze_campaign(
         report["measurement_method"],
         "",
         "A comparative claim is allowed only when package, runtime source/config, "
-        "same-allocation, per-rank completion, and metric gates all pass.",
+        "parameter-state, same-allocation, per-rank completion, and metric gates "
+        "all pass.",
         "",
         f"Full machine-readable result: `{output_dir / 'analysis.json'}`",
     ]
