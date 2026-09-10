@@ -68,7 +68,8 @@ def audit(
     iterator = iter(dataloader)
     observed = []
     for batch_index in range(1, 11):
-        input_dict, labels = next(iterator)
+        input_dict = dict(next(iterator))
+        labels = input_dict.pop("labels")
         if input_dict.get("num_valid_tokens") != labels.numel():
             raise RuntimeError("latest Trainer valid-token metadata is incorrect")
         observed.append(

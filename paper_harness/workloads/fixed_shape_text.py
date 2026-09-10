@@ -189,7 +189,7 @@ class FixedShapeTextDataLoader(BaseDataLoader):
         self._dataset = dataset
         self._source = iter(dataset)
 
-    def __iter__(self) -> Iterator[tuple[dict[str, torch.Tensor | int], torch.Tensor]]:
+    def __iter__(self) -> Iterator[dict[str, torch.Tensor | int]]:
         while True:
             samples = [next(self._source) for _ in range(self.local_batch_size)]
             input_dict = {
@@ -197,8 +197,9 @@ class FixedShapeTextDataLoader(BaseDataLoader):
                 for name in samples[0][0]
             }
             labels = torch.stack([sample[1] for sample in samples])
+            input_dict["labels"] = labels
             input_dict["num_valid_tokens"] = int((labels != IGNORE_INDEX).sum())
-            yield input_dict, labels
+            yield input_dict
 
     def state_dict(self) -> dict[str, Any]:
         return {

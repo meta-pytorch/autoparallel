@@ -5,7 +5,7 @@ workload = "muse_glimmer_30b_seed"
 
 [sources.torchtitan]
 remote = "https://github.com/AlbedoWang/torchtitan.git"
-commit = "b23f77b82a796022c5e5e2addd6e9a1419719bf6"
+commit = "fd69701b6dc46c15b1214ba2f6ec6bbf3e044f3e"
 dirty_policy = "forbid"
 
 [sources.autoparallel]

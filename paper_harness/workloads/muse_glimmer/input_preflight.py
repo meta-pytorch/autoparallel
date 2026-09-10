@@ -93,7 +93,8 @@ def audit(
     iterator = iter(dataloader)
     observed = []
     for step in range(1, 26):
-        input_dict, labels = next(iterator)
+        input_dict = dict(next(iterator))
+        labels = input_dict.pop("labels")
         observed.append(
             {"dp_rank": dp_rank, "step": step, "sha256": _batch_sha256(input_dict, labels)}
         )

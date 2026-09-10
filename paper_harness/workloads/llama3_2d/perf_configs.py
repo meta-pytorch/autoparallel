@@ -533,9 +533,10 @@ class AuditedReplayDataLoader(BaseDataLoader):
                 for name in samples[0][0]
             }
             labels = torch.stack([sample[1] for sample in samples])
+            input_dict["labels"] = labels
             input_dict["num_valid_tokens"] = int((labels != IGNORE_INDEX).sum())
             self._index += 1
-            yield input_dict, labels
+            yield input_dict
 
     def state_dict(self):
         return {"index": self._index}

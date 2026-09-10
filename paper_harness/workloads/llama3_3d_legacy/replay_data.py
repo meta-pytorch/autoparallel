@@ -121,13 +121,14 @@ class ReplayDataLoader(BaseDataLoader):
             },
         )
 
-    def __iter__(self) -> Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]]:
+    def __iter__(self) -> Iterator[dict[str, torch.Tensor | int]]:
         while self._index < len(self._batches):
             input_dict, labels = self._batches[self._index]
             self._index += 1
             batch = dict(input_dict)
+            batch["labels"] = labels
             batch["num_valid_tokens"] = int((labels != IGNORE_INDEX).sum())
-            yield batch, labels
+            yield batch
 
     def state_dict(self) -> dict[str, Any]:
         return {"index": self._index}
@@ -149,7 +150,7 @@ class EmptyDataLoader(BaseDataLoader):
     def __init__(self, config: Config, **kwargs) -> None:
         del config, kwargs
 
-    def __iter__(self) -> Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]]:
+    def __iter__(self) -> Iterator[dict[str, torch.Tensor | int]]:
         return iter(())
 
     def state_dict(self) -> dict[str, Any]:

@@ -138,17 +138,18 @@ class FixedC4ReplayDataLoader(BaseDataLoader):
         self._labels = tensors["labels"][:, first:last]
         self._index = 0
 
-    def __iter__(self) -> Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]]:
+    def __iter__(self) -> Iterator[dict[str, torch.Tensor | int]]:
         while True:
             slot = self._index % self._inputs.shape[0]
             self._index += 1
             yield {
                 "input": self._inputs[slot],
                 "positions": self._positions[slot],
+                "labels": self._labels[slot],
                 "num_valid_tokens": int(
                     (self._labels[slot] != IGNORE_INDEX).sum()
                 ),
-            }, self._labels[slot]
+            }
 
     def state_dict(self) -> dict[str, Any]:
         return {"index": self._index}

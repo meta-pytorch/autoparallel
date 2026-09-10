@@ -207,11 +207,14 @@ class FixedReplay16KDataLoader(BaseDataLoader):
         }
         output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
 
-    def __iter__(self) -> Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]]:
+    def __iter__(self) -> Iterator[dict[str, torch.Tensor | int]]:
         while True:
             input_dict, labels = self._batches[self._index]
             self._index = (self._index + 1) % len(self._batches)
-            yield dict(input_dict), labels
+            batch = dict(input_dict)
+            batch["labels"] = labels
+            batch["num_valid_tokens"] = int((labels != IGNORE_INDEX).sum())
+            yield batch
 
     def state_dict(self) -> dict[str, Any]:
         return {"index": self._index}

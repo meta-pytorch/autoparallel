@@ -538,9 +538,9 @@ class AuditedC4DataLoader(FixedShapeTextDataLoader):
         replay_batches = [next(source) for _ in range(replay_size)]
         batch_index = 0
         while True:
-            input_dict, labels = replay_batches[batch_index % replay_size]
+            input_dict = replay_batches[batch_index % replay_size]
             batch_index += 1
-            yield dict(input_dict), labels
+            yield dict(input_dict)
 
 
 def _base_config():
