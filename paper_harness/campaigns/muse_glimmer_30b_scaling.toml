@@ -86,7 +86,7 @@ evidence_globs = ["reports/*.md", "reports/**/*.json", "job/attempts/*/analysis/
 [[arms]]
 name = "gt_manual"
 profile = "gt_manual_aot_v1"
-module = "graph_trainer.muse_glimmer"
+module = "workloads.muse_glimmer.perf_configs"
 config = "graph_trainer_muse_glimmer_30b_sdpa_c4_4x2"
 args = ["--hf-assets-path", "{asset:muse_glimmer}"]
 [arms.overrides]
@@ -95,7 +95,7 @@ args = ["--hf-assets-path", "{asset:muse_glimmer}"]
 [[arms]]
 name = "apgt"
 profile = "apgt_v1"
-module = "graph_trainer.muse_glimmer"
+module = "workloads.muse_glimmer.perf_configs"
 config = "graph_trainer_muse_glimmer_30b_sdpa_c4_autoparallel_4x2"
 args = ["--hf-assets-path", "{asset:muse_glimmer}"]
 [arms.overrides]

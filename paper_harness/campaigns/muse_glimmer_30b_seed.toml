@@ -1,0 +1,92 @@
+schema_version = 1
+name = "muse-glimmer-30b-seed"
+description = "Create one unsharded native-DCP Muse Glimmer 30B model-only seed"
+workload = "muse_glimmer_30b_seed"
+
+[sources.torchtitan]
+remote = "https://github.com/AlbedoWang/torchtitan.git"
+commit = "0dc14f57b93ec830f395d024718d351d04305fdb"
+dirty_policy = "forbid"
+
+[sources.autoparallel]
+remote = "https://github.com/meta-pytorch/autoparallel.git"
+commit = "5102d629c0a97ec604b12c328b40147d214ecbe7"
+dirty_policy = "forbid"
+
+[model]
+flavor = "30B"
+attention_backend = "packed_document_sdpa"
+
+[data]
+mode = "streaming"
+identity = "batch_hash_manifest"
+dataset = "allenai/c4"
+revision = "1588ec454efa1a09f29cd18ddd04fe05fc8653a2"
+identity_manifest = "{asset:muse_input_manifests}/c4_input_manifest_lb2_s4096_dp4.jsonl"
+identity_manifest_sha256 = "6b529f2d7164f456a792ccf6d61488eba893ad6805df5c4e6731fef240d02cb1"
+
+[training]
+local_batch_size = 1
+global_batch_size = 1
+gradient_accumulation_steps = 1
+seq_len = 4096
+steps = 1
+
+[parallelism]
+data_parallel_replicate_degree = 1
+data_parallel_shard_degree = 1
+tensor_parallel_degree = 1
+context_parallel_degree = 1
+pipeline_parallel_degree = 1
+expert_parallel_degree = 1
+
+[checkpoint]
+enable = true
+folder = "checkpoint"
+create_seed_checkpoint = true
+last_save_model_only = true
+last_save_in_hf = false
+async_mode = "disabled"
+load_only = false
+
+[mast]
+nodes = 1
+nproc_per_node = 1
+hardware = "grandteton_80g_roce"
+locality = "dc;pci1"
+gpu_name_contains = "H100"
+conda_fbpkg = "torchtitan_conda_prod:902"
+retries = 0
+master_port = 29500
+phase_timeout_seconds = 7200
+
+[mast.environment]
+HF_HUB_CACHE = "{asset:c4_hf_cache}"
+HF_HUB_OFFLINE = "1"
+HF_DATASETS_OFFLINE = "1"
+HF_HUB_DISABLE_XET = "1"
+PYTORCH_ALLOC_CONF = "expandable_segments:True"
+
+[artifacts]
+required_assets = ["muse_glimmer", "muse_input_manifests", "c4_hf_cache"]
+warmup_steps = 0
+
+[[arms]]
+name = "seed"
+profile = "tt_main_manual_jit_v1"
+module = "workloads.muse_glimmer.perf_configs"
+config = "muse_glimmer_30b_sdpa_seed_checkpoint"
+args = ["--hf-assets-path", "{asset:muse_glimmer}"]
+[arms.overrides]
+"compile.enable" = true
+"compile.backend" = "inductor"
+"compile.components" = ["model", "loss"]
+
+[[phases]]
+name = "seed"
+kind = "correctness"
+arms = ["seed"]
+[phases.overrides]
+"training.steps" = 1
+"profiler.enable_profiling" = false
+"profiler.enable_memory_snapshot" = false
