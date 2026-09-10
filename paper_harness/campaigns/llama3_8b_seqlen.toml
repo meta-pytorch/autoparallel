@@ -37,6 +37,15 @@ tensor_parallel_degree = 8
 context_parallel_degree = 1
 pipeline_parallel_degree = 1
 
+[checkpoint]
+enable = true
+folder = "checkpoint"
+initial_load_path = "{asset:llama3_3d_seed_checkpoint}"
+initial_load_model_only = true
+initial_load_in_hf = true
+load_only = true
+create_seed_checkpoint = false
+
 [comparison]
 declared_variable = "autoparallel_fresh_solve_vs_canonical_2k_placement_replay"
 allowed_config_paths = []
@@ -71,7 +80,7 @@ HF_HUB_DISABLE_XET = "1"
 PYTORCH_ALLOC_CONF = "expandable_segments:True"
 
 [artifacts]
-required_assets = ["canonical_2k", "offline_c4", "llama_tokenizer"]
+required_assets = ["canonical_2k", "offline_c4", "llama_tokenizer", "llama3_3d_seed_checkpoint"]
 warmup_steps = 5
 
 [legacy]

@@ -12,7 +12,6 @@ from pathlib import Path
 import torch
 from datasets import Features, Value, load_dataset
 from torch.distributed.fsdp import MixedPrecisionPolicy
-from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
 from torchtitan.config import CompileConfig, TORCH_DTYPE_MAP
@@ -38,6 +37,8 @@ from torchtitan.models.common.config_utils import decoder_vocab_size
 from torchtitan.models.llama3.config_registry import llama3_8b
 from torchtitan.tools.logging import logger
 from torchtitan.tools.utils import device_type
+
+from workloads.parameter_state import register_post_load_parameter_audit
 
 
 C4_REPO = "allenai/c4"
@@ -208,56 +209,9 @@ class AutoParallelBackendOutputAdapter(torch.nn.Module):
         return self.model.init_weights(*args, **kwargs)
 
 
-def _normalize_parameter_name(name: str) -> str:
-    prefixes = ("model._orig_mod.", "_orig_mod.", "model.")
-    changed = True
-    while changed:
-        changed = False
-        for prefix in prefixes:
-            if name.startswith(prefix):
-                name = name.removeprefix(prefix)
-                changed = True
-    return name
-
-
-def _audit_model_parameters(_optimizers, model_parts, _parallel_dims):
-    """Record shard-local initialized weights without changing training state."""
+def _register_post_load_audits(optimizers, model_parts, parallel_dims):
     _write_inductor_path_audit()
-    audit_dir = os.environ.get("PARAMETER_AUDIT_DIR")
-    if audit_dir is None:
-        return
-
-    records = []
-    with torch.no_grad():
-        for part_index, model_part in enumerate(model_parts):
-            for name, parameter in model_part.named_parameters():
-                local = (
-                    parameter.to_local()
-                    if isinstance(parameter, DTensor)
-                    else parameter
-                )
-                flat = local.detach().reshape(-1)
-                sample = flat[: min(flat.numel(), 8192)].contiguous()
-                sample_bytes = sample.view(torch.uint8).cpu().numpy().tobytes()
-                float_local = local.detach().float()
-                records.append(
-                    {
-                        "part": part_index,
-                        "name": _normalize_parameter_name(name),
-                        "raw_name": name,
-                        "global_shape": list(parameter.shape),
-                        "local_shape": list(local.shape),
-                        "dtype": str(parameter.dtype),
-                        "sample_sha256": hashlib.sha256(sample_bytes).hexdigest(),
-                        "sum": float(float_local.sum().item()),
-                        "square_sum": float(float_local.square().sum().item()),
-                    }
-                )
-
-    output_dir = Path(audit_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    output = output_dir / f"rank_{int(os.environ['RANK']):02d}.json"
-    output.write_text(json.dumps(records, indent=2, sort_keys=True) + "\n")
+    register_post_load_parameter_audit(optimizers, model_parts, parallel_dims)
 
 
 def parallelize_autoparallel_backend_llama(
@@ -843,7 +797,7 @@ def _base_config():
     config.model_spec = model_registry(MODEL_FLAVOR, attn_backend="sdpa")
     config.model_spec = replace(
         config.model_spec,
-        post_optimizer_build_fn=_audit_model_parameters,
+        post_optimizer_build_fn=_register_post_load_audits,
     )
     config.hf_assets_path = os.environ["LLAMA_TOKENIZER_DIR"]
     config.loss = CrossEntropyLoss.Config(

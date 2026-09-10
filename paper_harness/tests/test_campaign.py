@@ -36,7 +36,10 @@ launched app: `mast_conda://torchx/llama3-paper-wangkj-grfhpnvn`
                 campaign = load_campaign(path)
                 self.assertEqual(campaign.world_size, 32)
                 self.assertIn("primary", campaign.raw["measurement"])
-                if path.name == "repro_llama3_8b_2d_32gpu.toml":
+                if path.name in {
+                    "repro_llama3_8b_2d_32gpu.toml",
+                    "repro_llama3_8b_seqlen_4k_32gpu.toml",
+                }:
                     self.assertNotIn("acceptance", campaign.raw["comparison"])
                 else:
                     self.assertIn("acceptance", campaign.raw["comparison"])

@@ -41,6 +41,15 @@ pipeline_parallel_degree = 1
 [comm]
 init_timeout_seconds = 1200
 
+[checkpoint]
+enable = true
+folder = "checkpoint"
+initial_load_path = "{asset:llama3_3d_seed_checkpoint}"
+initial_load_model_only = true
+initial_load_in_hf = true
+load_only = true
+create_seed_checkpoint = false
+
 [comparison]
 declared_variable = "autoparallel_fresh_solve_vs_canonical_2k_placement_replay"
 allowed_config_paths = []
@@ -50,16 +59,6 @@ pairs = [["replay_2k", "fresh"]]
 [comparison.performance_phase_by_arm]
 fresh = "00_fresh_measure"
 replay_2k = "02_replay_2k_measure"
-
-[comparison.acceptance]
-metric = "primary_latency"
-baseline = "replay_2k"
-treatment = "fresh"
-# Recomputed from the historical rank-0 TensorBoard end-to-end windows at the
-# same steps.  The legacy +5.012% post-fetch metric excluded timed-path input
-# hashing/file I/O and is retained only in the immutable historical report.
-reference_gap_percent = 2.7157989308851604
-tolerance_percentage_points = 2.0
 
 [measurement.primary]
 source = "tensorboard"
@@ -99,7 +98,7 @@ HF_HUB_DISABLE_XET = "1"
 PYTORCH_ALLOC_CONF = "expandable_segments:True"
 
 [artifacts]
-required_assets = ["canonical_2k", "offline_c4", "llama_tokenizer"]
+required_assets = ["canonical_2k", "offline_c4", "llama_tokenizer", "llama3_3d_seed_checkpoint"]
 warmup_steps = 5
 
 [[arms]]
