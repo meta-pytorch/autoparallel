@@ -37,7 +37,12 @@ CONFIG_SECTIONS = {
     "validator",
     "comm",
 }
-HARNESS_ONLY_SETTINGS = {"training.gradient_accumulation_steps"}
+LEGACY_TRAINING_SETTINGS = {
+    "training.local_batch_size",
+    "training.global_batch_size",
+    "training.seq_len",
+    "training.gradient_accumulation_steps",
+}
 RESERVED_ENVIRONMENT_KEYS = {
     "CONDA_DIR",
     "DUMP_DIR",
@@ -250,10 +255,9 @@ def _option_name(path: str, *, enabled: bool | None = None) -> str:
 
 
 def settings_to_argv(settings: dict[str, Any]) -> list[str]:
+    settings = _native_training_settings(settings)
     result: list[str] = []
     for path, value in sorted(settings.items()):
-        if path in HARNESS_ONLY_SETTINGS:
-            continue
         if not path or any(not part for part in path.split(".")):
             raise CampaignError(f"invalid TorchTitan setting path {path!r}")
         if isinstance(value, bool):
@@ -263,6 +267,43 @@ def settings_to_argv(settings: dict[str, Any]) -> list[str]:
             result.append(",".join(str(item) for item in value))
         elif value is not None:
             result.extend((_option_name(path), str(value)))
+    return result
+
+
+def _native_training_settings(settings: dict[str, Any]) -> dict[str, Any]:
+    result = dict(settings)
+    present = LEGACY_TRAINING_SETTINGS & result.keys()
+    if not present:
+        return result
+    required = {
+        "training.local_batch_size",
+        "training.global_batch_size",
+        "training.seq_len",
+    }
+    missing = required - result.keys()
+    if missing:
+        raise CampaignError(
+            "authored batch settings require local_batch_size, global_batch_size, "
+            f"and seq_len together; missing {sorted(missing)}"
+        )
+    local_batch = int(result.pop("training.local_batch_size"))
+    global_batch = int(result.pop("training.global_batch_size"))
+    seq_len = int(result.pop("training.seq_len"))
+    grad_accum = int(result.pop("training.gradient_accumulation_steps", 1))
+    if local_batch <= 0 or seq_len <= 0 or grad_accum <= 0:
+        raise CampaignError("local batch, sequence length, and gradient accumulation must be positive")
+    if global_batch == -1 and grad_accum != 1:
+        dp_degree = int(result.get("parallelism.data_parallel_replicate_degree", 1)) * int(
+            result.get("parallelism.data_parallel_shard_degree", 1)
+        )
+        global_batch = local_batch * dp_degree * grad_accum
+    elif global_batch != -1 and global_batch <= 0:
+        raise CampaignError("global_batch_size must be -1 or positive")
+    result["training.num_tokens_per_microbatch_per_dp_rank"] = local_batch * seq_len
+    result["training.num_tokens_per_train_step"] = (
+        -1 if global_batch == -1 else global_batch * seq_len
+    )
+    result["training.max_context_length"] = seq_len
     return result
 
 
@@ -403,6 +444,10 @@ def _validate_campaign(campaign: Campaign) -> None:
         raise CampaignError(
             "mast.locality must be an explicit 'dc;NAME' or 'region;NAME' constraint"
         )
+
+    from .experiment_lock import validate_campaign_lock
+
+    validate_campaign_lock(raw)
 
     environment_maps = [("mast.environment", mast.get("environment", {}))]
     environment_maps.extend(

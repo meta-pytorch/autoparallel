@@ -11,7 +11,8 @@ from typing import Any
 
 import torch
 
-from torchtitan.components.dataloader import BaseDataLoader
+from torchtitan.components.data.loader import BaseDataLoader
+from torchtitan.components.loss import IGNORE_INDEX
 
 from .io_utils import atomic_write_json, file_sha256, required_env
 
@@ -41,11 +42,17 @@ class ReplayDataLoader(BaseDataLoader):
         dp_world_size: int,
         dp_rank: int,
         tokenizer,
-        seq_len: int,
-        local_batch_size: int,
+        max_context_length: int,
+        num_tokens_per_batch: int,
         **kwargs,
     ) -> None:
         del config, tokenizer, kwargs
+        local_batch_size, remainder = divmod(
+            num_tokens_per_batch, max_context_length
+        )
+        if remainder or local_batch_size <= 0:
+            raise ValueError("Replay token batch is not rectangular")
+        seq_len = max_context_length
         started = time.perf_counter()
         replay_root = Path(required_env("BENCHMARK_REPLAY_ROOT"))
         replay_path = replay_root / f"dp_rank_{dp_rank:05d}.pt"
@@ -118,7 +125,9 @@ class ReplayDataLoader(BaseDataLoader):
         while self._index < len(self._batches):
             input_dict, labels = self._batches[self._index]
             self._index += 1
-            yield dict(input_dict), labels
+            batch = dict(input_dict)
+            batch["num_valid_tokens"] = int((labels != IGNORE_INDEX).sum())
+            yield batch, labels
 
     def state_dict(self) -> dict[str, Any]:
         return {"index": self._index}

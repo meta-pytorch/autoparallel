@@ -5,11 +5,13 @@ import json
 import os
 from dataclasses import dataclass, fields
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import torch
 
 from torchtitan.experiments.graph_trainer.trainer import GraphTrainer
+from torchtitan.observability import structured_logger as sl
+from torchtitan.protocols import BaseModel
 
 from .io_utils import atomic_write_json, required_env
 
@@ -34,10 +36,33 @@ class FairnessGraphTrainer(GraphTrainer):
     class Config(GraphTrainer.Config):
         pass
 
-    def post_dataloading_process(self, input_dict, labels):
-        inputs, labels, extra_kwargs = super().post_dataloading_process(
-            input_dict, labels
-        )
+    def forward_backward_step(
+        self,
+        *,
+        input_dict,
+        labels,
+        global_valid_tokens,
+    ):
+        if self.parallel_dims.pp_enabled or self.config.compile.mode != "aot_fx_trace":
+            raise RuntimeError(
+                "FairnessGraphTrainer requires non-PP aot_fx_trace execution"
+            )
+        assert isinstance(input_dict, dict)
+        assert isinstance(labels, torch.Tensor)
+        assert len(self.model_parts) == 1
+        model = self.model_parts[0]
+        with sl.log_trace_span("preprocess_inputs"):
+            inputs, labels, extra_kwargs = cast(BaseModel, model).preprocess_inputs(
+                {**input_dict, "labels": labels},
+                parallel_dims=self.parallel_dims,
+                parallelism=self.config.parallelism,
+                max_num_documents=self.dataloader.max_num_documents,
+                max_context_length=self.config.training.max_context_length,
+                apply_context_parallel=(
+                    not self._autoparallel_manages_context_parallel_input()
+                ),
+            )
+            self.ntokens_seen += labels.numel()
         if required_env("BENCHMARK_PHASE") == "correctness":
             tensors = {"input": inputs, "labels": labels}
             tensors.update(
@@ -65,7 +90,19 @@ class FairnessGraphTrainer(GraphTrainer):
                     },
                 },
             )
-        return inputs, labels, extra_kwargs
+        params = [
+            parameter
+            for _, parameter in model.named_parameters(remove_duplicate=False)
+            if parameter.requires_grad
+        ]
+        return self._make_fx_forward_backward_step(
+            model,
+            inputs,
+            labels,
+            global_valid_tokens,
+            params,
+            extra_kwargs,
+        )
 
 
 def to_fairness_graph_trainer_config(

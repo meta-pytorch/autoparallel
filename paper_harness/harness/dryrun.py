@@ -215,7 +215,13 @@ def audit_dryrun(
         checks,
     )
     _check("ttls", spec.get("ttlsConfig", {}).get("enable") is True, checks)
-    _check("conda", mast["conda_fbpkg"] in packages, checks)
+    locked_fbpkg = resolved["experiment_lock"]["runtime"]["conda_fbpkg"]
+    _check(
+        "conda",
+        mast["conda_fbpkg"] == locked_fbpkg
+        and packages.count(locked_fbpkg) == 1,
+        checks,
+    )
     _check("oilfs", "oil.oilfs:stable" in packages, checks)
     _check(
         "one_workspace_package",

@@ -6,11 +6,15 @@ The historical `native_torchtitan/` and `paired_graphtrainer_ap/` directories re
 
 ## Source ownership
 
-TorchTitan and AutoParallel are external inputs. The harness never checks out, patches, or writes either repository. A campaign pins each source commit and the CLI receives existing checkout paths.
+TorchTitan and AutoParallel are external inputs. The harness never checks out, patches, or writes either repository. Every campaign must match the immutable source and runtime versions in `experiment_lock.toml`, and the CLI receives existing clean checkout paths.
 
 Clean checkouts are required by default. A campaign may explicitly select `dirty_policy = "snapshot"`; that records the base commit, porcelain status, binary diff, untracked-file hashes, complete source-tree hash, and packaged-tree hash. This mode is intended for evaluating a change before submitting it upstream, not for silently bypassing provenance checks.
 
-The vendored snapshot and the clean AutoParallel/TorchTitan submission stacks are recorded in [UPSTREAM.md](UPSTREAM.md). Historical campaign pins were intentionally left unchanged; a new campaign must explicitly pin the submission commits when it opts into this stack.
+The clean AutoParallel/TorchTitan submission stacks are recorded in [UPSTREAM.md](UPSTREAM.md). Historical settings remain in their campaign files, but their source/runtime pins are updated to the one locked paper stack.
+
+The campaign format keeps `local_batch_size`, `global_batch_size`, `gradient_accumulation_steps`, and `seq_len` explicit. After matrix, phase, and arm overrides resolve, the harness translates them to latest TorchTitan's token fields. For example, local batch 2, global batch 8, and sequence length 8192 become 16384 tokens per DP-rank microbatch and 65536 tokens per train step, preserving gradient accumulation 1.
+
+`HARNESS_CORE.sha256` freezes the code-bearing harness, launcher, workload, lock, and measurement-script files. Validation and runtime preflight reject core drift. Changing the core requires an explicit harness-version update and a reviewed manifest regeneration; campaign settings and tests are outside the frozen core.
 
 ## Stable arm profiles
 

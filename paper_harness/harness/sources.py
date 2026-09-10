@@ -85,6 +85,20 @@ def _remote_chain(root: Path, *, limit: int = 8) -> list[str]:
     return chain
 
 
+def _configured_remotes(root: Path) -> list[str]:
+    urls: list[str] = []
+    for name in _git(root, "remote", check=False).splitlines():
+        urls.extend(
+            line
+            for line in _git(root, "remote", "get-url", "--all", name).splitlines()
+            if line and line not in urls
+        )
+    for url in _remote_chain(root):
+        if url not in urls:
+            urls.append(url)
+    return urls
+
+
 def inspect_source(
     name: str,
     root: Path,
@@ -105,7 +119,7 @@ def inspect_source(
     if dirty and policy == "forbid":
         raise CampaignError(f"{name} checkout is dirty but dirty_policy='forbid':\n{status}")
     manifest = tree_manifest(root)
-    remotes = _remote_chain(root)
+    remotes = _configured_remotes(root)
     expected_remote = str(spec["remote"])
     if _canonical_remote(expected_remote) not in {
         _canonical_remote(remote) for remote in remotes

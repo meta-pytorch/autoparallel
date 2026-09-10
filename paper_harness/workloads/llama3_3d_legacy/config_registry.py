@@ -6,10 +6,9 @@ from dataclasses import replace
 import torch
 from torch.nn.attention import SDPBackend
 
-from torchtitan.components.checkpoint import CheckpointManager
+from torchtitan.components.checkpointer import CheckpointManager
 from torchtitan.components.loss import CrossEntropyLoss
-from torchtitan.components.lr_scheduler import LRSchedulersContainer
-from torchtitan.components.optimizer import default_adamw
+from torchtitan.components.optimizer import default_adamw, LRSchedulersContainer
 from torchtitan.components.validate import Validator
 from torchtitan.config import CompileConfig
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
@@ -37,6 +36,14 @@ from .io_utils import bool_env, int_env, required_env
 from .replay_data import EmptyDataLoader, ReplayDataLoader
 
 
+def _parallelize_batched_autoparallel(*args, **kwargs):
+    from workloads.llama3_batched_autoparallel import (
+        parallelize_batched_autoparallel_llama,
+    )
+
+    return parallelize_batched_autoparallel_llama(*args, **kwargs)
+
+
 def _parallelize_manual_with_autoparallel_cp(
     model,
     *,
@@ -58,7 +65,7 @@ def _parallelize_manual_with_autoparallel_cp(
     )
 
     del ac_config
-    assert training.seq_len % parallel_dims.seq_len_divisor == 0
+    assert training.max_context_length % parallel_dims.seq_len_divisor == 0
 
     if parallel_dims.cp_enabled:
         _apply_autoparallel_context_parallel_attention(
@@ -129,9 +136,9 @@ def _base_config():
     config.lr_scheduler = LRSchedulersContainer.Config(warmup_steps=200)
     config.training = replace(
         config.training,
-        local_batch_size=local_batch_size,
-        global_batch_size=local_batch_size * dp_degree,
-        seq_len=seq_len,
+        num_tokens_per_microbatch_per_dp_rank=local_batch_size * seq_len,
+        num_tokens_per_train_step=local_batch_size * dp_degree * seq_len,
+        max_context_length=seq_len,
         steps=total_steps,
         dtype="float32",
         mixed_precision_param="bfloat16",
@@ -235,8 +242,8 @@ def seed_checkpoint():
     )
     config.training = replace(
         config.training,
-        local_batch_size=1,
-        global_batch_size=1,
+        num_tokens_per_microbatch_per_dp_rank=config.training.max_context_length,
+        num_tokens_per_train_step=config.training.max_context_length,
         steps=1,
     )
     config.dataloader = EmptyDataLoader.Config()
@@ -263,12 +270,14 @@ def seed_checkpoint():
 def _graph_config(*, enable_autoparallel: bool):
     config = to_graph_trainer_config(_base_config(), graph_llama3_model_registry)
     config = to_fairness_graph_trainer_config(config)
-    if not enable_autoparallel:
-        config.model_spec = replace(
-            config.model_spec,
-            parallelize_fn=_parallelize_manual_with_autoparallel_cp,
-        )
-    config.profiler = replace(config.profiler, trace_post_processor=None)
+    config.model_spec = replace(
+        config.model_spec,
+        parallelize_fn=(
+            _parallelize_batched_autoparallel
+            if enable_autoparallel
+            else _parallelize_manual_with_autoparallel_cp
+        ),
+    )
     placement_mode = os.environ.get("BENCHMARK_AP_PLACEMENTS_MODE", "")
     placement_path = os.environ.get("BENCHMARK_AP_PLACEMENTS_PATH", "")
     if placement_mode not in {"", "save", "load"}:

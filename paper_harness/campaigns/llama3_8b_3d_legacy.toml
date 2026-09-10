@@ -4,13 +4,13 @@ description = "Frozen final fair DP2 x CP2 x TP2 GraphTrainer manual/AP comparis
 workload = "llama3_8b_3d_legacy"
 
 [sources.torchtitan]
-remote = "https://github.com/pytorch/torchtitan.git"
-commit = "3f0b04753a1603c13b64ce387a61028a3729322a"
+remote = "https://github.com/AlbedoWang/torchtitan.git"
+commit = "6ced255cc55dec8a469bba2584c6c2efb35122ac"
 dirty_policy = "forbid"
 
 [sources.autoparallel]
 remote = "https://github.com/meta-pytorch/autoparallel.git"
-commit = "4b6c31bc1525c59ea999bdef390d308266cf7c01"
+commit = "5102d629c0a97ec604b12c328b40147d214ecbe7"
 dirty_policy = "forbid"
 
 [model]
@@ -49,7 +49,7 @@ nproc_per_node = 8
 hardware = "grandteton_80g_roce"
 locality = "dc;pci1"
 gpu_name_contains = "H100"
-conda_fbpkg = "torchtitan_conda_prod:902"
+conda_fbpkg = "torchtitan_conda_prod:946"
 retries = 0
 master_port = 29500
 phase_timeout_seconds = 7200

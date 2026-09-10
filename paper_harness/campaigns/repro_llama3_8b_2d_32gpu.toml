@@ -4,13 +4,13 @@ description = "32-GPU corrected-batch comparison of native TorchTitan versus Aut
 workload = "llama3_8b_2d"
 
 [sources.torchtitan]
-remote = "https://github.com/pytorch/torchtitan.git"
-commit = "383cae9f9c59845565963f1c9d7796c13d20fcd7"
+remote = "https://github.com/AlbedoWang/torchtitan.git"
+commit = "6ced255cc55dec8a469bba2584c6c2efb35122ac"
 dirty_policy = "forbid"
 
 [sources.autoparallel]
 remote = "https://github.com/meta-pytorch/autoparallel.git"
-commit = "b8ace2a55d465787840aa41466f50be4fd9f73c1"
+commit = "5102d629c0a97ec604b12c328b40147d214ecbe7"
 dirty_policy = "forbid"
 
 [model]
@@ -69,7 +69,7 @@ nproc_per_node = 8
 hardware = "grandteton_80g_roce"
 locality = "dc;pci1"
 gpu_name_contains = "H100"
-conda_fbpkg = "torchtitan_conda_prod:902"
+conda_fbpkg = "torchtitan_conda_prod:946"
 retries = 0
 master_port = 29500
 phase_timeout_seconds = 7200

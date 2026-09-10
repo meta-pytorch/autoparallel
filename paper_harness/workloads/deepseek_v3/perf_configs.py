@@ -16,11 +16,12 @@ from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import Shard
 
 from torchtitan.config import CompileConfig, TORCH_DTYPE_MAP
-from torchtitan.components.dataloader import ParallelAwareDataloader
 from torchtitan.components.loss import CrossEntropyLoss
-from torchtitan.components.lr_scheduler import LRSchedulersContainer
-from torchtitan.components.optimizer import default_adamw
-from torchtitan.components.optimizer import register_moe_load_balancing_hook
+from torchtitan.components.optimizer import (
+    default_adamw,
+    LRSchedulersContainer,
+    register_moe_load_balancing_hook,
+)
 from torchtitan.components.tokenizer import BaseTokenizer
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.distributed.fsdp import get_fsdp_reshard_after_forward_policy
@@ -31,16 +32,16 @@ from torchtitan.experiments.graph_trainer.configs import (
 from torchtitan.experiments.graph_trainer.deepseek_v3 import (
     model_registry as graph_model_registry,
 )
-from torchtitan.hf_datasets import DatasetConfig
-from torchtitan.hf_datasets.text_datasets import (
-    DATASETS,
-    HuggingFaceTextDataLoader,
-    HuggingFaceTextDataset,
-)
 from torchtitan.models.common.config_utils import decoder_vocab_size
 from torchtitan.models.deepseek_v3.config_registry import deepseek_v3_16b
 from torchtitan.tools.logging import logger
 from torchtitan.tools.utils import device_type
+
+from workloads.fixed_shape_text import (
+    DatasetConfig,
+    FixedShapeTextDataLoader,
+    FixedShapeTextDataset,
+)
 
 
 C4_REPO = "allenai/c4"
@@ -65,6 +66,7 @@ C4_SHARD_METADATA = {
     ),
 }
 DATASET_NAME = "c4_deepseek16b_pinned_audited"
+DATASETS: dict[str, DatasetConfig] = {}
 
 MODEL_FLAVOR = os.environ.get("BENCHMARK_MODEL", "16B")
 if MODEL_FLAVOR != "16B":
@@ -284,18 +286,25 @@ def parallelize_autoparallel_backend_deepseek(
         ac_config.build(dump_folder=dump_folder).apply(ap_model)
 
     def input_fn():
-        global_batch_size = training.global_batch_size
-        if global_batch_size < 0:
-            dp_degree = parallel_dims.dp_replicate * parallel_dims.dp_shard
-            global_batch_size = training.local_batch_size * dp_degree
+        dp_degree = parallel_dims.dp_replicate * parallel_dims.dp_shard
+        global_tokens = training.num_tokens_per_train_step
+        if global_tokens < 0:
+            global_tokens = (
+                training.num_tokens_per_microbatch_per_dp_rank * dp_degree
+            )
+        global_batch_size, remainder = divmod(
+            global_tokens, training.max_context_length
+        )
+        if remainder:
+            raise RuntimeError("AutoParallel placement token batch is not rectangular")
         tokens = torch.randint(
             0,
             ap_model.model_args.vocab_size,
-            (global_batch_size, training.seq_len),
+            (global_batch_size, training.max_context_length),
             device=torch.device(device_type),
         )
         positions = torch.arange(
-            training.seq_len,
+            training.max_context_length,
             dtype=torch.int64,
             device=torch.device(device_type),
         ).repeat(global_batch_size, 1)
@@ -444,7 +453,7 @@ DATASETS[DATASET_NAME] = DatasetConfig(
 )
 
 
-class PinnedC4Dataset(HuggingFaceTextDataset):
+class PinnedC4Dataset(FixedShapeTextDataset):
     def __init__(
         self,
         dataset_name: str,
@@ -474,13 +483,14 @@ class PinnedC4Dataset(HuggingFaceTextDataset):
             dp_rank=0,
             dp_world_size=1,
             infinite=infinite,
+            datasets=DATASETS,
         )
         self.dataset_name = DATASET_NAME
 
 
-class AuditedC4DataLoader(ParallelAwareDataloader):
+class AuditedC4DataLoader(FixedShapeTextDataLoader):
     @dataclass(kw_only=True, slots=True)
-    class Config(HuggingFaceTextDataLoader.Config):
+    class Config(FixedShapeTextDataLoader.Config):
         pass
 
     def __init__(
@@ -490,31 +500,32 @@ class AuditedC4DataLoader(ParallelAwareDataloader):
         dp_world_size: int,
         dp_rank: int,
         tokenizer: BaseTokenizer,
-        seq_len: int,
-        local_batch_size: int,
-        snapshot_every_n_steps: int | None = 1,
+        max_context_length: int,
+        num_tokens_per_batch: int,
         **kwargs,
     ) -> None:
         del kwargs
+        local_batch_size, remainder = divmod(
+            num_tokens_per_batch, max_context_length
+        )
+        if remainder:
+            raise ValueError("C4 token batch is not rectangular")
         dataset = PinnedC4Dataset(
             dataset_name=config.dataset,
             dataset_path=config.dataset_path,
             tokenizer=tokenizer,
-            seq_len=seq_len,
+            seq_len=max_context_length,
             dp_rank=dp_rank,
             dp_world_size=dp_world_size,
             infinite=config.infinite,
         )
         super().__init__(
-            dataset,
+            config,
+            dataset=dataset,
             dp_rank=dp_rank,
             dp_world_size=dp_world_size,
-            num_workers=config.num_workers,
-            persistent_workers=config.persistent_workers,
-            pin_memory=config.pin_memory,
-            prefetch_factor=config.prefetch_factor,
-            snapshot_every_n_steps=snapshot_every_n_steps,
-            batch_size=local_batch_size,
+            max_context_length=max_context_length,
+            num_tokens_per_batch=num_tokens_per_batch,
         )
 
     def __iter__(self):
@@ -552,9 +563,9 @@ def _base_config():
     config.optimizer = default_adamw(lr=2.2e-4)
     config.training = replace(
         config.training,
-        local_batch_size=LOCAL_BATCH_SIZE,
-        global_batch_size=GLOBAL_BATCH_SIZE,
-        seq_len=SEQ_LEN,
+        num_tokens_per_microbatch_per_dp_rank=LOCAL_BATCH_SIZE * SEQ_LEN,
+        num_tokens_per_train_step=GLOBAL_BATCH_SIZE * SEQ_LEN,
+        max_context_length=SEQ_LEN,
         steps=28,
         dtype="float32",
         mixed_precision_param="bfloat16",
@@ -619,14 +630,24 @@ def _graph_config(
     pass_pipeline: str = "default",
 ):
     config = to_graph_trainer_config(_base_config(), graph_model_registry)
+    if enable_autoparallel:
+        def reject_flat_autoparallel_input(*args, **kwargs):
+            del args, kwargs
+            raise RuntimeError(
+                "Latest TorchTitan DeepSeek AutoParallel traces a flat token stream; "
+                "the paper workload requires the historical independent [B, S] "
+                "microbatch and is intentionally fail-closed"
+            )
+
     config.model_spec = replace(
         config.model_spec,
         post_optimizer_build_fn=_audit_and_register_moe_hook,
+        parallelize_fn=(
+            reject_flat_autoparallel_input
+            if enable_autoparallel
+            else config.model_spec.parallelize_fn
+        ),
     )
-    # ``to_graph_trainer_config`` installs a cudagraph-only trace annotator.
-    # Cudagraphs are disabled in this experiment, so keep the profiler config
-    # identical to the backend configuration instead of serializing a no-op callback.
-    config.profiler = replace(config.profiler, trace_post_processor=None)
     disabled_passes = ["cudagraph_pass"]
     if not enable_remat:
         disabled_passes.extend(

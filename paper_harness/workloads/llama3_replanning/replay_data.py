@@ -10,7 +10,8 @@ from typing import Any
 
 import torch
 
-from torchtitan.components.dataloader import BaseDataLoader
+from torchtitan.components.data.loader import BaseDataLoader
+from torchtitan.components.loss import IGNORE_INDEX
 
 
 C4_REPO = "allenai/c4"
@@ -63,11 +64,17 @@ class FixedC4ReplayDataLoader(BaseDataLoader):
         dp_world_size: int,
         dp_rank: int,
         tokenizer,
-        seq_len: int,
-        local_batch_size: int,
+        max_context_length: int,
+        num_tokens_per_batch: int,
         **kwargs,
     ) -> None:
         del config, tokenizer, kwargs
+        local_batch_size, remainder = divmod(
+            num_tokens_per_batch, max_context_length
+        )
+        if remainder or local_batch_size <= 0:
+            raise ValueError("Replay token batch is not rectangular")
+        seq_len = max_context_length
         replay_root = Path(os.environ["BENCHMARK_REPLAY_ROOT"])
         selected_case = os.environ["BENCHMARK_REPLAY_CASE"]
         expected_case = case_name(seq_len, local_batch_size)
@@ -138,6 +145,9 @@ class FixedC4ReplayDataLoader(BaseDataLoader):
             yield {
                 "input": self._inputs[slot],
                 "positions": self._positions[slot],
+                "num_valid_tokens": int(
+                    (self._labels[slot] != IGNORE_INDEX).sum()
+                ),
             }, self._labels[slot]
 
     def state_dict(self) -> dict[str, Any]:

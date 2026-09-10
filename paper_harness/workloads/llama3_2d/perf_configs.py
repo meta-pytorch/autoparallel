@@ -14,10 +14,9 @@ from torch.distributed.tensor.placement_types import Replicate, Shard
 from torch.utils.data import IterableDataset
 
 from torchtitan.config import CompileConfig, TORCH_DTYPE_MAP
-from torchtitan.components.dataloader import ParallelAwareDataloader
-from torchtitan.components.loss import CrossEntropyLoss
-from torchtitan.components.lr_scheduler import LRSchedulersContainer
-from torchtitan.components.optimizer import default_adamw
+from torchtitan.components.data.loader import BaseDataLoader
+from torchtitan.components.loss import CrossEntropyLoss, IGNORE_INDEX
+from torchtitan.components.optimizer import default_adamw, LRSchedulersContainer
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.distributed.fsdp import get_fsdp_reshard_after_forward_policy
 from torchtitan.experiments.graph_trainer.configs import (
@@ -278,7 +277,13 @@ def parallelize_autoparallel_backend_llama(
 
     def input_fn():
         dp_degree = parallel_dims.dp_replicate * parallel_dims.dp_shard
-        global_batch_size = training.local_batch_size * dp_degree
+        local_batch_size, remainder = divmod(
+            training.num_tokens_per_microbatch_per_dp_rank,
+            training.max_context_length,
+        )
+        if remainder:
+            raise RuntimeError("AutoParallel placement token batch is not rectangular")
+        global_batch_size = local_batch_size * dp_degree
         if global_batch_size != PLACEMENT_GLOBAL_BATCH_SIZE:
             raise RuntimeError(
                 "AutoParallel placement input must represent one microbatch "
@@ -288,11 +293,11 @@ def parallelize_autoparallel_backend_llama(
         tokens = torch.randint(
             0,
             model.config.vocab_size,
-            (global_batch_size, training.seq_len),
+            (global_batch_size, training.max_context_length),
             device=torch.device(device_type),
         )
         positions = torch.arange(
-            training.seq_len,
+            training.max_context_length,
             dtype=torch.int64,
             device=torch.device(device_type),
         ).repeat(global_batch_size, 1)
@@ -417,24 +422,14 @@ def parallelize_graphtrainer_autoparallel_llama(
     **kwargs,
 ):
     """Keep the AP placement example at one microbatch across DP ranks."""
-    from torchtitan.experiments.graph_trainer.llama3.parallelize_autoparallel import (
-        parallelize_autoparallel_llama,
+    from workloads.llama3_batched_autoparallel import (
+        parallelize_batched_autoparallel_llama,
     )
 
-    dp_degree = parallel_dims.dp_replicate * parallel_dims.dp_shard
-    placement_global_batch_size = training.local_batch_size * dp_degree
-    if placement_global_batch_size != PLACEMENT_GLOBAL_BATCH_SIZE:
-        raise RuntimeError(
-            "GraphTrainer AutoParallel placement batch mismatch: "
-            f"{placement_global_batch_size} != {PLACEMENT_GLOBAL_BATCH_SIZE}"
-        )
-    return parallelize_autoparallel_llama(
+    return parallelize_batched_autoparallel_llama(
         model,
         parallel_dims=parallel_dims,
-        training=replace(
-            training,
-            global_batch_size=placement_global_batch_size,
-        ),
+        training=training,
         **kwargs,
     )
 
@@ -493,10 +488,10 @@ class TopologyInvariantReplayDataset(IterableDataset):
                 slot = (slot + 1) % REPLAY_SLOTS
 
 
-class AuditedReplayDataLoader(ParallelAwareDataloader):
+class AuditedReplayDataLoader(BaseDataLoader):
     @dataclass(kw_only=True, slots=True)
-    class Config(ParallelAwareDataloader.Config):
-        pass
+    class Config(BaseDataLoader.Config):
+        dataset: str = DATASET_NAME
 
     def __init__(
         self,
@@ -505,37 +500,54 @@ class AuditedReplayDataLoader(ParallelAwareDataloader):
         dp_world_size: int,
         dp_rank: int,
         tokenizer,
-        seq_len: int,
-        local_batch_size: int,
-        snapshot_every_n_steps: int | None = 1,
+        max_context_length: int,
+        num_tokens_per_batch: int,
         **kwargs,
     ) -> None:
         del kwargs, tokenizer
-        if seq_len != SEQ_LEN:
-            raise ValueError(f"Expected sequence length {SEQ_LEN}, got {seq_len}")
-        dataset = TopologyInvariantReplayDataset(
+        if max_context_length != SEQ_LEN:
+            raise ValueError(
+                f"Expected sequence length {SEQ_LEN}, got {max_context_length}"
+            )
+        local_batch_size, remainder = divmod(
+            num_tokens_per_batch, max_context_length
+        )
+        if remainder:
+            raise ValueError("Replay token batch is not rectangular")
+        self._dataset = TopologyInvariantReplayDataset(
             Path(os.environ["REPLAY_TENSORS_PATH"]),
             dp_rank=dp_rank,
             dp_world_size=dp_world_size,
             local_batch_size=local_batch_size,
         )
-        super().__init__(
-            dataset,
-            dp_rank=dp_rank,
-            dp_world_size=dp_world_size,
-            num_workers=config.num_workers,
-            persistent_workers=config.persistent_workers,
-            pin_memory=config.pin_memory,
-            prefetch_factor=config.prefetch_factor,
-            snapshot_every_n_steps=snapshot_every_n_steps,
-            batch_size=local_batch_size,
-        )
+        self.max_num_documents = config.max_num_documents
+        self._local_batch_size = local_batch_size
+        self._source = iter(self._dataset)
+        self._index = 0
 
     def __iter__(self):
-        source = super().__iter__()
         while True:
-            input_dict, labels = next(source)
-            yield dict(input_dict), labels
+            samples = [next(self._source) for _ in range(self._local_batch_size)]
+            input_dict = {
+                name: torch.stack([sample[0][name] for sample in samples])
+                for name in samples[0][0]
+            }
+            labels = torch.stack([sample[1] for sample in samples])
+            input_dict["num_valid_tokens"] = int((labels != IGNORE_INDEX).sum())
+            self._index += 1
+            yield input_dict, labels
+
+    def state_dict(self):
+        return {"index": self._index}
+
+    def load_state_dict(self, state_dict):
+        index = int(state_dict.get("index", 0))
+        if index < 0:
+            raise ValueError(f"Invalid replay index {index}")
+        self._source = iter(self._dataset)
+        for _ in range((index % REPLAY_SLOTS) * self._local_batch_size):
+            next(self._source)
+        self._index = index
 
 
 def _base_config():
@@ -555,9 +567,9 @@ def _base_config():
     config.lr_scheduler = LRSchedulersContainer.Config(warmup_steps=200)
     config.training = replace(
         config.training,
-        local_batch_size=LOCAL_BATCH_SIZE,
-        global_batch_size=GLOBAL_BATCH_SIZE,
-        seq_len=SEQ_LEN,
+        num_tokens_per_microbatch_per_dp_rank=LOCAL_BATCH_SIZE * SEQ_LEN,
+        num_tokens_per_train_step=GLOBAL_BATCH_SIZE * SEQ_LEN,
+        max_context_length=SEQ_LEN,
         steps=28,
         dtype="float32",
         mixed_precision_param="bfloat16",
@@ -620,18 +632,12 @@ def _graph_config(
     enable_remat: bool = True,
     enable_autoparallel: bool = True,
     pass_pipeline: str = "default",
-    use_historical_ap_batch_adapter: bool = True,
 ):
     config = to_graph_trainer_config(_base_config(), model_registry)
-    if use_historical_ap_batch_adapter:
-        config.model_spec = replace(
-            config.model_spec,
-            parallelize_fn=parallelize_graphtrainer_autoparallel_llama,
-        )
-    # ``to_graph_trainer_config`` installs a cudagraph-only trace annotator.
-    # Cudagraphs are disabled in this experiment, so keep the profiler config
-    # identical to the backend configuration instead of serializing a no-op callback.
-    config.profiler = replace(config.profiler, trace_post_processor=None)
+    config.model_spec = replace(
+        config.model_spec,
+        parallelize_fn=parallelize_graphtrainer_autoparallel_llama,
+    )
     disabled_passes = ["cudagraph_pass"]
     if not enable_remat:
         disabled_passes.extend(
@@ -678,17 +684,13 @@ def graphtrainer_manual_full_inductor_8b():
 
 
 def autoparallel_graphtrainer_full_inductor_current_8b():
-    return _graph_config(
-        inductor_compilation="full",
-        use_historical_ap_batch_adapter=False,
-    )
+    return _graph_config(inductor_compilation="full")
 
 
 def graphtrainer_manual_full_inductor_current_8b():
     return _graph_config(
         inductor_compilation="full",
         enable_autoparallel=False,
-        use_historical_ap_batch_adapter=False,
     )
 
 

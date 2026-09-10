@@ -89,6 +89,18 @@ launched app: `mast_conda://torchx/llama3-paper-wangkj-grfhpnvn`
             with self.assertRaisesRegex(CampaignError, "BENCHMARK_GLOBAL_BATCH_SIZE"):
                 load_campaign(path)
 
+    def test_campaign_source_pin_must_match_experiment_lock(self) -> None:
+        source = (REPO_ROOT / "campaigns/repro_llama3_8b_2d_32gpu.toml").read_text()
+        invalid = source.replace(
+            "5102d629c0a97ec604b12c328b40147d214ecbe7",
+            "0000000000000000000000000000000000000000",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "campaign.toml"
+            path.write_text(invalid)
+            with self.assertRaisesRegex(CampaignError, "experiment lock"):
+                load_campaign(path)
+
     def test_canonical_matrix_points(self) -> None:
         cases = {
             "muse_glimmer_30b_scaling.toml": ("16gpu", "32gpu", "64gpu", "128gpu"),
@@ -140,6 +152,45 @@ launched app: `mast_conda://torchx/llama3-paper-wangkj-grfhpnvn`
                 "2",
             ],
         )
+
+    def test_authored_batch_settings_render_as_latest_torchtitan_tokens(self) -> None:
+        self.assertEqual(
+            settings_to_argv(
+                {
+                    "training.local_batch_size": 2,
+                    "training.global_batch_size": 8,
+                    "training.gradient_accumulation_steps": 1,
+                    "training.seq_len": 8192,
+                }
+            ),
+            [
+                "--training.max-context-length",
+                "8192",
+                "--training.num-tokens-per-microbatch-per-dp-rank",
+                "16384",
+                "--training.num-tokens-per-train-step",
+                "65536",
+            ],
+        )
+
+    def test_default_global_batch_preserves_one_accumulation_step(self) -> None:
+        argv = settings_to_argv(
+            {
+                "training.local_batch_size": 2,
+                "training.global_batch_size": -1,
+                "training.seq_len": 4096,
+            }
+        )
+        self.assertEqual(argv[-2:], ["--training.num-tokens-per-train-step", "-1"])
+
+    def test_partial_authored_batch_settings_are_rejected(self) -> None:
+        with self.assertRaisesRegex(CampaignError, "require local_batch_size"):
+            settings_to_argv(
+                {
+                    "training.local_batch_size": 2,
+                    "training.seq_len": 8192,
+                }
+            )
 
     def test_autoparallel_solver_argument_rendering(self) -> None:
         self.assertEqual(
@@ -249,6 +300,54 @@ class SourceTests(unittest.TestCase):
             record = inspect_source("fixture", root, spec, evidence_dir=evidence)
             self.assertTrue(record["dirty"])
             self.assertTrue((evidence / "fixture/tracked.diff").is_file())
+
+    def test_source_accepts_expected_non_origin_remote(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "source"
+            root.mkdir()
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            subprocess.run(
+                ["git", "-C", str(root), "config", "user.email", "test@example.com"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(root), "config", "user.name", "Harness Test"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(root), "remote", "add", "origin", "/local/base"],
+                check=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "remote",
+                    "add",
+                    "github",
+                    "https://github.com/example/fixture.git",
+                ],
+                check=True,
+            )
+            (root / "tracked.txt").write_text("clean\n")
+            subprocess.run(["git", "-C", str(root), "add", "tracked.txt"], check=True)
+            subprocess.run(["git", "-C", str(root), "commit", "-qm", "fixture"], check=True)
+            head = subprocess.check_output(
+                ["git", "-C", str(root), "rev-parse", "HEAD"], text=True
+            ).strip()
+            record = inspect_source(
+                "fixture",
+                root,
+                {
+                    "commit": head,
+                    "remote": "https://github.com/example/fixture.git",
+                    "dirty_policy": "forbid",
+                },
+            )
+            self.assertIn(
+                "https://github.com/example/fixture.git", record["remote_chain"]
+            )
 
 
 if __name__ == "__main__":

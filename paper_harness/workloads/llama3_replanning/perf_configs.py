@@ -4,8 +4,7 @@ import os
 from dataclasses import replace
 
 from torchtitan.components.loss import CrossEntropyLoss
-from torchtitan.components.lr_scheduler import LRSchedulersContainer
-from torchtitan.components.optimizer import default_adamw
+from torchtitan.components.optimizer import default_adamw, LRSchedulersContainer
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.experiments.graph_trainer.configs import (
     GraphTrainerCompileConfig,
@@ -18,6 +17,14 @@ from torchtitan.models.llama3.config_registry import llama3_8b
 from workloads.parameter_state import register_post_load_parameter_audit
 
 from .replay_data import FixedC4ReplayDataLoader, case_name
+
+
+def _parallelize_batched_autoparallel(*args, **kwargs):
+    from workloads.llama3_batched_autoparallel import (
+        parallelize_batched_autoparallel_llama,
+    )
+
+    return parallelize_batched_autoparallel_llama(*args, **kwargs)
 
 
 def _positive_int_env(name: str) -> int:
@@ -65,9 +72,9 @@ def _base_config():
     config.lr_scheduler = LRSchedulersContainer.Config(warmup_steps=200)
     config.training = replace(
         config.training,
-        local_batch_size=local_batch_size,
-        global_batch_size=global_batch_size,
-        seq_len=seq_len,
+        num_tokens_per_microbatch_per_dp_rank=local_batch_size * seq_len,
+        num_tokens_per_train_step=global_batch_size * seq_len,
+        max_context_length=seq_len,
         steps=25,
         dtype="float32",
         mixed_precision_param="bfloat16",
@@ -128,7 +135,10 @@ def _base_config():
 def autoparallel_graphtrainer_replanning_8b():
     """Official GraphTrainer LLaMA model spec with the fixed AP integration."""
     config = to_graph_trainer_config(_base_config(), model_registry)
-    config.profiler = replace(config.profiler, trace_post_processor=None)
+    config.model_spec = replace(
+        config.model_spec,
+        parallelize_fn=_parallelize_batched_autoparallel,
+    )
     config.compile = GraphTrainerCompileConfig(
         enable=True,
         components=["model", "loss"],

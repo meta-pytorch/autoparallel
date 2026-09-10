@@ -10,6 +10,8 @@ from pathlib import Path
 import torch
 
 from .campaign import write_json
+from .experiment_lock import experiment_lock_digest, validate_runtime_lock
+from .integrity import validate_harness_integrity
 from .sources import manifest_digest, tree_manifest
 
 
@@ -30,6 +32,16 @@ def _inside(path: Path, root: Path) -> bool:
 
 
 def run(payload: Path, run_root: Path) -> dict:
+    packaged_experiment_lock = payload / "campaign/experiment_lock.toml"
+    harness_experiment_lock = payload / "harness_repo/experiment_lock.toml"
+    if packaged_experiment_lock.read_bytes() != harness_experiment_lock.read_bytes():
+        raise RuntimeError("packaged campaign and harness experiment locks differ")
+    resolved = json.loads((payload / "campaign/resolved_campaign.json").read_text())
+    actual_lock_sha256 = experiment_lock_digest(harness_experiment_lock)
+    if resolved.get("experiment_lock_sha256") != actual_lock_sha256:
+        raise RuntimeError("resolved campaign experiment-lock digest differs")
+    runtime_lock = validate_runtime_lock(torch)
+    harness_integrity = validate_harness_integrity(payload / "harness_repo")
     source_lock = json.loads((payload / "campaign/source_lock.json").read_text())
     source_roots = {
         "torchtitan": payload / "torchtitan",
@@ -68,6 +80,9 @@ def run(payload: Path, run_root: Path) -> dict:
         "module_paths": {name: str(path) for name, path in module_paths.items()},
         "source_checks": source_checks,
         "structured_logger_handlers": os.environ.get("TITAN_STRUCT_LOGGER_HANDLERS"),
+        "experiment_lock_sha256": actual_lock_sha256,
+        "runtime_lock": runtime_lock,
+        "harness_integrity": harness_integrity,
     }
     write_json(run_root / "runtime/preflight/report.json", report)
     return report

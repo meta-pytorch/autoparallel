@@ -11,7 +11,12 @@ from . import perf_configs
 
 def _batch_sha256(input_dict: dict[str, torch.Tensor], labels: torch.Tensor) -> str:
     digest = hashlib.sha256()
-    for name, tensor in [*sorted(input_dict.items()), ("labels", labels)]:
+    tensors = [
+        (name, tensor)
+        for name, tensor in sorted(input_dict.items())
+        if isinstance(tensor, torch.Tensor)
+    ]
+    for name, tensor in [*tensors, ("labels", labels)]:
         value = tensor.detach().cpu().contiguous()
         digest.update(name.encode())
         digest.update(str(value.dtype).encode())
@@ -55,14 +60,17 @@ def audit(
         dp_world_size=perf_configs.DP_DEGREE,
         dp_rank=dp_rank,
         tokenizer=tokenizer,
-        seq_len=config.training.seq_len,
-        local_batch_size=config.training.local_batch_size,
-        snapshot_every_n_steps=None,
+        max_context_length=config.training.max_context_length,
+        num_tokens_per_batch=(
+            config.training.num_tokens_per_microbatch_per_dp_rank
+        ),
     )
     iterator = iter(dataloader)
     observed = []
     for batch_index in range(1, 11):
         input_dict, labels = next(iterator)
+        if input_dict.get("num_valid_tokens") != labels.numel():
+            raise RuntimeError("latest Trainer valid-token metadata is incorrect")
         observed.append(
             {
                 "batch_index": batch_index,

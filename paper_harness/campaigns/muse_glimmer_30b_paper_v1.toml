@@ -5,7 +5,7 @@ workload = "muse_glimmer_30b_current"
 
 [sources.torchtitan]
 remote = "https://github.com/AlbedoWang/torchtitan.git"
-commit = "0dc14f57b93ec830f395d024718d351d04305fdb"
+commit = "6ced255cc55dec8a469bba2584c6c2efb35122ac"
 dirty_policy = "forbid"
 
 [sources.autoparallel]
@@ -75,7 +75,7 @@ nproc_per_node = 8
 hardware = "grandteton_80g_roce"
 locality = "dc;pci1"
 gpu_name_contains = "H100"
-conda_fbpkg = "torchtitan_conda_prod:902"
+conda_fbpkg = "torchtitan_conda_prod:946"
 retries = 0
 master_port = 29500
 phase_timeout_seconds = 10800

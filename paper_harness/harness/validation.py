@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Any
 
 from .campaign import Campaign, CampaignError, write_json
+from .experiment_lock import experiment_lock_digest, load_experiment_lock
+from .integrity import validate_harness_integrity
 from .parity import validate_pair
 from .profiles import validate_apgt_source, validate_profile, validate_profile_pair
 from .sources import inspect_source, manifest_digest, tree_manifest
@@ -96,6 +98,7 @@ def validate_campaign(
 ) -> dict[str, Any]:
     output_dir = output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    harness_integrity = validate_harness_integrity()
     asset_roots = asset_roots or {}
     required_assets = campaign.raw.get("artifacts", {}).get("required_assets", [])
     missing_assets = sorted(set(required_assets) - set(asset_roots))
@@ -113,6 +116,8 @@ def validate_campaign(
             "file_count": len(manifest),
         }
     write_json(output_dir / "asset_lock.json", asset_lock)
+    experiment_lock = load_experiment_lock()
+    experiment_lock_sha256 = experiment_lock_digest()
     data = campaign.raw.get("data", {})
     identity_template = data.get("identity_manifest")
     identity_sha256 = data.get("identity_manifest_sha256")
@@ -168,6 +173,8 @@ def validate_campaign(
         }
 
     resolved = campaign.resolved_dict()
+    resolved["experiment_lock"] = experiment_lock
+    resolved["experiment_lock_sha256"] = experiment_lock_sha256
     serialized: dict[str, dict[str, Any]] = {}
     serialized_environments: dict[str, dict[str, str]] = {}
     profile_checks = []
@@ -320,6 +327,9 @@ def validate_campaign(
         "python": str((python or Path(sys.executable)).resolve()),
         "source_lock": source_lock,
         "asset_lock": asset_lock,
+        "harness_integrity": harness_integrity,
+        "experiment_lock": experiment_lock,
+        "experiment_lock_sha256": experiment_lock_sha256,
         "source_lock_sha256": source_lock_sha256,
         "profile_contracts": contract,
         "profile_checks": profile_checks,

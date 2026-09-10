@@ -10,11 +10,10 @@ from typing import Any
 
 import torch
 from torch.nn.attention import SDPBackend
-from torchtitan.components.checkpoint import CheckpointManager
-from torchtitan.components.dataloader import BaseDataLoader
-from torchtitan.components.loss import CrossEntropyLoss
-from torchtitan.components.lr_scheduler import LRSchedulersContainer
-from torchtitan.components.optimizer import default_adamw
+from torchtitan.components.checkpointer import CheckpointManager
+from torchtitan.components.data.loader import BaseDataLoader
+from torchtitan.components.loss import CrossEntropyLoss, IGNORE_INDEX
+from torchtitan.components.optimizer import default_adamw, LRSchedulersContainer
 from torchtitan.components.validate import Validator
 from torchtitan.config import CompileConfig
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
@@ -145,11 +144,17 @@ class FixedReplay16KDataLoader(BaseDataLoader):
         dp_world_size: int,
         dp_rank: int,
         tokenizer,
-        seq_len: int,
-        local_batch_size: int,
+        max_context_length: int,
+        num_tokens_per_batch: int,
         **kwargs,
     ) -> None:
         del config, tokenizer, kwargs
+        local_batch_size, remainder = divmod(
+            num_tokens_per_batch, max_context_length
+        )
+        if remainder or local_batch_size <= 0:
+            raise ValueError("Replay token batch is not rectangular")
+        seq_len = max_context_length
         if seq_len != TARGET_SEQUENCE_LENGTH:
             raise ValueError(
                 f"Expected sequence length {TARGET_SEQUENCE_LENGTH}, got {seq_len}"
@@ -169,12 +174,14 @@ class FixedReplay16KDataLoader(BaseDataLoader):
                 dp_rank=dp_rank,
                 local_batch_size=local_batch_size,
             )
+            batch_sha256 = _batch_sha256(input_dict, labels)
+            input_dict["num_valid_tokens"] = int((labels != IGNORE_INDEX).sum())
             self._batches.append((input_dict, labels))
             batch_records.append(
                 {
                     "slot": slot,
                     "source_indices": source_indices,
-                    "sha256": _batch_sha256(input_dict, labels),
+                    "sha256": batch_sha256,
                 }
             )
         self._index = 0
@@ -270,9 +277,9 @@ def _base_config():
     config.lr_scheduler = LRSchedulersContainer.Config(warmup_steps=200)
     config.training = replace(
         config.training,
-        local_batch_size=local_batch_size,
-        global_batch_size=local_batch_size * dp_degree,
-        seq_len=seq_len,
+        num_tokens_per_microbatch_per_dp_rank=local_batch_size * seq_len,
+        num_tokens_per_train_step=local_batch_size * dp_degree * seq_len,
+        max_context_length=seq_len,
         steps=25,
         dtype="float32",
         mixed_precision_param="bfloat16",
@@ -365,7 +372,7 @@ def _parallelize_manual_with_autoparallel_cp(
     )
 
     del ac_config
-    if training.seq_len % parallel_dims.seq_len_divisor:
+    if training.max_context_length % parallel_dims.seq_len_divisor:
         raise ValueError("Sequence length is incompatible with the 3D mesh")
     _apply_autoparallel_context_parallel_attention(
         model, _build_autoparallel_mesh(parallel_dims)
@@ -389,11 +396,11 @@ def _parallelize_manual_with_autoparallel_cp(
 
 def _parallelize_fixed_3d(model, *, compile_config, **kwargs):
     if compile_config.enable_autoparallel:
-        from torchtitan.experiments.graph_trainer.llama3.parallelize_autoparallel import (
-            parallelize_autoparallel_llama,
+        from workloads.llama3_batched_autoparallel import (
+            parallelize_batched_autoparallel_llama,
         )
 
-        return parallelize_autoparallel_llama(
+        return parallelize_batched_autoparallel_llama(
             model,
             compile_config=compile_config,
             **kwargs,
@@ -412,7 +419,6 @@ def _graph_config(*, enable_autoparallel: bool):
         name="graphtrainer/llama3_3d_current",
         parallelize_fn=_parallelize_fixed_3d,
     )
-    config.profiler = replace(config.profiler, trace_post_processor=None)
     config.compile = GraphTrainerCompileConfig(
         enable=True,
         components=["model", "loss"],

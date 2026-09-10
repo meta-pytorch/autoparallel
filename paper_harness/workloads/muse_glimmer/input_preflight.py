@@ -14,7 +14,12 @@ from torchtitan.experiments.graph_trainer.muse_glimmer.config_registry import (
 
 def _batch_sha256(input_dict: dict[str, torch.Tensor], labels: torch.Tensor) -> str:
     digest = hashlib.sha256()
-    for name, tensor in [*sorted(input_dict.items()), ("labels", labels)]:
+    tensors = [
+        (name, tensor)
+        for name, tensor in sorted(input_dict.items())
+        if isinstance(tensor, torch.Tensor)
+    ]
+    for name, tensor in [*tensors, ("labels", labels)]:
         value = tensor.detach().cpu().contiguous()
         digest.update(name.encode())
         digest.update(str(value.dtype).encode())
@@ -59,11 +64,14 @@ def audit(
         }
 
     config = graph_trainer_muse_glimmer_30b_sdpa_c4_4x2()
+    local_batch_size = int(resolved["training"]["local_batch_size"])
+    global_batch_size = int(resolved["training"]["global_batch_size"])
+    seq_len = int(resolved["training"]["seq_len"])
     config.training = replace(
         config.training,
-        local_batch_size=int(resolved["training"]["local_batch_size"]),
-        global_batch_size=int(resolved["training"]["global_batch_size"]),
-        seq_len=int(resolved["training"]["seq_len"]),
+        num_tokens_per_microbatch_per_dp_rank=local_batch_size * seq_len,
+        num_tokens_per_train_step=global_batch_size * seq_len,
+        max_context_length=seq_len,
     )
     config.parallelism = replace(
         config.parallelism,
@@ -77,9 +85,10 @@ def audit(
         dp_world_size=fsdp_degree,
         dp_rank=dp_rank,
         tokenizer=tokenizer,
-        seq_len=config.training.seq_len,
-        local_batch_size=config.training.local_batch_size,
-        snapshot_every_n_steps=None,
+        max_context_length=config.training.max_context_length,
+        num_tokens_per_batch=(
+            config.training.num_tokens_per_microbatch_per_dp_rank
+        ),
     )
     iterator = iter(dataloader)
     observed = []

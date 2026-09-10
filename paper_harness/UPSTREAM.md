@@ -1,6 +1,6 @@
 # Submission stack provenance
 
-The harness is vendored from `AlbedoWang/AutoParallel-Harness` commit `854c63e69e1f2e515ad6c14e799b3c241dcbfd93`. The snapshot is kept under `paper_harness/` so the paper branch records the exact launcher and analysis code without making TorchTitan or AutoParallel runtime sources mutable inputs.
+The harness originated from `AlbedoWang/AutoParallel-Harness` commit `854c63e69e1f2e515ad6c14e799b3c241dcbfd93`. It is checked into `paper_harness/` so the paper branch records the exact launcher and analysis code without modifying either runtime source checkout.
 
 ## AutoParallel
 
@@ -12,14 +12,14 @@ The `kaijian/paper-submission` branch is an explicit linear stack:
 4. NCCL topology-cost fix, cherry-picked from `b8ace2a55d465787840aa41466f50be4fd9f73c1` as `34085887102c6d5a627ca8229f92e9ae44ed1426`.
 5. The permanent harness snapshot and its documentation under `paper_harness/`.
 
-Current AutoParallel `main` is not merged implicitly. This keeps the paper stack attributable and lets a campaign pin any other clean AutoParallel commit instead.
+The immutable experiment source is `5102d629c0a97ec604b12c328b40147d214ecbe7`. Current AutoParallel `main` is not merged implicitly.
 
 ## TorchTitan
 
-The companion `AlbedoWang/torchtitan` branch `kaijian/paper-submission` ends at `7f480ff1a9ba04296b297a19b0b1614f26b47bb8`. Its stack contains the prior GraphTrainer AutoParallel integration, the validated LLaMA3/DeepSeek V3 3D integration snapshot, the solver configuration bridge, and the AP+GraphTrainer full-Inductor contract used by the fixed LLaMA3 reproduction.
+The companion `AlbedoWang/torchtitan` branch `kaijian/paper-submission` is pinned at `6ced255cc55dec8a469bba2584c6c2efb35122ac`, rebased on official TorchTitan main `f93fd4ccff855b7e2a8f7d959e6532a9fa743f9e`. Its stack contains the GraphTrainer AutoParallel integration, LLaMA3/DeepSeek V3/Muse integration, solver configuration bridge, AP-specific Inductor settings, FQN restoration, and overlap-ordering fixes.
 
-The snapshot-restoration commit is `5f032d1337ddf2cf6ee1c334a3dd1a9816490ed3`. It reconstructs the final retained 3D integration source atop the available Git history because the original local final commit object was no longer available. Commit `d0ced23d8b41895bfb2e2d8a0c0305d18ed08ccb` adds the typed solver configuration and shared forwarding logic. Commit `7f480ff1a9ba04296b297a19b0b1614f26b47bb8` restores the source contract from the successful `383cae9f9c59845565963f1c9d7796c13d20fcd7` reproduction: AP-specific overlap and collective bucketing, no manual joint pass on the AP arm, and those settings forwarded into full Inductor.
+The final compatibility commit migrates the integration to latest TorchTitan's token-based training configuration and keeps the cross-entropy path valid for both current token-major inputs and historical fixed-shape LLaMA batches.
 
 ## Pinning policy
 
-Campaigns pin immutable source commits and receive clean checkout paths at validation/package time. Existing historical campaign pins are provenance records and are not rewritten to the submission stack. New paper campaigns should pin the desired AutoParallel and TorchTitan submission commits explicitly, and any later source change should produce new commit pins rather than editing either checkout in place.
+`experiment_lock.toml` is authoritative for both source commits and `torchtitan_conda_prod:946`. Every campaign must repeat those exact pins, and validation rejects dirty trees, source drift, runtime drift, or a changed frozen harness core. A later source or harness change requires a new explicit lock/version rather than editing a packaged attempt.

@@ -514,6 +514,24 @@ def retrieve(args: argparse.Namespace) -> None:
         raise SystemExit(f"refusing to overwrite retrieved run: {attempt / 'run'}")
     if not args.oilfs_uri.startswith("ws://"):
         raise SystemExit("--oilfs-uri must be an exact ws:// workspace URI")
+    job_id = (attempt / "job_id.txt").read_text().strip()
+    status_result = _capture(
+        ["mast", "--output", "json", "get-status", job_id],
+        cwd=HARNESS_ROOT,
+        record_root=attempt / "retrieval" / "terminal_gate",
+        name="status",
+    )
+    summary = _scheduler_summary(json.loads(status_result.stdout))
+    if not (
+        summary["root_state"] == "COMPLETE"
+        and summary["latest_attempt_state"] == "COMPLETE"
+        and summary["task_groups"]
+        and summary["tasks"]
+        and all(group["state"] == "COMPLETE" for group in summary["task_groups"])
+        and all(task["state"] == "COMPLETE" for task in summary["tasks"])
+        and not summary["continuity_errors"]
+    ):
+        raise SystemExit("retrieval requires a fully successful terminal MAST job")
     definition = json.loads((attempt / "submitted_definition.json").read_text())
     packages = [str(value) for value in _walk_values(definition, "fbpkgIdentifier")]
     if args.oilfs_package not in packages:

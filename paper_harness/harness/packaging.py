@@ -85,6 +85,10 @@ def package_campaign(
         payload / "campaign" / "resolved_campaign.json",
     )
     shutil.copy2(validation_root / "source_lock.json", payload / "campaign/source_lock.json")
+    shutil.copy2(
+        Path(__file__).resolve().parents[1] / "experiment_lock.toml",
+        payload / "campaign/experiment_lock.toml",
+    )
     if (validation_root / "serialized_configs").is_dir():
         _copy_tree(
             validation_root / "serialized_configs",

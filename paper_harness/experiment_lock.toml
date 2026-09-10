@@ -1,0 +1,26 @@
+schema_version = 1
+harness_version = "paper-harness-v1"
+
+[sources.torchtitan]
+remote = "https://github.com/AlbedoWang/torchtitan.git"
+upstream_commit = "f93fd4ccff855b7e2a8f7d959e6532a9fa743f9e"
+commit = "6ced255cc55dec8a469bba2584c6c2efb35122ac"
+
+[sources.autoparallel]
+remote = "https://github.com/meta-pytorch/autoparallel.git"
+commit = "5102d629c0a97ec604b12c328b40147d214ecbe7"
+
+[runtime]
+conda_fbpkg = "torchtitan_conda_prod:946"
+python_version = "3.12.14"
+torch_version = "2.15.0a0+git9d5a710"
+torch_git_version = "9d5a71058272ed10ee6156c9f570711864e07e38"
+cuda_version = "13.0"
+nccl_version = [2, 30, 7]
+
+[runtime.packages]
+spmd_types = "0.2.5"
+grain = "0.2.18"
+attn-gym = "0.0.8"
+torch-remat = "0.2.0"
+datasets = "4.7.0"
