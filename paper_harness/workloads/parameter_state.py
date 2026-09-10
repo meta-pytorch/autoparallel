@@ -27,10 +27,11 @@ def _write_post_load_audit(model_parts: list[torch.nn.Module], output: Path) -> 
     for part_index, model_part in enumerate(model_parts):
         for name, parameter in model_part.named_parameters():
             local = parameter.to_local() if isinstance(parameter, DTensor) else parameter
-            flat = local.detach().reshape(-1)
+            cpu_local = local.detach().cpu()
+            flat = cpu_local.reshape(-1)
             sample = flat[: min(flat.numel(), 8192)].contiguous()
-            sample_bytes = sample.view(torch.uint8).cpu().numpy().tobytes()
-            float_local = local.detach().double()
+            sample_bytes = sample.view(torch.uint8).numpy().tobytes()
+            float_local = cpu_local.double()
             records.append(
                 {
                     "stage": "post_load",
