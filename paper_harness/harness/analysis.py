@@ -430,6 +430,7 @@ def _parameter_state_audit(campaign: Campaign, run_root: Path) -> dict[str, Any]
     errors: list[dict[str, Any]] = []
     reference_key: str | None = None
     reference: dict[tuple[int, str], dict[str, Any]] | None = None
+    reference_stage: str | None = None
     saw_audit = False
 
     for phase in campaign.phases:
@@ -452,12 +453,14 @@ def _parameter_state_audit(campaign: Campaign, run_root: Path) -> dict[str, Any]
                 )
 
             values: dict[tuple[int, str], dict[str, Any]] = {}
+            stages = set()
             for path in paths:
                 try:
                     records = json.loads(path.read_text())
                     if not isinstance(records, list):
                         raise TypeError("parameter audit must be a JSON list")
                     for record in records:
+                        stages.add(str(record.get("stage", "legacy_pre_load")))
                         parameter_key = (
                             int(record["part"]),
                             _canonical_parameter_name(str(record["name"])),
@@ -483,6 +486,16 @@ def _parameter_state_audit(campaign: Campaign, run_root: Path) -> dict[str, Any]
                         current["square_sums"].append(float(record["square_sum"]))
                 except Exception as error:
                     errors.append({"run": key, "path": str(path), "error": str(error)})
+
+            if len(stages) != 1:
+                errors.append(
+                    {
+                        "run": key,
+                        "error": "parameter audit stage mismatch",
+                        "stages": sorted(stages),
+                    }
+                )
+            stage = next(iter(stages)) if len(stages) == 1 else None
 
             aggregated = {}
             for parameter_key, value in values.items():
@@ -521,6 +534,7 @@ def _parameter_state_audit(campaign: Campaign, run_root: Path) -> dict[str, Any]
                 }
             runs[key] = {
                 "files": [str(path) for path in paths],
+                "stage": stage,
                 "parameters": {
                     f"{part}:{name}": value
                     for (part, name), value in sorted(aggregated.items())
@@ -529,7 +543,19 @@ def _parameter_state_audit(campaign: Campaign, run_root: Path) -> dict[str, Any]
             if reference is None:
                 reference_key = key
                 reference = aggregated
+                reference_stage = stage
                 continue
+
+            if stage != reference_stage:
+                errors.append(
+                    {
+                        "run": key,
+                        "reference_run": reference_key,
+                        "error": "parameter audit stage differs",
+                        "reference": reference_stage,
+                        "current": stage,
+                    }
+                )
 
             if set(aggregated) != set(reference):
                 errors.append(

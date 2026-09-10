@@ -25,6 +25,7 @@ def _write_parameter_audit(
     rows: tuple[tuple[list[int], float, float], tuple[list[int], float, float]],
     *,
     checkpoint_wrapped: bool = False,
+    stage: str | None = None,
 ) -> None:
     output = root / "performance" / arm / "parameter_audit"
     output.mkdir(parents=True)
@@ -43,6 +44,8 @@ def _write_parameter_audit(
             "sum": total,
             "square_sum": square_total,
         }
+        if stage is not None:
+            record["stage"] = stage
         (output / f"rank_{rank:02d}.json").write_text(
             json.dumps([record], indent=2, sort_keys=True) + "\n"
         )
@@ -107,6 +110,20 @@ class ParameterStateAuditTests(unittest.TestCase):
             self.assertEqual(result["status"], "failed")
             self.assertTrue(result["required"])
             self.assertEqual(len(result["errors"]), 2)
+
+    def test_parameter_audit_stage_must_match_across_arms(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            rows = (([2, 1], 1.0, 3.0), ([2, 1], 2.0, 4.0))
+            _write_parameter_audit(root, "baseline", rows)
+            _write_parameter_audit(root, "treatment", rows, stage="post_load")
+
+            result = _parameter_state_audit(_Campaign(), root)
+
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(
+                result["errors"][0]["error"], "parameter audit stage differs"
+            )
 
 
 class PrimaryMeasurementTests(unittest.TestCase):

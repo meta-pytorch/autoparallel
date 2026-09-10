@@ -49,6 +49,15 @@ fsdp_reshard_after_forward = "default"
 [comm]
 init_timeout_seconds = 1200
 
+[checkpoint]
+enable = true
+folder = "checkpoint"
+initial_load_path = "{asset:llama3_3d_seed_checkpoint}"
+initial_load_model_only = true
+initial_load_in_hf = true
+load_only = true
+create_seed_checkpoint = false
+
 [measurement.primary]
 source = "structured_logs"
 steps = [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25]
@@ -82,7 +91,7 @@ HF_HUB_DISABLE_XET = "1"
 PYTORCH_ALLOC_CONF = "expandable_segments:True"
 
 [artifacts]
-required_assets = ["llama_tokenizer", "llama_replanning_inputs"]
+required_assets = ["llama_tokenizer", "llama_replanning_inputs", "llama3_3d_seed_checkpoint"]
 warmup_steps = 5
 
 [[arms]]

@@ -15,6 +15,8 @@ from torchtitan.experiments.graph_trainer.llama3 import model_registry
 from torchtitan.models.common.config_utils import decoder_vocab_size
 from torchtitan.models.llama3.config_registry import llama3_8b
 
+from workloads.parameter_state import register_post_load_parameter_audit
+
 from .replay_data import FixedC4ReplayDataLoader, case_name
 
 
@@ -50,7 +52,10 @@ def _base_config():
         )
 
     config = llama3_8b()
-    config.model_spec = model_registry("8B", attn_backend="sdpa")
+    config.model_spec = replace(
+        model_registry("8B", attn_backend="sdpa"),
+        post_optimizer_build_fn=register_post_load_parameter_audit,
+    )
     config.hf_assets_path = os.environ["LLAMA_TOKENIZER_DIR"]
     config.dataloader = FixedC4ReplayDataLoader.Config()
     config.loss = CrossEntropyLoss.Config(

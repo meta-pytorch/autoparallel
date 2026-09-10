@@ -39,6 +39,15 @@ tensor_parallel_degree = 4
 context_parallel_degree = 1
 pipeline_parallel_degree = 1
 
+[checkpoint]
+enable = true
+folder = "checkpoint"
+initial_load_path = "{asset:llama3_3d_seed_checkpoint}"
+initial_load_model_only = true
+initial_load_in_hf = true
+load_only = true
+create_seed_checkpoint = false
+
 [comparison]
 declared_variable = "training_parallelization_compile_stack"
 allowed_config_paths = ["compile.*", "model_spec.name", "parallelism.*"]
@@ -70,7 +79,7 @@ HF_HUB_DISABLE_XET = "1"
 PYTORCH_ALLOC_CONF = "expandable_segments:True"
 
 [artifacts]
-required_assets = ["llama_tokenizer", "llama_replay"]
+required_assets = ["llama_tokenizer", "llama_replay", "llama3_3d_seed_checkpoint"]
 warmup_steps = 5
 
 [legacy]

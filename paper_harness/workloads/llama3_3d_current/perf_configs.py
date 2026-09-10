@@ -34,6 +34,8 @@ from torchtitan.models.llama3 import llama3_configs
 from torchtitan.models.llama3 import model_registry as native_llama3_model_registry
 from torchtitan.models.llama3.config_registry import llama3_8b
 
+from workloads.parameter_state import register_post_load_parameter_audit
+
 SOURCE_SEQUENCE_LENGTH = 8192
 TARGET_SEQUENCE_LENGTH = 16384
 REPLAY_SLOTS = 10
@@ -255,7 +257,10 @@ def _base_config():
         )
 
     config = llama3_8b()
-    config.model_spec = _flash_sdpa_model_spec()
+    config.model_spec = replace(
+        _flash_sdpa_model_spec(),
+        post_optimizer_build_fn=register_post_load_parameter_audit,
+    )
     config.hf_assets_path = _required_env("LLAMA_TOKENIZER_DIR")
     config.dataloader = FixedReplay16KDataLoader.Config()
     config.loss = CrossEntropyLoss.Config(
