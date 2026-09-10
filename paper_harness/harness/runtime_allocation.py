@@ -11,8 +11,10 @@ import torch
 
 def _datacenter(host: str) -> str:
     labels = host.rstrip(".").split(".")
-    if labels[-2:] == ["facebook", "com"]:
-        labels = labels[:-2]
+    for suffix in (["facebook", "com"], ["tw", "fbinfra", "net"]):
+        if labels[-len(suffix) :] == suffix:
+            labels = labels[: -len(suffix)]
+            break
     if len(labels) < 2:
         raise RuntimeError(f"cannot determine datacenter from {host!r}")
     return labels[-1]
