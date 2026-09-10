@@ -126,11 +126,13 @@ Performance phases keep Kineto and TORCH_TRACE disabled. Trace phases run after 
 
 ## Canonical campaigns
 
+The only end-to-end packaged path validated against the locked stack so far is the LLaMA3 2D 4x8 point. Other LLaMA campaigns have been migrated to the same token/batch contract but still require their own gate run. Muse Glimmer and DeepSeek performance entry points are intentionally fail-closed until their historical batched attention/input semantics are ported and reviewed; their campaign files remain as serialized experiment specifications, not runnable-result evidence.
+
 - `campaigns/llama3_8b_2d_scaling.toml`: 8 through 128 GPUs, with TorchTitan TP, GraphTrainer manual, and AP+GraphTrainer arms. The GraphTrainer-manual/AP pair receives an additional strict one-toggle audit.
 - `campaigns/llama3_8b_3d_legacy.toml`: final fair DP2 x CP2 x TP2 pair.
 - `campaigns/llama3_8b_seqlen.toml`: 2K through 32K at 32 GPUs.
-- `campaigns/muse_glimmer_30b_scaling.toml`: 16 through 128 GPUs.
-- `campaigns/deepseek_v3_16b.toml`: 16/32-GPU workload; historical failed runs remain non-comparative.
+- `campaigns/muse_glimmer_30b_scaling.toml`: locked 16 through 128-GPU specification; performance entry points currently fail closed.
+- `campaigns/deepseek_v3_16b.toml`: locked 16/32-GPU specification; the AP performance entry point currently fails closed and historical failed runs remain non-comparative.
 - `campaigns/repro_*.toml`: fixed 32-GPU reproduction presets with explicit historical metrics; relative-gap acceptance is retained only when the reference used the campaign's current batch semantics.
 
 Legacy evidence is imported read-only with `analyze`; missing or failed artifacts never become a performance conclusion.
@@ -142,4 +144,4 @@ VALIDATION_ROOT="$TASK_ROOT/validation/static" \
   PYTHON_BIN=/path/to/compatible/python scripts/run_static_preflight.sh
 ```
 
-The initial MAST validation is functional only: the smallest existing real topology for LLaMA 2D, LLaMA 3D, Muse, and DeepSeek performs source/package/config/allocation checks, real compile/train steps, and an isolated trace smoke. It is not a latency or speedup benchmark.
+Before a workload is admitted to the frozen runnable set, its initial MAST validation is functional only: the smallest existing real topology must pass source/package/config/allocation checks, real compile/train steps, and an isolated trace smoke. That gate is not a latency or speedup benchmark.
