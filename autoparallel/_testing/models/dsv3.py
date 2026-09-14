@@ -1017,6 +1017,18 @@ class MoE(nn.Module):
             persistent=False,
         )
 
+    @property
+    def expert_bias_E(self) -> torch.Tensor | None:  # noqa: N802
+        expert_bias = self.expert_bias
+        assert expert_bias is None or isinstance(expert_bias, torch.Tensor)
+        return expert_bias
+
+    @property
+    def tokens_per_expert_E(self) -> torch.Tensor:  # noqa: N802
+        tokens_per_expert = self.tokens_per_expert
+        assert isinstance(tokens_per_expert, torch.Tensor)
+        return tokens_per_expert
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
@@ -1296,6 +1308,17 @@ class DeepSeekV3Config:
     layers: list = field(default_factory=list)
 
 
+def _get_rope_config(config):
+    rope = getattr(config, "rope", None)
+    if rope is not None:
+        return rope
+
+    first_attention = getattr(config, "first_attention", None)
+    if first_attention is None:
+        raise ValueError("DeepSeek V3 config does not define RoPE")
+    return first_attention.rope
+
+
 def make_dsv3_config(
     dim: int = 256,
     vocab_size: int = 2048,
@@ -1391,7 +1414,7 @@ def make_dsv3_config(
 
 
 def precompute_freqs_cis(config) -> torch.Tensor:
-    rope = config.rope
+    rope = _get_rope_config(config)
     dim = rope.dim
     seqlen = rope.max_seq_len
     beta_fast = rope.beta_fast
@@ -1552,7 +1575,7 @@ class Attention(nn.Module):
         self.wo = nn.Linear(self.n_heads * self.v_head_dim, self.dim, bias=False)
         self.softmax_scale = self.qk_head_dim**-0.5
 
-        rope_cfg = model_config.rope
+        rope_cfg = _get_rope_config(model_config)
         if rope_cfg.max_seq_len > rope_cfg.original_seq_len:
             mscale = 0.1 * attn_config.mscale * math.log(rope_cfg.rope_factor) + 1.0
             self.softmax_scale = self.softmax_scale * mscale * mscale
@@ -1758,17 +1781,25 @@ class TransformerBlock(nn.Module):
         self.moe_enabled = layer_config.moe is not None
         if self.moe_enabled:
             moe_cfg = layer_config.moe
+            experts_cfg = getattr(moe_cfg, "experts", None)
+            if experts_cfg is None:
+                experts_cfg = moe_cfg.routed_experts.inner_experts
+                score_before_experts = False
+                use_grouped_mm = True
+            else:
+                score_before_experts = experts_cfg.token_dispatcher.score_before_experts
+                use_grouped_mm = experts_cfg.use_grouped_mm
             self.moe = MoE(
                 dim=dim,
-                hidden_dim=moe_cfg.experts.hidden_dim,
+                hidden_dim=experts_cfg.hidden_dim,
                 num_experts=moe_cfg.num_experts,
                 top_k=moe_cfg.router.top_k,
                 shared_experts_hidden_dim=moe_cfg.shared_experts.w1.out_features,
                 score_func=moe_cfg.router.score_func,
                 route_norm=moe_cfg.router.route_norm,
                 route_scale=moe_cfg.router.route_scale,
-                score_before_experts=moe_cfg.experts.token_dispatcher.score_before_experts,
-                use_grouped_mm=moe_cfg.experts.use_grouped_mm,
+                score_before_experts=score_before_experts,
+                use_grouped_mm=use_grouped_mm,
                 load_balance_coeff=moe_cfg.load_balance_coeff,
                 mesh=mesh,
                 roles=roles,
@@ -1842,7 +1873,7 @@ class DeepSeekV3Model(nn.Module):
         # is used with multiple inheritance (e.g., with ModelProtocol in torchtitan)
         nn.Module.__init__(self)
         self.compute_dtype = compute_dtype
-        self.max_seq_len = config.rope.max_seq_len
+        self.max_seq_len = _get_rope_config(config).max_seq_len
         self.tok_embeddings = nn.Embedding(config.vocab_size, config.dim)
         self.register_buffer(
             "freqs_cis", precompute_freqs_cis(config), persistent=False
@@ -1963,6 +1994,7 @@ def _init_weights_layers(
         if seed is not None:
             torch.manual_seed(seed)
         if layer is not None:
+            layer = getattr(layer, "_checkpoint_wrapped_module", layer)
             assert isinstance(layer, TransformerBlock)
             layer.init_weights(buffer_device)  # type: ignore[arg-type]
 

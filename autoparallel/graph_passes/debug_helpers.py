@@ -12,6 +12,7 @@ from typing import Any, Callable
 import torch
 from torch._functorch.aot_autograd import aot_export_joint_with_descriptors
 from torch._inductor.fx_passes.overlap_scheduling import (
+    estimate_roofline_runtime_ms,
     get_group_name,
     schedule_overlap_bucketing,
 )
@@ -167,6 +168,28 @@ def _resolve_comm_node(node, global_time):
     return arg
 
 
+def _has_unbacked_symbol(value: Any) -> bool:
+    """Return whether FX metadata contains a data-dependent symbolic value."""
+
+    def resolve_node(item: Any) -> Any:
+        return item.meta.get("val") if isinstance(item, torch.fx.Node) else item
+
+    flat_values, _ = torch.utils._pytree.tree_flatten(
+        torch.utils._pytree.tree_map(resolve_node, value)
+    )
+    for item in flat_values:
+        if isinstance(item, torch.SymInt) and item.node.hint is None:
+            return True
+        if isinstance(item, torch.Tensor):
+            symbolic_sizes_and_strides = (*item.shape, *item.stride())
+            if any(
+                isinstance(dim, torch.SymInt) and dim.node.hint is None
+                for dim in symbolic_sizes_and_strides
+            ):
+                return True
+    return False
+
+
 def make_custom_runtime_estimation(mesh):
     _TARGET_TO_COLLECTIVE = {
         torch.ops._c10d_functional.all_gather_into_tensor.default: "allgather",
@@ -185,10 +208,19 @@ def make_custom_runtime_estimation(mesh):
         if not isinstance(node.target, torch._ops.OpOverload):
             return 0
 
+        has_unbacked_symbol = override_size is None and _has_unbacked_symbol(
+            (node.args, node.kwargs, node.meta.get("val"))
+        )
+
         if _is_communication_node(node):
             target = node.target
             if target == torch.ops._c10d_functional.wait_tensor.default:
                 return 0
+            if has_unbacked_symbol:
+                runtime_ms = torch._inductor.comm_analysis.estimate_nccl_collective_runtime_from_fx_node(
+                    node, override_size
+                )
+                return runtime_ms * 1000
             collective = _TARGET_TO_COLLECTIVE.get(target)
             if collective is None:
                 return 0
@@ -219,6 +251,11 @@ def make_custom_runtime_estimation(mesh):
                 mesh_dim,
                 mesh_topo,
             )
+        if has_unbacked_symbol:
+            # The AP roofline model uses Python comparisons that would guard on
+            # data-dependent MoE shapes. Inductor's estimator handles those
+            # shapes with optimization hints. Convert ms to AP's microseconds.
+            return estimate_roofline_runtime_ms(node) * 1000
         return estimate_strategy_runtime_cost(node, None)
 
     return custom_runtime_estimation

@@ -6,10 +6,96 @@
 import pytest
 import torch
 from torch import nn
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+    CheckpointWrapper,
+    checkpoint_wrapper,
+)
+from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import Shard
 
 from autoparallel.api import auto_parallel
+from autoparallel.cast_parametrization import apply_dtype_cast
+from autoparallel.module_construction import make_parallel_module
+from autoparallel._testing.models.dsv3 import (
+    DeepSeekV3Model,
+    TransformerBlock,
+    make_dsv3_config,
+)
+
+
+@pytest.mark.parametrize("checkpointed", [False, True])
+def test_dsv3_init_weights_with_checkpointed_layers(checkpointed):
+    config = make_dsv3_config(
+        dim=32,
+        vocab_size=64,
+        n_layers=2,
+        n_dense_layers=1,
+        n_heads=4,
+        kv_lora_rank=16,
+        qk_nope_head_dim=8,
+        qk_rope_head_dim=8,
+        v_head_dim=8,
+        dense_hidden_dim=64,
+        moe_hidden_dim=32,
+        num_experts=4,
+        num_shared_experts=1,
+        top_k=2,
+        max_seq_len=16,
+        original_seq_len=16,
+    )
+    with torch.device("meta"):
+        model = DeepSeekV3Model(config)
+
+    if checkpointed:
+        for layer_id, layer in list(model.layers.items()):
+            model.layers[layer_id] = checkpoint_wrapper(layer)
+
+    apply_dtype_cast(
+        model,
+        MixedPrecisionPolicy(
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.float32,
+            cast_forward_inputs=False,
+        ),
+    )
+    parallel_model = make_parallel_module(
+        model,
+        dict(model.named_parameters()),
+        dict(model.named_buffers()),
+    )
+
+    inner_layers = []
+    for layer in parallel_model.layers.values():
+        if checkpointed:
+            assert isinstance(layer, CheckpointWrapper)
+            layer = layer._checkpoint_wrapped_module
+        assert isinstance(layer, TransformerBlock)
+        inner_layers.append(layer)
+
+    assert [layer.moe_enabled for layer in inner_layers] == [False, True]
+
+    parallel_model.to_empty(device="cpu")
+    with torch.no_grad():
+        parallel_model.init_weights(buffer_device=torch.device("cpu"), seed=42)
+
+    for parameter in parallel_model.parameters():
+        assert not parameter.is_meta
+        assert torch.isfinite(parameter).all()
+    for layer in inner_layers:
+        assert torch.equal(
+            layer.attention_norm.weight,
+            torch.ones_like(layer.attention_norm.weight),
+        )
+        assert torch.equal(
+            layer.ffn_norm.weight, torch.ones_like(layer.ffn_norm.weight)
+        )
+    assert torch.count_nonzero(inner_layers[0].feed_forward.w1.weight) > 0
+    assert torch.count_nonzero(inner_layers[1].moe.experts.w1) > 0
+    assert torch.equal(
+        inner_layers[1].moe.tokens_per_expert,
+        torch.zeros_like(inner_layers[1].moe.tokens_per_expert),
+    )
 
 
 def test_init(device_mesh_1d):
