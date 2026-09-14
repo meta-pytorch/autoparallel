@@ -51,6 +51,9 @@ from torch.distributed.tensor.placement_types import (
 
 # need to import this to have the dtype_cast registered
 from ..cast_parametrization import dtype_cast  # noqa
+
+# need to import this to have doc_packed_attn_op registered
+from ..ops import doc_packed_attn  # noqa: F401
 from .dtensor_sharding_helpers import _try_single_dim_strategy, get_op_strategy
 
 _op_rules = {}
@@ -677,4 +680,188 @@ def uniform_strategy(mesh, op_schema: OpSchema):
 
     return expand_to_full_mesh_op_strategy(
         mesh, op_schema, single_mesh_dim_strategies, input_index=1
+    )
+
+
+@register_rule(torch.ops.autoparallel.doc_packed_attn_op.default)
+def doc_packed_attn_op_rule(mesh, op_schema):
+    """Sharding strategy for autoparallel::doc_packed_attn_op.
+
+    Schema:
+        (query, key, value, cu_seq_q, n_docs, scale, window_size, enable_gqa)
+        -> (out, lse, rng_state)
+
+    Tensor layouts:
+        query : [B, S, H_q,  D]    -- batch dim 0, heads dim 2
+        key   : [B, S, H_kv, D]
+        value : [B, S, H_kv, D]
+        cu_seq_q: [B, MAX_DOCS+1]  -- batch dim 0; MAX_DOCS dim never sharded
+        out   : same as query
+        lse   : [H_q, B*S]         -- heads dim 0, T=B*S dim 1
+        rng_state: [2]             -- always Replicate
+
+    Per-mesh-dim options:
+        - "R" Replicate everywhere.
+        - "B" Shard batch: q/k/v/cu/out dim 0, lse dim 1.
+        - "H" Shard heads: q/k/v/out dim 2, lse dim 0. Requires H_q and H_kv
+              both divisible by the mesh-dim size so GQA broadcasting keeps
+              the H_q/H_kv ratio uniform per rank.
+
+    Not shardable in Phase 1:
+        - S dim (sequence) -- would require context parallelism.
+        - cu_seq_q's MAX_DOCS+1 dim -- doc-boundary descriptors are not a
+          parallel axis.
+    """
+    from torch.distributed.tensor._ops.utils import expand_to_full_mesh_op_strategy
+
+    q_strat = op_schema.args_schema[0]
+    k_strat = op_schema.args_schema[1]
+    q_meta = q_strat.strategies[0].output_spec.tensor_meta
+    k_meta = k_strat.strategies[0].output_spec.tensor_meta
+    B, S, H_q, _D = q_meta.shape
+    H_kv = k_meta.shape[2]
+
+    # Layout per role: [out, lse, rng | q, k, v, cu_seq_q, n_docs, scale, window_size, enable_gqa]
+    # input_index = 3 (three outputs).
+    R = Replicate()
+    # Build PlacementLists for each per-mesh-dim option.
+    # "B" sharding — q/k/v/cu/out shard dim 0, lse shards dim 1, rng replicated.
+    b_strat = [
+        Shard(0),
+        Shard(1),
+        R,  # outputs
+        Shard(0),
+        Shard(0),
+        Shard(0),
+        Shard(0),  # tensor inputs
+        None,
+        None,
+        None,
+        None,
+    ]  # n_docs, scale, window_size, enable_gqa
+    # "H" sharding — q/k/v/out shard dim 2, lse shards dim 0, cu/rng replicated.
+    h_strat = [
+        Shard(2),
+        Shard(0),
+        R,
+        Shard(2),
+        Shard(2),
+        Shard(2),
+        R,
+        None,
+        None,
+        None,
+        None,
+    ]
+    # "R" replicate-everywhere.
+    r_strat = [R, R, R, R, R, R, R, None, None, None, None]
+
+    single_mesh_dim_strategies = [r_strat]
+    if B > 1:
+        single_mesh_dim_strategies.append(b_strat)
+    if H_q > 1 and H_kv > 1:
+        single_mesh_dim_strategies.append(h_strat)
+
+    lse_meta = _gen_tensor_meta(
+        torch.empty((H_q, B * S), dtype=torch.float32, device="meta")
+    )
+    rng_meta = _gen_tensor_meta(torch.empty((2,), dtype=torch.int64, device="meta"))
+
+    return expand_to_full_mesh_op_strategy(
+        mesh,
+        op_schema,
+        single_mesh_dim_strategies,
+        output_tensor_meta=(q_meta, lse_meta, rng_meta),
+        input_index=3,
+    )
+
+
+@register_rule(torch.ops.autoparallel.doc_packed_attn_backward_op.default)
+def doc_packed_attn_backward_op_rule(mesh, op_schema):
+    """Sharding strategy for autoparallel::doc_packed_attn_backward_op.
+
+    Schema:
+        (grad_out, query, key, value, out, lse, cu_seq_q, rng_state,
+         n_docs, scale, window_size)
+        -> (dq, dk, dv)
+
+    Tensor layouts (same as the forward — the THD reshape is hidden inside
+    the op body):
+        grad_out, q, out : [B, S, H_q,  D]
+        k, v             : [B, S, H_kv, D]
+        lse              : [H_q, B*S]
+        cu_seq_q         : [B, MAX_DOCS+1]
+        rng_state        : [2]
+
+    Per-mesh-dim options match the forward:
+        - "R" Replicate everywhere.
+        - "B" Shard batch: q/k/v/grad_out/out/cu_seq_q/dq/dk/dv dim 0, lse dim 1.
+        - "H" Shard heads: q/k/v/grad_out/out/dq/dk/dv dim 2, lse dim 0.
+    """
+    from torch.distributed.tensor._ops.utils import expand_to_full_mesh_op_strategy
+
+    q_strat = op_schema.args_schema[1]
+    k_strat = op_schema.args_schema[2]
+    q_meta = q_strat.strategies[0].output_spec.tensor_meta
+    k_meta = k_strat.strategies[0].output_spec.tensor_meta
+    B, S, H_q, _D = q_meta.shape
+    H_kv = k_meta.shape[2]
+
+    # Layout per role: [dq, dk, dv | grad_out, q, k, v, out, lse, cu_seq_q,
+    #                   rng_state, n_docs, scale, window_size]
+    # input_index = 3.
+    R = Replicate()
+    # "B" — batch sharding: q/k/v/grad_out/out/cu_seq_q/dq/dk/dv shard dim 0,
+    # lse shards dim 1, rng_state replicated.
+    b_strat = [
+        Shard(0),
+        Shard(0),
+        Shard(0),  # dq, dk, dv
+        Shard(0),
+        Shard(0),
+        Shard(0),
+        Shard(0),
+        Shard(0),
+        Shard(1),
+        # grad_out, q, k, v, out, lse
+        Shard(0),  # cu_seq_q
+        R,  # rng_state
+        None,
+        None,
+        None,
+    ]  # n_docs, scale, window_size
+    # "H" — heads sharding: q/k/v/grad_out/out/dq/dk/dv shard dim 2,
+    # lse shards dim 0, cu/rng replicated.
+    h_strat = [
+        Shard(2),
+        Shard(2),
+        Shard(2),
+        Shard(2),
+        Shard(2),
+        Shard(2),
+        Shard(2),
+        Shard(2),
+        Shard(0),
+        R,
+        R,
+        None,
+        None,
+        None,
+    ]
+    # "R" — replicate everywhere.
+    r_strat = [R, R, R, R, R, R, R, R, R, R, R, None, None, None]
+
+    single_mesh_dim_strategies = [r_strat]
+    if B > 1:
+        single_mesh_dim_strategies.append(b_strat)
+    if H_q > 1 and H_kv > 1:
+        single_mesh_dim_strategies.append(h_strat)
+
+    return expand_to_full_mesh_op_strategy(
+        mesh,
+        op_schema,
+        single_mesh_dim_strategies,
+        # Outputs are (dq, dk, dv) — same shapes as q, k, v (v has k's shape).
+        output_tensor_meta=(q_meta, k_meta, k_meta),
+        input_index=3,
     )
