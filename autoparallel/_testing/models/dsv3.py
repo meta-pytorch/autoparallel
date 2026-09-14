@@ -1600,7 +1600,7 @@ class Attention(nn.Module):
         def build_inner_attention(block_mask: BlockMask | None = None):
             return build_attention(
                 self.use_flex_attn,
-                attn_config.mask_type,
+                getattr(attn_config, "mask_type", "causal"),
                 fixed_block_size=fixed_block_size,
                 context_parallel_mesh=mesh if self.context_parallel else None,
                 scale=self.softmax_scale,
