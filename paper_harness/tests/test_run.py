@@ -376,6 +376,10 @@ class SubmissionLifecycleTests(unittest.TestCase):
         definition["hpcTaskGroups"][0]["spec"]["env"][
             "DUMP_DIR"
         ] = "/mnt/wsfuse/outputs/job-123"
+        definition["localityConstraints"]["locality"] = "DC"
+        definition["hpcTaskGroups"][0]["spec"]["machineConstraints"]["types"][
+            "serverSubTypes"
+        ] = ["T20_GRAND_TETON_HBM3_ROCE"]
         checks, _ = _definition_checks(
             {"status": "ok", "data": definition},
             resolved=resolved,
@@ -385,6 +389,16 @@ class SubmissionLifecycleTests(unittest.TestCase):
             expected_job_id="job-123",
         )
         self.assertTrue(all(checks.values()), checks)
+        definition["localityConstraints"]["locality"] = "UNKNOWN"
+        checks, _ = _definition_checks(
+            {"status": "ok", "data": definition},
+            resolved=resolved,
+            launcher_root=launcher,
+            command=command,
+            combined=None,
+            expected_job_id="job-123",
+        )
+        self.assertFalse(checks["locality_scope"])
 
     def test_terminal_scheduler_summary_is_strict(self) -> None:
         task = {

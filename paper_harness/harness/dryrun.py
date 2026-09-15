@@ -14,11 +14,14 @@ MARKER = "=== SCHEDULER REQUEST ===\n"
 WORKSPACE_PACKAGE = "torchtitan_workspace:"
 PAYLOAD_PACKAGE = "torchtitan_additional_packages:"
 HARDWARE_SERVER_SUBTYPES = {
-    "grandteton_80g_roce": "LogicalServerSubType.T20_GRAND_TETON_HBM3_ROCE",
+    "grandteton_80g_roce": (
+        "LogicalServerSubType.T20_GRAND_TETON_HBM3_ROCE",
+        "T20_GRAND_TETON_HBM3_ROCE",
+    ),
 }
 LOCALITY_SCOPES = {
-    "dc": "Locality.DC",
-    "region": "Locality.REGION",
+    "dc": ("Locality.DC", "DC"),
+    "region": ("Locality.REGION", "REGION"),
 }
 
 
@@ -238,12 +241,16 @@ def _definition_checks(
         == int(mast["nproc_per_node"]),
         checks,
     )
-    expected_subtype = HARDWARE_SERVER_SUBTYPES.get(str(mast["hardware"]))
+    expected_subtypes = HARDWARE_SERVER_SUBTYPES.get(str(mast["hardware"]))
+    observed_subtypes = (
+        spec.get("machineConstraints", {}).get("types", {}).get("serverSubTypes")
+    )
     _check(
         "hardware_subtype",
-        expected_subtype is not None
-        and spec.get("machineConstraints", {}).get("types", {}).get("serverSubTypes")
-        == [expected_subtype],
+        expected_subtypes is not None
+        and isinstance(observed_subtypes, list)
+        and len(observed_subtypes) == 1
+        and observed_subtypes[0] in expected_subtypes,
         checks,
     )
     _check(
@@ -296,13 +303,13 @@ def _definition_checks(
         checks,
     )
     locality_parts = str(mast["locality"]).split(";", 1)
-    expected_scope = LOCALITY_SCOPES.get(locality_parts[0])
+    expected_scopes = LOCALITY_SCOPES.get(locality_parts[0])
     expected_locality = locality_parts[1] if len(locality_parts) == 2 else None
     observed_locality = definition.get("localityConstraints", {})
     _check(
         "locality_scope",
-        expected_scope is not None
-        and observed_locality.get("locality") == expected_scope,
+        expected_scopes is not None
+        and observed_locality.get("locality") in expected_scopes,
         checks,
     )
     _check(
