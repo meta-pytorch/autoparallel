@@ -15,6 +15,9 @@ retains the `60517d28` AutoParallel/GraphTrainer integration.
   lineage and merged without source conflicts.
 - `3f0b0475`: LLaMA 3D behavior is ported from the preserved source snapshot;
   its unavailable original commit is not claimed as an ancestor.
+- `20004e05` (PR #4553): ported as `6df7bc5f` to save the matched
+  AutoParallel A2A-to-linear SAC boundaries without restoring the broader
+  collective policy removed by `383cae9f`.
 
 The 3D port includes only the approved legacy-DTensor AP configuration, CP
 input-ownership seam, DP-shard/CP/TP mesh, CP-aware SDPA, DTensor output, and

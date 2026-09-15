@@ -3,7 +3,7 @@ harness_version = "legacy-dtensor-v1"
 
 [sources.torchtitan]
 remote = "https://github.com/AlbedoWang/torchtitan.git"
-commit = "59f126f8309e9c69b558fb5853ea1bb88e97005a"
+commit = "6df7bc5f6b21d270f27b38c226b84cf0f7b957a9"
 dirty_policy = "forbid"
 
 [sources.autoparallel]
