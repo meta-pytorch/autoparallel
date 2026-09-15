@@ -988,13 +988,13 @@ def _run_tlparse(
             "error": "the supplied tlparse path is not executable",
             "traces": [str(path) for path in traces],
         }
+    output_root.mkdir(parents=True, exist_ok=True)
     outputs = []
     for index, trace in enumerate(traces):
         destination = output_root / f"trace_{index:03d}"
         command = [
             str(binary),
             "--no-browser",
-            "-p",
             "-o",
             str(destination),
             str(trace),
