@@ -9,7 +9,12 @@ from types import SimpleNamespace
 from unittest import mock
 
 from harness.campaign import CampaignError
-from harness.cli import _torchx_command, build_parser
+from harness.cli import (
+    _is_post_render_dryrun_shutdown_abort,
+    _run_torchx,
+    _torchx_command,
+    build_parser,
+)
 from harness.dryrun import _definition_checks
 from harness.run import (
     _attempt_path,
@@ -233,6 +238,109 @@ class RunTests(unittest.TestCase):
 
 
 class SubmissionLifecycleTests(unittest.TestCase):
+    @staticmethod
+    def _shutdown_abort(
+        *,
+        returncode: int = -6,
+        scheduler_json: str = (
+            '{"env":{"TORCHX_JOB_ID":"mast_conda://torchx/dryrun-generated"}}'
+        ),
+        tail: str | None = None,
+        stderr: str | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        if tail is None:
+            tail = (
+                "Current Session ID: b72e1947-6f83-4c69-878c-59cdfa1b2c24\n\n"
+                "To view Scuba log for your session:: "
+                "https://fburl.com/scuba/pytorch_elastic_tsm_log/hxk3emju\n"
+            )
+        if stderr is None:
+            stderr = "\n".join(
+                (
+                    "folly::SingletonVault::fireShutdownTimer()",
+                    "terminate called after throwing an instance of "
+                    "'std::runtime_error'",
+                    "Failed to complete shutdown within 300000ms. Shutdown log:",
+                )
+            )
+        stdout = (
+            "=== APPLICATION ===\n{}\n"
+            f"=== SCHEDULER REQUEST ===\n{scheduler_json}\n{tail}\n"
+        )
+        return subprocess.CompletedProcess(
+            ["torchx", "run", "--dryrun"], returncode, stdout, stderr
+        )
+
+    def test_only_exact_post_render_dryrun_shutdown_abort_is_recoverable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            attempt = Path(temporary)
+            completed = self._shutdown_abort()
+            command = ["torchx", "run", "--dryrun"]
+            self.assertTrue(
+                _is_post_render_dryrun_shutdown_abort(completed, command, attempt)
+            )
+
+            mutations = (
+                self._shutdown_abort(returncode=1),
+                self._shutdown_abort(scheduler_json="{"),
+                self._shutdown_abort(tail="unexpected"),
+                self._shutdown_abort(stderr="missing shutdown signature"),
+                subprocess.CompletedProcess(
+                    completed.args,
+                    completed.returncode,
+                    completed.stdout + "=== SCHEDULER REQUEST ===\n{}\n",
+                    completed.stderr,
+                ),
+            )
+            for mutation in mutations:
+                with self.subTest(mutation=mutation):
+                    self.assertFalse(
+                        _is_post_render_dryrun_shutdown_abort(
+                            mutation, command, attempt
+                        )
+                    )
+            self.assertFalse(
+                _is_post_render_dryrun_shutdown_abort(
+                    completed, ["torchx", "run"], attempt
+                )
+            )
+            (attempt / "job_id.txt").write_text("already-submitted\n")
+            self.assertFalse(
+                _is_post_render_dryrun_shutdown_abort(completed, command, attempt)
+            )
+
+    def test_recovered_dryrun_still_requires_full_audit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            attempt = Path(temporary)
+            completed = self._shutdown_abort()
+            with (
+                mock.patch(
+                    "harness.cli._verify_sealed_attempt",
+                    return_value={"validation": {"application_contract_validated": True}},
+                ),
+                mock.patch(
+                    "harness.cli._torchx_command",
+                    return_value=["torchx", "run", "--dryrun"],
+                ),
+                mock.patch("harness.cli.subprocess.run", return_value=completed),
+                mock.patch(
+                    "harness.cli.audit_dryrun",
+                    side_effect=CampaignError("exact package audit failed"),
+                ) as audit,
+            ):
+                with self.assertRaisesRegex(CampaignError, "exact package audit failed"):
+                    _run_torchx(attempt, dryrun=True)
+            audit.assert_called_once()
+
+    def test_submission_never_accepts_shutdown_abort(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            completed = self._shutdown_abort()
+            self.assertFalse(
+                _is_post_render_dryrun_shutdown_abort(
+                    completed, ["torchx", "run"], Path(temporary)
+                )
+            )
+
     def test_torchx_command_pins_workspace_fbpkg(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             attempt = Path(temporary)

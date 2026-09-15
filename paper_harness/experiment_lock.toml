@@ -1,5 +1,5 @@
 schema_version = 1
-harness_version = "legacy-dtensor-v2-approx-paper"
+harness_version = "legacy-dtensor-v3-approx-paper"
 
 [sources.torchtitan]
 remote = "https://github.com/AlbedoWang/torchtitan.git"

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import signal
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -10,13 +11,24 @@ from pathlib import Path
 
 from .analysis import analyze_campaign
 from .campaign import CampaignError, load_campaign
-from .dryrun import audit_dryrun
+from .dryrun import MARKER, audit_dryrun
 from .packaging import package_campaign
 from .run import run_reproduction
 from .sources import manifest_digest, tree_manifest
 from .validation import validate_campaign
 
 MAST_HANDLE_PATTERN = re.compile(r"mast_conda://[^/\s`]+/([^\s`]+)")
+APPLICATION_MARKER = "=== APPLICATION ===\n"
+DRYRUN_SHUTDOWN_ERRORS = (
+    "folly::SingletonVault::fireShutdownTimer()",
+    "terminate called after throwing an instance of 'std::runtime_error'",
+    "Failed to complete shutdown within 300000ms. Shutdown log:",
+)
+SESSION_BANNER = re.compile(
+    r"^Current Session ID: [0-9a-f-]+\n\n"
+    r"To view Scuba log for your session:: "
+    r"https://fburl\.com/scuba/pytorch_elastic_tsm_log/[0-9a-z]+$"
+)
 
 
 def _asset_roots(values: list[str]) -> dict[str, Path]:
@@ -92,6 +104,31 @@ def _submitted_job_id(output: str) -> str:
     return matches[0]
 
 
+def _is_post_render_dryrun_shutdown_abort(
+    completed: subprocess.CompletedProcess[str], command: list[str], attempt: Path
+) -> bool:
+    if completed.returncode != -signal.SIGABRT or "--dryrun" not in command:
+        return False
+    if (attempt / "job_id.txt").exists() or (attempt / "submission.json").exists():
+        return False
+    if (
+        completed.stdout.count(APPLICATION_MARKER) != 1
+        or completed.stdout.count(MARKER) != 1
+        or completed.stdout.index(APPLICATION_MARKER)
+        > completed.stdout.index(MARKER)
+        or not all(marker in completed.stderr for marker in DRYRUN_SHUTDOWN_ERRORS)
+    ):
+        return False
+    scheduler_output = completed.stdout.split(MARKER, 1)[1]
+    try:
+        definition, end = json.JSONDecoder().raw_decode(scheduler_output)
+    except json.JSONDecodeError:
+        return False
+    return isinstance(definition, dict) and bool(
+        SESSION_BANNER.fullmatch(scheduler_output[end:].strip())
+    )
+
+
 def _run_torchx(attempt: Path, *, dryrun: bool) -> dict:
     package_report = _verify_sealed_attempt(attempt)
     if not package_report["validation"].get("application_contract_validated"):
@@ -136,7 +173,10 @@ def _run_torchx(attempt: Path, *, dryrun: bool) -> dict:
     (attempt / f"{prefix}.stdout").write_text(completed.stdout)
     (attempt / f"{prefix}.stderr").write_text(completed.stderr)
     (attempt / f"{prefix}.returncode").write_text(f"{completed.returncode}\n")
-    if completed.returncode:
+    recovered_dryrun = dryrun and _is_post_render_dryrun_shutdown_abort(
+        completed, command, attempt
+    )
+    if completed.returncode and not recovered_dryrun:
         raise CampaignError(f"{' '.join(command)} exited {completed.returncode}")
     if dryrun:
         return audit_dryrun(
