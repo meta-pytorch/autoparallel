@@ -9,7 +9,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from harness.campaign import CampaignError
-from harness.cli import build_parser
+from harness.cli import _torchx_command, build_parser
 from harness.dryrun import _definition_checks
 from harness.run import (
     _attempt_path,
@@ -233,6 +233,36 @@ class RunTests(unittest.TestCase):
 
 
 class SubmissionLifecycleTests(unittest.TestCase):
+    def test_torchx_command_pins_workspace_fbpkg(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            attempt = Path(temporary)
+            validation = attempt / "validation"
+            validation.mkdir()
+            (validation / "resolved_campaign.json").write_text(
+                json.dumps(
+                    {
+                        "name": "campaign",
+                        "mast": {
+                            "conda_fbpkg": "runtime:1",
+                            "locality": "dc;pci1",
+                            "hardware": "grandteton_80g_roce",
+                            "nodes": 1,
+                            "nproc_per_node": 8,
+                        },
+                        "experiment_lock": {
+                            "execution": {
+                                "workspace_fbpkg_id": "torchtitan_workspace:abc"
+                            }
+                        },
+                    }
+                )
+            )
+            command = _torchx_command(attempt, dryrun=True)
+            scheduler = next(
+                token for token in command if token.startswith("--scheduler_args=")
+            )
+            self.assertIn("workspace_fbpkg_id=torchtitan_workspace:abc", scheduler)
+
     def test_existing_job_id_never_resubmits(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             attempt = Path(temporary)
@@ -257,7 +287,10 @@ class SubmissionLifecycleTests(unittest.TestCase):
                 "retries": 0,
                 "master_port": 29500,
             },
-            "experiment_lock": {"runtime": {"conda_fbpkg": "runtime:1"}},
+            "experiment_lock": {
+                "runtime": {"conda_fbpkg": "runtime:1"},
+                "execution": {"workspace_fbpkg_id": "torchtitan_workspace:abc"},
+            },
             "resolved_phases": [{"arms": ["baseline", "treatment"]}],
         }
         definition = {
@@ -299,6 +332,8 @@ class SubmissionLifecycleTests(unittest.TestCase):
                         "command": "$WORKSPACE_DIR/mount.sh && /packages/conda_mast_core/tee/torchx_tee.sh command",
                         "env": {
                             "HARNESS_PAYLOAD_ROOT": "/packages/torchtitan_additional_packages/payload",
+                            "WORKSPACE_DIR": "/packages/torchtitan_workspace",
+                            "WORKSPACE_FBPKG_ID": "torchtitan_workspace:abc",
                             "DUMP_DIR": "/mnt/wsfuse/outputs/${app_id}",
                             "TITAN_STRUCT_LOGGER_HANDLERS": (
                                 "torchtitan.observability.structured_logger."
@@ -325,7 +360,9 @@ class SubmissionLifecycleTests(unittest.TestCase):
         command = [
             "torchx",
             "run",
-            "--scheduler_args=conda_fbpkg_id=runtime:1,localityConstraints=dc;pci1,forceSingleRegion=False",
+            "--scheduler_args=conda_fbpkg_id=runtime:1,"
+            "workspace_fbpkg_id=torchtitan_workspace:abc,"
+            "localityConstraints=dc;pci1,forceSingleRegion=False",
         ]
         launcher = Path(__file__).resolve().parents[1] / "launcher"
         resolved["name"] = "test-campaign"

@@ -3,9 +3,10 @@ from __future__ import annotations
 import hashlib
 import importlib.metadata
 import platform
-import tomllib
 from pathlib import Path
 from typing import Any
+
+import tomllib
 
 from .campaign import CampaignError
 
@@ -40,6 +41,13 @@ def load_experiment_lock(path: Path = LOCK_PATH) -> dict[str, Any]:
     execution = lock.get("execution")
     if not isinstance(execution, dict) or execution.get("spmd_backend") != "default":
         raise CampaignError("experiment lock requires spmd_backend='default'")
+    workspace_fbpkg_id = execution.get("workspace_fbpkg_id")
+    if not isinstance(workspace_fbpkg_id, str) or not workspace_fbpkg_id.startswith(
+        "torchtitan_workspace:"
+    ):
+        raise CampaignError(
+            "experiment lock requires a pinned torchtitan_workspace fbpkg ID"
+        )
     return lock
 
 

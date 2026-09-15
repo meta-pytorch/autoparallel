@@ -26,3 +26,4 @@ spmd_types = "0.2.1"
 
 [execution]
 spmd_backend = "default"
+workspace_fbpkg_id = "torchtitan_workspace:d5482ad9fabe330cb6d2282cb8641fa6"

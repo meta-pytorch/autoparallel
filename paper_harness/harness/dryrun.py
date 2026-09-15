@@ -219,6 +219,12 @@ def _definition_checks(
         scheduler.get("conda_fbpkg_id") == str(mast["conda_fbpkg"]),
         checks,
     )
+    locked_workspace = resolved["experiment_lock"]["execution"]["workspace_fbpkg_id"]
+    _check(
+        "scheduler_workspace",
+        scheduler.get("workspace_fbpkg_id") == locked_workspace,
+        checks,
+    )
     _check(
         "genai_cluster",
         definition.get("hpcClusterUuid") == "MastGenAICluster",
@@ -339,7 +345,9 @@ def _definition_checks(
     _check("oilfs", "oil.oilfs:stable" in packages, checks)
     _check(
         "one_workspace_package",
-        sum(str(package).startswith(WORKSPACE_PACKAGE) for package in packages) == 1,
+        packages.count(locked_workspace) == 1
+        and sum(str(package).startswith(WORKSPACE_PACKAGE) for package in packages)
+        == 1,
         checks,
     )
     _check(
@@ -359,6 +367,17 @@ def _definition_checks(
         "payload_root",
         env.get("HARNESS_PAYLOAD_ROOT")
         == "/packages/torchtitan_additional_packages/payload",
+        checks,
+    )
+    workspace_name = locked_workspace.split(":", 1)[0]
+    _check(
+        "workspace_environment",
+        env.get("WORKSPACE_FBPKG_ID") == locked_workspace,
+        checks,
+    )
+    _check(
+        "workspace_directory",
+        env.get("WORKSPACE_DIR") == f"/packages/{workspace_name}",
         checks,
     )
     _check(

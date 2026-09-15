@@ -41,13 +41,18 @@ def _add_sources(parser: argparse.ArgumentParser) -> None:
 def _torchx_command(attempt: Path, *, dryrun: bool) -> list[str]:
     resolved = json.loads((attempt / "validation/resolved_campaign.json").read_text())
     mast = resolved["mast"]
+    workspace_fbpkg_id = resolved["experiment_lock"]["execution"]["workspace_fbpkg_id"]
     payload = attempt / "package/payload"
     command = ["torchx", "run"]
     if dryrun:
         command.append("--dryrun")
     command.extend(
         [
-            f"--scheduler_args=conda_fbpkg_id={mast['conda_fbpkg']},localityConstraints={mast['locality']},forceSingleRegion=False",
+            (
+                f"--scheduler_args=conda_fbpkg_id={mast['conda_fbpkg']},"
+                f"workspace_fbpkg_id={workspace_fbpkg_id},"
+                f"localityConstraints={mast['locality']},forceSingleRegion=False"
+            ),
             "mast.py:train",
             "--name",
             resolved["name"],
