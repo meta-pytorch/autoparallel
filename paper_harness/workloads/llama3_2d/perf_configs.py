@@ -147,7 +147,6 @@ def _write_inductor_path_audit() -> None:
     custom_post_pass = torch._inductor.config.post_grad_custom_post_pass
     configuration = os.environ["BENCHMARK_CONFIGURATION"]
     expected_patch_active = configuration in {
-        "graphtrainer_manual",
         "autoparallel_backend_example_scheduling",
         "autoparallel_graphtrainer",
         "autoparallel_graphtrainer_current",
