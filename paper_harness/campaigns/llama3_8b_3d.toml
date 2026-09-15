@@ -1,6 +1,6 @@
 schema_version = 1
-name = "llama3-8b-3d-unified"
-description = "Pinned LLaMA 3 8B DP2 x CP2 x TP2 GraphTrainer comparison"
+name = "llama3-8b-3d-long-approx"
+description = "LLaMA 3 8B 16K FSDP x CP x TP three-arm Approx scale-up"
 workload = "llama3_8b_3d"
 
 [model]
@@ -12,56 +12,79 @@ mode = "replay"
 identity = "manifest"
 dataset = "allenai/c4"
 revision = "1588ec454efa1a09f29cd18ddd04fe05fc8653a2"
-identity_manifest = "{asset:llama3_3d_replay}/manifest.json"
-identity_manifest_sha256 = "ca3dba04e7e95c2f0ed6a73f4f649836422a3e5efbf687817194f30ee698139c"
+identity_manifest = "{asset:llama3_3d_16k_dp2}/manifest.json"
+identity_manifest_sha256 = "5ea8bdf061731d970da4541d1b96ea115702abb783bf18a064cbf64d9aa4a7f4"
+runtime_input_hash_audit = true
 
 [training]
 local_batch_size = 2
 global_batch_size = 4
-seq_len = 8192
+seq_len = 16384
 
 [parallelism]
 data_parallel_replicate_degree = 1
 data_parallel_shard_degree = 2
-tensor_parallel_degree = 2
+tensor_parallel_degree = 4
 context_parallel_degree = 2
 pipeline_parallel_degree = 1
 
 [comparison]
-declared_variable = "graphtrainer_parallelization_compile_stack"
+declared_variable = "trainer_parallelization_compile_stack"
 allowed_config_paths = ["compile.*", "model_spec.name"]
 allowed_environment_keys = ["BENCHMARK_ARM"]
-pairs = [["gt_manual_cp", "apgt_cp"]]
+pairs = [
+  ["tt_main", "gt_manual_cp"],
+  ["tt_main", "apgt_cp"],
+  ["gt_manual_cp", "apgt_cp"],
+]
+
+[measurement.primary]
+source = "structured_logs"
+steps = [7, 8, 9, 12, 13, 14, 17, 18, 19, 22, 23, 24]
+rank_selector = "latest_fetching_batch_end"
+value = "step_end_minus_fetching_batch_end"
 
 [mast]
-nodes = 1
+nodes = 2
 nproc_per_node = 8
 hardware = "grandteton_80g_roce"
 locality = "dc;pci1"
 gpu_name_contains = "H100"
 retries = 0
 master_port = 29500
-phase_timeout_seconds = 7200
+phase_timeout_seconds = 14400
 
 [mast.environment]
-BENCHMARK_WORLD_SIZE = "8"
+BENCHMARK_WORLD_SIZE = "16"
 BENCHMARK_DP_DEGREE = "2"
 BENCHMARK_CP_DEGREE = "2"
-BENCHMARK_TP_DEGREE = "2"
+BENCHMARK_TP_DEGREE = "4"
 BENCHMARK_LOCAL_BATCH_SIZE = "2"
-BENCHMARK_SEQ_LEN = "8192"
-BENCHMARK_AP_PLACEMENTS_MODE = "load"
-BENCHMARK_AP_PLACEMENTS_PATH = "{asset:llama3_3d_placements}/autoparallel_placements.json"
-BENCHMARK_REPLAY_ROOT = "{asset:llama3_3d_replay}"
-BENCHMARK_REPLAY_MANIFEST_SHA256 = "ca3dba04e7e95c2f0ed6a73f4f649836422a3e5efbf687817194f30ee698139c"
+BENCHMARK_SEQ_LEN = "16384"
 BENCHMARK_SEED_CHECKPOINT = "{asset:llama3_3d_seed_checkpoint}"
-LLAMA_TOKENIZER_DIR = "{asset:llama3_3d_tokenizer}"
+LLAMA_TOKENIZER_DIR = "{asset:llama_tokenizer}"
+BENCHMARK_REPLAY_ROOT = "{asset:llama3_3d_16k_dp2}"
+BENCHMARK_REPLAY_MANIFEST_SHA256 = "5ea8bdf061731d970da4541d1b96ea115702abb783bf18a064cbf64d9aa4a7f4"
 PYTORCH_ALLOC_CONF = "expandable_segments:True"
 TORCHINDUCTOR_CUDAGRAPHS = "0"
 
 [artifacts]
-required_assets = ["llama3_3d_placements", "llama3_3d_replay", "llama3_3d_seed_checkpoint", "llama3_3d_tokenizer"]
+required_assets = [
+  "llama3_3d_16k_dp2",
+  "llama3_3d_16k_dp4",
+  "llama3_3d_16k_dp8",
+  "llama3_3d_seed_checkpoint",
+  "llama_tokenizer",
+]
 warmup_steps = 5
+
+[[arms]]
+name = "tt_main"
+profile = "tt_main_default_v1"
+module = "workloads.llama3_3d.config_registry"
+config = "torchtitan_main"
+[arms.environment]
+BENCHMARK_ARM = "tt_main"
 
 [[arms]]
 name = "gt_manual_cp"
@@ -76,17 +99,19 @@ name = "apgt_cp"
 profile = "apgt_validated_v1"
 module = "workloads.llama3_3d.config_registry"
 config = "graph_autoparallel"
+[arms.overrides]
+"compile.autoparallel_solver" = "approx"
 [arms.environment]
 BENCHMARK_ARM = "graph_autoparallel"
 
 [[phases]]
 name = "performance"
 kind = "performance"
-arms = ["gt_manual_cp", "apgt_cp"]
+arms = ["tt_main", "gt_manual_cp", "apgt_cp"]
 [phases.environment]
 BENCHMARK_PHASE = "steady"
 BENCHMARK_TOTAL_STEPS = "25"
-BENCHMARK_LOG_FREQ = "1"
+BENCHMARK_LOG_FREQ = "5"
 BENCHMARK_ENABLE_KINETO = "0"
 BENCHMARK_ENABLE_MEMORY_SNAPSHOT = "0"
 BENCHMARK_STRUCTURED_LOGGING = "1"
@@ -97,16 +122,55 @@ BENCHMARK_PROFILE_WARMUP = "0"
 [[phases]]
 name = "trace"
 kind = "trace"
-arms = ["gt_manual_cp", "apgt_cp"]
-trace_ranks = [2]
+arms = ["tt_main", "gt_manual_cp", "apgt_cp"]
+trace_ranks = [0]
 [phases.environment]
 BENCHMARK_PHASE = "profile"
-BENCHMARK_TOTAL_STEPS = "18"
+BENCHMARK_TOTAL_STEPS = "6"
 BENCHMARK_LOG_FREQ = "1"
 BENCHMARK_ENABLE_KINETO = "1"
 BENCHMARK_ENABLE_MEMORY_SNAPSHOT = "0"
 BENCHMARK_STRUCTURED_LOGGING = "1"
-BENCHMARK_PROFILE_RANK = "2"
-BENCHMARK_PROFILE_FREQ = "18"
+BENCHMARK_PROFILE_RANK = "0"
+BENCHMARK_PROFILE_FREQ = "6"
 BENCHMARK_PROFILE_ACTIVE = "3"
 BENCHMARK_PROFILE_WARMUP = "0"
+
+[[matrix.points]]
+name = "2x2x4"
+[matrix.points.settings]
+"mast.nodes" = 2
+"parallelism.data_parallel_shard_degree" = 2
+"training.global_batch_size" = 4
+"mast.environment.BENCHMARK_WORLD_SIZE" = "16"
+"mast.environment.BENCHMARK_DP_DEGREE" = "2"
+"data.identity_manifest" = "{asset:llama3_3d_16k_dp2}/manifest.json"
+"data.identity_manifest_sha256" = "5ea8bdf061731d970da4541d1b96ea115702abb783bf18a064cbf64d9aa4a7f4"
+"mast.environment.BENCHMARK_REPLAY_ROOT" = "{asset:llama3_3d_16k_dp2}"
+"mast.environment.BENCHMARK_REPLAY_MANIFEST_SHA256" = "5ea8bdf061731d970da4541d1b96ea115702abb783bf18a064cbf64d9aa4a7f4"
+
+[[matrix.points]]
+name = "4x2x4"
+[matrix.points.settings]
+"mast.nodes" = 4
+"parallelism.data_parallel_shard_degree" = 4
+"training.global_batch_size" = 8
+"mast.environment.BENCHMARK_WORLD_SIZE" = "32"
+"mast.environment.BENCHMARK_DP_DEGREE" = "4"
+"data.identity_manifest" = "{asset:llama3_3d_16k_dp4}/manifest.json"
+"data.identity_manifest_sha256" = "b68a759275a162b0eaff11f3787166b01c83256bd4f5b78939b75c00f76b9e4e"
+"mast.environment.BENCHMARK_REPLAY_ROOT" = "{asset:llama3_3d_16k_dp4}"
+"mast.environment.BENCHMARK_REPLAY_MANIFEST_SHA256" = "b68a759275a162b0eaff11f3787166b01c83256bd4f5b78939b75c00f76b9e4e"
+
+[[matrix.points]]
+name = "8x2x4"
+[matrix.points.settings]
+"mast.nodes" = 8
+"parallelism.data_parallel_shard_degree" = 8
+"training.global_batch_size" = 16
+"mast.environment.BENCHMARK_WORLD_SIZE" = "64"
+"mast.environment.BENCHMARK_DP_DEGREE" = "8"
+"data.identity_manifest" = "{asset:llama3_3d_16k_dp8}/manifest.json"
+"data.identity_manifest_sha256" = "9a46acb8b75c7f3eaebdf8549231967a8b16f4efce95de3061cd3e844f49c219"
+"mast.environment.BENCHMARK_REPLAY_ROOT" = "{asset:llama3_3d_16k_dp8}"
+"mast.environment.BENCHMARK_REPLAY_MANIFEST_SHA256" = "9a46acb8b75c7f3eaebdf8549231967a8b16f4efce95de3061cd3e844f49c219"

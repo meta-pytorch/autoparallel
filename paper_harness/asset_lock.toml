@@ -63,3 +63,18 @@ relative_path = "llama3_3d_placements"
 file_count = 1
 tree_sha256 = "c3c16d1c9dc57189881167c0156eb13b9d16e728ca959c66853aeb1d8cb5dca7"
 file_sha256 = "00fdf26d79503df423837176907f2ac3aa3646589fdde20f3fa9cf2fca769ace"
+
+[assets.llama3_3d_16k_dp2]
+relative_path = "llama3_3d_16k_current_dp2"
+file_count = 3
+tree_sha256 = "023ae1a3084bed5dfa17da57664112d59e33bf855e43423456de1d64316cc6b4"
+
+[assets.llama3_3d_16k_dp4]
+relative_path = "llama3_3d_16k_current_dp4"
+file_count = 5
+tree_sha256 = "cb818a98602bb7ab4b83d855a96294d12780c2d248d82e099abf2cc909211c82"
+
+[assets.llama3_3d_16k_dp8]
+relative_path = "llama3_3d_16k_current_dp8"
+file_count = 9
+tree_sha256 = "e8fe82c642d32ce8720134ec525fa9a55401b925e8f7111819913d643972ba10"

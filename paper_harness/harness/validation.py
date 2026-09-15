@@ -9,7 +9,12 @@ from pathlib import Path
 from typing import Any
 
 from .assets import asset_lock_digest, load_asset_lock
-from .campaign import Campaign, CampaignError, write_json
+from .campaign import (
+    PLANNER_RESULT_CLASSIFICATION,
+    Campaign,
+    CampaignError,
+    write_json,
+)
 from .experiment_lock import experiment_lock_digest, load_experiment_lock
 from .integrity import validate_harness_integrity
 from .parity import validate_pair
@@ -85,6 +90,51 @@ def _probe_config(
     return json.loads(output.read_text())
 
 
+def _validate_planner_cli(
+    campaign: Campaign,
+    *,
+    autoparallel_root: Path,
+    output_dir: Path,
+    python: Path,
+) -> dict[str, Any]:
+    script = autoparallel_root.resolve() / "tests/search_profile.py"
+    if not script.is_file():
+        raise CampaignError(f"locked AutoParallel tree has no planner CLI: {script}")
+    command = [str(python), str(script), "--help"]
+    completed = subprocess.run(
+        command,
+        cwd=autoparallel_root,
+        env={
+            **os.environ,
+            "PYTHONPATH": _pythonpath(autoparallel_root),
+            "PYTHONDONTWRITEBYTECODE": "1",
+        },
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    report = {
+        "status": "passed",
+        "classification": PLANNER_RESULT_CLASSIFICATION,
+        "command": command,
+        "returncode": completed.returncode,
+        "stdout": completed.stdout,
+        "stderr": completed.stderr,
+        "profile_script": str(script),
+        "run_count": len(campaign.planner_runs()),
+    }
+    if completed.returncode or "--source-lock" not in completed.stdout:
+        report["status"] = "failed"
+        write_json(output_dir / "planner_contract.json", report)
+        raise CampaignError(
+            "planner CLI validation requires a successful --help response with "
+            "the --source-lock option"
+        )
+    write_json(output_dir / "planner_contract.json", report)
+    return report
+
+
 def validate_campaign(
     campaign: Campaign,
     *,
@@ -128,36 +178,39 @@ def validate_campaign(
     write_json(output_dir / "asset_lock.json", asset_lock)
     experiment_lock = load_experiment_lock()
     experiment_lock_sha256 = experiment_lock_digest()
-    data = campaign.raw.get("data", {})
-    identity_template = data.get("identity_manifest")
-    identity_sha256 = data.get("identity_manifest_sha256")
-    if not identity_template or not identity_sha256:
-        raise CampaignError(
-            "data identity_manifest and identity_manifest_sha256 are required"
+    if not campaign.is_planner:
+        data = campaign.raw.get("data", {})
+        identity_template = data.get("identity_manifest")
+        identity_sha256 = data.get("identity_manifest_sha256")
+        if not identity_template or not identity_sha256:
+            raise CampaignError(
+                "data identity_manifest and identity_manifest_sha256 are required"
+            )
+        identity_text = str(identity_template).replace(
+            "{harness}", str(Path(__file__).resolve().parents[1])
         )
-    identity_text = str(identity_template).replace(
-        "{harness}", str(Path(__file__).resolve().parents[1])
-    )
-    while "{asset:" in identity_text:
-        start = identity_text.index("{asset:")
-        end = identity_text.index("}", start)
-        name = identity_text[start + len("{asset:") : end]
-        if name not in asset_roots:
-            raise CampaignError(f"missing --asset-root for {name!r}")
-        identity_text = (
-            identity_text[:start]
-            + str(asset_roots[name].resolve())
-            + identity_text[end + 1 :]
-        )
-    identity_path = Path(identity_text)
-    if not identity_path.is_file():
-        raise CampaignError(f"input identity manifest does not exist: {identity_path}")
-    observed_identity_hash = hashlib.sha256(identity_path.read_bytes()).hexdigest()
-    if observed_identity_hash != identity_sha256:
-        raise CampaignError(
-            f"input identity manifest hash mismatch: {observed_identity_hash} != "
-            f"{identity_sha256}"
-        )
+        while "{asset:" in identity_text:
+            start = identity_text.index("{asset:")
+            end = identity_text.index("}", start)
+            name = identity_text[start + len("{asset:") : end]
+            if name not in asset_roots:
+                raise CampaignError(f"missing --asset-root for {name!r}")
+            identity_text = (
+                identity_text[:start]
+                + str(asset_roots[name].resolve())
+                + identity_text[end + 1 :]
+            )
+        identity_path = Path(identity_text)
+        if not identity_path.is_file():
+            raise CampaignError(
+                f"input identity manifest does not exist: {identity_path}"
+            )
+        observed_identity_hash = hashlib.sha256(identity_path.read_bytes()).hexdigest()
+        if observed_identity_hash != identity_sha256:
+            raise CampaignError(
+                f"input identity manifest hash mismatch: {observed_identity_hash} != "
+                f"{identity_sha256}"
+            )
     source_evidence = output_dir / "source_evidence"
     specs = campaign.source_specs()
     source_lock = {
@@ -192,8 +245,16 @@ def validate_campaign(
     serialized_environments: dict[str, dict[str, str]] = {}
     profile_checks = []
     parity_checks = []
-    if probe_configs:
-        python = python or Path(sys.executable)
+    python = python or Path(sys.executable)
+    planner_contract = None
+    if campaign.is_planner:
+        planner_contract = _validate_planner_cli(
+            campaign,
+            autoparallel_root=autoparallel_root,
+            output_dir=output_dir,
+            python=python,
+        )
+    elif probe_configs:
         serialized_root = output_dir / "serialized_configs"
         for phase in campaign.phases:
             phase_configs = {}
@@ -334,8 +395,12 @@ def validate_campaign(
     report = {
         "status": "passed",
         "campaign": campaign.name,
-        "probe_configs": probe_configs,
-        "python": str((python or Path(sys.executable)).resolve()),
+        "campaign_type": campaign.campaign_type,
+        "application_contract_validated": bool(
+            planner_contract or (probe_configs and serialized)
+        ),
+        "probe_configs": bool(probe_configs and not campaign.is_planner),
+        "python": str(python.resolve()),
         "source_lock": source_lock,
         "asset_lock": asset_lock,
         "harness_integrity": harness_integrity,
@@ -347,6 +412,7 @@ def validate_campaign(
         "profile_contracts": contract,
         "profile_checks": profile_checks,
         "parity_checks": parity_checks,
+        "planner_contract": planner_contract,
     }
     write_json(output_dir / "validation_report.json", report)
     return report

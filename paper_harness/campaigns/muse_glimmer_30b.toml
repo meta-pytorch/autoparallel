@@ -1,6 +1,6 @@
 schema_version = 1
-name = "muse-glimmer-30b-unified"
-description = "Pinned Muse Glimmer 30B GraphTrainer and AutoParallel scaling"
+name = "muse-glimmer-30b-approx"
+description = "Pinned Muse Glimmer 30B three-arm Approx scaling"
 workload = "muse_glimmer_30b_sdpa"
 
 [model]
@@ -17,33 +17,46 @@ preflight_auditor = "workloads.muse_glimmer.input_preflight"
 
 [training]
 local_batch_size = 2
-global_batch_size = -1
+global_batch_size = 8
 seq_len = 4096
 
 [comm]
 init_timeout_seconds = 1800
 
+[metrics]
+save_for_all_ranks = true
+
 [parallelism]
 data_parallel_replicate_degree = 1
-data_parallel_shard_degree = 8
+data_parallel_shard_degree = 4
 tensor_parallel_degree = 2
 context_parallel_degree = 1
 pipeline_parallel_degree = 1
 
 [comparison]
-declared_variable = "graphtrainer_parallelization_compile_stack"
+declared_variable = "trainer_parallelization_compile_stack"
 allowed_config_paths = ["compile.*", "model_spec.name"]
-pairs = [["gt_manual", "apgt"]]
+pairs = [
+  ["tt_main", "gt_manual"],
+  ["tt_main", "apgt"],
+  ["gt_manual", "apgt"],
+]
+
+[measurement.primary]
+source = "structured_logs"
+steps = [7, 8, 9, 12, 13, 14, 17, 18, 19, 22, 23, 24]
+rank_selector = "latest_fetching_batch_end"
+value = "step_end_minus_fetching_batch_end"
 
 [mast]
-nodes = 2
+nodes = 1
 nproc_per_node = 8
 hardware = "grandteton_80g_roce"
 locality = "dc;pci1"
 gpu_name_contains = "H100"
 retries = 0
 master_port = 29500
-phase_timeout_seconds = 7200
+phase_timeout_seconds = 10800
 
 [mast.environment]
 HF_HUB_CACHE = "{asset:c4_hf_cache}"
@@ -56,6 +69,17 @@ TORCHINDUCTOR_CUDAGRAPHS = "0"
 [artifacts]
 required_assets = ["muse_glimmer", "muse_input_manifests", "c4_hf_cache"]
 warmup_steps = 5
+
+[[arms]]
+name = "tt_main"
+profile = "tt_main_default_v1"
+module = "workloads.muse_glimmer.perf_configs"
+config = "muse_glimmer_30b_sdpa_c4_torchtitan_4x2"
+args = ["--hf-assets-path", "{asset:muse_glimmer}"]
+[arms.overrides]
+"compile.enable" = true
+"compile.backend" = "inductor"
+"compile.components" = ["model", "loss"]
 
 [[arms]]
 name = "gt_manual"
@@ -74,11 +98,12 @@ config = "graph_trainer_muse_glimmer_30b_sdpa_c4_autoparallel_4x2"
 args = ["--hf-assets-path", "{asset:muse_glimmer}"]
 [arms.overrides]
 "compile.enable_autoparallel" = true
+"compile.autoparallel_solver" = "approx"
 
 [[phases]]
 name = "performance"
 kind = "performance"
-arms = ["gt_manual", "apgt"]
+arms = ["tt_main", "gt_manual", "apgt"]
 [phases.overrides]
 "training.steps" = 25
 "profiler.enable_profiling" = false
@@ -88,7 +113,7 @@ arms = ["gt_manual", "apgt"]
 [[phases]]
 name = "trace"
 kind = "trace"
-arms = ["gt_manual", "apgt"]
+arms = ["tt_main", "gt_manual", "apgt"]
 trace_ranks = [0]
 [phases.overrides]
 "training.steps" = 6
@@ -101,10 +126,20 @@ trace_ranks = [0]
 "metrics.log_freq" = 1
 
 [[matrix.points]]
+name = "8gpu"
+[matrix.points.settings]
+"mast.nodes" = 1
+"parallelism.data_parallel_shard_degree" = 4
+"training.global_batch_size" = 8
+"data.identity_manifest" = "{asset:muse_input_manifests}/c4_input_manifest_lb2_s4096_dp4.jsonl"
+"data.identity_manifest_sha256" = "6b529f2d7164f456a792ccf6d61488eba893ad6805df5c4e6731fef240d02cb1"
+
+[[matrix.points]]
 name = "16gpu"
 [matrix.points.settings]
 "mast.nodes" = 2
 "parallelism.data_parallel_shard_degree" = 8
+"training.global_batch_size" = 16
 "data.identity_manifest" = "{asset:muse_input_manifests}/c4_input_manifest_lb2_s4096_dp8.jsonl"
 "data.identity_manifest_sha256" = "4fda638c406cb949694e6007b404f026b1c37a33b94511aefdf2e78b14520f71"
 
@@ -113,6 +148,7 @@ name = "32gpu"
 [matrix.points.settings]
 "mast.nodes" = 4
 "parallelism.data_parallel_shard_degree" = 16
+"training.global_batch_size" = 32
 "data.identity_manifest" = "{asset:muse_input_manifests}/c4_input_manifest_lb2_s4096_dp16.jsonl"
 "data.identity_manifest_sha256" = "11a5a5e9ac2f706ae9428a6ffb3e4fcc1a56e9ce270f092d9704b56aff9cf934"
 
@@ -121,13 +157,6 @@ name = "64gpu"
 [matrix.points.settings]
 "mast.nodes" = 8
 "parallelism.data_parallel_shard_degree" = 32
+"training.global_batch_size" = 64
 "data.identity_manifest" = "{asset:muse_input_manifests}/c4_input_manifest_lb2_s4096_dp32.jsonl"
 "data.identity_manifest_sha256" = "4f339171083a62a51ebd4b6a53e2f28d8abeeeb629907047b580628e175158b1"
-
-[[matrix.points]]
-name = "128gpu"
-[matrix.points.settings]
-"mast.nodes" = 16
-"parallelism.data_parallel_shard_degree" = 64
-"data.identity_manifest" = "{asset:muse_input_manifests}/c4_input_manifest_lb2_s4096_dp64.jsonl"
-"data.identity_manifest_sha256" = "211f6f9e8a0430d729a8dfcac945461b3759bfb10fe7f52a32a291d9eb0e82c4"

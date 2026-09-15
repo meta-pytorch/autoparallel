@@ -65,16 +65,36 @@ if MODEL_FLAVOR != "16B":
 
 WORLD_SIZE = int(os.environ["BENCHMARK_WORLD_SIZE"])
 EP_DEGREE = int(os.environ["BENCHMARK_EP_DEGREE"])
-if EP_DEGREE != 8 or WORLD_SIZE not in (16, 32):
+TP_DEGREE = int(os.environ["BENCHMARK_TP_DEGREE"])
+if WORLD_SIZE % TP_DEGREE:
+    raise ValueError(f"World size {WORLD_SIZE} is not divisible by TP {TP_DEGREE}")
+DP_DEGREE = WORLD_SIZE // TP_DEGREE
+if EP_DEGREE % TP_DEGREE:
+    raise ValueError(f"EP {EP_DEGREE} is not divisible by TP {TP_DEGREE}")
+DP_SHARD_IN_EP = EP_DEGREE // TP_DEGREE
+if DP_DEGREE % DP_SHARD_IN_EP:
     raise ValueError(
-        f"Expected world size 16/32 with EP8, got {WORLD_SIZE=}, {EP_DEGREE=}"
+        f"DP {DP_DEGREE} is not divisible by DP-in-EP {DP_SHARD_IN_EP}"
     )
-DP_DEGREE = WORLD_SIZE
-EFSDP_DEGREE = WORLD_SIZE // EP_DEGREE
+DP_SHARD_MOD_EP = DP_DEGREE // DP_SHARD_IN_EP
+ATOMIC_MESH = (DP_SHARD_MOD_EP, DP_SHARD_IN_EP, TP_DEGREE)
+if ATOMIC_MESH not in {(2, 2, 4), (2, 2, 8), (4, 2, 8)}:
+    raise ValueError(f"Unsupported DeepSeek atomic mesh: {ATOMIC_MESH}")
 
 LOCAL_BATCH_SIZE = 4
 SEQ_LEN = 4096
 GLOBAL_BATCH_SIZE = LOCAL_BATCH_SIZE * DP_DEGREE
+
+
+def _batch_digest(input_dict: dict[str, torch.Tensor], labels: torch.Tensor) -> str:
+    digest = hashlib.sha256()
+    for name, tensor in [*sorted(input_dict.items()), ("labels", labels)]:
+        value = tensor.detach().cpu().contiguous()
+        digest.update(name.encode())
+        digest.update(str(value.dtype).encode())
+        digest.update(json.dumps(list(value.shape)).encode())
+        digest.update(value.view(torch.uint8).numpy().tobytes())
+    return digest.hexdigest()
 
 
 def _write_inductor_path_audit() -> None:
@@ -307,6 +327,7 @@ class AuditedC4DataLoader(ParallelAwareDataloader):
         **kwargs,
     ) -> None:
         del kwargs
+        self._audit_dp_rank = dp_rank
         dataset = PinnedC4Dataset(
             dataset_name=config.dataset,
             dataset_path=config.dataset_path,
@@ -336,6 +357,24 @@ class AuditedC4DataLoader(ParallelAwareDataloader):
             raise ValueError("FIXED_REPLAY_BATCHES must be positive")
         source = super().__iter__()
         replay_batches = [next(source) for _ in range(replay_size)]
+        audit_root = Path(os.environ["INPUT_AUDIT_DIR"])
+        audit_root.mkdir(parents=True, exist_ok=True)
+        (audit_root / f"rank_{int(os.environ['RANK']):05d}.json").write_text(
+            json.dumps(
+                {
+                    "rank": int(os.environ["RANK"]),
+                    "dp_rank": self._audit_dp_rank,
+                    "batch_count": len(replay_batches),
+                    "batch_sha256": [
+                        _batch_digest(input_dict, labels)
+                        for input_dict, labels in replay_batches
+                    ],
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n"
+        )
         batch_index = 0
         while True:
             input_dict, labels = replay_batches[batch_index % replay_size]
@@ -376,8 +415,8 @@ def _base_config():
         config.parallelism,
         data_parallel_replicate_degree=1,
         data_parallel_shard_degree=DP_DEGREE,
-        tensor_parallel_degree=1,
-        enable_sequence_parallel=False,
+        tensor_parallel_degree=TP_DEGREE,
+        enable_sequence_parallel=TP_DEGREE > 1,
         context_parallel_degree=1,
         pipeline_parallel_degree=1,
         expert_parallel_degree=EP_DEGREE,
@@ -422,7 +461,7 @@ def _base_config():
     return config
 
 
-def autoparallel_graphtrainer_16b():
+def _graphtrainer_16b(*, enable_autoparallel: bool):
     config = to_graph_trainer_config(_base_config(), graph_model_registry)
     config.model_spec = replace(
         config.model_spec,
@@ -432,11 +471,26 @@ def autoparallel_graphtrainer_16b():
     config.compile = GraphTrainerCompileConfig(
         enable=True,
         components=["model", "loss"],
+        backend="aot_eager",
+        mode="aot_fx_trace",
+        memory_policy="eager",
         inductor_compilation="full",
+        numerics_changing_optim=False,
         disable_passes=["cudagraph_pass"],
-        enable_autoparallel=True,
+        enable_fsdp_ag_rs_overlap=False,
+        enable_fsdp_dense_region_overlap=False,
+        enable_autoparallel=enable_autoparallel,
+        autoparallel_solver="approx",
     )
     return config
+
+
+def graphtrainer_manual_16b():
+    return _graphtrainer_16b(enable_autoparallel=False)
+
+
+def autoparallel_graphtrainer_16b():
+    return _graphtrainer_16b(enable_autoparallel=True)
 
 
 def torchtitan_baseline_16b():
@@ -460,5 +514,6 @@ def torchtitan_baseline_16b():
 
 EXPERIMENT_CONFIGS = (
     "torchtitan_baseline_16b",
+    "graphtrainer_manual_16b",
     "autoparallel_graphtrainer_16b",
 )

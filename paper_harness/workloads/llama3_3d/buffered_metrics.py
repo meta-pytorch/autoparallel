@@ -63,9 +63,6 @@ class BufferedMetricLogger(BaseLogger):
                 "replay_manifest_sha256": required_env(
                     "BENCHMARK_REPLAY_MANIFEST_SHA256"
                 ),
-                "allocation_fingerprint": required_env(
-                    "BENCHMARK_ALLOCATION_FINGERPRINT"
-                ),
                 "config_sha256": canonical_json_hash(self._config_dict),
                 "records": self._records,
                 "torch_dynamo_counters": counters,

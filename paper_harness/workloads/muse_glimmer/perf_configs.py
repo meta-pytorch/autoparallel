@@ -19,6 +19,7 @@ def _with_post_load_audit(config):
         config.model_spec,
         post_optimizer_build_fn=register_post_load_parameter_audit,
     )
+    config.profiler = replace(config.profiler, trace_post_processor=None)
     return config
 
 

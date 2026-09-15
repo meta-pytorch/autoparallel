@@ -1,0 +1,40 @@
+schema_version = 1
+campaign_type = "planner"
+name = "llama3-8b-planning-scalability-approx"
+description = "Planner-only LLaMA 3 8B Approx-versus-LP scalability study; not GPU training performance"
+workload = "planner_profile"
+
+[planner]
+model = "llama8b"
+repeats = 3
+solver = "approx"
+lazy_costs = true
+seeded = true
+reference_solver = "lp"
+
+[[planner.points]]
+name = "1d"
+mesh = [8]
+
+[[planner.points]]
+name = "2d"
+mesh = [4, 8]
+
+[[planner.points]]
+name = "3d"
+mesh = [4, 2, 4]
+
+[[planner.points]]
+name = "4d"
+mesh = [2, 2, 2, 4]
+
+[mast]
+nodes = 1
+nproc_per_node = 8
+hardware = "grandteton_80g_roce"
+locality = "dc;pci1"
+retries = 0
+phase_timeout_seconds = 21600
+
+[mast.environment]
+TORCHINDUCTOR_CUDAGRAPHS = "0"

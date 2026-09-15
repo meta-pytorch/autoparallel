@@ -18,6 +18,9 @@ retains the `60517d28` AutoParallel/GraphTrainer integration.
 - `20004e05` (PR #4553): ported as `6df7bc5f` to save the matched
   AutoParallel A2A-to-linear SAC boundaries without restoring the broader
   collective policy removed by `383cae9f`.
+- `26c329bd1`: experiment-only child of `6df7bc5f` that restores the previously
+  validated folded-EP/TP DeepSeek adapter and makes DeepSeek and Muse consume
+  the serialized AutoParallel solver selection.
 
 The 3D port includes only the approved legacy-DTensor AP configuration, CP
 input-ownership seam, DP-shard/CP/TP mesh, CP-aware SDPA, DTensor output, and
@@ -26,8 +29,10 @@ intentionally excluded.
 
 ## AutoParallel
 
-The maintained harness remains on `kaijian/paper-submission`. Runtime source
-is pinned to the commit immediately before the lock/harness-only updates.
+The maintained harness is based on `kaijian/paper-submission`. Runtime source
+is pinned to experiment branch commit `f167147d`, a child of the previous
+runtime pin that only adds sealed-package provenance input to the existing
+planner profiler.
 
 - `b8ace2a5` is represented by replay `3408588`.
 - `570bf072` is represented by the equivalent cuDNN broadcast-mask fix at

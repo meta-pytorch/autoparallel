@@ -10,6 +10,7 @@ from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.optimizer import default_adamw
 from torchtitan.components.validate import Validator
+from torchtitan.config import CompileConfig
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.experiments.graph_trainer.common_utils import (
     build_decoder_config_for_backend,
@@ -26,6 +27,7 @@ from torchtitan.models.common.config_utils import decoder_vocab_size
 from torchtitan.models.llama3 import llama3_configs
 from torchtitan.models.llama3 import model_registry as native_llama3_model_registry
 from torchtitan.models.llama3.config_registry import llama3_8b
+from workloads.parameter_state import register_post_load_parameter_audit
 
 from .buffered_metrics import BufferedMetricsProcessor
 from .io_utils import bool_env, int_env, required_env
@@ -41,7 +43,11 @@ def _native_sdpa_model_spec():
     torch.backends.cuda.enable_mem_efficient_sdp(False)
     native = native_llama3_model_registry("8B")
     sdpa_model = build_decoder_config_for_backend(llama3_configs["8B"], "sdpa")
-    return replace(native, model=sdpa_model)
+    return replace(
+        native,
+        model=sdpa_model,
+        post_optimizer_build_fn=register_post_load_parameter_audit,
+    )
 
 
 def _base_config():
@@ -164,6 +170,10 @@ def _base_config():
 
 def _graph_config(*, enable_autoparallel: bool):
     config = to_graph_trainer_config(_base_config(), graph_llama3_model_registry)
+    config.model_spec = replace(
+        config.model_spec,
+        post_optimizer_build_fn=register_post_load_parameter_audit,
+    )
     config.profiler = replace(config.profiler, trace_post_processor=None)
     placement_mode = os.environ.get("BENCHMARK_AP_PLACEMENTS_MODE", "")
     placement_path = os.environ.get("BENCHMARK_AP_PLACEMENTS_PATH", "")
@@ -190,6 +200,16 @@ def _graph_config(*, enable_autoparallel: bool):
         autoparallel_placements_load_path=(
             placement_path if enable_autoparallel and placement_mode == "load" else ""
         ),
+    )
+    return config
+
+
+def torchtitan_main():
+    config = _base_config()
+    config.compile = CompileConfig(
+        enable=True,
+        components=["model", "loss"],
+        backend="inductor",
     )
     return config
 

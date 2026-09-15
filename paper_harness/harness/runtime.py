@@ -12,7 +12,7 @@ import time
 import traceback
 from pathlib import Path
 
-from .campaign import load_campaign, write_json
+from .campaign import PLANNER_RESULT_CLASSIFICATION, load_campaign, write_json
 from .parity import IGNORED_PATHS, validate_pair
 from .profiles import validate_profile
 from .validation import _probe_config
@@ -185,6 +185,43 @@ def _audit_runtime_configs(
         mode=resolved.get("execution_mode", "formal"),
     )
     output_root = run_root / "runtime/configs"
+    if campaign.is_planner:
+        profile_script = payload / "autoparallel/tests/search_profile.py"
+        command = [sys.executable, str(profile_script), "--help"]
+        completed = subprocess.run(
+            command,
+            cwd=payload / "autoparallel",
+            env=base_env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        expected_runs = campaign.planner_runs()
+        checks = {
+            "profile_script_exists": profile_script.is_file(),
+            "profile_cli_help": completed.returncode == 0,
+            "profile_cli_source_lock": "--source-lock" in completed.stdout,
+            "resolved_runs_match": resolved.get("resolved_planner_runs")
+            == expected_runs,
+            "planner_only_classification": resolved.get("result_classification")
+            == PLANNER_RESULT_CLASSIFICATION,
+        }
+        report = {
+            "status": "passed" if all(checks.values()) else "failed",
+            "campaign_type": "planner",
+            "classification": PLANNER_RESULT_CLASSIFICATION,
+            "checks": checks,
+            "command": command,
+            "stdout": completed.stdout,
+            "stderr": completed.stderr,
+            "runs": expected_runs,
+        }
+        write_json(output_root / "report.json", report)
+        if report["status"] != "passed":
+            raise RuntimeError("packaged planner CLI contract validation failed")
+        return
+
     checks = []
     configs_by_run = {}
     for phase in campaign.phases:
@@ -284,6 +321,93 @@ def _audit_runtime_configs(
     write_json(output_root / "report.json", {"status": "passed", "checks": checks})
 
 
+def _planner_command(
+    payload: Path,
+    resolved: dict,
+    run: dict,
+    output: Path,
+) -> list[str]:
+    source_lock_path = payload / "campaign/source_lock.json"
+    source_lock = json.loads(source_lock_path.read_text())
+    command = [
+        "timeout",
+        "--signal=TERM",
+        "--kill-after=60s",
+        f"{int(resolved['mast'].get('phase_timeout_seconds', 21600))}s",
+        sys.executable,
+        str(payload / "autoparallel/tests/search_profile.py"),
+        "--model",
+        str(resolved["planner"]["model"]),
+        "--mesh",
+        ",".join(str(value) for value in run["mesh"]),
+        "--solver",
+        str(run["solver"]),
+        "--revision-label",
+        str(source_lock["autoparallel"]["head"]),
+        "--source-lock",
+        str(source_lock_path),
+        "--detailed-solution",
+        "--output",
+        str(output),
+    ]
+    if run["lazy_costs"] is not None:
+        command.extend(("--lazy-costs", str(run["lazy_costs"]).lower()))
+    if run["seeded"]:
+        command.append("--seeded")
+    return command
+
+
+def _run_planner_campaign(
+    payload: Path,
+    resolved: dict,
+    run_root: Path,
+    base_env: dict[str, str],
+) -> int:
+    if int(os.environ["RANK"]) != 0:
+        raise RuntimeError("only rank zero may execute planner subprocesses")
+    planner_root = run_root / "planner"
+    write_json(
+        planner_root / "metadata.json",
+        {
+            "campaign_type": "planner",
+            "classification": PLANNER_RESULT_CLASSIFICATION,
+            "training_performance_evidence": False,
+            "runs": resolved["resolved_planner_runs"],
+        },
+    )
+    for run in resolved["resolved_planner_runs"]:
+        output_root = (
+            planner_root
+            / run["point"]
+            / f"repeat_{int(run['repeat']):02d}"
+            / run["solver"]
+        )
+        result_path = output_root / "result.json"
+        command = _planner_command(payload, resolved, run, result_path)
+        _atomic_text(output_root / "started", "started\n")
+        write_json(output_root / "command.json", command)
+        status = _tee_run(
+            command,
+            cwd=payload / "autoparallel",
+            env=base_env,
+            log=output_root / "stdout_stderr.log",
+        )
+        _atomic_text(output_root / "exit_code", f"{status}\n")
+        try:
+            result = (
+                json.loads(result_path.read_text()) if result_path.is_file() else {}
+            )
+        except Exception as error:
+            result = {"status": "invalid", "error": str(error)}
+        if status or result.get("status") != "success":
+            _atomic_text(output_root / "failed", f"{status}\n")
+            _atomic_text(planner_root / "failed", f"{run['point']} {run['solver']}\n")
+            return status or 1
+        _atomic_text(output_root / "completed", "completed\n")
+    _atomic_text(planner_root / "completed", "completed\n")
+    return 0
+
+
 def main() -> None:
     payload = Path(os.environ["HARNESS_PAYLOAD_ROOT"]).resolve()
     resolved_path = payload / "campaign/resolved_campaign.json"
@@ -349,6 +473,63 @@ def main() -> None:
             raise
     elif not _wait_for_phase(preflight_root, timeout):
         raise RuntimeError("rank-zero package/import preflight failed")
+
+    if resolved.get("campaign_type") == "planner":
+        allocation = [
+            sys.executable,
+            "-m",
+            "harness.runtime_allocation",
+            "--phase",
+            "planner",
+            "--arm",
+            "planner_profile",
+            "--run-root",
+            str(run_root),
+            "--nodes",
+            str(mast["nodes"]),
+            "--world-size",
+            str(world_size),
+            "--nproc-per-node",
+            str(mast["nproc_per_node"]),
+            "--locality",
+            mast["locality"],
+            "--gpu-substring",
+            mast.get("gpu_name_contains", "H100"),
+        ]
+        subprocess.run(allocation, cwd=autoparallel_root, env=base_env, check=True)
+        planner_root = run_root / "planner"
+        planner_timeout = timeout * len(resolved["resolved_planner_runs"])
+        if rank == 0:
+            try:
+                status = _run_planner_campaign(payload, resolved, run_root, base_env)
+            except Exception as error:
+                write_json(
+                    planner_root / "runtime_error.json",
+                    {
+                        "error": f"{type(error).__name__}: {error}",
+                        "traceback": traceback.format_exc(),
+                    },
+                )
+                _atomic_text(planner_root / "failed", "runtime exception\n")
+                status = 1
+        else:
+            status = 0 if _wait_for_phase(planner_root, planner_timeout) else 1
+        planner_runtime = planner_root / "runtime"
+        _atomic_text(planner_runtime / f"rank_{rank:05d}.exit_code", f"{status}\n")
+        statuses = _wait_for_ranks(planner_runtime, world_size, planner_timeout)
+        if rank == 0:
+            marker = (
+                "all_ranks_completed"
+                if all(code == 0 for code in statuses)
+                else "all_ranks_failed"
+            )
+            _atomic_text(
+                planner_root / marker,
+                "\n".join(str(code) for code in statuses) + "\n",
+            )
+        if any(statuses):
+            raise SystemExit(max(statuses))
+        return
 
     phase_index = 0
     for phase in resolved["resolved_phases"]:

@@ -10,6 +10,7 @@ import argparse
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -17,12 +18,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-
 HARNESS_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(HARNESS_ROOT))
 
+from harness.dryrun import audit_submitted_definition  # noqa: E402
 from harness.sources import manifest_digest, tree_manifest  # noqa: E402
-
 
 ACTIVE_STATES = {"PENDING", "RUNNING"}
 TERMINAL_STATES = {"COMPLETE", "DEAD"}
@@ -127,9 +127,11 @@ def prepare(args: argparse.Namespace) -> None:
 
     report = json.loads((attempt / "package_report.json").read_text())
     if report.get("status") != "passed" or not report["validation"].get(
-        "probe_configs"
+        "application_contract_validated"
     ):
-        raise SystemExit("package did not preserve a passing ConfigManager validation")
+        raise SystemExit(
+            "package did not preserve a passing application-contract validation"
+        )
 
     _capture(
         [
@@ -175,11 +177,30 @@ def _walk_values(value: Any, key: str) -> list[Any]:
     return found
 
 
-def _content_manifest(root: Path) -> dict[str, str]:
+def _package_evidence(
+    root: Path, manifest: dict[str, str] | None = None
+) -> dict[str, Any]:
+    manifest = manifest if manifest is not None else tree_manifest(root)
+    files = {}
+    for relative, digest in manifest.items():
+        path = root / relative
+        mode = stat.S_IMODE(path.stat().st_mode)
+        files[relative] = {
+            "sha256": digest,
+            "mode": f"{mode:04o}",
+            "executable": bool(mode & 0o111),
+        }
+    metadata = sorted(
+        relative
+        for relative in manifest
+        if Path(relative).name == "METADATA" or relative.endswith(".CHECKSUMS")
+    )
     return {
-        path: digest
-        for path, digest in tree_manifest(root).items()
-        if path != "METADATA" and not path.endswith(".CHECKSUMS")
+        "root": str(root),
+        "tree_sha256": manifest_digest(manifest),
+        "file_count": len(manifest),
+        "metadata_files": metadata,
+        "files": files,
     }
 
 
@@ -190,15 +211,17 @@ def _one_package(packages: list[str], prefix: str) -> str:
     return matches[0]
 
 
-def submit(args: argparse.Namespace) -> None:
-    attempt = _absolute(args.attempt, "--attempt")
-    if (attempt / "job_id.txt").exists():
-        raise SystemExit(f"attempt already has a submitted job: {attempt}")
+def _ensure_submitted(attempt: Path, python: Path) -> tuple[str, bool]:
+    job_id_path = attempt / "job_id.txt"
+    if job_id_path.exists():
+        job_id = job_id_path.read_text().strip()
+        if not job_id:
+            raise SystemExit(f"submitted job ID is empty: {job_id_path}")
+        return job_id, False
     record_root = attempt / "measurement"
-    python = Path(
-        json.loads((attempt / "package_report.json").read_text())["validation"][
-            "python"
-        ]
+    _write_json(
+        record_root / "submission_started.json",
+        {"timestamp_utc": datetime.now(timezone.utc).isoformat()},
     )
     _capture(
         [str(python), "-m", "harness.cli", "submit", "--attempt", str(attempt)],
@@ -207,7 +230,30 @@ def submit(args: argparse.Namespace) -> None:
         name="submit",
         env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
     )
-    job_id = (attempt / "job_id.txt").read_text().strip()
+    job_id = job_id_path.read_text().strip()
+    if not job_id:
+        raise SystemExit(f"submitted job ID is empty: {job_id_path}")
+    return job_id, True
+
+
+def submit(args: argparse.Namespace) -> None:
+    attempt = _absolute(args.attempt, "--attempt")
+    python = Path(
+        json.loads((attempt / "package_report.json").read_text())["validation"][
+            "python"
+        ]
+    )
+    job_id, newly_submitted = _ensure_submitted(attempt, python)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    record_root = attempt / "submitted_package_audits" / stamp
+    _write_json(
+        record_root / "audit_started.json",
+        {
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "job_id": job_id,
+            "newly_submitted": newly_submitted,
+        },
+    )
 
     _capture(
         [
@@ -244,13 +290,19 @@ def submit(args: argparse.Namespace) -> None:
     )
     definition = json.loads(definition_result.stdout)
     _write_json(attempt / "submitted_definition.json", definition)
+    definition_audit = audit_submitted_definition(
+        attempt,
+        definition,
+        launcher_root=HARNESS_ROOT / "launcher",
+    )
+    _write_json(record_root / "definition_audit.json", definition_audit)
     packages = [str(value) for value in _walk_values(definition, "fbpkgIdentifier")]
     package_ids = {
         "workspace": _one_package(packages, "torchtitan_workspace:"),
         "payload": _one_package(packages, "torchtitan_additional_packages:"),
     }
 
-    package_root = attempt / "packages"
+    package_root = record_root / "packages"
     destinations = {
         "workspace": package_root / "submitted_workspace",
         "payload": package_root / "submitted_payload",
@@ -268,7 +320,7 @@ def submit(args: argparse.Namespace) -> None:
         )
 
     fetched_payload = destinations["payload"] / "payload"
-    preflight_output = attempt / "exact_submitted_package_preflight"
+    preflight_output = record_root / "exact_submitted_package_preflight"
     env = {
         **os.environ,
         "PYTHONDONTWRITEBYTECODE": "1",
@@ -289,18 +341,113 @@ def submit(args: argparse.Namespace) -> None:
         record_root=record_root,
         name="exact_submitted_package_preflight",
         env=env,
+        check=False,
     )
-    expected_payload = _content_manifest(attempt / "package/payload")
-    actual_payload = _content_manifest(fetched_payload)
-    expected_workspace = _content_manifest(package_root / "dryrun_workspace")
-    actual_workspace = _content_manifest(destinations["workspace"])
+    dryrun_packages = attempt / "packages"
+    stored_evidence = {
+        "source_payload": dryrun_packages / "source_payload.manifest.json",
+        "dryrun_workspace": dryrun_packages / "fetched_workspace.manifest.json",
+        "dryrun_payload_package": dryrun_packages
+        / "fetched_payload_package.manifest.json",
+    }
+    evidence = {
+        name: json.loads(path.read_text()) for name, path in stored_evidence.items()
+    }
+    submitted_roots = {
+        "submitted_workspace": destinations["workspace"],
+        "submitted_payload_package": destinations["payload"],
+    }
+    for name, root in submitted_roots.items():
+        evidence[name] = _package_evidence(root)
+        _write_json(record_root / f"{name}.manifest.json", evidence[name])
+
+    def content_manifest(name: str) -> dict[str, str]:
+        return {
+            path: row["sha256"]
+            for path, row in evidence[name]["files"].items()
+            if path != "METADATA" and not path.endswith(".CHECKSUMS")
+        }
+
+    def payload_content(name: str) -> dict[str, str]:
+        prefix = "payload/"
+        return {
+            path.removeprefix(prefix): digest
+            for path, digest in content_manifest(name).items()
+            if path.startswith(prefix)
+        }
+
+    expected_payload = payload_content("dryrun_payload_package")
+    actual_payload = payload_content("submitted_payload_package")
+    expected_workspace = content_manifest("dryrun_workspace")
+    actual_workspace = content_manifest("submitted_workspace")
+
+    def has_package_metadata(name: str) -> bool:
+        files = evidence[name]["metadata_files"]
+        return "METADATA" in files
+
+    submitted_metadata = {
+        name: has_package_metadata(name)
+        for name in ("submitted_workspace", "submitted_payload_package")
+    }
+    metadata_identity = {}
+    for name, package_name, package_root_path in (
+        ("workspace", package_ids["workspace"], destinations["workspace"]),
+        ("payload", package_ids["payload"], destinations["payload"]),
+    ):
+        expected_name, expected_version = package_name.split(":", 1)
+        try:
+            metadata = json.loads((package_root_path / "METADATA").read_text())
+        except (OSError, json.JSONDecodeError):
+            metadata = {}
+        metadata_identity[name] = {
+            "expected_package": expected_name,
+            "expected_version": expected_version,
+            "actual_package": metadata.get("package"),
+            "actual_version": metadata.get("version"),
+            "matched": metadata.get("package") == expected_name
+            and metadata.get("version") == expected_version,
+        }
+    permission_matches = {
+        "workspace": {
+            path: row["mode"]
+            for path, row in evidence["dryrun_workspace"]["files"].items()
+            if path not in {"METADATA"} and not path.endswith(".CHECKSUMS")
+        }
+        == {
+            path: row["mode"]
+            for path, row in evidence["submitted_workspace"]["files"].items()
+            if path not in {"METADATA"} and not path.endswith(".CHECKSUMS")
+        },
+        "payload": {
+            path: row["mode"]
+            for path, row in evidence["dryrun_payload_package"]["files"].items()
+            if path.startswith("payload/")
+        }
+        == {
+            path: row["mode"]
+            for path, row in evidence["submitted_payload_package"]["files"].items()
+            if path.startswith("payload/")
+        },
+    }
+    executable_checks = {
+        "workspace_mount": os.access(destinations["workspace"] / "mount.sh", os.X_OK),
+        "payload_runner": os.access(
+            fetched_payload / "harness_repo/launcher/run_rank.sh", os.X_OK
+        ),
+    }
     audit = {
         "status": "passed",
+        "audit_root": str(record_root),
         "job_id": job_id,
         "priority": priority_data,
         "packages": package_ids,
+        "reference_manifests": {
+            name: str(path) for name, path in stored_evidence.items()
+        },
+        "definition_audit": definition_audit,
         "payload": {
             "matched": expected_payload == actual_payload,
+            "source_matched": content_manifest("source_payload") == actual_payload,
             "expected_tree_sha256": manifest_digest(expected_payload),
             "actual_tree_sha256": manifest_digest(actual_payload),
         },
@@ -310,12 +457,36 @@ def submit(args: argparse.Namespace) -> None:
             "actual_tree_sha256": manifest_digest(actual_workspace),
         },
         "exact_package_preflight_returncode": preflight.returncode,
+        "exact_package_preflight_output": str(preflight_output),
+        "metadata_present": submitted_metadata,
+        "metadata_identity": metadata_identity,
+        "checksum_manifests": {
+            name: [
+                path
+                for path in evidence[name]["metadata_files"]
+                if path.endswith(".CHECKSUMS")
+            ]
+            for name in ("submitted_workspace", "submitted_payload_package")
+        },
+        "permission_matches": permission_matches,
+        "executable_checks": executable_checks,
     }
-    if not audit["payload"]["matched"] or not audit["workspace"]["matched"]:
+    if not (
+        audit["payload"]["matched"]
+        and audit["payload"]["source_matched"]
+        and audit["workspace"]["matched"]
+        and preflight.returncode == 0
+        and all(submitted_metadata.values())
+        and all(value["matched"] for value in metadata_identity.values())
+        and all(permission_matches.values())
+        and all(executable_checks.values())
+    ):
         audit["status"] = "failed"
     _write_json(attempt / "submitted_package_audit.json", audit)
     if audit["status"] != "passed":
-        raise SystemExit("actual submitted package content differs from dry-run inputs")
+        raise SystemExit(
+            "actual submitted package content, metadata, or permissions failed audit"
+        )
     print(json.dumps(audit, indent=2, sort_keys=True))
 
 
@@ -328,6 +499,51 @@ def _task_groups(latest: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _arm_markers(attempt: Path, run_root: Path) -> dict[str, Any]:
     resolved = json.loads((attempt / "validation/resolved_campaign.json").read_text())
+    if resolved.get("campaign_type") == "planner":
+        world_size = int(resolved["world_size"])
+        runs = []
+        for run in resolved["resolved_planner_runs"]:
+            root = (
+                run_root
+                / "planner"
+                / run["point"]
+                / f"repeat_{int(run['repeat']):02d}"
+                / run["solver"]
+            )
+            runs.append(
+                {
+                    "point": run["point"],
+                    "repeat": run["repeat"],
+                    "solver": run["solver"],
+                    "started": (root / "started").is_file(),
+                    "completed": (root / "completed").is_file(),
+                    "failed": (root / "failed").is_file(),
+                    "result": (root / "result.json").is_file(),
+                }
+            )
+        exit_paths = sorted((run_root / "planner/runtime").glob("rank_*.exit_code"))
+        exit_codes = []
+        for path in exit_paths:
+            try:
+                exit_codes.append(int(path.read_text().strip()))
+            except ValueError:
+                exit_codes.append(-1)
+        return {
+            "run_root": str(run_root),
+            "campaign_type": "planner",
+            "campaign_completed": (run_root / "planner/completed").is_file(),
+            "all_ranks_completed": (run_root / "planner/all_ranks_completed").is_file(),
+            "allocation_records": len(
+                list(
+                    (run_root / "allocation/planner/planner_profile").glob(
+                        "rank_*.json"
+                    )
+                )
+            ),
+            "expected_ranks": world_size,
+            "rank_exit_codes": exit_codes,
+            "runs": runs,
+        }
     world_size = int(resolved["mast"]["nodes"]) * int(
         resolved["mast"]["nproc_per_node"]
     )
@@ -355,9 +571,15 @@ def _arm_markers(attempt: Path, run_root: Path) -> dict[str, Any]:
     return {"run_root": str(run_root), "arms": arms}
 
 
-def _scheduler_summary(status: dict[str, Any]) -> dict[str, Any]:
+def _scheduler_summary(
+    status: dict[str, Any], *, expected_nodes: int | None = None
+) -> dict[str, Any]:
+    if not isinstance(status, dict) or not isinstance(status.get("data"), dict):
+        raise SystemExit("MAST status response has no data object")
     data = status["data"]
     latest = data.get("latestAttempt") or {}
+    if not isinstance(latest, dict):
+        raise SystemExit("MAST status latestAttempt is not an object")
     groups = _task_groups(latest)
     tasks = [
         task
@@ -366,21 +588,69 @@ def _scheduler_summary(status: dict[str, Any]) -> dict[str, Any]:
         for task in attempts
     ]
     continuity_errors = []
-    if latest.get("attemptIndex", 0) != 0:
+    if status.get("status") != "ok":
+        continuity_errors.append("MAST status envelope is not ok")
+    for owner, value, required in (
+        ("job", data, ("state", "numRestarts", "latestAttempt")),
+        ("latest attempt", latest, ("state", "attemptIndex")),
+    ):
+        missing = [key for key in required if key not in value]
+        if missing:
+            continuity_errors.append(f"{owner} is missing fields {missing}")
+    if latest.get("attemptIndex") != 0:
         continuity_errors.append("scheduler attempt index is not zero")
-    if int(data.get("numRestarts") or 0) != 0:
+    if not isinstance(data.get("numRestarts"), int) or data.get("numRestarts") != 0:
         continuity_errors.append("scheduler restart count is not zero")
     for group in groups:
-        if group.get("attemptIndex", 0) != 0 or group.get("attemptEpoch", 0) != 0:
+        required = (
+            "attemptIndex",
+            "attemptEpoch",
+            "numTasks",
+            "numFailedTasks",
+            "numShrunkTasks",
+            "onElasticCapacity",
+            "state",
+        )
+        missing = [key for key in required if key not in group]
+        if missing:
+            continuity_errors.append(f"task group is missing fields {missing}")
+        if group.get("attemptIndex") != 0 or group.get("attemptEpoch") != 0:
             continuity_errors.append("task-group attempt/epoch is not zero")
-        if int(group.get("numFailedTasks") or 0) != 0:
+        if group.get("numFailedTasks") != 0:
             continuity_errors.append("task group reports failed tasks")
-        if int(group.get("numShrunkTasks") or 0) != 0:
+        if group.get("numShrunkTasks") != 0:
             continuity_errors.append("task group reports shrunk tasks")
-        if group.get("onElasticCapacity") is True:
+        if group.get("onElasticCapacity") is not False:
             continuity_errors.append("task group is on elastic capacity")
-    if any(task.get("attemptIndex", 0) != 0 for task in tasks):
+    if any("attemptIndex" not in task or "state" not in task for task in tasks):
+        continuity_errors.append("task execution is missing required fields")
+    if any(task.get("attemptIndex") != 0 for task in tasks):
         continuity_errors.append("task execution attempt index is not zero")
+    if data.get("state") == "COMPLETE":
+        if expected_nodes is None:
+            continuity_errors.append("expected node count was not supplied")
+        else:
+            if len(groups) != 1:
+                continuity_errors.append("terminal job does not have one task group")
+            if len(tasks) != expected_nodes:
+                continuity_errors.append(
+                    f"terminal task count {len(tasks)} != expected nodes {expected_nodes}"
+                )
+            hosts = [task.get("hostname") for task in tasks]
+            if any(not isinstance(host, str) or not host for host in hosts):
+                continuity_errors.append("terminal task hostname is missing")
+            elif len(set(hosts)) != expected_nodes:
+                continuity_errors.append(
+                    f"terminal host count {len(set(hosts))} != expected {expected_nodes}"
+                )
+            if any(task.get("exitCode") != 0 for task in tasks):
+                continuity_errors.append(
+                    "terminal task exit code is missing or nonzero"
+                )
+            if any(group.get("numTasks") != expected_nodes for group in groups):
+                continuity_errors.append(
+                    "terminal task-group size differs from request"
+                )
     return {
         "root_state": data.get("state"),
         "latest_attempt_state": latest.get("state"),
@@ -413,8 +683,12 @@ def _scheduler_summary(status: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _terminal_evidence(attempt: Path, job_id: str, stamp: str) -> None:
+def _terminal_evidence(
+    attempt: Path, job_id: str, stamp: str, *, expected_nodes: int
+) -> None:
     root = attempt / "terminal_evidence" / stamp
+    errors = []
+    parsed = {}
     for name, command in (
         ("status", ["mast", "--output", "json", "get-status", job_id]),
         ("history", ["mast", "--output", "json", "get-job-history", job_id]),
@@ -429,13 +703,56 @@ def _terminal_evidence(attempt: Path, job_id: str, stamp: str) -> None:
             ["mast", "--output", "json", "get-logs", "--file-path", "stderr", job_id],
         ),
     ):
-        _capture(command, cwd=HARNESS_ROOT, record_root=root, name=name, check=False)
+        completed = _capture(
+            command, cwd=HARNESS_ROOT, record_root=root, name=name, check=False
+        )
+        if completed.returncode:
+            errors.append(f"{name} exited {completed.returncode}")
+            continue
+        try:
+            parsed[name] = json.loads(completed.stdout)
+        except json.JSONDecodeError:
+            errors.append(f"{name} did not return JSON")
+    if "status" in parsed:
+        summary = _scheduler_summary(parsed["status"], expected_nodes=expected_nodes)
+        if not (
+            summary["root_state"] == "COMPLETE"
+            and summary["latest_attempt_state"] == "COMPLETE"
+            and not summary["continuity_errors"]
+            and all(group["state"] == "COMPLETE" for group in summary["task_groups"])
+            and all(task["state"] == "COMPLETE" for task in summary["tasks"])
+        ):
+            errors.append("terminal status does not satisfy completion gates")
+    if "priority" in parsed:
+        priority = parsed["priority"].get("data", {})
+        if (priority.get("priority"), priority.get("sub_priority")) != (
+            "CRITICAL",
+            99,
+        ):
+            errors.append("terminal priority is not CRITICAL/99")
+    if "definition" in parsed:
+        try:
+            audit_submitted_definition(
+                attempt,
+                parsed["definition"],
+                launcher_root=HARNESS_ROOT / "launcher",
+            )
+        except Exception as error:
+            errors.append(f"terminal definition audit failed: {error}")
+    _write_json(
+        root / "evidence_audit.json",
+        {"status": "passed" if not errors else "failed", "errors": errors},
+    )
+    if errors:
+        raise SystemExit(f"terminal evidence collection failed: {errors}")
 
 
 def monitor(args: argparse.Namespace) -> None:
     attempt = _absolute(args.attempt, "--attempt")
     run_root = _absolute(args.run_root, "--run-root") if args.run_root else None
     job_id = (attempt / "job_id.txt").read_text().strip()
+    resolved = json.loads((attempt / "validation/resolved_campaign.json").read_text())
+    expected_nodes = int(resolved["mast"]["nodes"])
     while True:
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         poll = attempt / "polls" / stamp
@@ -459,7 +776,7 @@ def monitor(args: argparse.Namespace) -> None:
             time.sleep(args.interval_seconds)
             continue
         status = json.loads(status_result.stdout)
-        summary = _scheduler_summary(status)
+        summary = _scheduler_summary(status, expected_nodes=expected_nodes)
         if run_root is not None:
             summary["arm_markers"] = _arm_markers(attempt, run_root)
         _write_json(poll / "summary.json", summary)
@@ -471,7 +788,7 @@ def monitor(args: argparse.Namespace) -> None:
 
         state = summary["root_state"]
         if state in TERMINAL_STATES:
-            _terminal_evidence(attempt, job_id, stamp)
+            _terminal_evidence(attempt, job_id, stamp, expected_nodes=expected_nodes)
             complete = (
                 state == "COMPLETE"
                 and summary["latest_attempt_state"] == "COMPLETE"
@@ -484,13 +801,31 @@ def monitor(args: argparse.Namespace) -> None:
                 and not summary["continuity_errors"]
             )
             if complete and run_root is not None:
-                complete = all(
-                    arm["started"]
-                    and arm["completed"]
-                    and not arm["failed"]
-                    and arm["allocation_records"] == arm["expected_ranks"]
-                    for arm in summary["arm_markers"]["arms"]
-                )
+                markers = summary["arm_markers"]
+                if markers.get("campaign_type") == "planner":
+                    complete = (
+                        markers["campaign_completed"]
+                        and markers["all_ranks_completed"]
+                        and markers["allocation_records"] == markers["expected_ranks"]
+                        and len(markers["rank_exit_codes"]) == markers["expected_ranks"]
+                        and not any(markers["rank_exit_codes"])
+                        and bool(markers["runs"])
+                    )
+                    complete = complete and all(
+                        run["started"]
+                        and run["completed"]
+                        and not run["failed"]
+                        and run["result"]
+                        for run in markers["runs"]
+                    )
+                else:
+                    complete = all(
+                        arm["started"]
+                        and arm["completed"]
+                        and not arm["failed"]
+                        and arm["allocation_records"] == arm["expected_ranks"]
+                        for arm in markers["arms"]
+                    )
             if not complete:
                 raise SystemExit("job did not satisfy terminal completion gates")
             return
@@ -521,7 +856,10 @@ def retrieve(args: argparse.Namespace) -> None:
         record_root=attempt / "retrieval" / "terminal_gate",
         name="status",
     )
-    summary = _scheduler_summary(json.loads(status_result.stdout))
+    resolved = json.loads((attempt / "validation/resolved_campaign.json").read_text())
+    summary = _scheduler_summary(
+        json.loads(status_result.stdout), expected_nodes=int(resolved["mast"]["nodes"])
+    )
     if not (
         summary["root_state"] == "COMPLETE"
         and summary["latest_attempt_state"] == "COMPLETE"
@@ -640,10 +978,10 @@ def analyze(args: argparse.Namespace) -> None:
             str(attempt),
             "--output",
             str(output),
-            "--tlparse-bin",
-            str(args.tlparse_bin),
         )
     )
+    if args.tlparse_bin is not None:
+        command.extend(("--tlparse-bin", str(args.tlparse_bin)))
     env = {
         **os.environ,
         "PYTHONDONTWRITEBYTECODE": "1",
@@ -714,7 +1052,7 @@ def build_parser() -> argparse.ArgumentParser:
     analyze_parser.add_argument("--point")
     analyze_parser.add_argument("--mode", choices=("formal", "gate"), default="formal")
     analyze_parser.add_argument("--python", type=Path)
-    analyze_parser.add_argument("--tlparse-bin", type=Path, required=True)
+    analyze_parser.add_argument("--tlparse-bin", type=Path)
     analyze_parser.set_defaults(func=analyze)
     return parser
 

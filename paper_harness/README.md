@@ -14,17 +14,26 @@ The command performs source checkout, runtime and asset verification,
 validation, packaging, MAST dry-run, submission, CRITICAL/99 priority
 verification, monitoring, retrieval, and canonical analysis. It is resumable:
 rerunning the same model and setting reuses the task state and never submits a
-second job when `job_id.txt` exists.
+second job when `job_id.txt` exists. Every task uses the immutable
+`attempts/001` layout; legacy `attempt/` layouts and additional attempt numbers
+fail closed rather than being migrated or retried automatically.
 
 Valid settings are declared in `run_settings.toml`:
 
-- `llama3_8b`: `2d-8gpu`, `2d-16gpu`, `2d-32gpu`, `2d-64gpu`,
-  `2d-128gpu`, `3d-dp2-cp2-tp2`, and `seqlen-{2k,4k,8k,16k,32k}`;
-- `muse_glimmer_30b`: `2d-{16gpu,32gpu,64gpu,128gpu}`;
-- `deepseek_v3_16b`: `efsdp-ep-{16gpu,32gpu}`.
+- `llama3_8b`: `2d-{8gpu,16gpu,32gpu,64gpu,128gpu}`,
+  `3d-long-{2x2x4,4x2x4,8x2x4}`,
+  `replanning-{seq2k-lb2,seq4k-lb2,seq8k-lb2,seq16k-lb2,seq32k-lb2,seq2k-lb4,seq2k-lb8}`,
+  and `planning-scalability`;
+- `muse_glimmer_30b`: `2d-{8gpu,16gpu,32gpu,64gpu}`;
+- `deepseek_v3_16b`: `3d-{2x2x4,2x2x8,4x2x8}`.
 
 `HARNESS_WORKSPACE_ROOT` may select the parent directory for task records. It
 does not affect experiment inputs or source versions.
+
+`HARNESS_CACHE_ROOT` may select an absolute shared source/runtime cache. The
+cache is namespaced by the experiment-lock digest and materialized under a
+process-safe file lock; task attempts, evidence, mounts, and results remain
+independent.
 
 ## Locked stack
 
@@ -67,6 +76,13 @@ precision, activation checkpointing intent, optimizer, scheduler, physical
 allocation, rank-to-GPU mapping, and measurement method. A campaign must
 declare the complete trainer/parallelization/compiler stack as its variable
 when profile defaults differ.
+
+The `planning-scalability` setting is a planner-only fake-H100 cost-model
+study, not GPU training-performance evidence. One eight-rank MAST allocation
+is audited, rank zero runs the existing AutoParallel search-profile CLI for
+the declared 1D through 4D meshes, and all ranks participate in completion
+gates. Each mesh records three lazy, seeded Approx runs and three independent
+LP-reference runs.
 
 ## Lower-level commands
 

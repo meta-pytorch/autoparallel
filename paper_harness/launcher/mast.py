@@ -1,6 +1,5 @@
 import getpass
 import json
-import os
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -39,6 +38,9 @@ def train(
     resolved = json.loads((payload / "campaign/resolved_campaign.json").read_text())
     if nodes * nproc_per_node != int(resolved["world_size"]):
         raise ValueError("MAST resources differ from the resolved campaign")
+    campaign_type = resolved.get("campaign_type", "training")
+    if campaign_type not in {"training", "planner"}:
+        raise ValueError(f"unsupported campaign type: {campaign_type}")
     package = _make_fbpkg(str(payload))
     task_env = {
         "NCCL_DEBUG": "INFO,WARN",
@@ -54,7 +56,7 @@ def train(
         # mast.environment.
         "HARNESS_PAYLOAD_ROOT": f"/packages/{_ADDITIONAL_PACKAGE}/{payload.name}",
         "DUMP_DIR": "/mnt/wsfuse/outputs/${app_id}",
-        "EXPERIMENT_TASK": "training",
+        "EXPERIMENT_TASK": campaign_type,
         "JOB_ID": "${app_id}",
     }
     task_env.update(resolved["mast"].get("environment", {}))
@@ -68,7 +70,7 @@ def train(
         "--nproc-per-node",
         str(nproc_per_node),
         "--role",
-        "training",
+        campaign_type,
         "--no-python",
         entrypoint,
         name=f"{name}-{getpass.getuser()}",
@@ -80,7 +82,7 @@ def train(
         conda_mast_core_fbpkg_id="conda_mast_core:stable",
     )
     role = task_app.roles[0]
-    role.name = "training"
+    role.name = campaign_type
     for index in range(1, sum(len(phase["arms"]) for phase in resolved["resolved_phases"])):
         role.port_map[f"training_phase_{index + 1}"] = int(
             resolved["mast"].get("master_port", 29500)

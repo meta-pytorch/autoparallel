@@ -1,6 +1,6 @@
 schema_version = 1
-name = "deepseek-v3-16b-tt-main-vs-apgt"
-description = "Pinned DeepSeek V3 16B MainTrainer and AutoParallel campaign"
+name = "deepseek-v3-16b-3d-approx"
+description = "Pinned DeepSeek V3 16B three-arm folded-EP x TP Approx campaign"
 workload = "deepseek_v3_16b"
 
 [model]
@@ -13,25 +13,37 @@ identity = "index_manifest"
 dataset = "allenai/c4"
 revision = "1588ec454efa1a09f29cd18ddd04fe05fc8653a2"
 identity_manifest = "{harness}/data/index_manifests/deepseek_v3_16b.json"
-identity_manifest_sha256 = "5b385bdd7478ecdc2578ff9627d2aa9f30c715ba760608f9134305944f8af2cc"
+identity_manifest_sha256 = "1a3f28bc07585126bb864262e26bdb26d3bb42e30c7f70e8482661842528fb5b"
+runtime_input_hash_audit = true
 
 [training]
 local_batch_size = 4
-global_batch_size = 64
+global_batch_size = 16
 seq_len = 4096
 
 [parallelism]
 data_parallel_replicate_degree = 1
-data_parallel_shard_degree = 16
-tensor_parallel_degree = 1
+data_parallel_shard_degree = 4
+tensor_parallel_degree = 4
 context_parallel_degree = 1
 pipeline_parallel_degree = 1
+expert_parallel_degree = 8
 
 [comparison]
 declared_variable = "training_parallelization_compile_stack"
 allowed_config_paths = ["compile.*", "model_spec.name"]
 allowed_environment_keys = ["BENCHMARK_CONFIGURATION", "EXPERIMENT_ARM"]
-pairs = [["tt_main", "apgt"]]
+pairs = [
+  ["tt_main", "gt_manual"],
+  ["tt_main", "apgt"],
+  ["gt_manual", "apgt"],
+]
+
+[measurement.primary]
+source = "structured_logs"
+steps = [7, 8, 9, 12, 13, 14, 17, 18, 19, 22, 23, 24]
+rank_selector = "latest_fetching_batch_end"
+value = "step_end_minus_fetching_batch_end"
 
 [mast]
 nodes = 2
@@ -41,12 +53,13 @@ locality = "dc;pci1"
 gpu_name_contains = "H100"
 retries = 0
 master_port = 29500
-phase_timeout_seconds = 7200
+phase_timeout_seconds = 14400
 
 [mast.environment]
 BENCHMARK_WORLD_SIZE = "16"
 BENCHMARK_EP_DEGREE = "8"
-C4_SHARD_ROOT = "{asset:offline_c4}/en"
+BENCHMARK_TP_DEGREE = "4"
+C4_SHARD_ROOT = "{asset:offline_c4}"
 DEEPSEEK_TOKENIZER_DIR = "{asset:deepseek_tokenizer}"
 FIXED_REPLAY_BATCHES = "10"
 AP_COLLECTIVE_MUST_SAVE_EXPECTATION = "off"
@@ -69,10 +82,21 @@ BENCHMARK_CONFIGURATION = "torchtitan_baseline"
 EXPERIMENT_ARM = "T"
 
 [[arms]]
+name = "gt_manual"
+profile = "gt_manual_eager_v1"
+module = "workloads.deepseek_v3.perf_configs"
+config = "graphtrainer_manual_16b"
+[arms.environment]
+BENCHMARK_CONFIGURATION = "graphtrainer_manual"
+EXPERIMENT_ARM = "M"
+
+[[arms]]
 name = "apgt"
 profile = "apgt_validated_v1"
 module = "workloads.deepseek_v3.perf_configs"
 config = "autoparallel_graphtrainer_16b"
+[arms.overrides]
+"compile.autoparallel_solver" = "approx"
 [arms.environment]
 BENCHMARK_CONFIGURATION = "autoparallel_graphtrainer"
 EXPERIMENT_ARM = "G"
@@ -80,7 +104,7 @@ EXPERIMENT_ARM = "G"
 [[phases]]
 name = "performance"
 kind = "performance"
-arms = ["tt_main", "apgt"]
+arms = ["tt_main", "gt_manual", "apgt"]
 [phases.overrides]
 "training.steps" = 25
 "profiler.enable_profiling" = false
@@ -90,7 +114,7 @@ arms = ["tt_main", "apgt"]
 [[phases]]
 name = "trace"
 kind = "trace"
-arms = ["tt_main", "apgt"]
+arms = ["tt_main", "gt_manual", "apgt"]
 trace_ranks = [0]
 [phases.overrides]
 "training.steps" = 6
@@ -103,17 +127,37 @@ trace_ranks = [0]
 "metrics.log_freq" = 1
 
 [[matrix.points]]
-name = "16gpu"
+name = "2x2x4"
 [matrix.points.settings]
 "mast.nodes" = 2
-"parallelism.data_parallel_shard_degree" = 16
-"training.global_batch_size" = 64
+"parallelism.data_parallel_shard_degree" = 4
+"parallelism.tensor_parallel_degree" = 4
+"parallelism.expert_parallel_degree" = 8
+"training.global_batch_size" = 16
 "mast.environment.BENCHMARK_WORLD_SIZE" = "16"
+"mast.environment.BENCHMARK_EP_DEGREE" = "8"
+"mast.environment.BENCHMARK_TP_DEGREE" = "4"
 
 [[matrix.points]]
-name = "32gpu"
+name = "2x2x8"
 [matrix.points.settings]
 "mast.nodes" = 4
-"parallelism.data_parallel_shard_degree" = 32
-"training.global_batch_size" = 128
+"parallelism.data_parallel_shard_degree" = 4
+"parallelism.tensor_parallel_degree" = 8
+"parallelism.expert_parallel_degree" = 16
+"training.global_batch_size" = 16
 "mast.environment.BENCHMARK_WORLD_SIZE" = "32"
+"mast.environment.BENCHMARK_EP_DEGREE" = "16"
+"mast.environment.BENCHMARK_TP_DEGREE" = "8"
+
+[[matrix.points]]
+name = "4x2x8"
+[matrix.points.settings]
+"mast.nodes" = 8
+"parallelism.data_parallel_shard_degree" = 8
+"parallelism.tensor_parallel_degree" = 8
+"parallelism.expert_parallel_degree" = 16
+"training.global_batch_size" = 32
+"mast.environment.BENCHMARK_WORLD_SIZE" = "64"
+"mast.environment.BENCHMARK_EP_DEGREE" = "16"
+"mast.environment.BENCHMARK_TP_DEGREE" = "8"

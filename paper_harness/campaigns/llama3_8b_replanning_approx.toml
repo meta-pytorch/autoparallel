@@ -1,0 +1,229 @@
+schema_version = 1
+name = "llama3-8b-replanning-approx"
+description = "Self-contained canonical-2K Approx replanning sweep on a 4x8 mesh"
+workload = "llama3_8b_seqlen"
+
+[model]
+flavor = "8B"
+attention_backend = "sdpa"
+
+[data]
+mode = "streaming"
+identity = "index_manifest"
+dataset = "allenai/c4"
+revision = "1588ec454efa1a09f29cd18ddd04fe05fc8653a2"
+identity_manifest = "{harness}/data/index_manifests/llama3_8b_seqlen.json"
+identity_manifest_sha256 = "096e7c916f929de31673c58bc5df808e59b0e028e0cdc169626470d026f29d4f"
+runtime_input_hash_audit = true
+
+[training]
+local_batch_size = 2
+global_batch_size = 8
+seq_len = 2048
+
+[parallelism]
+data_parallel_replicate_degree = 1
+data_parallel_shard_degree = 4
+tensor_parallel_degree = 8
+context_parallel_degree = 1
+pipeline_parallel_degree = 1
+
+[checkpoint]
+enable = true
+folder = "checkpoint"
+initial_load_path = "{asset:llama3_3d_seed_checkpoint}"
+initial_load_model_only = true
+initial_load_in_hf = true
+load_only = true
+create_seed_checkpoint = false
+
+[comparison]
+declared_variable = "fresh_approx_replan_vs_in_job_canonical_2k_replay"
+allowed_config_paths = []
+allowed_environment_keys = [
+  "AP_CANONICAL_PLACEMENT",
+  "AP_CANONICAL_SOURCE",
+  "AP_STRATEGY_MODE",
+  "EXPERIMENT_ARM",
+]
+pairs = [["target_fresh", "replay_2k"]]
+
+[measurement.primary]
+source = "structured_logs"
+steps = [7, 8, 9, 12, 13, 14, 17, 18, 19, 22, 23, 24]
+rank_selector = "latest_fetching_batch_end"
+value = "step_end_minus_fetching_batch_end"
+
+[mast]
+nodes = 4
+nproc_per_node = 8
+hardware = "grandteton_80g_roce"
+locality = "dc;pci1"
+gpu_name_contains = "H100"
+retries = 0
+master_port = 29500
+phase_timeout_seconds = 14400
+
+[mast.environment]
+BENCHMARK_WORLD_SIZE = "32"
+BENCHMARK_TP_DEGREE = "8"
+BENCHMARK_SEQ_LEN = "2048"
+BENCHMARK_LOCAL_BATCH_SIZE = "2"
+BENCHMARK_CONFIGURATION = "autoparallel_graphtrainer"
+C4_SHARD_ROOT = "{asset:offline_c4}"
+LLAMA_TOKENIZER_DIR = "{asset:llama_tokenizer}"
+FIXED_REPLAY_BATCHES = "10"
+AP_COLLECTIVE_MUST_SAVE_EXPECTATION = "off"
+HF_HUB_OFFLINE = "1"
+HF_DATASETS_OFFLINE = "1"
+HF_HUB_DISABLE_XET = "1"
+PYTORCH_ALLOC_CONF = "expandable_segments:True"
+TORCHINDUCTOR_CUDAGRAPHS = "0"
+
+[artifacts]
+required_assets = ["offline_c4", "llama_tokenizer", "llama3_3d_seed_checkpoint"]
+warmup_steps = 5
+placement_audit = "replanning"
+
+[[arms]]
+name = "canonical_fresh"
+profile = "apgt_validated_v1"
+module = "workloads.llama3_seqlen.perf_configs"
+config = "autoparallel_graphtrainer_seqlen_8b"
+[arms.overrides]
+"compile.autoparallel_solver" = "approx"
+[arms.environment]
+AP_STRATEGY_MODE = "fresh"
+AP_CANONICAL_SOURCE = "in_job"
+AP_CANONICAL_PLACEMENT = "{output}/canonical_input_absent.json"
+EXPERIMENT_ARM = "canonical_fresh"
+
+[[arms]]
+name = "target_fresh"
+profile = "apgt_validated_v1"
+module = "workloads.llama3_seqlen.perf_configs"
+config = "autoparallel_graphtrainer_seqlen_8b"
+[arms.overrides]
+"compile.autoparallel_solver" = "approx"
+[arms.environment]
+AP_STRATEGY_MODE = "fresh"
+AP_CANONICAL_SOURCE = "in_job"
+AP_CANONICAL_PLACEMENT = "{output}/../../canonical/canonical_fresh/placement_audit/solution_rank_000.json"
+EXPERIMENT_ARM = "target_fresh"
+
+[[arms]]
+name = "replay_2k"
+profile = "apgt_validated_v1"
+module = "workloads.llama3_seqlen.perf_configs"
+config = "autoparallel_graphtrainer_seqlen_8b"
+[arms.overrides]
+"compile.autoparallel_solver" = "approx"
+[arms.environment]
+AP_STRATEGY_MODE = "replay_2k"
+AP_CANONICAL_SOURCE = "in_job"
+AP_CANONICAL_PLACEMENT = "{output}/../../canonical/canonical_fresh/placement_audit/solution_rank_000.json"
+EXPERIMENT_ARM = "replay_2k"
+
+[[phases]]
+name = "canonical"
+kind = "correctness"
+arms = ["canonical_fresh"]
+[phases.overrides]
+"training.local_batch_size" = 2
+"training.global_batch_size" = 8
+"training.seq_len" = 2048
+"training.steps" = 1
+"profiler.enable_profiling" = false
+"profiler.enable_memory_snapshot" = false
+"metrics.log_freq" = 1
+[phases.environment]
+BENCHMARK_SEQ_LEN = "2048"
+BENCHMARK_LOCAL_BATCH_SIZE = "2"
+
+[[phases]]
+name = "performance"
+kind = "performance"
+arms = ["target_fresh", "replay_2k"]
+[phases.overrides]
+"training.steps" = 25
+"profiler.enable_profiling" = false
+"profiler.enable_memory_snapshot" = false
+"metrics.log_freq" = 5
+
+[[phases]]
+name = "trace"
+kind = "trace"
+arms = ["target_fresh", "replay_2k"]
+trace_ranks = [0]
+[phases.overrides]
+"training.steps" = 6
+"profiler.enable_profiling" = true
+"profiler.enable_memory_snapshot" = false
+"profiler.profile_freq" = 6
+"profiler.profiler_warmup" = 0
+"profiler.profiler_active" = 3
+"profiler.profiler_repeat" = 1
+"metrics.log_freq" = 1
+
+[[matrix.points]]
+name = "seq2k-lb2"
+[matrix.points.settings]
+"training.seq_len" = 2048
+"training.local_batch_size" = 2
+"training.global_batch_size" = 8
+"mast.environment.BENCHMARK_SEQ_LEN" = "2048"
+"mast.environment.BENCHMARK_LOCAL_BATCH_SIZE" = "2"
+
+[[matrix.points]]
+name = "seq4k-lb2"
+[matrix.points.settings]
+"training.seq_len" = 4096
+"training.local_batch_size" = 2
+"training.global_batch_size" = 8
+"mast.environment.BENCHMARK_SEQ_LEN" = "4096"
+"mast.environment.BENCHMARK_LOCAL_BATCH_SIZE" = "2"
+
+[[matrix.points]]
+name = "seq8k-lb2"
+[matrix.points.settings]
+"training.seq_len" = 8192
+"training.local_batch_size" = 2
+"training.global_batch_size" = 8
+"mast.environment.BENCHMARK_SEQ_LEN" = "8192"
+"mast.environment.BENCHMARK_LOCAL_BATCH_SIZE" = "2"
+
+[[matrix.points]]
+name = "seq16k-lb2"
+[matrix.points.settings]
+"training.seq_len" = 16384
+"training.local_batch_size" = 2
+"training.global_batch_size" = 8
+"mast.environment.BENCHMARK_SEQ_LEN" = "16384"
+"mast.environment.BENCHMARK_LOCAL_BATCH_SIZE" = "2"
+
+[[matrix.points]]
+name = "seq32k-lb2"
+[matrix.points.settings]
+"training.seq_len" = 32768
+"training.local_batch_size" = 2
+"training.global_batch_size" = 8
+"mast.environment.BENCHMARK_SEQ_LEN" = "32768"
+"mast.environment.BENCHMARK_LOCAL_BATCH_SIZE" = "2"
+
+[[matrix.points]]
+name = "seq2k-lb4"
+[matrix.points.settings]
+"training.seq_len" = 2048
+"training.local_batch_size" = 4
+"training.global_batch_size" = 16
+"mast.environment.BENCHMARK_SEQ_LEN" = "2048"
+"mast.environment.BENCHMARK_LOCAL_BATCH_SIZE" = "4"
+
+[[matrix.points]]
+name = "seq2k-lb8"
+[matrix.points.settings]
+"training.seq_len" = 2048
+"training.local_batch_size" = 8
+"training.global_batch_size" = 32
+"mast.environment.BENCHMARK_SEQ_LEN" = "2048"
+"mast.environment.BENCHMARK_LOCAL_BATCH_SIZE" = "8"

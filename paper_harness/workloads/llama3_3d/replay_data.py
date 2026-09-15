@@ -112,10 +112,20 @@ class ReplayDataLoader(BaseDataLoader):
                 "iteration_contract": "memory_index_and_shallow_input_dict_copy_only",
             },
         )
+        input_audit = Path(required_env("INPUT_AUDIT_DIR"))
+        atomic_write_json(
+            input_audit / f"rank_{int(os.environ['RANK']):05d}.json",
+            {
+                "rank": int(os.environ["RANK"]),
+                "dp_rank": dp_rank,
+                "batch_count": len(self._batch_hashes),
+                "batch_sha256": self._batch_hashes,
+            },
+        )
 
     def __iter__(self) -> Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]]:
-        while self._index < len(self._batches):
-            input_dict, labels = self._batches[self._index]
+        while True:
+            input_dict, labels = self._batches[self._index % len(self._batches)]
             self._index += 1
             yield dict(input_dict), labels
 
@@ -124,6 +134,6 @@ class ReplayDataLoader(BaseDataLoader):
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         index = int(state_dict.get("index", 0))
-        if not 0 <= index <= len(self._batches):
+        if index < 0:
             raise ValueError(f"Invalid replay index {index}")
         self._index = index

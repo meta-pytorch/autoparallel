@@ -22,14 +22,17 @@ class CampaignTests(unittest.TestCase):
                 "deepseek_v3_16b.toml",
                 "llama3_8b_2d.toml",
                 "llama3_8b_3d.toml",
-                "llama3_8b_seqlen.toml",
+                "llama3_8b_planner.toml",
+                "llama3_8b_replanning_approx.toml",
                 "muse_glimmer_30b.toml",
             },
         )
 
     def test_all_settings_resolve_to_the_global_lock(self) -> None:
         lock = load_experiment_lock()
-        for setting in load_run_settings().values():
+        settings = load_run_settings()
+        self.assertEqual(len(settings), 23)
+        for setting in settings.values():
             with self.subTest(model=setting.model, setting=setting.setting):
                 campaign = load_campaign(setting.campaign, point=setting.point)
                 self.assertEqual(campaign.source_specs(), lock["sources"])
@@ -37,14 +40,33 @@ class CampaignTests(unittest.TestCase):
                     campaign.raw["mast"]["conda_fbpkg"],
                     lock["runtime"]["conda_fbpkg"],
                 )
-                self.assertEqual(
-                    campaign.raw["parallelism"]["spmd_backend"],
-                    "default",
-                )
+                if not campaign.is_planner:
+                    self.assertEqual(
+                        campaign.raw["parallelism"]["spmd_backend"],
+                        "default",
+                    )
                 self.assertEqual(
                     campaign.raw["mast"]["environment"]["TORCHINDUCTOR_CUDAGRAPHS"],
                     "0",
                 )
+
+    def test_every_training_autoparallel_arm_uses_approx(self) -> None:
+        for setting in load_run_settings().values():
+            campaign = load_campaign(setting.campaign, point=setting.point)
+            if campaign.is_planner:
+                continue
+            for phase in campaign.phases:
+                for arm_name in phase.arms:
+                    arm = campaign.arm(arm_name)
+                    if arm.profile != "apgt_validated_v1":
+                        continue
+                    self.assertEqual(
+                        campaign.phase_arm_settings(phase, arm).get(
+                            "compile.autoparallel_solver"
+                        ),
+                        "approx",
+                        (setting.model, setting.setting, phase.name, arm_name),
+                    )
 
     def test_authored_source_runtime_and_backend_pins_are_rejected(self) -> None:
         source = (REPO_ROOT / "campaigns/llama3_8b_2d.toml").read_text()
@@ -92,10 +114,19 @@ class CampaignTests(unittest.TestCase):
 
     def test_canonical_matrix_points(self) -> None:
         cases = {
-            "muse_glimmer_30b.toml": ("16gpu", "32gpu", "64gpu", "128gpu"),
+            "muse_glimmer_30b.toml": ("8gpu", "16gpu", "32gpu", "64gpu"),
             "llama3_8b_2d.toml": ("8gpu", "16gpu", "32gpu", "64gpu", "128gpu"),
-            "llama3_8b_seqlen.toml": ("2k", "4k", "8k", "16k", "32k"),
-            "deepseek_v3_16b.toml": ("16gpu", "32gpu"),
+            "llama3_8b_3d.toml": ("2x2x4", "4x2x4", "8x2x4"),
+            "llama3_8b_replanning_approx.toml": (
+                "seq2k-lb2",
+                "seq4k-lb2",
+                "seq8k-lb2",
+                "seq16k-lb2",
+                "seq32k-lb2",
+                "seq2k-lb4",
+                "seq2k-lb8",
+            ),
+            "deepseek_v3_16b.toml": ("2x2x4", "2x2x8", "4x2x8"),
         }
         for filename, points in cases.items():
             for point in points:
@@ -106,14 +137,75 @@ class CampaignTests(unittest.TestCase):
                     )
                     self.assertGreater(campaign.world_size, 0)
                     self.assertTrue(campaign.phases)
-        self.assertEqual(
-            load_campaign(REPO_ROOT / "campaigns/llama3_8b_3d.toml").world_size,
-            8,
-        )
 
     def test_matrix_requires_an_explicit_point(self) -> None:
         with self.assertRaisesRegex(CampaignError, "requires --point"):
             load_campaign(REPO_ROOT / "campaigns/muse_glimmer_30b.toml")
+
+    def test_requested_three_dimensional_meshes(self) -> None:
+        deepseek = {
+            "2x2x4": (4, 8, 4),
+            "2x2x8": (4, 16, 8),
+            "4x2x8": (8, 16, 8),
+        }
+        for point, expected in deepseek.items():
+            campaign = load_campaign(
+                REPO_ROOT / "campaigns/deepseek_v3_16b.toml", point=point
+            )
+            parallelism = campaign.raw["parallelism"]
+            self.assertEqual(
+                (
+                    parallelism["data_parallel_shard_degree"],
+                    parallelism["expert_parallel_degree"],
+                    parallelism["tensor_parallel_degree"],
+                ),
+                expected,
+            )
+
+        for point, expected_dp in (("2x2x4", 2), ("4x2x4", 4), ("8x2x4", 8)):
+            campaign = load_campaign(
+                REPO_ROOT / "campaigns/llama3_8b_3d.toml", point=point
+            )
+            parallelism = campaign.raw["parallelism"]
+            self.assertEqual(
+                (
+                    parallelism["data_parallel_shard_degree"],
+                    parallelism["context_parallel_degree"],
+                    parallelism["tensor_parallel_degree"],
+                ),
+                (expected_dp, 2, 4),
+            )
+            self.assertEqual(campaign.raw["training"]["seq_len"], 16384)
+
+    def test_planner_campaign_expands_exact_approx_and_lp_runs(self) -> None:
+        campaign = load_campaign(REPO_ROOT / "campaigns/llama3_8b_planner.toml")
+        self.assertTrue(campaign.is_planner)
+        self.assertEqual(campaign.world_size, 8)
+        self.assertFalse(campaign.arms)
+        self.assertFalse(campaign.phases)
+        runs = campaign.planner_runs()
+        self.assertEqual(len(runs), 24)
+        self.assertEqual(
+            [
+                (point["name"], point["mesh"])
+                for point in campaign.raw["planner"]["points"]
+            ],
+            [
+                ("1d", [8]),
+                ("2d", [4, 8]),
+                ("3d", [4, 2, 4]),
+                ("4d", [2, 2, 2, 4]),
+            ],
+        )
+        for run in runs:
+            if run["role"] == "candidate":
+                self.assertEqual(run["solver"], "approx")
+                self.assertTrue(run["lazy_costs"])
+                self.assertTrue(run["seeded"])
+            else:
+                self.assertEqual(run["solver"], "lp")
+                self.assertIsNone(run["lazy_costs"])
+                self.assertFalse(run["seeded"])
 
     def test_gate_mode_is_functional_and_trace_only(self) -> None:
         campaign = load_campaign(

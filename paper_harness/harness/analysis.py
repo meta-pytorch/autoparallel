@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .campaign import Campaign, write_json
+from .campaign import PLANNER_RESULT_CLASSIFICATION, Campaign, write_json
 from .sources import manifest_digest, tree_manifest
 
 
@@ -196,6 +196,56 @@ def _all_rank_memory(
     phase_root: Path, warmup_steps: int, world_size: int
 ) -> dict[str, Any]:
     paths = sorted((phase_root / "job/tb").glob("**/rank_*/events.out.tfevents.*"))
+    buffered_paths = sorted(
+        (phase_root / "job/benchmark_metrics").glob("rank_*.json")
+    )
+    if not paths and buffered_paths:
+        errors = []
+        values: dict[str, list[dict[str, float | int]]] = {
+            tag: [] for tag in MEMORY_TAGS
+        }
+        observed_ranks = set()
+        for path in buffered_paths:
+            try:
+                payload = json.loads(path.read_text())
+                rank = int(payload["rank"])
+                observed_ranks.add(rank)
+                for record in payload["records"]:
+                    step = int(record["step"])
+                    if step <= warmup_steps:
+                        continue
+                    metrics = record["metrics"]
+                    for tag in MEMORY_TAGS:
+                        if tag in metrics:
+                            values[tag].append(
+                                {"rank": rank, "step": step, "value": float(metrics[tag])}
+                            )
+            except Exception as error:
+                errors.append(f"invalid buffered metric file {path}: {error}")
+        if observed_ranks != set(range(world_size)):
+            errors.append(
+                "buffered metric rank set mismatch: "
+                f"expected={list(range(world_size))}, observed={sorted(observed_ranks)}"
+            )
+        summaries = {}
+        for tag, rows in values.items():
+            samples = [float(row["value"]) for row in rows]
+            if not samples:
+                errors.append(f"buffered metrics have no post-warmup samples for {tag}")
+            peak_row = max(rows, key=lambda row: float(row["value"])) if rows else None
+            summaries[tag] = {
+                "all_rank_samples": _summary(samples),
+                "peak": peak_row,
+            }
+        return {
+            "status": "passed" if not errors else "failed",
+            "measurement_method": (
+                "maximum across every rank and post-warmup buffered metric window"
+            ),
+            "files": [str(path) for path in buffered_paths],
+            "metrics": summaries,
+            "errors": errors,
+        }
     by_rank: dict[int, Path] = {}
     errors = []
     for path in paths:
@@ -302,6 +352,7 @@ def _structured_metrics(
     incomplete_steps = {}
     for name in TIMER_EVENTS:
         step_rows = values[name]
+        ordered_steps = sorted(step_rows)
         incomplete = [
             step
             for step, rank_values in sorted(step_rows.items())
@@ -317,12 +368,12 @@ def _structured_metrics(
                 ]
             ),
             "rank0_steps": _summary(
-                [rank_values[0] for rank_values in step_rows.values() if 0 in rank_values]
+                [step_rows[step][0] for step in ordered_steps if 0 in step_rows[step]]
             ),
             "per_step_rank_max": _summary(
-                [max(rank_values.values()) for rank_values in step_rows.values()]
+                [max(step_rows[step].values()) for step in ordered_steps]
             ),
-            "steps": sorted(step_rows),
+            "steps": ordered_steps,
         }
     complete = (
         len(paths) == world_size
@@ -412,6 +463,133 @@ def _allocation_audit(campaign: Campaign, run_root: Path) -> dict[str, Any]:
             runs[key] = {"files": [str(path) for path in paths], "ranks": sorted(rows)}
     return {
         "status": "passed" if not errors else "failed",
+        "runs": runs,
+        "errors": errors,
+    }
+
+
+def _input_hash_audit(campaign: Campaign, run_root: Path) -> dict[str, Any]:
+    required = bool(campaign.raw.get("data", {}).get("runtime_input_hash_audit"))
+    if not required:
+        return {"status": "passed", "required": False, "pairs": [], "errors": []}
+    pairs = []
+    errors = []
+    for phase in campaign.phases:
+        for baseline, treatment in campaign.raw.get("comparison", {}).get("pairs", []):
+            if baseline not in phase.arms or treatment not in phase.arms:
+                continue
+            by_arm = {}
+            for arm in (baseline, treatment):
+                paths = sorted((run_root / phase.name / arm / "input_audit").glob("rank_*.json"))
+                rows = {}
+                for path in paths:
+                    try:
+                        row = json.loads(path.read_text())
+                        rows[int(row["rank"])] = {
+                            "dp_rank": int(row["dp_rank"]),
+                            "batch_count": int(row["batch_count"]),
+                            "batch_sha256": list(row["batch_sha256"]),
+                        }
+                    except Exception as error:
+                        errors.append(f"invalid input audit {path}: {error}")
+                if set(rows) != set(range(campaign.world_size)):
+                    errors.append(
+                        f"{phase.name}/{arm}: input-audit rank set mismatch"
+                    )
+                by_arm[arm] = rows
+            matched = by_arm[baseline] == by_arm[treatment]
+            if not matched:
+                errors.append(
+                    f"{phase.name}: input hashes differ for {baseline}/{treatment}"
+                )
+            pairs.append(
+                {
+                    "phase": phase.name,
+                    "baseline": baseline,
+                    "treatment": treatment,
+                    "matched": matched,
+                    "ranks": sorted(set(by_arm[baseline]) & set(by_arm[treatment])),
+                }
+            )
+    if not pairs:
+        errors.append("runtime input-hash audit found no comparison pair")
+    return {
+        "status": "passed" if not errors else "failed",
+        "required": True,
+        "pairs": pairs,
+        "errors": errors,
+    }
+
+
+def _placement_audit(campaign: Campaign, run_root: Path) -> dict[str, Any]:
+    required = campaign.raw.get("artifacts", {}).get("placement_audit") == "replanning"
+    if not required:
+        return {"status": "passed", "required": False, "runs": {}, "errors": []}
+    runs = {}
+    errors = []
+    for phase in campaign.phases:
+        for arm in phase.arms:
+            root = run_root / phase.name / arm / "placement_audit"
+            paths = sorted(root.glob("rank_*.json"))
+            rows = {}
+            for path in paths:
+                try:
+                    row = json.loads(path.read_text())
+                    rows[int(row["rank"])] = row
+                except Exception as error:
+                    errors.append(f"invalid placement audit {path}: {error}")
+            key = f"{phase.name}/{arm}"
+            if set(rows) != set(range(campaign.world_size)):
+                errors.append(f"{key}: placement-audit rank set mismatch")
+            modes = {row.get("mode") for row in rows.values()}
+            solvers = {row.get("configured_solver") for row in rows.values()}
+            invoked = {row.get("solver_invoked") for row in rows.values()}
+            placement_digests = {row.get("placement_digest") for row in rows.values()}
+            placement_file_hashes = {
+                row.get("placement_file_sha256") for row in rows.values()
+            }
+            if solvers != {"approx"}:
+                errors.append(f"{key}: configured solver is not uniformly Approx")
+            expected_mode = "replay_2k" if arm == "replay_2k" else "fresh"
+            if modes != {expected_mode}:
+                errors.append(f"{key}: strategy mode contract mismatch")
+            expected_invoked = arm != "replay_2k"
+            if invoked != {expected_invoked}:
+                errors.append(f"{key}: solver invocation contract mismatch")
+            if len(placement_digests) != 1 or None in placement_digests:
+                errors.append(f"{key}: ranks selected different placements")
+            if len(placement_file_hashes) != 1 or None in placement_file_hashes:
+                errors.append(f"{key}: placement file hashes differ across ranks")
+            runs[key] = {
+                "files": [str(path) for path in paths],
+                "modes": sorted(str(value) for value in modes),
+                "solver_invoked": sorted(str(value) for value in invoked),
+                "placement_digests": sorted(str(value) for value in placement_digests),
+                "placement_file_sha256": sorted(
+                    str(value) for value in placement_file_hashes
+                ),
+                "rows": rows,
+            }
+
+    canonical = runs.get("canonical/canonical_fresh", {})
+    canonical_digests = set(canonical.get("placement_digests", []))
+    canonical_hashes = set(canonical.get("placement_file_sha256", []))
+    for phase_name in ("performance", "trace"):
+        replay = runs.get(f"{phase_name}/replay_2k", {})
+        replay_rows = replay.get("rows", {})
+        replay_canonical_digests = {
+            row.get("canonical_placement_digest") for row in replay_rows.values()
+        }
+        replay_canonical_hashes = {
+            row.get("canonical_file_sha256") for row in replay_rows.values()
+        }
+        if replay_canonical_digests != canonical_digests:
+            errors.append(f"{phase_name}: replay placement differs from canonical")
+        if replay_canonical_hashes != canonical_hashes:
+            errors.append(f"{phase_name}: replay file hash differs from canonical")
+    return {
+        "status": "passed" if not errors else "failed",
+        "required": True,
         "runs": runs,
         "errors": errors,
     }
@@ -885,6 +1063,9 @@ def _pair_summaries(campaign: Campaign, phases: dict[str, Any]) -> list[dict[str
             * int(training.get("gradient_accumulation_steps", 1))
         )
     tokens_per_step = global_batch * int(training["seq_len"])
+    normal_steps = set(
+        campaign.raw.get("measurement", {}).get("primary", {}).get("steps", [])
+    )
     phase_by_arm = _performance_phase_by_arm(campaign)
     for baseline, treatment in pairs:
         if baseline not in phase_by_arm or treatment not in phase_by_arm:
@@ -897,12 +1078,33 @@ def _pair_summaries(campaign: Campaign, phases: dict[str, Any]) -> list[dict[str
         components = {}
         errors = []
         for name in TIMER_EVENTS:
-            left = left_arm["structured_metrics"]["components_ms"][name][
-                "per_step_rank_max"
-            ]
-            right = right_arm["structured_metrics"]["components_ms"][name][
-                "per_step_rank_max"
-            ]
+            left_component = left_arm["structured_metrics"]["components_ms"][name]
+            right_component = right_arm["structured_metrics"]["components_ms"][name]
+            left = left_component["per_step_rank_max"]
+            right = right_component["per_step_rank_max"]
+            left_steps = left_component["steps"]
+            right_steps = right_component["steps"]
+            if normal_steps and left is not None and right is not None:
+                left_values = dict(zip(left_steps, left["samples"] if left else []))
+                right_values = dict(zip(right_steps, right["samples"] if right else []))
+                if name == "step_end":
+                    missing_left = sorted(normal_steps - left_values.keys())
+                    missing_right = sorted(normal_steps - right_values.keys())
+                    if missing_left:
+                        errors.append(
+                            f"{name} baseline missing normal steps {missing_left}"
+                        )
+                    if missing_right:
+                        errors.append(
+                            f"{name} treatment missing normal steps {missing_right}"
+                        )
+                selected = sorted(
+                    normal_steps & left_values.keys() & right_values.keys()
+                )
+                left = _summary([left_values[step] for step in selected])
+                right = _summary([right_values[step] for step in selected])
+                left_steps = selected
+                right_steps = selected
             if left is None or right is None:
                 components[name] = None
                 continue
@@ -910,12 +1112,6 @@ def _pair_summaries(campaign: Campaign, phases: dict[str, Any]) -> list[dict[str
                 errors.append(
                     f"{name} sample count differs: {left['count']} != {right['count']}"
                 )
-            left_steps = left_arm["structured_metrics"]["components_ms"][name][
-                "steps"
-            ]
-            right_steps = right_arm["structured_metrics"]["components_ms"][name][
-                "steps"
-            ]
             if left_steps != right_steps:
                 errors.append(f"{name} measured step identities differ")
             components[name] = {
@@ -931,7 +1127,10 @@ def _pair_summaries(campaign: Campaign, phases: dict[str, Any]) -> list[dict[str
                 "phase": phase_label,
                 "baseline": baseline,
                 "treatment": treatment,
-                "measurement_method": "paired configuration; per-step rank-max timing",
+                "measurement_method": (
+                    "paired configuration; full-step latency and throughput use the "
+                    "declared primary normal steps and per-step rank-max timing"
+                ),
                 "status": "passed" if not errors else "failed",
                 "errors": errors,
                 "components_ms": components,
@@ -939,14 +1138,13 @@ def _pair_summaries(campaign: Campaign, phases: dict[str, Any]) -> list[dict[str
                     name: _summary(
                         [
                             tokens_per_step * 1000.0 / value
-                            for value in arm["structured_metrics"]["components_ms"]
-                            ["step_end"]["per_step_rank_max"]["samples"]
+                            for value in components["step_end"][
+                                "baseline_ms" if name == baseline else "treatment_ms"
+                            ]["samples"]
                         ]
                     )
                     for name, arm in ((baseline, left_arm), (treatment, right_arm))
-                    if arm["structured_metrics"]["components_ms"]["step_end"]
-                    ["per_step_rank_max"]
-                    is not None
+                    if components.get("step_end") is not None
                 },
             }
         )
@@ -994,7 +1192,9 @@ def _run_tlparse(
         destination = output_root / f"trace_{index:03d}"
         command = [
             str(binary),
+            "parse",
             "--no-browser",
+            "--overwrite",
             "-o",
             str(destination),
             str(trace),
@@ -1034,6 +1234,356 @@ def _run_tlparse(
     }
 
 
+PLANNER_TIMING_FIELDS = (
+    "model_and_mesh_setup_s",
+    "graph_trace_s",
+    "optimizer_init_s",
+    "user_constraints_s",
+    "factor_build_s",
+    "solver_core_s",
+    "search_total_s",
+)
+
+
+def _planner_result(
+    run_root: Path,
+    expected: dict[str, Any],
+    *,
+    source_lock: dict[str, Any],
+    source_lock_sha256: str,
+) -> tuple[dict[str, Any], list[str]]:
+    root = (
+        run_root
+        / "planner"
+        / expected["point"]
+        / f"repeat_{int(expected['repeat']):02d}"
+        / expected["solver"]
+    )
+    errors = []
+    for marker in (
+        "started",
+        "completed",
+        "exit_code",
+        "command.json",
+        "result.json",
+        "stdout_stderr.log",
+    ):
+        if not (root / marker).is_file():
+            errors.append(f"missing {marker}: {root}")
+    if (root / "failed").exists():
+        errors.append(f"failed marker exists: {root}")
+    if errors:
+        return {"root": str(root)}, errors
+    try:
+        exit_code = int((root / "exit_code").read_text().strip())
+        command = json.loads((root / "command.json").read_text())
+        result = json.loads((root / "result.json").read_text())
+    except Exception as error:
+        return {"root": str(root)}, [f"invalid planner evidence at {root}: {error}"]
+    if exit_code != 0:
+        errors.append(f"nonzero exit code {exit_code}: {root}")
+    if result.get("status") != "success":
+        errors.append(f"planner result is not successful: {root}")
+    request = result.get("request", {})
+    expected_request = {
+        "model": "llama8b",
+        "mesh": ",".join(str(value) for value in expected["mesh"]),
+        "solver": expected["solver"],
+        "lazy_costs": (
+            str(expected["lazy_costs"]).lower()
+            if expected["lazy_costs"] is not None
+            else None
+        ),
+        "seeded": expected["seeded"],
+        "revision_label": source_lock["autoparallel"]["head"],
+    }
+    for name, value in expected_request.items():
+        if request.get(name) != value:
+            errors.append(
+                f"planner request {name} mismatch at {root}: "
+                f"{request.get(name)!r} != {value!r}"
+            )
+    if not isinstance(command, list) or not all(
+        isinstance(token, str) for token in command
+    ):
+        errors.append(f"planner command is not a string array: {root}")
+    elif "--source-lock" not in command or "--detailed-solution" not in command:
+        errors.append(
+            f"planner command lacks locked detailed profiling options: {root}"
+        )
+    if not request.get("source_lock"):
+        errors.append(f"planner request has no source lock: {root}")
+    lock_evidence = result.get("source_lock", {})
+    if lock_evidence.get("sha256") != source_lock_sha256:
+        errors.append(f"source-lock digest mismatch: {root}")
+    if lock_evidence.get("autoparallel", {}).get("head") != source_lock.get(
+        "autoparallel", {}
+    ).get("head"):
+        errors.append(f"source-lock AutoParallel head mismatch: {root}")
+    if result.get("expanded_config", {}).get("mesh_shape") != expected["mesh"]:
+        errors.append(f"expanded planner mesh mismatch: {root}")
+    objective = result.get("objective")
+    if not isinstance(objective, (int, float)) or not math.isfinite(objective):
+        errors.append(f"planner objective is not finite: {root}")
+    timings = result.get("timings", {})
+    for name in PLANNER_TIMING_FIELDS:
+        value = timings.get(name)
+        if not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+            errors.append(f"planner timing {name} is invalid: {root}")
+    row = {
+        **expected,
+        "status": "passed" if not errors else "failed",
+        "root": str(root),
+        "command": command,
+        "result": str(root / "result.json"),
+        "result_sha256": _sha256(root / "result.json"),
+        "log": str(root / "stdout_stderr.log"),
+        "objective": objective,
+        "placement_sha256": result.get("placement_sha256"),
+        "timings_s": {name: timings.get(name) for name in PLANNER_TIMING_FIELDS},
+        "environment": result.get("environment"),
+        "source_lock": lock_evidence,
+        "errors": errors,
+    }
+    return row, errors
+
+
+def _planner_rank_audit(campaign: Campaign, run_root: Path) -> dict[str, Any]:
+    allocation_paths = sorted(
+        (run_root / "allocation/planner/planner_profile").glob("rank_*.json")
+    )
+    exit_paths = sorted((run_root / "planner/runtime").glob("rank_*.exit_code"))
+    errors = []
+    allocation_ranks = set()
+    hosts = set()
+    for path in allocation_paths:
+        try:
+            row = json.loads(path.read_text())
+            allocation_ranks.add(int(row["rank"]))
+            hosts.add(row["hostname"])
+            if (
+                int(row["world_size"]) != campaign.world_size
+                or int(row["local_world_size"])
+                != int(campaign.raw["mast"]["nproc_per_node"])
+            ):
+                errors.append(f"allocation size mismatch: {path}")
+        except Exception as error:
+            errors.append(f"invalid allocation record {path}: {error}")
+    expected_ranks = set(range(campaign.world_size))
+    if allocation_ranks != expected_ranks:
+        errors.append(
+            "planner allocation rank set mismatch: "
+            f"{sorted(allocation_ranks)} != {sorted(expected_ranks)}"
+        )
+    if len(hosts) != int(campaign.raw["mast"]["nodes"]):
+        errors.append(f"planner allocation host count mismatch: {sorted(hosts)}")
+    exit_codes = {}
+    for path in exit_paths:
+        try:
+            rank = int(path.stem.removeprefix("rank_"))
+            exit_codes[rank] = int(path.read_text().strip())
+        except ValueError as error:
+            errors.append(f"invalid planner rank exit record {path}: {error}")
+    if set(exit_codes) != expected_ranks or any(exit_codes.values()):
+        errors.append(f"planner rank exits are incomplete or nonzero: {exit_codes}")
+    if not (run_root / "planner/all_ranks_completed").is_file():
+        errors.append("planner all-rank completion marker is missing")
+    return {
+        "status": "passed" if not errors else "failed",
+        "allocation_files": [str(path) for path in allocation_paths],
+        "allocation_ranks": sorted(allocation_ranks),
+        "hosts": sorted(hosts),
+        "rank_exit_codes": exit_codes,
+        "errors": errors,
+    }
+
+
+def _analyze_planner_campaign(
+    campaign: Campaign,
+    *,
+    attempt_root: Path,
+    output_dir: Path,
+) -> dict[str, Any]:
+    attempt_root = attempt_root.resolve()
+    output_dir = output_dir.resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    run_root = attempt_root / "run"
+    source_lock_path = attempt_root / "package/payload/campaign/source_lock.json"
+    source_lock = json.loads(source_lock_path.read_text())
+    source_lock_sha256 = _sha256(source_lock_path)
+    rows = []
+    errors = []
+    for expected in campaign.planner_runs():
+        row, run_errors = _planner_result(
+            run_root,
+            expected,
+            source_lock=source_lock,
+            source_lock_sha256=source_lock_sha256,
+        )
+        rows.append(row)
+        errors.extend(run_errors)
+
+    points = []
+    for point in campaign.raw["planner"]["points"]:
+        point_rows = [row for row in rows if row.get("point") == point["name"]]
+        candidates = [row for row in point_rows if row.get("role") == "candidate"]
+        references = [row for row in point_rows if row.get("role") == "reference"]
+        gaps = []
+        for repeat in range(1, int(campaign.raw["planner"]["repeats"]) + 1):
+            candidate = next(
+                (row for row in candidates if row.get("repeat") == repeat), None
+            )
+            reference = next(
+                (row for row in references if row.get("repeat") == repeat), None
+            )
+            if candidate is None or reference is None:
+                errors.append(f"{point['name']}: missing repeat {repeat} result pair")
+                continue
+            candidate_objective = candidate.get("objective")
+            reference_objective = reference.get("objective")
+            if not all(
+                isinstance(value, (int, float)) and math.isfinite(value) and value > 0
+                for value in (candidate_objective, reference_objective)
+            ):
+                errors.append(
+                    f"{point['name']}: invalid objective pair at repeat {repeat}"
+                )
+                continue
+            tolerance = max(abs(reference_objective) * 1e-8, 1e-6)
+            if candidate_objective + tolerance < reference_objective:
+                errors.append(
+                    f"{point['name']}: Approx objective is below the LP lower bound "
+                    f"at repeat {repeat}"
+                )
+            gaps.append(
+                {
+                    "repeat": repeat,
+                    "approx_objective": candidate_objective,
+                    "lp_objective": reference_objective,
+                    "gap_percent": (candidate_objective - reference_objective)
+                    / reference_objective
+                    * 100.0,
+                }
+            )
+
+        def timing_summary(selected: list[dict[str, Any]]) -> dict[str, Any]:
+            return {
+                name: _summary(
+                    [
+                        float(row["timings_s"][name])
+                        for row in selected
+                        if "timings_s" in row
+                    ]
+                )
+                for name in PLANNER_TIMING_FIELDS
+            }
+
+        points.append(
+            {
+                "point": point["name"],
+                "mesh": point["mesh"],
+                "approx": {
+                    "timings_s": timing_summary(candidates),
+                    "objectives": _summary(
+                        [
+                            float(row["objective"])
+                            for row in candidates
+                            if "objective" in row
+                        ]
+                    ),
+                    "placement_sha256": sorted(
+                        {
+                            row["placement_sha256"]
+                            for row in candidates
+                            if row.get("placement_sha256")
+                        }
+                    ),
+                },
+                "lp_reference": {
+                    "timings_s": timing_summary(references),
+                    "objectives": _summary(
+                        [
+                            float(row["objective"])
+                            for row in references
+                            if "objective" in row
+                        ]
+                    ),
+                },
+                "objective_gap_percent": _summary(
+                    [float(row["gap_percent"]) for row in gaps]
+                ),
+                "paired_repeats": gaps,
+            }
+        )
+
+    audits = {
+        "package": _package_audit(attempt_root),
+        "runtime_preflight": _load_audit(
+            run_root / "runtime/preflight/report.json", "runtime preflight"
+        ),
+        "runtime_planner_contract": _load_audit(
+            run_root / "runtime/configs/report.json", "runtime planner contract"
+        ),
+        "allocation_and_rank_completion": _planner_rank_audit(campaign, run_root),
+    }
+    if not (run_root / "planner/completed").is_file():
+        errors.append("planner campaign completion marker is missing")
+    valid = (
+        bool(rows)
+        and not errors
+        and all(row.get("status") == "passed" for row in rows)
+        and all(audit["status"] == "passed" for audit in audits.values())
+    )
+    report = {
+        "status": "passed" if valid else "incomplete",
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "campaign": campaign.name,
+        "campaign_type": "planner",
+        "classification": PLANNER_RESULT_CLASSIFICATION,
+        "training_performance_evidence": False,
+        "performance_conclusion_allowed": False,
+        "measurement_method": (
+            "three independent Approx lazy seeded searches and three independent "
+            "LP relaxations per mesh; solver time is search_total_s; gap is "
+            "(Approx objective - LP objective) / LP objective * 100%"
+        ),
+        "source_lock": str(source_lock_path),
+        "source_lock_sha256": source_lock_sha256,
+        "points": points,
+        "runs": rows,
+        "audits": audits,
+        "errors": errors,
+    }
+    write_json(output_dir / "analysis.json", report)
+    lines = [
+        f"# {campaign.name}",
+        "",
+        f"Status: `{report['status']}`",
+        "",
+        f"Classification: {PLANNER_RESULT_CLASSIFICATION}.",
+        "",
+        report["measurement_method"],
+        "",
+        "| Mesh | Approx search mean (s) | LP search mean (s) | Gap mean (%) |",
+        "|---|---:|---:|---:|",
+    ]
+    for point in points:
+        approx = point["approx"]["timings_s"]["search_total_s"]
+        reference = point["lp_reference"]["timings_s"]["search_total_s"]
+        gap = point["objective_gap_percent"]
+        lines.append(
+            f"| {point['point']} {point['mesh']} | "
+            f"{approx['mean'] if approx else 'n/a'} | "
+            f"{reference['mean'] if reference else 'n/a'} | "
+            f"{gap['mean'] if gap else 'n/a'} |"
+        )
+    lines.extend(
+        ["", f"Full machine-readable result: `{output_dir / 'analysis.json'}`"]
+    )
+    (output_dir / "report.md").write_text("\n".join(lines) + "\n")
+    return report
+
+
 def analyze_campaign(
     campaign: Campaign,
     *,
@@ -1041,6 +1591,12 @@ def analyze_campaign(
     output_dir: Path,
     tlparse_bin: Path | None = None,
 ) -> dict[str, Any]:
+    if campaign.is_planner:
+        return _analyze_planner_campaign(
+            campaign,
+            attempt_root=attempt_root,
+            output_dir=output_dir,
+        )
     attempt_root = attempt_root.resolve()
     output_dir = output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1091,6 +1647,8 @@ def analyze_campaign(
             run_root / "runtime/configs/report.json", "runtime config parity report"
         ),
         "allocation": _allocation_audit(campaign, run_root),
+        "runtime_input_hashes": _input_hash_audit(campaign, run_root),
+        "placements": _placement_audit(campaign, run_root),
         "parameter_state_moments": _parameter_state_audit(campaign, run_root),
     }
     if campaign.raw.get("data", {}).get("preflight_auditor"):

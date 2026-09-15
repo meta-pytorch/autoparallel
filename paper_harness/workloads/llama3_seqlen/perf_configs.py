@@ -122,7 +122,9 @@ if (WORLD_SIZE, TP_DEGREE) != (32, 8):
     raise ValueError(f"Unsupported mesh: {WORLD_SIZE=} {TP_DEGREE=}")
 DP_DEGREE = WORLD_SIZE // TP_DEGREE
 
-LOCAL_BATCH_SIZE = 2
+LOCAL_BATCH_SIZE = int(os.environ.get("BENCHMARK_LOCAL_BATCH_SIZE", "2"))
+if LOCAL_BATCH_SIZE not in (2, 4, 8):
+    raise ValueError(f"Unsupported local batch size: {LOCAL_BATCH_SIZE}")
 SEQ_LEN = int(os.environ["BENCHMARK_SEQ_LEN"])
 if SEQ_LEN not in SUPPORTED_SEQUENCE_LENGTHS:
     raise ValueError(f"Unsupported sequence length: {SEQ_LEN}")
@@ -212,6 +214,17 @@ def _placement_digest(payload: dict[str, dict[str, object]]) -> str:
     ).hexdigest()
 
 
+def _batch_digest(input_dict: dict[str, torch.Tensor], labels: torch.Tensor) -> str:
+    digest = hashlib.sha256()
+    for name, tensor in [*sorted(input_dict.items()), ("labels", labels)]:
+        value = tensor.detach().cpu().contiguous()
+        digest.update(name.encode())
+        digest.update(str(value.dtype).encode())
+        digest.update(json.dumps(list(value.shape)).encode())
+        digest.update(value.view(torch.uint8).numpy().tobytes())
+    return digest.hexdigest()
+
+
 def parallelize_autoparallel_graphtrainer_seqlen_llama(
     model,
     *,
@@ -257,16 +270,29 @@ def parallelize_autoparallel_graphtrainer_seqlen_llama(
     if strategy_mode not in ("fresh", "replay_2k"):
         raise ValueError(f"Unsupported AP_STRATEGY_MODE={strategy_mode!r}")
     canonical_path = Path(os.environ["AP_CANONICAL_PLACEMENT"])
+    canonical_source = os.environ.get("AP_CANONICAL_SOURCE", "asset")
+    if canonical_source not in ("asset", "in_job"):
+        raise ValueError(f"Unsupported AP_CANONICAL_SOURCE={canonical_source!r}")
     expected_canonical_sha256 = os.environ.get("EXPECTED_CANONICAL_SHA256", "")
     canonical_file_sha256 = None
     canonical_payload = None
     if canonical_path.is_file():
         canonical_file_sha256 = hashlib.sha256(canonical_path.read_bytes()).hexdigest()
-        if canonical_file_sha256 != expected_canonical_sha256:
+        if canonical_source == "asset" and not expected_canonical_sha256:
+            raise RuntimeError("Asset canonical placement requires an expected SHA-256")
+        if expected_canonical_sha256 and canonical_file_sha256 != expected_canonical_sha256:
             raise RuntimeError(
                 "Canonical placement file hash mismatch: "
                 f"{canonical_file_sha256} != {expected_canonical_sha256}"
             )
+        if canonical_source == "in_job":
+            run_root = (Path(os.environ["DUMP_DIR"]) / "run").resolve()
+            try:
+                canonical_path.resolve().relative_to(run_root)
+            except ValueError as error:
+                raise RuntimeError(
+                    f"In-job canonical placement is outside the run root: {canonical_path}"
+                ) from error
         canonical_manifest = json.loads(canonical_path.read_text())
         if canonical_manifest.get("version") != 1:
             raise RuntimeError(f"Unexpected placement version: {canonical_path}")
@@ -331,6 +357,7 @@ def parallelize_autoparallel_graphtrainer_seqlen_llama(
         dense_mesh,
         mp_policy=mp_policy,
         reshard_after_forward=reshard_after_forward,
+        solver=compile_config.autoparallel_solver,
     )
     with autop_context as autop:
         trace_seconds = time.perf_counter() - trace_start
@@ -346,6 +373,9 @@ def parallelize_autoparallel_graphtrainer_seqlen_llama(
             solver_invoked = True
             solution_path = audit_dir / f"solution_rank_{rank:03d}.json"
             autop.sharding_optimizer.save_placements(solution_path)
+            solution_file_sha256 = hashlib.sha256(
+                solution_path.read_bytes()
+            ).hexdigest()
             solution_payload = json.loads(solution_path.read_text())["placements"]
         else:
             sharding_placement = autop.sharding_optimizer.load_placements(
@@ -353,6 +383,7 @@ def parallelize_autoparallel_graphtrainer_seqlen_llama(
             )
             solver_invoked = False
             solution_path = canonical_path
+            solution_file_sha256 = canonical_file_sha256
             solution_payload = _placement_payload(sharding_placement)
             if solution_payload != canonical_payload:
                 raise RuntimeError("Loaded solution differs from the canonical 2K plan")
@@ -431,12 +462,15 @@ def parallelize_autoparallel_graphtrainer_seqlen_llama(
     audit = {
         "rank": rank,
         "mode": strategy_mode,
+        "configured_solver": compile_config.autoparallel_solver,
         "solver_invoked": solver_invoked,
+        "canonical_source": canonical_source,
         "canonical_sequence_length": CANONICAL_SEQUENCE_LENGTH,
         "target_sequence_length": training.seq_len,
         "mesh_shape": list(mesh_shape),
         "mesh_dim_names": list(dense_mesh.mesh_dim_names),
         "placement_file": str(solution_path),
+        "placement_file_sha256": solution_file_sha256,
         "canonical_file": str(canonical_path),
         "canonical_file_sha256": canonical_file_sha256,
         "placement_digest": solution_digest,
@@ -568,6 +602,7 @@ class AuditedC4DataLoader(ParallelAwareDataloader):
         **kwargs,
     ) -> None:
         del kwargs
+        self._audit_dp_rank = dp_rank
         dataset = PinnedC4Dataset(
             dataset_name=config.dataset,
             dataset_path=config.dataset_path,
@@ -597,6 +632,24 @@ class AuditedC4DataLoader(ParallelAwareDataloader):
             raise ValueError("FIXED_REPLAY_BATCHES must be positive")
         source = super().__iter__()
         replay_batches = [next(source) for _ in range(replay_size)]
+        audit_root = Path(os.environ["INPUT_AUDIT_DIR"])
+        audit_root.mkdir(parents=True, exist_ok=True)
+        (audit_root / f"rank_{int(os.environ['RANK']):05d}.json").write_text(
+            json.dumps(
+                {
+                    "rank": int(os.environ["RANK"]),
+                    "dp_rank": self._audit_dp_rank,
+                    "batch_count": len(replay_batches),
+                    "batch_sha256": [
+                        _batch_digest(input_dict, labels)
+                        for input_dict, labels in replay_batches
+                    ],
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n"
+        )
         batch_index = 0
         while True:
             input_dict, labels = replay_batches[batch_index % replay_size]
@@ -692,6 +745,7 @@ def _graph_config():
         inductor_compilation="full",
         disable_passes=["cudagraph_pass"],
         enable_autoparallel=True,
+        autoparallel_solver="approx",
     )
     return config
 

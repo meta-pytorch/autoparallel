@@ -32,38 +32,74 @@ point = "128gpu"
 
 [[settings]]
 model = "llama3_8b"
-setting = "3d-dp2-cp2-tp2"
+setting = "3d-long-2x2x4"
 campaign = "campaigns/llama3_8b_3d.toml"
+point = "2x2x4"
 
 [[settings]]
 model = "llama3_8b"
-setting = "seqlen-2k"
-campaign = "campaigns/llama3_8b_seqlen.toml"
-point = "2k"
+setting = "3d-long-4x2x4"
+campaign = "campaigns/llama3_8b_3d.toml"
+point = "4x2x4"
 
 [[settings]]
 model = "llama3_8b"
-setting = "seqlen-4k"
-campaign = "campaigns/llama3_8b_seqlen.toml"
-point = "4k"
+setting = "3d-long-8x2x4"
+campaign = "campaigns/llama3_8b_3d.toml"
+point = "8x2x4"
 
 [[settings]]
 model = "llama3_8b"
-setting = "seqlen-8k"
-campaign = "campaigns/llama3_8b_seqlen.toml"
-point = "8k"
+setting = "replanning-seq2k-lb2"
+campaign = "campaigns/llama3_8b_replanning_approx.toml"
+point = "seq2k-lb2"
 
 [[settings]]
 model = "llama3_8b"
-setting = "seqlen-16k"
-campaign = "campaigns/llama3_8b_seqlen.toml"
-point = "16k"
+setting = "replanning-seq4k-lb2"
+campaign = "campaigns/llama3_8b_replanning_approx.toml"
+point = "seq4k-lb2"
 
 [[settings]]
 model = "llama3_8b"
-setting = "seqlen-32k"
-campaign = "campaigns/llama3_8b_seqlen.toml"
-point = "32k"
+setting = "replanning-seq8k-lb2"
+campaign = "campaigns/llama3_8b_replanning_approx.toml"
+point = "seq8k-lb2"
+
+[[settings]]
+model = "llama3_8b"
+setting = "replanning-seq16k-lb2"
+campaign = "campaigns/llama3_8b_replanning_approx.toml"
+point = "seq16k-lb2"
+
+[[settings]]
+model = "llama3_8b"
+setting = "replanning-seq32k-lb2"
+campaign = "campaigns/llama3_8b_replanning_approx.toml"
+point = "seq32k-lb2"
+
+[[settings]]
+model = "llama3_8b"
+setting = "replanning-seq2k-lb4"
+campaign = "campaigns/llama3_8b_replanning_approx.toml"
+point = "seq2k-lb4"
+
+[[settings]]
+model = "llama3_8b"
+setting = "replanning-seq2k-lb8"
+campaign = "campaigns/llama3_8b_replanning_approx.toml"
+point = "seq2k-lb8"
+
+[[settings]]
+model = "llama3_8b"
+setting = "planning-scalability"
+campaign = "campaigns/llama3_8b_planner.toml"
+
+[[settings]]
+model = "muse_glimmer_30b"
+setting = "2d-8gpu"
+campaign = "campaigns/muse_glimmer_30b.toml"
+point = "8gpu"
 
 [[settings]]
 model = "muse_glimmer_30b"
@@ -84,19 +120,19 @@ campaign = "campaigns/muse_glimmer_30b.toml"
 point = "64gpu"
 
 [[settings]]
-model = "muse_glimmer_30b"
-setting = "2d-128gpu"
-campaign = "campaigns/muse_glimmer_30b.toml"
-point = "128gpu"
+model = "deepseek_v3_16b"
+setting = "3d-2x2x4"
+campaign = "campaigns/deepseek_v3_16b.toml"
+point = "2x2x4"
 
 [[settings]]
 model = "deepseek_v3_16b"
-setting = "efsdp-ep-16gpu"
+setting = "3d-2x2x8"
 campaign = "campaigns/deepseek_v3_16b.toml"
-point = "16gpu"
+point = "2x2x8"
 
 [[settings]]
 model = "deepseek_v3_16b"
-setting = "efsdp-ep-32gpu"
+setting = "3d-4x2x8"
 campaign = "campaigns/deepseek_v3_16b.toml"
-point = "32gpu"
+point = "4x2x8"

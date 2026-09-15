@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import math
+import re
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -88,7 +89,13 @@ TOP_LEVEL_KEYS = {
     "matrix",
     "selected_point",
     "execution_mode",
+    "campaign_type",
+    "planner",
 }
+
+PLANNER_RESULT_CLASSIFICATION = (
+    "planner-only fake-H100 cost-model evidence; not GPU training performance"
+)
 
 
 @dataclass(frozen=True)
@@ -138,6 +145,42 @@ class Campaign:
 
     def arm(self, name: str) -> Arm:
         return next(arm for arm in self.arms if arm.name == name)
+
+    @property
+    def campaign_type(self) -> str:
+        return str(self.raw.get("campaign_type", "training"))
+
+    @property
+    def is_planner(self) -> bool:
+        return self.campaign_type == "planner"
+
+    def planner_runs(self) -> list[dict[str, Any]]:
+        if not self.is_planner:
+            return []
+        planner = self.raw["planner"]
+        runs = []
+        for point in planner["points"]:
+            for repeat in range(1, int(planner["repeats"]) + 1):
+                for role, solver in (
+                    ("candidate", planner["solver"]),
+                    ("reference", planner["reference_solver"]),
+                ):
+                    runs.append(
+                        {
+                            "point": point["name"],
+                            "mesh": list(point["mesh"]),
+                            "repeat": repeat,
+                            "role": role,
+                            "solver": solver,
+                            "lazy_costs": bool(planner["lazy_costs"])
+                            if role == "candidate"
+                            else None,
+                            "seeded": bool(planner["seeded"])
+                            if role == "candidate"
+                            else False,
+                        }
+                    )
+        return runs
 
     def source_specs(self) -> dict[str, dict[str, Any]]:
         return copy.deepcopy(self.raw["sources"])
@@ -221,6 +264,9 @@ class Campaign:
             }
             for phase in self.phases
         ]
+        if self.is_planner:
+            value["result_classification"] = PLANNER_RESULT_CLASSIFICATION
+            value["resolved_planner_runs"] = self.planner_runs()
         return value
 
 
@@ -374,6 +420,78 @@ def _parse_phases(raw: dict[str, Any], arm_names: set[str]) -> tuple[Phase, ...]
     return tuple(result)
 
 
+def _validate_planner(campaign: Campaign) -> None:
+    raw = campaign.raw
+    allowed = {
+        "schema_version",
+        "name",
+        "description",
+        "workload",
+        "campaign_type",
+        "sources",
+        "mast",
+        "planner",
+        "execution_mode",
+    }
+    unknown = set(raw) - allowed
+    if unknown:
+        raise CampaignError(f"planner campaign has unsupported keys: {sorted(unknown)}")
+    if raw["workload"] != "planner_profile":
+        raise CampaignError("planner campaign workload must be 'planner_profile'")
+    if campaign.arms or campaign.phases:
+        raise CampaignError("planner campaigns cannot contain training arms or phases")
+    mast = raw["mast"]
+    if int(mast["nodes"]) != 1 or int(mast["nproc_per_node"]) != 8:
+        raise CampaignError("planner campaigns require one host with eight MAST ranks")
+
+    planner = raw.get("planner")
+    required = {
+        "model",
+        "repeats",
+        "solver",
+        "lazy_costs",
+        "seeded",
+        "reference_solver",
+        "points",
+    }
+    if not isinstance(planner, dict) or set(planner) != required:
+        raise CampaignError(f"[planner] requires exactly {sorted(required)}")
+    if planner["model"] != "llama8b":
+        raise CampaignError("planner.model must be 'llama8b'")
+    if planner["solver"] != "approx":
+        raise CampaignError("planner.solver must be 'approx'")
+    if planner["lazy_costs"] is not True or planner["seeded"] is not True:
+        raise CampaignError(
+            "Approx planner runs require lazy_costs=true and seeded=true"
+        )
+    if planner["reference_solver"] != "lp":
+        raise CampaignError("planner.reference_solver must be 'lp'")
+    if not isinstance(planner["repeats"], int) or planner["repeats"] <= 0:
+        raise CampaignError("planner.repeats must be a positive integer")
+    points = planner["points"]
+    if not isinstance(points, list) or not points:
+        raise CampaignError("planner.points must be a non-empty array of tables")
+    names = []
+    for index, point in enumerate(points):
+        if not isinstance(point, dict) or set(point) != {"name", "mesh"}:
+            raise CampaignError(f"planner.points[{index}] requires name and mesh")
+        name = point["name"]
+        mesh = point["mesh"]
+        if not isinstance(name, str) or not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", name):
+            raise CampaignError(f"planner.points[{index}].name is invalid")
+        if (
+            not isinstance(mesh, list)
+            or not 1 <= len(mesh) <= 4
+            or not all(isinstance(value, int) and value > 0 for value in mesh)
+        ):
+            raise CampaignError(
+                f"planner.points[{index}].mesh must contain 1 to 4 positive integers"
+            )
+        names.append(name)
+    if len(names) != len(set(names)):
+        raise CampaignError("planner point names must be unique")
+
+
 def _validate_campaign(campaign: Campaign) -> None:
     raw = campaign.raw
     unknown = set(raw) - TOP_LEVEL_KEYS
@@ -381,6 +499,8 @@ def _validate_campaign(campaign: Campaign) -> None:
         raise CampaignError(f"unknown top-level keys: {sorted(unknown)}")
     if raw.get("schema_version") != 1:
         raise CampaignError("schema_version must be 1")
+    if campaign.campaign_type not in {"training", "planner"}:
+        raise CampaignError(f"unknown campaign_type {campaign.campaign_type!r}")
     if not raw.get("name") or not raw.get("workload"):
         raise CampaignError("name and workload are required")
     sources = raw.get("sources")
@@ -435,6 +555,10 @@ def _validate_campaign(campaign: Campaign) -> None:
             raise CampaignError(f"{owner}.TORCHINDUCTOR_CUDAGRAPHS must be '0'")
     if mast_environment.get("TORCHINDUCTOR_CUDAGRAPHS") != "0":
         raise CampaignError("mast.environment.TORCHINDUCTOR_CUDAGRAPHS must be '0'")
+
+    if campaign.is_planner:
+        _validate_planner(campaign)
+        return
 
     comparison = raw.get("comparison", {})
     if len(campaign.arms) > 1:
@@ -694,6 +818,8 @@ def _apply_mode(raw: dict[str, Any], mode: str) -> dict[str, Any]:
     result["execution_mode"] = mode
     if mode == "formal":
         return result
+    if result.get("campaign_type", "training") == "planner":
+        raise CampaignError("planner campaigns support only formal mode")
 
     result.pop("measurement", None)
     comparison = result.get("comparison", {})
@@ -804,9 +930,10 @@ def _inject_experiment_lock(raw: dict[str, Any]) -> dict[str, Any]:
     result = copy.deepcopy(raw)
     result["sources"] = copy.deepcopy(lock["sources"])
     result.setdefault("mast", {})["conda_fbpkg"] = lock["runtime"]["conda_fbpkg"]
-    result.setdefault("parallelism", {})["spmd_backend"] = lock["execution"][
-        "spmd_backend"
-    ]
+    if result.get("campaign_type", "training") == "training":
+        result.setdefault("parallelism", {})["spmd_backend"] = lock["execution"][
+            "spmd_backend"
+        ]
     return result
 
 
@@ -817,8 +944,12 @@ def load_campaign(
     with path.open("rb") as stream:
         authored = _inject_experiment_lock(tomllib.load(stream))
         raw = _apply_mode(_apply_matrix(authored, point), mode)
-    arms = _parse_arms(raw)
-    phases = _parse_phases(raw, {arm.name for arm in arms})
+    if raw.get("campaign_type", "training") == "planner":
+        arms: tuple[Arm, ...] = ()
+        phases: tuple[Phase, ...] = ()
+    else:
+        arms = _parse_arms(raw)
+        phases = _parse_phases(raw, {arm.name for arm in arms})
     campaign = Campaign(path=path, raw=raw, arms=arms, phases=phases)
     _validate_campaign(campaign)
     return campaign

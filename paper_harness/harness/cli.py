@@ -5,6 +5,7 @@ import json
 import re
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .analysis import analyze_campaign
@@ -88,10 +89,10 @@ def _submitted_job_id(output: str) -> str:
 
 def _run_torchx(attempt: Path, *, dryrun: bool) -> dict:
     package_report = _verify_sealed_attempt(attempt)
-    if not package_report["validation"].get("probe_configs"):
+    if not package_report["validation"].get("application_contract_validated"):
         raise CampaignError(
-            "MAST rendering/submission requires ConfigManager validation in the "
-            "exact compatible Python environment"
+            "MAST rendering/submission requires application-contract validation "
+            "in the exact compatible Python environment"
         )
     if not dryrun:
         dryrun_path = attempt / "dryrun_audit.json"
@@ -144,6 +145,7 @@ def _run_torchx(attempt: Path, *, dryrun: bool) -> dict:
     (attempt / "job_id.txt").write_text(f"{job_id}\n")
     result = {
         "status": "submitted",
+        "submitted_at_utc": datetime.now(timezone.utc).isoformat(),
         "command": command,
         "job_id": job_id,
         "handle": handle,
@@ -161,6 +163,7 @@ def build_parser() -> argparse.ArgumentParser:
     run = subparsers.add_parser("run")
     run.add_argument("--model", required=True)
     run.add_argument("--setting", required=True)
+    run.add_argument("--attempt-number", type=int, default=1)
 
     validate = subparsers.add_parser("validate")
     validate.add_argument("campaign", type=Path)
@@ -194,7 +197,9 @@ def main() -> None:
     args = build_parser().parse_args()
     try:
         if args.command == "run":
-            result = run_reproduction(args.model, args.setting)
+            result = run_reproduction(
+                args.model, args.setting, attempt_number=args.attempt_number
+            )
         elif args.command == "validate":
             campaign = load_campaign(args.campaign, point=args.point, mode=args.mode)
             assets = _asset_roots(args.asset_root)

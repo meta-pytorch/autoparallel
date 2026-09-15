@@ -1,6 +1,6 @@
 schema_version = 1
-name = "llama3-8b-2d-unified"
-description = "Pinned LLaMA 3 8B MainTrainer, GraphTrainer, and AutoParallel scale-up"
+name = "llama3-8b-2d-approx"
+description = "Pinned LLaMA 3 8B three-arm Approx scale-up"
 workload = "llama3_8b_2d"
 
 [model]
@@ -42,7 +42,17 @@ create_seed_checkpoint = false
 declared_variable = "training_parallelization_compile_stack"
 allowed_config_paths = ["compile.*", "model_spec.name"]
 allowed_environment_keys = ["BENCHMARK_CONFIGURATION", "EXPERIMENT_ARM", "BENCHMARK_TP_DEGREE"]
-pairs = [["gt_manual", "apgt"], ["tt_main_tp", "apgt"]]
+pairs = [
+  ["tt_main_tp", "gt_manual"],
+  ["tt_main_tp", "apgt"],
+  ["gt_manual", "apgt"],
+]
+
+[measurement.primary]
+source = "structured_logs"
+steps = [7, 8, 9, 12, 13, 14, 17, 18, 19, 22, 23, 24]
+rank_selector = "latest_fetching_batch_end"
+value = "step_end_minus_fetching_batch_end"
 
 [mast]
 nodes = 1
@@ -97,6 +107,8 @@ name = "apgt"
 profile = "apgt_validated_v1"
 module = "workloads.llama3_2d.perf_configs"
 config = "autoparallel_graphtrainer_8b"
+[arms.overrides]
+"compile.autoparallel_solver" = "approx"
 [arms.environment]
 BENCHMARK_CONFIGURATION = "autoparallel_graphtrainer"
 EXPERIMENT_ARM = "G"
