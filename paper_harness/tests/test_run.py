@@ -277,6 +277,8 @@ class SubmissionLifecycleTests(unittest.TestCase):
                         "arguments": [
                             "--rdzv_backend",
                             "mast",
+                            "--rdzv_conf",
+                            "use_libuv=True",
                             "--rdzv_id",
                             "test-campaign-wangkj-abc123",
                             "--nnodes",
@@ -329,6 +331,27 @@ class SubmissionLifecycleTests(unittest.TestCase):
         resolved["name"] = "test-campaign"
         checks, _ = _definition_checks(
             definition,
+            resolved=resolved,
+            launcher_root=launcher,
+            command=command,
+            combined=None,
+        )
+        self.assertTrue(all(checks.values()), checks)
+
+        resolved["mast"]["nodes"] = 1
+        definition["hpcTaskGroups"][0]["taskCount"] = 1
+        arguments = definition["hpcTaskGroups"][0]["spec"]["arguments"]
+        arguments[arguments.index("--nnodes") + 1] = "1"
+        arguments[arguments.index("--rdzv_backend") + 1] = "c10d"
+        config_index = arguments.index("--rdzv_conf")
+        del arguments[config_index : config_index + 2]
+        insert_at = arguments.index("--rdzv_backend") + 2
+        arguments[insert_at:insert_at] = [
+            "--rdzv_endpoint",
+            "localhost:0",
+        ]
+        checks, _ = _definition_checks(
+            {"status": "ok", "data": definition},
             resolved=resolved,
             launcher_root=launcher,
             command=command,

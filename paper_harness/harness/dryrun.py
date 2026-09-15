@@ -256,8 +256,25 @@ def _definition_checks(
         _argument(arguments, "--nproc-per-node") == str(mast["nproc_per_node"]),
         checks,
     )
+    single_node = int(mast["nodes"]) == 1
     _check(
-        "rendezvous_backend", _argument(arguments, "--rdzv_backend") == "mast", checks
+        "rendezvous_backend",
+        _argument(arguments, "--rdzv_backend") == ("c10d" if single_node else "mast"),
+        checks,
+    )
+    _check(
+        "rendezvous_endpoint",
+        _argument(arguments, "--rdzv_endpoint") == "localhost:0"
+        if single_node
+        else "--rdzv_endpoint" not in arguments,
+        checks,
+    )
+    _check(
+        "rendezvous_config",
+        "--rdzv_conf" not in arguments
+        if single_node
+        else _argument(arguments, "--rdzv_conf") == "use_libuv=True",
+        checks,
     )
     _check("rendezvous_id", _argument(arguments, "--rdzv_id") == job_name, checks)
     _check(
