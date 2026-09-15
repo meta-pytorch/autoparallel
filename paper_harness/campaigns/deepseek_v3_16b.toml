@@ -53,6 +53,7 @@ AP_COLLECTIVE_MUST_SAVE_EXPECTATION = "off"
 HF_HUB_OFFLINE = "1"
 HF_DATASETS_OFFLINE = "1"
 PYTORCH_ALLOC_CONF = "expandable_segments:True"
+TORCHINDUCTOR_CUDAGRAPHS = "0"
 
 [artifacts]
 required_assets = ["offline_c4", "deepseek_tokenizer"]

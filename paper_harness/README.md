@@ -51,10 +51,12 @@ requires a version bump and manifest regeneration.
 
 - `tt_main_default_v1`: native TorchTitan model/parallelizer with ordinary
   Inductor compilation.
-- `gt_manual_eager_v1`: native GraphTrainer defaults with only the memory
-  policy set to `eager`, matching MainTrainer selective activation
-  checkpointing.
+- `gt_manual_eager_v1`: GraphTrainer with eager memory policy and full Inductor
+  compilation.
 - `apgt_validated_v1`: AutoParallel + GraphTrainer validated defaults.
+
+All active settings set `TORCHINDUCTOR_CUDAGRAPHS=0`. Both GraphTrainer
+profiles use full Inductor compilation and disable `cudagraph_pass`.
 
 MainTrainer and manual GraphTrainer never import or invoke the AutoParallel
 parallelizer. The AutoParallel profile is the only profile that enables

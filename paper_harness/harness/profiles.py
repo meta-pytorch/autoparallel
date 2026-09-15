@@ -47,16 +47,16 @@ def validate_profile(arm: Arm, config: dict[str, Any]) -> dict[str, Any]:
                 "compile.backend": "aot_eager",
                 "compile.mode": "aot_fx_trace",
                 "compile.memory_policy": "eager",
-                "compile.inductor_compilation": "regional",
+                "compile.inductor_compilation": "full",
                 "compile.numerics_changing_optim": False,
                 "compile.enable_fsdp_ag_rs_overlap": False,
                 "compile.enable_fsdp_dense_region_overlap": False,
                 "compile.enable_autoparallel": False,
             },
         )
-        if _get(config, "compile.disable_passes") != []:
+        if set(_get(config, "compile.disable_passes")) != {"cudagraph_pass"}:
             raise CampaignError(
-                "gt_manual_eager_v1 must retain GraphTrainer's default pass list"
+                "gt_manual_eager_v1 requires only cudagraph_pass to be disabled"
             )
     elif arm.profile == "apgt_validated_v1":
         _expect(

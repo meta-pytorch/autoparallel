@@ -57,6 +57,7 @@ BENCHMARK_REPLAY_MANIFEST_SHA256 = "ca3dba04e7e95c2f0ed6a73f4f649836422a3e5efbf6
 BENCHMARK_SEED_CHECKPOINT = "{asset:llama3_3d_seed_checkpoint}"
 LLAMA_TOKENIZER_DIR = "{asset:llama3_3d_tokenizer}"
 PYTORCH_ALLOC_CONF = "expandable_segments:True"
+TORCHINDUCTOR_CUDAGRAPHS = "0"
 
 [artifacts]
 required_assets = ["llama3_3d_placements", "llama3_3d_replay", "llama3_3d_seed_checkpoint", "llama3_3d_tokenizer"]

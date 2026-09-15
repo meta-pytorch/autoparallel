@@ -27,8 +27,20 @@ def muse_glimmer_30b_sdpa_c4_torchtitan_4x2():
 
 
 def graph_trainer_muse_glimmer_30b_sdpa_c4_4x2():
-    return _with_post_load_audit(_graphtrainer_manual())
+    config = _with_post_load_audit(_graphtrainer_manual())
+    config.compile = replace(
+        config.compile,
+        inductor_compilation="full",
+        disable_passes=["cudagraph_pass"],
+    )
+    return config
 
 
 def graph_trainer_muse_glimmer_30b_sdpa_c4_autoparallel_4x2():
-    return _with_post_load_audit(_graphtrainer_ap())
+    config = _with_post_load_audit(_graphtrainer_ap())
+    config.compile = replace(
+        config.compile,
+        inductor_compilation="full",
+        disable_passes=["cudagraph_pass"],
+    )
+    return config

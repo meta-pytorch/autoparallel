@@ -41,6 +41,10 @@ class CampaignTests(unittest.TestCase):
                     campaign.raw["parallelism"]["spmd_backend"],
                     "default",
                 )
+                self.assertEqual(
+                    campaign.raw["mast"]["environment"]["TORCHINDUCTOR_CUDAGRAPHS"],
+                    "0",
+                )
 
     def test_authored_source_runtime_and_backend_pins_are_rejected(self) -> None:
         source = (REPO_ROOT / "campaigns/llama3_8b_2d.toml").read_text()
@@ -73,6 +77,18 @@ class CampaignTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(CampaignError, "spmd_backend is forbidden"):
                 load_campaign(backend_pin, point="8gpu")
+
+            cudagraph_enabled = root / "cudagraph.toml"
+            cudagraph_enabled.write_text(
+                source.replace(
+                    'TORCHINDUCTOR_CUDAGRAPHS = "0"',
+                    'TORCHINDUCTOR_CUDAGRAPHS = "1"',
+                )
+            )
+            with self.assertRaisesRegex(
+                CampaignError, "TORCHINDUCTOR_CUDAGRAPHS must be '0'"
+            ):
+                load_campaign(cudagraph_enabled, point="8gpu")
 
     def test_canonical_matrix_points(self) -> None:
         cases = {

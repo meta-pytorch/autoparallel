@@ -66,6 +66,7 @@ HF_HUB_OFFLINE = "1"
 HF_DATASETS_OFFLINE = "1"
 HF_HUB_DISABLE_XET = "1"
 PYTORCH_ALLOC_CONF = "expandable_segments:True"
+TORCHINDUCTOR_CUDAGRAPHS = "0"
 
 [artifacts]
 required_assets = ["llama_tokenizer", "llama_replay", "llama3_3d_seed_checkpoint"]

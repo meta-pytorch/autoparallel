@@ -416,7 +416,8 @@ def _validate_campaign(campaign: Campaign) -> None:
             "mast.locality must be an explicit 'dc;NAME' or 'region;NAME' constraint"
         )
 
-    environment_maps = [("mast.environment", mast.get("environment", {}))]
+    mast_environment = mast.get("environment", {})
+    environment_maps = [("mast.environment", mast_environment)]
     environment_maps.extend(
         (f"arms.{arm.name}.environment", arm.environment) for arm in campaign.arms
     )
@@ -430,6 +431,10 @@ def _validate_campaign(campaign: Campaign) -> None:
         reserved = sorted(set(environment) & RESERVED_ENVIRONMENT_KEYS)
         if reserved:
             raise CampaignError(f"{owner} sets harness-reserved keys: {reserved}")
+        if environment.get("TORCHINDUCTOR_CUDAGRAPHS", "0") != "0":
+            raise CampaignError(f"{owner}.TORCHINDUCTOR_CUDAGRAPHS must be '0'")
+    if mast_environment.get("TORCHINDUCTOR_CUDAGRAPHS") != "0":
+        raise CampaignError("mast.environment.TORCHINDUCTOR_CUDAGRAPHS must be '0'")
 
     comparison = raw.get("comparison", {})
     if len(campaign.arms) > 1:

@@ -689,6 +689,8 @@ def _graph_config():
     config.compile = GraphTrainerCompileConfig(
         enable=True,
         components=["model", "loss"],
+        inductor_compilation="full",
+        disable_passes=["cudagraph_pass"],
         enable_autoparallel=True,
     )
     return config

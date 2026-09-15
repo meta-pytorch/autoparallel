@@ -385,6 +385,8 @@ def _graph_config(*, enable_autoparallel: bool):
         enable=True,
         components=["model", "loss"],
         memory_policy="eager",
+        inductor_compilation="full",
+        disable_passes=["cudagraph_pass"],
         enable_autoparallel=enable_autoparallel,
     )
     return config
