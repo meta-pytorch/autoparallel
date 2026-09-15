@@ -8,6 +8,7 @@ from .campaign import CampaignError
 MANIFEST_NAME = "HARNESS_CORE.sha256"
 CORE_PATHS = (
     "asset_lock.toml",
+    "campaigns",
     "experiment_lock.toml",
     "harness",
     "launcher",

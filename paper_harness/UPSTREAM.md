@@ -43,5 +43,5 @@ or runtime pins and cannot override the locked `default` DTensor backend.
 Original campaign files are preserved under `provenance/campaigns/`.
 
 A moving branch name is not evidence for a result. Every report records the
-exact harness tip, runtime source commits, lock digest, source tree digests,
-runtime versions, resolved campaign, asset hashes, and command.
+exact harness content manifest, runtime source commits, lock digest, source
+tree digests, runtime versions, resolved campaign, asset hashes, and command.

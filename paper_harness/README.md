@@ -43,9 +43,9 @@ counts, and content hashes for every model, tokenizer, replay, placement, and
 dataset asset. There is no fallback to an unpinned local path or network
 download.
 
-`HARNESS_CORE.sha256` covers the lock files, harness, launcher, active
-workloads, and measurement scripts. A code change requires a version bump and
-manifest regeneration.
+`HARNESS_CORE.sha256` covers the lock files, active campaigns, harness,
+launcher, active workloads, and measurement scripts. A code or campaign change
+requires a version bump and manifest regeneration.
 
 ## Execution profiles
 
