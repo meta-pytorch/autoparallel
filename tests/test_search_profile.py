@@ -4,6 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import gc
+import hashlib
 import json
 import math
 import os
@@ -19,8 +20,10 @@ import torch
 from search_profile import (
     ProfiledAutoParallel,
     finite,
+    main,
     parse_args,
     solution_fingerprint,
+    source_lock_metadata,
     validate_args,
     validate_solution,
 )
@@ -51,6 +54,96 @@ def _args(*values):
             "unused.json",
         ]
     )
+
+
+def _source_lock():
+    return {
+        "autoparallel": {
+            "name": "autoparallel",
+            "root": "/source/autoparallel",
+            "remote": "https://github.com/meta-pytorch/autoparallel.git",
+            "expected_remote": "https://github.com/meta-pytorch/autoparallel.git",
+            "head": "1" * 40,
+            "branch": "<detached>",
+            "commit_time": "2026-09-15T00:00:00-07:00",
+            "dirty": False,
+            "dirty_policy": "forbid",
+            "status": [],
+            "tree_sha256": "2" * 64,
+            "file_count": 247,
+        },
+        "torchtitan": {},
+    }
+
+
+def test_source_lock_metadata_without_git(tmp_path, monkeypatch):
+    source_lock = tmp_path / "source_lock.json"
+    source_lock.write_text(json.dumps(_source_lock()))
+    monkeypatch.chdir(tmp_path)
+
+    args = _args("--model", "llama1b", "--mesh", "8", "--source-lock", str(source_lock))
+    result = source_lock_metadata(source_lock)
+
+    assert not (tmp_path / ".git").exists()
+    assert args.source_lock == source_lock
+    assert result["sha256"] == hashlib.sha256(source_lock.read_bytes()).hexdigest()
+    assert result["autoparallel"]["head"] == "1" * 40
+    assert result["autoparallel"]["tree_sha256"] == "2" * 64
+
+
+def test_main_uses_source_lock_without_git(tmp_path, monkeypatch):
+    source_lock = tmp_path / "source_lock.json"
+    source_lock.write_text(json.dumps(_source_lock()))
+    output = tmp_path / "result.json"
+    monkeypatch.chdir(tmp_path)
+
+    return_code = main(
+        [
+            "--model",
+            "llama1b",
+            "--mesh",
+            "0",
+            "--solver",
+            "approx",
+            "--revision-label",
+            "test",
+            "--source-lock",
+            str(source_lock),
+            "--output",
+            str(output),
+        ]
+    )
+    result = json.loads(output.read_text())
+
+    assert return_code == 1
+    assert not (tmp_path / ".git").exists()
+    assert "git" not in result
+    assert (
+        result["source_lock"]["sha256"]
+        == hashlib.sha256(source_lock.read_bytes()).hexdigest()
+    )
+    assert "mesh dimensions must be positive" in result["error"]["message"]
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("head", "1" * 12, "full Git SHA"),
+        ("tree_sha256", "not-a-digest", "SHA-256 digest"),
+        ("dirty", True, "dirty AutoParallel source"),
+        ("status", ["M tests/search_profile.py"], "dirty AutoParallel source"),
+    ],
+)
+def test_source_lock_metadata_rejects_invalid_provenance(
+    tmp_path, field, value, message
+):
+    source = _source_lock()
+    source["autoparallel"][field] = value
+    source_lock = tmp_path / "source_lock.json"
+    source_lock.write_text(json.dumps(source))
+
+    with pytest.raises(RuntimeError, match=message):
+        source_lock_metadata(source_lock)
 
 
 @pytest.mark.parametrize(

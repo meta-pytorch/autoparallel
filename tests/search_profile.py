@@ -9,6 +9,7 @@ import json
 import math
 import os
 import platform
+import re
 import resource
 import subprocess
 import time
@@ -78,6 +79,14 @@ def parse_args(argv=None):
     parser.add_argument("--seeded", action="store_true")
     parser.add_argument("--revision-label", required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--source-lock",
+        type=Path,
+        help=(
+            "Validated paper-harness source_lock.json for a sealed package; "
+            "omit to require a clean Git worktree"
+        ),
+    )
     parser.add_argument("--detailed-solution", action="store_true")
     return parser.parse_args(argv)
 
@@ -327,6 +336,60 @@ def git_metadata():
     }
 
 
+def source_lock_metadata(path):
+    try:
+        payload = path.read_bytes()
+        source_lock = json.loads(payload)
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"failed to read source lock {path}: {error}") from error
+    if not isinstance(source_lock, dict):
+        raise RuntimeError("source lock must be a JSON object")
+    record = source_lock.get("autoparallel")
+    if not isinstance(record, dict):
+        raise RuntimeError("source lock requires an autoparallel object")
+    required_types = {
+        "name": str,
+        "root": str,
+        "remote": str,
+        "expected_remote": str,
+        "head": str,
+        "branch": str,
+        "commit_time": str,
+        "dirty": bool,
+        "dirty_policy": str,
+        "status": list,
+        "tree_sha256": str,
+        "file_count": int,
+    }
+    for field, expected_type in required_types.items():
+        value = record.get(field)
+        if not isinstance(value, expected_type) or (
+            expected_type is int and isinstance(value, bool)
+        ):
+            raise RuntimeError(
+                f"source lock autoparallel.{field} must be {expected_type.__name__}"
+            )
+    if record["name"] != "autoparallel":
+        raise RuntimeError("source lock autoparallel.name must be 'autoparallel'")
+    if re.fullmatch(r"[0-9a-f]{40}", record["head"]) is None:
+        raise RuntimeError("source lock autoparallel.head must be a full Git SHA")
+    if re.fullmatch(r"[0-9a-f]{64}", record["tree_sha256"]) is None:
+        raise RuntimeError(
+            "source lock autoparallel.tree_sha256 must be a SHA-256 digest"
+        )
+    if record["file_count"] < 1:
+        raise RuntimeError("source lock autoparallel.file_count must be positive")
+    if not all(isinstance(line, str) for line in record["status"]):
+        raise RuntimeError("source lock autoparallel.status must contain strings")
+    if record["dirty"] or record["status"]:
+        raise RuntimeError("source lock records a dirty AutoParallel source")
+    return {
+        "path": str(path.resolve()),
+        "sha256": hashlib.sha256(payload).hexdigest(),
+        "autoparallel": record,
+    }
+
+
 def cpu_model():
     try:
         for line in Path("/proc/cpuinfo").read_text().splitlines():
@@ -390,7 +453,11 @@ def main(argv=None):
     result = {
         "schema_version": 1,
         "status": "error",
-        "request": vars(args) | {"output": str(args.output)},
+        "request": vars(args)
+        | {
+            "output": str(args.output),
+            "source_lock": str(args.source_lock) if args.source_lock else None,
+        },
         "environment": {
             "python": platform.python_version(),
             "torch": torch.__version__,
@@ -403,7 +470,10 @@ def main(argv=None):
         },
     }
     try:
-        result["git"] = git_metadata()
+        if args.source_lock is None:
+            result["git"] = git_metadata()
+        else:
+            result["source_lock"] = source_lock_metadata(args.source_lock)
         world_size, mesh_shape = validate_args(args)
         torch.manual_seed(0)
         with ExitStack() as stack:
