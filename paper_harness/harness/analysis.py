@@ -424,6 +424,18 @@ def _canonical_parameter_name(name: str) -> str:
     return name
 
 
+_BFLOAT16_MOMENT_RTOL = 2**-7
+
+
+def _parameter_moment_matches(reference: float, current: float) -> bool:
+    return math.isclose(
+        reference,
+        current,
+        rel_tol=_BFLOAT16_MOMENT_RTOL,
+        abs_tol=0.0,
+    )
+
+
 def _parameter_state_audit(campaign: Campaign, run_root: Path) -> dict[str, Any]:
     """Require and compare initialized-parameter moments for paired runs."""
     runs: dict[str, Any] = {}
@@ -578,14 +590,17 @@ def _parameter_state_audit(campaign: Campaign, run_root: Path) -> dict[str, Any]
                 current = aggregated[parameter_key]
                 differences = {
                     field: {"reference": expected[field], "current": current[field]}
-                    for field in (
-                        "global_shape",
-                        "dtype",
-                        "sum",
-                        "square_sum",
-                    )
+                    for field in ("global_shape", "dtype")
                     if expected[field] != current[field]
                 }
+                for field in ("sum", "square_sum"):
+                    if not _parameter_moment_matches(
+                        expected[field], current[field]
+                    ):
+                        differences[field] = {
+                            "reference": expected[field],
+                            "current": current[field],
+                        }
                 if differences:
                     errors.append(
                         {
@@ -608,8 +623,8 @@ def _parameter_state_audit(campaign: Campaign, run_root: Path) -> dict[str, Any]
         "runs": runs,
         "errors": errors,
         "limitation": (
-            "matching aggregate moments detect observed initialization mismatches but do "
-            "not prove elementwise tensor identity"
+            "BF16 aggregate moments use one BF16 machine-epsilon relative tolerance; "
+            "matching moments do not prove elementwise tensor identity"
         ),
     }
 
