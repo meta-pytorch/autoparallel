@@ -22,11 +22,15 @@ def _canonical_name(name: str) -> str:
 
 
 @torch.no_grad()
-def _write_post_load_audit(model_parts: list[torch.nn.Module], output: Path) -> None:
+def _write_parameter_audit(
+    model_parts: list[torch.nn.Module], output: Path, *, stage: str
+) -> None:
     records = []
     for part_index, model_part in enumerate(model_parts):
         for name, parameter in model_part.named_parameters():
-            local = parameter.to_local() if isinstance(parameter, DTensor) else parameter
+            local = (
+                parameter.to_local() if isinstance(parameter, DTensor) else parameter
+            )
             cpu_local = local.detach().cpu()
             flat = cpu_local.reshape(-1)
             sample = flat[: min(flat.numel(), 8192)].contiguous()
@@ -34,7 +38,7 @@ def _write_post_load_audit(model_parts: list[torch.nn.Module], output: Path) -> 
             float_local = cpu_local.double()
             records.append(
                 {
-                    "stage": "post_load",
+                    "stage": stage,
                     "part": part_index,
                     "name": _canonical_name(name),
                     "raw_name": name,
@@ -56,12 +60,15 @@ def _write_post_load_audit(model_parts: list[torch.nn.Module], output: Path) -> 
 def register_post_load_parameter_audit(
     _optimizers, model_parts: list[torch.nn.Module], _parallel_dims
 ) -> None:
-    """Write one parameter audit after every model part loads its checkpoint."""
+    """Audit fresh parameters and refresh the audit after checkpoint loading."""
     audit_dir = os.environ.get("PARAMETER_AUDIT_DIR")
     if audit_dir is None:
         return
     if not model_parts:
         raise RuntimeError("parameter-state audit requires at least one model part")
+
+    output = Path(audit_dir) / f"rank_{int(os.environ['RANK']):02d}.json"
+    _write_parameter_audit(model_parts, output, stage="post_optimizer_build")
 
     loaded_parts: set[int] = set()
     handles = []
@@ -73,8 +80,7 @@ def register_post_load_parameter_audit(
                 return
             for handle in handles:
                 handle.remove()
-            output = Path(audit_dir) / f"rank_{int(os.environ['RANK']):02d}.json"
-            _write_post_load_audit(model_parts, output)
+            _write_parameter_audit(model_parts, output, stage="post_load")
 
         return hook
 

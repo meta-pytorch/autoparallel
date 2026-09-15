@@ -1,6 +1,6 @@
 schema_version = 1
 name = "muse-glimmer-30b-unified"
-description = "Pinned Muse Glimmer 30B GraphTrainer and AutoParallel scaling"
+description = "Pinned Muse Glimmer 30B MainTrainer, GraphTrainer, and AutoParallel scaling"
 workload = "muse_glimmer_30b_sdpa"
 
 [model]
@@ -30,10 +30,17 @@ tensor_parallel_degree = 2
 context_parallel_degree = 1
 pipeline_parallel_degree = 1
 
+[metrics]
+save_for_all_ranks = true
+
 [comparison]
-declared_variable = "graphtrainer_parallelization_compile_stack"
+declared_variable = "trainer_parallelization_compile_stack"
 allowed_config_paths = ["compile.*", "model_spec.name"]
-pairs = [["gt_manual", "apgt"]]
+pairs = [
+  ["tt_main", "gt_manual"],
+  ["tt_main", "apgt"],
+  ["gt_manual", "apgt"],
+]
 
 [mast]
 nodes = 2
@@ -58,6 +65,17 @@ required_assets = ["muse_glimmer", "muse_input_manifests", "c4_hf_cache"]
 warmup_steps = 5
 
 [[arms]]
+name = "tt_main"
+profile = "tt_main_default_v1"
+module = "workloads.muse_glimmer.perf_configs"
+config = "muse_glimmer_30b_sdpa_c4_torchtitan_4x2"
+args = ["--hf-assets-path", "{asset:muse_glimmer}"]
+[arms.overrides]
+"compile.enable" = true
+"compile.backend" = "inductor"
+"compile.components" = ["model", "loss"]
+
+[[arms]]
 name = "gt_manual"
 profile = "gt_manual_eager_v1"
 module = "workloads.muse_glimmer.perf_configs"
@@ -78,7 +96,7 @@ args = ["--hf-assets-path", "{asset:muse_glimmer}"]
 [[phases]]
 name = "performance"
 kind = "performance"
-arms = ["gt_manual", "apgt"]
+arms = ["tt_main", "gt_manual", "apgt"]
 [phases.overrides]
 "training.steps" = 25
 "profiler.enable_profiling" = false
@@ -88,7 +106,7 @@ arms = ["gt_manual", "apgt"]
 [[phases]]
 name = "trace"
 kind = "trace"
-arms = ["gt_manual", "apgt"]
+arms = ["tt_main", "gt_manual", "apgt"]
 trace_ranks = [0]
 [phases.overrides]
 "training.steps" = 6

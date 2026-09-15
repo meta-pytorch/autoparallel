@@ -25,9 +25,14 @@ class PostLoadParameterAuditTests(unittest.TestCase):
                 ]
                 register_post_load_parameter_audit(None, parts, None)
                 output = Path(temporary) / "rank_00.json"
+                initial_records = json.loads(output.read_text())
+                self.assertEqual(
+                    [record["stage"] for record in initial_records],
+                    ["post_optimizer_build"] * 2,
+                )
 
                 parts[0].load_state_dict({"weight": torch.full((2, 2), 3.0)})
-                self.assertFalse(output.exists())
+                self.assertEqual(json.loads(output.read_text()), initial_records)
 
                 parts[1].load_state_dict({"weight": torch.full((1, 2), 5.0)})
                 records = json.loads(output.read_text())
