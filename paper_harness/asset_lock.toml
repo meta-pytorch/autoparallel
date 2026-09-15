@@ -1,0 +1,65 @@
+schema_version = 1
+workspace_uri = "ws://ws.ai.pci0ai/checkpoint/infra"
+root = "outputs/autoparallel-harness/legacy-dtensor-v1/assets"
+
+[assets.llama_tokenizer]
+relative_path = "llama_tokenizer"
+file_count = 2
+tree_sha256 = "0c1f413da00c91a34921db99f99243456f8853e04bd7b030f8371577bf63babd"
+
+[assets.deepseek_tokenizer]
+relative_path = "llama_tokenizer"
+file_count = 2
+tree_sha256 = "0c1f413da00c91a34921db99f99243456f8853e04bd7b030f8371577bf63babd"
+
+[assets.llama_replay]
+relative_path = "llama_replay"
+file_count = 2
+tree_sha256 = "8f22d7d3717bd8da6bbbe334b20a4825e19eb09a4e090c74034e92c2683b78dc"
+
+[assets.llama3_3d_seed_checkpoint]
+relative_path = "llama3_3d_seed_checkpoint"
+file_count = 2
+tree_sha256 = "e585c75ffa4c7df096d6062a05a3eb164e3a357411996517efd41dfb3853fe32"
+
+[assets.llama3_3d_tokenizer]
+relative_path = "llama3_3d_tokenizer"
+file_count = 2
+tree_sha256 = "5824671baf011f65991f88594425cb43c77f57f0ff6870c406e21862846fdea3"
+
+[assets.canonical_2k]
+relative_path = "canonical_2k"
+file_count = 2
+tree_sha256 = "27812bb31fd2aea607d362d90b7d4f4224be7f41adac036eec4005440bf9e890"
+
+[assets.offline_c4]
+relative_path = "offline_c4"
+file_count = 17
+tree_sha256 = "a83663094189eec3783c5881debe58f32a9ad500dbb9fe88549f0cfe3351fdf4"
+
+[assets.muse_glimmer]
+relative_path = "muse_glimmer"
+file_count = 2
+tree_sha256 = "93a64861421ac38d0a7d1b03f44e5ab0148b9e0eb4ee69c465a26e026e69290f"
+
+[assets.muse_input_manifests]
+relative_path = "muse_input_manifests"
+file_count = 13
+tree_sha256 = "e084c24e505f5404f64f50cae28870fca2b3d29a909ff6a58a308a3ae8d4d1f2"
+
+[assets.c4_hf_cache]
+relative_path = "c4_hf_cache"
+file_count = 34
+tree_sha256 = "7ea7e777d9a0b52d1b66fc90207cda7f3ffac7d6f7979211c7355e13caa563ea"
+
+[assets.llama3_3d_replay]
+relative_path = "llama3_3d_replay"
+file_count = 3
+tree_sha256 = "ef1c9cea37c42375849750f76f5b98a59568a5a5d33471aca2a96dc8d5ce7876"
+manifest_sha256 = "ca3dba04e7e95c2f0ed6a73f4f649836422a3e5efbf687817194f30ee698139c"
+
+[assets.llama3_3d_placements]
+relative_path = "llama3_3d_placements"
+file_count = 1
+tree_sha256 = "c3c16d1c9dc57189881167c0156eb13b9d16e728ca959c66853aeb1d8cb5dca7"
+file_sha256 = "00fdf26d79503df423837176907f2ac3aa3646589fdde20f3fa9cf2fca769ace"

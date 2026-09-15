@@ -1,23 +1,20 @@
 # Workload adapter provenance
 
-These adapters preserve the real model/config entry points used by the accepted
-experiments. They contain configuration glue only; TorchTitan and AutoParallel
-remain external source inputs.
+The active adapters target the single source/runtime stack in
+`experiment_lock.toml`. Historical campaign definitions are preserved under
+`provenance/campaigns/` and are not executable inputs.
 
-- `llama3_2d/perf_configs.py` derives from the final 2026-08-17 paired scaling
-  adapter, SHA-256
-  `1b9c878176b7437e746cc335e991def46d670e5ff2cc6d20203aed3a306612f6`.
-  The permanent version adds only a GraphTrainer-manual registry function that
-  calls the existing `_graph_config` with `enable_autoparallel=False`.
-- `llama3_3d_legacy/` is copied from the final 2026-08-31 fair DP2×CP2×TP2
-  harness. Its five source-file hashes are retained by Git history and every
-  packaged payload manifest.
-- `llama3_seqlen/perf_configs.py` derives from historical SHA-256
-  `c5389e515d0455d65dcc47a30e8a970f7745f5d3ccfd152bbc45da2435881ecf`.
-  The permanent version removes only per-yield tensor hashing and JSONL writes.
-- `deepseek_v3/perf_configs.py` derives from branch
-  `kaijian/deepseek-v3-16b-four-arm-harness`, original SHA-256
-  `30beb7f3dca7111ce885346d0ad050517c470863407099be9ad67840b6bef104`.
-  The permanent version removes only per-yield tensor hashing and JSONL writes.
+- `llama3_2d/` retains the old sample-shaped replay contract. MainTrainer uses
+  native LLaMA parallelization, manual GraphTrainer uses native GraphTrainer
+  with eager memory policy, and only the AP arm enables AutoParallel.
+- `llama3_3d/` retains the accepted DP2 x CP2 x TP2 replay and measurement
+  contract. Its manual arm no longer calls an AutoParallel CP helper.
+- `llama3_seqlen/` retains the fixed C4 schedule and canonical-2K placement
+  replay contract.
+- `muse_glimmer/` is a thin wrapper around the pinned TorchTitan Muse configs;
+  manual and AP select independent compile defaults.
+- `deepseek_v3/` retains the sample-shaped SDPA workload and uses the pinned
+  AutoParallel DeepSeek bridge only in the AP arm.
 
-Any further integration change requires a new versioned profile and user gate.
+No active workload may select a source revision, runtime package, or SPMD
+backend. Those values come only from the checked-in locks.

@@ -14,7 +14,7 @@ from pathlib import Path
 
 from .campaign import load_campaign, write_json
 from .parity import IGNORED_PATHS, validate_pair
-from .profiles import validate_profile, validate_profile_pair
+from .profiles import validate_profile
 from .validation import _probe_config
 
 
@@ -264,15 +264,6 @@ def _audit_runtime_configs(
                 )
                 check["phase"] = phase.name
                 checks.append(check)
-                profile_pair = validate_profile_pair(
-                    campaign.arm(baseline),
-                    phase_configs[baseline],
-                    campaign.arm(treatment),
-                    phase_configs[treatment],
-                )
-                if profile_pair is not None:
-                    profile_pair["phase"] = phase.name
-                    checks.append(profile_pair)
     comparison = campaign.raw.get("comparison", {})
     phase_by_arm = comparison.get("performance_phase_by_arm", {})
     for baseline, treatment in comparison.get("pairs", []):
@@ -290,15 +281,6 @@ def _audit_runtime_configs(
         )
         check["phase"] = phase_label
         checks.append(check)
-        profile_pair = validate_profile_pair(
-            campaign.arm(baseline),
-            configs_by_run[left_key],
-            campaign.arm(treatment),
-            configs_by_run[right_key],
-        )
-        if profile_pair is not None:
-            profile_pair["phase"] = phase_label
-            checks.append(profile_pair)
     write_json(output_root / "report.json", {"status": "passed", "checks": checks})
 
 
@@ -399,7 +381,11 @@ def main() -> None:
             if rank == 0:
                 _atomic_text(output / "started", "started\n")
 
-            cache = Path(tempfile.mkdtemp(prefix=f"permanent-harness-{phase['name']}-{arm_name}-{rank}-"))
+            cache = Path(
+                tempfile.mkdtemp(
+                    prefix=f"permanent-harness-{phase['name']}-{arm_name}-{rank}-"
+                )
+            )
             env = dict(base_env)
             env.update(
                 {
@@ -416,10 +402,14 @@ def main() -> None:
                     "BENCHMARK_SOURCE_LOCK_SHA256": source_lock_sha256,
                     "RUN_ROOT": str(output),
                     "INPUT_AUDIT_DIR": str(output / "input_audit"),
-                    "MODULE_ISOLATION_AUDIT_DIR": str(output / "module_isolation_audit"),
+                    "MODULE_ISOLATION_AUDIT_DIR": str(
+                        output / "module_isolation_audit"
+                    ),
                     "PARAMETER_AUDIT_DIR": str(output / "parameter_audit"),
                     "PLACEMENT_AUDIT_DIR": str(output / "placement_audit"),
-                    "AP_COLLECTIVE_HOOK_AUDIT_DIR": str(output / "collective_hook_audit"),
+                    "AP_COLLECTIVE_HOOK_AUDIT_DIR": str(
+                        output / "collective_hook_audit"
+                    ),
                     "EXPECTED_TT_ROOT": str(torchtitan_root),
                     "EXPECTED_AP_ROOT": str(autoparallel_root),
                 }
@@ -432,7 +422,10 @@ def main() -> None:
             )
             for directory in (cache / "inductor", cache / "triton", cache / "tmp"):
                 directory.mkdir(parents=True)
-            if phase["kind"] in {"trace", "torch_trace"} and rank in phase["trace_ranks"]:
+            if (
+                phase["kind"] in {"trace", "torch_trace"}
+                and rank in phase["trace_ranks"]
+            ):
                 trace_root = output / "torch_trace" / f"rank_{rank:05d}"
                 trace_root.mkdir(parents=True, exist_ok=True)
                 env["TORCH_TRACE"] = str(trace_root)
@@ -443,15 +436,7 @@ def main() -> None:
                 _expand(token, payload=payload, output=output)
                 for token in phase["argv_by_arm"][arm_name]
             ]
-            profile = next(
-                arm["profile"]
-                for arm in resolved["resolved_arms"]
-                if arm["name"] == arm_name
-            )
-            if (
-                phase["kind"] in {"trace", "kineto"}
-                and not profile.endswith("_cp_legacy_v1")
-            ):
+            if phase["kind"] in {"trace", "kineto"}:
                 argv = _set_boolean_option(
                     argv,
                     "profiler.enable-profiling",
@@ -482,7 +467,10 @@ def main() -> None:
             statuses = _wait_for_ranks(runtime, world_size, timeout)
             if rank == 0:
                 _atomic_text(
-                    output / ("completed" if all(code == 0 for code in statuses) else "failed"),
+                    output
+                    / (
+                        "completed" if all(code == 0 for code in statuses) else "failed"
+                    ),
                     "\n".join(str(code) for code in statuses) + "\n",
                 )
             if not _wait_for_phase(output, timeout):

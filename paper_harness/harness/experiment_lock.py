@@ -9,7 +9,6 @@ from typing import Any
 
 from .campaign import CampaignError
 
-
 LOCK_PATH = Path(__file__).resolve().parents[1] / "experiment_lock.toml"
 
 
@@ -18,40 +17,34 @@ def load_experiment_lock(path: Path = LOCK_PATH) -> dict[str, Any]:
         lock = tomllib.load(stream)
     if lock.get("schema_version") != 1:
         raise CampaignError("experiment_lock.toml schema_version must be 1")
+    sources = lock.get("sources")
+    if not isinstance(sources, dict) or set(sources) != {
+        "torchtitan",
+        "autoparallel",
+    }:
+        raise CampaignError("experiment lock requires exactly two source entries")
+    for name, source in sources.items():
+        if not isinstance(source, dict):
+            raise CampaignError(f"experiment lock source {name!r} must be a table")
+        if not source.get("remote") or not source.get("commit"):
+            raise CampaignError(
+                f"experiment lock source {name!r} requires remote and commit"
+            )
+        if source.get("dirty_policy") != "forbid":
+            raise CampaignError(
+                f"experiment lock source {name!r} must forbid dirty trees"
+            )
+    runtime = lock.get("runtime")
+    if not isinstance(runtime, dict) or not runtime.get("conda_fbpkg"):
+        raise CampaignError("experiment lock requires a runtime conda_fbpkg")
+    execution = lock.get("execution")
+    if not isinstance(execution, dict) or execution.get("spmd_backend") != "default":
+        raise CampaignError("experiment lock requires spmd_backend='default'")
     return lock
 
 
 def experiment_lock_digest(path: Path = LOCK_PATH) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
-def validate_campaign_lock(raw: dict[str, Any]) -> dict[str, Any]:
-    lock = load_experiment_lock()
-    mismatches: dict[str, dict[str, Any]] = {}
-    for name in ("torchtitan", "autoparallel"):
-        expected = lock["sources"][name]
-        actual = raw["sources"][name]
-        for field in ("remote", "commit"):
-            if actual.get(field) != expected[field]:
-                mismatches[f"sources.{name}.{field}"] = {
-                    "expected": expected[field],
-                    "actual": actual.get(field),
-                }
-        if actual.get("dirty_policy", "forbid") != "forbid":
-            mismatches[f"sources.{name}.dirty_policy"] = {
-                "expected": "forbid",
-                "actual": actual.get("dirty_policy"),
-            }
-    expected_fbpkg = lock["runtime"]["conda_fbpkg"]
-    actual_fbpkg = raw["mast"].get("conda_fbpkg")
-    if actual_fbpkg != expected_fbpkg:
-        mismatches["mast.conda_fbpkg"] = {
-            "expected": expected_fbpkg,
-            "actual": actual_fbpkg,
-        }
-    if mismatches:
-        raise CampaignError(f"campaign violates experiment lock: {mismatches}")
-    return lock
 
 
 def validate_runtime_lock(torch_module: Any) -> dict[str, Any]:

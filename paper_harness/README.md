@@ -1,147 +1,88 @@
 # Permanent AutoParallel experiment harness
 
-This branch is the single harness for new TorchTitan, GraphTrainer, and AutoParallel experiments. It starts from the Muse Glimmer harness because that version already separated paired GraphTrainer runs, native TorchTitan runs, profiler-off performance phases, same-allocation trace phases, serialized-config parity, package verification, and fail-closed analysis.
+This harness has one supported source and runtime stack. Users choose a model
+and setting; source revisions, Python/PyTorch, the distributed backend, and
+assets are resolved from checked-in locks.
 
-The historical `native_torchtitan/` and `paired_graphtrainer_ap/` directories remain as provenance. New campaigns use the shared `harness/`, `launcher/`, and `workloads/` code.
-
-## Source ownership
-
-TorchTitan and AutoParallel are external inputs. The harness never checks out, patches, or writes either repository. Every campaign must match the immutable source and runtime versions in `experiment_lock.toml`, and the CLI receives existing clean checkout paths.
-
-Clean checkouts are required by default. A campaign may explicitly select `dirty_policy = "snapshot"`; that records the base commit, porcelain status, binary diff, untracked-file hashes, complete source-tree hash, and packaged-tree hash. This mode is intended for evaluating a change before submitting it upstream, not for silently bypassing provenance checks.
-
-The clean AutoParallel/TorchTitan submission stacks are recorded in [UPSTREAM.md](UPSTREAM.md). Historical settings remain in their campaign files, but their source/runtime pins are updated to the one locked paper stack.
-
-The campaign format keeps `local_batch_size`, `global_batch_size`, `gradient_accumulation_steps`, and `seq_len` explicit. After matrix, phase, and arm overrides resolve, the harness translates them to latest TorchTitan's token fields. For example, local batch 2, global batch 8, and sequence length 8192 become 16384 tokens per DP-rank microbatch and 65536 tokens per train step, preserving gradient accumulation 1.
-
-`HARNESS_CORE.sha256` freezes the code-bearing harness, launcher, workload, lock, and measurement-script files. Validation and runtime preflight reject core drift. Changing the core requires an explicit harness-version update and a reviewed manifest regeneration; campaign settings and tests are outside the frozen core.
-
-## Stable arm profiles
-
-| Profile | Meaning |
-| --- | --- |
-| `tt_main_manual_jit_v1` | TorchTitan MainTrainer, manual parallelization, ordinary `torch.compile` |
-| `gt_manual_aot_v1` | GraphTrainer `aot_fx_trace`, manual parallelization, full Inductor |
-| `apgt_v1` | GraphTrainer `aot_fx_trace`, AutoParallel placement/lowering, full Inductor |
-| `gt_manual_cp_legacy_v1` / `apgt_cp_legacy_v1` | Frozen final-fairness 3D CP pair |
-| `ap_backend_legacy_v1` | Historical `autoparallel_backend` path only |
-
-For the current `apgt_v1` contract, both GraphTrainer arms serialize the same compile settings except for `compile.enable_autoparallel`. The manual arm keeps GraphTrainer's joint transformer-block bucketing pass. The AutoParallel arm is selected by the source pass builder, skips that manual pass, and passes the fixed AutoParallel overlap/bucketing settings to terminal full Inductor. A source checkout that does not prove this contract is rejected; changing the contract requires a new profile version and explicit review.
-
-The model adapters, model-specific input/output constraints, memory constraints, tracing path, and placement application are fixed by the `apgt_v1` source contract. The solver and placement solve/save/load mode remain declared experiment variables.
-
-## AutoParallel solver settings
-
-The companion TorchTitan submission branch accepts the following fields under `[compile]`. These are forwarded to the existing PR523 AutoParallel constructor or `optimize_placement`; the harness does not patch either source tree.
-
-| Field | Default | AutoParallel destination |
-| --- | --- | --- |
-| `autoparallel_solver` | `"ilp"` | `solver` |
-| `autoparallel_fast_build` | `true` | `fast_build` |
-| `autoparallel_lazy_costs` | `"auto"` | `lazy_costs=None`; `"lazy"` and `"eager"` map to `True` and `False` |
-| `autoparallel_strategy_radius` | `2` | `strategy_radius`; placement replay forces `0` |
-| `autoparallel_optimality_check` | `false` | `optimality_check` |
-| `autoparallel_approx_candidate_limit` | `128` | `approximate_options.candidate_limit` |
-| `autoparallel_approx_bp_iters` | `400` | `approximate_options.bp_iters` |
-| `autoparallel_approx_bp_tol` | `0.001` | `approximate_options.bp_tol` |
-| `autoparallel_approx_max_sweeps` | `12` | `approximate_options.max_sweeps` |
-| `autoparallel_approx_max_time_s` | `60.0` | `approximate_options.max_time_s` |
-| `autoparallel_approx_star_passes` | `2` | `approximate_options.star_passes` |
-| `autoparallel_approx_max_star_children` | `32` | `approximate_options.max_star_children` |
-| `autoparallel_approx_group_domain_limit` | `512` | `approximate_options.group_domain_limit` |
-
-`autoparallel_placements_save_path` and `autoparallel_placements_load_path` retain the prior placement JSON behavior and are mutually exclusive. Approximate-only options are forwarded only when `autoparallel_solver = "approx"`. The integration deliberately does not expose `dynamic`, `cost_model`, repeated-subgraph handling, graph adapters, constraints, or lowering hooks as campaign knobs.
-
-## Campaign format
-
-`campaign.toml` is the authored input. Validation writes a complete `resolved_campaign.json`, serialized TorchTitan config for every phase/arm, `source_lock.json`, parity reports, and package manifests.
-
-Campaigns declare:
-
-- source remotes, commits, and dirty policy;
-- model, attention backend, dataset revision, tokenizer and input identity;
-- local/global batch, sequence length, precision, optimizer, scheduler and SAC;
-- DP-replicate, DP-shard, TP, CP, PP and EP settings;
-- arm profiles, phase order, warmup/measurement windows and trace ranks;
-- Kineto/TORCH_TRACE behavior, MAST resources, environment and artifacts;
-- the variable under test and exact config/environment paths allowed to differ.
-
-The launcher does not impose `TORCHINDUCTOR_COMPILE_THREADS`: PyTorch's runtime default is preserved unless a campaign pins the variable in `[mast.environment]`. Compile parallelism is recorded experiment state because it can materially change cold-start duration and rank skew.
-
-Optional `[measurement.primary]` settings select an exact historical metric from structured logs or rank-0 TensorBoard. Optional `[comparison.acceptance]` settings compare that metric's relative arm gap with a declared reference and percentage-point tolerance. Interleaved campaigns may map each arm to its performance phase with `[comparison.performance_phase_by_arm]`.
-
-Common TorchTitan config sections use their native names. Less common settings go in `[torchtitan.overrides]` as dotted paths. Unknown upstream fields fail when the exact pinned source parses the generated arguments. An arm or phase may override a common dotted path; the resulting serialized configs are compared before submission.
-
-`training.local_batch_size` is the microbatch per data-parallel replica. `global_batch_size = local_batch_size * data_parallel_replicate_degree * data_parallel_shard_degree * gradient_accumulation_steps`; TP, CP, PP, and EP ranks do not multiply global batch.
-
-Every declared paired comparison must emit a complete all-rank parameter-state audit for every arm and phase. The LLaMA 2D, replanning, and current 3D campaigns load one immutable model-only seed in every arm and emit the audit from a one-shot `load_state_dict` post-hook before the first forward. Missing audits, partial rank coverage, mixed pre/post-load stages, or unequal normalized global moments make the analysis non-comparative.
-
-Scaling and sequence sweeps use `[[matrix.points]]`. Select one immutable point per MAST allocation with `--point`.
-
-## Data path
-
-New streaming campaigns use a pinned dataset/tokenizer and a deterministic index schedule. The manifest is validated before launch and all paired arms use the same schedule. The measured training loop performs no tensor hashing, file append, or added synchronization. Historical replay/cache modes remain explicit in their presets.
-
-Campaigns may declare `data.preflight_auditor` as a `workloads.*` module. Its `audit` function runs on every rank before any training phase; one TP representative per DP rank performs expensive batch hashing and all ranks must produce a passing or explicitly skipped audit record.
-
-The old LLaMA sequence-length and DeepSeek adapters hashed tensors and appended JSONL records from the dataloader iterator. That instrumentation is removed from the permanent adapters. Imported historical reports retain an explicit warning that their end-to-end timing included it.
-
-## Commands
-
-Use a Python interpreter from the exact compatible environment:
+## Run
 
 ```bash
-python -m harness.cli validate campaigns/muse_glimmer_30b_scaling.toml \
-  --point 16gpu --mode gate \
-  --torchtitan-root "$TORCHTITAN_ROOT" \
-  --autoparallel-root "$AUTOPARALLEL_ROOT" \
-  --asset-root muse_glimmer="$MUSE_ASSETS" \
-  --asset-root muse_input_manifests="$MUSE_INPUT_MANIFESTS" \
-  --asset-root c4_hf_cache="$C4_HF_CACHE" \
-  --output "$TASK_ROOT/validation"
-
-python -m harness.cli package campaigns/muse_glimmer_30b_scaling.toml \
-  --point 16gpu --mode gate \
-  --torchtitan-root "$TORCHTITAN_ROOT" \
-  --autoparallel-root "$AUTOPARALLEL_ROOT" \
-  --asset-root muse_glimmer="$MUSE_ASSETS" \
-  --asset-root muse_input_manifests="$MUSE_INPUT_MANIFESTS" \
-  --asset-root c4_hf_cache="$C4_HF_CACHE" \
-  --attempt "$TASK_ROOT/attempts/001"
-
-python -m harness.cli render-mast --attempt "$TASK_ROOT/attempts/001"
-python -m harness.cli submit --attempt "$TASK_ROOT/attempts/001"
-python -m harness.cli analyze campaigns/muse_glimmer_30b_scaling.toml \
-  --point 16gpu --mode gate --attempt-root "$TASK_ROOT/attempts/001" \
-  --output "$TASK_ROOT/attempts/001/analysis"
+python -m harness.cli run --model llama3_8b --setting 2d-32gpu
 ```
 
-`--mode gate` resolves each campaign to a two-step functional phase plus a two-step trace smoke; it can validate integration but can never authorize a performance conclusion. The default `--mode formal` keeps the campaign's declared performance and trace phases.
+The command performs source checkout, runtime and asset verification,
+validation, packaging, MAST dry-run, submission, CRITICAL/99 priority
+verification, monitoring, retrieval, and canonical analysis. It is resumable:
+rerunning the same model and setting reuses the task state and never submits a
+second job when `job_id.txt` exists.
 
-For a checked-in prepare/submit/monitor/retrieve/analyze workflow and the portable LLaMA3 DP4 x TP8 A/B/C wrapper, see `scripts/measurements/README.md`.
+Valid settings are declared in `run_settings.toml`:
 
-`render-mast` performs the TorchX dry run, parses the MAST scheduler request, downloads the newly generated workspace and payload fbpkgs, verifies complete content hashes and executable bits, then re-imports the downloaded sources and re-parses every config. `submit` accepts only that audited immutable payload and an unchanged launcher. Every comparison runs all arms sequentially in one allocation, with a fresh process, rendezvous port, and compiler cache per arm. Allocation identity and rank-to-GPU mapping must remain unchanged across arms. The dry-run audit also requires `hpcClusterUuid=MastGenAICluster` and verifies the authored locality. Current paper campaigns combine the `grandteton_80g_roce` resource with `dc;pci1`, which maps to `MACHINE_TYPE_T20_GRAND_TETON_HBM3_ROCE_GENAI_PCI`; a campaign targeting the non-PCI pool must declare its own locality explicitly.
+- `llama3_8b`: `2d-8gpu`, `2d-16gpu`, `2d-32gpu`, `2d-64gpu`,
+  `2d-128gpu`, `3d-dp2-cp2-tp2`, and `seqlen-{2k,4k,8k,16k,32k}`;
+- `muse_glimmer_30b`: `2d-{16gpu,32gpu,64gpu,128gpu}`;
+- `deepseek_v3_16b`: `efsdp-ep-{16gpu,32gpu}`.
 
-Performance phases keep Kineto and TORCH_TRACE disabled. Trace phases run after performance in the same allocation and enable Kineto and TORCH_TRACE only on declared ranks; tlparse consumes the saved TORCH_TRACE directory offline.
+`HARNESS_WORKSPACE_ROOT` may select the parent directory for task records. It
+does not affect experiment inputs or source versions.
 
-## Canonical campaigns
+## Locked stack
 
-The only end-to-end packaged path validated against the locked stack so far is the LLaMA3 2D 4x8 point. Other LLaMA campaigns have been migrated to the same token/batch contract but still require their own gate run. Muse Glimmer and DeepSeek performance entry points are intentionally fail-closed until their historical batched attention/input semantics are ported and reviewed; their campaign files remain as serialized experiment specifications, not runnable-result evidence.
+`experiment_lock.toml` is the only authority for:
 
-- `campaigns/llama3_8b_2d_scaling.toml`: 8 through 128 GPUs, with TorchTitan TP, GraphTrainer manual, and AP+GraphTrainer arms. The GraphTrainer-manual/AP pair receives an additional strict one-toggle audit.
-- `campaigns/llama3_8b_3d_legacy.toml`: final fair DP2 x CP2 x TP2 pair.
-- `campaigns/llama3_8b_seqlen.toml`: 2K through 32K at 32 GPUs.
-- `campaigns/muse_glimmer_30b_scaling.toml`: locked 16 through 128-GPU specification; performance entry points currently fail closed.
-- `campaigns/deepseek_v3_16b.toml`: locked 16/32-GPU specification; the AP performance entry point currently fails closed and historical failed runs remain non-comparative.
-- `campaigns/repro_*.toml`: fixed 32-GPU reproduction presets with explicit historical metrics; relative-gap acceptance is retained only when the reference used the campaign's current batch semantics.
+- exact TorchTitan and AutoParallel commits and remotes;
+- `torchtitan_conda_prod:902` and exact runtime versions;
+- the legacy/default DTensor backend.
 
-Legacy evidence is imported read-only with `analyze`; missing or failed artifacts never become a performance conclusion.
+Campaigns cannot declare source revisions, conda packages, or
+`parallelism.spmd_backend`. Validation rejects such overrides. The source trees
+must be clean and at the exact locked commits.
 
-## Local validation
+`asset_lock.toml` pins the internal OilFS workspace, relative paths, file
+counts, and content hashes for every model, tokenizer, replay, placement, and
+dataset asset. There is no fallback to an unpinned local path or network
+download.
 
-```bash
-VALIDATION_ROOT="$TASK_ROOT/validation/static" \
-  PYTHON_BIN=/path/to/compatible/python scripts/run_static_preflight.sh
-```
+`HARNESS_CORE.sha256` covers the lock files, harness, launcher, active
+workloads, and measurement scripts. A code change requires a version bump and
+manifest regeneration.
 
-Before a workload is admitted to the frozen runnable set, its initial MAST validation is functional only: the smallest existing real topology must pass source/package/config/allocation checks, real compile/train steps, and an isolated trace smoke. That gate is not a latency or speedup benchmark.
+## Execution profiles
+
+- `tt_main_default_v1`: native TorchTitan model/parallelizer with ordinary
+  Inductor compilation.
+- `gt_manual_eager_v1`: native GraphTrainer defaults with only the memory
+  policy set to `eager`, matching MainTrainer selective activation
+  checkpointing.
+- `apgt_validated_v1`: AutoParallel + GraphTrainer validated defaults.
+
+MainTrainer and manual GraphTrainer never import or invoke the AutoParallel
+parallelizer. The AutoParallel profile is the only profile that enables
+`compile.enable_autoparallel`.
+
+All paired arms retain identical model, inputs, batch and sequence shape,
+precision, activation checkpointing intent, optimizer, scheduler, physical
+allocation, rank-to-GPU mapping, and measurement method. A campaign must
+declare the complete trainer/parallelization/compiler stack as its variable
+when profile defaults differ.
+
+## Lower-level commands
+
+The existing `validate`, `package`, `render-mast`, `submit`, and `analyze`
+subcommands remain for diagnosis. They require explicit source and asset paths
+where applicable. `run` is the supported reproduction entry point.
+
+## Historical provenance
+
+Original campaign files and their model-specific pins are stored unchanged in
+`provenance/campaigns/`. They are evidence, not runnable active campaigns.
+`UPSTREAM.md` maps each historical pin to the unified stack.
+
+The unified stack is a new-stack retake. Historical performance numbers remain
+attributed to their original source and runtime pins.
+
+## Validation status
+
+The initial release is labeled `source-validated, GPU-unverified`: source,
+configuration, package, and local unit checks are required before publishing,
+but no GPU or MAST job is launched as part of the branch construction.

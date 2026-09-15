@@ -11,9 +11,9 @@ from .analysis import analyze_campaign
 from .campaign import CampaignError, load_campaign
 from .dryrun import audit_dryrun
 from .packaging import package_campaign
+from .run import run_reproduction
 from .sources import manifest_digest, tree_manifest
 from .validation import validate_campaign
-
 
 MAST_HANDLE_PATTERN = re.compile(r"mast_conda://[^/\s`]+/([^\s`]+)")
 
@@ -107,15 +107,18 @@ def _run_torchx(attempt: Path, *, dryrun: bool) -> dict:
             raise CampaignError(
                 "launcher changed after the audited dry run; create a new attempt"
             )
-        if dryrun_audit.get("payload_tree_sha256") != package_report[
-            "payload_tree_sha256"
-        ]:
+        if (
+            dryrun_audit.get("payload_tree_sha256")
+            != package_report["payload_tree_sha256"]
+        ):
             raise CampaignError(
                 "dry-run payload does not match the sealed submission payload"
             )
     command = _torchx_command(attempt, dryrun=dryrun)
     prefix = "dryrun" if dryrun else "submission"
-    (attempt / f"{prefix}.command.json").write_text(json.dumps(command, indent=2) + "\n")
+    (attempt / f"{prefix}.command.json").write_text(
+        json.dumps(command, indent=2) + "\n"
+    )
     completed = subprocess.run(
         command,
         cwd=Path(__file__).resolve().parents[1] / "launcher",
@@ -155,6 +158,10 @@ def _run_torchx(attempt: Path, *, dryrun: bool) -> dict:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m harness.cli")
     subparsers = parser.add_subparsers(dest="command", required=True)
+    run = subparsers.add_parser("run")
+    run.add_argument("--model", required=True)
+    run.add_argument("--setting", required=True)
+
     validate = subparsers.add_parser("validate")
     validate.add_argument("campaign", type=Path)
     validate.add_argument("--point")
@@ -186,7 +193,9 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_parser().parse_args()
     try:
-        if args.command == "validate":
+        if args.command == "run":
+            result = run_reproduction(args.model, args.setting)
+        elif args.command == "validate":
             campaign = load_campaign(args.campaign, point=args.point, mode=args.mode)
             assets = _asset_roots(args.asset_root)
             result = validate_campaign(

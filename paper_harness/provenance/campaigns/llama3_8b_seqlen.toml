@@ -3,6 +3,16 @@ name = "llama3-8b-apgt-seqlen-fresh-vs-2k"
 description = "Canonical AP+GT sequence-length sweep, fresh solve versus canonical-2K placement"
 workload = "llama3_8b_seqlen"
 
+[sources.torchtitan]
+remote = "https://github.com/AlbedoWang/torchtitan.git"
+commit = "8eec9e6ffd22b881adc96e7dddea66f2ff12b4ab"
+dirty_policy = "forbid"
+
+[sources.autoparallel]
+remote = "https://github.com/meta-pytorch/autoparallel.git"
+commit = "b8ace2a55d465787840aa41466f50be4fd9f73c1"
+dirty_policy = "forbid"
+
 [model]
 flavor = "8B"
 attention_backend = "sdpa"
@@ -48,6 +58,7 @@ nproc_per_node = 8
 hardware = "grandteton_80g_roce"
 locality = "dc;pci1"
 gpu_name_contains = "H100"
+conda_fbpkg = "torchtitan_conda_prod:902"
 retries = 0
 master_port = 29500
 phase_timeout_seconds = 7200
@@ -72,9 +83,13 @@ PYTORCH_ALLOC_CONF = "expandable_segments:True"
 required_assets = ["canonical_2k", "offline_c4", "llama_tokenizer", "llama3_3d_seed_checkpoint"]
 warmup_steps = 5
 
+[legacy]
+instrumentation_note = "Historical runs hashed and appended each yielded batch; imported end-to-end latency retains that overhead."
+evidence_globs = ["reports/final/*.md", "reports/final/*.json"]
+
 [[arms]]
 name = "fresh"
-profile = "apgt_validated_v1"
+profile = "apgt_v1"
 module = "workloads.llama3_seqlen.perf_configs"
 config = "autoparallel_graphtrainer_seqlen_8b"
 [arms.environment]
@@ -83,7 +98,7 @@ EXPERIMENT_ARM = "fresh"
 
 [[arms]]
 name = "replay_2k"
-profile = "apgt_validated_v1"
+profile = "apgt_v1"
 module = "workloads.llama3_seqlen.perf_configs"
 config = "autoparallel_graphtrainer_seqlen_8b"
 [arms.environment]

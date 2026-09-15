@@ -1,0 +1,102 @@
+schema_version = 1
+
+[[settings]]
+model = "llama3_8b"
+setting = "2d-8gpu"
+campaign = "campaigns/llama3_8b_2d.toml"
+point = "8gpu"
+
+[[settings]]
+model = "llama3_8b"
+setting = "2d-16gpu"
+campaign = "campaigns/llama3_8b_2d.toml"
+point = "16gpu"
+
+[[settings]]
+model = "llama3_8b"
+setting = "2d-32gpu"
+campaign = "campaigns/llama3_8b_2d.toml"
+point = "32gpu"
+
+[[settings]]
+model = "llama3_8b"
+setting = "2d-64gpu"
+campaign = "campaigns/llama3_8b_2d.toml"
+point = "64gpu"
+
+[[settings]]
+model = "llama3_8b"
+setting = "2d-128gpu"
+campaign = "campaigns/llama3_8b_2d.toml"
+point = "128gpu"
+
+[[settings]]
+model = "llama3_8b"
+setting = "3d-dp2-cp2-tp2"
+campaign = "campaigns/llama3_8b_3d.toml"
+
+[[settings]]
+model = "llama3_8b"
+setting = "seqlen-2k"
+campaign = "campaigns/llama3_8b_seqlen.toml"
+point = "2k"
+
+[[settings]]
+model = "llama3_8b"
+setting = "seqlen-4k"
+campaign = "campaigns/llama3_8b_seqlen.toml"
+point = "4k"
+
+[[settings]]
+model = "llama3_8b"
+setting = "seqlen-8k"
+campaign = "campaigns/llama3_8b_seqlen.toml"
+point = "8k"
+
+[[settings]]
+model = "llama3_8b"
+setting = "seqlen-16k"
+campaign = "campaigns/llama3_8b_seqlen.toml"
+point = "16k"
+
+[[settings]]
+model = "llama3_8b"
+setting = "seqlen-32k"
+campaign = "campaigns/llama3_8b_seqlen.toml"
+point = "32k"
+
+[[settings]]
+model = "muse_glimmer_30b"
+setting = "2d-16gpu"
+campaign = "campaigns/muse_glimmer_30b.toml"
+point = "16gpu"
+
+[[settings]]
+model = "muse_glimmer_30b"
+setting = "2d-32gpu"
+campaign = "campaigns/muse_glimmer_30b.toml"
+point = "32gpu"
+
+[[settings]]
+model = "muse_glimmer_30b"
+setting = "2d-64gpu"
+campaign = "campaigns/muse_glimmer_30b.toml"
+point = "64gpu"
+
+[[settings]]
+model = "muse_glimmer_30b"
+setting = "2d-128gpu"
+campaign = "campaigns/muse_glimmer_30b.toml"
+point = "128gpu"
+
+[[settings]]
+model = "deepseek_v3_16b"
+setting = "efsdp-ep-16gpu"
+campaign = "campaigns/deepseek_v3_16b.toml"
+point = "16gpu"
+
+[[settings]]
+model = "deepseek_v3_16b"
+setting = "efsdp-ep-32gpu"
+campaign = "campaigns/deepseek_v3_16b.toml"
+point = "32gpu"

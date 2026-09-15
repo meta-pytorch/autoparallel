@@ -1,26 +1,28 @@
 schema_version = 1
-harness_version = "paper-harness-v2"
+harness_version = "legacy-dtensor-v1"
 
 [sources.torchtitan]
 remote = "https://github.com/AlbedoWang/torchtitan.git"
-upstream_commit = "310e2a66e1756a965a73d5c547da01d69c1aac70"
-commit = "fd69701b6dc46c15b1214ba2f6ec6bbf3e044f3e"
+commit = "59f126f8309e9c69b558fb5853ea1bb88e97005a"
+dirty_policy = "forbid"
 
 [sources.autoparallel]
 remote = "https://github.com/meta-pytorch/autoparallel.git"
-commit = "5102d629c0a97ec604b12c328b40147d214ecbe7"
+commit = "25ef8176c0ef2c0c93ec7a7a523bc1f287386f2d"
+dirty_policy = "forbid"
 
 [runtime]
-conda_fbpkg = "torchtitan_conda_prod:946"
-python_version = "3.12.14"
-torch_version = "2.15.0a0+git9d5a710"
-torch_git_version = "9d5a71058272ed10ee6156c9f570711864e07e38"
+conda_fbpkg = "torchtitan_conda_prod:902"
+python_version = "3.12.13"
+torch_version = "2.14.0a0+git77bc9b4"
+torch_git_version = "77bc9b492a38ec3122bb510f588a1321f4038e5c"
 cuda_version = "13.0"
 nccl_version = [2, 30, 7]
 
 [runtime.packages]
-spmd_types = "0.2.5"
-grain = "0.2.18"
-attn-gym = "0.0.8"
-torch-remat = "0.2.0"
 datasets = "4.7.0"
+pulp = "3.3.2"
+spmd_types = "0.2.1"
+
+[execution]
+spmd_backend = "default"

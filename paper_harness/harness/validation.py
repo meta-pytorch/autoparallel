@@ -1,22 +1,25 @@
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 import os
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any
 
+from .assets import asset_lock_digest, load_asset_lock
 from .campaign import Campaign, CampaignError, write_json
 from .experiment_lock import experiment_lock_digest, load_experiment_lock
 from .integrity import validate_harness_integrity
 from .parity import validate_pair
-from .profiles import validate_apgt_source, validate_profile, validate_profile_pair
+from .profiles import validate_apgt_source, validate_profile
 from .sources import inspect_source, manifest_digest, tree_manifest
 
 
-def _validate_phase_config(phase_kind: str, profile: str, config: dict[str, Any]) -> None:
+def _validate_phase_config(
+    phase_kind: str, profile: str, config: dict[str, Any]
+) -> None:
     profiler = config.get("profiler", {})
     if phase_kind == "performance" and (
         profiler.get("enable_profiling") or profiler.get("enable_memory_snapshot")
@@ -24,11 +27,7 @@ def _validate_phase_config(phase_kind: str, profile: str, config: dict[str, Any]
         raise CampaignError(
             "performance phases must disable Kineto and memory snapshots"
         )
-    if (
-        phase_kind in {"trace", "kineto"}
-        and not profile.endswith("_cp_legacy_v1")
-        and not profiler.get("enable_profiling")
-    ):
+    if phase_kind in {"trace", "kineto"} and not profiler.get("enable_profiling"):
         raise CampaignError("trace/kineto phases must enable the Torch profiler")
 
 
@@ -99,22 +98,33 @@ def validate_campaign(
     output_dir = output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     harness_integrity = validate_harness_integrity()
+    locked_assets = load_asset_lock()
+    locked_assets_sha256 = asset_lock_digest()
     asset_roots = asset_roots or {}
     required_assets = campaign.raw.get("artifacts", {}).get("required_assets", [])
     missing_assets = sorted(set(required_assets) - set(asset_roots))
     if missing_assets:
         raise CampaignError(f"missing required --asset-root values: {missing_assets}")
+    unknown_assets = sorted(set(asset_roots) - set(locked_assets["assets"]))
+    if unknown_assets:
+        raise CampaignError(f"asset lock has no entries for {unknown_assets}")
     for name, root in asset_roots.items():
         if not root.resolve().is_dir():
             raise CampaignError(f"asset root {name!r} is not a directory: {root}")
     asset_lock = {}
     for name, root in sorted(asset_roots.items()):
         manifest = tree_manifest(root.resolve())
-        asset_lock[name] = {
+        observed = {
             "root": str(root.resolve()),
             "tree_sha256": manifest_digest(manifest),
             "file_count": len(manifest),
         }
+        expected = locked_assets["assets"][name]
+        if observed["tree_sha256"] != expected["tree_sha256"]:
+            raise CampaignError(f"locked asset {name!r} tree digest differs")
+        if observed["file_count"] != int(expected["file_count"]):
+            raise CampaignError(f"locked asset {name!r} file count differs")
+        asset_lock[name] = observed
     write_json(output_dir / "asset_lock.json", asset_lock)
     experiment_lock = load_experiment_lock()
     experiment_lock_sha256 = experiment_lock_digest()
@@ -122,7 +132,9 @@ def validate_campaign(
     identity_template = data.get("identity_manifest")
     identity_sha256 = data.get("identity_manifest_sha256")
     if not identity_template or not identity_sha256:
-        raise CampaignError("data identity_manifest and identity_manifest_sha256 are required")
+        raise CampaignError(
+            "data identity_manifest and identity_manifest_sha256 are required"
+        )
     identity_text = str(identity_template).replace(
         "{harness}", str(Path(__file__).resolve().parents[1])
     )
@@ -150,10 +162,16 @@ def validate_campaign(
     specs = campaign.source_specs()
     source_lock = {
         "torchtitan": inspect_source(
-            "torchtitan", torchtitan_root, specs["torchtitan"], evidence_dir=source_evidence
+            "torchtitan",
+            torchtitan_root,
+            specs["torchtitan"],
+            evidence_dir=source_evidence,
         ),
         "autoparallel": inspect_source(
-            "autoparallel", autoparallel_root, specs["autoparallel"], evidence_dir=source_evidence
+            "autoparallel",
+            autoparallel_root,
+            specs["autoparallel"],
+            evidence_dir=source_evidence,
         ),
     }
     write_json(output_dir / "source_lock.json", source_lock)
@@ -163,18 +181,13 @@ def validate_campaign(
 
     profiles = {arm.profile for arm in campaign.arms}
     contract: dict[str, Any] = {}
-    if profiles & {"gt_manual_aot_v1", "apgt_v1"}:
-        contract["apgt_v1"] = validate_apgt_source(torchtitan_root)
-    if profiles & {"gt_manual_cp_legacy_v1", "apgt_cp_legacy_v1"}:
-        contract["apgt_cp_legacy_v1"] = {
-            "status": "legacy",
-            "source_pin_required": True,
-            "cross_profile_comparison_allowed": False,
-        }
+    if "apgt_validated_v1" in profiles:
+        contract["apgt_validated_v1"] = validate_apgt_source(torchtitan_root)
 
     resolved = campaign.resolved_dict()
     resolved["experiment_lock"] = experiment_lock
     resolved["experiment_lock_sha256"] = experiment_lock_sha256
+    resolved["asset_lock_sha256"] = locked_assets_sha256
     serialized: dict[str, dict[str, Any]] = {}
     serialized_environments: dict[str, dict[str, str]] = {}
     profile_checks = []
@@ -188,6 +201,7 @@ def validate_campaign(
                 arm = campaign.arm(arm_name)
                 path = serialized_root / phase.name / f"{arm_name}.json"
                 path.parent.mkdir(parents=True, exist_ok=True)
+
                 def expand(value: str) -> str:
                     while "{asset:" in value:
                         start = value.index("{asset:")
@@ -195,11 +209,15 @@ def validate_campaign(
                         name = value[start + len("{asset:") : end]
                         if name not in asset_roots:
                             raise CampaignError(f"missing --asset-root for {name!r}")
-                        value = value[:start] + str(asset_roots[name].resolve()) + value[end + 1 :]
-                    return (
-                        value.replace("{output}", str(output_dir / "probe"))
-                        .replace("{harness}", str(Path(__file__).resolve().parents[1]))
+                        value = (
+                            value[:start]
+                            + str(asset_roots[name].resolve())
+                            + value[end + 1 :]
+                        )
+                    return value.replace("{output}", str(output_dir / "probe")).replace(
+                        "{harness}", str(Path(__file__).resolve().parents[1])
                     )
+
                 argv = []
                 for token in campaign.phase_arm_args(phase, arm):
                     argv.append(expand(token))
@@ -209,11 +227,16 @@ def validate_campaign(
                 raw_probe_env.setdefault("BENCHMARK_ARM", arm_name)
                 raw_probe_env.setdefault("BENCHMARK_OUTPUT_DIR", "{output}")
                 raw_probe_env.setdefault(
+                    "RANK",
+                    str(phase.trace_ranks[0])
+                    if phase.kind in {"trace", "kineto"} and phase.trace_ranks
+                    else "0",
+                )
+                raw_probe_env.setdefault(
                     "BENCHMARK_SOURCE_LOCK_SHA256", source_lock_sha256
                 )
                 probe_env = {
-                    key: expand(str(value))
-                    for key, value in raw_probe_env.items()
+                    key: expand(str(value)) for key, value in raw_probe_env.items()
                 }
                 config = _probe_config(
                     argv,
@@ -249,22 +272,17 @@ def validate_campaign(
                         )
                         check["phase"] = phase.name
                         parity_checks.append(check)
-                        profile_pair = validate_profile_pair(
-                            campaign.arm(baseline),
-                            phase_configs[baseline],
-                            campaign.arm(treatment),
-                            phase_configs[treatment],
-                        )
-                        if profile_pair is not None:
-                            profile_pair["phase"] = phase.name
-                            parity_checks.append(profile_pair)
                         baseline_env = dict(campaign.raw["mast"].get("environment", {}))
                         treatment_env = dict(baseline_env)
                         baseline_env.update(
-                            campaign.phase_arm_environment(phase, campaign.arm(baseline))
+                            campaign.phase_arm_environment(
+                                phase, campaign.arm(baseline)
+                            )
                         )
                         treatment_env.update(
-                            campaign.phase_arm_environment(phase, campaign.arm(treatment))
+                            campaign.phase_arm_environment(
+                                phase, campaign.arm(treatment)
+                            )
                         )
                         environment_check = validate_pair(
                             baseline,
@@ -292,17 +310,10 @@ def validate_campaign(
                     serialized[right_key],
                     list(comparison["allowed_config_paths"]),
                 )
-                check["phase"] = f"{phase_by_arm[baseline]} -> {phase_by_arm[treatment]}"
+                check[
+                    "phase"
+                ] = f"{phase_by_arm[baseline]} -> {phase_by_arm[treatment]}"
                 parity_checks.append(check)
-                profile_pair = validate_profile_pair(
-                    campaign.arm(baseline),
-                    serialized[left_key],
-                    campaign.arm(treatment),
-                    serialized[right_key],
-                )
-                if profile_pair is not None:
-                    profile_pair["phase"] = check["phase"]
-                    parity_checks.append(profile_pair)
                 environment_check = validate_pair(
                     baseline,
                     serialized_environments[left_key],
@@ -330,6 +341,8 @@ def validate_campaign(
         "harness_integrity": harness_integrity,
         "experiment_lock": experiment_lock,
         "experiment_lock_sha256": experiment_lock_sha256,
+        "locked_assets": locked_assets,
+        "locked_assets_sha256": locked_assets_sha256,
         "source_lock_sha256": source_lock_sha256,
         "profile_contracts": contract,
         "profile_checks": profile_checks,

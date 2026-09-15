@@ -3,22 +3,17 @@ from __future__ import annotations
 import json
 import os
 import sys
-import time
 from dataclasses import dataclass, replace
-from functools import partial
 from pathlib import Path
 
 import torch
-from torch.distributed.fsdp import MixedPrecisionPolicy
-from torch.distributed.tensor.placement_types import Replicate, Shard
 from torch.utils.data import IterableDataset
-
-from torchtitan.config import CompileConfig, TORCH_DTYPE_MAP
-from torchtitan.components.data.loader import BaseDataLoader
-from torchtitan.components.loss import CrossEntropyLoss, IGNORE_INDEX
-from torchtitan.components.optimizer import default_adamw, LRSchedulersContainer
+from torchtitan.components.dataloader import ParallelAwareDataloader
+from torchtitan.components.loss import CrossEntropyLoss
+from torchtitan.components.lr_scheduler import LRSchedulersContainer
+from torchtitan.components.optimizer import default_adamw
+from torchtitan.config import CompileConfig
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
-from torchtitan.distributed.fsdp import get_fsdp_reshard_after_forward_policy
 from torchtitan.experiments.graph_trainer.configs import (
     GraphTrainerCompileConfig,
     to_graph_trainer_config,
@@ -26,11 +21,7 @@ from torchtitan.experiments.graph_trainer.configs import (
 from torchtitan.experiments.graph_trainer.llama3 import model_registry
 from torchtitan.models.common.config_utils import decoder_vocab_size
 from torchtitan.models.llama3.config_registry import llama3_8b
-from torchtitan.tools.logging import logger
-from torchtitan.tools.utils import device_type
-
 from workloads.parameter_state import register_post_load_parameter_audit
-
 
 C4_REPO = "allenai/c4"
 C4_REVISION = "1588ec454efa1a09f29cd18ddd04fe05fc8653a2"
@@ -132,9 +123,7 @@ if GLOBAL_BATCH_SIZE % (LOCAL_BATCH_SIZE * DP_DEGREE) != 0:
         "Global batch must equal local batch per DP rank * DP degree * "
         "an integer gradient accumulation count"
     )
-GRADIENT_ACCUMULATION_STEPS = GLOBAL_BATCH_SIZE // (
-    LOCAL_BATCH_SIZE * DP_DEGREE
-)
+GRADIENT_ACCUMULATION_STEPS = GLOBAL_BATCH_SIZE // (LOCAL_BATCH_SIZE * DP_DEGREE)
 PLACEMENT_GLOBAL_BATCH_SIZE = LOCAL_BATCH_SIZE * DP_DEGREE
 REPLAY_SLOTS = 10
 
@@ -182,6 +171,8 @@ def _write_inductor_path_audit() -> None:
             f"Unexpected custom post-grad scheduler for {configuration}: "
             f"present={custom_post_pass is not None}"
         )
+    if custom_post_pass is not None and not callable(custom_post_pass):
+        raise RuntimeError("Configured post-grad scheduler is not callable")
 
     audit_dir = Path(os.environ["MODULE_ISOLATION_AUDIT_DIR"])
     audit_dir.mkdir(parents=True, exist_ok=True)
@@ -202,236 +193,9 @@ def _write_inductor_path_audit() -> None:
     output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
 
 
-class AutoParallelBackendOutputAdapter(torch.nn.Module):
-    """Restore the TP-sharded model output to the DTensor loss boundary."""
-
-    def __init__(self, model, model_output):
-        super().__init__()
-        self.model = model
-        self.model_output = model_output
-
-    def forward(self, *args, **kwargs):
-        from torchtitan.experiments.graph_trainer.autoparallel_api import (
-            _wrap_autoparallel_output,
-        )
-
-        return _wrap_autoparallel_output(self.model(*args, **kwargs), self.model_output)
-
-    def init_weights(self, *args, **kwargs):
-        return self.model.init_weights(*args, **kwargs)
-
-
 def _register_post_load_audits(optimizers, model_parts, parallel_dims):
     _write_inductor_path_audit()
     register_post_load_parameter_audit(optimizers, model_parts, parallel_dims)
-
-
-def parallelize_autoparallel_backend_llama(
-    model,
-    *,
-    parallel_dims,
-    training,
-    parallelism,
-    compile_config,
-    ac_config,
-    dump_folder,
-):
-    """Use the standard AutoParallel apply_placement + backend path."""
-    from autoparallel import AutoParallel, ForwardInputs
-    from autoparallel.compile import autoparallel_backend
-    from autoparallel.cost_models.collective_runtime_estimation import (
-        set_nccl_topo_config,
-    )
-    from autoparallel.cost_models.nccl_cost_model import detect_nccl_topo_config
-    from autoparallel.graph_passes.auto_bucketing import (
-        aten_autobucketing_config,
-        aten_autobucketing_reordering_pass,
-    )
-    from autoparallel.graph_passes.debug_helpers import (
-        make_custom_runtime_estimation,
-    )
-    from autoparallel.graph_passes.estimate_graph_metrics import (
-        estimate_graph_metrics,
-    )
-    from torchtitan.experiments.graph_trainer.autoparallel_api import (
-        AutoParallelModelOutput,
-    )
-
-    del compile_config
-    if parallel_dims.dp_replicate_enabled:
-        raise ValueError("AutoParallel Llama3 does not support DDP yet")
-    if parallel_dims.cp_enabled:
-        raise ValueError("AutoParallel Llama3 does not support CP yet")
-    if parallel_dims.pp_enabled:
-        raise ValueError("AutoParallel Llama3 does not support PP yet")
-
-    if ac_config is not None:
-        ac_config.build(dump_folder=dump_folder).apply(model)
-
-    mesh_axis_names = [
-        name
-        for name in ("dp_replicate", "fsdp", "tp")
-        if parallel_dims.get_optional_mesh(name) is not None
-    ]
-    mesh = parallel_dims.get_mesh(mesh_axis_names)
-
-    def input_fn():
-        dp_degree = parallel_dims.dp_replicate * parallel_dims.dp_shard
-        local_batch_size, remainder = divmod(
-            training.num_tokens_per_microbatch_per_dp_rank,
-            training.max_context_length,
-        )
-        if remainder:
-            raise RuntimeError("AutoParallel placement token batch is not rectangular")
-        global_batch_size = local_batch_size * dp_degree
-        if global_batch_size != PLACEMENT_GLOBAL_BATCH_SIZE:
-            raise RuntimeError(
-                "AutoParallel placement input must represent one microbatch "
-                f"across DP ranks: {global_batch_size} != "
-                f"{PLACEMENT_GLOBAL_BATCH_SIZE}"
-            )
-        tokens = torch.randint(
-            0,
-            model.config.vocab_size,
-            (global_batch_size, training.max_context_length),
-            device=torch.device(device_type),
-        )
-        positions = torch.arange(
-            training.max_context_length,
-            dtype=torch.int64,
-            device=torch.device(device_type),
-        ).repeat(global_batch_size, 1)
-        return ForwardInputs(args=(tokens,), kwargs={"positions": positions})
-
-    mp_policy = MixedPrecisionPolicy(
-        param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
-        reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
-        cast_forward_inputs=False,
-    )
-    reshard_after_forward = get_fsdp_reshard_after_forward_policy(
-        parallelism.fsdp_reshard_after_forward,
-        parallel_dims.pp_enabled,
-    )
-    if reshard_after_forward is not True:
-        raise RuntimeError(
-            "This experiment requires reshard_after_forward=True in every arm"
-        )
-    input_sharding_by_axis = {
-        "dp_replicate": Shard(0),
-        "fsdp": Shard(0),
-        "tp": Replicate(),
-    }
-    input_sharding = tuple(input_sharding_by_axis[name] for name in mesh.mesh_dim_names)
-    output_sharding = tuple(
-        Shard(2) if name == "tp" else Shard(0) for name in mesh.mesh_dim_names
-    )
-
-    with AutoParallel(
-        model,
-        input_fn,
-        mesh,
-        mp_policy=mp_policy,
-        reshard_after_forward=reshard_after_forward,
-    ) as autop:
-        autop.add_parameter_memory_constraint(low=None, high=None)
-        autop.add_input_constraints([input_sharding, input_sharding])
-        autop.add_output_constraints([output_sharding])
-        start = time.time()
-        placement = autop.optimize_placement(verbose=False)
-        logger.info(
-            "AutoParallel backend placement took %.2f seconds", time.time() - start
-        )
-        parallel_model = autop.apply_placement(placement)
-
-    import autoparallel.api as autoparallel_api
-
-    hook_expectation = os.environ["AP_COLLECTIVE_MUST_SAVE_EXPECTATION"]
-    hook_present = hasattr(
-        autoparallel_api, "_save_autoparallel_collectives_for_first_partition"
-    )
-    hook_audit = getattr(autoparallel_api, "_ap_collective_must_save_audit", None)
-    if hook_expectation == "on":
-        if not hook_present or not isinstance(hook_audit, dict):
-            raise RuntimeError("Expected AP collective MUST_SAVE hook audit is absent")
-        if hook_audit.get("collective_total", 0) <= 0:
-            raise RuntimeError(f"AP collective MUST_SAVE hook matched nothing: {hook_audit}")
-    elif hook_expectation == "off":
-        if hook_present or hook_audit is not None:
-            raise RuntimeError("AP collective MUST_SAVE hook is present in the off arm")
-    else:
-        raise RuntimeError(f"Unknown AP hook expectation: {hook_expectation!r}")
-    hook_report = {
-        "expectation": hook_expectation,
-        "hook_present": hook_present,
-        "hook_audit": hook_audit,
-        "reshard_after_forward": reshard_after_forward,
-        "rank": int(os.environ["RANK"]),
-    }
-    hook_audit_dir = Path(os.environ["AP_COLLECTIVE_HOOK_AUDIT_DIR"])
-    hook_audit_dir.mkdir(parents=True, exist_ok=True)
-    (hook_audit_dir / f"rank_{int(os.environ['RANK']):02d}.json").write_text(
-        json.dumps(hook_report, indent=2, sort_keys=True) + "\n"
-    )
-
-    set_nccl_topo_config(detect_nccl_topo_config(mesh))
-    custom_runtime_estimation = make_custom_runtime_estimation(mesh)
-    autobucketing_config = aten_autobucketing_config()
-    autobucketing_config.custom_runtime_estimation = custom_runtime_estimation
-    autobucketing_config.save_trace = False
-    autobucketing_pass = partial(
-        aten_autobucketing_reordering_pass,
-        configs=autobucketing_config,
-    )
-
-    def post_grad_pass(graph):
-        new_gm = autobucketing_pass(graph)
-        logger.info(
-            "AutoParallel post-grad graph metrics: %s",
-            estimate_graph_metrics(new_gm, custom_runtime_estimation),
-        )
-        return new_gm
-
-    torch._inductor.config.reorder_for_peak_memory = False
-    torch._inductor.config.reorder_for_compute_comm_overlap = False
-    torch._inductor.config.post_grad_custom_post_pass = post_grad_pass
-
-    parallel_model = torch.compile(
-        parallel_model,
-        backend=autoparallel_backend(
-            enable_ac=False,
-            overlap_scheduling=True,
-        ),
-    )
-    model_output = (
-        AutoParallelModelOutput(
-            output_mesh=parallel_dims.get_mesh("tp"),
-            output_placements=(Shard(2),),
-            sharded_output_axis=2,
-        )
-        if parallel_dims.tp_enabled
-        else None
-    )
-    return AutoParallelBackendOutputAdapter(parallel_model, model_output)
-
-
-def parallelize_graphtrainer_autoparallel_llama(
-    model,
-    *,
-    parallel_dims,
-    training,
-    **kwargs,
-):
-    """Keep the AP placement example at one microbatch across DP ranks."""
-    from workloads.llama3_batched_autoparallel import (
-        parallelize_batched_autoparallel_llama,
-    )
-
-    return parallelize_batched_autoparallel_llama(
-        model,
-        parallel_dims=parallel_dims,
-        training=training,
-        **kwargs,
-    )
 
 
 class TopologyInvariantReplayDataset(IterableDataset):
@@ -451,11 +215,16 @@ class TopologyInvariantReplayDataset(IterableDataset):
             raise ValueError(
                 f"Expected local batch {LOCAL_BATCH_SIZE}, got {local_batch_size}"
             )
-        payload = torch.load(replay_path, map_location="cpu", mmap=True, weights_only=True)
+        payload = torch.load(
+            replay_path, map_location="cpu", mmap=True, weights_only=True
+        )
         expected_shape = (REPLAY_SLOTS, 256, SEQ_LEN)
         for name in ("input", "positions", "labels"):
             tensor = payload.get(name)
-            if not isinstance(tensor, torch.Tensor) or tuple(tensor.shape) != expected_shape:
+            if (
+                not isinstance(tensor, torch.Tensor)
+                or tuple(tensor.shape) != expected_shape
+            ):
                 raise ValueError(
                     f"Replay tensor {name!r} has invalid shape: "
                     f"{None if tensor is None else tuple(tensor.shape)}"
@@ -488,10 +257,10 @@ class TopologyInvariantReplayDataset(IterableDataset):
                 slot = (slot + 1) % REPLAY_SLOTS
 
 
-class AuditedReplayDataLoader(BaseDataLoader):
+class AuditedReplayDataLoader(ParallelAwareDataloader):
     @dataclass(kw_only=True, slots=True)
-    class Config(BaseDataLoader.Config):
-        dataset: str = DATASET_NAME
+    class Config(ParallelAwareDataloader.Config):
+        pass
 
     def __init__(
         self,
@@ -500,55 +269,37 @@ class AuditedReplayDataLoader(BaseDataLoader):
         dp_world_size: int,
         dp_rank: int,
         tokenizer,
-        max_context_length: int,
-        num_tokens_per_batch: int,
+        seq_len: int,
+        local_batch_size: int,
+        snapshot_every_n_steps: int | None = 1,
         **kwargs,
     ) -> None:
         del kwargs, tokenizer
-        if max_context_length != SEQ_LEN:
-            raise ValueError(
-                f"Expected sequence length {SEQ_LEN}, got {max_context_length}"
-            )
-        local_batch_size, remainder = divmod(
-            num_tokens_per_batch, max_context_length
-        )
-        if remainder:
-            raise ValueError("Replay token batch is not rectangular")
-        self._dataset = TopologyInvariantReplayDataset(
+        if seq_len != SEQ_LEN:
+            raise ValueError(f"Expected sequence length {SEQ_LEN}, got {seq_len}")
+        dataset = TopologyInvariantReplayDataset(
             Path(os.environ["REPLAY_TENSORS_PATH"]),
             dp_rank=dp_rank,
             dp_world_size=dp_world_size,
             local_batch_size=local_batch_size,
         )
-        self.max_num_documents = config.max_num_documents
-        self._local_batch_size = local_batch_size
-        self._source = iter(self._dataset)
-        self._index = 0
+        super().__init__(
+            dataset,
+            dp_rank=dp_rank,
+            dp_world_size=dp_world_size,
+            num_workers=config.num_workers,
+            persistent_workers=config.persistent_workers,
+            pin_memory=config.pin_memory,
+            prefetch_factor=config.prefetch_factor,
+            snapshot_every_n_steps=snapshot_every_n_steps,
+            batch_size=local_batch_size,
+        )
 
     def __iter__(self):
+        source = super().__iter__()
         while True:
-            samples = [next(self._source) for _ in range(self._local_batch_size)]
-            input_dict = {
-                name: torch.stack([sample[0][name] for sample in samples])
-                for name in samples[0][0]
-            }
-            labels = torch.stack([sample[1] for sample in samples])
-            input_dict["labels"] = labels
-            input_dict["num_valid_tokens"] = int((labels != IGNORE_INDEX).sum())
-            self._index += 1
-            yield input_dict
-
-    def state_dict(self):
-        return {"index": self._index}
-
-    def load_state_dict(self, state_dict):
-        index = int(state_dict.get("index", 0))
-        if index < 0:
-            raise ValueError(f"Invalid replay index {index}")
-        self._source = iter(self._dataset)
-        for _ in range((index % REPLAY_SLOTS) * self._local_batch_size):
-            next(self._source)
-        self._index = index
+            input_dict, labels = next(source)
+            yield dict(input_dict), labels
 
 
 def _base_config():
@@ -568,9 +319,9 @@ def _base_config():
     config.lr_scheduler = LRSchedulersContainer.Config(warmup_steps=200)
     config.training = replace(
         config.training,
-        num_tokens_per_microbatch_per_dp_rank=LOCAL_BATCH_SIZE * SEQ_LEN,
-        num_tokens_per_train_step=GLOBAL_BATCH_SIZE * SEQ_LEN,
-        max_context_length=SEQ_LEN,
+        local_batch_size=LOCAL_BATCH_SIZE,
+        global_batch_size=GLOBAL_BATCH_SIZE,
+        seq_len=SEQ_LEN,
         steps=28,
         dtype="float32",
         mixed_precision_param="bfloat16",
@@ -627,72 +378,24 @@ def _base_config():
     return config
 
 
-def _graph_config(
-    *,
-    inductor_compilation: str,
-    enable_remat: bool = True,
-    enable_autoparallel: bool = True,
-    pass_pipeline: str = "default",
-):
+def _graph_config(*, enable_autoparallel: bool):
     config = to_graph_trainer_config(_base_config(), model_registry)
-    config.model_spec = replace(
-        config.model_spec,
-        parallelize_fn=parallelize_graphtrainer_autoparallel_llama,
-    )
-    disabled_passes = ["cudagraph_pass"]
-    if not enable_remat:
-        disabled_passes.extend(
-            ["tag_with_memory_policy_pass", "selective_activation_remat_pass"]
-        )
+    config.profiler = replace(config.profiler, trace_post_processor=None)
     config.compile = GraphTrainerCompileConfig(
         enable=True,
         components=["model", "loss"],
-        mode="aot_fx_trace",
         memory_policy="eager",
-        inductor_compilation=inductor_compilation,
-        numerics_changing_optim=False,
-        disable_passes=disabled_passes,
-        enable_fsdp_ag_rs_overlap=False,
-        enable_fsdp_dense_region_overlap=False,
         enable_autoparallel=enable_autoparallel,
-        pass_pipeline=pass_pipeline,
     )
     return config
 
 
-def _backend_config():
-    config = _base_config()
-    name = "autoparallel_backend/example_scheduling/llama3"
-    config.model_spec = replace(
-        config.model_spec,
-        name=name,
-        parallelize_fn=parallelize_autoparallel_backend_llama,
-    )
-    config.compile = CompileConfig(enable=False)
-    return config
+def graphtrainer_manual_eager_8b():
+    return _graph_config(enable_autoparallel=False)
 
 
-def autoparallel_backend_example_scheduling_8b():
-    return _backend_config()
-
-
-def autoparallel_graphtrainer_full_inductor_8b():
-    return _graph_config(inductor_compilation="full")
-
-
-def graphtrainer_manual_full_inductor_8b():
-    return _graph_config(inductor_compilation="full", enable_autoparallel=False)
-
-
-def autoparallel_graphtrainer_full_inductor_current_8b():
-    return _graph_config(inductor_compilation="full")
-
-
-def graphtrainer_manual_full_inductor_current_8b():
-    return _graph_config(
-        inductor_compilation="full",
-        enable_autoparallel=False,
-    )
+def autoparallel_graphtrainer_8b():
+    return _graph_config(enable_autoparallel=True)
 
 
 def torchtitan_baseline_8b():
@@ -716,9 +419,6 @@ def torchtitan_baseline_8b():
 
 EXPERIMENT_CONFIGS = (
     "torchtitan_baseline_8b",
-    "graphtrainer_manual_full_inductor_8b",
-    "graphtrainer_manual_full_inductor_current_8b",
-    "autoparallel_backend_example_scheduling_8b",
-    "autoparallel_graphtrainer_full_inductor_8b",
-    "autoparallel_graphtrainer_full_inductor_current_8b",
+    "graphtrainer_manual_eager_8b",
+    "autoparallel_graphtrainer_8b",
 )

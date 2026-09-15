@@ -1,7 +1,17 @@
 schema_version = 1
 name = "deepseek-v3-16b-tt-main-vs-apgt"
-description = "Pinned DeepSeek V3 16B MainTrainer and AutoParallel campaign"
+description = "DeepSeek V3 16B permanent-harness functional/performance template"
 workload = "deepseek_v3_16b"
+
+[sources.torchtitan]
+remote = "https://github.com/AlbedoWang/torchtitan.git"
+commit = "f75694db12e8200126d3fbeccea647e3c54c7ba4"
+dirty_policy = "forbid"
+
+[sources.autoparallel]
+remote = "https://github.com/meta-pytorch/autoparallel.git"
+commit = "b6865e7ce874c08e548177a78d2c96f21b65fa36"
+dirty_policy = "forbid"
 
 [model]
 flavor = "16B"
@@ -39,6 +49,7 @@ nproc_per_node = 8
 hardware = "grandteton_80g_roce"
 locality = "dc;pci1"
 gpu_name_contains = "H100"
+conda_fbpkg = "torchtitan_conda_prod:902"
 retries = 0
 master_port = 29500
 phase_timeout_seconds = 7200
@@ -58,9 +69,13 @@ PYTORCH_ALLOC_CONF = "expandable_segments:True"
 required_assets = ["offline_c4", "deepseek_tokenizer"]
 warmup_steps = 5
 
+[legacy]
+instrumentation_note = "The old four-arm runner hashed and appended each yielded batch; no valid final comparison was produced."
+evidence_globs = ["reports/*.md", "reports/*.json"]
+
 [[arms]]
 name = "tt_main"
-profile = "tt_main_default_v1"
+profile = "tt_main_manual_jit_v1"
 module = "workloads.deepseek_v3.perf_configs"
 config = "torchtitan_baseline_16b"
 [arms.environment]
@@ -69,9 +84,9 @@ EXPERIMENT_ARM = "T"
 
 [[arms]]
 name = "apgt"
-profile = "apgt_validated_v1"
+profile = "apgt_v1"
 module = "workloads.deepseek_v3.perf_configs"
-config = "autoparallel_graphtrainer_16b"
+config = "autoparallel_graphtrainer_full_inductor_16b"
 [arms.environment]
 BENCHMARK_CONFIGURATION = "autoparallel_graphtrainer"
 EXPERIMENT_ARM = "G"

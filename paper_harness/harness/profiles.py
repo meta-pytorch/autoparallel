@@ -4,7 +4,6 @@ from pathlib import Path
 from typing import Any
 
 from .campaign import Arm, CampaignError
-from .parity import validate_pair
 
 
 def _get(config: dict[str, Any], path: str) -> Any:
@@ -27,11 +26,11 @@ def _expect(config: dict[str, Any], expected: dict[str, Any]) -> None:
 
 
 def validate_profile(arm: Arm, config: dict[str, Any]) -> dict[str, Any]:
-    if arm.profile == "tt_main_manual_jit_v1":
+    if arm.profile == "tt_main_default_v1":
         model_spec_name = str(_get(config, "model_spec.name"))
         if "graphtrainer" in model_spec_name.replace("_", "").lower():
             raise CampaignError(
-                "tt_main_manual_jit_v1 cannot use a GraphTrainer model spec"
+                "tt_main_default_v1 cannot use a GraphTrainer model spec"
             )
         _expect(
             config,
@@ -40,30 +39,26 @@ def validate_profile(arm: Arm, config: dict[str, Any]) -> dict[str, Any]:
                 "compile.backend": "inductor",
             },
         )
-        if set(_get(config, "compile.components")) != {"model", "loss"}:
-            raise CampaignError("tt_main_manual_jit_v1 must compile model and loss")
-    elif arm.profile in {
-        "gt_manual_aot_v1",
-        "apgt_v1",
-        "gt_manual_cp_legacy_v1",
-        "apgt_cp_legacy_v1",
-        "apgt_3d_exact_mesh_flash_v1",
-    }:
-        legacy_cp = arm.profile in {"gt_manual_cp_legacy_v1", "apgt_cp_legacy_v1"}
-        model_spec_name = _get(config, "model_spec.name")
-        if not legacy_cp and not (
-            arm.module.startswith("graph_trainer.")
-            or "graphtrainer" in str(model_spec_name).replace("_", "").lower()
-        ):
+    elif arm.profile == "gt_manual_eager_v1":
+        _expect(
+            config,
+            {
+                "compile.enable": True,
+                "compile.backend": "aot_eager",
+                "compile.mode": "aot_fx_trace",
+                "compile.memory_policy": "eager",
+                "compile.inductor_compilation": "regional",
+                "compile.numerics_changing_optim": False,
+                "compile.enable_fsdp_ag_rs_overlap": False,
+                "compile.enable_fsdp_dense_region_overlap": False,
+                "compile.enable_autoparallel": False,
+            },
+        )
+        if _get(config, "compile.disable_passes") != []:
             raise CampaignError(
-                f"{arm.profile} requires a GraphTrainer model spec, got "
-                f"{model_spec_name!r}"
+                "gt_manual_eager_v1 must retain GraphTrainer's default pass list"
             )
-        expected_ap = arm.profile in {
-            "apgt_v1",
-            "apgt_cp_legacy_v1",
-            "apgt_3d_exact_mesh_flash_v1",
-        }
+    elif arm.profile == "apgt_validated_v1":
         _expect(
             config,
             {
@@ -75,59 +70,19 @@ def validate_profile(arm: Arm, config: dict[str, Any]) -> dict[str, Any]:
                 "compile.numerics_changing_optim": False,
                 "compile.enable_fsdp_ag_rs_overlap": False,
                 "compile.enable_fsdp_dense_region_overlap": False,
-                "compile.enable_autoparallel": expected_ap,
+                "compile.enable_autoparallel": True,
             },
         )
-        if set(_get(config, "compile.components")) != {"model", "loss"}:
-            raise CampaignError(f"{arm.profile} must compile model and loss")
-        disabled = set(_get(config, "compile.disable_passes"))
-        if "cudagraph_pass" not in disabled:
-            raise CampaignError(f"{arm.profile} requires cudagraph_pass to be disabled")
-        joint = "joint_transformer_block_bucketing_reordering_pass"
-        if legacy_cp and joint not in disabled:
-            raise CampaignError(f"{arm.profile} requires the historical joint-pass disable")
-        if not legacy_cp and joint in disabled:
+        if set(_get(config, "compile.disable_passes")) != {"cudagraph_pass"}:
             raise CampaignError(
-                f"{arm.profile} must not disable the joint pass in serialized config; "
-                "the source pass builder selects manual joint versus AP scheduling"
+                "apgt_validated_v1 requires only cudagraph_pass to be disabled"
             )
-        if not legacy_cp and disabled != {"cudagraph_pass"}:
-            raise CampaignError(
-                f"{arm.profile} requires only cudagraph_pass disabled, got {sorted(disabled)}"
-            )
-        if arm.profile == "apgt_3d_exact_mesh_flash_v1" and not arm.module.startswith(
-            "workloads.llama3_3d_current."
-        ):
-            raise CampaignError(
-                "apgt_3d_exact_mesh_flash_v1 requires the fixed current-head "
-                "LLaMA3 3D workload"
-            )
-    elif arm.profile == "ap_backend_legacy_v1":
-        if "autoparallel" not in arm.config and "autoparallel" not in arm.module:
-            raise CampaignError("ap_backend_legacy_v1 must name an AutoParallel config/module")
+    else:
+        raise CampaignError(f"unknown profile {arm.profile!r}")
+
+    if set(_get(config, "compile.components")) != {"model", "loss"}:
+        raise CampaignError(f"{arm.profile} must compile model and loss")
     return {"arm": arm.name, "profile": arm.profile, "status": "passed"}
-
-
-def validate_profile_pair(
-    baseline_arm: Arm,
-    baseline: dict[str, Any],
-    treatment_arm: Arm,
-    treatment: dict[str, Any],
-) -> dict[str, Any] | None:
-    if baseline_arm.profile == "gt_manual_aot_v1" and treatment_arm.profile in {
-        "apgt_v1",
-        "apgt_3d_exact_mesh_flash_v1",
-    }:
-        check = validate_pair(
-            baseline_arm.name,
-            baseline,
-            treatment_arm.name,
-            treatment,
-            ["compile.enable_autoparallel"],
-        )
-        check["kind"] = "fixed_apgt_v1_pair_contract"
-        return check
-    return None
 
 
 def validate_apgt_source(torchtitan_root: Path) -> dict[str, Any]:
@@ -137,47 +92,38 @@ def validate_apgt_source(torchtitan_root: Path) -> dict[str, Any]:
     trainer_path = graph_root / "trainer.py"
     if not all(path.is_file() for path in (passes_path, api_path, trainer_path)):
         raise CampaignError("TorchTitan source lacks GraphTrainer AutoParallel files")
-    passes = passes_path.read_text()
-    api = api_path.read_text()
-    trainer = trainer_path.read_text()
-    pass_needles = (
-        "if config.compile.enable_autoparallel:",
-        "joint_transformer_block_bucketing_reordering_pass",
-        "_autoparallel_inductor_configs",
-        "full_inductor_configs=full_inductor_configs",
-        "autoparallel_mesh=autoparallel_mesh",
-        "AutoParallel full Inductor compilation requires its runtime mesh",
-    )
-    api_needles = (
-        "_graph_trainer_autoparallel_mesh",
-        "aten_distributed_optimizations.enable_overlap_scheduling",
-        "aten_distributed_optimizations.collective_bucketing",
-        "aten_distributed_optimizations.insert_overlap_deps",
-        '"aten_distributed_optimizations.max_compute_pre_fetch": 10',
-        '"reorder_for_peak_memory": False',
-        '"reorder_for_compute_comm_overlap": False',
-        '"post_grad_custom_post_pass"',
-        "aten_autobucketing_reordering_pass",
-    )
-    missing = [item for item in pass_needles if item not in passes]
-    missing.extend(item for item in api_needles if item not in api)
-    trainer_needles = (
-        "pipeline_fn is construct_default_graph_passes",
-        "autoparallel_mesh=getattr(",
-        'model, "_graph_trainer_autoparallel_mesh", None',
-    )
-    missing.extend(item for item in trainer_needles if item not in trainer)
+
+    evidence = {
+        passes_path: (
+            "if config.compile.enable_autoparallel:",
+            "joint_transformer_block_bucketing_reordering_pass",
+            "_autoparallel_inductor_configs",
+            "full_inductor_configs=full_inductor_configs",
+        ),
+        api_path: (
+            "aten_distributed_optimizations.enable_overlap_scheduling",
+            "aten_distributed_optimizations.collective_bucketing",
+            "aten_autobucketing_reordering_pass",
+            "autoparallel_manages_context_parallel_input",
+        ),
+        trainer_path: (
+            "autoparallel_manages_context_parallel_input",
+            "dist_utils.set_pg_timeouts",
+        ),
+    }
+    missing = [
+        token
+        for path, tokens in evidence.items()
+        for token in tokens
+        if token not in path.read_text()
+    ]
     if missing:
         raise CampaignError(
-            "source does not satisfy apgt_v1; user gate required before changing "
-            f"the contract. Missing evidence: {missing}"
+            "source does not satisfy apgt_validated_v1; missing evidence: " f"{missing}"
         )
     return {
         "status": "passed",
         "passes_path": str(passes_path.resolve()),
         "autoparallel_api_path": str(api_path.resolve()),
         "trainer_path": str(trainer_path.resolve()),
-        "manual_joint_pass": "enabled_by_enable_autoparallel_false_branch",
-        "ap_joint_pass": "absent_by_enable_autoparallel_true_branch",
-        "ap_full_inductor_configs": "verified",
     }

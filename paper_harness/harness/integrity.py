@@ -5,14 +5,15 @@ from pathlib import Path
 
 from .campaign import CampaignError
 
-
 MANIFEST_NAME = "HARNESS_CORE.sha256"
 CORE_PATHS = (
+    "asset_lock.toml",
     "experiment_lock.toml",
     "harness",
     "launcher",
     "workloads",
     "scripts/measurements",
+    "run_settings.toml",
 )
 
 

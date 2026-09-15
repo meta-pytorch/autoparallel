@@ -1,25 +1,47 @@
-# Submission stack provenance
-
-The harness originated from `AlbedoWang/AutoParallel-Harness` commit `854c63e69e1f2e515ad6c14e799b3c241dcbfd93`. It is checked into `paper_harness/` so the paper branch records the exact launcher and analysis code without modifying either runtime source checkout.
-
-## AutoParallel
-
-The `kaijian/paper-submission` branch is an explicit linear stack:
-
-1. PR523 stack head: `946f0643bea1e40165a63696b3e18982aea07838`.
-2. Context-parallel integration head: `ec819dbe1d0827e3b52a0225ec1fcb47f8bd9732`.
-3. N-D ordered FSDP shard-layout fix: `6f649f835e7d531be7d05c09927ed5cef1352b29`.
-4. NCCL topology-cost fix, cherry-picked from `b8ace2a55d465787840aa41466f50be4fd9f73c1` as `34085887102c6d5a627ca8229f92e9ae44ed1426`.
-5. The permanent harness snapshot and its documentation under `paper_harness/`.
-
-The immutable experiment source is `5102d629c0a97ec604b12c328b40147d214ecbe7`. Current AutoParallel `main` is not merged implicitly.
+# Unified legacy-DTensor stack provenance
 
 ## TorchTitan
 
-The companion `AlbedoWang/torchtitan` branch `kaijian/paper-submission` is pinned at `fd69701b6dc46c15b1214ba2f6ec6bbf3e044f3e`, rebased on official TorchTitan main `310e2a66e1756a965a73d5c547da01d69c1aac70`. Its stack contains the GraphTrainer AutoParallel integration, LLaMA3/DeepSeek V3/Muse integration, solver configuration bridge, AP-specific Inductor settings, FQN restoration, overlap-ordering fixes, and the current SPMD mesh timeout API compatibility fix.
+The maintained source branch is `kaijian/unified-383-repro` in
+`AlbedoWang/torchtitan`. Its history has `383cae9f` as an actual ancestor and
+retains the `60517d28` AutoParallel/GraphTrainer integration.
 
-The final compatibility commit migrates the integration to latest TorchTitan's token-based training configuration and keeps the cross-entropy path valid for both current token-major inputs and historical fixed-shape LLaMA batches.
+- `383cae9f`: eager SAC treats AutoParallel collectives like other
+  GraphTrainer collectives.
+- `8eec9e6f`: validated AutoParallel compiler defaults.
+- `0dcc68c3`: Muse Glimmer GraphTrainer/AutoParallel support.
+- `c59ce51a`: timeout propagation to all multi-axis process groups.
+- `58b458293`: DeepSeek V3 integration replayed onto the validated-defaults
+  lineage and merged without source conflicts.
+- `3f0b0475`: LLaMA 3D behavior is ported from the preserved source snapshot;
+  its unavailable original commit is not claimed as an ancestor.
 
-## Pinning policy
+The 3D port includes only the approved legacy-DTensor AP configuration, CP
+input-ownership seam, DP-shard/CP/TP mesh, CP-aware SDPA, DTensor output, and
+placement save/load behavior. The unrelated BlockMask private-API change is
+intentionally excluded.
 
-`experiment_lock.toml` is authoritative for both source commits and `torchtitan_conda_prod:946`. Every campaign must repeat those exact pins, and validation rejects dirty trees, source drift, runtime drift, or a changed frozen harness core. A later source or harness change requires a new explicit lock/version rather than editing a packaged attempt.
+## AutoParallel
+
+The maintained harness remains on `kaijian/paper-submission`. Runtime source
+is pinned to the commit immediately before the lock/harness-only updates.
+
+- `b8ace2a5` is represented by replay `3408588`.
+- `570bf072` is represented by the equivalent cuDNN broadcast-mask fix at
+  `5102d629`.
+- `4b6c31bc` is represented by the CP stack and N-D ordered-sharding replay
+  ending at `6f649f8`.
+- The `b6865e7c` branch is merged into the current paper branch. Conflict
+  resolution retains current CP/FlexAttention behavior and restores the
+  DeepSeek aliases, symbolic handling, dynamic estimator, and checkpointed
+  layer initialization.
+
+## Reproduction policy
+
+`experiment_lock.toml` is authoritative. Active campaigns contain no source
+or runtime pins and cannot override the locked `default` DTensor backend.
+Original campaign files are preserved under `provenance/campaigns/`.
+
+A moving branch name is not evidence for a result. Every report records the
+exact harness tip, runtime source commits, lock digest, source tree digests,
+runtime versions, resolved campaign, asset hashes, and command.

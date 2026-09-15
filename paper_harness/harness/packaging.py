@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import json
 import os
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Any
 
 from .campaign import Campaign, CampaignError, write_json
 from .sources import manifest_digest, tree_manifest
@@ -62,7 +62,9 @@ def package_campaign(
 ) -> dict:
     attempt_root = attempt_root.resolve()
     if attempt_root.exists() and any(attempt_root.iterdir()):
-        raise CampaignError(f"refusing to overwrite non-empty attempt directory {attempt_root}")
+        raise CampaignError(
+            f"refusing to overwrite non-empty attempt directory {attempt_root}"
+        )
     attempt_root.mkdir(parents=True, exist_ok=True)
     validation_root = attempt_root / "validation"
     validation = validate_campaign(
@@ -84,10 +86,20 @@ def package_campaign(
         validation_root / "resolved_campaign.json",
         payload / "campaign" / "resolved_campaign.json",
     )
-    shutil.copy2(validation_root / "source_lock.json", payload / "campaign/source_lock.json")
+    shutil.copy2(
+        validation_root / "source_lock.json", payload / "campaign/source_lock.json"
+    )
     shutil.copy2(
         Path(__file__).resolve().parents[1] / "experiment_lock.toml",
         payload / "campaign/experiment_lock.toml",
+    )
+    shutil.copy2(
+        Path(__file__).resolve().parents[1] / "asset_lock.toml",
+        payload / "campaign/asset_lock.toml",
+    )
+    shutil.copy2(
+        Path(__file__).resolve().parents[1] / "run_settings.toml",
+        payload / "campaign/run_settings.toml",
     )
     if (validation_root / "serialized_configs").is_dir():
         _copy_tree(
@@ -128,7 +140,7 @@ def package_campaign(
             "file_count": len(copied_manifest),
         }
     payload_manifest = tree_manifest(payload)
-    package_report = {
+    package_report: dict[str, Any] = {
         "status": "passed",
         "payload": str(payload),
         "payload_tree_sha256": manifest_digest(payload_manifest),

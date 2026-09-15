@@ -14,13 +14,9 @@ class CampaignError(ValueError):
 
 
 PROFILES = {
-    "tt_main_manual_jit_v1",
-    "gt_manual_aot_v1",
-    "apgt_v1",
-    "gt_manual_cp_legacy_v1",
-    "apgt_cp_legacy_v1",
-    "apgt_3d_exact_mesh_flash_v1",
-    "ap_backend_legacy_v1",
+    "tt_main_default_v1",
+    "gt_manual_eager_v1",
+    "apgt_validated_v1",
 }
 PHASE_KINDS = {"correctness", "performance", "kineto", "torch_trace", "trace"}
 CONFIG_SECTIONS = {
@@ -37,12 +33,7 @@ CONFIG_SECTIONS = {
     "validator",
     "comm",
 }
-LEGACY_TRAINING_SETTINGS = {
-    "training.local_batch_size",
-    "training.global_batch_size",
-    "training.seq_len",
-    "training.gradient_accumulation_steps",
-}
+HARNESS_ONLY_SETTINGS = {"training.gradient_accumulation_steps"}
 RESERVED_ENVIRONMENT_KEYS = {
     "CONDA_DIR",
     "DUMP_DIR",
@@ -196,10 +187,14 @@ class Campaign:
         return result
 
     def resolved_dict(self) -> dict[str, Any]:
+        from .experiment_lock import experiment_lock_digest, load_experiment_lock
+
         value = copy.deepcopy(self.raw)
         value["name"] = self.name
         value["campaign_file"] = str(self.path.resolve())
         value["world_size"] = self.world_size
+        value["experiment_lock"] = load_experiment_lock()
+        value["experiment_lock_sha256"] = experiment_lock_digest()
         value["resolved_arms"] = [
             {
                 "name": arm.name,
@@ -240,7 +235,9 @@ def _flatten(value: dict[str, Any], *, prefix: str) -> dict[str, Any]:
     return result
 
 
-def _merge_unique(target: dict[str, Any], values: dict[str, Any], *, owner: str) -> None:
+def _merge_unique(
+    target: dict[str, Any], values: dict[str, Any], *, owner: str
+) -> None:
     for key, value in values.items():
         if not isinstance(key, str) or "." not in key:
             raise CampaignError(f"{owner} setting {key!r} must be a dotted path")
@@ -255,9 +252,10 @@ def _option_name(path: str, *, enabled: bool | None = None) -> str:
 
 
 def settings_to_argv(settings: dict[str, Any]) -> list[str]:
-    settings = _native_training_settings(settings)
     result: list[str] = []
     for path, value in sorted(settings.items()):
+        if path in HARNESS_ONLY_SETTINGS:
+            continue
         if not path or any(not part for part in path.split(".")):
             raise CampaignError(f"invalid TorchTitan setting path {path!r}")
         if isinstance(value, bool):
@@ -267,43 +265,6 @@ def settings_to_argv(settings: dict[str, Any]) -> list[str]:
             result.append(",".join(str(item) for item in value))
         elif value is not None:
             result.extend((_option_name(path), str(value)))
-    return result
-
-
-def _native_training_settings(settings: dict[str, Any]) -> dict[str, Any]:
-    result = dict(settings)
-    present = LEGACY_TRAINING_SETTINGS & result.keys()
-    if not present:
-        return result
-    required = {
-        "training.local_batch_size",
-        "training.global_batch_size",
-        "training.seq_len",
-    }
-    missing = required - result.keys()
-    if missing:
-        raise CampaignError(
-            "authored batch settings require local_batch_size, global_batch_size, "
-            f"and seq_len together; missing {sorted(missing)}"
-        )
-    local_batch = int(result.pop("training.local_batch_size"))
-    global_batch = int(result.pop("training.global_batch_size"))
-    seq_len = int(result.pop("training.seq_len"))
-    grad_accum = int(result.pop("training.gradient_accumulation_steps", 1))
-    if local_batch <= 0 or seq_len <= 0 or grad_accum <= 0:
-        raise CampaignError("local batch, sequence length, and gradient accumulation must be positive")
-    if global_batch == -1 and grad_accum != 1:
-        dp_degree = int(result.get("parallelism.data_parallel_replicate_degree", 1)) * int(
-            result.get("parallelism.data_parallel_shard_degree", 1)
-        )
-        global_batch = local_batch * dp_degree * grad_accum
-    elif global_batch != -1 and global_batch <= 0:
-        raise CampaignError("global_batch_size must be -1 or positive")
-    result["training.num_tokens_per_microbatch_per_dp_rank"] = local_batch * seq_len
-    result["training.num_tokens_per_train_step"] = (
-        -1 if global_batch == -1 else global_batch * seq_len
-    )
-    result["training.max_context_length"] = seq_len
     return result
 
 
@@ -379,7 +340,9 @@ def _parse_phases(raw: dict[str, Any], arm_names: set[str]) -> tuple[Phase, ...]
             raise CampaignError(f"phases[{index}].arms cannot be empty")
         unknown = set(arms) - arm_names
         if unknown:
-            raise CampaignError(f"phase {row['name']!r} has unknown arms {sorted(unknown)}")
+            raise CampaignError(
+                f"phase {row['name']!r} has unknown arms {sorted(unknown)}"
+            )
         overrides = row.get("overrides", {})
         if not isinstance(overrides, dict):
             raise CampaignError(f"phases[{index}].overrides must be a table")
@@ -389,7 +352,9 @@ def _parse_phases(raw: dict[str, Any], arm_names: set[str]) -> tuple[Phase, ...]
         if not isinstance(trace_ranks, list) or not all(
             isinstance(rank, int) and rank >= 0 for rank in trace_ranks
         ):
-            raise CampaignError(f"phases[{index}].trace_ranks must contain nonnegative integers")
+            raise CampaignError(
+                f"phases[{index}].trace_ranks must contain nonnegative integers"
+            )
         result.append(
             Phase(
                 name=str(row["name"]),
@@ -420,14 +385,18 @@ def _validate_campaign(campaign: Campaign) -> None:
         raise CampaignError("name and workload are required")
     sources = raw.get("sources")
     if not isinstance(sources, dict) or set(sources) < {"torchtitan", "autoparallel"}:
-        raise CampaignError("[sources.torchtitan] and [sources.autoparallel] are required")
+        raise CampaignError(
+            "[sources.torchtitan] and [sources.autoparallel] are required"
+        )
     for name, source in sources.items():
         if not isinstance(source, dict):
             raise CampaignError(f"sources.{name} must be a table")
         if not source.get("commit") or not source.get("remote"):
             raise CampaignError(f"sources.{name} requires remote and commit")
         if source.get("dirty_policy", "forbid") not in {"forbid", "snapshot"}:
-            raise CampaignError(f"sources.{name}.dirty_policy must be forbid or snapshot")
+            raise CampaignError(
+                f"sources.{name}.dirty_policy must be forbid or snapshot"
+            )
 
     mast = raw.get("mast")
     if not isinstance(mast, dict):
@@ -438,16 +407,14 @@ def _validate_campaign(campaign: Campaign) -> None:
     if int(mast["nodes"]) <= 0 or int(mast["nproc_per_node"]) <= 0:
         raise CampaignError("MAST node and process counts must be positive")
     if int(mast.get("retries", 0)) != 0:
-        raise CampaignError("paired permanent-harness campaigns require mast.retries = 0")
+        raise CampaignError(
+            "paired permanent-harness campaigns require mast.retries = 0"
+        )
     locality = str(mast["locality"]).split(";", 1)
     if len(locality) != 2 or locality[0] not in {"dc", "region"} or not locality[1]:
         raise CampaignError(
             "mast.locality must be an explicit 'dc;NAME' or 'region;NAME' constraint"
         )
-
-    from .experiment_lock import validate_campaign_lock
-
-    validate_campaign_lock(raw)
 
     environment_maps = [("mast.environment", mast.get("environment", {}))]
     environment_maps.extend(
@@ -467,10 +434,16 @@ def _validate_campaign(campaign: Campaign) -> None:
     comparison = raw.get("comparison", {})
     if len(campaign.arms) > 1:
         if not comparison.get("declared_variable"):
-            raise CampaignError("multi-arm campaigns require comparison.declared_variable")
+            raise CampaignError(
+                "multi-arm campaigns require comparison.declared_variable"
+            )
         allowed = comparison.get("allowed_config_paths")
-        if not isinstance(allowed, list) or not all(isinstance(item, str) for item in allowed):
-            raise CampaignError("comparison.allowed_config_paths must be an array of strings")
+        if not isinstance(allowed, list) or not all(
+            isinstance(item, str) for item in allowed
+        ):
+            raise CampaignError(
+                "comparison.allowed_config_paths must be an array of strings"
+            )
         allowed_environment = comparison.get("allowed_environment_keys", [])
         if not isinstance(allowed_environment, list) or not all(
             isinstance(item, str) for item in allowed_environment
@@ -585,7 +558,9 @@ def _validate_campaign(campaign: Campaign) -> None:
                 "reserved_memory_tag",
             }
             if primary.get("unit_scale_to_ms") != 1000:
-                raise CampaignError("TensorBoard latency must declare unit_scale_to_ms = 1000")
+                raise CampaignError(
+                    "TensorBoard latency must declare unit_scale_to_ms = 1000"
+                )
         unknown_primary = set(primary) - allowed_primary
         if unknown_primary:
             raise CampaignError(
@@ -683,7 +658,9 @@ def _apply_matrix(raw: dict[str, Any], point: str | None) -> dict[str, Any]:
         raise CampaignError(f"campaign requires --point; available values: {names}")
     matches = [entry for entry in matrix["points"] if entry.get("name") == point]
     if len(matches) != 1:
-        raise CampaignError(f"unknown or duplicate matrix point {point!r}; available: {names}")
+        raise CampaignError(
+            f"unknown or duplicate matrix point {point!r}; available: {names}"
+        )
     result = copy.deepcopy(raw)
     result["selected_point"] = point
     settings = matches[0].get("settings", {})
@@ -697,7 +674,9 @@ def _apply_matrix(raw: dict[str, Any], point: str | None) -> dict[str, Any]:
         for piece in pieces[:-1]:
             child = current.setdefault(piece, {})
             if not isinstance(child, dict):
-                raise CampaignError(f"matrix setting {path!r} crosses a non-table value")
+                raise CampaignError(
+                    f"matrix setting {path!r} crosses a non-table value"
+                )
             current = child
         current[pieces[-1]] = value
     return result
@@ -719,7 +698,9 @@ def _apply_mode(raw: dict[str, Any], mode: str) -> dict[str, Any]:
     phases = result.get("phases", [])
     if not phases:
         return result
-    base = next((phase for phase in phases if phase.get("kind") == "performance"), phases[0])
+    base = next(
+        (phase for phase in phases if phase.get("kind") == "performance"), phases[0]
+    )
     trace = next(
         (phase for phase in phases if phase.get("kind") in {"trace", "kineto"}),
         base,
@@ -776,12 +757,61 @@ def _apply_mode(raw: dict[str, Any], mode: str) -> dict[str, Any]:
     return result
 
 
+def _inject_experiment_lock(raw: dict[str, Any]) -> dict[str, Any]:
+    from .experiment_lock import load_experiment_lock
+
+    if "sources" in raw:
+        raise CampaignError(
+            "campaign source pins are forbidden; use experiment_lock.toml"
+        )
+    mast = raw.get("mast")
+    if isinstance(mast, dict) and "conda_fbpkg" in mast:
+        raise CampaignError(
+            "campaign runtime pins are forbidden; use experiment_lock.toml"
+        )
+    if raw.get("parallelism", {}).get("spmd_backend") is not None:
+        raise CampaignError(
+            "campaign spmd_backend is forbidden; use experiment_lock.toml"
+        )
+    native = raw.get("torchtitan", {}).get("overrides", {})
+    if isinstance(native, dict) and "parallelism.spmd_backend" in native:
+        raise CampaignError(
+            "campaign spmd_backend is forbidden; use experiment_lock.toml"
+        )
+    for owner in ("arms", "phases"):
+        for row in raw.get(owner, []):
+            if isinstance(row, dict) and "parallelism.spmd_backend" in row.get(
+                "overrides", {}
+            ):
+                raise CampaignError(
+                    f"{owner} spmd_backend override is forbidden; "
+                    "use experiment_lock.toml"
+                )
+    for point in raw.get("matrix", {}).get("points", []):
+        if isinstance(point, dict) and "parallelism.spmd_backend" in point.get(
+            "settings", {}
+        ):
+            raise CampaignError(
+                "matrix spmd_backend override is forbidden; use experiment_lock.toml"
+            )
+
+    lock = load_experiment_lock()
+    result = copy.deepcopy(raw)
+    result["sources"] = copy.deepcopy(lock["sources"])
+    result.setdefault("mast", {})["conda_fbpkg"] = lock["runtime"]["conda_fbpkg"]
+    result.setdefault("parallelism", {})["spmd_backend"] = lock["execution"][
+        "spmd_backend"
+    ]
+    return result
+
+
 def load_campaign(
     path: Path, *, point: str | None = None, mode: str = "formal"
 ) -> Campaign:
     path = path.resolve()
     with path.open("rb") as stream:
-        raw = _apply_mode(_apply_matrix(tomllib.load(stream), point), mode)
+        authored = _inject_experiment_lock(tomllib.load(stream))
+        raw = _apply_mode(_apply_matrix(authored, point), mode)
     arms = _parse_arms(raw)
     phases = _parse_phases(raw, {arm.name for arm in arms})
     campaign = Campaign(path=path, raw=raw, arms=arms, phases=phases)

@@ -9,6 +9,7 @@ from pathlib import Path
 
 import torch
 
+from .assets import asset_lock_digest
 from .campaign import write_json
 from .experiment_lock import experiment_lock_digest, validate_runtime_lock
 from .integrity import validate_harness_integrity
@@ -40,6 +41,13 @@ def run(payload: Path, run_root: Path) -> dict:
     actual_lock_sha256 = experiment_lock_digest(harness_experiment_lock)
     if resolved.get("experiment_lock_sha256") != actual_lock_sha256:
         raise RuntimeError("resolved campaign experiment-lock digest differs")
+    packaged_asset_lock = payload / "campaign/asset_lock.toml"
+    harness_asset_lock = payload / "harness_repo/asset_lock.toml"
+    if packaged_asset_lock.read_bytes() != harness_asset_lock.read_bytes():
+        raise RuntimeError("packaged campaign and harness asset locks differ")
+    actual_asset_lock_sha256 = asset_lock_digest(harness_asset_lock)
+    if resolved.get("asset_lock_sha256") != actual_asset_lock_sha256:
+        raise RuntimeError("resolved campaign asset-lock digest differs")
     runtime_lock = validate_runtime_lock(torch)
     harness_integrity = validate_harness_integrity(payload / "harness_repo")
     source_lock = json.loads((payload / "campaign/source_lock.json").read_text())
@@ -66,9 +74,13 @@ def run(payload: Path, run_root: Path) -> dict:
         ),
     }
     if not _inside(module_paths["torchtitan"], source_roots["torchtitan"]):
-        raise RuntimeError(f"unexpected TorchTitan import: {module_paths['torchtitan']}")
+        raise RuntimeError(
+            f"unexpected TorchTitan import: {module_paths['torchtitan']}"
+        )
     if not _inside(module_paths["autoparallel"], source_roots["autoparallel"]):
-        raise RuntimeError(f"unexpected AutoParallel import: {module_paths['autoparallel']}")
+        raise RuntimeError(
+            f"unexpected AutoParallel import: {module_paths['autoparallel']}"
+        )
     report = {
         "status": "passed",
         "python": sys.version,
@@ -76,11 +88,14 @@ def run(payload: Path, run_root: Path) -> dict:
         "torch_version": torch.__version__,
         "torch_git_version": getattr(torch.version, "git_version", None),
         "cuda_version": torch.version.cuda,
-        "nccl_version": torch.cuda.nccl.version() if torch.cuda.is_available() else None,
+        "nccl_version": torch.cuda.nccl.version()
+        if torch.cuda.is_available()
+        else None,
         "module_paths": {name: str(path) for name, path in module_paths.items()},
         "source_checks": source_checks,
         "structured_logger_handlers": os.environ.get("TITAN_STRUCT_LOGGER_HANDLERS"),
         "experiment_lock_sha256": actual_lock_sha256,
+        "asset_lock_sha256": actual_asset_lock_sha256,
         "runtime_lock": runtime_lock,
         "harness_integrity": harness_integrity,
     }

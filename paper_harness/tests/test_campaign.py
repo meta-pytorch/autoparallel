@@ -6,128 +6,105 @@ import unittest
 from pathlib import Path
 
 from harness.campaign import CampaignError, load_campaign, settings_to_argv
-from harness.cli import _submitted_job_id
+from harness.experiment_lock import load_experiment_lock
 from harness.parity import validate_pair
+from harness.settings import load_run_settings
 from harness.sources import inspect_source
-
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class CampaignTests(unittest.TestCase):
-    def test_submitted_job_id_uses_torchx_mast_handle(self) -> None:
-        output = """Current Session ID: session-id
-
-mast_conda://torchx/llama3-paper-wangkj-grfhpnvn
-launched app: `mast_conda://torchx/llama3-paper-wangkj-grfhpnvn`
-"""
+    def test_only_canonical_campaigns_are_active(self) -> None:
         self.assertEqual(
-            _submitted_job_id(output), "llama3-paper-wangkj-grfhpnvn"
+            {path.name for path in (REPO_ROOT / "campaigns").glob("*.toml")},
+            {
+                "deepseek_v3_16b.toml",
+                "llama3_8b_2d.toml",
+                "llama3_8b_3d.toml",
+                "llama3_8b_seqlen.toml",
+                "muse_glimmer_30b.toml",
+            },
         )
 
-    def test_reproduction_campaigns_are_fixed_to_32_gpus(self) -> None:
-        expected_init_timeouts = {
-            "repro_llama3_8b_2d_32gpu.toml": 1200,
-            "repro_llama3_8b_seqlen_4k_32gpu.toml": 1200,
-            "repro_muse_glimmer_30b_32gpu.toml": 1800,
-        }
-        for path in sorted((REPO_ROOT / "campaigns").glob("repro_*.toml")):
-            with self.subTest(path=path.name):
-                campaign = load_campaign(path)
-                self.assertEqual(campaign.world_size, 32)
-                self.assertIn("primary", campaign.raw["measurement"])
-                if path.name in {
-                    "repro_llama3_8b_2d_32gpu.toml",
-                    "repro_llama3_8b_seqlen_4k_32gpu.toml",
-                }:
-                    self.assertNotIn("acceptance", campaign.raw["comparison"])
-                else:
-                    self.assertIn("acceptance", campaign.raw["comparison"])
+    def test_all_settings_resolve_to_the_global_lock(self) -> None:
+        lock = load_experiment_lock()
+        for setting in load_run_settings().values():
+            with self.subTest(model=setting.model, setting=setting.setting):
+                campaign = load_campaign(setting.campaign, point=setting.point)
+                self.assertEqual(campaign.source_specs(), lock["sources"])
                 self.assertEqual(
-                    campaign.raw["comm"]["init_timeout_seconds"],
-                    expected_init_timeouts[path.name],
+                    campaign.raw["mast"]["conda_fbpkg"],
+                    lock["runtime"]["conda_fbpkg"],
                 )
-        llama = load_campaign(REPO_ROOT / "campaigns/repro_llama3_8b_2d_32gpu.toml")
-        self.assertEqual(llama.arm_names, {"tt_main_tp", "apgt"})
-        self.assertEqual(llama.raw["training"]["local_batch_size"], 2)
-        self.assertEqual(llama.raw["training"]["global_batch_size"], 8)
-        self.assertEqual(llama.raw["training"]["gradient_accumulation_steps"], 1)
+                self.assertEqual(
+                    campaign.raw["parallelism"]["spmd_backend"],
+                    "default",
+                )
 
-    def test_gate_mode_keeps_all_arms_for_interleaved_formal_phases(self) -> None:
-        campaign = load_campaign(
-            REPO_ROOT / "campaigns/repro_llama3_8b_seqlen_4k_32gpu.toml",
-            mode="gate",
-        )
-        self.assertEqual(
-            [phase.arms for phase in campaign.phases],
-            [("fresh", "replay_2k"), ("fresh", "replay_2k")],
-        )
-
-    def test_arm_override_cannot_break_the_world_mesh(self) -> None:
-        source = (REPO_ROOT / "campaigns/repro_llama3_8b_2d_32gpu.toml").read_text()
-        invalid = source.replace(
-            "[arms.environment]\nBENCHMARK_CONFIGURATION = \"torchtitan_baseline\"",
-            "[arms.overrides]\n\"parallelism.tensor_parallel_degree\" = 1\n"
-            "[arms.environment]\nBENCHMARK_CONFIGURATION = \"torchtitan_baseline\"",
-            1,
-        )
+    def test_authored_source_runtime_and_backend_pins_are_rejected(self) -> None:
+        source = (REPO_ROOT / "campaigns/llama3_8b_2d.toml").read_text()
         with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "campaign.toml"
-            path.write_text(invalid)
-            with self.assertRaisesRegex(CampaignError, "parallel mesh product"):
-                load_campaign(path)
+            root = Path(temporary)
+            source_pin = root / "source.toml"
+            source_pin.write_text(
+                source + '\n[sources.torchtitan]\nremote = "x"\ncommit = "y"\n'
+            )
+            with self.assertRaisesRegex(CampaignError, "source pins are forbidden"):
+                load_campaign(source_pin, point="8gpu")
 
-    def test_batch_environment_cannot_disagree_with_structured_settings(self) -> None:
-        source = (REPO_ROOT / "campaigns/repro_llama3_8b_2d_32gpu.toml").read_text()
-        invalid = source.replace(
-            'BENCHMARK_GLOBAL_BATCH_SIZE = "8"',
-            'BENCHMARK_GLOBAL_BATCH_SIZE = "64"',
-        )
-        with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "campaign.toml"
-            path.write_text(invalid)
-            with self.assertRaisesRegex(CampaignError, "BENCHMARK_GLOBAL_BATCH_SIZE"):
-                load_campaign(path)
+            runtime_pin = root / "runtime.toml"
+            runtime_pin.write_text(
+                source.replace(
+                    'gpu_name_contains = "H100"',
+                    'gpu_name_contains = "H100"\nconda_fbpkg = "other:1"',
+                )
+            )
+            with self.assertRaisesRegex(CampaignError, "runtime pins are forbidden"):
+                load_campaign(runtime_pin, point="8gpu")
 
-    def test_campaign_source_pin_must_match_experiment_lock(self) -> None:
-        source = (REPO_ROOT / "campaigns/repro_llama3_8b_2d_32gpu.toml").read_text()
-        invalid = source.replace(
-            "5102d629c0a97ec604b12c328b40147d214ecbe7",
-            "0000000000000000000000000000000000000000",
-        )
-        with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "campaign.toml"
-            path.write_text(invalid)
-            with self.assertRaisesRegex(CampaignError, "experiment lock"):
-                load_campaign(path)
+            backend_pin = root / "backend.toml"
+            backend_pin.write_text(
+                source.replace(
+                    "pipeline_parallel_degree = 1",
+                    'pipeline_parallel_degree = 1\nspmd_backend = "spmd_types"',
+                    1,
+                )
+            )
+            with self.assertRaisesRegex(CampaignError, "spmd_backend is forbidden"):
+                load_campaign(backend_pin, point="8gpu")
 
     def test_canonical_matrix_points(self) -> None:
         cases = {
-            "muse_glimmer_30b_scaling.toml": ("16gpu", "32gpu", "64gpu", "128gpu"),
-            "llama3_8b_2d_scaling.toml": ("8gpu", "16gpu", "32gpu", "64gpu", "128gpu"),
+            "muse_glimmer_30b.toml": ("16gpu", "32gpu", "64gpu", "128gpu"),
+            "llama3_8b_2d.toml": ("8gpu", "16gpu", "32gpu", "64gpu", "128gpu"),
             "llama3_8b_seqlen.toml": ("2k", "4k", "8k", "16k", "32k"),
             "deepseek_v3_16b.toml": ("16gpu", "32gpu"),
         }
         for filename, points in cases.items():
             for point in points:
                 with self.subTest(filename=filename, point=point):
-                    campaign = load_campaign(REPO_ROOT / "campaigns" / filename, point=point)
+                    campaign = load_campaign(
+                        REPO_ROOT / "campaigns" / filename,
+                        point=point,
+                    )
                     self.assertGreater(campaign.world_size, 0)
                     self.assertTrue(campaign.phases)
-        legacy = load_campaign(REPO_ROOT / "campaigns/llama3_8b_3d_legacy.toml")
-        self.assertEqual(legacy.world_size, 8)
+        self.assertEqual(
+            load_campaign(REPO_ROOT / "campaigns/llama3_8b_3d.toml").world_size,
+            8,
+        )
 
     def test_matrix_requires_an_explicit_point(self) -> None:
         with self.assertRaisesRegex(CampaignError, "requires --point"):
-            load_campaign(REPO_ROOT / "campaigns/muse_glimmer_30b_scaling.toml")
+            load_campaign(REPO_ROOT / "campaigns/muse_glimmer_30b.toml")
 
     def test_gate_mode_is_functional_and_trace_only(self) -> None:
         campaign = load_campaign(
-            REPO_ROOT / "campaigns/muse_glimmer_30b_scaling.toml",
+            REPO_ROOT / "campaigns/muse_glimmer_30b.toml",
             point="16gpu",
             mode="gate",
         )
-        self.assertEqual(campaign.name, "muse-glimmer-30b-gt-manual-vs-apgt-16gpu-gate")
         self.assertEqual(
             [(phase.name, phase.kind) for phase in campaign.phases],
             [("functional", "correctness"), ("trace_smoke", "trace")],
@@ -135,25 +112,21 @@ launched app: `mast_conda://torchx/llama3-paper-wangkj-grfhpnvn`
         for phase in campaign.phases:
             self.assertEqual(phase.overrides["training.steps"], 2)
 
-    def test_native_argument_rendering(self) -> None:
-        self.assertEqual(
-            settings_to_argv(
-                {
-                    "training.steps": 2,
-                    "profiler.enable_profiling": False,
-                    "compile.components": ["model", "loss"],
-                }
-            ),
-            [
-                "--compile.components",
-                "model,loss",
-                "--profiler.no-enable-profiling",
-                "--training.steps",
-                "2",
-            ],
+    def test_arm_override_cannot_break_the_world_mesh(self) -> None:
+        source = (REPO_ROOT / "campaigns/llama3_8b_2d.toml").read_text()
+        invalid = source.replace(
+            '[arms.environment]\nBENCHMARK_CONFIGURATION = "torchtitan_baseline"',
+            '[arms.overrides]\n"parallelism.tensor_parallel_degree" = 1\n'
+            '[arms.environment]\nBENCHMARK_CONFIGURATION = "torchtitan_baseline"',
+            1,
         )
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "campaign.toml"
+            path.write_text(invalid)
+            with self.assertRaisesRegex(CampaignError, "parallel mesh product"):
+                load_campaign(path, point="8gpu")
 
-    def test_authored_batch_settings_render_as_latest_torchtitan_tokens(self) -> None:
+    def test_native_argument_rendering_keeps_sample_based_fields(self) -> None:
         self.assertEqual(
             settings_to_argv(
                 {
@@ -164,78 +137,12 @@ launched app: `mast_conda://torchx/llama3-paper-wangkj-grfhpnvn`
                 }
             ),
             [
-                "--training.max-context-length",
+                "--training.global-batch-size",
+                "8",
+                "--training.local-batch-size",
+                "2",
+                "--training.seq-len",
                 "8192",
-                "--training.num-tokens-per-microbatch-per-dp-rank",
-                "16384",
-                "--training.num-tokens-per-train-step",
-                "65536",
-            ],
-        )
-
-    def test_default_global_batch_preserves_one_accumulation_step(self) -> None:
-        argv = settings_to_argv(
-            {
-                "training.local_batch_size": 2,
-                "training.global_batch_size": -1,
-                "training.seq_len": 4096,
-            }
-        )
-        self.assertEqual(argv[-2:], ["--training.num-tokens-per-train-step", "-1"])
-
-    def test_partial_authored_batch_settings_are_rejected(self) -> None:
-        with self.assertRaisesRegex(CampaignError, "require local_batch_size"):
-            settings_to_argv(
-                {
-                    "training.local_batch_size": 2,
-                    "training.seq_len": 8192,
-                }
-            )
-
-    def test_autoparallel_solver_argument_rendering(self) -> None:
-        self.assertEqual(
-            settings_to_argv(
-                {
-                    "compile.autoparallel_solver": "approx",
-                    "compile.autoparallel_fast_build": False,
-                    "compile.autoparallel_lazy_costs": "eager",
-                    "compile.autoparallel_strategy_radius": 1,
-                    "compile.autoparallel_optimality_check": True,
-                    "compile.autoparallel_approx_candidate_limit": 64,
-                    "compile.autoparallel_approx_bp_iters": 80,
-                    "compile.autoparallel_approx_bp_tol": 0.002,
-                    "compile.autoparallel_approx_max_sweeps": 6,
-                    "compile.autoparallel_approx_max_time_s": 30.0,
-                    "compile.autoparallel_approx_star_passes": 3,
-                    "compile.autoparallel_approx_max_star_children": 16,
-                    "compile.autoparallel_approx_group_domain_limit": 256,
-                }
-            ),
-            [
-                "--compile.autoparallel-approx-bp-iters",
-                "80",
-                "--compile.autoparallel-approx-bp-tol",
-                "0.002",
-                "--compile.autoparallel-approx-candidate-limit",
-                "64",
-                "--compile.autoparallel-approx-group-domain-limit",
-                "256",
-                "--compile.autoparallel-approx-max-star-children",
-                "16",
-                "--compile.autoparallel-approx-max-sweeps",
-                "6",
-                "--compile.autoparallel-approx-max-time-s",
-                "30.0",
-                "--compile.autoparallel-approx-star-passes",
-                "3",
-                "--compile.no-autoparallel-fast-build",
-                "--compile.autoparallel-lazy-costs",
-                "eager",
-                "--compile.autoparallel-optimality-check",
-                "--compile.autoparallel-solver",
-                "approx",
-                "--compile.autoparallel-strategy-radius",
-                "1",
             ],
         )
 
@@ -249,26 +156,21 @@ launched app: `mast_conda://torchx/llama3-paper-wangkj-grfhpnvn`
                 ["compile.enable_autoparallel"],
             )
 
-    def test_parity_ignores_process_local_callable_addresses(self) -> None:
-        result = validate_pair(
-            "left",
-            {"model": "<function init at 0x1234abcd>"},
-            "right",
-            {"model": "<function init at 0xfeed5678>"},
-            [],
-        )
-        self.assertEqual(result["observed_differences"], [])
-
 
 class SourceTests(unittest.TestCase):
-    def test_dirty_source_is_fail_closed_or_snapshotted(self) -> None:
+    def test_dirty_source_is_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "source"
-            evidence = Path(temporary) / "evidence"
             root.mkdir()
             subprocess.run(["git", "init", "-q", str(root)], check=True)
-            subprocess.run(["git", "-C", str(root), "config", "user.email", "test@example.com"], check=True)
-            subprocess.run(["git", "-C", str(root), "config", "user.name", "Harness Test"], check=True)
+            subprocess.run(
+                ["git", "-C", str(root), "config", "user.email", "test@example.com"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(root), "config", "user.name", "Harness Test"],
+                check=True,
+            )
             subprocess.run(
                 [
                     "git",
@@ -283,9 +185,12 @@ class SourceTests(unittest.TestCase):
             )
             (root / "tracked.txt").write_text("clean\n")
             subprocess.run(["git", "-C", str(root), "add", "tracked.txt"], check=True)
-            subprocess.run(["git", "-C", str(root), "commit", "-qm", "fixture"], check=True)
+            subprocess.run(
+                ["git", "-C", str(root), "commit", "-qm", "fixture"], check=True
+            )
             head = subprocess.check_output(
-                ["git", "-C", str(root), "rev-parse", "HEAD"], text=True
+                ["git", "-C", str(root), "rev-parse", "HEAD"],
+                text=True,
             ).strip()
             spec = {
                 "commit": head,
@@ -296,58 +201,6 @@ class SourceTests(unittest.TestCase):
             (root / "tracked.txt").write_text("dirty\n")
             with self.assertRaisesRegex(CampaignError, "dirty_policy"):
                 inspect_source("fixture", root, spec)
-            spec["dirty_policy"] = "snapshot"
-            record = inspect_source("fixture", root, spec, evidence_dir=evidence)
-            self.assertTrue(record["dirty"])
-            self.assertTrue((evidence / "fixture/tracked.diff").is_file())
-
-    def test_source_accepts_expected_non_origin_remote(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary) / "source"
-            root.mkdir()
-            subprocess.run(["git", "init", "-q", str(root)], check=True)
-            subprocess.run(
-                ["git", "-C", str(root), "config", "user.email", "test@example.com"],
-                check=True,
-            )
-            subprocess.run(
-                ["git", "-C", str(root), "config", "user.name", "Harness Test"],
-                check=True,
-            )
-            subprocess.run(
-                ["git", "-C", str(root), "remote", "add", "origin", "/local/base"],
-                check=True,
-            )
-            subprocess.run(
-                [
-                    "git",
-                    "-C",
-                    str(root),
-                    "remote",
-                    "add",
-                    "github",
-                    "https://github.com/example/fixture.git",
-                ],
-                check=True,
-            )
-            (root / "tracked.txt").write_text("clean\n")
-            subprocess.run(["git", "-C", str(root), "add", "tracked.txt"], check=True)
-            subprocess.run(["git", "-C", str(root), "commit", "-qm", "fixture"], check=True)
-            head = subprocess.check_output(
-                ["git", "-C", str(root), "rev-parse", "HEAD"], text=True
-            ).strip()
-            record = inspect_source(
-                "fixture",
-                root,
-                {
-                    "commit": head,
-                    "remote": "https://github.com/example/fixture.git",
-                    "dirty_policy": "forbid",
-                },
-            )
-            self.assertIn(
-                "https://github.com/example/fixture.git", record["remote_chain"]
-            )
 
 
 if __name__ == "__main__":
