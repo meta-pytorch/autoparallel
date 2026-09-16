@@ -18,6 +18,9 @@ retains the `60517d28` AutoParallel/GraphTrainer integration.
 - `20004e05` (PR #4553): ported as `6df7bc5f` to save the matched
   AutoParallel A2A-to-linear SAC boundaries without restoring the broader
   collective policy removed by `383cae9f`.
+- `26c329bd`: experiment-only child of `6df7bc5f` that adds the folded-EP/TP
+  DeepSeek adapter and makes DeepSeek and Muse consume the configured
+  AutoParallel solver.
 
 The 3D port includes only the approved legacy-DTensor AP configuration, CP
 input-ownership seam, DP-shard/CP/TP mesh, CP-aware SDPA, DTensor output, and
