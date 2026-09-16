@@ -97,6 +97,8 @@ name = "apgt"
 profile = "apgt_validated_v1"
 module = "workloads.llama3_2d.perf_configs"
 config = "autoparallel_graphtrainer_8b"
+[arms.overrides]
+"compile.autoparallel_solver" = "approx"
 [arms.environment]
 BENCHMARK_CONFIGURATION = "autoparallel_graphtrainer"
 EXPERIMENT_ARM = "G"
