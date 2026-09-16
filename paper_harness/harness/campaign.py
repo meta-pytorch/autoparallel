@@ -456,6 +456,8 @@ def _validate_campaign(campaign: Campaign) -> None:
             raise CampaignError(
                 "comparison.allowed_environment_keys must be an array of strings"
             )
+        if not isinstance(comparison.get("require_parameter_state", True), bool):
+            raise CampaignError("comparison.require_parameter_state must be a boolean")
         pairs = comparison.get("pairs")
         if not isinstance(pairs, list) or not pairs:
             raise CampaignError("multi-arm campaigns require comparison.pairs")

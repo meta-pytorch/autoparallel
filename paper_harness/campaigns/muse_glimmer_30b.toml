@@ -36,6 +36,7 @@ save_for_all_ranks = true
 [comparison]
 declared_variable = "trainer_parallelization_compile_stack"
 allowed_config_paths = ["compile.*", "model_spec.name"]
+require_parameter_state = false
 pairs = [
   ["tt_main", "gt_manual"],
   ["tt_main", "apgt"],

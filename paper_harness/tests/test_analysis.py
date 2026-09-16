@@ -19,6 +19,15 @@ class _Campaign:
     raw = {"comparison": {"pairs": [["baseline", "treatment"]]}}
 
 
+class _CampaignWithoutParameterGate(_Campaign):
+    raw = {
+        "comparison": {
+            "pairs": [["baseline", "treatment"]],
+            "require_parameter_state": False,
+        }
+    }
+
+
 def _write_parameter_audit(
     root: Path,
     arm: str,
@@ -110,6 +119,16 @@ class ParameterStateAuditTests(unittest.TestCase):
             self.assertEqual(result["status"], "failed")
             self.assertTrue(result["required"])
             self.assertEqual(len(result["errors"]), 2)
+
+    def test_missing_parameter_audits_are_allowed_when_not_required(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            result = _parameter_state_audit(
+                _CampaignWithoutParameterGate(), Path(temporary)
+            )
+
+            self.assertEqual(result["status"], "passed")
+            self.assertFalse(result["required"])
+            self.assertEqual(result["errors"], [])
 
     def test_parameter_audit_stage_must_match_across_arms(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

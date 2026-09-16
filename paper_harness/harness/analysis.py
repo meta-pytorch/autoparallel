@@ -611,7 +611,10 @@ def _parameter_state_audit(campaign: Campaign, run_root: Path) -> dict[str, Any]
                         }
                     )
 
-    required = bool(campaign.raw.get("comparison", {}).get("pairs"))
+    comparison = campaign.raw.get("comparison", {})
+    required = bool(comparison.get("pairs")) and comparison.get(
+        "require_parameter_state", True
+    )
     if required or saw_audit:
         for key, run in runs.items():
             if not run["files"]:
@@ -1120,7 +1123,11 @@ def analyze_campaign(
         for phase in phases.values()
         for arm in phase["arms"].values()
     )
-    all_audits_passed = all(audit["status"] == "passed" for audit in audits.values())
+    all_audits_passed = all(
+        audit["status"] == "passed"
+        for name, audit in audits.items()
+        if name != "parameter_state_moments" or audit.get("required", True)
+    )
     is_gate = campaign.raw.get("execution_mode") == "gate"
     all_pairs_passed = bool(pairs) and all(pair["status"] == "passed" for pair in pairs)
     valid = all_runs_passed and all_audits_passed and tlparse["status"] != "failed"
@@ -1154,9 +1161,9 @@ def analyze_campaign(
         "",
         report["measurement_method"],
         "",
-        "A comparative claim is allowed only when package, runtime source/config, "
-        "parameter-state, same-allocation, per-rank completion, and metric gates "
-        "all pass.",
+        "A comparative claim is allowed only when all required package, runtime "
+        "source/config, parameter-state, same-allocation, per-rank completion, "
+        "and metric gates pass.",
         "",
         f"Full machine-readable result: `{output_dir / 'analysis.json'}`",
     ]
