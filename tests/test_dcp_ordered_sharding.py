@@ -20,7 +20,7 @@ import torch
 from torch.distributed._local_tensor import LocalTensor, LocalTensorMode
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
-from torch.distributed.tensor._dtensor_spec import DTensorSpec
+from torch.distributed.tensor._dtensor_spec import DTensorSpec, ShardOrderEntry
 from torch.distributed.tensor._utils import _compute_local_shape_and_global_offset
 from torch.distributed.tensor.placement_types import (
     Partial,
@@ -28,8 +28,6 @@ from torch.distributed.tensor.placement_types import (
     Shard,
     _StridedShard,
 )
-
-from autoparallel.apply_sharding import _compute_shard_order
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -69,8 +67,7 @@ class TestStridedShardFromReversedOrder:
     """Verify that reversed shard_order produces _StridedShard placements."""
 
     def test_reversed_order_produces_strided_shard(self, device_mesh_2d):
-        default_order = DTensorSpec.compute_default_shard_order((Shard(0), Shard(0)))
-        reversed_order = _compute_shard_order(default_order, reverse=True)
+        reversed_order = (ShardOrderEntry(tensor_dim=0, mesh_dims=(1, 0)),)
 
         strided = DTensorSpec._convert_shard_order_to_StridedShard(
             reversed_order, (Shard(0), Shard(0)), device_mesh_2d
@@ -95,6 +92,31 @@ class TestStridedShardFromReversedOrder:
         assert all(
             isinstance(p, Shard) and not isinstance(p, _StridedShard) for p in result
         )
+
+    def test_mixed_dimension_order_produces_expected_storage(self):
+        mesh = DeviceMesh(
+            "cuda",
+            torch.arange(16).reshape(2, 2, 4),
+            mesh_dim_names=("dp", "cp", "tp"),
+        )
+        preferred = (
+            ShardOrderEntry(tensor_dim=0, mesh_dims=(1, 0)),
+            ShardOrderEntry(tensor_dim=1, mesh_dims=(2,)),
+        )
+
+        physical = DTensorSpec._convert_shard_order_to_StridedShard(
+            preferred,
+            (Shard(0), Shard(0), Shard(1)),
+            mesh,
+        )
+
+        assert physical == (
+            _StridedShard(0, split_factor=2),
+            Shard(0),
+            Shard(1),
+        )
+        _, decoded = DTensorSpec._normalize_placements_into_shard_order(physical, mesh)
+        assert decoded == preferred
 
 
 # ---------------------------------------------------------------------------
@@ -233,6 +255,24 @@ class TestChunkOffsetsForDCP:
                 all_indices.add(int(val))
 
         assert all_indices == set(range(64))
+
+    def test_mixed_dimension_offsets_match_physical_layout(self):
+        mesh_shape = (2, 2, 4)
+        global_shape = (16, 16)
+        placements = (_StridedShard(0, split_factor=2), Shard(0), Shard(1))
+        global_tensor = torch.arange(16 * 16, dtype=torch.float).reshape(global_shape)
+        shards = _shard_tensor(global_tensor, mesh_shape, placements)
+
+        for rank in range(math.prod(mesh_shape)):
+            coord = list(_mesh_coords(rank, mesh_shape))
+            local_shape, offset = _compute_local_shape_and_global_offset(
+                global_shape, mesh_shape, coord, placements
+            )
+            local = shards[rank]
+            first_linear_index = offset[0] * global_shape[1] + offset[1]
+
+            assert tuple(local.shape) == local_shape
+            assert int(local.flatten()[0].item()) == first_linear_index
 
 
 # ---------------------------------------------------------------------------
@@ -519,9 +559,11 @@ class TestShardParamsWithOrderedSharding:
             param_node,
         ) = _build_linear_graph_and_placements(device_mesh_2d)
 
-        # Verify the param node is in placement_order with reversed flag.
+        # Verify the parameter carries the reversed 2D storage order.
         assert param_node in param_placement_order
-        assert param_placement_order[param_node].is_target_reversed_order is True
+        assert param_placement_order[param_node].preferred_shard_order == (
+            ShardOrderEntry(tensor_dim=0, mesh_dims=(1, 0)),
+        )
 
         fqn_to_param = get_named_param_nodes(gm.graph)
         params_spec = {fqn: None for fqn in fqn_to_param}

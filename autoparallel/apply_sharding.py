@@ -19,7 +19,11 @@ from torch._functorch._aot_autograd.fx_utils import (
 from torch._inductor.decomposition import select_decomp_table
 from torch._subclasses.fake_tensor import FakeTensor, unset_fake_temporarily
 from torch.distributed.tensor import DTensor
-from torch.distributed.tensor._dtensor_spec import DTensorSpec, ShardOrderEntry
+from torch.distributed.tensor._dtensor_spec import (
+    DTensorSpec,
+    ShardOrder,
+    ShardOrderEntry,
+)
 from torch.distributed.tensor._redistribute import use_min_cost_redistribution_plan
 from torch.distributed.tensor.placement_types import Partial, Replicate, Shard  # noqa
 from torch.fx.experimental.proxy_tensor import make_fx
@@ -69,16 +73,40 @@ def _localize_shape_arg(node, shape_arg, output_spec):
     return local_shape
 
 
-def _compute_shard_order(shard_order, reverse: bool):
-    result = []
-    for tensor_dim, mesh_dims in shard_order:
-        default_order = sorted(mesh_dims)
-        if reverse:
-            default_order = default_order[::-1]
-        result.append(
-            ShardOrderEntry(tensor_dim=tensor_dim, mesh_dims=tuple(default_order))
-        )
-    return tuple(result)
+def _project_shard_order(
+    preferred_shard_order: ShardOrder,
+    spec: DTensorSpec,
+) -> ShardOrder:
+    """Project a parameter storage order onto the shards present in ``spec``."""
+    actual_shards = {
+        (placement.dim, mesh_dim)
+        for mesh_dim, placement in enumerate(spec.placements)
+        if isinstance(placement, Shard)
+    }
+    covered_shards: set[tuple[int, int]] = set()
+    projected_order = []
+
+    for entry in preferred_shard_order:
+        matching_mesh_dims = []
+        for mesh_dim in entry.mesh_dims:
+            if mesh_dim >= len(spec.placements):
+                continue
+            placement = spec.placements[mesh_dim]
+            if isinstance(placement, Shard) and placement.dim == entry.tensor_dim:
+                matching_mesh_dims.append(mesh_dim)
+        mesh_dims = tuple(matching_mesh_dims)
+        if mesh_dims:
+            projected_order.append(
+                ShardOrderEntry(tensor_dim=entry.tensor_dim, mesh_dims=mesh_dims)
+            )
+            covered_shards.update(
+                (entry.tensor_dim, mesh_dim) for mesh_dim in mesh_dims
+            )
+
+    if covered_shards != actual_shards:
+        assert spec.shard_order is not None
+        return spec.shard_order
+    return tuple(projected_order)
 
 
 class ApplyShardingInterpreter(torch.fx.Interpreter):
@@ -128,14 +156,14 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
         assert tgt_spec.shard_order is not None
         if node not in self.param_placement_order:
             return curr_spec.shard_order, tgt_spec.shard_order
-        is_target_reversed_order, need_reorder = self.param_placement_order[node]
-        curr_shard_order = _compute_shard_order(
-            curr_spec.shard_order,
-            reverse=not (is_target_reversed_order and need_reorder),
+        preferred_shard_order = self.param_placement_order[node].preferred_shard_order
+        curr_shard_order = _project_shard_order(
+            preferred_shard_order,
+            curr_spec,
         )
-        tgt_shard_order = _compute_shard_order(
-            tgt_spec.shard_order,
-            reverse=is_target_reversed_order,
+        tgt_shard_order = _project_shard_order(
+            preferred_shard_order,
+            tgt_spec,
         )
         return curr_shard_order, tgt_shard_order
 
@@ -144,8 +172,6 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
             p if not p.is_partial() else Replicate() for p in tgt_spec.placements
         )
         x = arg
-        if node in self.param_placement_order and self.param_placement_order[node][1]:
-            assert curr_spec.placements != tgt_spec.placements
         curr_shard_order, tgt_shard_order = self._compute_origin_and_target_shard_order(
             node, curr_spec, tgt_spec
         )
@@ -296,28 +322,26 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
 def _build_physical_placements(sharding_placement, param_placement_order):
     """Build a dict mapping each node to its physical DTensorSpec.
 
-    For reversed-order nodes in param_placement_order, converts to
-    _StridedShard placements so the physical layout matches the intended
-    shard order. For everything else, returns the solver-assigned spec.
+    For ordered parameter nodes, converts to _StridedShard placements when
+    needed so the physical layout matches the preferred storage order.
     """
     physical = {}
     for node, op_spec in sharding_placement.items():
         if op_spec.input_specs is None:
             continue
         tgt_spec = op_spec.input_specs[0]
-        if (
-            node in param_placement_order
-            and param_placement_order[node].is_target_reversed_order
-        ):
-            reversed_shard_order = _compute_shard_order(
-                tgt_spec.shard_order, reverse=True
+        if node in param_placement_order:
+            preferred_shard_order = _project_shard_order(
+                param_placement_order[node].preferred_shard_order,
+                tgt_spec,
             )
-            placements = DTensorSpec._convert_shard_order_to_StridedShard(
-                reversed_shard_order, tgt_spec.placements, tgt_spec.mesh
-            )
-            tgt_spec = DTensorSpec(
-                tgt_spec.mesh, placements, tensor_meta=tgt_spec.tensor_meta
-            )
+            if preferred_shard_order != tgt_spec.shard_order:
+                placements = DTensorSpec._convert_shard_order_to_StridedShard(
+                    preferred_shard_order, tgt_spec.placements, tgt_spec.mesh
+                )
+                tgt_spec = DTensorSpec(
+                    tgt_spec.mesh, placements, tensor_meta=tgt_spec.tensor_meta
+                )
         physical[node] = tgt_spec
     return physical
 
