@@ -23,6 +23,7 @@ class CampaignTests(unittest.TestCase):
                 "llama3_8b_2d.toml",
                 "llama3_8b_3d.toml",
                 "llama3_8b_3d_weight_shard_order_ab.toml",
+                "llama3_8b_3d_weight_shard_order_full_sac_ab.toml",
                 "llama3_8b_planner.toml",
                 "llama3_8b_replanning_approx.toml",
                 "muse_glimmer_30b.toml",
@@ -32,7 +33,7 @@ class CampaignTests(unittest.TestCase):
     def test_all_settings_resolve_to_the_global_lock(self) -> None:
         lock = load_experiment_lock()
         settings = load_run_settings()
-        self.assertEqual(len(settings), 23)
+        self.assertEqual(len(settings), 24)
         for setting in settings.values():
             with self.subTest(model=setting.model, setting=setting.setting):
                 campaign = load_campaign(setting.campaign, point=setting.point)

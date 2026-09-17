@@ -1,5 +1,5 @@
 schema_version = 1
-harness_version = "weight-shard-order-ab-v1"
+harness_version = "weight-shard-order-full-sac-ab-v1"
 
 [sources.torchtitan]
 remote = "https://github.com/AlbedoWang/torchtitan.git"
