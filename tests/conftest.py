@@ -91,3 +91,15 @@ def device_mesh_3d():
         mesh_dim_names=("dp", "tp", "cp"),
     )
     return mesh
+
+
+@pytest.fixture(scope="module")
+def device_mesh_hsdp_3d():
+    """A 3D mesh named like TorchTitan's dense HSDP + TP mesh."""
+    world_size = torch.distributed.get_world_size()
+    mesh = torch.distributed.device_mesh.init_device_mesh(
+        "cuda",
+        (2, world_size // 16, 8),
+        mesh_dim_names=("dp_replicate", "fsdp", "tp"),
+    )
+    return mesh

@@ -1083,3 +1083,94 @@ def test_lazy_costs_requires_approx_solver(device_mesh_2d, solver):
             solver=solver,
             lazy_costs=True,
         )
+
+
+class _TwoLinear(nn.Module):
+    def __init__(self, dim1, dim2):
+        super().__init__()
+        self.linear1 = nn.Linear(dim1, dim2, bias=False)
+        self.linear2 = nn.Linear(dim2, dim1, bias=False)
+
+    def forward(self, x):
+        return self.linear2(F.relu(self.linear1(x)))
+
+
+def _hsdp_model_and_input_fn(mesh, dim1=1024, dim2=4096):
+    batch = 8 * mesh.shape[0] * mesh.shape[1]
+
+    def input_fn():
+        return torch.rand(batch, dim1, device="cuda", requires_grad=True)
+
+    with torch.device("meta"):
+        model = _TwoLinear(dim1, dim2)
+    return model, input_fn
+
+
+@apply_cuda_patches
+@pytest.mark.parametrize(
+    "solver,strategy_radius", [("ilp", None), ("approx", 0), ("approx", 2)]
+)
+def test_parameter_axis_constraint_replicates_one_mesh_axis(
+    device_mesh_hsdp_3d, solver, strategy_radius
+):
+    """add_parameter_axis_constraint pins one mesh axis of every parameter.
+
+    The remaining axes stay free, and the parameter memory constraint still
+    drives them to shard, which is the HSDP layout the solver should produce.
+    With solver="approx" on a 3D mesh the optimizer is built lazily, so this
+    also covers the queued-constraint path.
+    """
+    mesh = device_mesh_hsdp_3d
+    model, input_fn = _hsdp_model_and_input_fn(mesh)
+    x_sharding = (Shard(0), Shard(0), Replicate())
+
+    with AutoParallel(
+        model, input_fn, mesh, solver=solver, strategy_radius=strategy_radius
+    ) as autop:
+        autop.add_input_constraints([x_sharding])
+        autop.add_output_constraints([x_sharding])
+        autop.add_parameter_memory_constraint(low=None, high=None)
+        autop.add_parameter_axis_constraint("dp_replicate", Replicate())
+        solution = autop.optimize_placement()
+        param_nodes = get_param_nodes(autop.gm.graph)
+
+    assert param_nodes
+    for node in param_nodes:
+        placements = solution[node].output_specs.placements
+        assert placements[0] == Replicate(), (node.name, placements)
+        assert any(isinstance(placement, Shard) for placement in placements[1:]), (
+            node.name,
+            placements,
+        )
+
+
+@apply_cuda_patches
+def test_parameter_axis_constraint_without_it_may_shard_every_axis(
+    device_mesh_hsdp_3d,
+):
+    """Baseline: the same problem without the constraint is free to shard the
+    replicate axis, which is why the constraint is needed for an HSDP layout."""
+    mesh = device_mesh_hsdp_3d
+    model, input_fn = _hsdp_model_and_input_fn(mesh)
+    x_sharding = (Shard(0), Shard(0), Replicate())
+
+    with AutoParallel(model, input_fn, mesh, solver="ilp") as autop:
+        autop.add_input_constraints([x_sharding])
+        autop.add_output_constraints([x_sharding])
+        autop.add_parameter_memory_constraint(low=None, high=None)
+        solution = autop.optimize_placement()
+        param_nodes = get_param_nodes(autop.gm.graph)
+
+    assert any(
+        not solution[node].output_specs.placements[0].is_replicate()
+        for node in param_nodes
+    )
+
+
+@apply_cuda_patches
+def test_parameter_axis_constraint_rejects_unknown_axis(device_mesh_hsdp_3d):
+    mesh = device_mesh_hsdp_3d
+    model, input_fn = _hsdp_model_and_input_fn(mesh)
+    with AutoParallel(model, input_fn, mesh) as autop:
+        with pytest.raises(ValueError, match="Unknown mesh axis"):
+            autop.add_parameter_axis_constraint("not_an_axis", Replicate())
