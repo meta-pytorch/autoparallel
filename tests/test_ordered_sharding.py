@@ -10,15 +10,23 @@ from conftest import apply_cuda_patches
 from torch import nn
 from torch._functorch._aot_autograd.fx_utils import get_param_and_grad_nodes
 from torch._functorch.aot_autograd import aot_export_joint_with_descriptors
-from torch.distributed.tensor._dtensor_spec import DTensorSpec, ShardOrderEntry
+from torch.distributed.tensor._dtensor_spec import (
+    DTensorSpec,
+    ShardOrderEntry,
+    TensorMeta,
+)
 from torch.distributed.tensor._op_schema import OpSpec
 from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
 
 from autoparallel.api import AutoParallel
 from autoparallel.shardings.ordered_sharding import (
-    _infer_adjoint_storage_order,
+    _fallback_improves_layout_only_redistribution,
+    _FallbackPlanSummary,
     _infer_pure_release_storage_order,
     _matches_adjoint_gradient_pattern,
+    _physical_storage_is_checkpoint_compatible,
+    _redistribution_prefixes_are_unambiguous,
+    _summarize_fallback_plan,
     build_param_grad_linear_chains,
     compute_optimal_placement_order_for_parameters,
     get_redistributed_input_placements,
@@ -80,6 +88,15 @@ def _get_joint_graph(model: nn.Module, sample_input: torch.Tensor):
         gm = joint_with_descriptors.graph_module
         param_grad_nodes = list(get_param_and_grad_nodes(gm.graph).values())
         return gm, param_grad_nodes
+
+
+def _spec(device_mesh, placements, shape=(4096, 4096)):
+    tensor = torch.empty(shape, device="meta")
+    return DTensorSpec(
+        device_mesh,
+        placements,
+        tensor_meta=TensorMeta(tensor.shape, tensor.stride(), tensor.dtype),
+    )
 
 
 class TestBuildParamGradLinearChains:
@@ -547,9 +564,9 @@ def test_compute_optimal_placement_order_ss_to_rs(device_mesh_2d):
     grad_boundary_node = grad_chain[-1].all_input_nodes[0]
 
     # Manually construct sharding_placement dict with the S(0)S(0)->RS(0) pattern
-    ss_spec = DTensorSpec(device_mesh_2d, (Shard(0), Shard(0)))
-    rs_spec = DTensorSpec(device_mesh_2d, (Replicate(), Shard(0)))
-    ps_spec = DTensorSpec(device_mesh_2d, (Partial(), Shard(0)))
+    ss_spec = _spec(device_mesh_2d, (Shard(0), Shard(0)))
+    rs_spec = _spec(device_mesh_2d, (Replicate(), Shard(0)))
+    ps_spec = _spec(device_mesh_2d, (Partial(), Shard(0)))
 
     sharding_placement = {
         # param output is S(0)S(0)
@@ -625,10 +642,10 @@ def test_compute_optimal_placement_order_ss_to_rs_with_grad_chain_redistribution
     graph.output((mm_fwd, grad_alias))
     gm = torch.fx.GraphModule(torch.nn.Module(), graph)
 
-    ss = DTensorSpec(device_mesh_2d, (Shard(0), Shard(0)))
-    rs = DTensorSpec(device_mesh_2d, (Replicate(), Shard(0)))
-    sr = DTensorSpec(device_mesh_2d, (Shard(0), Replicate()))
-    ps = DTensorSpec(device_mesh_2d, (Partial(), Shard(0)))
+    ss = _spec(device_mesh_2d, (Shard(0), Shard(0)))
+    rs = _spec(device_mesh_2d, (Replicate(), Shard(0)))
+    sr = _spec(device_mesh_2d, (Shard(0), Replicate()))
+    ps = _spec(device_mesh_2d, (Partial(), Shard(0)))
 
     # The key setup: mm_bwd outputs S(0)R, but permute_bwd expects P(sum)S(0).
     # This creates a redistribution at permute_bwd from its input (mm_bwd).
@@ -699,44 +716,14 @@ def test_infer_pure_release_storage_order_multiple_tensor_dims():
     )
 
 
-def test_infer_pure_release_storage_order_released_only_tensor_dim():
+def test_infer_pure_release_storage_order_mixed_tensor_dims():
     source = (Shard(0), Shard(0), Shard(1))
 
     assert _infer_pure_release_storage_order(
-        source, (Replicate(), Replicate(), Shard(1))
+        source, (Replicate(), Shard(0), Shard(1))
     ) == (
         ShardOrderEntry(tensor_dim=0, mesh_dims=(1, 0)),
         ShardOrderEntry(tensor_dim=1, mesh_dims=(2,)),
-    )
-    assert _infer_pure_release_storage_order(
-        source, (Replicate(), Replicate(), Replicate())
-    ) == (
-        ShardOrderEntry(tensor_dim=0, mesh_dims=(1, 0)),
-        ShardOrderEntry(tensor_dim=1, mesh_dims=(2,)),
-    )
-
-
-def test_infer_pure_release_storage_order_other_released_only_patterns():
-    assert _infer_pure_release_storage_order(
-        (Shard(0), Shard(1), Shard(1)),
-        (Shard(0), Replicate(), Replicate()),
-    ) == (
-        ShardOrderEntry(tensor_dim=0, mesh_dims=(0,)),
-        ShardOrderEntry(tensor_dim=1, mesh_dims=(2, 1)),
-    )
-    assert _infer_pure_release_storage_order(
-        (Shard(0), Shard(1), Shard(0)),
-        (Replicate(), Shard(1), Replicate()),
-    ) == (
-        ShardOrderEntry(tensor_dim=0, mesh_dims=(2, 0)),
-        ShardOrderEntry(tensor_dim=1, mesh_dims=(1,)),
-    )
-    assert _infer_pure_release_storage_order(
-        (Shard(0), Shard(0), Shard(1), Shard(1)),
-        (Replicate(), Replicate(), Replicate(), Replicate()),
-    ) == (
-        ShardOrderEntry(tensor_dim=0, mesh_dims=(1, 0)),
-        ShardOrderEntry(tensor_dim=1, mesh_dims=(3, 2)),
     )
 
 
@@ -795,59 +782,201 @@ def test_matches_adjoint_gradient_pattern_3d():
     )
 
 
-def test_infer_adjoint_storage_order_across_multiple_forward_boundaries():
-    storage = (Shard(0), Shard(0), Shard(1))
-    first_forward_target = (Replicate(), Shard(0), Shard(1))
-    expected = (
+def test_fallback_gate_accepts_only_measured_layout_a2a(device_mesh_3d):
+    storage = _spec(
+        device_mesh_3d,
+        (Shard(0), Shard(0), Shard(1)),
+        (4096, 14336),
+    )
+    first_target = _spec(
+        device_mesh_3d,
+        (Replicate(), Shard(0), Shard(1)),
+        (4096, 14336),
+    )
+    grad_source = _spec(
+        device_mesh_3d,
+        (Partial(), Partial(), Shard(1)),
+        (4096, 14336),
+    )
+    preferred = (
+        ShardOrderEntry(tensor_dim=0, mesh_dims=(1, 0)),
+        ShardOrderEntry(tensor_dim=1, mesh_dims=(2,)),
+    )
+    transposed = _spec(
+        device_mesh_3d,
+        (Replicate(), Shard(1), Shard(0)),
+        (14336, 4096),
+    )
+    compute = _spec(
+        device_mesh_3d,
+        (Replicate(), Replicate(), Shard(0)),
+        (14336, 4096),
+    )
+
+    baseline = _summarize_fallback_plan(storage, first_target)
+    assert baseline is not None and baseline.has_all_to_all
+    assert _fallback_improves_layout_only_redistribution(
+        storage,
+        [(storage, first_target), (transposed, compute)],
+        [(grad_source, storage)],
+        preferred,
+    )
+
+
+def test_fallback_gate_rejects_endpoint_only_adjoint(device_mesh_3d):
+    storage = _spec(
+        device_mesh_3d,
+        (Shard(0), Shard(0), Shard(1)),
+        (4096, 14336),
+    )
+    first_target = _spec(
+        device_mesh_3d,
+        (Replicate(), Shard(0), Shard(1)),
+        (4096, 14336),
+    )
+    grad_source = _spec(
+        device_mesh_3d,
+        (Partial(), Partial(), Shard(1)),
+        (4096, 14336),
+    )
+    preferred = (
         ShardOrderEntry(tensor_dim=0, mesh_dims=(1, 0)),
         ShardOrderEntry(tensor_dim=1, mesh_dims=(2,)),
     )
 
-    assert (
-        _infer_adjoint_storage_order(
-            storage,
-            first_forward_target,
-            (Partial(), Partial(), Shard(1)),
-            storage,
-        )
-        == expected
-    )
-    assert (
-        _infer_adjoint_storage_order(
-            storage,
-            first_forward_target,
-            (Partial(), Partial(), Partial()),
-            storage,
-        )
-        == expected
+    # The endpoint placements look like a two-axis adjoint, but the actual
+    # forward chain releases only mesh dim 0.  There is no mesh-dim-1 AG for
+    # the second RS to be adjoint to, so changing storage order is unsafe.
+    assert not _fallback_improves_layout_only_redistribution(
+        storage,
+        [(storage, first_target)],
+        [(grad_source, storage)],
+        preferred,
     )
 
 
-def test_infer_adjoint_storage_order_rejects_non_prefix_forward_boundary():
-    storage = (Shard(0), Shard(0), Shard(1))
+def test_fallback_gate_rejects_default_plan_without_a2a(device_mesh_3d):
+    storage = _spec(
+        device_mesh_3d,
+        (Shard(0), Shard(0), Shard(1)),
+        (4096, 14336),
+    )
+    fully_replicated = _spec(
+        device_mesh_3d,
+        (Replicate(), Replicate(), Replicate()),
+        (4096, 14336),
+    )
+    grad_source = _spec(
+        device_mesh_3d,
+        (Partial(), Partial(), Partial()),
+        (4096, 14336),
+    )
+    preferred = (
+        ShardOrderEntry(tensor_dim=0, mesh_dims=(1, 0)),
+        ShardOrderEntry(tensor_dim=1, mesh_dims=(2,)),
+    )
 
-    assert (
-        _infer_adjoint_storage_order(
-            storage,
-            (Replicate(), Shard(1), Shard(1)),
-            (Partial(), Partial(), Shard(1)),
-            storage,
-        )
-        is None
+    # The all-shards-to-all-replicates fast path is already A2A-free.
+    baseline = _summarize_fallback_plan(storage, fully_replicated)
+    assert baseline is not None and not baseline.has_all_to_all
+    assert not _fallback_improves_layout_only_redistribution(
+        storage,
+        [(storage, fully_replicated)],
+        [(grad_source, storage)],
+        preferred,
     )
 
 
-def test_infer_adjoint_storage_order_preserves_flattened_path():
-    storage = (Shard(0), Shard(0))
+def test_fallback_gate_rejects_logical_a2a(device_mesh_3d):
+    source = _spec(
+        device_mesh_3d,
+        (Shard(0), Replicate(), Shard(1)),
+        (4096, 14336),
+    )
+    target = _spec(
+        device_mesh_3d,
+        (Shard(1), Replicate(), Shard(1)),
+        (4096, 14336),
+    )
+    preferred = DTensorSpec.compute_default_shard_order(source.placements)
 
-    assert (
-        _infer_adjoint_storage_order(
+    assert not _fallback_improves_layout_only_redistribution(
+        source,
+        [(source, target)],
+        [(source, source)],
+        preferred,
+    )
+
+
+def test_fallback_gate_requires_strict_cost_reduction(device_mesh_3d):
+    storage = _spec(
+        device_mesh_3d,
+        (Shard(0), Shard(0), Shard(1)),
+        (4096, 14336),
+    )
+    first_target = _spec(
+        device_mesh_3d,
+        (Replicate(), Shard(0), Shard(1)),
+        (4096, 14336),
+    )
+    grad_source = _spec(
+        device_mesh_3d,
+        (Partial(), Partial(), Shard(1)),
+        (4096, 14336),
+    )
+    preferred = (
+        ShardOrderEntry(tensor_dim=0, mesh_dims=(1, 0)),
+        ShardOrderEntry(tensor_dim=1, mesh_dims=(2,)),
+    )
+    plans = [
+        _FallbackPlanSummary((("all_to_all", (1,)),), 10.0),
+        _FallbackPlanSummary((("all_gather", (0,)),), 10.0),
+        _FallbackPlanSummary((("all_to_all", (1,)),), 10.0),
+        _FallbackPlanSummary((("reduce_scatter", (0,)),), 10.0),
+    ]
+
+    import unittest.mock as mock
+
+    with mock.patch(
+        "autoparallel.shardings.ordered_sharding._summarize_fallback_plan",
+        side_effect=plans,
+    ):
+        assert not _fallback_improves_layout_only_redistribution(
             storage,
-            (Replicate(), Replicate()),
-            (Partial(), Partial()),
-            storage,
+            [(storage, first_target)],
+            [(grad_source, storage)],
+            preferred,
         )
-        is None
+
+
+def test_checkpoint_gate_rejects_uneven_strided_storage(device_mesh_3d):
+    storage = _spec(
+        device_mesh_3d,
+        (Shard(0), Shard(0), Shard(1)),
+        (4097, 14336),
+    )
+    preferred = (
+        ShardOrderEntry(tensor_dim=0, mesh_dims=(1, 0)),
+        ShardOrderEntry(tensor_dim=1, mesh_dims=(2,)),
+    )
+
+    assert not _physical_storage_is_checkpoint_compatible(storage, preferred)
+
+
+def test_fallback_gate_rejects_branched_parameter_prefix():
+    graph = torch.fx.Graph()
+    param = graph.placeholder("param")
+    first_user = graph.call_function(torch.ops.aten.clone.default, (param,))
+    other_user = graph.call_function(torch.ops.aten.clone.default, (param,))
+    grad_input = graph.placeholder("grad_input")
+    grad = graph.call_function(torch.ops.aten.clone.default, (grad_input,))
+    graph.output((first_user, other_user, grad))
+
+    assert not _redistribution_prefixes_are_unambiguous(
+        [param, first_user],
+        first_user,
+        [grad],
+        grad,
     )
 
 
@@ -860,7 +989,7 @@ def test_compute_order_from_composite_adjoint_across_transpose(device_mesh_3d):
     for final_placement, grad_after_transpose in (
         (
             (Replicate(), Replicate(), Replicate()),
-            (Partial(), Partial(), Partial()),
+            (Partial(), Partial(), Shard(1)),
         ),
         (
             (Replicate(), Replicate(), Shard(0)),
@@ -887,14 +1016,32 @@ def test_compute_order_from_composite_adjoint_across_transpose(device_mesh_3d):
         graph.output((mm_fwd, grad_alias))
         gm = torch.fx.GraphModule(torch.nn.Module(), graph)
 
-        storage = DTensorSpec(device_mesh_3d, (Shard(0), Shard(0), Shard(1)))
-        first_target = DTensorSpec(device_mesh_3d, (Replicate(), Shard(0), Shard(1)))
-        transposed = DTensorSpec(device_mesh_3d, (Replicate(), Shard(1), Shard(0)))
-        final = DTensorSpec(device_mesh_3d, final_placement)
-        grad_before_transpose = DTensorSpec(
-            device_mesh_3d, (Partial(), Partial(), Shard(0))
+        storage = _spec(
+            device_mesh_3d,
+            (Shard(0), Shard(0), Shard(1)),
+            (4096, 4096),
         )
-        grad_after = DTensorSpec(device_mesh_3d, grad_after_transpose)
+        first_target = _spec(
+            device_mesh_3d,
+            (Replicate(), Shard(0), Shard(1)),
+            (4096, 4096),
+        )
+        transposed = _spec(
+            device_mesh_3d,
+            (Replicate(), Shard(1), Shard(0)),
+            (4096, 4096),
+        )
+        final = _spec(device_mesh_3d, final_placement, (4096, 4096))
+        grad_before_transpose = _spec(
+            device_mesh_3d,
+            (Partial(), Partial(), Shard(0)),
+            (4096, 4096),
+        )
+        grad_after = _spec(
+            device_mesh_3d,
+            grad_after_transpose,
+            (4096, 4096),
+        )
 
         sharding_placement = {
             param: OpSpec(output_specs=storage, input_specs=[storage]),
@@ -952,9 +1099,9 @@ def test_compute_optimal_placement_order_3d(device_mesh_3d):
     graph.output((mm_fwd, grad_alias))
     gm = torch.fx.GraphModule(torch.nn.Module(), graph)
 
-    storage = DTensorSpec(device_mesh_3d, (Shard(0), Shard(0), Shard(0)))
-    compute = DTensorSpec(device_mesh_3d, (Replicate(), Replicate(), Shard(0)))
-    grad_compute = DTensorSpec(device_mesh_3d, (Partial(), Partial(), Shard(0)))
+    storage = _spec(device_mesh_3d, (Shard(0), Shard(0), Shard(0)))
+    compute = _spec(device_mesh_3d, (Replicate(), Replicate(), Shard(0)))
+    grad_compute = _spec(device_mesh_3d, (Partial(), Partial(), Shard(0)))
 
     sharding_placement = {
         param: OpSpec(output_specs=storage, input_specs=[storage]),

@@ -20,7 +20,11 @@ import torch
 from torch.distributed._local_tensor import LocalTensor, LocalTensorMode
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
-from torch.distributed.tensor._dtensor_spec import DTensorSpec, ShardOrderEntry
+from torch.distributed.tensor._dtensor_spec import (
+    DTensorSpec,
+    ShardOrderEntry,
+    TensorMeta,
+)
 from torch.distributed.tensor._utils import _compute_local_shape_and_global_offset
 from torch.distributed.tensor.placement_types import (
     Partial,
@@ -498,7 +502,7 @@ def _build_linear_graph_and_placements(device_mesh_2d):
         compute_optimal_placement_order_for_parameters,
     )
 
-    dim = 64
+    dim = 512
     model = nn.Linear(dim, dim, bias=False)
     sample_input = torch.randn(8, dim, requires_grad=True)
 
@@ -519,9 +523,15 @@ def _build_linear_graph_and_placements(device_mesh_2d):
     grad_boundary_node = grad_chain[-1].all_input_nodes[0]
 
     mesh = device_mesh_2d
-    ss_spec = DTensorSpec(mesh, (Shard(0), Shard(0)))
-    rs_spec = DTensorSpec(mesh, (Replicate(), Shard(0)))
-    ps_spec = DTensorSpec(mesh, (Partial(), Shard(0)))
+    param_value = param.meta["val"]
+    tensor_meta = TensorMeta(
+        param_value.shape,
+        param_value.stride(),
+        param_value.dtype,
+    )
+    ss_spec = DTensorSpec(mesh, (Shard(0), Shard(0)), tensor_meta=tensor_meta)
+    rs_spec = DTensorSpec(mesh, (Replicate(), Shard(0)), tensor_meta=tensor_meta)
+    ps_spec = DTensorSpec(mesh, (Partial(), Shard(0)), tensor_meta=tensor_meta)
 
     sharding_placement = {
         param: OpSpec(output_specs=ss_spec, input_specs=[ss_spec]),

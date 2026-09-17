@@ -19,11 +19,7 @@ from torch._functorch._aot_autograd.fx_utils import (
 from torch._inductor.decomposition import select_decomp_table
 from torch._subclasses.fake_tensor import FakeTensor, unset_fake_temporarily
 from torch.distributed.tensor import DTensor
-from torch.distributed.tensor._dtensor_spec import (
-    DTensorSpec,
-    ShardOrder,
-    ShardOrderEntry,
-)
+from torch.distributed.tensor._dtensor_spec import DTensorSpec
 from torch.distributed.tensor._redistribute import use_min_cost_redistribution_plan
 from torch.distributed.tensor.placement_types import Partial, Replicate, Shard  # noqa
 from torch.fx.experimental.proxy_tensor import make_fx
@@ -31,6 +27,7 @@ from torch.utils._pytree import tree_flatten, tree_map_only
 
 from .graph_passes.graph_utils import all_input_nodes, cleanup_graph
 from .shardings.ordered_sharding import (
+    _project_shard_order,
     compute_optimal_placement_order_for_parameters,
     ordered_redistribute_local_tensor,
 )
@@ -71,42 +68,6 @@ def _localize_shape_arg(node, shape_arg, output_spec):
         if isinstance(s, torch.SymInt):
             local_shape[i] = s
     return local_shape
-
-
-def _project_shard_order(
-    preferred_shard_order: ShardOrder,
-    spec: DTensorSpec,
-) -> ShardOrder:
-    """Project a parameter storage order onto the shards present in ``spec``."""
-    actual_shards = {
-        (placement.dim, mesh_dim)
-        for mesh_dim, placement in enumerate(spec.placements)
-        if isinstance(placement, Shard)
-    }
-    covered_shards: set[tuple[int, int]] = set()
-    projected_order = []
-
-    for entry in preferred_shard_order:
-        matching_mesh_dims = []
-        for mesh_dim in entry.mesh_dims:
-            if mesh_dim >= len(spec.placements):
-                continue
-            placement = spec.placements[mesh_dim]
-            if isinstance(placement, Shard) and placement.dim == entry.tensor_dim:
-                matching_mesh_dims.append(mesh_dim)
-        mesh_dims = tuple(matching_mesh_dims)
-        if mesh_dims:
-            projected_order.append(
-                ShardOrderEntry(tensor_dim=entry.tensor_dim, mesh_dims=mesh_dims)
-            )
-            covered_shards.update(
-                (entry.tensor_dim, mesh_dim) for mesh_dim in mesh_dims
-            )
-
-    if covered_shards != actual_shards:
-        assert spec.shard_order is not None
-        return spec.shard_order
-    return tuple(projected_order)
 
 
 class ApplyShardingInterpreter(torch.fx.Interpreter):
@@ -644,14 +605,13 @@ def apply_sharding_to_model(gm, sharding_placement, params_spec, buffers_spec):
             fake_mode.shape_env = ShapeEnv()
             fake_mode.static_shapes = False
 
-    param_placement_order = compute_optimal_placement_order_for_parameters(
-        gm, sharding_placement
-    )
-    physical_placements = _build_physical_placements(
-        sharding_placement, param_placement_order
-    )
-
     with _mark_rank_symbols_ignorable():
+        param_placement_order = compute_optimal_placement_order_for_parameters(
+            gm, sharding_placement
+        )
+        physical_placements = _build_physical_placements(
+            sharding_placement, param_placement_order
+        )
         local_args = _make_local_args(gm, physical_placements)
         t1 = time.perf_counter()
 
