@@ -19,11 +19,17 @@ def load_experiment_lock(path: Path = LOCK_PATH) -> dict[str, Any]:
     if lock.get("schema_version") != 1:
         raise CampaignError("experiment_lock.toml schema_version must be 1")
     sources = lock.get("sources")
-    if not isinstance(sources, dict) or set(sources) != {
-        "torchtitan",
-        "autoparallel",
-    }:
-        raise CampaignError("experiment lock requires exactly two source entries")
+    required_sources = {"torchtitan", "autoparallel"}
+    allowed_sources = required_sources | {"autoparallel_baseline"}
+    if (
+        not isinstance(sources, dict)
+        or not required_sources <= set(sources)
+        or set(sources) - allowed_sources
+    ):
+        raise CampaignError(
+            "experiment lock requires torchtitan and autoparallel sources and "
+            "optionally accepts autoparallel_baseline"
+        )
     for name, source in sources.items():
         if not isinstance(source, dict):
             raise CampaignError(f"experiment lock source {name!r} must be a table")

@@ -46,6 +46,7 @@ def _asset_roots(values: list[str]) -> dict[str, Path]:
 def _add_sources(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--torchtitan-root", type=Path, required=True)
     parser.add_argument("--autoparallel-root", type=Path, required=True)
+    parser.add_argument("--baseline-autoparallel-root", type=Path)
     parser.add_argument("--asset-root", action="append", default=[])
     parser.add_argument("--python", type=Path, default=Path(sys.executable))
 
@@ -114,8 +115,7 @@ def _is_post_render_dryrun_shutdown_abort(
     if (
         completed.stdout.count(APPLICATION_MARKER) != 1
         or completed.stdout.count(MARKER) != 1
-        or completed.stdout.index(APPLICATION_MARKER)
-        > completed.stdout.index(MARKER)
+        or completed.stdout.index(APPLICATION_MARKER) > completed.stdout.index(MARKER)
         or not all(marker in completed.stderr for marker in DRYRUN_SHUTDOWN_ERRORS)
     ):
         return False
@@ -252,6 +252,7 @@ def main() -> None:
                 campaign,
                 torchtitan_root=args.torchtitan_root,
                 autoparallel_root=args.autoparallel_root,
+                baseline_autoparallel_root=args.baseline_autoparallel_root,
                 output_dir=args.output,
                 asset_roots=assets,
                 python=args.python,
@@ -262,6 +263,7 @@ def main() -> None:
                 campaign,
                 torchtitan_root=args.torchtitan_root,
                 autoparallel_root=args.autoparallel_root,
+                baseline_autoparallel_root=args.baseline_autoparallel_root,
                 attempt_root=args.attempt,
                 asset_roots=_asset_roots(args.asset_root),
                 python=args.python,

@@ -26,6 +26,7 @@ from harness.run import (
     _write_materialization_ready,
     run_reproduction,
 )
+from harness.runtime import _autoparallel_root
 from harness.settings import load_run_settings, resolve_run_setting
 from scripts.measurements.measurement import (
     _ensure_submitted,
@@ -35,6 +36,46 @@ from scripts.measurements.measurement import (
 
 
 class RunTests(unittest.TestCase):
+    def test_dual_autoparallel_source_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            payload = Path(temporary)
+            candidate = payload / "autoparallel"
+            baseline = payload / "autoparallel_baseline"
+            candidate.mkdir()
+            baseline.mkdir()
+
+            self.assertEqual(
+                _autoparallel_root(
+                    payload, {"BENCHMARK_AP_SOURCE_VARIANT": "candidate"}
+                ),
+                candidate,
+            )
+            self.assertEqual(
+                _autoparallel_root(
+                    payload, {"BENCHMARK_AP_SOURCE_VARIANT": "baseline"}
+                ),
+                baseline,
+            )
+            with self.assertRaisesRegex(RuntimeError, "invalid AutoParallel"):
+                _autoparallel_root(payload, {"BENCHMARK_AP_SOURCE_VARIANT": "unknown"})
+
+    def test_package_cli_accepts_baseline_autoparallel_root(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "package",
+                "campaign.toml",
+                "--attempt",
+                "/tmp/attempt",
+                "--torchtitan-root",
+                "/tmp/torchtitan",
+                "--autoparallel-root",
+                "/tmp/candidate",
+                "--baseline-autoparallel-root",
+                "/tmp/baseline",
+            ]
+        )
+        self.assertEqual(args.baseline_autoparallel_root, Path("/tmp/baseline"))
+
     def test_run_cli_accepts_explicit_attempt_number(self) -> None:
         args = build_parser().parse_args(
             [
@@ -316,7 +357,9 @@ class SubmissionLifecycleTests(unittest.TestCase):
             with (
                 mock.patch(
                     "harness.cli._verify_sealed_attempt",
-                    return_value={"validation": {"application_contract_validated": True}},
+                    return_value={
+                        "validation": {"application_contract_validated": True}
+                    },
                 ),
                 mock.patch(
                     "harness.cli._torchx_command",
@@ -328,7 +371,9 @@ class SubmissionLifecycleTests(unittest.TestCase):
                     side_effect=CampaignError("exact package audit failed"),
                 ) as audit,
             ):
-                with self.assertRaisesRegex(CampaignError, "exact package audit failed"):
+                with self.assertRaisesRegex(
+                    CampaignError, "exact package audit failed"
+                ):
                     _run_torchx(attempt, dryrun=True)
             audit.assert_called_once()
 

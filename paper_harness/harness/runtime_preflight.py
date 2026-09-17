@@ -55,6 +55,8 @@ def run(payload: Path, run_root: Path) -> dict:
         "torchtitan": payload / "torchtitan",
         "autoparallel": payload / "autoparallel",
     }
+    if "autoparallel_baseline" in source_lock:
+        source_roots["autoparallel_baseline"] = payload / "autoparallel_baseline"
     source_checks = {}
     for name, root in source_roots.items():
         digest = manifest_digest(tree_manifest(root))

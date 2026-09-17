@@ -55,6 +55,7 @@ def package_campaign(
     *,
     torchtitan_root: Path,
     autoparallel_root: Path,
+    baseline_autoparallel_root: Path | None = None,
     attempt_root: Path,
     asset_roots: dict[str, Path] | None = None,
     probe_configs: bool = True,
@@ -71,6 +72,7 @@ def package_campaign(
         campaign,
         torchtitan_root=torchtitan_root,
         autoparallel_root=autoparallel_root,
+        baseline_autoparallel_root=baseline_autoparallel_root,
         output_dir=validation_root,
         probe_configs=probe_configs,
         asset_roots=asset_roots,
@@ -80,6 +82,11 @@ def package_campaign(
     _copy_harness(Path(__file__).resolve().parents[1], payload / "harness_repo")
     _copy_tree(torchtitan_root.resolve(), payload / "torchtitan")
     _copy_tree(autoparallel_root.resolve(), payload / "autoparallel")
+    if baseline_autoparallel_root is not None:
+        _copy_tree(
+            baseline_autoparallel_root.resolve(),
+            payload / "autoparallel_baseline",
+        )
     (payload / "campaign").mkdir(parents=True)
     shutil.copy2(campaign.path, payload / "campaign" / "campaign.toml")
     shutil.copy2(
@@ -125,8 +132,14 @@ def package_campaign(
         }
 
     source_copy_checks = {}
-    for name in ("torchtitan", "autoparallel"):
-        copied_manifest = tree_manifest(payload / name)
+    packaged_sources = {
+        "torchtitan": payload / "torchtitan",
+        "autoparallel": payload / "autoparallel",
+    }
+    if baseline_autoparallel_root is not None:
+        packaged_sources["autoparallel_baseline"] = payload / "autoparallel_baseline"
+    for name, copied_root in packaged_sources.items():
+        copied_manifest = tree_manifest(copied_root)
         copied_digest = manifest_digest(copied_manifest)
         expected_digest = validation["source_lock"][name]["tree_sha256"]
         if copied_digest != expected_digest:

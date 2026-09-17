@@ -1,5 +1,5 @@
 schema_version = 1
-harness_version = "legacy-dtensor-v3-approx-paper"
+harness_version = "weight-shard-order-ab-v1"
 
 [sources.torchtitan]
 remote = "https://github.com/AlbedoWang/torchtitan.git"
@@ -7,6 +7,11 @@ commit = "26c329bd14df4238bb65e661286231d42d15935e"
 dirty_policy = "forbid"
 
 [sources.autoparallel]
+remote = "https://github.com/meta-pytorch/autoparallel.git"
+commit = "a4cc074c20b084f312472fd76a8153374ba2b2b3"
+dirty_policy = "forbid"
+
+[sources.autoparallel_baseline]
 remote = "https://github.com/meta-pytorch/autoparallel.git"
 commit = "f167147dd07286f6f7b20cfdfc7b1167aced2a2d"
 dirty_policy = "forbid"

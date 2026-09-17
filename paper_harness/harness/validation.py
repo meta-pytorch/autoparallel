@@ -9,12 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .assets import asset_lock_digest, load_asset_lock
-from .campaign import (
-    PLANNER_RESULT_CLASSIFICATION,
-    Campaign,
-    CampaignError,
-    write_json,
-)
+from .campaign import PLANNER_RESULT_CLASSIFICATION, Campaign, CampaignError, write_json
 from .experiment_lock import experiment_lock_digest, load_experiment_lock
 from .integrity import validate_harness_integrity
 from .parity import validate_pair
@@ -140,6 +135,7 @@ def validate_campaign(
     *,
     torchtitan_root: Path,
     autoparallel_root: Path,
+    baseline_autoparallel_root: Path | None = None,
     output_dir: Path,
     probe_configs: bool = True,
     asset_roots: dict[str, Path] | None = None,
@@ -227,6 +223,19 @@ def validate_campaign(
             evidence_dir=source_evidence,
         ),
     }
+    if "autoparallel_baseline" in specs:
+        if baseline_autoparallel_root is None:
+            raise CampaignError("experiment lock requires --baseline-autoparallel-root")
+        source_lock["autoparallel_baseline"] = inspect_source(
+            "autoparallel_baseline",
+            baseline_autoparallel_root,
+            specs["autoparallel_baseline"],
+            evidence_dir=source_evidence,
+        )
+    elif baseline_autoparallel_root is not None:
+        raise CampaignError(
+            "--baseline-autoparallel-root requires an experiment-lock entry"
+        )
     write_json(output_dir / "source_lock.json", source_lock)
     source_lock_sha256 = hashlib.sha256(
         (output_dir / "source_lock.json").read_bytes()
@@ -299,10 +308,21 @@ def validate_campaign(
                 probe_env = {
                     key: expand(str(value)) for key, value in raw_probe_env.items()
                 }
+                source_variant = probe_env.get(
+                    "BENCHMARK_AP_SOURCE_VARIANT", "candidate"
+                )
+                if source_variant == "candidate":
+                    arm_autoparallel_root = autoparallel_root
+                elif source_variant == "baseline" and baseline_autoparallel_root:
+                    arm_autoparallel_root = baseline_autoparallel_root
+                else:
+                    raise CampaignError(
+                        f"invalid AutoParallel source variant {source_variant!r}"
+                    )
                 config = _probe_config(
                     argv,
                     torchtitan_root=torchtitan_root,
-                    autoparallel_root=autoparallel_root,
+                    autoparallel_root=arm_autoparallel_root,
                     output=path,
                     python=python,
                     extra_env=probe_env,

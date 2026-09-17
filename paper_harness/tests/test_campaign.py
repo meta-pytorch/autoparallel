@@ -22,6 +22,7 @@ class CampaignTests(unittest.TestCase):
                 "deepseek_v3_16b.toml",
                 "llama3_8b_2d.toml",
                 "llama3_8b_3d.toml",
+                "llama3_8b_3d_weight_shard_order_ab.toml",
                 "llama3_8b_planner.toml",
                 "llama3_8b_replanning_approx.toml",
                 "muse_glimmer_30b.toml",
@@ -137,6 +138,34 @@ class CampaignTests(unittest.TestCase):
                     )
                     self.assertGreater(campaign.world_size, 0)
                     self.assertTrue(campaign.phases)
+
+    def test_weight_shard_order_campaign_changes_only_source_variant(self) -> None:
+        campaign = load_campaign(
+            REPO_ROOT / "campaigns/llama3_8b_3d_weight_shard_order_ab.toml"
+        )
+        self.assertEqual(campaign.world_size, 16)
+        self.assertEqual(
+            campaign.raw["comparison"]["declared_variable"],
+            "autoparallel_weight_physical_shard_order_lowering",
+        )
+        self.assertEqual(
+            [arm.name for arm in campaign.arms],
+            ["apgt_baseline", "apgt_fixed"],
+        )
+        self.assertEqual(
+            [arm.environment["BENCHMARK_AP_SOURCE_VARIANT"] for arm in campaign.arms],
+            ["baseline", "candidate"],
+        )
+        self.assertEqual(
+            [
+                campaign.phase_arm_settings(campaign.phases[0], arm)
+                for arm in campaign.arms
+            ],
+            [
+                campaign.phase_arm_settings(campaign.phases[0], campaign.arms[0]),
+                campaign.phase_arm_settings(campaign.phases[0], campaign.arms[0]),
+            ],
+        )
 
     def test_matrix_requires_an_explicit_point(self) -> None:
         with self.assertRaisesRegex(CampaignError, "requires --point"):

@@ -44,6 +44,32 @@ def _expand(value: str, *, payload: Path, output: Path) -> str:
     return value
 
 
+def _autoparallel_root(payload: Path, environment: dict[str, str]) -> Path:
+    variant = environment.get("BENCHMARK_AP_SOURCE_VARIANT", "candidate")
+    if variant == "candidate":
+        root = payload / "autoparallel"
+    elif variant == "baseline":
+        root = payload / "autoparallel_baseline"
+    else:
+        raise RuntimeError(f"invalid AutoParallel source variant {variant!r}")
+    if not root.is_dir():
+        raise RuntimeError(
+            f"AutoParallel source variant {variant!r} is not packaged: {root}"
+        )
+    return root
+
+
+def _arm_pythonpath(payload: Path, autoparallel_root: Path) -> str:
+    return os.pathsep.join(
+        [
+            str(payload / "harness_repo"),
+            str(autoparallel_root),
+            str(payload / "torchtitan"),
+            os.environ.get("TORCHX_RUN_PYTHONPATH", ""),
+        ]
+    )
+
+
 def _set_boolean_option(argv: list[str], path: str, enabled: bool) -> list[str]:
     positive = f"--{path.replace('_', '-')}"
     section, name = positive.rsplit(".", 1)
@@ -250,12 +276,15 @@ def _audit_runtime_configs(
                     for key, value in campaign.phase_arm_environment(phase, arm).items()
                 }
             )
+            arm_autoparallel_root = _autoparallel_root(payload, extra_env)
+            extra_env["PYTHONPATH"] = _arm_pythonpath(payload, arm_autoparallel_root)
+            extra_env["EXPECTED_AP_ROOT"] = str(arm_autoparallel_root)
             path = output_root / phase.name / f"{arm_name}.json"
             path.parent.mkdir(parents=True, exist_ok=True)
             config = _probe_config(
                 argv,
                 torchtitan_root=payload / "torchtitan",
-                autoparallel_root=payload / "autoparallel",
+                autoparallel_root=arm_autoparallel_root,
                 output=path,
                 python=Path(sys.executable),
                 extra_env=extra_env,
@@ -601,6 +630,9 @@ def main() -> None:
                     for key, value in phase["environment_by_arm"][arm_name].items()
                 }
             )
+            arm_autoparallel_root = _autoparallel_root(payload, env)
+            env["PYTHONPATH"] = _arm_pythonpath(payload, arm_autoparallel_root)
+            env["EXPECTED_AP_ROOT"] = str(arm_autoparallel_root)
             for directory in (cache / "inductor", cache / "triton", cache / "tmp"):
                 directory.mkdir(parents=True)
             if (
