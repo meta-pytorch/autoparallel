@@ -323,6 +323,36 @@ def _assert_has_tensor_meta(spec_or_specs, node, label):
         ), f"{node} {label} doesn't have a tensor_meta"
 
 
+def resolve_mesh_axis(mesh, axis) -> int:
+    """Return the mesh dimension index for an axis name or integer."""
+    if isinstance(axis, str):
+        names = mesh.mesh_dim_names
+        if not names or axis not in names:
+            raise ValueError(f"Unknown mesh axis {axis!r}; mesh dim names are {names}")
+        return list(names).index(axis)
+    if isinstance(axis, bool) or not isinstance(axis, int):
+        raise TypeError(f"Mesh axis must be a name or an integer, got {axis!r}")
+    if not -mesh.ndim <= axis < mesh.ndim:
+        raise ValueError(f"Mesh axis {axis} is out of range for a {mesh.ndim}D mesh")
+    return axis % mesh.ndim
+
+
+def first_output_placements(spec_or_specs) -> tuple[Placement, ...] | None:
+    """Return the placements of a strategy's first DTensorSpec output, if any.
+
+    Node constraints match a strategy by its output placement.  For nodes whose
+    output_specs is a tuple (e.g. SDPA), the first DTensorSpec element is the
+    representative, matching add_node_constraint.
+    """
+    if isinstance(spec_or_specs, DTensorSpec):
+        return spec_or_specs.placements
+    if isinstance(spec_or_specs, (list, tuple)):
+        for spec in spec_or_specs:
+            if isinstance(spec, DTensorSpec):
+                return spec.placements
+    return None
+
+
 class ShardingOptimizer:
     def __init__(
         self,
@@ -369,6 +399,12 @@ class ShardingOptimizer:
         self.strategy_radius = strategy_radius
         self._constraint_log: list[tuple[str, dict]] = []
         self._memory_constraint: tuple[float, float] | None = None
+        # USER (Category 5e): per-mesh-axis parameter placement rules. Applied
+        # lazily on every solve, like the parameter memory constraint, so that
+        # parameter nodes of a lazily built optimizer are still covered and a
+        # re-solve neither duplicates nor drops them.
+        self._parameter_axis_constraints: list[tuple[int, Placement]] = []
+        self._parameter_axis_constraint_names: list[str] = []
         # Maps ILP constraint name → node_name for active node constraints,
         # so that _apply_memory_constraint can exclude constrained params and
         # remove_constraints can keep this in sync.
@@ -1329,6 +1365,7 @@ class ShardingOptimizer:
             # is a lower bound on a different (unconstrained) problem and can fall
             # below the true ILP optimum.
             self._apply_memory_constraint()
+            self._apply_parameter_axis_constraints()
 
             for var in self.pulp_variables.values():
                 var.cat = pulp.LpContinuous
@@ -1380,6 +1417,7 @@ class ShardingOptimizer:
 
     def _solve(self, verbose=False):
         self._apply_memory_constraint()
+        self._apply_parameter_axis_constraints()
         # The sharding ILP is flow-like and its LP relaxation is usually integral.
         # Disable CBC's integer preprocessing; branch-and-bound still runs when
         # the relaxation is fractional.
@@ -1447,6 +1485,7 @@ class ShardingOptimizer:
         variables = self.prob.variables()
         original_cats = [v.cat for v in variables]
         self._apply_memory_constraint()
+        self._apply_parameter_axis_constraints()
         t0 = time.perf_counter()
         try:
             for v in variables:
@@ -1610,12 +1649,23 @@ class ShardingOptimizer:
         """Remove constraints by name, allowing re-solve to revert to the
         unconstrained optimum."""
         memory_names = {"memory_constraint_high", "memory_constraint_low"}
+        axis_names = set(self._parameter_axis_constraint_names)
         for name in names:
             if self.prob is not None:
                 del self.prob.constraints[name]
             elif name not in memory_names:
                 raise RuntimeError("Named constraint removal requires an ILP/LP build")
             self._node_constraint_names.pop(name, None)
+            if name in axis_names:
+                # One axis rule generates many named constraints, so removing any
+                # of them drops the whole rule instead of leaving it half applied.
+                self._parameter_axis_constraints = []
+                self._parameter_axis_constraint_names = []
+                self._constraint_log = [
+                    entry
+                    for entry in self._constraint_log
+                    if entry[0] != "add_parameter_axis_constraint"
+                ]
             if name in memory_names:
                 self._memory_constraint = None
                 self._constraint_log = [
@@ -2301,6 +2351,10 @@ class ShardingOptimizer:
                 continue
             node_idx = self.node_map[node]
             num_out_strat = len(self.strats[node].strategies)
+            # The best achievable ratio must respect the parameter axis rules:
+            # deriving the budget from a strategy the solver may not pick would
+            # make the memory constraint infeasible.
+            axis_allowed = self._parameter_axis_allowed_indices(node)
             ratios: list[float] = []
             for out_idx in range(num_out_strat):
                 dv = self._find_decision_var(node_idx, 0, out_idx)
@@ -2313,14 +2367,101 @@ class ShardingOptimizer:
                 new_size: int = math.prod(new_tensor_shape)
                 old_size: int = math.prod(tensor_shape)
                 ratio = new_size / old_size
-                ratios.append(ratio)
+                if axis_allowed is None or out_idx in axis_allowed:
+                    ratios.append(ratio)
                 elms.append(dv.var * ratio)
+            if not ratios:
+                raise RuntimeError(
+                    f"Parameter {node.name!r} has no selectable strategy left for "
+                    "the parameter memory constraint"
+                )
             best_ratio: float = min(ratios)
             budget_low += max(best_ratio, memory_factor_low)
             budget_high += max(best_ratio, memory_factor_high)
 
         self.prob += (pulp.lpSum(elms) <= budget_high, "memory_constraint_high")
         self.prob += (pulp.lpSum(elms) >= budget_low, "memory_constraint_low")
+
+    def add_parameter_axis_constraint(self, axis, placement):
+        """USER (Category 5e): Force one mesh axis of every parameter.
+
+        Every parameter node must choose a strategy whose output placement on
+        ``axis`` equals ``placement``; the other mesh axes stay free for the
+        solver. This expresses layouts such as HSDP, where parameters are
+        replicated on the replicate axis and sharded on the remaining axes.
+
+        ``axis`` is a mesh dimension name or index. Unlike add_node_constraint,
+        this is a rule rather than a fixed node set, so it also covers parameter
+        nodes of an optimizer that is built after this call.
+        """
+        axis_index = resolve_mesh_axis(self.mesh, axis)
+        self._constraint_log.append(
+            (
+                "add_parameter_axis_constraint",
+                {"axis": axis_index, "placement": placement},
+            )
+        )
+        self._parameter_axis_constraints.append((axis_index, placement))
+
+    def _parameter_axis_allowed_indices(self, node) -> set[int] | None:
+        """Strategy indices of ``node`` permitted by every parameter axis rule.
+
+        None when no rule is active, so callers can skip the filter entirely.
+        """
+        if not self._parameter_axis_constraints:
+            return None
+        allowed: set[int] | None = None
+        for axis, placement in self._parameter_axis_constraints:
+            indices = set(self.parameter_axis_constraint_indices(node, axis, placement))
+            allowed = indices if allowed is None else allowed & indices
+        return allowed
+
+    def parameter_axis_constraint_indices(self, node, axis: int, placement):
+        """Strategy indices of ``node`` whose output placement on ``axis`` matches."""
+        indices = [
+            index
+            for index, strategy in enumerate(self.strats[node].strategies)
+            if (placements := first_output_placements(strategy.output_specs))
+            is not None
+            and placements[axis] == placement
+        ]
+        if not indices:
+            raise RuntimeError(
+                f"No strategy for parameter {node.name!r} places mesh axis {axis} "
+                f"as {placement}. Relax the parameter axis constraint, or widen "
+                "the strategy search (for example strategy_radius=0)."
+            )
+        return indices
+
+    def _apply_parameter_axis_constraints(self):
+        """Rebuild the parameter axis constraints in the ILP.
+
+        Called on every solve so that repeated solves neither duplicate nor lose
+        the constraint. The generated names are deliberately not recorded in
+        _node_constraint_names: an axis rule leaves the remaining mesh axes free,
+        so these parameters must stay inside the parameter memory budget.
+        """
+        if self.prob is None:
+            return  # approx-only builds replay this from _constraint_log
+        for name in self._parameter_axis_constraint_names:
+            self.prob.constraints.pop(name, None)
+        self._parameter_axis_constraint_names = []
+        if not self._parameter_axis_constraints:
+            return
+        param_nodes: list[torch.fx.Node] = get_param_nodes(self.graph)
+        for axis, placement in self._parameter_axis_constraints:
+            for node in param_nodes:
+                self._parameter_axis_constraint_names.extend(
+                    self._add_node_constraint(
+                        node,
+                        output_constraint_indices=(
+                            self.parameter_axis_constraint_indices(
+                                node, axis, placement
+                            )
+                        ),
+                        constraint_name="parameter_axis_constraint",
+                    )
+                )
 
     def add_node_constraint(self, node, placement=None, constraint_name=None):
         """USER (Category 5d): Force a specific placement for a node.

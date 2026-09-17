@@ -467,6 +467,7 @@ class ApproximateShardingSolver:
         _parse_constraints on a full build (see tests)."""
         from torch._functorch._aot_autograd.fx_utils import (
             get_param_and_grad_nodes,
+            get_param_nodes,
             get_plain_input_and_grad_nodes,
             get_plain_output_and_tangent_nodes,
         )
@@ -580,10 +581,29 @@ class ApproximateShardingSolver:
             if tnode is not None:
                 add_paired(node, tnode)
 
-        # 4. user node/input/output placement restrictions (== add_node_constraint),
-        #    replayed from _constraint_log.
+        # 4. user node/input/output placement restrictions (== add_node_constraint
+        #    and add_parameter_axis_constraint), replayed from _constraint_log.
         restrict: dict[int, set] = {}
         for fname, kwargs in getattr(opt, "_constraint_log", []):
+            if fname == "add_parameter_axis_constraint":
+                axis = kwargs["axis"]
+                placement = kwargs["placement"]
+                for node in get_param_nodes(opt.graph):
+                    if node not in opt.strats:
+                        continue
+                    out_set = set(
+                        opt.parameter_axis_constraint_indices(node, axis, placement)
+                    )
+                    r = nroot(opt.node_map[node])
+                    merged = restrict.get(r, out_set) & out_set
+                    if not merged:
+                        raise RuntimeError(
+                            "add_parameter_axis_constraint left no feasible "
+                            f"strategy for parameter {node.name!r}; its cluster "
+                            "root is shared with an incompatible constraint"
+                        )
+                    restrict[r] = merged
+                continue
             if fname != "add_node_constraint":
                 continue
             node = next(

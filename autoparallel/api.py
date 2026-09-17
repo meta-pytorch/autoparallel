@@ -54,7 +54,7 @@ from .input_validation import (
     flatten_and_convert_inputs_to_local_shapes,
 )
 from .module_construction import make_parallel_module
-from .optimize_sharding import ShardingOptimizer
+from .optimize_sharding import ShardingOptimizer, resolve_mesh_axis
 from .shardings.placement_options import _get_device_from_mesh
 from .tracing import (
     _add_unused_params_and_buffers,
@@ -388,6 +388,8 @@ class AutoParallel:
                 self.sharding_optimizer.add_sharded_input_constraint(*args)
             elif kind == "output":
                 self.sharding_optimizer.add_sharded_output_constraint(*args)
+            elif kind == "parameter_axis":
+                self.sharding_optimizer.add_parameter_axis_constraint(*args)
             else:
                 raise AssertionError(f"Unknown pending constraint kind: {kind}")
         self._pending_constraints.clear()
@@ -493,6 +495,26 @@ class AutoParallel:
             self._pending_constraints.append(("parameter_memory", (low, high)))
         else:
             self.sharding_optimizer.add_parameter_memory_constraint(low, high)
+
+    def add_parameter_axis_constraint(self, axis, placement):
+        """Require every parameter to use ``placement`` on one mesh axis.
+
+        ``axis`` is a mesh dimension name or index. The remaining mesh axes stay
+        free for the solver, so this expresses layouts such as HSDP: replicate
+        parameters on the replicate axis and let the solver shard the rest.
+
+        With solver="approx" on a mesh of more than two dimensions the sharding
+        optimizer is built lazily, so the constraint is queued until then.
+        """
+        self._assert_entered()
+
+        # Resolve now so an unknown axis fails here rather than at solve time,
+        # when the optimizer may only be built later (approx on a 3D mesh).
+        axis = resolve_mesh_axis(self.mesh, axis)
+        if self.sharding_optimizer is None:
+            self._pending_constraints.append(("parameter_axis", (axis, placement)))
+        else:
+            self.sharding_optimizer.add_parameter_axis_constraint(axis, placement)
 
     def add_input_constraints(self, constraints):
         self._assert_entered()
