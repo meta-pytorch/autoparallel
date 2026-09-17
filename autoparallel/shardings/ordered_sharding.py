@@ -162,10 +162,61 @@ def _spec_with_shard_order(spec: DTensorSpec, shard_order: ShardOrder) -> DTenso
     )
 
 
+def _flattened_specs(
+    curr_spec: DTensorSpec, tgt_spec: DTensorSpec
+) -> Optional[tuple[DTensorSpec, DTensorSpec]]:
+    """Return the 1-D specs this redistribution collapses to, if it does.
+
+    Mirrors the condition of ``_optimize_same_nd_sharding_as_1d`` so that the
+    cost gate prices the same plan the runtime will emit.
+    """
+    curr_spec_first = curr_spec.placements[0]
+    if not all(curr_spec_first == p for p in curr_spec.placements):
+        return None
+    tgt_spec_first = tgt_spec.placements[0]
+    if not all(tgt_spec_first == p for p in tgt_spec.placements):
+        return None
+
+    # TODO: make this more general, I'm playing safe for now
+    allowed_placements = [(Shard(0), Replicate()), (Partial(), Shard(0))]
+    if (curr_spec_first, tgt_spec_first) not in allowed_placements:
+        return None
+
+    mesh = curr_spec.device_mesh
+    # TODO: remove ndim == 1 special case once
+    # DeviceMesh._flatten is fixed
+    if mesh.ndim != 1:
+        flat_mesh = mesh._flatten()
+    else:
+        flat_mesh = mesh
+    return (
+        DTensorSpec(flat_mesh, (curr_spec_first,), tensor_meta=curr_spec.tensor_meta),
+        DTensorSpec(flat_mesh, (tgt_spec_first,), tensor_meta=tgt_spec.tensor_meta),
+    )
+
+
 def _fallback_plan(source: DTensorSpec, target: DTensorSpec) -> Optional[_FallbackPlan]:
     """Propagate one redistribution through DTensor and price its actual steps."""
     if source.mesh != target.mesh or source.tensor_meta is None:
         return None
+    if DTensorSpec.is_default_device_order(
+        source.shard_order
+    ) and DTensorSpec.is_default_device_order(target.shard_order):
+        flattened = _flattened_specs(source, target)
+        if flattened is not None:
+            flat_source, flat_target = flattened
+            cost = float(redistribute_cost(flat_source, flat_target, [0]))
+            if not math.isfinite(cost):
+                return None
+            kind = (
+                "all_gather"
+                if isinstance(flat_source.placements[0], Shard)
+                else "reduce_scatter"
+            )
+            return _FallbackPlan(
+                ((kind, tuple(range(len(source.placements)))),),
+                cost,
+            )
     try:
         transforms = _optimize_transform_infos(
             _gen_transform_infos_non_cached(
@@ -220,31 +271,10 @@ def _optimize_same_nd_sharding_as_1d(
     current placement is S(0)S(0) and the target placement is RR, this
     function will perform a single collective, instead of two collectives.
     """
-    curr_spec_first = curr_spec.placements[0]
-    if not all(curr_spec_first == p for p in curr_spec.placements):
+    flattened = _flattened_specs(curr_spec, tgt_spec)
+    if flattened is None:
         return redistribute_local_tensor(arg, curr_spec, tgt_spec)
-    tgt_spec_first = tgt_spec.placements[0]
-    if not all(tgt_spec_first == p for p in tgt_spec.placements):
-        return redistribute_local_tensor(arg, curr_spec, tgt_spec)
-
-    # TODO: make this more general, I'm playing safe for now
-    allowed_placements = [(Shard(0), Replicate()), (Partial(), Shard(0))]
-    if (curr_spec_first, tgt_spec_first) not in allowed_placements:
-        return redistribute_local_tensor(arg, curr_spec, tgt_spec)
-
-    mesh = curr_spec.device_mesh
-    # TODO: remove ndim == 1 special case once
-    # DeviceMesh._flatten is fixed
-    if mesh.ndim != 1:
-        flat_mesh = mesh._flatten()
-    else:
-        flat_mesh = mesh
-    flat_curr_spec = DTensorSpec(
-        flat_mesh, (curr_spec_first,), tensor_meta=curr_spec.tensor_meta
-    )
-    flat_tgt_spec = DTensorSpec(
-        flat_mesh, (tgt_spec_first,), tensor_meta=tgt_spec.tensor_meta
-    )
+    flat_curr_spec, flat_tgt_spec = flattened
     return redistribute_local_tensor(arg, flat_curr_spec, flat_tgt_spec)
 
 
@@ -376,7 +406,13 @@ def _get_chain_redistributions(
 def _linear_chains_are_unambiguous(
     param_chain: list[torch.fx.Node], grad_chain: list[torch.fx.Node]
 ) -> bool:
-    if not param_chain or not grad_chain or len(param_chain[-1].users) != 1:
+    """Check that every node carrying the reordered layout has a single user.
+
+    Only the nodes before the last one can hold the non-default storage order:
+    the gate below requires the first redistribution to end in default order, so
+    the last chain node always produces a default-ordered value and may fan out.
+    """
+    if not param_chain or not grad_chain:
         return False
     for current, next_node in zip(param_chain, param_chain[1:]):
         if len(current.users) != 1 or next(iter(current.users)) is not next_node:
@@ -526,16 +562,17 @@ def _multi_boundary_adjoint_improves_fallback(
     backward_order = _logical_collective_order(
         backward, reordered_mesh_dims, backward=True
     )
+    # The gradient may arrive already sharded on some of the axes the forward
+    # gathered, so it only has to restore a subset of them.
     if (
         not forward_order
-        or backward_order is None
-        or len(backward_order) != len(forward_order)
-        or set(backward_order) != set(forward_order)
+        or not backward_order
+        or not set(backward_order).issubset(forward_order)
     ):
         return False
 
     expected_grad_source = tuple(
-        Partial() if mesh_dim in forward_order else placement
+        Partial() if mesh_dim in backward_order else placement
         for mesh_dim, placement in enumerate(storage.placements)
     )
     if last_source.placements != expected_grad_source:
@@ -578,9 +615,17 @@ def _multi_boundary_adjoint_improves_fallback(
     )
     if planned_forward_order != forward_order:
         return False
-    if _planned_collective_order(
-        candidate_backward_plans, reordered_mesh_dims, "reduce_scatter"
-    ) != tuple(reversed(planned_forward_order)):
+    expected_backward_order = tuple(
+        mesh_dim
+        for mesh_dim in reversed(planned_forward_order)
+        if mesh_dim in backward_order
+    )
+    if (
+        _planned_collective_order(
+            candidate_backward_plans, reordered_mesh_dims, "reduce_scatter"
+        )
+        != expected_backward_order
+    ):
         return False
 
     try:
@@ -764,6 +809,18 @@ def compute_optimal_placement_order_for_parameters(
         preferred_shard_order = _infer_fsdplike_storage_order(
             param_curr_plc, param_tgt_plc
         )
+        if preferred_shard_order is None:
+            # A forward that releases every shard leaves the storage order
+            # unconstrained, so derive it from the gradient boundary instead:
+            # the axes the gradient keeps sharded must stay outside the ones it
+            # restores from Partial.
+            preferred_shard_order = _infer_fsdplike_storage_order(
+                grad_tgt_plc,
+                tuple(
+                    Replicate() if isinstance(placement, Partial) else placement
+                    for placement in grad_curr_plc
+                ),
+            )
         if preferred_shard_order is None:
             continue
 
