@@ -89,6 +89,13 @@ def _campaign_command(args: argparse.Namespace, action: str) -> list[str]:
             str(args.python),
         )
     )
+    if args.baseline_autoparallel_root is not None:
+        command.extend(
+            (
+                "--baseline-autoparallel-root",
+                str(args.baseline_autoparallel_root),
+            )
+        )
     for asset in args.asset_root:
         command.extend(("--asset-root", asset))
     return command
@@ -106,6 +113,11 @@ def prepare(args: argparse.Namespace) -> None:
         (args.autoparallel_root, "--autoparallel-root"),
     ):
         _absolute(path, name)
+    if args.baseline_autoparallel_root is not None:
+        _absolute(
+            args.baseline_autoparallel_root,
+            "--baseline-autoparallel-root",
+        )
 
     command = _campaign_command(args, "package") + ["--attempt", str(attempt)]
     completed = subprocess.run(
@@ -1015,6 +1027,7 @@ def build_parser() -> argparse.ArgumentParser:
     prepare_parser.add_argument("--attempt", type=Path, required=True)
     prepare_parser.add_argument("--torchtitan-root", type=Path, required=True)
     prepare_parser.add_argument("--autoparallel-root", type=Path, required=True)
+    prepare_parser.add_argument("--baseline-autoparallel-root", type=Path)
     prepare_parser.add_argument("--asset-root", action="append", default=[])
     prepare_parser.add_argument("--python", type=Path, default=Path(sys.executable))
     prepare_parser.set_defaults(func=prepare)
