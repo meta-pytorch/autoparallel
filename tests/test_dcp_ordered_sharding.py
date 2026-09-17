@@ -93,6 +93,31 @@ class TestStridedShardFromReversedOrder:
             isinstance(p, Shard) and not isinstance(p, _StridedShard) for p in result
         )
 
+    def test_mixed_dimension_order_produces_expected_storage(self):
+        mesh = DeviceMesh(
+            "cuda",
+            torch.arange(16).reshape(2, 2, 4),
+            mesh_dim_names=("dp", "cp", "tp"),
+        )
+        preferred = (
+            ShardOrderEntry(tensor_dim=0, mesh_dims=(1, 0)),
+            ShardOrderEntry(tensor_dim=1, mesh_dims=(2,)),
+        )
+
+        physical = DTensorSpec._convert_shard_order_to_StridedShard(
+            preferred,
+            (Shard(0), Shard(0), Shard(1)),
+            mesh,
+        )
+
+        assert physical == (
+            _StridedShard(0, split_factor=2),
+            Shard(0),
+            Shard(1),
+        )
+        _, decoded = DTensorSpec._normalize_placements_into_shard_order(physical, mesh)
+        assert decoded == preferred
+
 
 # ---------------------------------------------------------------------------
 # Tests: chunk offset computation for DCP
@@ -230,6 +255,24 @@ class TestChunkOffsetsForDCP:
                 all_indices.add(int(val))
 
         assert all_indices == set(range(64))
+
+    def test_mixed_dimension_offsets_match_physical_layout(self):
+        mesh_shape = (2, 2, 4)
+        global_shape = (16, 16)
+        placements = (_StridedShard(0, split_factor=2), Shard(0), Shard(1))
+        global_tensor = torch.arange(16 * 16, dtype=torch.float).reshape(global_shape)
+        shards = _shard_tensor(global_tensor, mesh_shape, placements)
+
+        for rank in range(math.prod(mesh_shape)):
+            coord = list(_mesh_coords(rank, mesh_shape))
+            local_shape, offset = _compute_local_shape_and_global_offset(
+                global_shape, mesh_shape, coord, placements
+            )
+            local = shards[rank]
+            first_linear_index = offset[0] * global_shape[1] + offset[1]
+
+            assert tuple(local.shape) == local_shape
+            assert int(local.flatten()[0].item()) == first_linear_index
 
 
 # ---------------------------------------------------------------------------

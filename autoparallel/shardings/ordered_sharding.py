@@ -33,11 +33,31 @@ class OrderInfo:
     preferred_shard_order: ShardOrder
 
 
-def _infer_fsdplike_storage_order(
+def _can_optimize_same_nd_sharding_as_1d(
+    source: tuple[Placement, ...],
+    target: tuple[Placement, ...],
+) -> bool:
+    if not source or len(source) != len(target):
+        return False
+
+    src = source[0]
+    dst = target[0]
+    if not all(src == placement for placement in source):
+        return False
+    if not all(dst == placement for placement in target):
+        return False
+
+    return (src, dst) in {
+        (Shard(0), Replicate()),
+        (Partial(), Shard(0)),
+    }
+
+
+def _infer_pure_release_storage_order(
     source: tuple[Placement, ...],
     target: tuple[Placement, ...],
 ) -> Optional[ShardOrder]:
-    """Infer an order that keeps retained shards outside released shards."""
+    """Infer storage order for a redistribution that only releases shards."""
     if len(source) != len(target):
         return None
 
@@ -56,7 +76,7 @@ def _infer_fsdplike_storage_order(
         else:
             return None
 
-    if not released or any(not retained[tensor_dim] for tensor_dim in released):
+    if not released or _can_optimize_same_nd_sharding_as_1d(source, target):
         return None
 
     preferred_order = tuple(
@@ -74,7 +94,7 @@ def _infer_fsdplike_storage_order(
     return preferred_order if preferred_order != default_order else None
 
 
-def _matches_inverse_gradient_pattern(
+def _matches_adjoint_gradient_pattern(
     param_source: tuple[Placement, ...],
     param_target: tuple[Placement, ...],
     grad_source: tuple[Placement, ...],
@@ -95,6 +115,61 @@ def _matches_inverse_gradient_pattern(
     return grad_source == expected_grad_source
 
 
+def _infer_adjoint_storage_order(
+    param_source: tuple[Placement, ...],
+    first_param_target: tuple[Placement, ...],
+    grad_source: tuple[Placement, ...],
+    grad_target: tuple[Placement, ...],
+) -> Optional[ShardOrder]:
+    """Infer storage order from the adjoint of the complete parameter chain.
+
+    The first forward redistribution can release only a prefix of the shards
+    released by the complete chain.  The corresponding gradient boundary
+    exposes the complete release set in the parameter's storage orientation.
+    """
+    if not (
+        len(param_source)
+        == len(first_param_target)
+        == len(grad_source)
+        == len(grad_target)
+    ):
+        return None
+    if grad_target != param_source:
+        return None
+
+    composite_target: list[Placement] = []
+    for stored, grad in zip(param_source, grad_source):
+        if isinstance(stored, Shard) and grad == Partial():
+            composite_target.append(Replicate())
+        elif grad == stored:
+            composite_target.append(stored)
+        else:
+            return None
+
+    composite_target_tuple = tuple(composite_target)
+    if not _matches_adjoint_gradient_pattern(
+        param_source,
+        composite_target_tuple,
+        grad_source,
+        grad_target,
+    ):
+        return None
+    for stored, first, composite in zip(
+        param_source, first_param_target, composite_target_tuple
+    ):
+        if first == stored:
+            continue
+        if (
+            isinstance(stored, Shard)
+            and isinstance(first, Replicate)
+            and isinstance(composite, Replicate)
+        ):
+            continue
+        return None
+
+    return _infer_pure_release_storage_order(param_source, composite_target_tuple)
+
+
 def _optimize_same_nd_sharding_as_1d(
     arg: torch.Tensor, curr_spec: DTensorSpec, tgt_spec: DTensorSpec
 ) -> torch.Tensor:
@@ -104,17 +179,13 @@ def _optimize_same_nd_sharding_as_1d(
     current placement is S(0)S(0) and the target placement is RR, this
     function will perform a single collective, instead of two collectives.
     """
-    curr_spec_first = curr_spec.placements[0]
-    if not all(curr_spec_first == p for p in curr_spec.placements):
-        return redistribute_local_tensor(arg, curr_spec, tgt_spec)
-    tgt_spec_first = tgt_spec.placements[0]
-    if not all(tgt_spec_first == p for p in tgt_spec.placements):
+    if not _can_optimize_same_nd_sharding_as_1d(
+        curr_spec.placements, tgt_spec.placements
+    ):
         return redistribute_local_tensor(arg, curr_spec, tgt_spec)
 
-    # TODO: make this more general, I'm playing safe for now
-    allowed_placements = [(Shard(0), Replicate()), (Partial(), Shard(0))]
-    if (curr_spec_first, tgt_spec_first) not in allowed_placements:
-        return redistribute_local_tensor(arg, curr_spec, tgt_spec)
+    curr_spec_first = curr_spec.placements[0]
+    tgt_spec_first = tgt_spec.placements[0]
 
     mesh = curr_spec.device_mesh
     # TODO: remove ndim == 1 special case once
@@ -377,19 +448,23 @@ def compute_optimal_placement_order_for_parameters(
         (param_curr_plc, param_tgt_plc),
         (grad_curr_plc, grad_tgt_plc),
     ) in matched_param_grad_pairs:
-        # Skip if param source placement doesn't match grad target placement
-        if param_curr_plc != grad_tgt_plc:
+        param_storage_spec = sharding_placement[param_node].output_specs
+        if not isinstance(param_storage_spec, DTensorSpec):
+            continue
+        param_storage_plc = param_storage_spec.placements
+        # The preferred order describes the physical parameter storage.  Fail
+        # closed if a view changed tensor dimensions before the first forward
+        # redistribution; that requires explicit order remapping support.
+        if param_curr_plc != param_storage_plc:
             continue
 
-        preferred_shard_order = _infer_fsdplike_storage_order(
-            param_curr_plc, param_tgt_plc
-        )
-        if preferred_shard_order is None or not _matches_inverse_gradient_pattern(
-            param_curr_plc,
+        preferred_shard_order = _infer_adjoint_storage_order(
+            param_storage_plc,
             param_tgt_plc,
             grad_curr_plc,
             grad_tgt_plc,
-        ):
+        )
+        if preferred_shard_order is None:
             continue
 
         # Get the user nodes where redistribution occurs

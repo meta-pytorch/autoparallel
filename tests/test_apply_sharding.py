@@ -249,6 +249,99 @@ class TestOrderedRedistributeFusion:
         counts = _count_collectives(gm)
         assert counts == {"all_gather": 2, "reduce_scatter": 0, "alltoall": 0}
 
+    def test_3d_mixed_dimension_weight_chain_has_no_alltoall(self):
+        mesh = DeviceMesh(
+            "cuda",
+            torch.arange(16).reshape(2, 2, 4),
+            mesh_dim_names=("dp", "cp", "tp"),
+        )
+        preferred = (
+            ShardOrderEntry(tensor_dim=0, mesh_dims=(1, 0)),
+            ShardOrderEntry(tensor_dim=1, mesh_dims=(2,)),
+        )
+
+        for shape, final_placements, expected_stage2_gathers in (
+            (
+                (4096, 4096),
+                (Replicate(), Replicate(), Replicate()),
+                2,
+            ),
+            (
+                (4096, 14336),
+                (Replicate(), Replicate(), Shard(0)),
+                1,
+            ),
+        ):
+            source, first_target, local = self._make_specs(
+                mesh,
+                (Shard(0), Shard(0), Shard(1)),
+                (Replicate(), Shard(0), Shard(1)),
+                shape=shape,
+            )
+            source.shard_order = preferred
+
+            first_graph = make_fx(
+                lambda x: ordered_redistribute_local_tensor(x, source, first_target),
+                tracing_mode="real",
+            )(local)
+            assert _count_collectives(first_graph) == {
+                "all_gather": 1,
+                "reduce_scatter": 0,
+                "alltoall": 0,
+            }
+
+            transposed_shape = tuple(reversed(shape))
+            transposed_source, final_target, transposed_local = self._make_specs(
+                mesh,
+                (Replicate(), Shard(1), Shard(0)),
+                final_placements,
+                shape=transposed_shape,
+            )
+            second_graph = make_fx(
+                lambda x: ordered_redistribute_local_tensor(
+                    x, transposed_source, final_target
+                ),
+                tracing_mode="real",
+            )(transposed_local)
+            assert _count_collectives(second_graph) == {
+                "all_gather": expected_stage2_gathers,
+                "reduce_scatter": 0,
+                "alltoall": 0,
+            }
+
+    def test_3d_mixed_dimension_weight_gradient_has_no_alltoall(self):
+        mesh = DeviceMesh(
+            "cuda",
+            torch.arange(16).reshape(2, 2, 4),
+            mesh_dim_names=("dp", "cp", "tp"),
+        )
+        preferred = (
+            ShardOrderEntry(tensor_dim=0, mesh_dims=(1, 0)),
+            ShardOrderEntry(tensor_dim=1, mesh_dims=(2,)),
+        )
+
+        for shape, grad_placements, expected_reduce_scatters in (
+            ((4096, 4096), (Partial(), Partial(), Partial()), 3),
+            ((4096, 14336), (Partial(), Partial(), Shard(1)), 2),
+        ):
+            source, target, local = self._make_specs(
+                mesh,
+                grad_placements,
+                (Shard(0), Shard(0), Shard(1)),
+                shape=shape,
+            )
+            target.shard_order = preferred
+
+            graph = make_fx(
+                lambda x: ordered_redistribute_local_tensor(x, source, target),
+                tracing_mode="real",
+            )(local)
+            assert _count_collectives(graph) == {
+                "all_gather": 0,
+                "reduce_scatter": expected_reduce_scatters,
+                "alltoall": 0,
+            }
+
 
 class TestShardOrderSpecIsolation:
     """Test that shard_order modifications don't leak between shared DTensorSpec
@@ -359,3 +452,42 @@ def test_build_physical_placements_3d_uses_strided_shards():
         physical.mesh,
     )
     assert decoded_order == (ShardOrderEntry(tensor_dim=0, mesh_dims=(2, 1, 0)),)
+
+
+def test_build_physical_placements_3d_mixed_tensor_dims():
+    mesh = DeviceMesh(
+        "cuda",
+        torch.arange(16).reshape(2, 2, 4),
+        mesh_dim_names=("dp", "cp", "tp"),
+    )
+    tm = _make_tensor_meta([4096, 14336])
+    storage = DTensorSpec(
+        mesh,
+        (Shard(0), Shard(0), Shard(1)),
+        tensor_meta=tm,
+    )
+    graph = torch.fx.Graph()
+    param = graph.placeholder("param")
+    sharding_placement = {param: OpSpec(output_specs=storage, input_specs=[storage])}
+    preferred = (
+        ShardOrderEntry(tensor_dim=0, mesh_dims=(1, 0)),
+        ShardOrderEntry(tensor_dim=1, mesh_dims=(2,)),
+    )
+
+    physical = _build_physical_placements(
+        sharding_placement,
+        {param: OrderInfo(preferred_shard_order=preferred)},
+    )[param]
+
+    from torch.distributed.tensor.placement_types import _StridedShard
+
+    assert physical.placements == (
+        _StridedShard(0, split_factor=2),
+        Shard(0),
+        Shard(1),
+    )
+    _, decoded_order = DTensorSpec._normalize_placements_into_shard_order(
+        physical.placements,
+        physical.mesh,
+    )
+    assert decoded_order == preferred
