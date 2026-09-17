@@ -3,7 +3,7 @@ harness_version = "weight-shard-order-no-scheduling-ab-v1"
 
 [sources.torchtitan]
 remote = "https://github.com/AlbedoWang/torchtitan.git"
-commit = "48371513d207d4a076f9d1d26ac05c6e5a795610"
+commit = "eb3f8521137b9a63ac72e321e5a275015160b37a"
 dirty_policy = "forbid"
 
 [sources.autoparallel]
