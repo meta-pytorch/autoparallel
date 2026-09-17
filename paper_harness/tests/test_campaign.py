@@ -23,7 +23,7 @@ class CampaignTests(unittest.TestCase):
                 "llama3_8b_2d.toml",
                 "llama3_8b_3d.toml",
                 "llama3_8b_3d_weight_shard_order_ab.toml",
-                "llama3_8b_3d_weight_shard_order_full_sac_ab.toml",
+                "llama3_8b_3d_weight_shard_order_no_overlap_ab.toml",
                 "llama3_8b_planner.toml",
                 "llama3_8b_replanning_approx.toml",
                 "muse_glimmer_30b.toml",
