@@ -1,6 +1,6 @@
 schema_version = 1
-name = "llama3-8b-3d-weight-shard-order-no-overlap-ab-2x2x4"
-description = "Correctness ablation for baseline versus ordered weight shards with AP overlap scheduling disabled"
+name = "llama3-8b-3d-weight-shard-order-full-sac-ab-2x2x4"
+description = "Correctness ablation for baseline versus ordered weight shards under full recompute"
 workload = "llama3_8b_3d"
 
 [model]
@@ -79,6 +79,7 @@ module = "workloads.llama3_3d.config_registry"
 config = "graph_autoparallel"
 [arms.overrides]
 "compile.autoparallel_solver" = "approx"
+"compile.memory_policy" = "full"
 [arms.environment]
 BENCHMARK_ARM = "apgt_baseline"
 BENCHMARK_AP_SOURCE_VARIANT = "baseline"
@@ -90,6 +91,7 @@ module = "workloads.llama3_3d.config_registry"
 config = "graph_autoparallel"
 [arms.overrides]
 "compile.autoparallel_solver" = "approx"
+"compile.memory_policy" = "full"
 [arms.environment]
 BENCHMARK_ARM = "apgt_fixed"
 BENCHMARK_AP_SOURCE_VARIANT = "candidate"

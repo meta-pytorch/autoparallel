@@ -1,9 +1,9 @@
 schema_version = 1
-harness_version = "weight-shard-order-no-overlap-ab-v1"
+harness_version = "weight-shard-order-full-sac-ab-v1"
 
 [sources.torchtitan]
 remote = "https://github.com/AlbedoWang/torchtitan.git"
-commit = "ba7c003dc0deefbca576f2de9e90b42c8481f0a3"
+commit = "26c329bd14df4238bb65e661286231d42d15935e"
 dirty_policy = "forbid"
 
 [sources.autoparallel]
