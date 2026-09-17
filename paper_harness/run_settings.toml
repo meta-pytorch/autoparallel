@@ -50,11 +50,6 @@ point = "8x2x4"
 
 [[settings]]
 model = "llama3_8b"
-setting = "3d-long-2x2x4-full-sac-ab"
-campaign = "campaigns/llama3_8b_3d_weight_shard_order_full_sac_ab.toml"
-
-[[settings]]
-model = "llama3_8b"
 setting = "replanning-seq2k-lb2"
 campaign = "campaigns/llama3_8b_replanning_approx.toml"
 point = "seq2k-lb2"
