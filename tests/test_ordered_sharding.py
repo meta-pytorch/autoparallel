@@ -945,8 +945,11 @@ def _build_weight_chain_graph(extra_cast_user: bool = False):
     """Rebuild the parameter/gradient chain AutoParallel produces for a linear weight.
 
     The node sequence and the fan-out mirror the LLaMA3 joint graph: ``_add_alias``
-    leaves an ``aten.alias`` node that both the forward einsum and the backward
-    permute consume, so the last node of the parameter chain has two users.
+    leaves an ``aten.alias`` node that both the forward matmul and the backward
+    permute consume.  The backward consumer is built first so that
+    ``build_param_grad_linear_chains`` walks through the alias into it, which is
+    what it does on a real AutoParallel graph — the two-user node lands in the
+    middle of the chain, not at its end.
     """
     graph = torch.fx.Graph()
     param = graph.placeholder("param")
@@ -954,8 +957,8 @@ def _build_weight_chain_graph(extra_cast_user: bool = False):
     dtype_cast_fwd = graph.call_function(torch.ops.aten.clone.default, (param,))
     permute_fwd = graph.call_function(torch.ops.aten.t.default, (dtype_cast_fwd,))
     alias_fwd = graph.call_function(torch.ops.aten.alias.default, (permute_fwd,))
-    mm_fwd = graph.call_function(torch.ops.aten.mm.default, (x, alias_fwd))
     reuse_bwd = graph.call_function(torch.ops.aten.t.default, (alias_fwd,))
+    mm_fwd = graph.call_function(torch.ops.aten.mm.default, (x, alias_fwd))
 
     grad_out = graph.placeholder("grad_out")
     mm_bwd = graph.call_function(torch.ops.aten.mm.default, (x, grad_out))
@@ -998,8 +1001,8 @@ def _weight_chain_placement(
         n["dtype_cast_fwd"]: OpSpec(output_specs=storage, input_specs=[storage]),
         n["permute_fwd"]: OpSpec(output_specs=transposed, input_specs=[first_target]),
         n["alias_fwd"]: OpSpec(output_specs=final, input_specs=[final]),
-        n["mm_fwd"]: OpSpec(output_specs=final, input_specs=[final, final]),
         n["reuse_bwd"]: OpSpec(output_specs=final, input_specs=[final]),
+        n["mm_fwd"]: OpSpec(output_specs=final, input_specs=[final, final]),
         n["grad_out"]: OpSpec(output_specs=final),
         n["mm_bwd"]: OpSpec(output_specs=grad_source, input_specs=[final, final]),
         n["permute_bwd"]: OpSpec(output_specs=grad_source, input_specs=[grad_source]),

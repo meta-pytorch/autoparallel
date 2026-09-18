@@ -403,24 +403,31 @@ def _get_chain_redistributions(
     return result
 
 
-def _linear_chains_are_unambiguous(
-    param_chain: list[torch.fx.Node], grad_chain: list[torch.fx.Node]
-) -> bool:
-    """Check that every node carrying the reordered layout has a single user.
+def _unambiguous_param_prefix(chain: list[torch.fx.Node]) -> list[torch.fx.Node]:
+    """Return the part of a parameter chain the storage order can reach.
 
-    Only the nodes before the last one can hold the non-default storage order:
-    the gate below requires the first redistribution to end in default order, so
-    the last chain node always produces a default-ordered value and may fan out.
+    ``_add_alias`` leaves a node with two users — the forward consumer and the
+    backward one — in the middle of every weight chain, and
+    ``build_param_grad_linear_chains`` walks straight past it.  Everything after
+    that node reads a value the gate has already required to be back in default
+    order, so only the prefix ending at it can carry the reordered layout.
     """
-    if not param_chain or not grad_chain:
-        return False
-    for current, next_node in zip(param_chain, param_chain[1:]):
+    prefix = chain[:1]
+    for current, next_node in zip(chain, chain[1:]):
         if len(current.users) != 1 or next(iter(current.users)) is not next_node:
-            return False
-    for current, next_node in zip(grad_chain, grad_chain[1:]):
+            break
+        prefix = prefix + [next_node]
+    return prefix
+
+
+def _unambiguous_grad_prefix(chain: list[torch.fx.Node]) -> list[torch.fx.Node]:
+    """Same, for a gradient chain, which runs from the gradient to its producer."""
+    prefix = chain[:1]
+    for current, next_node in zip(chain, chain[1:]):
         if current.all_input_nodes != [next_node] or len(next_node.users) != 1:
-            return False
-    return True
+            break
+        prefix = prefix + [next_node]
+    return prefix
 
 
 def _reordered_mesh_dims(
@@ -532,10 +539,12 @@ def _multi_boundary_adjoint_improves_fallback(
     preferred_order: ShardOrder,
 ) -> bool:
     """Gate PR #529's multi-boundary extension on the concrete fallback plans."""
-    if not _linear_chains_are_unambiguous(param_chain, grad_chain):
+    param_prefix = _unambiguous_param_prefix(param_chain)
+    grad_prefix = _unambiguous_grad_prefix(grad_chain)
+    if not param_prefix or not grad_prefix:
         return False
-    forward = _get_chain_redistributions(param_chain, sharding_placement)
-    backward_from_storage = _get_chain_redistributions(grad_chain, sharding_placement)
+    forward = _get_chain_redistributions(param_prefix, sharding_placement)
+    backward_from_storage = _get_chain_redistributions(grad_prefix, sharding_placement)
     if not forward or not backward_from_storage:
         return False
     backward = list(reversed(backward_from_storage))
