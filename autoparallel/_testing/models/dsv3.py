@@ -1103,13 +1103,13 @@ class ScaledDotProductAttention(torch.nn.Module):
         if cls.backends:
             return
 
-        # Add CuDNN on B200 w/ highest priority
+        # Match TorchTitan's H100+ SDPA preference for cuDNN attention.
         cls.backends = [
             SDPBackend.FLASH_ATTENTION,
             SDPBackend.EFFICIENT_ATTENTION,
             SDPBackend.MATH,
         ]
-        if has_cuda_capability(10, 0):
+        if has_cuda_capability(9, 0):
             cls.backends.insert(0, SDPBackend.CUDNN_ATTENTION)
 
     def forward(
