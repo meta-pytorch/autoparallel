@@ -429,13 +429,9 @@ class TokenChoiceTopKRouter(nn.Module):
                     Number of tokens assigned to each expert with shape ``(num_experts,)``.
         """
         # scores shape (bs*slen, num_experts)
-        # scores = self.gate(x)
-        scores = _linear_compute(
-            x,
-            gate_weight,
-            None,
-            x.dtype if torch.is_floating_point(x) else None,
-        )
+        # Compute the gate in float32 to help stability of expert load
+        # balancing, matching TorchTitan's autocast around self.gate(x).
+        scores = _linear_compute(x, gate_weight, None, torch.float32)
 
         # By default, sigmoid or softmax is performed in float32 to avoid loss explosion
         if self.score_func == "sigmoid":
@@ -450,15 +446,15 @@ class TokenChoiceTopKRouter(nn.Module):
         #       top_scores is still derived from the original scores.
         if expert_bias is not None:
             _, selected_experts_indices = torch.topk(
-                scores + expert_bias, k=self.top_k, dim=-1
+                scores + expert_bias, k=self.top_k, dim=-1, sorted=False
             )
             top_scores = scores.gather(dim=-1, index=selected_experts_indices)
         else:
             top_scores, selected_experts_indices = torch.topk(
-                scores, k=self.top_k, dim=-1
+                scores, k=self.top_k, dim=-1, sorted=False
             )
 
-        if self.score_func == "sigmoid" and self.route_norm:
+        if self.route_norm:
             denominator = top_scores.sum(dim=-1, keepdim=True) + 1e-20
             top_scores = top_scores / denominator
         top_scores = top_scores * self.route_scale
@@ -1037,7 +1033,13 @@ class MoE(nn.Module):
         Returns:
             out (torch.Tensor): Output tensor with shape ``(bs, slen, dim)``.
         """
-        experts_w1, experts_w2, experts_w3 = self.experts.parameters()
+        # Attribute access, not parameters(): apply_dtype_cast installs the
+        # mixed-precision cast as a class-level property, which parameters()
+        # bypasses. Without the cast here the weights cross the local_map
+        # boundary in FP32, since the .bfloat16() in _run_experts_grouped_mm is
+        # inside the region and cannot be hoisted above the redistribution.
+        experts = self.experts
+        experts_w1, experts_w2, experts_w3 = experts.w1, experts.w2, experts.w3
         shared_w1, shared_w2, shared_w3 = self.shared_experts.parameters()
         out, num_tokens_per_expert = _moe_forward(
             x,
@@ -1319,6 +1321,15 @@ def _get_rope_config(config):
     return first_attention.rope
 
 
+def _rope_uses_yarn(rope) -> bool:
+    """Whether YaRN frequency scaling and its softmax mscale apply.
+
+    Matches TorchTitan's predicate. ``RoPEConfig`` has no ``scaling`` field and
+    is always YaRN, so it defaults accordingly.
+    """
+    return getattr(rope, "scaling", "yarn") == "yarn" and rope.rope_factor > 1.0
+
+
 def make_dsv3_config(
     dim: int = 256,
     vocab_size: int = 2048,
@@ -1486,12 +1497,15 @@ def precompute_freqs_cis(config) -> torch.Tensor:
     freqs = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
 
     # YaRN scaling for extended context. YaRN is used to extend the context length after pre-training.
-    if seqlen > rope.original_seq_len:
+    # Gate on the scaling mode, not on max_seq_len: TorchTitan rewrites
+    # rope.max_seq_len to training.seq_len, which makes a length comparison
+    # against original_seq_len silently disable YaRN.
+    if _rope_uses_yarn(rope):
         low, high = find_correction_range(
             beta_fast, beta_slow, dim, base, rope.original_seq_len
         )
-        smooth = 1 - linear_ramp_factor(low, high, dim // 2)
-        freqs = freqs / factor * (1 - smooth) + freqs * smooth
+        ramp = linear_ramp_factor(low, high, dim // 2)
+        freqs = freqs / factor * ramp + freqs * (1 - ramp)
 
     # Create position indices
     t = torch.arange(seqlen)
@@ -1576,7 +1590,7 @@ class Attention(nn.Module):
         self.softmax_scale = self.qk_head_dim**-0.5
 
         rope_cfg = _get_rope_config(model_config)
-        if rope_cfg.max_seq_len > rope_cfg.original_seq_len:
+        if _rope_uses_yarn(rope_cfg):
             mscale = 0.1 * attn_config.mscale * math.log(rope_cfg.rope_factor) + 1.0
             self.softmax_scale = self.softmax_scale * mscale * mscale
 
@@ -1943,21 +1957,27 @@ class DeepSeekV3Model(nn.Module):
 
         for layer in self.layers.values():
             h = layer(h, freqs_cis, attention_masks, document_ids)
-        h = (
-            _rms_norm_compute(h, self.norm, self.compute_dtype)
-            if self.norm is not None
-            else h
-        )
-        output = (
-            _linear_compute(
-                h,
-                self.lm_head.weight,
-                self.lm_head.bias,
-                self.compute_dtype,
+        # These call sites use the functional helpers instead of the submodule
+        # forward, so _annotate_module_fqns never tags them. graph_trainer's
+        # selective-activation-remat bounds its remat regions on the "lm_head"
+        # FQN, so annotate explicitly to match the native TorchTitan path.
+        with fx_traceback.annotate({_MODULE_FQN: "norm"}):
+            h = (
+                _rms_norm_compute(h, self.norm, self.compute_dtype)
+                if self.norm is not None
+                else h
             )
-            if self.lm_head is not None
-            else h
-        )
+        with fx_traceback.annotate({_MODULE_FQN: "lm_head"}):
+            output = (
+                _linear_compute(
+                    h,
+                    self.lm_head.weight,
+                    self.lm_head.bias,
+                    self.compute_dtype,
+                )
+                if self.lm_head is not None
+                else h
+            )
         return output
 
     def get_attention_masks(self, positions: torch.Tensor) -> BlockMask | None:
