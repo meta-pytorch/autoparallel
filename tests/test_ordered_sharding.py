@@ -20,6 +20,7 @@ from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
 
 from autoparallel.api import AutoParallel
 from autoparallel.shardings.ordered_sharding import (
+    _consumer_boundary_for_input,
     _infer_fsdplike_storage_order,
     _matches_inverse_gradient_pattern,
     build_param_grad_linear_chains,
@@ -1108,3 +1109,47 @@ def test_compute_optimal_placement_order_full_release_uses_gradient_boundary(
     expected = (ShardOrderEntry(tensor_dim=0, mesh_dims=(2, 1, 0)),)
     for key in ("param", "dtype_cast_fwd", "permute_fwd", "grad_alias"):
         assert placement_order[nodes[key]].preferred_shard_order == expected, key
+
+
+def test_consumer_boundary_ignores_arguments_without_a_sharding_entry():
+    """``input_specs`` is indexed over the arguments that carry a sharding entry.
+
+    A ``local_map`` HOP also takes its body as a ``get_attr`` argument, which has
+    no entry. Counting it shifts every later argument by one, which is how the
+    DeepSeek expert ``w2`` -- the third weight passed to the region -- came back
+    as "no boundary" while ``w1``/``w3`` only looked right because their
+    neighbours happened to carry the same placement.
+    """
+    mesh = torch.distributed.device_mesh.DeviceMesh(
+        "cuda", torch.arange(16).reshape(2, 8), mesh_dim_names=("dp", "tp")
+    )
+    tm = TensorMeta(
+        torch.Size([64, 2048, 1408]),
+        torch.empty([64, 2048, 1408], device="meta").stride(),
+        torch.bfloat16,
+    )
+    storage = DTensorSpec(mesh, (Shard(0), Shard(0)), tensor_meta=tm)
+    region = DTensorSpec(mesh, (Replicate(), Shard(0)), tensor_meta=tm)
+
+    graph = torch.fx.Graph()
+    body = graph.get_attr("region_body")          # carries no sharding entry
+    w1 = graph.placeholder("w1")
+    w3 = graph.placeholder("w3")
+    w2 = graph.placeholder("w2")
+    hop = graph.call_function(torch.ops.aten.stack.default, ((body, w1, w3, w2),))
+    graph.output(hop)
+
+    sharding_placement = {
+        w1: OpSpec(output_specs=storage, input_specs=[storage]),
+        w3: OpSpec(output_specs=storage, input_specs=[storage]),
+        w2: OpSpec(output_specs=storage, input_specs=[storage]),
+        # one spec per argument that has a sharding entry: w1, w3, w2
+        hop: OpSpec(output_specs=region, input_specs=[region, region, region]),
+    }
+
+    for weight in (w1, w3, w2):
+        boundary = _consumer_boundary_for_input(hop, weight, sharding_placement)
+        assert boundary == (
+            storage.placements,
+            region.placements,
+        ), f"{weight} boundary was not discovered: {boundary}"
