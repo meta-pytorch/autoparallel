@@ -111,13 +111,23 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
                 )
         return result
 
-    def _compute_origin_and_target_shard_order(self, node, curr_spec, tgt_spec):
+    def _compute_origin_and_target_shard_order(
+        self, node, curr_spec, tgt_spec, producer=None
+    ):
         # shard_order should be automatically assigned once `placements` is set
         assert curr_spec.shard_order is not None
         assert tgt_spec.shard_order is not None
-        if node not in self.param_placement_order:
+        # The storage order lives on the parameter chain. A boundary between a
+        # chain node and a consumer that is not itself on the chain -- a matmul,
+        # or the local_map region MoE expert weights are passed into -- still has
+        # to be lowered in the chain's order, or the tensor is read in a layout it
+        # was not stored in.
+        order_source = node if node in self.param_placement_order else producer
+        if order_source is None or order_source not in self.param_placement_order:
             return curr_spec.shard_order, tgt_spec.shard_order
-        preferred_shard_order = self.param_placement_order[node].preferred_shard_order
+        preferred_shard_order = self.param_placement_order[
+            order_source
+        ].preferred_shard_order
         curr_shard_order = _project_shard_order(
             preferred_shard_order,
             curr_spec,
@@ -128,13 +138,13 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
         )
         return curr_shard_order, tgt_shard_order
 
-    def redistribute_tensor(self, arg, curr_spec, tgt_spec, node):
+    def redistribute_tensor(self, arg, curr_spec, tgt_spec, node, producer=None):
         tgt_placements = tuple(
             p if not p.is_partial() else Replicate() for p in tgt_spec.placements
         )
         x = arg
         curr_shard_order, tgt_shard_order = self._compute_origin_and_target_shard_order(
-            node, curr_spec, tgt_spec
+            node, curr_spec, tgt_spec, producer
         )
         if (
             curr_spec.placements != tgt_spec.placements
@@ -177,7 +187,7 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
             # the HOP manages their distribution internally.
             if curr_spec is not None and tgt_spec is not None:
                 new_args_0[idx] = self.redistribute_tensor(
-                    arg, curr_spec, tgt_spec, node
+                    arg, curr_spec, tgt_spec, node, producer=all_input_nodes[0]
                 )
         else:
             tgt_spec = None
@@ -223,7 +233,7 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
                 # SymInts). See comment in _call_getitem for details.
                 new_flat_args_t.append(arg)
             else:
-                x = self.redistribute_tensor(arg, curr_spec, tgt_spec, node)
+                x = self.redistribute_tensor(arg, curr_spec, tgt_spec, node, producer=n)
                 new_flat_args_t.append(x)
             last_tgt_spec = tgt_spec
 

@@ -31,6 +31,7 @@ from torch.distributed.tensor.placement_types import (  # noqa
 from torch.utils._pytree import tree_flatten
 
 from ..cost_models.collective_runtime_estimation import redistribute_cost
+from ..graph_passes.graph_utils import all_input_nodes
 
 
 @dataclass(frozen=True)
@@ -384,10 +385,15 @@ def _consumer_boundary_for_input(
         return None
     if consumer_spec.input_specs is None:
         return None
+    # ``input_specs`` is indexed over the arguments that carry a sharding entry,
+    # so the position has to be computed over the same filtered list that
+    # ApplyShardingInterpreter._get_input_nodes builds. A local_map HOP also
+    # takes its body as a get_attr argument, which has no entry; counting it
+    # would shift every weight's index by one.
     arg_nodes = [
         value
         for value in tree_flatten(consumer.args)[0]
-        if isinstance(value, torch.fx.Node)
+        if isinstance(value, torch.fx.Node) and value in sharding_placement
     ]
     positions = [i for i, node in enumerate(arg_nodes) if node is input_node]
     if len(positions) != 1 or positions[0] >= len(consumer_spec.input_specs):
@@ -405,6 +411,29 @@ def _consumer_boundary_for_input(
             for placement in target.placements
         ),
     )
+
+
+def _order_reaches_every_boundary(
+    param_chain: list[torch.fx.Node],
+    sharding_placement: dict[torch.fx.Node, OpSpec],
+) -> bool:
+    """Whether every consumer of the chain can resolve the chain's storage order.
+
+    ``ApplyShardingInterpreter`` looks the order up from the node that produced
+    the tensor it is redistributing, so a consumer resolves it exactly when the
+    chain node is one of its own arguments. A consumer that reaches the value
+    indirectly -- through a container rebuilt by ``getitem``, say -- would read
+    the reordered storage as if it were in default order. Reject the parameter
+    in that case: it keeps the default layout and the redundant collective
+    instead of silently reading the wrong shards.
+    """
+    for chain_node in param_chain:
+        for consumer in chain_node.users:
+            if consumer not in sharding_placement:
+                continue
+            if chain_node not in all_input_nodes(consumer):
+                return False
+    return True
 
 
 def _get_chain_redistributions(
@@ -918,6 +947,9 @@ def compute_optimal_placement_order_for_parameters(
                 preferred_shard_order,
             ):
                 continue
+
+        if not _order_reaches_every_boundary(param_chain, sharding_placement):
+            continue
 
         # Preserve the chosen storage order through the forward parameter chain.
         _assign_order_info_to_chain(
