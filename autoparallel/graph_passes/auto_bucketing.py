@@ -91,19 +91,25 @@ def _patch_fsdp_bucketing():
                     key = node_group_key(coll_node)
                     groups[key].append(coll_node)
 
-        if not groups:
+        synchronize_world_buckets = (
+            aten_autobucketing_config.synchronize_world_buckets
+            and torch.distributed.is_initialized()
+            and torch.distributed.get_world_size() > 1
+        )
+        if not groups and not synchronize_world_buckets:
             return []
 
         node_descendents = collect_node_descendants(g)
         max_topo_span = aten_autobucketing_config.max_topo_span
 
-        buckets = []
+        buckets_by_key = {}
         # Metrics aggregated across all groups.
         n_close_bytes = 0
         n_close_span = 0
         max_observed_span = 0
 
         for key, nodes in groups.items():
+            group_buckets = []
             cur_bucket = []
             cur_bucket_descendents = OrderedSet()
             cur_bucket_size_bytes = 0
@@ -140,7 +146,7 @@ def _patch_fsdp_bucketing():
 
                 if close_for_bytes or close_for_span:
                     if len(cur_bucket) > 1:
-                        buckets.append(cur_bucket)
+                        group_buckets.append(cur_bucket)
                         if close_for_bytes:
                             n_close_bytes += 1
                         if close_for_span:
@@ -163,11 +169,86 @@ def _patch_fsdp_bucketing():
                 if cur_bucket_start_rank is None:
                     cur_bucket_start_rank = node_rank
             if len(cur_bucket) > 1:
-                buckets.append(cur_bucket)
+                group_buckets.append(cur_bucket)
                 observed_span = (
                     ranks.get(cur_bucket[-1].name, 0) - cur_bucket_start_rank
                 )
                 max_observed_span = max(max_observed_span, observed_span)
+
+            buckets_by_key[key] = group_buckets
+
+        if synchronize_world_buckets:
+            from torch.distributed.distributed_c10d import (
+                _get_default_group,
+                _get_process_group_name,
+            )
+
+            world_group_name = _get_process_group_name(_get_default_group())
+            local_plans = {}
+            for key, nodes in groups.items():
+                group_name = key[0] if isinstance(key, tuple) else key
+                if group_name != world_group_name:
+                    continue
+                node_to_index = {node: index for index, node in enumerate(nodes)}
+                signatures = tuple(
+                    (
+                        node.meta.get("custom", {}).get("module_fqn"),
+                        str(node.target),
+                        str(node.meta["val"].dtype),
+                        int(node.meta["val"].numel()),
+                        int(node.all_input_nodes[0].meta["val"].numel()),
+                    )
+                    for node in nodes
+                )
+                plan = tuple(
+                    tuple(node_to_index[node] for node in bucket)
+                    for bucket in buckets_by_key[key]
+                )
+                local_plans[repr(key)] = (signatures, plan)
+
+            gathered_plans = [None] * torch.distributed.get_world_size()
+            torch.distributed.all_gather_object(gathered_plans, local_plans)
+            if any(plan.keys() != local_plans.keys() for plan in gathered_plans):
+                raise RuntimeError("CP ranks produced different world bucket groups")
+
+            for key, nodes in groups.items():
+                key_repr = repr(key)
+                if key_repr not in local_plans:
+                    continue
+                signatures = local_plans[key_repr][0]
+                if any(plan[key_repr][0] != signatures for plan in gathered_plans):
+                    raise RuntimeError(
+                        "CP ranks produced different world collective sequences"
+                    )
+                canonical_rank, (_, canonical_plan) = max(
+                    enumerate(plan[key_repr] for plan in gathered_plans),
+                    key=lambda item: (
+                        sum(len(bucket) for bucket in item[1][1]),
+                        tuple(len(bucket) for bucket in item[1][1]),
+                        -item[0],
+                    ),
+                )
+                for indices in canonical_plan:
+                    descendants = OrderedSet()
+                    for index in indices:
+                        node = nodes[index]
+                        if node in descendants:
+                            raise RuntimeError(
+                                "Canonical CP bucket contains dependent collectives"
+                            )
+                        descendants |= node_descendents[node]
+                buckets_by_key[key] = [
+                    [nodes[index] for index in indices] for indices in canonical_plan
+                ]
+                logger.info(
+                    "Synchronized world bucket plan from rank %d: "
+                    "local_sizes=%s canonical_sizes=%s",
+                    canonical_rank,
+                    [len(bucket) for bucket in local_plans[key_repr][1]],
+                    [len(bucket) for bucket in canonical_plan],
+                )
+
+        buckets = [bucket for key in groups for bucket in buckets_by_key[key]]
 
         if buckets:
             logger.info(
@@ -301,6 +382,8 @@ class aten_autobucketing_config:
         span. Bounds how far compute can be displaced when bucketing rewires
         the dep graph and stable_topological_sort runs afterwards. Set to
         None to disable the span bound (only bytes cap applies).
+    - synchronize_world_buckets: use one validated world-PG bucket plan across
+        ranks whose CP-local graphs may have different topological spans.
     """
 
     max_in_flight_gb = 2.0
@@ -310,6 +393,7 @@ class aten_autobucketing_config:
     max_compute_pre_fetch = 50
     max_topo_span: int | None = 1500
     collective_bucketing = False
+    synchronize_world_buckets = False
     save_trace = True
     _counter = 0
 
