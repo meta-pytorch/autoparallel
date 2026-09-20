@@ -363,6 +363,50 @@ def get_redistributed_input_placements(
     return res
 
 
+def _consumer_boundary_for_input(
+    consumer: torch.fx.Node,
+    input_node: torch.fx.Node,
+    sharding_placement: dict[torch.fx.Node, OpSpec],
+) -> Optional[tuple[tuple[Placement, ...], tuple[Placement, ...]]]:
+    """The redistribution a multi-input consumer asks for on one of its inputs.
+
+    ``build_param_grad_linear_chains`` stops before any consumer with more than
+    one input, so a weight whose chain ends there has no redistribution between
+    chain nodes: the only boundary is the consumer's input spec. That is the
+    shape of a weight passed straight into a ``local_map`` region, which is how
+    MoE expert weights reach their experts. Indexing by argument position keeps
+    the consumer's other inputs out, which ``get_redistributed_input_placements``
+    cannot do because it reports the whole node at once.
+    """
+    consumer_spec = sharding_placement.get(consumer)
+    source_spec = sharding_placement.get(input_node)
+    if consumer_spec is None or source_spec is None:
+        return None
+    if consumer_spec.input_specs is None:
+        return None
+    arg_nodes = [
+        value
+        for value in tree_flatten(consumer.args)[0]
+        if isinstance(value, torch.fx.Node)
+    ]
+    positions = [i for i, node in enumerate(arg_nodes) if node is input_node]
+    if len(positions) != 1 or positions[0] >= len(consumer_spec.input_specs):
+        return None
+    source = source_spec.output_specs
+    target = consumer_spec.input_specs[positions[0]]
+    if not isinstance(source, DTensorSpec) or not isinstance(target, DTensorSpec):
+        return None
+    if source.placements == target.placements:
+        return None
+    return (
+        source.placements,
+        tuple(
+            Replicate() if placement.is_partial() else placement
+            for placement in target.placements
+        ),
+    )
+
+
 def _get_chain_redistributions(
     chain: list[torch.fx.Node],
     sharding_placement: dict[torch.fx.Node, OpSpec],
@@ -778,6 +822,23 @@ def compute_optimal_placement_order_for_parameters(
         )
         if redistribution_info and source_node not in redistribution_map:
             redistribution_map[source_node] = (user_node, redistribution_info)
+
+    # A parameter whose chain ends at a multi-input consumer has its only
+    # boundary on that consumer's input spec, which the loop above cannot see.
+    for param_node, _ in param_and_grad_nodes:
+        if param_node in redistribution_map:
+            continue
+        chain = source_to_chain.get(param_node)
+        if not chain:
+            continue
+        terminal = chain[-1]
+        for consumer in terminal.users:
+            boundary = _consumer_boundary_for_input(
+                consumer, terminal, sharding_placement
+            )
+            if boundary is not None:
+                redistribution_map[param_node] = (consumer, {terminal: boundary})
+                break
 
     # Find param-grad pairs where both require redistribution
     param_to_grad_map = dict(param_and_grad_nodes)
