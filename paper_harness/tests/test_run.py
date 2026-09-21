@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 
 from harness.run import _materialize_source
+from harness.runtime import _allocation_fingerprint
 from harness.settings import load_run_settings, resolve_run_setting
 
 
@@ -56,6 +58,38 @@ class RunTests(unittest.TestCase):
                 ).strip(),
                 commit,
             )
+
+    def test_allocation_fingerprint_uses_the_full_rank_mapping(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            reference = root / "runtime/allocation_reference"
+            reference.mkdir(parents=True)
+            records = [
+                {
+                    "hostname": "host-a.pci1",
+                    "rank": 0,
+                    "local_rank": 0,
+                    "world_size": 2,
+                    "local_world_size": 1,
+                    "gpu_ordinal": 0,
+                    "gpu_uuid": "gpu-a",
+                },
+                {
+                    "hostname": "host-b.pci1",
+                    "rank": 1,
+                    "local_rank": 0,
+                    "world_size": 2,
+                    "local_world_size": 1,
+                    "gpu_ordinal": 0,
+                    "gpu_uuid": "gpu-b",
+                },
+            ]
+            for rank, record in enumerate(records):
+                (reference / f"rank_{rank:03d}.json").write_text(json.dumps(record))
+            initial = _allocation_fingerprint(root, 2, 1)
+            records[1]["gpu_uuid"] = "gpu-c"
+            (reference / "rank_001.json").write_text(json.dumps(records[1]))
+            self.assertNotEqual(initial, _allocation_fingerprint(root, 2, 1))
 
 
 if __name__ == "__main__":

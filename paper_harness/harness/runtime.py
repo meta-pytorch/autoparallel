@@ -89,6 +89,41 @@ def _wait_for_ranks(runtime: Path, world_size: int, timeout_seconds: int) -> lis
     )
 
 
+def _allocation_fingerprint(
+    run_root: Path, world_size: int, timeout_seconds: int
+) -> str:
+    reference_dir = run_root / "runtime/allocation_reference"
+    paths = [reference_dir / f"rank_{rank:03d}.json" for rank in range(world_size)]
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        try:
+            records = [json.loads(path.read_text()) for path in paths]
+        except (FileNotFoundError, json.JSONDecodeError):
+            time.sleep(0.1)
+            continue
+        identity_fields = (
+            "hostname",
+            "rank",
+            "local_rank",
+            "world_size",
+            "local_world_size",
+            "gpu_ordinal",
+            "gpu_name",
+            "gpu_pci_bus_id",
+            "gpu_uuid",
+            "cuda_visible_devices",
+            "device_network_id",
+            "device_backend_network_topology",
+        )
+        identity = [
+            {field: record.get(field) for field in identity_fields}
+            for record in records
+        ]
+        encoded = json.dumps(identity, separators=(",", ":"), sort_keys=True).encode()
+        return hashlib.sha256(encoded).hexdigest()
+    raise RuntimeError("timed out waiting for complete allocation reference")
+
+
 def _wait_for_phase(root: Path, timeout_seconds: int) -> bool:
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
@@ -378,6 +413,11 @@ def main() -> None:
                 mast.get("gpu_name_contains", "H100"),
             ]
             subprocess.run(allocation, cwd=torchtitan_root, env=base_env, check=True)
+            allocation_fingerprint = _allocation_fingerprint(
+                run_root,
+                world_size,
+                timeout,
+            )
             if rank == 0:
                 _atomic_text(output / "started", "started\n")
 
@@ -400,6 +440,7 @@ def main() -> None:
                     "BENCHMARK_ARM": arm_name,
                     "BENCHMARK_OUTPUT_DIR": str(output),
                     "BENCHMARK_SOURCE_LOCK_SHA256": source_lock_sha256,
+                    "BENCHMARK_ALLOCATION_FINGERPRINT": allocation_fingerprint,
                     "RUN_ROOT": str(output),
                     "INPUT_AUDIT_DIR": str(output / "input_audit"),
                     "MODULE_ISOLATION_AUDIT_DIR": str(
