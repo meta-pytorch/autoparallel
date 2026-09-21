@@ -20,8 +20,10 @@ class CampaignTests(unittest.TestCase):
             {path.name for path in (REPO_ROOT / "campaigns").glob("*.toml")},
             {
                 "deepseek_v3_16b.toml",
+                "deepseek_v3_16b_tp_ep.toml",
                 "llama3_8b_2d.toml",
                 "llama3_8b_3d.toml",
+                "llama3_8b_3d_dps4_cp2_tp4.toml",
                 "llama3_8b_seqlen.toml",
                 "muse_glimmer_30b.toml",
             },
@@ -92,10 +94,28 @@ class CampaignTests(unittest.TestCase):
 
     def test_canonical_matrix_points(self) -> None:
         cases = {
-            "muse_glimmer_30b.toml": ("16gpu", "32gpu", "64gpu", "128gpu"),
-            "llama3_8b_2d.toml": ("8gpu", "16gpu", "32gpu", "64gpu", "128gpu"),
+            "muse_glimmer_30b.toml": (
+                "1d-fsdp8",
+                "16gpu",
+                "32gpu",
+                "64gpu",
+                "128gpu",
+            ),
+            "llama3_8b_2d.toml": (
+                "1d-fsdp8",
+                "8gpu",
+                "16gpu",
+                "32gpu",
+                "64gpu",
+                "128gpu",
+            ),
             "llama3_8b_seqlen.toml": ("2k", "4k", "8k", "16k", "32k"),
             "deepseek_v3_16b.toml": ("16gpu", "32gpu"),
+            "deepseek_v3_16b_tp_ep.toml": (
+                "1d-tp8-ep8-sp",
+                "2d-dps2-tp8-ep8-sp",
+                "3d-dps4-tp8-ep16-sp",
+            ),
         }
         for filename, points in cases.items():
             for point in points:
@@ -110,6 +130,40 @@ class CampaignTests(unittest.TestCase):
             load_campaign(REPO_ROOT / "campaigns/llama3_8b_3d.toml").world_size,
             8,
         )
+
+    def test_requested_matrix_contract(self) -> None:
+        expected = {
+            ("llama3_8b", "1d-fsdp8"): (8, 1, 8, 1, 1, 16),
+            ("llama3_8b", "2d-dps2-tp8"): (16, 1, 2, 1, 8, 4),
+            ("llama3_8b", "3d-dps4-cp2-tp4"): (32, 1, 4, 2, 4, 8),
+            ("muse_glimmer_30b", "1d-fsdp8"): (8, 1, 8, 1, 1, -1),
+            ("muse_glimmer_30b", "2d-dps8-tp2"): (16, 1, 8, 1, 2, -1),
+            ("deepseek_v3_16b", "1d-tp8-ep8-sp"): (8, 1, 1, 1, 8, 2),
+            ("deepseek_v3_16b", "2d-dps2-tp8-ep8-sp"): (16, 1, 2, 1, 8, 4),
+            ("deepseek_v3_16b", "3d-dps4-tp8-ep16-sp"): (32, 1, 4, 1, 8, 8),
+        }
+        settings = load_run_settings()
+        for key, values in expected.items():
+            with self.subTest(model=key[0], setting=key[1]):
+                setting = settings[key]
+                campaign = load_campaign(setting.campaign, point=setting.point)
+                parallelism = campaign.raw["parallelism"]
+                observed = (
+                    campaign.world_size,
+                    parallelism["data_parallel_replicate_degree"],
+                    parallelism["data_parallel_shard_degree"],
+                    parallelism["context_parallel_degree"],
+                    parallelism["tensor_parallel_degree"],
+                    campaign.raw["training"]["global_batch_size"],
+                )
+                self.assertEqual(observed, values)
+                self.assertEqual(len(campaign.arms), 3)
+                ap_arm = next(
+                    arm for arm in campaign.arms if arm.name.startswith("apgt")
+                )
+                self.assertEqual(
+                    ap_arm.overrides["compile.autoparallel_solver"], "approx"
+                )
 
     def test_matrix_requires_an_explicit_point(self) -> None:
         with self.assertRaisesRegex(CampaignError, "requires --point"):

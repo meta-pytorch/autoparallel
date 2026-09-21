@@ -12,7 +12,7 @@ from harness.settings import load_run_settings, resolve_run_setting
 class RunTests(unittest.TestCase):
     def test_every_setting_is_unique_and_resolvable(self) -> None:
         settings = load_run_settings()
-        self.assertEqual(len(settings), 17)
+        self.assertEqual(len(settings), 25)
         for key, expected in settings.items():
             self.assertEqual(resolve_run_setting(*key), expected)
 

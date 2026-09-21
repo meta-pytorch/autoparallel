@@ -10,6 +10,7 @@ from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.optimizer import default_adamw
 from torchtitan.components.validate import Validator
+from torchtitan.config import CompileConfig
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.experiments.graph_trainer.common_utils import (
     build_decoder_config_for_backend,
@@ -30,6 +31,7 @@ from torchtitan.models.llama3.config_registry import llama3_8b
 from .buffered_metrics import BufferedMetricsProcessor
 from .io_utils import bool_env, int_env, required_env
 from .replay_data import ReplayDataLoader
+from workloads.parameter_state import register_post_load_parameter_audit
 
 
 def _native_sdpa_model_spec():
@@ -61,6 +63,10 @@ def _base_config():
 
     config = llama3_8b()
     config.model_spec = _native_sdpa_model_spec()
+    config.model_spec = replace(
+        config.model_spec,
+        post_optimizer_build_fn=register_post_load_parameter_audit,
+    )
     config.hf_assets_path = required_env("LLAMA_TOKENIZER_DIR")
     config.dataloader = ReplayDataLoader.Config()
     config.loss = CrossEntropyLoss.Config(
@@ -164,6 +170,10 @@ def _base_config():
 
 def _graph_config(*, enable_autoparallel: bool):
     config = to_graph_trainer_config(_base_config(), graph_llama3_model_registry)
+    config.model_spec = replace(
+        config.model_spec,
+        post_optimizer_build_fn=register_post_load_parameter_audit,
+    )
     config.profiler = replace(config.profiler, trace_post_processor=None)
     placement_mode = os.environ.get("BENCHMARK_AP_PLACEMENTS_MODE", "")
     placement_path = os.environ.get("BENCHMARK_AP_PLACEMENTS_PATH", "")
@@ -200,3 +210,13 @@ def graph_manual():
 
 def graph_autoparallel():
     return _graph_config(enable_autoparallel=True)
+
+
+def torchtitan_main():
+    config = _base_config()
+    config.compile = CompileConfig(
+        enable=True,
+        components=["model", "loss"],
+        backend="inductor",
+    )
+    return config

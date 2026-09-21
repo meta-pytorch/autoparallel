@@ -93,6 +93,7 @@ config = "graph_trainer_muse_glimmer_30b_sdpa_c4_autoparallel_4x2"
 args = ["--hf-assets-path", "{asset:muse_glimmer}"]
 [arms.overrides]
 "compile.enable_autoparallel" = true
+"compile.autoparallel_solver" = "approx"
 
 [[phases]]
 name = "performance"
@@ -124,6 +125,15 @@ name = "16gpu"
 [matrix.points.settings]
 "mast.nodes" = 2
 "parallelism.data_parallel_shard_degree" = 8
+"data.identity_manifest" = "{asset:muse_input_manifests}/c4_input_manifest_lb2_s4096_dp8.jsonl"
+"data.identity_manifest_sha256" = "4fda638c406cb949694e6007b404f026b1c37a33b94511aefdf2e78b14520f71"
+
+[[matrix.points]]
+name = "1d-fsdp8"
+[matrix.points.settings]
+"mast.nodes" = 1
+"parallelism.data_parallel_shard_degree" = 8
+"parallelism.tensor_parallel_degree" = 1
 "data.identity_manifest" = "{asset:muse_input_manifests}/c4_input_manifest_lb2_s4096_dp8.jsonl"
 "data.identity_manifest_sha256" = "4fda638c406cb949694e6007b404f026b1c37a33b94511aefdf2e78b14520f71"
 

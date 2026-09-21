@@ -65,14 +65,22 @@ if MODEL_FLAVOR != "16B":
 
 WORLD_SIZE = int(os.environ["BENCHMARK_WORLD_SIZE"])
 EP_DEGREE = int(os.environ["BENCHMARK_EP_DEGREE"])
-if EP_DEGREE != 8 or WORLD_SIZE not in (16, 32):
+TP_DEGREE = int(os.environ.get("BENCHMARK_TP_DEGREE", "1"))
+if WORLD_SIZE % TP_DEGREE:
     raise ValueError(
-        f"Expected world size 16/32 with EP8, got {WORLD_SIZE=}, {EP_DEGREE=}"
+        f"Tensor parallel degree must divide world size: {WORLD_SIZE=} {TP_DEGREE=}"
     )
-DP_DEGREE = WORLD_SIZE
+if WORLD_SIZE % EP_DEGREE or EP_DEGREE % TP_DEGREE:
+    raise ValueError(
+        "Expert parallelism must contain TP and divide the world: "
+        f"{WORLD_SIZE=} {EP_DEGREE=} {TP_DEGREE=}"
+    )
+DP_DEGREE = WORLD_SIZE // TP_DEGREE
 EFSDP_DEGREE = WORLD_SIZE // EP_DEGREE
 
-LOCAL_BATCH_SIZE = 4
+LOCAL_BATCH_SIZE = int(os.environ.get("BENCHMARK_LOCAL_BATCH_SIZE", "4"))
+if LOCAL_BATCH_SIZE < 1:
+    raise ValueError(f"Local batch size must be positive: {LOCAL_BATCH_SIZE}")
 SEQ_LEN = 4096
 GLOBAL_BATCH_SIZE = LOCAL_BATCH_SIZE * DP_DEGREE
 
@@ -95,7 +103,10 @@ def _write_inductor_path_audit() -> None:
     patch_active = all("_patch_fsdp_bucketing" in value for value in functions.values())
     custom_post_pass = torch._inductor.config.post_grad_custom_post_pass
     configuration = os.environ["BENCHMARK_CONFIGURATION"]
-    expected_patch_active = configuration != "torchtitan_baseline"
+    expected_patch_active = configuration in {
+        "autoparallel_graphtrainer",
+        "autoparallel_backend_example_scheduling",
+    }
     if patch_active != expected_patch_active:
         raise RuntimeError(
             "Unexpected AutoParallel bucketing hook state for "
@@ -376,8 +387,8 @@ def _base_config():
         config.parallelism,
         data_parallel_replicate_degree=1,
         data_parallel_shard_degree=DP_DEGREE,
-        tensor_parallel_degree=1,
-        enable_sequence_parallel=False,
+        tensor_parallel_degree=TP_DEGREE,
+        enable_sequence_parallel=TP_DEGREE > 1,
         context_parallel_degree=1,
         pipeline_parallel_degree=1,
         expert_parallel_degree=EP_DEGREE,
@@ -439,6 +450,12 @@ def autoparallel_graphtrainer_16b():
     return config
 
 
+def graphtrainer_manual_16b():
+    config = autoparallel_graphtrainer_16b()
+    config.compile = replace(config.compile, enable_autoparallel=False)
+    return config
+
+
 def torchtitan_baseline_16b():
     if "autoparallel.graph_passes.auto_bucketing" in sys.modules:
         raise RuntimeError("Native TorchTitan baseline was polluted by AutoParallel")
@@ -460,5 +477,6 @@ def torchtitan_baseline_16b():
 
 EXPERIMENT_CONFIGS = (
     "torchtitan_baseline_16b",
+    "graphtrainer_manual_16b",
     "autoparallel_graphtrainer_16b",
 )

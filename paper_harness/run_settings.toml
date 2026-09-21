@@ -100,3 +100,50 @@ model = "deepseek_v3_16b"
 setting = "efsdp-ep-32gpu"
 campaign = "campaigns/deepseek_v3_16b.toml"
 point = "32gpu"
+
+[[settings]]
+model = "llama3_8b"
+setting = "1d-fsdp8"
+campaign = "campaigns/llama3_8b_2d.toml"
+point = "1d-fsdp8"
+
+[[settings]]
+model = "llama3_8b"
+setting = "2d-dps2-tp8"
+campaign = "campaigns/llama3_8b_2d.toml"
+point = "16gpu"
+
+[[settings]]
+model = "llama3_8b"
+setting = "3d-dps4-cp2-tp4"
+campaign = "campaigns/llama3_8b_3d_dps4_cp2_tp4.toml"
+
+[[settings]]
+model = "muse_glimmer_30b"
+setting = "1d-fsdp8"
+campaign = "campaigns/muse_glimmer_30b.toml"
+point = "1d-fsdp8"
+
+[[settings]]
+model = "muse_glimmer_30b"
+setting = "2d-dps8-tp2"
+campaign = "campaigns/muse_glimmer_30b.toml"
+point = "16gpu"
+
+[[settings]]
+model = "deepseek_v3_16b"
+setting = "1d-tp8-ep8-sp"
+campaign = "campaigns/deepseek_v3_16b_tp_ep.toml"
+point = "1d-tp8-ep8-sp"
+
+[[settings]]
+model = "deepseek_v3_16b"
+setting = "2d-dps2-tp8-ep8-sp"
+campaign = "campaigns/deepseek_v3_16b_tp_ep.toml"
+point = "2d-dps2-tp8-ep8-sp"
+
+[[settings]]
+model = "deepseek_v3_16b"
+setting = "3d-dps4-tp8-ep16-sp"
+campaign = "campaigns/deepseek_v3_16b_tp_ep.toml"
+point = "3d-dps4-tp8-ep16-sp"

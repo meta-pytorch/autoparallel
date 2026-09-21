@@ -142,6 +142,18 @@ name = "8gpu"
 "mast.environment.BENCHMARK_GLOBAL_BATCH_SIZE" = "4"
 
 [[matrix.points]]
+name = "1d-fsdp8"
+[matrix.points.settings]
+"mast.nodes" = 1
+"parallelism.data_parallel_shard_degree" = 8
+"parallelism.tensor_parallel_degree" = 1
+"training.global_batch_size" = 16
+"training.gradient_accumulation_steps" = 1
+"mast.environment.BENCHMARK_WORLD_SIZE" = "8"
+"mast.environment.BENCHMARK_TP_DEGREE" = "1"
+"mast.environment.BENCHMARK_GLOBAL_BATCH_SIZE" = "16"
+
+[[matrix.points]]
 name = "16gpu"
 [matrix.points.settings]
 "mast.nodes" = 2
