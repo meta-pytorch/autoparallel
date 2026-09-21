@@ -667,13 +667,6 @@ def _multi_boundary_adjoint_improves_fallback(
     candidate_forward[0] = _candidate_edge(forward[0], preferred_order)
     candidate_backward[-1] = _candidate_edge(backward[-1], preferred_order)
 
-    # The non-default order must exist only at the two storage boundaries.
-    if (
-        candidate_forward[0][2].shard_order != baseline_forward[0][2].shard_order
-        or candidate_backward[-1][1].shard_order != baseline_backward[-1][1].shard_order
-    ):
-        return False
-
     baseline_plans = _plans_for_edges(baseline_forward + baseline_backward)
     candidate_forward_plans = _plans_for_edges(candidate_forward)
     candidate_backward_plans = _plans_for_edges(candidate_backward)
