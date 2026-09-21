@@ -2,9 +2,9 @@
 
 ## TorchTitan
 
-The maintained source branch is `kaijian/unified-383-repro` in
-`AlbedoWang/torchtitan`. Its history has `383cae9f` as an actual ancestor and
-retains the `60517d28` AutoParallel/GraphTrainer integration.
+The locked source is `kaijian/deepseek-baseline-parity-20260918` in
+`AlbedoWang/torchtitan` at `94e596cc`. Its history has `383cae9f` as an actual
+ancestor and retains the `60517d28` AutoParallel/GraphTrainer integration.
 
 - `383cae9f`: eager SAC treats AutoParallel collectives like other
   GraphTrainer collectives.
@@ -21,6 +21,11 @@ retains the `60517d28` AutoParallel/GraphTrainer integration.
 - `26c329bd`: experiment-only child of `6df7bc5f` that adds the folded-EP/TP
   DeepSeek adapter and makes DeepSeek and Muse consume the configured
   AutoParallel solver.
+- `4a297d02`: fixes GraphTrainer FSDP dependency ordering.
+- `8ceafd62`: shards DeepSeek AutoParallel logits over TP.
+- `94e596cc`: cherry-picks the CP bucket-plan activation from `c2116c31` onto
+  `8ceafd62`; TorchTitan passes `parallel_dims.cp_enabled` to AutoParallel's
+  `synchronize_world_buckets` setting, leaving the non-CP default disabled.
 
 The 3D port includes only the approved legacy-DTensor AP configuration, CP
 input-ownership seam, DP-shard/CP/TP mesh, CP-aware SDPA, DTensor output, and
@@ -41,6 +46,16 @@ is pinned to the commit immediately before the lock/harness-only updates.
   resolution retains current CP/FlexAttention behavior and restores the
   DeepSeek aliases, symbolic handling, dynamic estimator, and checkpointed
   layer initialization.
+- `e63da659` enables the H100 DeepSeek cuDNN SDPA path, and `0a3f3123` aligns
+  the AutoParallel DeepSeek model semantics with TorchTitan.
+- `fb056bd4`, `eabe93f9`, `dab6a2db`, `b66e7405`, and `8d009717` form the
+  ordered-sharding sequence: multi-boundary fallback-adjoint eligibility,
+  real-chain eligibility, alias and multi-input-consumer reachability, and
+  producer-keyed boundary lowering.
+- `6fb00205` adds opt-in cross-rank consensus for world bucket plans.
+- `684b8533` restores the real-shape shard-order coverage and adds CP
+  bucket-consensus coverage. It is the AutoParallel runtime pin; the following
+  harness-only commit updates this lock and provenance.
 
 ## Reproduction policy
 
