@@ -10,6 +10,10 @@ The patches are installed at module import time, so importing
 auto_bucketing replaces the originals in PyTorch's bucketing/fsdp modules.
 """
 
+from contextlib import contextmanager
+from unittest import mock
+
+import pytest
 import torch
 import torch._inductor.fx_passes.bucketing as bucketing_mod
 import torch._inductor.fx_passes.fsdp as fsdp_mod
@@ -146,6 +150,32 @@ def _call_greedy_bucket(gm, bucket_cap_mb, *, filter_wait_node=None):
     )
 
 
+@contextmanager
+def _world_bucket_consensus(gather):
+    """Enable world-plan synchronization with a deterministic two-rank peer."""
+    saved = ab.aten_autobucketing_config.synchronize_world_buckets
+    ab.aten_autobucketing_config.synchronize_world_buckets = True
+    try:
+        with (
+            mock.patch.object(torch.distributed, "is_initialized", return_value=True),
+            mock.patch.object(torch.distributed, "get_world_size", return_value=2),
+            mock.patch.object(
+                torch.distributed, "all_gather_object", side_effect=gather
+            ),
+            mock.patch(
+                "torch.distributed.distributed_c10d._get_default_group",
+                return_value=object(),
+            ),
+            mock.patch(
+                "torch.distributed.distributed_c10d._get_process_group_name",
+                return_value="world",
+            ),
+        ):
+            yield
+    finally:
+        ab.aten_autobucketing_config.synchronize_world_buckets = saved
+
+
 def test_greedy_bucket_merges_within_caps():
     """4 small AGs, plenty of room: one bucket containing all of them."""
     gm, ag_nodes, _ = _build_ag_chain_graph(n_ags=4, ag_shape_bytes_each=1024)
@@ -278,3 +308,120 @@ def test_greedy_bucket_skips_descendant_collectives():
         assert not (
             ag1 in b and ag2 in b
         ), "AG1 and AG2 ended up in same bucket despite descendant relation"
+
+
+def test_world_bucket_consensus_selects_most_complete_valid_plan():
+    """Use one canonical plan when CP-local ranks retain different members.
+
+    This is the reduced form of the observed 4x2x4 run, where rank-local world
+    plans had sizes [13, 13, 13, 13, 13, 7, ..., 4] and
+    [14, 14, 14, 14, 12, 6, ..., 2]. The test keeps the same-signature,
+    different-coverage property while using five real FX collective nodes.
+    """
+    gm, ag_nodes, _ = _build_ag_chain_graph(
+        n_ags=5, ag_shape_bytes_each=1024, group_name="world"
+    )
+
+    def gather(gathered, local):
+        key = next(iter(local))
+        signatures = local[key][0]
+        gathered[:] = [
+            {key: (signatures, ((0, 1), (2, 3)))},
+            {key: (signatures, ((0, 1, 2), (3, 4)))},
+        ]
+
+    with _world_bucket_consensus(gather):
+        buckets = _call_greedy_bucket(gm, bucket_cap_mb=10.0)
+
+    assert buckets == [ag_nodes[:3], ag_nodes[3:]]
+
+
+def test_world_bucket_consensus_rejects_different_group_sets():
+    gm, _, _ = _build_ag_chain_graph(
+        n_ags=4, ag_shape_bytes_each=1024, group_name="world"
+    )
+
+    def gather(gathered, local):
+        gathered[:] = [local, {}]
+
+    with _world_bucket_consensus(gather):
+        with pytest.raises(RuntimeError, match="different world bucket groups"):
+            _call_greedy_bucket(gm, bucket_cap_mb=10.0)
+
+
+def test_world_bucket_consensus_rejects_different_collective_sequences():
+    gm, _, _ = _build_ag_chain_graph(
+        n_ags=4, ag_shape_bytes_each=1024, group_name="world"
+    )
+
+    def gather(gathered, local):
+        key = next(iter(local))
+        signatures, plan = local[key]
+        changed = list(signatures)
+        changed[0] = (*changed[0][:-1], changed[0][-1] + 1)
+        gathered[:] = [local, {key: (tuple(changed), plan)}]
+
+    with _world_bucket_consensus(gather):
+        with pytest.raises(RuntimeError, match="different world collective sequences"):
+            _call_greedy_bucket(gm, bucket_cap_mb=10.0)
+
+
+def test_world_bucket_consensus_rejects_dependent_canonical_bucket():
+    graph = torch.fx.Graph()
+    placeholder = graph.placeholder("p")
+    placeholder.meta["val"] = _make_fake_tensor_meta((512,), torch.bfloat16)
+    ag1 = _make_ag_node(graph, placeholder, "world", (512,), group_size=8)
+    wait1 = _make_wait_node(graph, ag1)
+    ag2 = _make_ag_node(graph, wait1, "world", (512,), group_size=8)
+    wait2 = _make_wait_node(graph, ag2)
+    graph.output((wait2,))
+    gm = _build_gm(graph)
+
+    def gather(gathered, local):
+        key = next(iter(local))
+        signatures = local[key][0]
+        gathered[:] = [
+            {key: (signatures, ())},
+            {key: (signatures, ((0, 1),))},
+        ]
+
+    with _world_bucket_consensus(gather):
+        with pytest.raises(RuntimeError, match="dependent collectives"):
+            _call_greedy_bucket(gm, bucket_cap_mb=10.0)
+
+
+def test_world_bucket_consensus_leaves_non_world_group_local():
+    gm, ag_nodes, _ = _build_ag_chain_graph(
+        n_ags=4, ag_shape_bytes_each=1024, group_name="dp"
+    )
+
+    def gather(gathered, local):
+        assert local == {}
+        gathered[:] = [{}, {}]
+
+    with _world_bucket_consensus(gather):
+        buckets = _call_greedy_bucket(gm, bucket_cap_mb=10.0)
+
+    assert buckets == [ag_nodes]
+
+
+def test_world_bucket_consensus_default_off_avoids_distributed_exchange():
+    gm, ag_nodes, _ = _build_ag_chain_graph(
+        n_ags=4, ag_shape_bytes_each=1024, group_name="world"
+    )
+    saved = ab.aten_autobucketing_config.synchronize_world_buckets
+    ab.aten_autobucketing_config.synchronize_world_buckets = False
+    try:
+        with (
+            mock.patch.object(torch.distributed, "is_initialized", return_value=True),
+            mock.patch.object(
+                torch.distributed,
+                "all_gather_object",
+                side_effect=AssertionError("unexpected distributed exchange"),
+            ),
+        ):
+            buckets = _call_greedy_bucket(gm, bucket_cap_mb=10.0)
+    finally:
+        ab.aten_autobucketing_config.synchronize_world_buckets = saved
+
+    assert buckets == [ag_nodes]

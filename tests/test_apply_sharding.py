@@ -359,3 +359,88 @@ def test_build_physical_placements_3d_uses_strided_shards():
         physical.mesh,
     )
     assert decoded_order == (ShardOrderEntry(tensor_dim=0, mesh_dims=(2, 1, 0)),)
+
+
+class TestProducerKeyedShardOrder:
+    """A weight consumed by a node that is not on its chain -- a matmul, or the
+    local_map region MoE expert weights are passed into -- must still be
+    redistributed in the storage order its chain carries."""
+
+    def _mesh(self):
+        # (dp_shard_mod_ep=2, tp=8) -- the DeepSeek V3 folded MoE mesh
+        return DeviceMesh(
+            "cuda", torch.arange(16).reshape(2, 8), mesh_dim_names=("dp", "tp")
+        )
+
+    def _expert_weight_boundary(self, mesh):
+        # DeepSeek V3 routed-expert weight on (dp_shard_mod_ep=2, tp=8), where tp
+        # is also the EP axis: stored S(0)S(0), the region wants R S(0). Tensor
+        # dim 0 is sharded by both axes, so in default (dp-major) order releasing
+        # dp lowers to all-to-all -> all-gather -> all-to-all.
+        tm = _make_tensor_meta([64, 1408, 2048])
+        storage = DTensorSpec(mesh, (Shard(0), Shard(0)), tensor_meta=tm)
+        region = DTensorSpec(mesh, (Replicate(), Shard(0)), tensor_meta=tm)
+        return storage, region
+
+    def _interpreter(self, mesh, storage, region, order):
+        graph = torch.fx.Graph()
+        param = graph.placeholder("param")
+        cast = graph.call_function(
+            torch.ops.prims.convert_element_type.default, (param, torch.bfloat16)
+        )
+        other = graph.placeholder("other")
+        consumer = graph.call_function(torch.ops.aten.mul.Tensor, (cast, other))
+        graph.output(consumer)
+        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+
+        sharding_placement = {
+            param: OpSpec(output_specs=storage, input_specs=[storage]),
+            cast: OpSpec(output_specs=storage, input_specs=[storage]),
+            other: OpSpec(output_specs=region, input_specs=[region]),
+            consumer: OpSpec(output_specs=region, input_specs=[region, region]),
+        }
+        interp = ApplyShardingInterpreter(
+            gm,
+            sharding_placement,
+            # The order lives on the parameter chain. The consumer is deliberately
+            # absent, which is the shape build_param_grad_linear_chains produces.
+            param_placement_order={
+                param: OrderInfo(preferred_shard_order=order),
+                cast: OrderInfo(preferred_shard_order=order),
+            },
+        )
+        interp._curr_node = consumer
+        return interp, cast, consumer
+
+    def test_producer_order_collapses_boundary_to_one_all_gather(self):
+        mesh = self._mesh()
+        storage, region = self._expert_weight_boundary(mesh)
+        order = (ShardOrderEntry(tensor_dim=0, mesh_dims=(1, 0)),)
+        interp, cast, consumer = self._interpreter(mesh, storage, region, order)
+        local = torch.randn(4, 1408, 2048, device="meta")
+
+        def trace_fn(x):
+            return interp.redistribute_tensor(
+                x, storage, region, consumer, producer=cast
+            )
+
+        counts = _count_collectives(make_fx(trace_fn, tracing_mode="real")(local))
+        assert counts == {"all_gather": 1, "reduce_scatter": 0, "alltoall": 0}
+
+    def test_order_is_resolved_from_the_producer_not_the_consumer(self):
+        """The consumer carries no order of its own. Only the producer can supply
+        it, and without one the specs keep their default order."""
+        mesh = self._mesh()
+        storage, region = self._expert_weight_boundary(mesh)
+        order = (ShardOrderEntry(tensor_dim=0, mesh_dims=(1, 0)),)
+        interp, cast, consumer = self._interpreter(mesh, storage, region, order)
+
+        assert interp._compute_origin_and_target_shard_order(
+            consumer, storage, region
+        ) == (storage.shard_order, region.shard_order)
+
+        curr_order, tgt_order = interp._compute_origin_and_target_shard_order(
+            consumer, storage, region, producer=cast
+        )
+        assert curr_order == order
+        assert curr_order != storage.shard_order

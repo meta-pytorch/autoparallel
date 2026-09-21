@@ -10,12 +10,17 @@ from conftest import apply_cuda_patches
 from torch import nn
 from torch._functorch._aot_autograd.fx_utils import get_param_and_grad_nodes
 from torch._functorch.aot_autograd import aot_export_joint_with_descriptors
-from torch.distributed.tensor._dtensor_spec import DTensorSpec, ShardOrderEntry
+from torch.distributed.tensor._dtensor_spec import (
+    DTensorSpec,
+    ShardOrderEntry,
+    TensorMeta,
+)
 from torch.distributed.tensor._op_schema import OpSpec
 from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
 
 from autoparallel.api import AutoParallel
 from autoparallel.shardings.ordered_sharding import (
+    _consumer_boundary_for_input,
     _infer_fsdplike_storage_order,
     _matches_inverse_gradient_pattern,
     build_param_grad_linear_chains,
@@ -922,3 +927,229 @@ def test_compute_optimal_placement_order_multi_layer(device_mesh_2d):
         # Verify that all nodes in placement_order have shard_order metadata
         for node in placement_order:
             assert "shard_order" in node.meta
+
+
+def _spec_with_meta(mesh, placements, shape, dtype=torch.bfloat16):
+    stride = []
+    acc = 1
+    for size in reversed(shape):
+        stride.append(acc)
+        acc *= size
+    return DTensorSpec(
+        mesh,
+        placements,
+        tensor_meta=TensorMeta(torch.Size(shape), tuple(reversed(stride)), dtype),
+    )
+
+
+def _build_weight_chain_graph(extra_cast_user: bool = False):
+    """Rebuild the parameter/gradient chain AutoParallel produces for a linear weight.
+
+    The node sequence and the fan-out mirror the LLaMA3 joint graph: ``_add_alias``
+    leaves an ``aten.alias`` node that both the forward matmul and the backward
+    permute consume.  The backward consumer is built first so that
+    ``build_param_grad_linear_chains`` walks through the alias into it, which is
+    what it does on a real AutoParallel graph -- the two-user node lands in the
+    middle of the chain, not at its end.
+    """
+    graph = torch.fx.Graph()
+    param = graph.placeholder("param")
+    x = graph.placeholder("x")
+    dtype_cast_fwd = graph.call_function(torch.ops.aten.clone.default, (param,))
+    permute_fwd = graph.call_function(torch.ops.aten.t.default, (dtype_cast_fwd,))
+    alias_fwd = graph.call_function(torch.ops.aten.alias.default, (permute_fwd,))
+    reuse_bwd = graph.call_function(torch.ops.aten.t.default, (alias_fwd,))
+    mm_fwd = graph.call_function(torch.ops.aten.mm.default, (x, alias_fwd))
+
+    grad_out = graph.placeholder("grad_out")
+    mm_bwd = graph.call_function(torch.ops.aten.mm.default, (x, grad_out))
+    permute_bwd = graph.call_function(torch.ops.aten.t.default, (mm_bwd,))
+    dtype_cast_bwd = graph.call_function(torch.ops.aten.clone.default, (permute_bwd,))
+    grad_alias = graph.call_function(torch.ops.aten.alias.default, (dtype_cast_bwd,))
+
+    outputs = [mm_fwd, reuse_bwd, grad_alias]
+    nodes = {
+        "param": param,
+        "x": x,
+        "dtype_cast_fwd": dtype_cast_fwd,
+        "permute_fwd": permute_fwd,
+        "alias_fwd": alias_fwd,
+        "mm_fwd": mm_fwd,
+        "reuse_bwd": reuse_bwd,
+        "grad_out": grad_out,
+        "mm_bwd": mm_bwd,
+        "permute_bwd": permute_bwd,
+        "dtype_cast_bwd": dtype_cast_bwd,
+        "grad_alias": grad_alias,
+    }
+    if extra_cast_user:
+        nodes["cast_peek"] = graph.call_function(
+            torch.ops.aten.alias.default, (dtype_cast_fwd,)
+        )
+        outputs.append(nodes["cast_peek"])
+
+    graph.output(tuple(outputs))
+    return torch.fx.GraphModule(torch.nn.Module(), graph), nodes
+
+
+def _weight_chain_placement(
+    nodes, storage, first_target, transposed, final, grad_source
+):
+    n = nodes
+    placement = {
+        n["param"]: OpSpec(output_specs=storage, input_specs=[storage]),
+        n["x"]: OpSpec(output_specs=final),
+        n["dtype_cast_fwd"]: OpSpec(output_specs=storage, input_specs=[storage]),
+        n["permute_fwd"]: OpSpec(output_specs=transposed, input_specs=[first_target]),
+        n["alias_fwd"]: OpSpec(output_specs=final, input_specs=[final]),
+        n["reuse_bwd"]: OpSpec(output_specs=final, input_specs=[final]),
+        n["mm_fwd"]: OpSpec(output_specs=final, input_specs=[final, final]),
+        n["grad_out"]: OpSpec(output_specs=final),
+        n["mm_bwd"]: OpSpec(output_specs=grad_source, input_specs=[final, final]),
+        n["permute_bwd"]: OpSpec(output_specs=grad_source, input_specs=[grad_source]),
+        n["dtype_cast_bwd"]: OpSpec(
+            output_specs=grad_source, input_specs=[grad_source]
+        ),
+        n["grad_alias"]: OpSpec(output_specs=storage, input_specs=[storage]),
+    }
+    if "cast_peek" in n:
+        placement[n["cast_peek"]] = OpSpec(output_specs=storage, input_specs=[storage])
+    return placement
+
+
+def _run_placement_order(gm, nodes, placement):
+    import unittest.mock as mock
+
+    with mock.patch(
+        "autoparallel.shardings.ordered_sharding.get_param_and_grad_nodes"
+    ) as get_pairs:
+        get_pairs.return_value = {0: (nodes["param"], nodes["grad_alias"])}
+        return compute_optimal_placement_order_for_parameters(gm, placement)
+
+
+def _row_parallel_specs(mesh, shape, final_placements):
+    """`wo`/`w2`-style weight: the forward releases one axis before the transpose
+    and the rest after it, so the gradient is the adjoint of the composition."""
+    return {
+        "storage": _spec_with_meta(mesh, (Shard(0), Shard(0), Shard(1)), shape),
+        "first_target": _spec_with_meta(mesh, (Replicate(), Shard(0), Shard(1)), shape),
+        "transposed": _spec_with_meta(
+            mesh, (Replicate(), Shard(1), Shard(0)), tuple(reversed(shape))
+        ),
+        "final": _spec_with_meta(mesh, final_placements, tuple(reversed(shape))),
+        "grad_source": _spec_with_meta(
+            mesh, (Partial(), Partial(), Shard(1)), shape, torch.float32
+        ),
+    }
+
+
+def test_compute_optimal_placement_order_two_boundary_chain(device_mesh_3d):
+    """`S(0)S(0)S(1)` weight released across two boundaries around the transpose.
+
+    Placements and chain shape are those of `layers.*.attention.wo.weight` in the
+    `llama3-8b-3d-long-approx-*` solutions.
+    """
+    gm, nodes = _build_weight_chain_graph()
+    specs = _row_parallel_specs(
+        device_mesh_3d, (4096, 4096), (Replicate(), Replicate(), Replicate())
+    )
+    placement = _weight_chain_placement(nodes, **specs)
+
+    placement_order = _run_placement_order(gm, nodes, placement)
+
+    expected = (
+        ShardOrderEntry(tensor_dim=0, mesh_dims=(1, 0)),
+        ShardOrderEntry(tensor_dim=1, mesh_dims=(2,)),
+    )
+    for key in ("param", "dtype_cast_fwd", "permute_fwd", "grad_alias"):
+        assert placement_order[nodes[key]].preferred_shard_order == expected, key
+    # Nothing past the first boundary may carry the reordered layout.
+    assert nodes["alias_fwd"] not in placement_order
+
+
+def test_compute_optimal_placement_order_rejects_fanout_before_boundary(device_mesh_3d):
+    """A second consumer of a reordered value must veto the optimization."""
+    gm, nodes = _build_weight_chain_graph(extra_cast_user=True)
+    specs = _row_parallel_specs(
+        device_mesh_3d, (4096, 4096), (Replicate(), Replicate(), Replicate())
+    )
+    placement = _weight_chain_placement(nodes, **specs)
+
+    assert _run_placement_order(gm, nodes, placement) == {}
+
+
+def test_compute_optimal_placement_order_full_release_uses_gradient_boundary(
+    device_mesh_3d,
+):
+    """`wqkv`-style weight: the forward releases every axis, so only the gradient
+    boundary constrains the storage layout.
+
+    Placements are those of `layers.*.attention.qkv_linear.wqkv.weight` in the
+    `llama3-8b-3d-long-approx-2x2x4` solution.
+    """
+    shape = (6144, 4096)
+    gm, nodes = _build_weight_chain_graph()
+    replicated = (Replicate(), Replicate(), Replicate())
+    transposed_shape = tuple(reversed(shape))
+    specs = {
+        "storage": _spec_with_meta(
+            device_mesh_3d, (Shard(0), Shard(0), Shard(0)), shape
+        ),
+        "first_target": _spec_with_meta(device_mesh_3d, replicated, shape),
+        "transposed": _spec_with_meta(device_mesh_3d, replicated, transposed_shape),
+        "final": _spec_with_meta(device_mesh_3d, replicated, transposed_shape),
+        "grad_source": _spec_with_meta(
+            device_mesh_3d, (Partial(), Partial(), Shard(0)), shape, torch.float32
+        ),
+    }
+    placement = _weight_chain_placement(nodes, **specs)
+
+    placement_order = _run_placement_order(gm, nodes, placement)
+
+    expected = (ShardOrderEntry(tensor_dim=0, mesh_dims=(2, 1, 0)),)
+    for key in ("param", "dtype_cast_fwd", "permute_fwd", "grad_alias"):
+        assert placement_order[nodes[key]].preferred_shard_order == expected, key
+
+
+def test_consumer_boundary_ignores_arguments_without_a_sharding_entry():
+    """``input_specs`` is indexed over the arguments that carry a sharding entry.
+
+    A ``local_map`` HOP also takes its body as a ``get_attr`` argument, which has
+    no entry. Counting it shifts every later argument by one, which is how the
+    DeepSeek expert ``w2`` -- the third weight passed to the region -- came back
+    as "no boundary" while ``w1``/``w3`` only looked right because their
+    neighbours happened to carry the same placement.
+    """
+    mesh = torch.distributed.device_mesh.DeviceMesh(
+        "cuda", torch.arange(16).reshape(2, 8), mesh_dim_names=("dp", "tp")
+    )
+    tm = TensorMeta(
+        torch.Size([64, 2048, 1408]),
+        torch.empty([64, 2048, 1408], device="meta").stride(),
+        torch.bfloat16,
+    )
+    storage = DTensorSpec(mesh, (Shard(0), Shard(0)), tensor_meta=tm)
+    region = DTensorSpec(mesh, (Replicate(), Shard(0)), tensor_meta=tm)
+
+    graph = torch.fx.Graph()
+    body = graph.get_attr("region_body")  # carries no sharding entry
+    w1 = graph.placeholder("w1")
+    w3 = graph.placeholder("w3")
+    w2 = graph.placeholder("w2")
+    hop = graph.call_function(torch.ops.aten.stack.default, ((body, w1, w3, w2),))
+    graph.output(hop)
+
+    sharding_placement = {
+        w1: OpSpec(output_specs=storage, input_specs=[storage]),
+        w3: OpSpec(output_specs=storage, input_specs=[storage]),
+        w2: OpSpec(output_specs=storage, input_specs=[storage]),
+        # one spec per argument that has a sharding entry: w1, w3, w2
+        hop: OpSpec(output_specs=region, input_specs=[region, region, region]),
+    }
+
+    for weight in (w1, w3, w2):
+        boundary = _consumer_boundary_for_input(hop, weight, sharding_placement)
+        assert boundary == (
+            storage.placements,
+            region.placements,
+        ), f"{weight} boundary was not discovered: {boundary}"
