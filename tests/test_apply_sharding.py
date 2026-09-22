@@ -535,3 +535,60 @@ def test_partial_subset_producer_establishes_order_without_collectives():
         grad_consumer,
         grad_producer,
     ) == {"all_gather": 0, "reduce_scatter": 1, "alltoall": 0}
+
+
+@apply_cuda_patches
+def test_hsdp_orthogonal_partial_axis_lowers_without_alltoall():
+    mesh = DeviceMesh(
+        "cuda",
+        torch.arange(32).reshape(2, 2, 8),
+        mesh_dim_names=("dp_replicate", "dp_shard", "tp"),
+    )
+    graph = torch.fx.Graph()
+    producer = graph.placeholder("producer")
+    consumer = graph.call_function(torch.ops.aten.clone.default, (producer,))
+    graph.output(consumer)
+    gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+    tensor_meta = _make_tensor_meta([14336, 4096])
+    source = DTensorSpec(
+        mesh,
+        (Partial(), Partial(), Shard(0)),
+        tensor_meta=tensor_meta,
+    )
+    target = DTensorSpec(
+        mesh,
+        (Replicate(), Shard(0), Shard(0)),
+        tensor_meta=tensor_meta,
+    )
+    preferred = (ShardOrderEntry(tensor_dim=0, mesh_dims=(2, 1)),)
+    interp = ApplyShardingInterpreter(
+        gm,
+        {},
+        param_placement_order={consumer: OrderInfo(preferred)},
+    )
+
+    def redistribute(value):
+        return interp.redistribute_tensor(
+            value, source, target, consumer, producer=producer
+        )
+
+    traced = make_fx(redistribute, tracing_mode="real")(
+        torch.randn(1792, 4096, device="meta")
+    )
+    assert _count_collectives(traced) == {
+        "all_gather": 0,
+        "reduce_scatter": 1,
+        "alltoall": 0,
+    }
+    collectives = [
+        "all_reduce"
+        if "all_reduce" in getattr(node.target, "__name__", "")
+        else "reduce_scatter"
+        for node in traced.graph.nodes
+        if node.op == "call_function"
+        and any(
+            name in getattr(node.target, "__name__", "")
+            for name in ("all_reduce", "reduce_scatter")
+        )
+    ]
+    assert collectives == ["all_reduce", "reduce_scatter"]
