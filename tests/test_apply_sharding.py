@@ -507,6 +507,20 @@ def test_partial_subset_producer_establishes_order_without_collectives():
         grad_producer,
         carrier,
     ) == {"all_gather": 0, "reduce_scatter": 0, "alltoall": 0}
+    lm_head_meta = _make_tensor_meta([8, 64, 128256])
+    lm_head_source = DTensorSpec(
+        mesh, (Shard(0), Shard(1), Shard(2)), tensor_meta=lm_head_meta
+    )
+    lm_head_target = DTensorSpec(
+        mesh, (Shard(0), Shard(2), Shard(2)), tensor_meta=lm_head_meta
+    )
+    assert trace_redistribution(
+        torch.randn(2, 32, 32064, device="meta"),
+        lm_head_source,
+        lm_head_target,
+        grad_producer,
+        carrier,
+    ) == {"all_gather": 0, "reduce_scatter": 0, "alltoall": 1}
     assert trace_redistribution(
         torch.randn(448, 4096, device="meta"),
         storage,

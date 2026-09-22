@@ -881,8 +881,6 @@ def _producer_order_plan(
             return None
         if concrete is None or not _plan_matches_solver(concrete, source, target):
             return None
-        if any(kind != "local" for kind, _ in concrete.operations):
-            return None
         planned_edges.append((source, target, concrete))
 
     return (
@@ -1049,7 +1047,10 @@ def _multi_boundary_adjoint_improves_fallback(
         )
         if not baseline_differs_from_solver:
             return None
-    if any(plan.all_to_all_count for plan in candidate_plans):
+    if any(
+        plan.all_to_all_count
+        for plan in candidate_forward_plans + candidate_backward_plans
+    ):
         return None
     if multi_boundary_plan.grad_producer is None and not any(
         plan.all_to_all_count for plan in baseline_plans

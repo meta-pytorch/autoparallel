@@ -1235,7 +1235,19 @@ def test_partial_subset_order_reaches_unique_gradient_producer():
         torch.arange(32).reshape(4, 2, 4),
         mesh_dim_names=("dp", "cp", "tp"),
     )
-    for weight_shape in ((14336, 4096), (128256, 4096)):
+    cases = (
+        (
+            (14336, 4096),
+            (Shard(0), Replicate(), Shard(2)),
+            (Shard(0), Shard(2), Shard(2)),
+        ),
+        (
+            (128256, 4096),
+            (Shard(0), Shard(1), Shard(2)),
+            (Shard(0), Shard(2), Shard(2)),
+        ),
+    )
+    for weight_shape, carrier_source, carrier_target in cases:
         gm, nodes = _build_partial_subset_weight_graph()
         placement = _partial_subset_weight_placement(
             mesh,
@@ -1244,8 +1256,8 @@ def test_partial_subset_order_reaches_unique_gradient_producer():
             storage_placements=(Shard(0), Shard(0), Shard(0)),
             forward_target_placements=(Replicate(), Replicate(), Shard(0)),
             grad_source_placements=(Partial(), Shard(0), Shard(0)),
-            carrier_source_placements=(Shard(0), Replicate(), Shard(2)),
-            carrier_target_placements=(Shard(0), Shard(2), Shard(2)),
+            carrier_source_placements=carrier_source,
+            carrier_target_placements=carrier_target,
             other_placements=(Shard(0), Replicate(), Replicate()),
         )
 
@@ -1418,6 +1430,24 @@ def test_partial_subset_plan_matches_solver_cost_and_lowering():
         assert concrete is not None
         assert concrete.operations == expected_operations
         assert concrete.all_to_all_count == 0
+
+    lm_head_shape = (8, 64, 128256)
+    lm_head_source = _spec_with_meta(
+        mesh, (Shard(0), Shard(1), Shard(2)), lm_head_shape
+    )
+    lm_head_target = _spec_with_meta(
+        mesh, (Shard(0), Shard(2), Shard(2)), lm_head_shape
+    )
+    concrete = _fallback_plan(
+        lm_head_source,
+        _spec_with_shard_order(
+            lm_head_target,
+            _project_order_info(remapped, lm_head_target),
+        ),
+    )
+    assert concrete == _logical_plan(lm_head_source, lm_head_target)
+    assert concrete is not None
+    assert concrete.operations == (("all_to_all", (1,)),)
 
 
 def test_consumer_boundary_ignores_arguments_without_a_sharding_entry():
