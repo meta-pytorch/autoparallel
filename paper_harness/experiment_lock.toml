@@ -1,5 +1,5 @@
 schema_version = 1
-harness_version = "legacy-dtensor-v7-paper-submission-hsdp-apgt-trace-timeout60"
+harness_version = "legacy-dtensor-v8-paper-submission-hsdp-orthogonal-fix-trace"
 
 [sources.torchtitan]
 remote = "https://github.com/AlbedoWang/torchtitan.git"
@@ -8,7 +8,7 @@ dirty_policy = "forbid"
 
 [sources.autoparallel]
 remote = "https://github.com/meta-pytorch/autoparallel.git"
-commit = "a3cd1ab0f7bd871e70d2cf79d1fd4087a62342e5"
+commit = "f738c4be74f9ad00092551dda059539f0086cc32"
 dirty_policy = "forbid"
 
 [runtime]
