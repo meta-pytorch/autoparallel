@@ -169,6 +169,32 @@ class CampaignTests(unittest.TestCase):
         with self.assertRaisesRegex(CampaignError, "requires --point"):
             load_campaign(REPO_ROOT / "campaigns/muse_glimmer_30b.toml")
 
+    def test_merged_hsdp_settings(self) -> None:
+        settings = load_run_settings()
+        expected = {
+            ("llama3_8b", "3d-dpr2-dps2-tp8-paper-merged"): (2, 2, 8),
+            ("muse_glimmer_30b", "3d-dpr2-dps8-tp2-paper-merged"): (2, 8, 2),
+        }
+        for key, mesh in expected.items():
+            with self.subTest(model=key[0], setting=key[1]):
+                setting = settings[key]
+                campaign = load_campaign(setting.campaign, point=setting.point)
+                parallelism = campaign.raw["parallelism"]
+                self.assertEqual(
+                    (
+                        parallelism["data_parallel_replicate_degree"],
+                        parallelism["data_parallel_shard_degree"],
+                        parallelism["tensor_parallel_degree"],
+                    ),
+                    mesh,
+                )
+                ap_arm = next(
+                    arm for arm in campaign.arms if arm.name.startswith("apgt")
+                )
+                self.assertEqual(
+                    ap_arm.overrides["compile.autoparallel_solver"], "approx"
+                )
+
     def test_gate_mode_is_functional_and_trace_only(self) -> None:
         campaign = load_campaign(
             REPO_ROOT / "campaigns/muse_glimmer_30b.toml",

@@ -1,0 +1,136 @@
+schema_version = 1
+name = "llama3-8b-3d-2x2x8-hsdp"
+description = "Pinned LLaMA 3 8B MainTrainer, GraphTrainer, and AutoParallel on a dp_replicate 2 x dp_shard 2 x tp 8 mesh"
+workload = "llama3_8b_3d_hsdp"
+
+[model]
+flavor = "8B"
+attention_backend = "sdpa"
+
+[data]
+mode = "replay"
+identity = "manifest"
+dataset = "allenai/c4"
+revision = "1588ec454efa1a09f29cd18ddd04fe05fc8653a2"
+identity_manifest = "{asset:llama_replay}/manifest.json"
+identity_manifest_sha256 = "2f17a4bdf5328e6b9949d5c78ee66fb59393fba7f1c7d55cc827cc5923237020"
+preflight_auditor = "workloads.llama3_2d.input_preflight"
+
+[training]
+local_batch_size = 2
+global_batch_size = 8
+gradient_accumulation_steps = 1
+seq_len = 8192
+
+[parallelism]
+data_parallel_replicate_degree = 2
+data_parallel_shard_degree = 2
+tensor_parallel_degree = 8
+context_parallel_degree = 1
+pipeline_parallel_degree = 1
+
+[checkpoint]
+enable = true
+folder = "checkpoint"
+initial_load_path = "{asset:llama3_3d_seed_checkpoint}"
+initial_load_model_only = true
+initial_load_in_hf = true
+load_only = true
+create_seed_checkpoint = false
+
+[comparison]
+declared_variable = "training_parallelization_compile_stack"
+allowed_config_paths = ["compile.*", "model_spec.name"]
+allowed_environment_keys = ["BENCHMARK_CONFIGURATION", "EXPERIMENT_ARM"]
+pairs = [
+  ["tt_main_tp", "gt_manual"],
+  ["gt_manual", "apgt_hsdp"],
+  ["tt_main_tp", "apgt_hsdp"],
+]
+
+[mast]
+nodes = 4
+nproc_per_node = 8
+hardware = "grandteton_80g_roce"
+locality = "dc;pci1"
+gpu_name_contains = "H100"
+retries = 0
+master_port = 29500
+phase_timeout_seconds = 7200
+
+[mast.environment]
+BENCHMARK_MODEL = "8B"
+BENCHMARK_WORLD_SIZE = "32"
+BENCHMARK_TP_DEGREE = "8"
+BENCHMARK_DP_DEGREE = "4"
+BENCHMARK_DP_REPLICATE_DEGREE = "2"
+BENCHMARK_GLOBAL_BATCH_SIZE = "8"
+LLAMA_TOKENIZER_DIR = "{asset:llama_tokenizer}"
+REPLAY_TENSORS_PATH = "{asset:llama_replay}/replay_tokens.pt"
+REPLAY_MANIFEST_PATH = "{asset:llama_replay}/manifest.json"
+HF_HUB_OFFLINE = "1"
+HF_DATASETS_OFFLINE = "1"
+HF_HUB_DISABLE_XET = "1"
+PYTORCH_ALLOC_CONF = "expandable_segments:True"
+TORCHINDUCTOR_CUDAGRAPHS = "0"
+
+[artifacts]
+required_assets = ["llama_tokenizer", "llama_replay", "llama3_3d_seed_checkpoint"]
+warmup_steps = 5
+
+[[arms]]
+name = "tt_main_tp"
+profile = "tt_main_default_v1"
+module = "workloads.llama3_2d.perf_configs"
+config = "torchtitan_baseline_8b"
+[arms.environment]
+BENCHMARK_CONFIGURATION = "torchtitan_baseline"
+EXPERIMENT_ARM = "T"
+AP_COLLECTIVE_MUST_SAVE_EXPECTATION = "off"
+
+[[arms]]
+name = "gt_manual"
+profile = "gt_manual_eager_v1"
+module = "workloads.llama3_2d.perf_configs"
+config = "graphtrainer_manual_eager_8b"
+[arms.environment]
+BENCHMARK_CONFIGURATION = "graphtrainer_manual"
+EXPERIMENT_ARM = "M"
+AP_COLLECTIVE_MUST_SAVE_EXPECTATION = "off"
+
+[[arms]]
+name = "apgt_hsdp"
+profile = "apgt_validated_v1"
+module = "workloads.llama3_3d_hsdp.perf_configs"
+config = "autoparallel_graphtrainer_hsdp_8b"
+[arms.overrides]
+"compile.autoparallel_solver" = "approx"
+[arms.environment]
+BENCHMARK_CONFIGURATION = "autoparallel_graphtrainer"
+EXPERIMENT_ARM = "G"
+AP_COLLECTIVE_MUST_SAVE_EXPECTATION = "off"
+
+[[phases]]
+name = "performance"
+kind = "performance"
+arms = ["tt_main_tp", "gt_manual", "apgt_hsdp"]
+[phases.overrides]
+"training.steps" = 25
+"profiler.enable_profiling" = false
+"profiler.enable_memory_snapshot" = false
+"metrics.log_freq" = 5
+
+[[phases]]
+name = "trace"
+kind = "trace"
+arms = ["tt_main_tp", "gt_manual", "apgt_hsdp"]
+trace_ranks = [0]
+[phases.overrides]
+"training.steps" = 6
+"profiler.enable_profiling" = true
+"profiler.enable_memory_snapshot" = false
+"profiler.profile_freq" = 6
+"profiler.profiler_warmup" = 0
+"profiler.profiler_active" = 3
+"profiler.profiler_repeat" = 1
+"metrics.log_freq" = 1

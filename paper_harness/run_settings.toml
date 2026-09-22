@@ -147,3 +147,13 @@ model = "deepseek_v3_16b"
 setting = "3d-dps4-tp8-ep16-sp"
 campaign = "campaigns/deepseek_v3_16b_tp_ep.toml"
 point = "3d-dps4-tp8-ep16-sp"
+
+[[settings]]
+model = "llama3_8b"
+setting = "3d-dpr2-dps2-tp8-paper-merged"
+campaign = "campaigns/variants/llama3_8b_3d_2x2x8.toml"
+
+[[settings]]
+model = "muse_glimmer_30b"
+setting = "3d-dpr2-dps8-tp2-paper-merged"
+campaign = "campaigns/variants/muse_glimmer_30b_3d_2x8x2.toml"

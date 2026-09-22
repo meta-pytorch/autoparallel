@@ -114,6 +114,12 @@ if (WORLD_SIZE, TP_DEGREE) not in {
 }:
     raise ValueError(f"Unsupported mesh: {WORLD_SIZE=} {TP_DEGREE=}")
 DP_DEGREE = WORLD_SIZE // TP_DEGREE
+DP_REPLICATE_DEGREE = int(os.environ.get("BENCHMARK_DP_REPLICATE_DEGREE", "1"))
+if DP_REPLICATE_DEGREE < 1 or DP_DEGREE % DP_REPLICATE_DEGREE:
+    raise ValueError(
+        f"Unsupported data parallel split: {DP_DEGREE=} {DP_REPLICATE_DEGREE=}"
+    )
+DP_SHARD_DEGREE = DP_DEGREE // DP_REPLICATE_DEGREE
 
 LOCAL_BATCH_SIZE = 2
 SEQ_LEN = 8192
@@ -329,8 +335,8 @@ def _base_config():
     )
     config.parallelism = replace(
         config.parallelism,
-        data_parallel_replicate_degree=1,
-        data_parallel_shard_degree=DP_DEGREE,
+        data_parallel_replicate_degree=DP_REPLICATE_DEGREE,
+        data_parallel_shard_degree=DP_SHARD_DEGREE,
         tensor_parallel_degree=TP_DEGREE,
         enable_sequence_parallel=True,
         context_parallel_degree=1,

@@ -127,3 +127,28 @@ def validate_apgt_source(torchtitan_root: Path) -> dict[str, Any]:
         "autoparallel_api_path": str(api_path.resolve()),
         "trainer_path": str(trainer_path.resolve()),
     }
+
+
+def validate_parameter_axis_constraint_source(
+    autoparallel_root: Path,
+) -> dict[str, Any]:
+    api_path = autoparallel_root / "autoparallel/api.py"
+    optimizer_path = autoparallel_root / "autoparallel/optimize_sharding.py"
+    required = {
+        api_path: "def add_parameter_axis_constraint",
+        optimizer_path: "def add_parameter_axis_constraint",
+    }
+    missing = [
+        str(path)
+        for path, token in required.items()
+        if not path.is_file() or token not in path.read_text()
+    ]
+    if missing:
+        raise CampaignError(
+            "HSDP AutoParallel requires parameter-axis constraints: " f"{missing}"
+        )
+    return {
+        "status": "passed",
+        "api_path": str(api_path.resolve()),
+        "optimizer_path": str(optimizer_path.resolve()),
+    }

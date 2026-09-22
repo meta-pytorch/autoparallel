@@ -1,5 +1,5 @@
 schema_version = 1
-harness_version = "legacy-dtensor-v3-paper-submission-shard-order-cp-matrix"
+harness_version = "legacy-dtensor-v4-paper-submission-hsdp-merged"
 
 [sources.torchtitan]
 remote = "https://github.com/AlbedoWang/torchtitan.git"
@@ -8,7 +8,7 @@ dirty_policy = "forbid"
 
 [sources.autoparallel]
 remote = "https://github.com/meta-pytorch/autoparallel.git"
-commit = "684b85331f995400517faf9c467cabb906a39801"
+commit = "d8d7fedca1748511488a3b697dc1bb8543b3d342"
 dirty_policy = "forbid"
 
 [runtime]

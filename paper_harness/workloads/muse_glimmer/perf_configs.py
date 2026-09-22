@@ -13,6 +13,8 @@ from torchtitan.experiments.graph_trainer.muse_glimmer.config_registry import (
 )
 from workloads.parameter_state import register_post_load_parameter_audit
 
+from .hsdp import parallelize_autoparallel_hsdp_muse_glimmer
+
 
 def _with_post_load_audit(config):
     config.model_spec = replace(
@@ -43,5 +45,15 @@ def graph_trainer_muse_glimmer_30b_sdpa_c4_autoparallel_4x2():
         config.compile,
         inductor_compilation="full",
         disable_passes=["cudagraph_pass"],
+    )
+    return config
+
+
+def graph_trainer_muse_glimmer_30b_sdpa_c4_autoparallel_hsdp():
+    config = graph_trainer_muse_glimmer_30b_sdpa_c4_autoparallel_4x2()
+    config.model_spec = replace(
+        config.model_spec,
+        name="autoparallel_graphtrainer/hsdp_3d/muse_glimmer",
+        parallelize_fn=parallelize_autoparallel_hsdp_muse_glimmer,
     )
     return config

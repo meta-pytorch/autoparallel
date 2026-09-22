@@ -45,7 +45,9 @@ def audit(
     del output, environment
     parallelism = resolved["parallelism"]
     tp_degree = int(parallelism["tensor_parallel_degree"])
+    replicate_degree = int(parallelism["data_parallel_replicate_degree"])
     fsdp_degree = int(parallelism["data_parallel_shard_degree"])
+    dp_degree = replicate_degree * fsdp_degree
     dp_rank, tp_rank = divmod(rank, tp_degree)
     manifest_path = _manifest_path(payload, resolved["data"]["identity_manifest"])
     records = [json.loads(line) for line in manifest_path.read_text().splitlines()]
@@ -68,6 +70,7 @@ def audit(
     )
     config.parallelism = replace(
         config.parallelism,
+        data_parallel_replicate_degree=replicate_degree,
         data_parallel_shard_degree=fsdp_degree,
         tensor_parallel_degree=tp_degree,
     )
@@ -75,7 +78,7 @@ def audit(
         tokenizer_path=str(payload / "assets/muse_glimmer")
     )
     dataloader = config.dataloader.build(
-        dp_world_size=fsdp_degree,
+        dp_world_size=dp_degree,
         dp_rank=dp_rank,
         tokenizer=tokenizer,
         seq_len=config.training.seq_len,

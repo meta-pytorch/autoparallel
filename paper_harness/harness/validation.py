@@ -13,7 +13,11 @@ from .campaign import Campaign, CampaignError, write_json
 from .experiment_lock import experiment_lock_digest, load_experiment_lock
 from .integrity import validate_harness_integrity
 from .parity import validate_pair
-from .profiles import validate_apgt_source, validate_profile
+from .profiles import (
+    validate_apgt_source,
+    validate_parameter_axis_constraint_source,
+    validate_profile,
+)
 from .sources import inspect_source, manifest_digest, tree_manifest
 
 
@@ -183,6 +187,10 @@ def validate_campaign(
     contract: dict[str, Any] = {}
     if "apgt_validated_v1" in profiles:
         contract["apgt_validated_v1"] = validate_apgt_source(torchtitan_root)
+        if int(campaign.raw["parallelism"]["data_parallel_replicate_degree"]) > 1:
+            contract["parameter_axis_constraint"] = (
+                validate_parameter_axis_constraint_source(autoparallel_root)
+            )
 
     resolved = campaign.resolved_dict()
     resolved["experiment_lock"] = experiment_lock
@@ -228,9 +236,11 @@ def validate_campaign(
                 raw_probe_env.setdefault("BENCHMARK_OUTPUT_DIR", "{output}")
                 raw_probe_env.setdefault(
                     "RANK",
-                    str(phase.trace_ranks[0])
-                    if phase.kind in {"trace", "kineto"} and phase.trace_ranks
-                    else "0",
+                    (
+                        str(phase.trace_ranks[0])
+                        if phase.kind in {"trace", "kineto"} and phase.trace_ranks
+                        else "0"
+                    ),
                 )
                 raw_probe_env.setdefault(
                     "BENCHMARK_SOURCE_LOCK_SHA256", source_lock_sha256
@@ -310,9 +320,9 @@ def validate_campaign(
                     serialized[right_key],
                     list(comparison["allowed_config_paths"]),
                 )
-                check[
-                    "phase"
-                ] = f"{phase_by_arm[baseline]} -> {phase_by_arm[treatment]}"
+                check["phase"] = (
+                    f"{phase_by_arm[baseline]} -> {phase_by_arm[treatment]}"
+                )
                 parity_checks.append(check)
                 environment_check = validate_pair(
                     baseline,

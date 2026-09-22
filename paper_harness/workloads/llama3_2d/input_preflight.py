@@ -16,7 +16,9 @@ def _sha256(path: Path) -> str:
 
 
 def _tensor_sha256(tensor: torch.Tensor) -> str:
-    return hashlib.sha256(tensor.detach().cpu().contiguous().numpy().tobytes()).hexdigest()
+    return hashlib.sha256(
+        tensor.detach().cpu().contiguous().numpy().tobytes()
+    ).hexdigest()
 
 
 def audit(
@@ -34,7 +36,10 @@ def audit(
     replay_path = Path(environment["REPLAY_TENSORS_PATH"])
     manifest = json.loads(manifest_path.read_text())
     replay = manifest["replay_file"]
-    if replay_path.stat().st_size != replay["size"] or _sha256(replay_path) != replay["sha256"]:
+    if (
+        replay_path.stat().st_size != replay["size"]
+        or _sha256(replay_path) != replay["sha256"]
+    ):
         raise RuntimeError("replay file differs from its manifest")
     tensors = torch.load(replay_path, map_location="cpu", mmap=True, weights_only=True)
     expected_shape = tuple(manifest["shape"])
@@ -57,7 +62,8 @@ def audit(
         "tensor_sha256": observed,
         "shape": list(expected_shape),
         "logical_mapping": {
-            "dp_degree": parallelism["data_parallel_shard_degree"],
+            "dp_degree": parallelism["data_parallel_replicate_degree"]
+            * parallelism["data_parallel_shard_degree"],
             "gradient_accumulation_steps": resolved["training"][
                 "gradient_accumulation_steps"
             ],

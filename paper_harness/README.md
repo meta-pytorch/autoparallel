@@ -20,9 +20,11 @@ Valid settings are declared in `run_settings.toml`:
 
 - `llama3_8b`: `2d-8gpu`, `2d-16gpu`, `2d-32gpu`, `2d-64gpu`,
   `2d-128gpu`, `1d-fsdp8`, `2d-dps2-tp8`, `3d-dp2-cp2-tp2`,
-  `3d-dps4-cp2-tp4`, and `seqlen-{2k,4k,8k,16k,32k}`;
+  `3d-dps4-cp2-tp4`, `3d-dpr2-dps2-tp8-paper-merged`, and
+  `seqlen-{2k,4k,8k,16k,32k}`;
 - `muse_glimmer_30b`: `1d-fsdp8`, `2d-dps8-tp2`, and
-  `2d-{16gpu,32gpu,64gpu,128gpu}`;
+  `2d-{16gpu,32gpu,64gpu,128gpu}`, plus
+  `3d-dpr2-dps8-tp2-paper-merged`;
 - `deepseek_v3_16b`: `efsdp-ep-{16gpu,32gpu}`, `1d-tp8-ep8-sp`,
   `2d-dps2-tp8-ep8-sp`, and `3d-dps4-tp8-ep16-sp`.
 
