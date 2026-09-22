@@ -1,5 +1,5 @@
 schema_version = 1
-harness_version = "legacy-dtensor-v5-paper-submission-hsdp-a2a-sac-merged"
+harness_version = "legacy-dtensor-v6-paper-submission-hsdp-a2a-sac-timeout60"
 
 [sources.torchtitan]
 remote = "https://github.com/AlbedoWang/torchtitan.git"
