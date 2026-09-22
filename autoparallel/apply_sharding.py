@@ -128,9 +128,14 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
         preferred_shard_order = self.param_placement_order[
             order_source
         ].preferred_shard_order
-        curr_shard_order = _project_shard_order(
-            preferred_shard_order,
-            curr_spec,
+        # The source layout belongs to its producer.  At a backward boundary,
+        # the ordered chain is the consumer, so an unordered producer still
+        # emits the source in its default order.  Treating that source as
+        # already ordered only relabels its shards and corrupts the gradient.
+        curr_shard_order = (
+            _project_shard_order(preferred_shard_order, curr_spec)
+            if producer is None or producer in self.param_placement_order
+            else curr_spec.shard_order
         )
         tgt_shard_order = _project_shard_order(
             preferred_shard_order,

@@ -47,8 +47,8 @@ class _FallbackPlan:
     cost: float
 
     @property
-    def has_all_to_all(self) -> bool:
-        return any(kind == "all_to_all" for kind, _ in self.operations)
+    def all_to_all_count(self) -> int:
+        return sum(kind == "all_to_all" for kind, _ in self.operations)
 
 
 def _infer_fsdplike_storage_order(
@@ -563,6 +563,19 @@ def _candidate_edge(
     )
 
 
+def _candidate_target_edge(
+    edge: tuple[torch.fx.Node, DTensorSpec, DTensorSpec],
+    preferred_order: ShardOrder,
+) -> tuple[torch.fx.Node, DTensorSpec, DTensorSpec]:
+    """Keep an unordered producer's source order and order only the target."""
+    node, source, target = _default_edge(edge)
+    return (
+        node,
+        source,
+        _spec_with_shard_order(target, _project_shard_order(preferred_order, target)),
+    )
+
+
 def _default_edge(
     edge: tuple[torch.fx.Node, DTensorSpec, DTensorSpec],
 ) -> tuple[torch.fx.Node, DTensorSpec, DTensorSpec]:
@@ -665,7 +678,7 @@ def _multi_boundary_adjoint_improves_fallback(
     candidate_forward = list(baseline_forward)
     candidate_backward = list(baseline_backward)
     candidate_forward[0] = _candidate_edge(forward[0], preferred_order)
-    candidate_backward[-1] = _candidate_edge(backward[-1], preferred_order)
+    candidate_backward[-1] = _candidate_target_edge(backward[-1], preferred_order)
 
     baseline_plans = _plans_for_edges(baseline_forward + baseline_backward)
     candidate_forward_plans = _plans_for_edges(candidate_forward)
@@ -677,9 +690,12 @@ def _multi_boundary_adjoint_improves_fallback(
     ):
         return False
     candidate_plans = candidate_forward_plans + candidate_backward_plans
-    if not any(plan.has_all_to_all for plan in baseline_plans):
-        return False
-    if any(plan.has_all_to_all for plan in candidate_plans):
+    baseline_all_to_all_count = sum(plan.all_to_all_count for plan in baseline_plans)
+    candidate_all_to_all_count = sum(plan.all_to_all_count for plan in candidate_plans)
+    if (
+        baseline_all_to_all_count == 0
+        or candidate_all_to_all_count >= baseline_all_to_all_count
+    ):
         return False
     if sum(plan.cost for plan in candidate_plans) >= sum(
         plan.cost for plan in baseline_plans
@@ -695,12 +711,15 @@ def _multi_boundary_adjoint_improves_fallback(
         for mesh_dim in reversed(planned_forward_order)
         if mesh_dim in backward_order
     )
-    if (
-        _planned_collective_order(
-            candidate_backward_plans, reordered_mesh_dims, "reduce_scatter"
-        )
-        != expected_backward_order
-    ):
+    planned_backward_order = tuple(
+        mesh_dim
+        for plan in candidate_backward_plans
+        for kind, mesh_dims in plan.operations
+        if kind == "reduce_scatter"
+        for mesh_dim in mesh_dims
+        if mesh_dim in reordered_mesh_dims
+    )
+    if planned_backward_order != expected_backward_order:
         return False
 
     try:
