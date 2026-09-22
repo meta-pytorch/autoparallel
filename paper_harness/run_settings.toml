@@ -162,3 +162,8 @@ campaign = "campaigns/variants/muse_glimmer_30b_3d_2x8x2.toml"
 model = "llama3_8b"
 setting = "3d-dpr2-dps2-tp8-a2a-sac-timeout60"
 campaign = "campaigns/variants/llama3_8b_3d_2x2x8_timeout60.toml"
+
+[[settings]]
+model = "llama3_8b"
+setting = "3d-dpr2-dps2-tp8-apgt-trace-timeout60"
+campaign = "campaigns/variants/llama3_8b_3d_2x2x8_apgt_trace_timeout60.toml"
