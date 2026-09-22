@@ -1,14 +1,14 @@
 schema_version = 1
-harness_version = "legacy-dtensor-v4-paper-submission-hsdp-merged"
+harness_version = "legacy-dtensor-v5-paper-submission-hsdp-a2a-sac-merged"
 
 [sources.torchtitan]
 remote = "https://github.com/AlbedoWang/torchtitan.git"
-commit = "94e596cc9aaaf257556d7ad1c6f9c064fc566776"
+commit = "e8068c445f93541c2169f52378e4bc7e0fba23ee"
 dirty_policy = "forbid"
 
 [sources.autoparallel]
 remote = "https://github.com/meta-pytorch/autoparallel.git"
-commit = "d8d7fedca1748511488a3b697dc1bb8543b3d342"
+commit = "a3cd1ab0f7bd871e70d2cf79d1fd4087a62342e5"
 dirty_policy = "forbid"
 
 [runtime]
