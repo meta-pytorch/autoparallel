@@ -27,7 +27,9 @@ from torch.utils._pytree import tree_flatten, tree_map_only
 
 from .graph_passes.graph_utils import all_input_nodes, cleanup_graph
 from .shardings.ordered_sharding import (
+    _project_order_info,
     _project_shard_order,
+    _resolve_edge_shard_orders,
     compute_optimal_placement_order_for_parameters,
     ordered_redistribute_local_tensor,
 )
@@ -117,31 +119,13 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
         # shard_order should be automatically assigned once `placements` is set
         assert curr_spec.shard_order is not None
         assert tgt_spec.shard_order is not None
-        # The storage order lives on the parameter chain. A boundary between a
-        # chain node and a consumer that is not itself on the chain -- a matmul,
-        # or the local_map region MoE expert weights are passed into -- still has
-        # to be lowered in the chain's order, or the tensor is read in a layout it
-        # was not stored in.
-        order_source = node if node in self.param_placement_order else producer
-        if order_source is None or order_source not in self.param_placement_order:
-            return curr_spec.shard_order, tgt_spec.shard_order
-        preferred_shard_order = self.param_placement_order[
-            order_source
-        ].preferred_shard_order
-        # The source layout belongs to its producer.  At a backward boundary,
-        # the ordered chain is the consumer, so an unordered producer still
-        # emits the source in its default order.  Treating that source as
-        # already ordered only relabels its shards and corrupts the gradient.
-        curr_shard_order = (
-            _project_shard_order(preferred_shard_order, curr_spec)
-            if producer is None or producer in self.param_placement_order
-            else curr_spec.shard_order
-        )
-        tgt_shard_order = _project_shard_order(
-            preferred_shard_order,
+        return _resolve_edge_shard_orders(
+            node,
+            producer,
+            curr_spec,
             tgt_spec,
+            self.param_placement_order,
         )
-        return curr_shard_order, tgt_shard_order
 
     def redistribute_tensor(self, arg, curr_spec, tgt_spec, node, producer=None):
         tgt_placements = tuple(
@@ -307,9 +291,8 @@ def _build_physical_placements(sharding_placement, param_placement_order):
             continue
         tgt_spec = op_spec.input_specs[0]
         if node in param_placement_order:
-            preferred_shard_order = _project_shard_order(
-                param_placement_order[node].preferred_shard_order,
-                tgt_spec,
+            preferred_shard_order = _project_order_info(
+                param_placement_order[node], tgt_spec
             )
             if preferred_shard_order != tgt_spec.shard_order:
                 placements = DTensorSpec._convert_shard_order_to_StridedShard(

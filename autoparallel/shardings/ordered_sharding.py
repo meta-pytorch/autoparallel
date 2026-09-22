@@ -39,6 +39,7 @@ class OrderInfo:
     """Preferred physical shard order for a parameter and its gradient."""
 
     preferred_shard_order: ShardOrder
+    project_by_mesh_priority: bool = False
 
 
 @dataclass(frozen=True)
@@ -49,6 +50,12 @@ class _FallbackPlan:
     @property
     def all_to_all_count(self) -> int:
         return sum(kind == "all_to_all" for kind, _ in self.operations)
+
+
+@dataclass(frozen=True)
+class _MultiBoundaryPlan:
+    grad_producer: Optional[torch.fx.Node] = None
+    carrier_input: Optional[torch.fx.Node] = None
 
 
 def _infer_fsdplike_storage_order(
@@ -151,6 +158,82 @@ def _project_shard_order(
         assert spec.shard_order is not None
         return spec.shard_order
     return tuple(projected_order)
+
+
+def _project_shard_order_by_mesh_priority(
+    preferred_shard_order: ShardOrder,
+    spec: DTensorSpec,
+) -> Optional[ShardOrder]:
+    """Project storage mesh order through a tensor-dimension-changing chain."""
+    mesh_dim_priority: dict[int, tuple[int, int]] = {}
+    for group_index, entry in enumerate(preferred_shard_order):
+        for order_index, mesh_dim in enumerate(entry.mesh_dims):
+            if mesh_dim in mesh_dim_priority:
+                return None
+            mesh_dim_priority[mesh_dim] = (group_index, order_index)
+
+    shards_by_tensor_dim: dict[int, list[int]] = defaultdict(list)
+    for mesh_dim, placement in enumerate(spec.placements):
+        if isinstance(placement, Shard):
+            if mesh_dim not in mesh_dim_priority:
+                return None
+            shards_by_tensor_dim[placement.dim].append(mesh_dim)
+
+    projected_order = []
+    for tensor_dim in sorted(shards_by_tensor_dim):
+        mesh_dims = shards_by_tensor_dim[tensor_dim]
+        source_groups = {mesh_dim_priority[mesh_dim][0] for mesh_dim in mesh_dims}
+        if len(source_groups) != 1:
+            return None
+        projected_order.append(
+            ShardOrderEntry(
+                tensor_dim=tensor_dim,
+                mesh_dims=tuple(
+                    sorted(mesh_dims, key=lambda dim: mesh_dim_priority[dim][1])
+                ),
+            )
+        )
+    return tuple(projected_order)
+
+
+def _project_order_info(order_info: OrderInfo, spec: DTensorSpec) -> ShardOrder:
+    if not order_info.project_by_mesh_priority:
+        return _project_shard_order(order_info.preferred_shard_order, spec)
+    projected = _project_shard_order_by_mesh_priority(
+        order_info.preferred_shard_order, spec
+    )
+    if projected is None:
+        raise ValueError(f"Cannot project {order_info} onto {spec}")
+    return projected
+
+
+def _resolve_edge_shard_orders(
+    consumer: torch.fx.Node,
+    producer: Optional[torch.fx.Node],
+    current_spec: DTensorSpec,
+    target_spec: DTensorSpec,
+    order_map: dict[torch.fx.Node, OrderInfo],
+) -> tuple[ShardOrder, ShardOrder]:
+    """Resolve physical orders from the nodes that own each side of an edge."""
+    source_info = order_map.get(producer) if producer is not None else None
+    target_info = order_map.get(consumer)
+    if producer is None:
+        source_info = target_info
+    if target_info is None:
+        target_info = source_info
+    current_order = (
+        _project_order_info(source_info, current_spec)
+        if source_info is not None
+        else current_spec.shard_order
+    )
+    target_order = (
+        _project_order_info(target_info, target_spec)
+        if target_info is not None
+        else target_spec.shard_order
+    )
+    assert current_order is not None
+    assert target_order is not None
+    return current_order, target_order
 
 
 def _spec_with_shard_order(spec: DTensorSpec, shard_order: ShardOrder) -> DTensorSpec:
@@ -563,19 +646,6 @@ def _candidate_edge(
     )
 
 
-def _candidate_target_edge(
-    edge: tuple[torch.fx.Node, DTensorSpec, DTensorSpec],
-    preferred_order: ShardOrder,
-) -> tuple[torch.fx.Node, DTensorSpec, DTensorSpec]:
-    """Keep an unordered producer's source order and order only the target."""
-    node, source, target = _default_edge(edge)
-    return (
-        node,
-        source,
-        _spec_with_shard_order(target, _project_shard_order(preferred_order, target)),
-    )
-
-
 def _default_edge(
     edge: tuple[torch.fx.Node, DTensorSpec, DTensorSpec],
 ) -> tuple[torch.fx.Node, DTensorSpec, DTensorSpec]:
@@ -591,6 +661,28 @@ def _default_edge(
     )
 
 
+def _ordered_edge(
+    edge: tuple[torch.fx.Node, DTensorSpec, DTensorSpec],
+    order_map: dict[torch.fx.Node, OrderInfo],
+) -> tuple[torch.fx.Node, DTensorSpec, DTensorSpec]:
+    node, source, target = edge
+    input_nodes = [
+        value
+        for value in tree_flatten(node.args)[0]
+        if isinstance(value, torch.fx.Node)
+    ]
+    if len(input_nodes) != 1:
+        raise ValueError(f"Expected one input for ordered edge at {node}")
+    source_order, target_order = _resolve_edge_shard_orders(
+        node, input_nodes[0], source, target, order_map
+    )
+    return (
+        node,
+        _spec_with_shard_order(source, source_order),
+        _spec_with_shard_order(target, target_order),
+    )
+
+
 def _plans_for_edges(
     edges: list[tuple[torch.fx.Node, DTensorSpec, DTensorSpec]],
 ) -> Optional[list[_FallbackPlan]]:
@@ -598,6 +690,205 @@ def _plans_for_edges(
     if any(plan is None for plan in plans):
         return None
     return [plan for plan in plans if plan is not None]
+
+
+def _logical_plan(source: DTensorSpec, target: DTensorSpec) -> Optional[_FallbackPlan]:
+    """Return the placement-only plan priced by the solver cost model."""
+    if source.mesh != target.mesh or len(source.placements) != len(target.placements):
+        return None
+    operations = []
+    for mesh_dim, (src, dst) in enumerate(zip(source.placements, target.placements)):
+        if src == dst:
+            continue
+        if isinstance(src, Shard) and isinstance(dst, Replicate):
+            kind = "all_gather"
+        elif isinstance(src, Shard) and isinstance(dst, Shard):
+            kind = "all_to_all"
+        elif isinstance(src, Partial) and isinstance(dst, Replicate):
+            kind = "all_reduce"
+        elif isinstance(src, Partial) and isinstance(dst, Shard):
+            kind = "reduce_scatter"
+        elif isinstance(src, Replicate) and isinstance(dst, Shard):
+            kind = "local"
+        else:
+            return None
+        operations.append((kind, (mesh_dim,)))
+    cost = float(redistribute_cost(source, target, list(range(source.mesh.ndim))))
+    if not math.isfinite(cost):
+        return None
+    return _FallbackPlan(tuple(operations), cost)
+
+
+def _plan_matches_solver(
+    concrete: _FallbackPlan,
+    source: DTensorSpec,
+    target: DTensorSpec,
+) -> bool:
+    logical = _logical_plan(source, target)
+    return (
+        logical is not None
+        and concrete.operations == logical.operations
+        and concrete.cost == logical.cost
+    )
+
+
+def _input_edges(
+    node: torch.fx.Node,
+    sharding_placement: dict[torch.fx.Node, OpSpec],
+) -> Optional[list[tuple[torch.fx.Node, torch.fx.Node, DTensorSpec, DTensorSpec]]]:
+    node_spec = sharding_placement.get(node)
+    if node_spec is None or node_spec.input_specs is None:
+        return None
+    input_nodes = [
+        input_node
+        for input_node in all_input_nodes(node)
+        if input_node in sharding_placement
+    ]
+    if len(input_nodes) != len(node_spec.input_specs):
+        return None
+    edges = []
+    for input_node, target in zip(input_nodes, node_spec.input_specs):
+        source = sharding_placement[input_node].output_specs
+        if not isinstance(source, DTensorSpec) or not isinstance(target, DTensorSpec):
+            return None
+        target = DTensorSpec(
+            target.mesh,
+            tuple(
+                Replicate() if isinstance(placement, Partial) else placement
+                for placement in target.placements
+            ),
+            tensor_meta=target.tensor_meta,
+        )
+        edges.append((node, input_node, source, target))
+    return edges
+
+
+def _producer_order_plan(
+    grad_chain: list[torch.fx.Node],
+    last_source: DTensorSpec,
+    sharding_placement: dict[torch.fx.Node, OpSpec],
+    preferred_order: ShardOrder,
+    reordered_mesh_dims: frozenset[int],
+) -> Optional[
+    tuple[
+        _MultiBoundaryPlan,
+        list[tuple[DTensorSpec, DTensorSpec, _FallbackPlan]],
+    ]
+]:
+    """Prove that one producer input establishes the intermediate shard order."""
+    if not grad_chain:
+        return None
+    carried_mesh_dims = frozenset(
+        mesh_dim
+        for mesh_dim in reordered_mesh_dims
+        if isinstance(last_source.placements[mesh_dim], Shard)
+    )
+    if not carried_mesh_dims:
+        return None
+
+    chain_tail = grad_chain[-1]
+    tail_inputs = chain_tail.all_input_nodes
+    if len(tail_inputs) != 1:
+        return None
+    producer = tail_inputs[0]
+    if set(producer.users) != {chain_tail}:
+        return None
+    producer_spec = sharding_placement.get(producer)
+    if producer_spec is None or not isinstance(producer_spec.output_specs, DTensorSpec):
+        return None
+
+    previous = producer
+    for consumer in reversed(grad_chain):
+        edges = _input_edges(consumer, sharding_placement)
+        if edges is None or len(edges) != 1 or edges[0][1] is not previous:
+            return None
+        _, _, source, target = edges[0]
+        output = sharding_placement[consumer].output_specs
+        if not isinstance(output, DTensorSpec):
+            return None
+        if (
+            source.tensor_meta is None
+            or target.tensor_meta is None
+            or output.tensor_meta is None
+        ):
+            return None
+        for mesh_dim in carried_mesh_dims:
+            src = source.placements[mesh_dim]
+            dst = target.placements[mesh_dim]
+            out = output.placements[mesh_dim]
+            if not (
+                isinstance(src, Shard)
+                and isinstance(dst, Shard)
+                and isinstance(out, Shard)
+                and src.dim == dst.dim
+                and source.shape[src.dim] == target.shape[dst.dim]
+                and target.shape[dst.dim] == output.shape[out.dim]
+            ):
+                return None
+        previous = consumer
+
+    producer_edges = _input_edges(producer, sharding_placement)
+    if producer_edges is None:
+        return None
+    carrier_edges = [
+        edge
+        for edge in producer_edges
+        if all(
+            isinstance(edge[3].placements[mesh_dim], Shard)
+            for mesh_dim in carried_mesh_dims
+        )
+    ]
+    if len(carrier_edges) != 1:
+        return None
+    carrier_edge = carrier_edges[0]
+    for edge in producer_edges:
+        if edge is carrier_edge:
+            continue
+        if any(
+            isinstance(edge[3].placements[mesh_dim], Shard)
+            for mesh_dim in carried_mesh_dims
+        ):
+            return None
+
+    for mesh_dim in carried_mesh_dims:
+        output_placement = producer_spec.output_specs.placements[mesh_dim]
+        carrier_placement = carrier_edge[3].placements[mesh_dim]
+        if not isinstance(output_placement, Shard) or not isinstance(
+            carrier_placement, Shard
+        ):
+            return None
+        if (
+            producer_spec.output_specs.tensor_meta is None
+            or carrier_edge[3].tensor_meta is None
+            or producer_spec.output_specs.shape[output_placement.dim]
+            != carrier_edge[3].shape[carrier_placement.dim]
+        ):
+            return None
+
+    producer_info = OrderInfo(preferred_order, project_by_mesh_priority=True)
+    producer_order_map = {producer: producer_info}
+    planned_edges = []
+    for consumer, input_node, source, target in producer_edges:
+        try:
+            source_order, target_order = _resolve_edge_shard_orders(
+                consumer, input_node, source, target, producer_order_map
+            )
+            concrete = _fallback_plan(
+                _spec_with_shard_order(source, source_order),
+                _spec_with_shard_order(target, target_order),
+            )
+        except (AssertionError, RuntimeError, TypeError, ValueError):
+            return None
+        if concrete is None or not _plan_matches_solver(concrete, source, target):
+            return None
+        if any(kind != "local" for kind, _ in concrete.operations):
+            return None
+        planned_edges.append((source, target, concrete))
+
+    return (
+        _MultiBoundaryPlan(producer, carrier_edge[1]),
+        planned_edges,
+    )
 
 
 def _planned_collective_order(
@@ -623,32 +914,32 @@ def _multi_boundary_adjoint_improves_fallback(
     grad_chain: list[torch.fx.Node],
     sharding_placement: dict[torch.fx.Node, OpSpec],
     preferred_order: ShardOrder,
-) -> bool:
+) -> Optional[_MultiBoundaryPlan]:
     """Gate PR #529's multi-boundary extension on the concrete fallback plans."""
     param_prefix = _unambiguous_param_prefix(param_chain)
     grad_prefix = _unambiguous_grad_prefix(grad_chain)
     if not param_prefix or not grad_prefix:
-        return False
+        return None
     forward = _get_chain_redistributions(param_prefix, sharding_placement)
     backward_from_storage = _get_chain_redistributions(grad_prefix, sharding_placement)
     if not forward or not backward_from_storage:
-        return False
+        return None
     backward = list(reversed(backward_from_storage))
     first_source = forward[0][1]
     last_source, last_target = backward[-1][1:]
     if first_source.placements != storage.placements:
-        return False
+        return None
     if last_target.placements != storage.placements:
-        return False
+        return None
     if first_source.tensor_meta is None or storage.tensor_meta is None:
-        return False
+        return None
     if (
         first_source.shape != storage.shape
         or first_source.stride != storage.stride
         or last_target.shape != storage.shape
         or last_target.stride != storage.stride
     ):
-        return False
+        return None
 
     reordered_mesh_dims = _reordered_mesh_dims(storage.placements, preferred_order)
     forward_order = _logical_collective_order(
@@ -664,21 +955,50 @@ def _multi_boundary_adjoint_improves_fallback(
         or not backward_order
         or not set(backward_order).issubset(forward_order)
     ):
-        return False
+        return None
 
     expected_grad_source = tuple(
         Partial() if mesh_dim in backward_order else placement
         for mesh_dim, placement in enumerate(storage.placements)
     )
     if last_source.placements != expected_grad_source:
-        return False
+        return None
 
     baseline_forward = [_default_edge(edge) for edge in forward]
     baseline_backward = [_default_edge(edge) for edge in backward]
     candidate_forward = list(baseline_forward)
-    candidate_backward = list(baseline_backward)
     candidate_forward[0] = _candidate_edge(forward[0], preferred_order)
-    candidate_backward[-1] = _candidate_target_edge(backward[-1], preferred_order)
+
+    if candidate_forward[0][2].shard_order != baseline_forward[0][2].shard_order:
+        return None
+
+    projected_backward_source = _project_shard_order(preferred_order, last_source)
+    producer_edges = []
+    multi_boundary_plan = _MultiBoundaryPlan()
+    if projected_backward_source != baseline_backward[-1][1].shard_order:
+        producer_result = _producer_order_plan(
+            grad_prefix,
+            last_source,
+            sharding_placement,
+            preferred_order,
+            reordered_mesh_dims,
+        )
+        if producer_result is None:
+            return None
+        multi_boundary_plan, producer_edges = producer_result
+        grad_order = OrderInfo(preferred_order, project_by_mesh_priority=True)
+        grad_order_map = {node: grad_order for node in grad_prefix}
+        assert multi_boundary_plan.grad_producer is not None
+        grad_order_map[multi_boundary_plan.grad_producer] = grad_order
+        try:
+            candidate_backward = [
+                _ordered_edge(edge, grad_order_map) for edge in backward
+            ]
+        except (AssertionError, RuntimeError, TypeError, ValueError):
+            return None
+    else:
+        candidate_backward = list(baseline_backward)
+        candidate_backward[-1] = _candidate_edge(backward[-1], preferred_order)
 
     baseline_plans = _plans_for_edges(baseline_forward + baseline_backward)
     candidate_forward_plans = _plans_for_edges(candidate_forward)
@@ -688,39 +1008,74 @@ def _multi_boundary_adjoint_improves_fallback(
         or candidate_forward_plans is None
         or candidate_backward_plans is None
     ):
-        return False
-    candidate_plans = candidate_forward_plans + candidate_backward_plans
-    baseline_all_to_all_count = sum(plan.all_to_all_count for plan in baseline_plans)
-    candidate_all_to_all_count = sum(plan.all_to_all_count for plan in candidate_plans)
-    if (
-        baseline_all_to_all_count == 0
-        or candidate_all_to_all_count >= baseline_all_to_all_count
+        return None
+
+    producer_candidate_plans = [plan for _, _, plan in producer_edges]
+    producer_baseline_plans = []
+    for source, target, _ in producer_edges:
+        baseline_plan = _fallback_plan(
+            _spec_with_shard_order(
+                source, DTensorSpec.compute_default_shard_order(source.placements)
+            ),
+            _spec_with_shard_order(
+                target, DTensorSpec.compute_default_shard_order(target.placements)
+            ),
+        )
+        if baseline_plan is None:
+            return None
+        producer_baseline_plans.append(baseline_plan)
+
+    baseline_plans += producer_baseline_plans
+    candidate_plans = (
+        candidate_forward_plans + candidate_backward_plans + producer_candidate_plans
+    )
+    candidate_edges = candidate_forward + candidate_backward
+    candidate_edge_plans = candidate_forward_plans + candidate_backward_plans
+    if multi_boundary_plan.grad_producer is not None:
+        if any(
+            not _plan_matches_solver(plan, source, target)
+            for (_, source, target), plan in zip(candidate_edges, candidate_edge_plans)
+        ):
+            return None
+        baseline_edges = baseline_forward + baseline_backward
+        baseline_differs_from_solver = any(
+            not _plan_matches_solver(plan, source, target)
+            for (_, source, target), plan in zip(baseline_edges, baseline_plans)
+        ) or any(
+            not _plan_matches_solver(plan, source, target)
+            for (source, target, _), plan in zip(
+                producer_edges, producer_baseline_plans
+            )
+        )
+        if not baseline_differs_from_solver:
+            return None
+    if any(plan.all_to_all_count for plan in candidate_plans):
+        return None
+    if multi_boundary_plan.grad_producer is None and not any(
+        plan.all_to_all_count for plan in baseline_plans
     ):
-        return False
+        return None
     if sum(plan.cost for plan in candidate_plans) >= sum(
         plan.cost for plan in baseline_plans
     ):
-        return False
+        return None
     planned_forward_order = _planned_collective_order(
         candidate_forward_plans, reordered_mesh_dims, "all_gather"
     )
     if planned_forward_order != forward_order:
-        return False
+        return None
     expected_backward_order = tuple(
         mesh_dim
         for mesh_dim in reversed(planned_forward_order)
         if mesh_dim in backward_order
     )
-    planned_backward_order = tuple(
-        mesh_dim
-        for plan in candidate_backward_plans
-        for kind, mesh_dims in plan.operations
-        if kind == "reduce_scatter"
-        for mesh_dim in mesh_dims
-        if mesh_dim in reordered_mesh_dims
-    )
-    if planned_backward_order != expected_backward_order:
-        return False
+    if (
+        _planned_collective_order(
+            candidate_backward_plans, reordered_mesh_dims, "reduce_scatter"
+        )
+        != expected_backward_order
+    ):
+        return None
 
     try:
         physical_storage = DTensorSpec._convert_shard_order_to_StridedShard(
@@ -732,8 +1087,10 @@ def _multi_boundary_adjoint_improves_fallback(
             last_target.mesh,
         )
     except (AssertionError, RuntimeError, TypeError, ValueError):
-        return False
-    return physical_storage == physical_grad
+        return None
+    if physical_storage != physical_grad:
+        return None
+    return multi_boundary_plan
 
 
 def build_param_grad_linear_chains(
@@ -808,6 +1165,8 @@ def _assign_order_info_to_chain(
     target_node: torch.fx.Node,
     preferred_shard_order: ShardOrder,
     order_map: dict[torch.fx.Node, OrderInfo],
+    *,
+    project_by_mesh_priority: bool = False,
 ) -> None:
     """
     Assign OrderInfo to nodes in a chain up to and including the target node.
@@ -821,6 +1180,7 @@ def _assign_order_info_to_chain(
     for node in chain:
         order_map[node] = OrderInfo(
             preferred_shard_order=preferred_shard_order,
+            project_by_mesh_priority=project_by_mesh_priority,
         )
         if node == target_node:
             break
@@ -947,40 +1307,70 @@ def compute_optimal_placement_order_for_parameters(
             grad_curr_plc,
             grad_tgt_plc,
         )
+        multi_boundary_plan = None
         if not exact_adjoint:
             storage = sharding_placement[param_node].output_specs
             if not isinstance(storage, DTensorSpec):
                 continue
-            if not _multi_boundary_adjoint_improves_fallback(
+            multi_boundary_plan = _multi_boundary_adjoint_improves_fallback(
                 storage,
                 param_chain,
                 grad_chain,
                 sharding_placement,
                 preferred_shard_order,
-            ):
+            )
+            if multi_boundary_plan is None:
                 continue
 
         if not _order_reaches_every_boundary(param_chain, sharding_placement):
             continue
+
+        pair_order: dict[torch.fx.Node, OrderInfo] = {}
 
         # Preserve the chosen storage order through the forward parameter chain.
         _assign_order_info_to_chain(
             param_chain,
             target_node=param_redistrib_node,
             preferred_shard_order=preferred_shard_order,
-            order_map=redistribute_node_order,
+            order_map=pair_order,
         )
 
         # Restore gradients to the same storage order in the backward chain.
-        _assign_order_info_to_chain(
-            grad_chain,
-            target_node=grad_redistrib_node,
-            preferred_shard_order=preferred_shard_order,
-            order_map=redistribute_node_order,
-        )
+        if multi_boundary_plan is not None and multi_boundary_plan.grad_producer:
+            _assign_order_info_to_chain(
+                grad_chain,
+                target_node=grad_chain[-1],
+                preferred_shard_order=preferred_shard_order,
+                order_map=pair_order,
+                project_by_mesh_priority=True,
+            )
+            pair_order[multi_boundary_plan.grad_producer] = OrderInfo(
+                preferred_shard_order,
+                project_by_mesh_priority=True,
+            )
+        else:
+            _assign_order_info_to_chain(
+                grad_chain,
+                target_node=grad_redistrib_node,
+                preferred_shard_order=preferred_shard_order,
+                order_map=pair_order,
+            )
+
+        if any(
+            node in redistribute_node_order
+            and redistribute_node_order[node] != order_info
+            for node, order_info in pair_order.items()
+        ):
+            continue
+        redistribute_node_order.update(pair_order)
 
     # Apply shard_order metadata to nodes
     for node, order_info in redistribute_node_order.items():
-        node.meta["shard_order"] = order_info.preferred_shard_order
+        output_spec = sharding_placement[node].output_specs
+        node.meta["shard_order"] = (
+            _project_order_info(order_info, output_spec)
+            if isinstance(output_spec, DTensorSpec)
+            else order_info.preferred_shard_order
+        )
 
     return redistribute_node_order
