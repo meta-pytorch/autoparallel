@@ -1337,6 +1337,32 @@ def test_nd_partial_subset_order_projection():
     assert placement_order[nodes["grad_producer"]].project_by_mesh_priority
 
 
+def test_hsdp_order_allows_orthogonal_partial_reduction():
+    mesh = torch.distributed.device_mesh.DeviceMesh(
+        "cuda",
+        torch.arange(32).reshape(2, 2, 8),
+        mesh_dim_names=("dp_replicate", "dp_shard", "tp"),
+    )
+    gm, nodes = _build_partial_subset_weight_graph()
+    placement = _partial_subset_weight_placement(
+        mesh,
+        nodes,
+        weight_shape=(14336, 4096),
+        storage_placements=(Replicate(), Shard(0), Shard(0)),
+        forward_target_placements=(Replicate(), Replicate(), Shard(0)),
+        grad_source_placements=(Partial(), Partial(), Shard(0)),
+        carrier_source_placements=(Shard(0), Shard(0), Shard(2)),
+        carrier_target_placements=(Shard(0), Shard(0), Shard(2)),
+        other_placements=(Shard(0), Shard(0), Replicate()),
+    )
+
+    placement_order = _run_placement_order(gm, nodes, placement)
+    expected = (ShardOrderEntry(tensor_dim=0, mesh_dims=(2, 1)),)
+    for key in ("param", "dtype_cast_fwd", "permute_fwd", "grad_alias"):
+        assert placement_order[nodes[key]] == OrderInfo(expected), key
+    assert nodes["grad_producer"] not in placement_order
+
+
 def test_partial_subset_order_rejects_ambiguous_gradient_producer():
     mesh = torch.distributed.device_mesh.DeviceMesh(
         "cuda", torch.arange(32).reshape(4, 2, 4)
@@ -1448,6 +1474,41 @@ def test_partial_subset_plan_matches_solver_cost_and_lowering():
     assert concrete == _logical_plan(lm_head_source, lm_head_target)
     assert concrete is not None
     assert concrete.operations == (("all_to_all", (1,)),)
+
+
+def test_hsdp_order_plan_preserves_orthogonal_all_reduce():
+    mesh = torch.distributed.device_mesh.DeviceMesh(
+        "cuda", torch.arange(32).reshape(2, 2, 8)
+    )
+    shape = (14336, 4096)
+    storage = _spec_with_meta(mesh, (Replicate(), Shard(0), Shard(0)), shape)
+    forward = _spec_with_meta(mesh, (Replicate(), Replicate(), Shard(0)), shape)
+    grad_source = _spec_with_meta(
+        mesh, (Partial(), Partial(), Shard(0)), shape, torch.float32
+    )
+    preferred = (ShardOrderEntry(tensor_dim=0, mesh_dims=(2, 1)),)
+    order = OrderInfo(preferred)
+    cases = (
+        (
+            storage,
+            forward,
+            (("all_gather", (1,)),),
+        ),
+        (
+            grad_source,
+            storage,
+            (("all_reduce", (0,)), ("reduce_scatter", (1,))),
+        ),
+    )
+    for source, target, expected_operations in cases:
+        concrete = _fallback_plan(
+            _spec_with_shard_order(source, _project_order_info(order, source)),
+            _spec_with_shard_order(target, _project_order_info(order, target)),
+        )
+        assert concrete == _logical_plan(source, target)
+        assert concrete is not None
+        assert concrete.operations == expected_operations
+        assert concrete.all_to_all_count == 0
 
 
 def test_consumer_boundary_ignores_arguments_without_a_sharding_entry():

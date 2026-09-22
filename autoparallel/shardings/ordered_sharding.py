@@ -279,17 +279,48 @@ def _flattened_specs(
     )
 
 
+def _orthogonal_partial_reduction_steps(
+    source: DTensorSpec, target: DTensorSpec
+) -> tuple[list[tuple[DTensorSpec, DTensorSpec, int]], DTensorSpec]:
+    """Stage reductions that do not participate in an ordered target layout."""
+    if DTensorSpec.is_default_device_order(target.shard_order):
+        return [], source
+    steps = []
+    current = source
+    for mesh_dim, (src, dst) in enumerate(zip(source.placements, target.placements)):
+        if not isinstance(src, Partial) or not isinstance(dst, Replicate):
+            continue
+        next_placements = list(current.placements)
+        next_placements[mesh_dim] = Replicate()
+        next_spec = DTensorSpec(
+            current.mesh,
+            tuple(next_placements),
+            tensor_meta=current.tensor_meta,
+            shard_order=current.shard_order,
+            use_strided_shard_as_shard_order=False,
+        )
+        steps.append((current, next_spec, mesh_dim))
+        current = next_spec
+    return steps, current
+
+
 def _fallback_plan(source: DTensorSpec, target: DTensorSpec) -> Optional[_FallbackPlan]:
     """Propagate one redistribution through DTensor and price its actual steps."""
     if source.mesh != target.mesh or source.tensor_meta is None:
         return None
+    operations = []
+    cost = 0.0
+    reduction_steps, source = _orthogonal_partial_reduction_steps(source, target)
+    for current, next_spec, mesh_dim in reduction_steps:
+        cost += float(redistribute_cost(current, next_spec, [mesh_dim]))
+        operations.append(("all_reduce", (mesh_dim,)))
     if DTensorSpec.is_default_device_order(
         source.shard_order
     ) and DTensorSpec.is_default_device_order(target.shard_order):
         flattened = _flattened_specs(source, target)
         if flattened is not None:
             flat_source, flat_target = flattened
-            cost = float(redistribute_cost(flat_source, flat_target, [0]))
+            cost += float(redistribute_cost(flat_source, flat_target, [0]))
             if not math.isfinite(cost):
                 return None
             kind = (
@@ -297,10 +328,8 @@ def _fallback_plan(source: DTensorSpec, target: DTensorSpec) -> Optional[_Fallba
                 if isinstance(flat_source.placements[0], Shard)
                 else "reduce_scatter"
             )
-            return _FallbackPlan(
-                ((kind, tuple(range(len(source.placements)))),),
-                cost,
-            )
+            operations.append((kind, tuple(range(len(source.placements)))))
+            return _FallbackPlan(tuple(operations), cost)
     try:
         transforms = _optimize_transform_infos(
             _gen_transform_infos_non_cached(
@@ -313,8 +342,6 @@ def _fallback_plan(source: DTensorSpec, target: DTensorSpec) -> Optional[_Fallba
             target.placements,
         )
         current_placements = list(source.placements)
-        operations = []
-        cost = 0.0
         for transform in transforms:
             mesh_dims = tuple(
                 getattr(transform, "original_mesh_dims", (transform.mesh_dim,))
@@ -385,6 +412,12 @@ def ordered_redistribute_local_tensor(
     # is_default_device_order checks ascending mesh_dims per entry (and
     # returns True for the empty tuple), which is the right consistency
     # criterion.
+    reduction_steps, curr_spec = _orthogonal_partial_reduction_steps(
+        curr_spec, tgt_spec
+    )
+    for source, target, _ in reduction_steps:
+        arg = redistribute_local_tensor(arg, source, target)
+
     both_default = DTensorSpec.is_default_device_order(
         curr_spec.shard_order
     ) and DTensorSpec.is_default_device_order(tgt_spec.shard_order)
@@ -619,6 +652,13 @@ def _logical_collective_order(
             zip(source.placements, target.placements)
         ):
             if src == dst:
+                continue
+            if (
+                backward
+                and mesh_dim not in relevant_mesh_dims
+                and isinstance(src, Partial)
+                and isinstance(dst, Replicate)
+            ):
                 continue
             is_expected = (
                 isinstance(src, Partial) and isinstance(dst, Shard)
@@ -889,6 +929,36 @@ def _producer_order_plan(
     )
 
 
+def _matches_multi_boundary_gradient_source(
+    storage: tuple[Placement, ...],
+    grad_source: tuple[Placement, ...],
+    backward_order: tuple[int, ...],
+    forward: list[tuple[torch.fx.Node, DTensorSpec, DTensorSpec]],
+) -> Optional[frozenset[int]]:
+    """Allow independent reductions on axes replicated by the parameter."""
+    if len(storage) != len(grad_source):
+        return None
+    backward_dims = set(backward_order)
+    orthogonal_reduction_dims = set()
+    for mesh_dim, (stored, source) in enumerate(zip(storage, grad_source)):
+        if mesh_dim in backward_dims:
+            if not isinstance(stored, Shard) or not isinstance(source, Partial):
+                return None
+        elif stored == source:
+            continue
+        elif isinstance(stored, Replicate) and isinstance(source, Partial):
+            if any(
+                edge_source.placements[mesh_dim] != stored
+                or edge_target.placements[mesh_dim] != stored
+                for _, edge_source, edge_target in forward
+            ):
+                return None
+            orthogonal_reduction_dims.add(mesh_dim)
+        else:
+            return None
+    return frozenset(orthogonal_reduction_dims)
+
+
 def _planned_collective_order(
     plans: list[_FallbackPlan],
     relevant_mesh_dims: frozenset[int],
@@ -955,11 +1025,13 @@ def _multi_boundary_adjoint_improves_fallback(
     ):
         return None
 
-    expected_grad_source = tuple(
-        Partial() if mesh_dim in backward_order else placement
-        for mesh_dim, placement in enumerate(storage.placements)
+    orthogonal_reduction_dims = _matches_multi_boundary_gradient_source(
+        storage.placements,
+        last_source.placements,
+        backward_order,
+        forward,
     )
-    if last_source.placements != expected_grad_source:
+    if orthogonal_reduction_dims is None:
         return None
 
     baseline_forward = [_default_edge(edge) for edge in forward]
@@ -998,11 +1070,11 @@ def _multi_boundary_adjoint_improves_fallback(
         candidate_backward = list(baseline_backward)
         candidate_backward[-1] = _candidate_edge(backward[-1], preferred_order)
 
-    baseline_plans = _plans_for_edges(baseline_forward + baseline_backward)
+    baseline_edge_plans = _plans_for_edges(baseline_forward + baseline_backward)
     candidate_forward_plans = _plans_for_edges(candidate_forward)
     candidate_backward_plans = _plans_for_edges(candidate_backward)
     if (
-        baseline_plans is None
+        baseline_edge_plans is None
         or candidate_forward_plans is None
         or candidate_backward_plans is None
     ):
@@ -1023,13 +1095,13 @@ def _multi_boundary_adjoint_improves_fallback(
             return None
         producer_baseline_plans.append(baseline_plan)
 
-    baseline_plans += producer_baseline_plans
+    baseline_plans = baseline_edge_plans + producer_baseline_plans
     candidate_plans = (
         candidate_forward_plans + candidate_backward_plans + producer_candidate_plans
     )
     candidate_edges = candidate_forward + candidate_backward
     candidate_edge_plans = candidate_forward_plans + candidate_backward_plans
-    if multi_boundary_plan.grad_producer is not None:
+    if multi_boundary_plan.grad_producer is not None or orthogonal_reduction_dims:
         if any(
             not _plan_matches_solver(plan, source, target)
             for (_, source, target), plan in zip(candidate_edges, candidate_edge_plans)
@@ -1038,7 +1110,7 @@ def _multi_boundary_adjoint_improves_fallback(
         baseline_edges = baseline_forward + baseline_backward
         baseline_differs_from_solver = any(
             not _plan_matches_solver(plan, source, target)
-            for (_, source, target), plan in zip(baseline_edges, baseline_plans)
+            for (_, source, target), plan in zip(baseline_edges, baseline_edge_plans)
         ) or any(
             not _plan_matches_solver(plan, source, target)
             for (source, target, _), plan in zip(
