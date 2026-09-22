@@ -4,6 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import torch
+from conftest import apply_cuda_patches
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor._dtensor_spec import (
     DTensorSpec,
@@ -444,3 +445,93 @@ class TestProducerKeyedShardOrder:
         )
         assert curr_order == order
         assert curr_order != storage.shard_order
+
+
+@apply_cuda_patches
+def test_partial_subset_producer_establishes_order_without_collectives():
+    mesh = DeviceMesh(
+        "cuda",
+        torch.arange(32).reshape(4, 2, 4),
+        mesh_dim_names=("dp", "cp", "tp"),
+    )
+    graph = torch.fx.Graph()
+    carrier = graph.placeholder("carrier")
+    grad_producer = graph.call_function(torch.ops.aten.clone.default, (carrier,))
+    grad_consumer = graph.call_function(torch.ops.aten.clone.default, (grad_producer,))
+    param = graph.placeholder("param")
+    forward_consumer = graph.call_function(torch.ops.aten.clone.default, (param,))
+    graph.output((grad_consumer, forward_consumer))
+    gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+
+    weight_meta = _make_tensor_meta([14336, 4096])
+    carrier_meta = _make_tensor_meta([8, 64, 14336])
+    storage = DTensorSpec(mesh, (Shard(0), Shard(0), Shard(0)), tensor_meta=weight_meta)
+    forward = DTensorSpec(
+        mesh, (Replicate(), Replicate(), Shard(0)), tensor_meta=weight_meta
+    )
+    grad_source = DTensorSpec(
+        mesh, (Partial(), Shard(0), Shard(0)), tensor_meta=weight_meta
+    )
+    carrier_source = DTensorSpec(
+        mesh, (Shard(0), Replicate(), Shard(2)), tensor_meta=carrier_meta
+    )
+    carrier_target = DTensorSpec(
+        mesh, (Shard(0), Shard(2), Shard(2)), tensor_meta=carrier_meta
+    )
+    preferred = (ShardOrderEntry(tensor_dim=0, mesh_dims=(2, 1, 0)),)
+    regular = OrderInfo(preferred)
+    remapped = OrderInfo(preferred, project_by_mesh_priority=True)
+    interp = ApplyShardingInterpreter(
+        gm,
+        {},
+        param_placement_order={
+            param: regular,
+            forward_consumer: regular,
+            grad_producer: remapped,
+            grad_consumer: remapped,
+        },
+    )
+
+    def trace_redistribution(local, source, target, consumer, producer):
+        def redistribute(value):
+            return interp.redistribute_tensor(
+                value, source, target, consumer, producer=producer
+            )
+
+        return _count_collectives(make_fx(redistribute, tracing_mode="real")(local))
+
+    assert trace_redistribution(
+        torch.randn(2, 64, 3584, device="meta"),
+        carrier_source,
+        carrier_target,
+        grad_producer,
+        carrier,
+    ) == {"all_gather": 0, "reduce_scatter": 0, "alltoall": 0}
+    lm_head_meta = _make_tensor_meta([8, 64, 128256])
+    lm_head_source = DTensorSpec(
+        mesh, (Shard(0), Shard(1), Shard(2)), tensor_meta=lm_head_meta
+    )
+    lm_head_target = DTensorSpec(
+        mesh, (Shard(0), Shard(2), Shard(2)), tensor_meta=lm_head_meta
+    )
+    assert trace_redistribution(
+        torch.randn(2, 32, 32064, device="meta"),
+        lm_head_source,
+        lm_head_target,
+        grad_producer,
+        carrier,
+    ) == {"all_gather": 0, "reduce_scatter": 0, "alltoall": 1}
+    assert trace_redistribution(
+        torch.randn(448, 4096, device="meta"),
+        storage,
+        forward,
+        forward_consumer,
+        param,
+    ) == {"all_gather": 2, "reduce_scatter": 0, "alltoall": 0}
+    assert trace_redistribution(
+        torch.randn(1792, 4096, device="meta"),
+        grad_source,
+        storage,
+        grad_consumer,
+        grad_producer,
+    ) == {"all_gather": 0, "reduce_scatter": 1, "alltoall": 0}

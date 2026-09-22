@@ -21,8 +21,14 @@ from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
 from autoparallel.api import AutoParallel
 from autoparallel.shardings.ordered_sharding import (
     _consumer_boundary_for_input,
+    _fallback_plan,
     _infer_fsdplike_storage_order,
+    _logical_plan,
     _matches_inverse_gradient_pattern,
+    _project_order_info,
+    _project_shard_order_by_mesh_priority,
+    _spec_with_shard_order,
+    OrderInfo,
     build_param_grad_linear_chains,
     compute_optimal_placement_order_for_parameters,
     get_redistributed_input_placements,
@@ -992,6 +998,118 @@ def _build_weight_chain_graph(extra_cast_user: bool = False):
     return torch.fx.GraphModule(torch.nn.Module(), graph), nodes
 
 
+def _build_partial_subset_weight_graph(producer_fanout: bool = False):
+    """Build the W1/W3 gradient-producer shape from the production joint graph."""
+    graph = torch.fx.Graph()
+    param = graph.placeholder("param")
+    forward_input = graph.placeholder("forward_input")
+    dtype_cast_fwd = graph.call_function(torch.ops.aten.clone.default, (param,))
+    permute_fwd = graph.call_function(torch.ops.aten.t.default, (dtype_cast_fwd,))
+    alias_fwd = graph.call_function(torch.ops.aten.alias.default, (permute_fwd,))
+    mm_fwd = graph.call_function(torch.ops.aten.mm.default, (forward_input, alias_fwd))
+
+    carrier = graph.placeholder("carrier")
+    other = graph.placeholder("other")
+    grad_producer = graph.call_function(
+        torch.ops.aten.einsum.default,
+        ("abc,abd->dc", [carrier, other]),
+    )
+    permute_bwd = graph.call_function(torch.ops.aten.t.default, (grad_producer,))
+    dtype_cast_bwd = graph.call_function(torch.ops.aten.clone.default, (permute_bwd,))
+    grad_alias = graph.call_function(torch.ops.aten.alias.default, (dtype_cast_bwd,))
+
+    outputs = [mm_fwd, grad_alias]
+    nodes = {
+        "param": param,
+        "forward_input": forward_input,
+        "dtype_cast_fwd": dtype_cast_fwd,
+        "permute_fwd": permute_fwd,
+        "alias_fwd": alias_fwd,
+        "mm_fwd": mm_fwd,
+        "carrier": carrier,
+        "other": other,
+        "grad_producer": grad_producer,
+        "permute_bwd": permute_bwd,
+        "dtype_cast_bwd": dtype_cast_bwd,
+        "grad_alias": grad_alias,
+    }
+    if producer_fanout:
+        nodes["producer_peek"] = graph.call_function(
+            torch.ops.aten.alias.default, (grad_producer,)
+        )
+        outputs.append(nodes["producer_peek"])
+    graph.output(tuple(outputs))
+    return torch.fx.GraphModule(torch.nn.Module(), graph), nodes
+
+
+def _partial_subset_weight_placement(
+    mesh,
+    nodes,
+    *,
+    weight_shape,
+    storage_placements,
+    forward_target_placements,
+    grad_source_placements,
+    carrier_source_placements,
+    carrier_target_placements,
+    other_placements,
+):
+    transposed_shape = tuple(reversed(weight_shape))
+
+    def transpose_placements(placements):
+        return tuple(
+            Shard(1 - placement.dim) if isinstance(placement, Shard) else placement
+            for placement in placements
+        )
+
+    transposed = _spec_with_meta(
+        mesh, transpose_placements(forward_target_placements), transposed_shape
+    )
+    grad_source = _spec_with_meta(
+        mesh, grad_source_placements, weight_shape, torch.float32
+    )
+    grad_producer_output = _spec_with_meta(
+        mesh, transpose_placements(grad_source_placements), transposed_shape
+    )
+    carrier_shape = (8, 64, weight_shape[0])
+    other_shape = (8, 64, weight_shape[1])
+    storage = _spec_with_meta(mesh, storage_placements, weight_shape)
+    forward_target = _spec_with_meta(mesh, forward_target_placements, weight_shape)
+    carrier_source = _spec_with_meta(mesh, carrier_source_placements, carrier_shape)
+    carrier_target = _spec_with_meta(mesh, carrier_target_placements, carrier_shape)
+    other = _spec_with_meta(mesh, other_placements, other_shape)
+    n = nodes
+    placement = {
+        n["param"]: OpSpec(output_specs=storage, input_specs=[storage]),
+        n["forward_input"]: OpSpec(output_specs=transposed),
+        n["dtype_cast_fwd"]: OpSpec(output_specs=storage, input_specs=[storage]),
+        n["permute_fwd"]: OpSpec(output_specs=transposed, input_specs=[forward_target]),
+        n["alias_fwd"]: OpSpec(output_specs=transposed, input_specs=[transposed]),
+        n["mm_fwd"]: OpSpec(
+            output_specs=transposed, input_specs=[transposed, transposed]
+        ),
+        n["carrier"]: OpSpec(output_specs=carrier_source),
+        n["other"]: OpSpec(output_specs=other),
+        n["grad_producer"]: OpSpec(
+            output_specs=grad_producer_output,
+            input_specs=[carrier_target, other],
+        ),
+        n["permute_bwd"]: OpSpec(
+            output_specs=grad_source, input_specs=[grad_producer_output]
+        ),
+        n["dtype_cast_bwd"]: OpSpec(
+            output_specs=grad_source, input_specs=[grad_source]
+        ),
+        n["grad_alias"]: OpSpec(output_specs=storage, input_specs=[storage]),
+    }
+    if "producer_peek" in n:
+        placement[n["producer_peek"]] = OpSpec(
+            output_specs=grad_producer_output,
+            input_specs=[grad_producer_output],
+        )
+    return placement
+
+
 def _weight_chain_placement(
     nodes, storage, first_target, transposed, final, grad_source
 ):
@@ -1109,6 +1227,227 @@ def test_compute_optimal_placement_order_full_release_uses_gradient_boundary(
     expected = (ShardOrderEntry(tensor_dim=0, mesh_dims=(2, 1, 0)),)
     for key in ("param", "dtype_cast_fwd", "permute_fwd", "grad_alias"):
         assert placement_order[nodes[key]].preferred_shard_order == expected, key
+
+
+def test_partial_subset_order_reaches_unique_gradient_producer():
+    mesh = torch.distributed.device_mesh.DeviceMesh(
+        "cuda",
+        torch.arange(32).reshape(4, 2, 4),
+        mesh_dim_names=("dp", "cp", "tp"),
+    )
+    cases = (
+        (
+            (14336, 4096),
+            (Shard(0), Replicate(), Shard(2)),
+            (Shard(0), Shard(2), Shard(2)),
+        ),
+        (
+            (128256, 4096),
+            (Shard(0), Shard(1), Shard(2)),
+            (Shard(0), Shard(2), Shard(2)),
+        ),
+    )
+    for weight_shape, carrier_source, carrier_target in cases:
+        gm, nodes = _build_partial_subset_weight_graph()
+        placement = _partial_subset_weight_placement(
+            mesh,
+            nodes,
+            weight_shape=weight_shape,
+            storage_placements=(Shard(0), Shard(0), Shard(0)),
+            forward_target_placements=(Replicate(), Replicate(), Shard(0)),
+            grad_source_placements=(Partial(), Shard(0), Shard(0)),
+            carrier_source_placements=carrier_source,
+            carrier_target_placements=carrier_target,
+            other_placements=(Shard(0), Replicate(), Replicate()),
+        )
+
+        placement_order = _run_placement_order(gm, nodes, placement)
+        expected = (ShardOrderEntry(tensor_dim=0, mesh_dims=(2, 1, 0)),)
+        assert placement_order[nodes["param"]] == OrderInfo(expected)
+        for key in (
+            "grad_alias",
+            "dtype_cast_bwd",
+            "permute_bwd",
+            "grad_producer",
+        ):
+            assert placement_order[nodes[key]] == OrderInfo(
+                expected, project_by_mesh_priority=True
+            )
+        assert nodes["carrier"] not in placement_order
+        assert nodes["grad_producer"].meta["shard_order"] == (
+            ShardOrderEntry(tensor_dim=1, mesh_dims=(2, 1)),
+        )
+
+
+def test_nd_partial_subset_order_projection():
+    mesh_3d = torch.distributed.device_mesh.DeviceMesh(
+        "cuda",
+        torch.arange(32).reshape(4, 2, 4),
+        mesh_dim_names=("dp_outer", "dp_inner", "tp"),
+    )
+    gm, nodes = _build_partial_subset_weight_graph()
+    placement = _partial_subset_weight_placement(
+        mesh_3d,
+        nodes,
+        weight_shape=(14336, 4096),
+        storage_placements=(Shard(0), Shard(0), Shard(0)),
+        forward_target_placements=(Replicate(), Replicate(), Shard(0)),
+        grad_source_placements=(Partial(), Shard(0), Shard(0)),
+        carrier_source_placements=(Shard(0), Replicate(), Shard(2)),
+        carrier_target_placements=(Shard(0), Shard(2), Shard(2)),
+        other_placements=(Shard(0), Replicate(), Replicate()),
+    )
+    assert nodes["param"] in _run_placement_order(gm, nodes, placement)
+
+    hsdp_order = (ShardOrderEntry(tensor_dim=0, mesh_dims=(2, 1)),)
+    hsdp_spec = DTensorSpec(mesh_3d, (Replicate(), Shard(0), Shard(0)))
+    assert _project_shard_order_by_mesh_priority(hsdp_order, hsdp_spec) == hsdp_order
+
+    mesh_4d = torch.distributed.device_mesh.DeviceMesh(
+        "cuda",
+        torch.arange(16).reshape(2, 2, 2, 2),
+        mesh_dim_names=("axis0", "axis1", "axis2", "axis3"),
+    )
+    gm, nodes = _build_partial_subset_weight_graph()
+    placement = _partial_subset_weight_placement(
+        mesh_4d,
+        nodes,
+        weight_shape=(64, 32),
+        storage_placements=(Shard(0), Shard(0), Shard(0), Shard(0)),
+        forward_target_placements=(
+            Replicate(),
+            Shard(0),
+            Replicate(),
+            Shard(0),
+        ),
+        grad_source_placements=(Partial(), Shard(0), Shard(0), Shard(0)),
+        carrier_source_placements=(Shard(0), Shard(2), Replicate(), Shard(2)),
+        carrier_target_placements=(Shard(0), Shard(2), Shard(2), Shard(2)),
+        other_placements=(
+            Shard(0),
+            Replicate(),
+            Replicate(),
+            Replicate(),
+        ),
+    )
+    placement_order = _run_placement_order(gm, nodes, placement)
+    assert placement_order[nodes["param"]] == OrderInfo(
+        (ShardOrderEntry(tensor_dim=0, mesh_dims=(1, 3, 2, 0)),)
+    )
+    assert placement_order[nodes["grad_producer"]].project_by_mesh_priority
+
+
+def test_partial_subset_order_rejects_ambiguous_gradient_producer():
+    mesh = torch.distributed.device_mesh.DeviceMesh(
+        "cuda", torch.arange(32).reshape(4, 2, 4)
+    )
+    common = {
+        "weight_shape": (14336, 4096),
+        "storage_placements": (Shard(0), Shard(0), Shard(0)),
+        "forward_target_placements": (Replicate(), Replicate(), Shard(0)),
+        "grad_source_placements": (Partial(), Shard(0), Shard(0)),
+        "carrier_source_placements": (Shard(0), Replicate(), Shard(2)),
+        "carrier_target_placements": (Shard(0), Shard(2), Shard(2)),
+    }
+
+    gm, nodes = _build_partial_subset_weight_graph()
+    placement = _partial_subset_weight_placement(
+        mesh,
+        nodes,
+        other_placements=(Shard(0), Shard(2), Shard(2)),
+        **common,
+    )
+    assert _run_placement_order(gm, nodes, placement) == {}
+
+    gm, nodes = _build_partial_subset_weight_graph(producer_fanout=True)
+    placement = _partial_subset_weight_placement(
+        mesh,
+        nodes,
+        other_placements=(Shard(0), Replicate(), Replicate()),
+        **common,
+    )
+    assert _run_placement_order(gm, nodes, placement) == {}
+
+    mixed_groups = (
+        ShardOrderEntry(tensor_dim=0, mesh_dims=(1, 0)),
+        ShardOrderEntry(tensor_dim=1, mesh_dims=(2,)),
+    )
+    mixed_spec = DTensorSpec(mesh, (Shard(0), Replicate(), Shard(0)))
+    assert _project_shard_order_by_mesh_priority(mixed_groups, mixed_spec) is None
+
+
+def test_partial_subset_plan_matches_solver_cost_and_lowering():
+    mesh = torch.distributed.device_mesh.DeviceMesh(
+        "cuda", torch.arange(32).reshape(4, 2, 4)
+    )
+    weight_shape = (14336, 4096)
+    storage = _spec_with_meta(mesh, (Shard(0), Shard(0), Shard(0)), weight_shape)
+    forward = _spec_with_meta(mesh, (Replicate(), Replicate(), Shard(0)), weight_shape)
+    grad_source = _spec_with_meta(
+        mesh, (Partial(), Shard(0), Shard(0)), weight_shape, torch.float32
+    )
+    carrier_shape = (8, 64, weight_shape[0])
+    carrier_source = _spec_with_meta(
+        mesh, (Shard(0), Replicate(), Shard(2)), carrier_shape
+    )
+    carrier_target = _spec_with_meta(
+        mesh, (Shard(0), Shard(2), Shard(2)), carrier_shape
+    )
+    preferred = (ShardOrderEntry(tensor_dim=0, mesh_dims=(2, 1, 0)),)
+    regular = OrderInfo(preferred)
+    remapped = OrderInfo(preferred, project_by_mesh_priority=True)
+
+    cases = (
+        (
+            carrier_source,
+            carrier_target,
+            carrier_source.shard_order,
+            _project_order_info(remapped, carrier_target),
+            (("local", (1,)),),
+        ),
+        (
+            storage,
+            forward,
+            _project_order_info(regular, storage),
+            _project_order_info(regular, forward),
+            (("all_gather", (0,)), ("all_gather", (1,))),
+        ),
+        (
+            grad_source,
+            storage,
+            _project_order_info(remapped, grad_source),
+            _project_order_info(remapped, storage),
+            (("reduce_scatter", (0,)),),
+        ),
+    )
+    for source, target, source_order, target_order, expected_operations in cases:
+        concrete = _fallback_plan(
+            _spec_with_shard_order(source, source_order),
+            _spec_with_shard_order(target, target_order),
+        )
+        logical = _logical_plan(source, target)
+        assert concrete == logical
+        assert concrete is not None
+        assert concrete.operations == expected_operations
+        assert concrete.all_to_all_count == 0
+
+    lm_head_shape = (8, 64, 128256)
+    lm_head_source = _spec_with_meta(
+        mesh, (Shard(0), Shard(1), Shard(2)), lm_head_shape
+    )
+    lm_head_target = _spec_with_meta(
+        mesh, (Shard(0), Shard(2), Shard(2)), lm_head_shape
+    )
+    concrete = _fallback_plan(
+        lm_head_source,
+        _spec_with_shard_order(
+            lm_head_target,
+            _project_order_info(remapped, lm_head_target),
+        ),
+    )
+    assert concrete == _logical_plan(lm_head_source, lm_head_target)
+    assert concrete is not None
+    assert concrete.operations == (("all_to_all", (1,)),)
 
 
 def test_consumer_boundary_ignores_arguments_without_a_sharding_entry():
