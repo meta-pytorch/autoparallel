@@ -1,5 +1,5 @@
 schema_version = 1
-harness_version = "legacy-dtensor-v10-paper-submission-reduce-order-cost535"
+harness_version = "legacy-dtensor-v11-paper-submission-reduce-order-cost535"
 
 [sources.torchtitan]
 remote = "https://github.com/AlbedoWang/torchtitan.git"
