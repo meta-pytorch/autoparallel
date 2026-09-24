@@ -1,5 +1,5 @@
 schema_version = 1
-harness_version = "legacy-dtensor-v11-paper-submission-reduce-order-cost535"
+harness_version = "legacy-dtensor-v12-paper-submission-ap-bwd-seqnr-fix"
 
 [sources.torchtitan]
 remote = "https://github.com/AlbedoWang/torchtitan.git"
@@ -8,7 +8,7 @@ dirty_policy = "forbid"
 
 [sources.autoparallel]
 remote = "https://github.com/meta-pytorch/autoparallel.git"
-commit = "6358220718b765068c15f699076dabceff9589ff"
+commit = "1e7dae837ffb53b452a891e43cba49cd6c793434"
 dirty_policy = "forbid"
 
 [runtime]

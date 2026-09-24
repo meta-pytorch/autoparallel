@@ -68,9 +68,11 @@ is pinned to the commit immediately before the lock/harness-only updates.
   collectives and cost.
 - `8004eb3` stages orthogonal HSDP `Partial -> Replicate` reductions before the
   remaining ordered redistribution.
-- `63582207` is the compatibility cherry-pick of AutoParallel PR #535 and is
-  the runtime pin. The selected campaigns opt into its calibrated
-  `h100_nvswitch_roce_400g` profile.
+- `63582207` is the compatibility cherry-pick of AutoParallel PR #535. The
+  selected campaigns opt into its calibrated `h100_nvswitch_roce_400g` profile.
+- `1e7dae8` keeps the outer autograd context (`grad_fn_seq_nr`) when
+  AutoParallel interprets its compiled graphs, so GraphTrainer's selective
+  activation remat sees the AP backward region. It is the runtime pin.
 
 ## Reproduction policy
 
