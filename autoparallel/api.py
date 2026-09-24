@@ -67,6 +67,27 @@ _APPLY_VIEW_MM_VIEW_PATTERN = True
 
 logger = logging.getLogger(__name__)
 
+# Keys of fx.traceback.current_meta that describe the *outer* autograd
+# execution context (pushed by the outer trace's autograd prehook via
+# set_grad_fn_seq_nr / _mark_autograd_backward). Interpreter replaces
+# current_meta with node.meta per node, which would drop them and make
+# outer-traced backward nodes fall back to a forward seq_nr.
+_OUTER_AUTOGRAD_META_KEYS = ("in_grad_fn", "grad_fn_seq_nr", "autograd_backward")
+
+
+class _PreserveOuterAutogradMetaInterpreter(torch.fx.Interpreter):
+    def __init__(self, gm, outer_meta):
+        super().__init__(gm)
+        self._outer_meta = outer_meta
+
+    @contextmanager
+    def _set_current_node(self, node):
+        with super()._set_current_node(node):
+            # current_meta is a fresh copy of node.meta here and is restored
+            # by set_current_meta on exit, so updating it does not leak.
+            torch.fx.traceback.get_current_meta().update(self._outer_meta)
+            yield
+
 
 def _boxed_nop_preserve_node_meta(fx_g, example_inputs, tag_forward=False):
     if tag_forward:
@@ -98,8 +119,12 @@ def _boxed_nop_preserve_node_meta(fx_g, example_inputs, tag_forward=False):
                 out.meta["custom"]["ap_must_save"] = True
 
     def run(args):
+        current = torch.fx.traceback.get_current_meta()
+        outer_meta = {k: current[k] for k in _OUTER_AUTOGRAD_META_KEYS if k in current}
         with torch.fx.traceback.preserve_node_meta():
-            return torch.fx.Interpreter(fx_g).boxed_run(args)
+            return _PreserveOuterAutogradMetaInterpreter(fx_g, outer_meta).boxed_run(
+                args
+            )
 
     run._boxed_call = True
     return run
