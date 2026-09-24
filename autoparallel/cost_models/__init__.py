@@ -4,6 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 
 from .nccl_cost_model import (  # noqa: F401
+    NCCLCostModelProfile,
     NCCLTopoConfig,
     a100_topo_config,
     detect_nccl_topo_config,

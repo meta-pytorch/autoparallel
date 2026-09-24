@@ -13,6 +13,7 @@ from autoparallel.cost_models.nccl_cost_model import (
     _RING_CORRECTION_FACTOR,
     GpuArch,
     NCCLAlgo,
+    NCCLCostModelProfile,
     NCCLFunc,
     NCCLProto,
     NCCLTopoConfig,
@@ -662,6 +663,41 @@ class TestMonotonicity:
         assert t < float("inf")
 
 
+class TestH100NVSwitchRoCE400GProfile:
+    def test_calibrated_point(self):
+        config = h100_topo_config(
+            num_nodes=2,
+            profile=NCCLCostModelProfile.H100_NVSWITCH_ROCE_400G,
+        )
+        topo = derive_mesh_dim_topo(config, (2, 8), 0)
+        assert nccl_reduce_scatter_cost(128 << 20, topo, config) == pytest.approx(
+            2128.29088
+        )
+
+    def test_interpolates_monotonically(self):
+        config = h100_topo_config(
+            num_nodes=2,
+            profile=NCCLCostModelProfile.H100_NVSWITCH_ROCE_400G,
+        )
+        topo = derive_mesh_dim_topo(config, (2, 8), 0)
+        sizes = (28 << 20, 30 << 20, 32 << 20)
+        costs = [nccl_allgather_cost(size, topo, config) for size in sizes]
+        assert costs[0] < costs[1] < costs[2]
+
+    def test_default_profile_is_unchanged(self):
+        topo = derive_mesh_dim_topo(h100_topo_config(num_nodes=2), (2, 8), 0)
+        default = nccl_allgather_cost(128 << 20, topo, h100_topo_config(num_nodes=2))
+        calibrated = nccl_allgather_cost(
+            128 << 20,
+            topo,
+            h100_topo_config(
+                num_nodes=2,
+                profile=NCCLCostModelProfile.H100_NVSWITCH_ROCE_400G,
+            ),
+        )
+        assert calibrated > default
+
+
 # ---- Public API wrapper tests ----
 
 
@@ -734,6 +770,33 @@ class TestDetectNCCLTopoConfig:
         assert config.arch == GpuArch.HOPPER
         assert config.num_nodes == 1
         assert config.gpus_per_node == 8
+
+    def test_h100_profile_from_environment(self, monkeypatch):
+        from unittest.mock import patch
+
+        monkeypatch.setenv(
+            "AUTOPARALLEL_NCCL_COST_MODEL_PROFILE", "h100_nvswitch_roce_400g"
+        )
+        mesh = self._make_mock_mesh(16)
+        with (
+            patch("torch.cuda.get_device_name", return_value="NVIDIA H100 80GB HBM3"),
+            patch("torch.cuda.device_count", return_value=8),
+        ):
+            config = detect_nccl_topo_config(mesh)
+        assert config is not None
+        assert config.profile == NCCLCostModelProfile.H100_NVSWITCH_ROCE_400G
+
+    def test_unknown_profile_rejected(self, monkeypatch):
+        from unittest.mock import patch
+
+        monkeypatch.setenv("AUTOPARALLEL_NCCL_COST_MODEL_PROFILE", "unknown")
+        mesh = self._make_mock_mesh(8)
+        with (
+            patch("torch.cuda.get_device_name", return_value="NVIDIA H100 80GB HBM3"),
+            patch("torch.cuda.device_count", return_value=8),
+            pytest.raises(ValueError, match="Unknown NCCL cost model profile"),
+        ):
+            detect_nccl_topo_config(mesh)
 
     def test_h200_detected(self):
         from unittest.mock import patch
