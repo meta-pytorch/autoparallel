@@ -54,6 +54,7 @@ master_port = 29500
 phase_timeout_seconds = 7200
 
 [mast.environment]
+AUTOPARALLEL_NCCL_COST_MODEL_PROFILE = "h100_nvswitch_roce_400g"
 HF_HUB_CACHE = "{asset:c4_hf_cache}"
 HF_HUB_OFFLINE = "1"
 HF_DATASETS_OFFLINE = "1"

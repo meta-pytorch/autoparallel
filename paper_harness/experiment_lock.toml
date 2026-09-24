@@ -1,14 +1,14 @@
 schema_version = 1
-harness_version = "legacy-dtensor-v9-paper-submission-hsdp-orthogonal-fix"
+harness_version = "legacy-dtensor-v10-paper-submission-reduce-order-cost535"
 
 [sources.torchtitan]
 remote = "https://github.com/AlbedoWang/torchtitan.git"
-commit = "e8068c445f93541c2169f52378e4bc7e0fba23ee"
+commit = "a68fa447d8f35475c0bf7ab46090838ed6cd79b7"
 dirty_policy = "forbid"
 
 [sources.autoparallel]
 remote = "https://github.com/meta-pytorch/autoparallel.git"
-commit = "8004eb3b06b54ee8a818cbeb2f244df86ad96c26"
+commit = "6358220718b765068c15f699076dabceff9589ff"
 dirty_policy = "forbid"
 
 [runtime]

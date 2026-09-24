@@ -167,3 +167,20 @@ campaign = "campaigns/variants/llama3_8b_3d_2x2x8_timeout60.toml"
 model = "llama3_8b"
 setting = "3d-dpr2-dps2-tp8-apgt-trace-timeout60"
 campaign = "campaigns/variants/llama3_8b_3d_2x2x8_apgt_trace_timeout60.toml"
+
+[[settings]]
+model = "llama3_8b"
+setting = "3d-dps2-cp2-tp4-16k-ro4859-cost535"
+campaign = "campaigns/variants/llama3_8b_3d_long_approx_reduce_order_cost535.toml"
+point = "2x2x4"
+
+[[settings]]
+model = "llama3_8b"
+setting = "3d-dps4-cp2-tp4-16k-f738-ro4859-cost535"
+campaign = "campaigns/variants/llama3_8b_3d_dps4_cp2_tp4_16k_f738_reduce_order_cost535.toml"
+
+[[settings]]
+model = "llama3_8b"
+setting = "3d-dps8-cp2-tp4-16k-ro4859-cost535"
+campaign = "campaigns/variants/llama3_8b_3d_long_approx_reduce_order_cost535.toml"
+point = "8x2x4"

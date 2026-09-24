@@ -3,7 +3,7 @@
 ## TorchTitan
 
 The locked source is `kaijian/deepseek-baseline-parity-20260918` in
-`AlbedoWang/torchtitan` at `e8068c44`. Its history has `383cae9f` as an actual
+`AlbedoWang/torchtitan` at `a68fa447`. Its history has `383cae9f` as an actual
 ancestor and retains the `60517d28` AutoParallel/GraphTrainer integration.
 
 - `383cae9f`: eager SAC treats AutoParallel collectives like other
@@ -29,6 +29,9 @@ ancestor and retains the `60517d28` AutoParallel/GraphTrainer integration.
 - `69e752e3`, `2876c9ac`, `63d411f9`, and `e8068c44` replace the exact-FQN
   AutoParallel SAC boundary rule with the fail-closed structural A2A-to-WO
   matcher and report its decisions.
+- `a68fa447` is the compatibility cherry-pick of TorchTitan PR #4859. It
+  reorders HSDP gradient reduction to reduce-scatter before all-reduce in the
+  shared GraphTrainer pass pipeline used by manual and AutoParallel modes.
 
 The 3D port includes only the approved legacy-DTensor AP configuration, CP
 input-ownership seam, DP-shard/CP/TP mesh, CP-aware SDPA, DTensor output, and
@@ -64,7 +67,10 @@ is pinned to the commit immediately before the lock/harness-only updates.
   through gradient producers and require lowering to match the modeled
   collectives and cost.
 - `8004eb3` stages orthogonal HSDP `Partial -> Replicate` reductions before the
-  remaining ordered redistribution. It is the AutoParallel runtime pin.
+  remaining ordered redistribution.
+- `63582207` is the compatibility cherry-pick of AutoParallel PR #535 and is
+  the runtime pin. The selected campaigns opt into its calibrated
+  `h100_nvswitch_roce_400g` profile.
 
 ## Reproduction policy
 

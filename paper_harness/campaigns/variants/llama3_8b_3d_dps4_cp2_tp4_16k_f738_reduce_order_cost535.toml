@@ -1,0 +1,127 @@
+schema_version = 1
+name = "llama3-8b-3d-dps4-cp2-tp4-seq16k-f738"
+description = "LLaMA 3 8B 16K MainTrainer, GraphTrainer, and fixed AutoParallel on DPS4 x CP2 x TP4 with reduce-order and calibrated H100 costs"
+workload = "llama3_8b_3d"
+
+[model]
+flavor = "8B"
+attention_backend = "flash_sdpa"
+
+[data]
+mode = "replay"
+identity = "manifest"
+dataset = "allenai/c4"
+revision = "1588ec454efa1a09f29cd18ddd04fe05fc8653a2"
+identity_manifest = "{asset:llama3_3d_16k_dp4}/manifest.json"
+identity_manifest_sha256 = "b68a759275a162b0eaff11f3787166b01c83256bd4f5b78939b75c00f76b9e4e"
+
+[training]
+local_batch_size = 2
+global_batch_size = 8
+gradient_accumulation_steps = 1
+seq_len = 16384
+
+[parallelism]
+data_parallel_replicate_degree = 1
+data_parallel_shard_degree = 4
+tensor_parallel_degree = 4
+context_parallel_degree = 2
+pipeline_parallel_degree = 1
+
+[comparison]
+declared_variable = "trainer_parallelization_compile_stack"
+allowed_config_paths = ["compile.*", "model_spec.name"]
+allowed_environment_keys = ["BENCHMARK_ARM"]
+pairs = [
+  ["tt_main", "gt_manual_cp"],
+  ["tt_main", "apgt_cp"],
+  ["gt_manual_cp", "apgt_cp"],
+]
+
+[measurement.primary]
+source = "structured_logs"
+steps = [7, 8, 9, 12, 13, 14, 17, 18, 19, 22, 23, 24]
+rank_selector = "latest_fetching_batch_end"
+value = "step_end_minus_fetching_batch_end"
+
+[mast]
+nodes = 4
+nproc_per_node = 8
+hardware = "grandteton_80g_roce"
+locality = "dc;pci1"
+gpu_name_contains = "H100"
+retries = 0
+master_port = 29500
+phase_timeout_seconds = 14400
+
+[mast.environment]
+AUTOPARALLEL_NCCL_COST_MODEL_PROFILE = "h100_nvswitch_roce_400g"
+BENCHMARK_WORLD_SIZE = "32"
+BENCHMARK_DP_DEGREE = "4"
+BENCHMARK_CP_DEGREE = "2"
+BENCHMARK_TP_DEGREE = "4"
+BENCHMARK_LOCAL_BATCH_SIZE = "2"
+BENCHMARK_GLOBAL_BATCH_SIZE = "8"
+BENCHMARK_SEQ_LEN = "16384"
+BENCHMARK_SEED_CHECKPOINT = "{asset:llama3_3d_seed_checkpoint}"
+LLAMA_TOKENIZER_DIR = "{asset:llama_tokenizer}"
+BENCHMARK_REPLAY_ROOT = "{asset:llama3_3d_16k_dp4}"
+BENCHMARK_REPLAY_MANIFEST_SHA256 = "b68a759275a162b0eaff11f3787166b01c83256bd4f5b78939b75c00f76b9e4e"
+PYTORCH_ALLOC_CONF = "expandable_segments:True"
+TORCHINDUCTOR_CUDAGRAPHS = "0"
+TORCH_NCCL_DESYNC_DEBUG = "1"
+TORCH_NCCL_TRACE_BUFFER_SIZE = "20000"
+TORCH_NCCL_DUMP_ON_TIMEOUT = "1"
+TORCH_NCCL_TRACE_CPP_STACK = "1"
+TORCH_NCCL_ENABLE_TIMING = "1"
+
+[artifacts]
+required_assets = [
+  "llama3_3d_16k_dp4",
+  "llama3_3d_seed_checkpoint",
+  "llama_tokenizer",
+]
+warmup_steps = 5
+
+[[arms]]
+name = "tt_main"
+profile = "tt_main_default_v1"
+module = "workloads.llama3_3d.config_registry"
+config = "torchtitan_main"
+[arms.environment]
+BENCHMARK_ARM = "tt_main"
+
+[[arms]]
+name = "gt_manual_cp"
+profile = "gt_manual_eager_v1"
+module = "workloads.llama3_3d.config_registry"
+config = "graph_manual"
+[arms.environment]
+BENCHMARK_ARM = "graph_manual"
+
+[[arms]]
+name = "apgt_cp"
+profile = "apgt_validated_v1"
+module = "workloads.llama3_3d.config_registry"
+config = "graph_autoparallel"
+[arms.overrides]
+"compile.autoparallel_solver" = "approx"
+[arms.environment]
+BENCHMARK_ARM = "graph_autoparallel"
+
+[[phases]]
+name = "performance"
+kind = "performance"
+arms = ["tt_main", "gt_manual_cp", "apgt_cp"]
+[phases.overrides]
+"comm.init_timeout_seconds" = 3600
+[phases.environment]
+BENCHMARK_PHASE = "steady"
+BENCHMARK_TOTAL_STEPS = "25"
+BENCHMARK_LOG_FREQ = "5"
+BENCHMARK_ENABLE_KINETO = "0"
+BENCHMARK_ENABLE_MEMORY_SNAPSHOT = "0"
+BENCHMARK_STRUCTURED_LOGGING = "1"
+BENCHMARK_PROFILE_FREQ = "25"
+BENCHMARK_PROFILE_ACTIVE = "1"
+BENCHMARK_PROFILE_WARMUP = "0"

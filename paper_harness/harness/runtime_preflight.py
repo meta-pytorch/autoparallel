@@ -38,6 +38,21 @@ def run(payload: Path, run_root: Path) -> dict:
     if packaged_experiment_lock.read_bytes() != harness_experiment_lock.read_bytes():
         raise RuntimeError("packaged campaign and harness experiment locks differ")
     resolved = json.loads((payload / "campaign/resolved_campaign.json").read_text())
+    expected_nccl_cost_model_profile = resolved["mast"].get("environment", {}).get(
+        "AUTOPARALLEL_NCCL_COST_MODEL_PROFILE"
+    )
+    nccl_cost_model_profile = os.environ.get(
+        "AUTOPARALLEL_NCCL_COST_MODEL_PROFILE"
+    )
+    if (
+        expected_nccl_cost_model_profile is not None
+        and nccl_cost_model_profile != expected_nccl_cost_model_profile
+    ):
+        raise RuntimeError(
+            "AutoParallel NCCL cost-model profile differs from the resolved "
+            f"campaign: expected {expected_nccl_cost_model_profile!r}, "
+            f"got {nccl_cost_model_profile!r}"
+        )
     actual_lock_sha256 = experiment_lock_digest(harness_experiment_lock)
     if resolved.get("experiment_lock_sha256") != actual_lock_sha256:
         raise RuntimeError("resolved campaign experiment-lock digest differs")
@@ -94,6 +109,7 @@ def run(payload: Path, run_root: Path) -> dict:
         "module_paths": {name: str(path) for name, path in module_paths.items()},
         "source_checks": source_checks,
         "structured_logger_handlers": os.environ.get("TITAN_STRUCT_LOGGER_HANDLERS"),
+        "autoparallel_nccl_cost_model_profile": nccl_cost_model_profile,
         "experiment_lock_sha256": actual_lock_sha256,
         "asset_lock_sha256": actual_asset_lock_sha256,
         "runtime_lock": runtime_lock,
