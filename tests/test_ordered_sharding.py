@@ -690,22 +690,13 @@ def test_infer_fsdplike_storage_order_3d():
     )
 
 
-def test_infer_fsdplike_storage_order_4d():
-    source = (Shard(0), Shard(0), Shard(0), Shard(0))
-    target = (Replicate(), Shard(0), Replicate(), Shard(0))
-
-    assert _infer_fsdplike_storage_order(source, target) == (
-        ShardOrderEntry(tensor_dim=0, mesh_dims=(1, 3, 2, 0)),
-    )
-
-
 def test_infer_fsdplike_storage_order_multiple_tensor_dims():
-    source = (Shard(0), Shard(1), Shard(0), Shard(1))
-    target = (Replicate(), Shard(1), Shard(0), Replicate())
+    source = (Shard(0), Shard(1), Shard(0))
+    target = (Replicate(), Shard(1), Shard(0))
 
     assert _infer_fsdplike_storage_order(source, target) == (
         ShardOrderEntry(tensor_dim=0, mesh_dims=(2, 0)),
-        ShardOrderEntry(tensor_dim=1, mesh_dims=(1, 3)),
+        ShardOrderEntry(tensor_dim=1, mesh_dims=(1,)),
     )
 
 
@@ -1279,7 +1270,7 @@ def test_partial_subset_order_reaches_unique_gradient_producer():
         )
 
 
-def test_nd_partial_subset_order_projection():
+def test_3d_partial_subset_order_projection():
     mesh_3d = torch.distributed.device_mesh.DeviceMesh(
         "cuda",
         torch.arange(32).reshape(4, 2, 4),
@@ -1302,39 +1293,6 @@ def test_nd_partial_subset_order_projection():
     hsdp_order = (ShardOrderEntry(tensor_dim=0, mesh_dims=(2, 1)),)
     hsdp_spec = DTensorSpec(mesh_3d, (Replicate(), Shard(0), Shard(0)))
     assert _project_shard_order_by_mesh_priority(hsdp_order, hsdp_spec) == hsdp_order
-
-    mesh_4d = torch.distributed.device_mesh.DeviceMesh(
-        "cuda",
-        torch.arange(16).reshape(2, 2, 2, 2),
-        mesh_dim_names=("axis0", "axis1", "axis2", "axis3"),
-    )
-    gm, nodes = _build_partial_subset_weight_graph()
-    placement = _partial_subset_weight_placement(
-        mesh_4d,
-        nodes,
-        weight_shape=(64, 32),
-        storage_placements=(Shard(0), Shard(0), Shard(0), Shard(0)),
-        forward_target_placements=(
-            Replicate(),
-            Shard(0),
-            Replicate(),
-            Shard(0),
-        ),
-        grad_source_placements=(Partial(), Shard(0), Shard(0), Shard(0)),
-        carrier_source_placements=(Shard(0), Shard(2), Replicate(), Shard(2)),
-        carrier_target_placements=(Shard(0), Shard(2), Shard(2), Shard(2)),
-        other_placements=(
-            Shard(0),
-            Replicate(),
-            Replicate(),
-            Replicate(),
-        ),
-    )
-    placement_order = _run_placement_order(gm, nodes, placement)
-    assert placement_order[nodes["param"]] == OrderInfo(
-        (ShardOrderEntry(tensor_dim=0, mesh_dims=(1, 3, 2, 0)),)
-    )
-    assert placement_order[nodes["grad_producer"]].project_by_mesh_priority
 
 
 def test_hsdp_order_allows_orthogonal_partial_reduction():

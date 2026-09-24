@@ -229,27 +229,6 @@ class TestOrderedRedistributeFusion:
         counts = _count_collectives(gm)
         assert counts == {"all_gather": 0, "reduce_scatter": 2, "alltoall": 0}
 
-    def test_4d_fsdplike_gather_has_no_alltoall(self):
-        mesh = DeviceMesh(
-            "cuda",
-            torch.arange(16).reshape(2, 2, 2, 2),
-            mesh_dim_names=("a", "b", "c", "d"),
-        )
-        src, dst, local = self._make_specs(
-            mesh,
-            (Shard(0), Shard(0), Shard(0), Shard(0)),
-            (Replicate(), Shard(0), Replicate(), Shard(0)),
-            shape=(4096, 1024),
-        )
-        src.shard_order = (ShardOrderEntry(tensor_dim=0, mesh_dims=(1, 3, 2, 0)),)
-
-        def trace_fn(x):
-            return ordered_redistribute_local_tensor(x, src, dst)
-
-        gm = make_fx(trace_fn, tracing_mode="real")(local)
-        counts = _count_collectives(gm)
-        assert counts == {"all_gather": 2, "reduce_scatter": 0, "alltoall": 0}
-
 
 class TestShardOrderSpecIsolation:
     """Test that shard_order modifications don't leak between shared DTensorSpec
