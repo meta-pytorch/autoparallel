@@ -20,15 +20,15 @@ from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
 
 from autoparallel.api import AutoParallel
 from autoparallel.shardings.ordered_sharding import (
+    OrderInfo,
     _consumer_boundary_for_input,
     _fallback_plan,
     _infer_fsdplike_storage_order,
     _logical_plan,
-    _matches_inverse_gradient_pattern,
+    _matches_adjoint_gradient_pattern,
     _project_order_info,
     _project_shard_order_by_mesh_priority,
     _spec_with_shard_order,
-    OrderInfo,
     build_param_grad_linear_chains,
     compute_optimal_placement_order_for_parameters,
     get_redistributed_input_placements,
@@ -740,23 +740,23 @@ def test_infer_fsdplike_storage_order_rejects_unsupported_patterns():
     )
 
 
-def test_matches_inverse_gradient_pattern_3d():
+def test_matches_adjoint_gradient_pattern_3d():
     param_source = (Shard(0), Shard(0), Shard(0))
     param_target = (Replicate(), Replicate(), Shard(0))
 
-    assert _matches_inverse_gradient_pattern(
+    assert _matches_adjoint_gradient_pattern(
         param_source,
         param_target,
         (Partial(), Partial(), Shard(0)),
         param_source,
     )
-    assert not _matches_inverse_gradient_pattern(
+    assert not _matches_adjoint_gradient_pattern(
         param_source,
         param_target,
         (Partial(), Replicate(), Shard(0)),
         param_source,
     )
-    assert not _matches_inverse_gradient_pattern(
+    assert not _matches_adjoint_gradient_pattern(
         param_source,
         param_target,
         (Partial(), Partial(), Shard(0)),

@@ -55,7 +55,6 @@ class _FallbackPlan:
 @dataclass(frozen=True)
 class _MultiBoundaryPlan:
     grad_producer: Optional[torch.fx.Node] = None
-    carrier_input: Optional[torch.fx.Node] = None
 
 
 def _infer_fsdplike_storage_order(
@@ -118,10 +117,6 @@ def _matches_adjoint_gradient_pattern(
         for param_src, param_dst in zip(param_source, param_target)
     )
     return grad_source == expected_grad_source
-
-
-# Keep the old private name for callers of the original PR #529 helper.
-_matches_inverse_gradient_pattern = _matches_adjoint_gradient_pattern
 
 
 def _project_shard_order(
@@ -308,7 +303,7 @@ def _fallback_plan(source: DTensorSpec, target: DTensorSpec) -> Optional[_Fallba
     """Propagate one redistribution through DTensor and price its actual steps."""
     if source.mesh != target.mesh or source.tensor_meta is None:
         return None
-    operations = []
+    operations: list[tuple[str, tuple[int, ...]]] = []
     cost = 0.0
     reduction_steps, source = _orthogonal_partial_reduction_steps(source, target)
     for current, next_spec, mesh_dim in reduction_steps:
@@ -924,7 +919,7 @@ def _producer_order_plan(
         planned_edges.append((source, target, concrete))
 
     return (
-        _MultiBoundaryPlan(producer, carrier_edge[1]),
+        _MultiBoundaryPlan(producer),
         planned_edges,
     )
 
@@ -1043,7 +1038,7 @@ def _multi_boundary_adjoint_improves_fallback(
         return None
 
     projected_backward_source = _project_shard_order(preferred_order, last_source)
-    producer_edges = []
+    producer_edges: list[tuple[DTensorSpec, DTensorSpec, _FallbackPlan]] = []
     multi_boundary_plan = _MultiBoundaryPlan()
     if projected_backward_source != baseline_backward[-1][1].shard_order:
         producer_result = _producer_order_plan(

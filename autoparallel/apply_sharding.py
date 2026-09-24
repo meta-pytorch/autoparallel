@@ -28,7 +28,6 @@ from torch.utils._pytree import tree_flatten, tree_map_only
 from .graph_passes.graph_utils import all_input_nodes, cleanup_graph
 from .shardings.ordered_sharding import (
     _project_order_info,
-    _project_shard_order,
     _resolve_edge_shard_orders,
     compute_optimal_placement_order_for_parameters,
     ordered_redistribute_local_tensor,

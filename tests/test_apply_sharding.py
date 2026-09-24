@@ -18,10 +18,10 @@ from torch.fx.experimental.proxy_tensor import make_fx
 from autoparallel.apply_sharding import (
     ApplyShardingInterpreter,
     _build_physical_placements,
-    _project_shard_order,
 )
 from autoparallel.shardings.ordered_sharding import (
     OrderInfo,
+    _project_shard_order,
     ordered_redistribute_local_tensor,
 )
 
