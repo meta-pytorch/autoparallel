@@ -3,7 +3,7 @@
 ## TorchTitan
 
 The locked source is `kaijian/deepseek-baseline-parity-20260918` in
-`AlbedoWang/torchtitan` at `94e596cc`. Its history has `383cae9f` as an actual
+`AlbedoWang/torchtitan` at `e8068c44`. Its history has `383cae9f` as an actual
 ancestor and retains the `60517d28` AutoParallel/GraphTrainer integration.
 
 - `383cae9f`: eager SAC treats AutoParallel collectives like other
@@ -26,6 +26,9 @@ ancestor and retains the `60517d28` AutoParallel/GraphTrainer integration.
 - `94e596cc`: cherry-picks the CP bucket-plan activation from `c2116c31` onto
   `8ceafd62`; TorchTitan passes `parallel_dims.cp_enabled` to AutoParallel's
   `synchronize_world_buckets` setting, leaving the non-CP default disabled.
+- `69e752e3`, `2876c9ac`, `63d411f9`, and `e8068c44` replace the exact-FQN
+  AutoParallel SAC boundary rule with the fail-closed structural A2A-to-WO
+  matcher and report its decisions.
 
 The 3D port includes only the approved legacy-DTensor AP configuration, CP
 input-ownership seam, DP-shard/CP/TP mesh, CP-aware SDPA, DTensor output, and
@@ -54,8 +57,14 @@ is pinned to the commit immediately before the lock/harness-only updates.
   producer-keyed boundary lowering.
 - `6fb00205` adds opt-in cross-rank consensus for world bucket plans.
 - `684b8533` restores the real-shape shard-order coverage and adds CP
-  bucket-consensus coverage. It is the AutoParallel runtime pin; the following
-  harness-only commit updates this lock and provenance.
+  bucket-consensus coverage.
+- `048ce7c` adds the parameter-axis constraint used to require HSDP parameters
+  to replicate on `dp_replicate` while leaving `fsdp` and `tp` to the solver.
+- `2f7c0bb`, `481f6ea`, `8d17878`, and `af91dc2` propagate physical shard order
+  through gradient producers and require lowering to match the modeled
+  collectives and cost.
+- `8004eb3` stages orthogonal HSDP `Partial -> Replicate` reductions before the
+  remaining ordered redistribution. It is the AutoParallel runtime pin.
 
 ## Reproduction policy
 
