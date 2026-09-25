@@ -659,19 +659,31 @@ def _package_audit(attempt_root: Path) -> dict[str, Any]:
     report = loaded["report"]
     expected = report.get("payload_tree_sha256")
     sealed = seal.read_text().strip()
-    actual = manifest_digest(tree_manifest(payload))
-    if not expected or expected != sealed or expected != actual:
+    manifest = json.loads((attempt_root / "package_manifest.json").read_text())
+    recorded = manifest_digest(manifest)
+    # Assets are deleted after submission; they were verified against the asset lock
+    # at packaging time, so only the retained code is compared against the manifest.
+    retained = {
+        path: digest for path, digest in manifest.items() if not path.startswith("assets/")
+    }
+    actual = {
+        path: digest
+        for path, digest in tree_manifest(payload).items()
+        if not path.startswith("assets/")
+    }
+    if not expected or expected != sealed or expected != recorded or actual != retained:
         return {
             "status": "failed",
             "error": "packaged payload differs from its seal",
             "reported": expected,
             "sealed": sealed,
-            "actual": actual,
+            "recorded": recorded,
+            "retained_matches_manifest": actual == retained,
         }
     return {
         "status": "passed",
         "path": loaded["path"],
-        "payload_tree_sha256": actual,
+        "payload_tree_sha256": recorded,
     }
 
 

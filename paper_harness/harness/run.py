@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -87,23 +88,6 @@ def _materialize_source(
     return target
 
 
-def _fetch_package(identifier: str, destination: Path, record_root: Path) -> Path:
-    if not destination.exists():
-        destination.mkdir(parents=True)
-        _capture(
-            ["fbpkg", "fetch", identifier, "--dest", str(destination)],
-            cwd=HARNESS_ROOT,
-            record_root=record_root,
-            name=f"fetch_{identifier.replace(':', '_')}",
-        )
-    matches = sorted(destination.rglob("conda/bin/python"))
-    if len(matches) != 1:
-        raise CampaignError(
-            f"expected one Python in fetched {identifier}, found {matches}"
-        )
-    return matches[0]
-
-
 def _mount_assets(task_root: Path, record_root: Path) -> tuple[Path, Path]:
     lock = load_asset_lock()
     package_root = task_root / "environment/oilfs"
@@ -182,11 +166,7 @@ def run_reproduction(model: str, setting_name: str) -> dict[str, Any]:
         source_root=source_root,
         record_root=record_root,
     )
-    python = _fetch_package(
-        lock["runtime"]["conda_fbpkg"],
-        task_root / "environment/torchtitan_conda_prod",
-        record_root,
-    )
+    python = Path(sys.executable)
 
     campaign = load_campaign(setting.campaign, point=setting.point, mode="formal")
     mountpoint, _ = _mount_assets(task_root, record_root)

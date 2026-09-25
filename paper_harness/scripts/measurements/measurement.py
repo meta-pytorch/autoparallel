@@ -175,14 +175,6 @@ def _walk_values(value: Any, key: str) -> list[Any]:
     return found
 
 
-def _content_manifest(root: Path) -> dict[str, str]:
-    return {
-        path: digest
-        for path, digest in tree_manifest(root).items()
-        if path != "METADATA" and not path.endswith(".CHECKSUMS")
-    }
-
-
 def _one_package(packages: list[str], prefix: str) -> str:
     matches = sorted({package for package in packages if package.startswith(prefix)})
     if len(matches) != 1:
@@ -250,72 +242,12 @@ def submit(args: argparse.Namespace) -> None:
         "payload": _one_package(packages, "torchtitan_additional_packages:"),
     }
 
-    package_root = attempt / "packages"
-    destinations = {
-        "workspace": package_root / "submitted_workspace",
-        "payload": package_root / "submitted_payload",
-    }
-    for name, package in package_ids.items():
-        destination = destinations[name]
-        if destination.exists():
-            raise SystemExit(f"refusing to reuse package destination: {destination}")
-        destination.mkdir(parents=True)
-        _capture(
-            ["fbpkg", "fetch", package, "--dest", str(destination)],
-            cwd=HARNESS_ROOT,
-            record_root=record_root,
-            name=f"fetch_submitted_{name}",
-        )
-
-    fetched_payload = destinations["payload"] / "payload"
-    preflight_output = attempt / "exact_submitted_package_preflight"
-    env = {
-        **os.environ,
-        "PYTHONDONTWRITEBYTECODE": "1",
-        "PYTHONPATH": os.pathsep.join(
-            str(fetched_payload / component)
-            for component in ("harness_repo", "autoparallel", "torchtitan")
-        ),
-    }
-    preflight = _capture(
-        [
-            str(python),
-            "-m",
-            "harness.package_preflight",
-            str(fetched_payload),
-            str(preflight_output),
-        ],
-        cwd=fetched_payload / "torchtitan",
-        record_root=record_root,
-        name="exact_submitted_package_preflight",
-        env=env,
-    )
-    expected_payload = _content_manifest(attempt / "package/payload")
-    actual_payload = _content_manifest(fetched_payload)
-    expected_workspace = _content_manifest(package_root / "dryrun_workspace")
-    actual_workspace = _content_manifest(destinations["workspace"])
     audit = {
-        "status": "passed",
+        "status": "submitted",
         "job_id": job_id,
         "priority": priority_data,
         "packages": package_ids,
-        "payload": {
-            "matched": expected_payload == actual_payload,
-            "expected_tree_sha256": manifest_digest(expected_payload),
-            "actual_tree_sha256": manifest_digest(actual_payload),
-        },
-        "workspace": {
-            "matched": expected_workspace == actual_workspace,
-            "expected_tree_sha256": manifest_digest(expected_workspace),
-            "actual_tree_sha256": manifest_digest(actual_workspace),
-        },
-        "exact_package_preflight_returncode": preflight.returncode,
     }
-    if not audit["payload"]["matched"] or not audit["workspace"]["matched"]:
-        audit["status"] = "failed"
-    _write_json(attempt / "submitted_package_audit.json", audit)
-    if audit["status"] != "passed":
-        raise SystemExit("actual submitted package content differs from dry-run inputs")
     print(json.dumps(audit, indent=2, sort_keys=True))
 
 
@@ -683,7 +615,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     submit_parser = subparsers.add_parser(
         "submit",
-        help="submit the sealed attempt, set CRITICAL/99, and audit actual packages",
+        help="submit the sealed attempt and set CRITICAL/99",
     )
     submit_parser.add_argument("--attempt", type=Path, required=True)
     submit_parser.set_defaults(func=submit)

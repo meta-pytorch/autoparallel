@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -142,6 +143,8 @@ def _run_torchx(attempt: Path, *, dryrun: bool) -> dict:
     job_id = _submitted_job_id(completed.stdout + "\n" + completed.stderr)
     handle = f"mast_conda://torchx/{job_id}"
     (attempt / "job_id.txt").write_text(f"{job_id}\n")
+    # The payload is uploaded by now; keep only the code that analysis reuses.
+    shutil.rmtree(attempt / "package/payload/assets", ignore_errors=True)
     result = {
         "status": "submitted",
         "command": command,
