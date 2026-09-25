@@ -1,0 +1,878 @@
+# AutoParallel as an Agent-Facing Planner and Plan Evaluator
+
+## Executive summary
+
+Coding agents are making explicit FSDP, tensor-parallel, and checkpointing
+recipes cheaper to write. That erodes one part of AutoParallel's original pitch.
+It does not eliminate the planning problem underneath, and it increases the rate
+at which new model variants outgrow established recipes.
+
+The durable promise is not "no manual parallelism code." It is:
+
+> AutoParallel searches or evaluates the representable distributed design space
+> and returns an executable plan together with reproducible evidence about its
+> legality, estimated cost, coverage, and verification status.
+
+```text
+model artifact + workload ──▶┌──────────────────────┐──▶ executable plan
+topology + objectives ──────▶│ AutoParallel backend │──▶ costs and alternatives
+candidate plan ─────────────▶└──────────────────────┘──▶ verification evidence
+```
+
+The repositioning is from convenience automation to **planning and evidence**.
+Agents and humans propose model code, boundary layouts, constraints, or
+representable candidate plans; AutoParallel analyzes the derived graph, searches
+or scores alternatives, validates their consistency, and returns versioned
+artifacts.
+
+This document supersedes the earlier drafts listed in [the docs index](README.md).
+
+## Concede what agents commoditize
+
+The README's "no manual parallelism code required" is genuinely less
+differentiated now. A TorchTitan-style plan for a standard transformer is
+mechanical, widely exemplified, and increasingly easy to generate. For a fixed
+model on a fixed cluster, a maintained hand-written recipe can be simple,
+predictable, and well benchmarked. AutoParallel should not argue that agents are
+incapable of producing such code.
+
+The stronger distinction is between **authoring a distributed program** and
+**deciding whether its plan is good**:
+
+- An agent can emit a plausible plan; AutoParallel can compare it against the
+  other legal plans and say what it costs.
+- An agent can reuse a familiar recipe; AutoParallel can re-evaluate that recipe
+  for a different shape, mesh, or topology.
+- An agent can repair model code; AutoParallel can name the graph region and the
+  constraint responsible for a failure.
+- An agent can launch experiments; AutoParallel can reduce how many expensive
+  distributed experiments are needed.
+
+Stating the concession first makes the remaining case more credible.
+
+## Why the planner remains valuable
+
+### Kernel agents are the proof, not the counterexample
+
+PTX, CuTe, and Triton agents work because the loop is tight — generate, compile,
+run, profile, compare against numeric and throughput ground truth — and because
+they *do not bypass the stack*. They do not replace compilers, assemblers,
+profilers, or correctness checks. They consume them.
+
+So the existence of capable kernel agents is evidence **for** building this
+backend, not against it. A successful codegen agent is a stack consumer, and the
+layer it consumes has to exist and has to be trustworthy.
+
+Distributed planning then fails the tight-loop precondition. A candidate can
+require a multi-node launch, performance is noisier, and some failures appear
+only at scale. Agents reduce the cost of producing candidates, not the cost of
+evaluating them. A planner should prune the space with graph constraints and
+calibrated models, then reserve real hardware for a small set of high-value
+measurements.
+
+### The optimization object is a derived graph
+
+AutoParallel plans over the joint forward and backward graph produced through
+Dynamo and AOTAutograd (`api.py`). Backward operations, saved tensors, gradient
+reductions, and most redistribution opportunities are not present in the
+original `nn.Module` source.
+
+The barrier is not that backward mathematics is unknowable — the backward of a
+matmul is well defined. It is that the facts that decide real cases are
+properties of the graph *after* partitioning, saved-tensor selection, recompute
+policy, decomposition, and representation-level passes. Reasoning about them
+from `model.py` means reproducing substantial compiler behavior before costing
+can begin.
+
+[adaptive_sharding.md](adaptive_sharding.md) makes this concrete. LLaMA3-8B and
+LLaMA3-70B, identical training configuration, diverge on `wo`: the 8B keeps it
+sequence-parallel, the 70B goes column-parallel. The deciding factors are that
+column-parallel yields `P(sum)S(0)` weight gradients — one reduce-scatter
+dimension — where sequence-parallel yields `P(sum)P(sum)` and needs a full 2D
+reduce-scatter, and that sequence-parallel `wo` emits `S(0)S(1)`, which the
+residual add consumes for free.
+
+The same document records a sharper version. Sequence-parallel strategies are
+only *visible* to the solver when the `view → mm → view` pattern is rewritten to
+preserve the sequence dimension; without that pass the decomposition folds
+sequence into batch and the entire strategy family disappears. The compiler
+representation determines which plans are available to search at all.
+
+### The answer is a function of the deployment
+
+A recipe is an artifact. The required behavior is closer to a function:
+
+```text
+plan = f(graph, shapes, topology, memory, objective, compiler behavior)
+```
+
+Batch size, sequence length, mesh dimensions, node count, GPU generation, and
+inter-node bandwidth each move the preferred plan without touching model source.
+This holds even if architecture churn slows.
+
+### The cost model is a systems asset, not an oracle
+
+`cost_models/nccl_cost_model.py` ports NCCL's `tuning.cc` algorithm and protocol
+selection — Ring, Tree, CollNet, NVLS, NVLS Tree crossed with LL, LL128, Simple
+— then corrects it against nccl-tests measurements on H100 NVSwitch. That
+coverage is not uniform: different collectives, message-size ranges, and node
+counts (up to 32) carry different amounts of measured support, which is exactly
+why provenance has to be reported per configuration rather than per collective.
+`adaptive_sharding.md` records that the adaptive behavior *requires* that model:
+the generic estimator did not price communication finely enough to separate the
+candidates. That body of systems knowledge cannot be
+recreated by language-model reasoning. It is measured on hardware.
+
+It must be exposed with its limits, and vague honesty is not useful. Precisely:
+
+**On the default path** — `cost_model="nccl"`, which calls
+`set_nccl_topo_config(detect_nccl_topo_config(mesh))`:
+
+- Blackwell is extrapolated. `_BLACKWELL_BW_SCALE = 640.0 / 320.0` scales
+  bandwidth from Hopper, and `_A2A_CE_BW[BLACKWELL]` is annotated `estimated
+  proportionally from bw_intra ratio; needs profiling`.
+- Compute costs are analytical: FLOPs over throughput at an assumed 70%
+  efficiency versus bytes over bandwidth at 70%, with a 7 µs launch floor. None
+  of it has been checked against real generated kernels.
+- Overlap is selected, not predicted. `apply_prefetch_discount` is a
+  caller-chosen multiplier defaulting to `scale=0.0` — collectives treated as
+  free — and is not applied automatically. The truth lies between free and fully
+  exposed, and the graph-level simulator cannot simply replace it: it requires a
+  lowered graph and therefore cannot be evaluated inside the search. See
+  [capability 2](#2-two-stage-overlap-evaluation).
+
+**On the fallback path only**, where `_nccl_topo_config is None`:
+
+- `all_to_all_cost` ends with `total_time *= 5` under a `FIXME`.
+  `collective_comm_cost` routes to `nccl_all_to_all_cost` whenever the NCCL
+  config is set, so this does not affect default planning. It still needs
+  containing: `adaptive_sharding.md` concludes that intra-node all-to-all is
+  competitive with all-gather for seq-par → head-par SDPA transitions, and a 5×
+  multiplier inverts exactly that comparison. A caller who lands on the fallback
+  gets a different plan family for a reason that is not a property of the
+  hardware.
+
+**These errors do not cancel in the solver.** A bias uniform across all costs
+would. A bias on one collective type or operator class shifts the selected plan
+away from every strategy that uses it. Calibration error is a plan-selection
+problem first and a reporting problem second.
+
+## What exists today
+
+Support and maturity are not binary, and that applies to this list as much as to
+operators.
+
+| Capability | State | Evidence | Qualification |
+|---|---|---|---|
+| Joint fwd/bwd capture | Core | CI | tied to evolving PyTorch internals |
+| DTensor strategy enumeration | Core | CI | coverage depends on upstream rules and local overrides |
+| Global ILP | Core | CI | optimal only within candidates and modeled costs |
+| Executable lowering | Core | CI | not packaged as an independently verifiable artifact |
+| `torch.compile` backend | Implemented | CI | AC and overlap use private compiler hooks |
+| NCCL cost model | Strongest on H100 NVSwitch | `test_nccl_cost_model` | coverage varies by collective, size, topology, arch |
+| Compute cost model | Analytical | — | 70% efficiency and 7 µs floor unvalidated |
+| Runtime/memory simulation | Implemented | `test_estimate_graph_metrics` | one aggregate peak; requires a lowered graph |
+| Numerical correctness | Simulated | `test_correctness` (`LocalTensorMode`) | verifies the direct joint-graph path, not public `apply_placement()` |
+| Distributed checkpointing | Tested | `test_dcp_roundtrip` | real multi-GPU coverage narrower than simulated |
+| Dynamic shapes, inference, mixed precision | Tested | dedicated test files | not equivalent to arbitrary dynamic programs |
+| FlexAttention | Tested | `test_flex_attention` | auxiliary layouts have explicit restrictions |
+| `local_map` / MoE | Explicit boundary | examples, DSV3 | internal communication not globally optimized or priced |
+| TorchTitan integration | LLaMA3 in CI | `--module autoparallel.llama3` | DeepSeek/MoE integration less mature (CI disabled) |
+| Pipeline parallelism | Not supported | — | micro-pipelined TP is not model PP |
+
+Plan JSON, trace artifacts, optimizer serialization, re-solving, placement
+explanations, and solution diffs all exist. They are fragmented across internal
+methods, logs, stdout, and tracing artifacts. `__init__.py` exports five symbols
+and none of them scores a plan. These capabilities should become the center of
+the interface.
+
+## Claims the product must make precisely
+
+### Say "cost-model-optimal"
+
+The ILP returns an exact optimum over the candidate strategies and costs it is
+given. It does not prove the plan is fastest on real hardware. Every result
+should identify the strategy-space version; the cost-model and
+calibration-profile versions; the topology profile; the workload shapes and
+dynamic dimensions; all constraints and boundary layouts; replication fallbacks
+and opaque regions; and how each important cost was produced.
+
+### Disclose which cost path produced the numbers
+
+The distinction between the default NCCL path and the generic fallback is not
+only documentation. It is a **response obligation**: topology detection can send
+a caller down the fallback without any explicit choice on their part, and the
+numbers they receive then come from a different model with different failure
+modes.
+
+Every response carries `cost_path`, and landing on the fallback emits a warning
+that is fatal under `policy.fallback_costs = "reject"`. Do not describe the
+fallback heuristic as affecting default planning, and do not let a caller
+discover after the fact that they were on it.
+
+### Support is a taxonomy
+
+A graph region may be directly supported, supported through decomposition,
+representable only with replication, opaque or manually specified, or
+unsupported.
+
+**Replicate-only is the dangerous case.** It does not fail; it yields a correct,
+working, quietly slow plan. It is the one failure mode a caller cannot detect
+from the outcome and would not think to check. It must be visible in every
+response and configurable as fatal.
+
+### Verification claims must name their substrate
+
+Fake tensors validate graph construction and shape propagation; they do not
+establish numerical equivalence. Simulated ranks exercise real values but not
+real network behavior. A small real mesh catches different failures from the
+target topology. No single `verified: true` field can carry all of these claims.
+
+Naming the substrate means more than a tier label. A Tier 2 numerical result is
+meaningless without the tolerance it passed at, the seed it ran under, and the
+inputs it used — "gradients match" at `rtol=1e-1` is a different claim from the
+same sentence at `rtol=1e-5`, and without the seed the result is not
+reproducible. The verification block carries `inputs_hash`, `random_seed`, and
+`tolerances` alongside the tier.
+
+### How a cost was built and whether it was checked are two axes
+
+These are independent. Collapsing them into a single vocabulary makes states like
+"analytical but validated" impossible to express — which is precisely the state
+the compute model lands in once the minimal benchmark runs.
+
+**`basis`** — how the term was constructed:
+
+- `measured`: this specific operation class and configuration was directly
+  benchmarked, inside a declared calibration range;
+- `interpolated`: derived between measurements within that range;
+- `extrapolated`: derived outside the range, or from another architecture;
+- `analytical`: produced by an analytical model;
+- `fallback`: produced by a generic heuristic.
+
+**`validation`** — whether a prediction was subsequently checked against
+observation: `unvalidated`, or `validated` with a pointer to the validating
+artifact.
+
+An end-to-end step benchmark that matches prediction validates the *sum*. Errors
+in opposite directions cancel inside a sum, so agreement at the aggregate level
+is not evidence about any individual term. A term whose basis is `extrapolated`
+does not become `measured` because the total came out right — it stays
+`extrapolated`, gains `validated` at the aggregate level, and the artifact should
+say exactly that. Promoting the basis instead would make the cost model report
+rising confidence while its component accuracy stays unknown, which is the exact
+failure the provenance scheme exists to prevent.
+
+### The caller still supplies policy
+
+The planner needs representative inputs, a topology, objectives, and some
+boundary constraints. Data-dependent MoE regions may still require explicit
+local semantics. Agents can help supply this policy, but defaults and
+assumptions must be *returned*, not silently applied.
+
+### Compatibility is part of correctness
+
+AutoParallel depends on private, evolving PyTorch APIs and nightly builds. Plan
+artifacts must record the PyTorch build and relevant compiler configuration, and
+the project needs a tested compatibility matrix plus clear failure codes when the
+environment is unsupported. A plan that is not reproducible against a declared
+PyTorch version is not a plan.
+
+## Product shape: evaluate and search
+
+Two operations sharing one validation and scoring implementation.
+
+### `score_plan`: evaluate a candidate
+
+```python
+report = score_plan(artifact, workload, topology,
+                    plan=candidate, objectives=objectives)
+
+report.valid
+report.coverage
+report.estimated.step_time_us
+report.estimated.exposed_communication_us
+report.estimated.memory          # by category
+report.confidence
+report.verification
+report.assumptions
+```
+
+Initially this accepts **only plans expressible through the captured graph and
+AutoParallel's candidate strategy space**. `load_placements` matches placement
+strings against the enumerated strategies, so a plan outside that space cannot be
+scored — it must be rejected explicitly, not silently mismatched. Scoring
+arbitrary distributed Python programs is a separate problem and the API must not
+imply it.
+
+Scoring requires more than connecting placement JSON to graph metrics:
+
+1. Match the plan to the model, graph, and strategy-space versions.
+2. Validate that every selected placement is available and legal.
+3. Reject missing, stale, or ambiguous node mappings.
+4. Lower the candidate into a parallel graph.
+5. Validate boundary contracts and collective consistency.
+6. Estimate the scheduled graph with a documented runtime estimator.
+7. Account separately for parameters, activations, optimizer state, temporary
+   collective buffers, and opaque-region contracts. Bucketing makes temporary
+   buffers real — `max_in_flight_gb` exists as a knob for exactly this.
+8. Return coverage, confidence, assumptions, and verification evidence.
+
+### `plan`: search and return alternatives
+
+```python
+result = plan(artifact, workload, topology, objectives)
+
+result.selected
+result.alternatives    # small diverse set with estimated deltas
+result.coverage
+result.explanation
+result.session_id
+```
+
+The solver's own plan passes through the same `score_plan` validation and
+reporting path as a caller-supplied plan, so solver output receives no less
+scrutiny and the two sets of numbers stay comparable.
+
+### Preserve a warm exploration session
+
+The existing workflow is already agent-shaped:
+
+```text
+add constraint -> resolve -> inspect diff -> explain -> remove or revise
+```
+
+`resolve()` is cheap by construction — it re-solves without rebuilding the
+objective. A stateless request stays the default, but `session_id` should
+address the traced graph and built optimizer so counterfactuals do not retrace.
+
+```json
+{
+  "schema_version": 1,
+  "session_id": "...",
+  "mutations": [
+    {"op": "add_node_constraint", "node_id": "...", "placement": ["S0", "S1"]}
+  ],
+  "return": ["score", "diff", "explanation"]
+}
+```
+
+Sessions expire; a stale id returns `PLAN_SESSION_EXPIRED` and the caller
+replays the immutable request.
+
+## A versioned artifact contract
+
+Local Python wrappers may accept an `nn.Module`, but a durable service boundary
+should accept a versioned, immutable capture artifact. A mutable model reference
+executes arbitrary Python and may resolve to a different graph in a different
+environment.
+
+**The artifact format is an open design decision, and the schema should not
+pretend otherwise.** A `torch.export` `ExportedProgram` is a forward-only
+artifact. AutoParallel plans over the output of
+`aot_export_joint_with_descriptors`, which carries `params_spec` and the
+descriptor metadata that the forward/backward pairing depends on, and it then
+runs graph passes — notably the `view → mm → view` rewrite — that determine which
+strategy families are visible at all. Naming a current PyTorch file format in the
+request would silently assert that the format carries all of this.
+
+Specify the required *semantics* and version the format. A capture artifact must
+carry, or deterministically reproduce:
+
+- the joint forward/backward graph;
+- parameter and buffer specs with forward/backward node pairing;
+- the graph-pass configuration applied before planning;
+- the PyTorch build and export options that produced it.
+
+A front-end may package this by running model code in a controlled environment
+rather than by reusing an existing file format.
+
+### Request
+
+```json
+{
+  "schema_version": 1,
+  "model": {
+    "artifact": "model.capture",
+    "content_hash": "sha256:...",
+    "artifact_format_version": 1,
+    "pytorch_build": "...",
+    "export_options_hash": "sha256:..."
+  },
+  "workload": {
+    "mode": "training",
+    "inputs": [
+      {"shape": [1024, 4096], "dtype": "bfloat16", "layout": ["S0", "R"]}
+    ],
+    "dynamic_dimensions": {"input.0": [0]}
+  },
+  "topology": {
+    "mesh": [16, 8],
+    "mesh_names": ["dp", "tp"],
+    "profile": "h100_nvswitch_400g_v1",
+    "profile_hash": "sha256:..."
+  },
+  "objectives": {
+    "mode": "throughput",
+    "parameter_memory_bytes": 40000000000,
+    "activation_memory_bytes": 20000000000
+  },
+  "constraints": [],
+  "policy": {
+    "replicate_only": "warn",
+    "opaque_regions": "warn",
+    "fallback_costs": "reject",
+    "extrapolated_costs": "warn"
+  }
+}
+```
+
+### Response
+
+```json
+{
+  "schema_version": 1,
+  "status": "planned",
+  "plan_id": "sha256:...",
+  "session_id": "...",
+  "provenance": {
+    "planner_version": "...",
+    "solver_version": "...",
+    "solver_options_hash": "sha256:...",
+    "strategy_space_version": "...",
+    "cost_model_version": "...",
+    "cost_path": "nccl",
+    "calibration_profile_hash": "sha256:...",
+    "artifact_format_version": 1,
+    "pytorch_build": "...",
+    "compiler_config_hash": "sha256:..."
+  },
+  "estimated": {
+    "step_time_us": 0.0,
+    "search_objective_score": 0.0,
+    "compute_us": 0.0,
+    "communication_us": 0.0,
+    "exposed_communication_us": 0.0,
+    "memory": {
+      "parameters_bytes": 0,
+      "activations_bytes": 0,
+      "optimizer_state_bytes": 0,
+      "collective_buffers_bytes": 0,
+      "peak_bytes": 0
+    },
+    "intervals": {
+      "step_time_us": [0.0, 0.0],
+      "peak_bytes": [0, 0]
+    }
+  },
+  "coverage": {
+    "direct": 0, "decomposed": 0,
+    "replicate_only": 0, "opaque": 0, "unsupported": 0
+  },
+  "confidence": {
+    "level": "medium",
+    "critical_terms": [
+      {
+        "node_id": "...",
+        "kind": "all_to_all",
+        "message_bytes": 0,
+        "mesh_dimension": "tp",
+        "n_nodes": 4,
+        "algorithm": "...",
+        "protocol": "...",
+        "basis": "extrapolated",
+        "validation": "unvalidated",
+        "validation_artifact": null,
+        "calibration_range": {},
+        "share_of_critical_path": 0.31
+      }
+    ],
+    "reasons": []
+  },
+  "verification": {
+    "highest_completed_tier": 0,
+    "inputs_hash": "sha256:...",
+    "random_seed": 0,
+    "tolerances": {},
+    "results": {}
+  },
+  "artifacts": {
+    "placements": "placements.json",
+    "parallel_graph": "parallel_graph.pt2",
+    "explanation": "explanation.json",
+    "visualization": "plan.html"
+  },
+  "warnings": []
+}
+```
+
+For fixed artifact hashes, workload, topology, policy, solver configuration, and
+implementation versions, reproducibility and cacheability are design goals.
+Determinism must be **tested**; it should not be assumed merely because the
+request is versioned. A CBC-backed solve does not obviously provide it across
+platforms.
+
+## Required capabilities
+
+### 1. Fine-grained cost provenance and confidence
+
+Tag every important cost term with a construction `basis` (`measured`,
+`interpolated`, `extrapolated`, `analytical`, `fallback`) and an independent
+`validation` status, per the two-axis rule above.
+
+Provenance must be keyed by *configuration*, not by collective name. The cost
+tables are indexed by algorithm, protocol, node count, ranks per node, and
+message size, so a label such as "AllGather: measured" asserts far more than any
+measurement supports. All-gather measured at 1 GB intra-node says nothing about
+all-gather at 4 MB across 16 nodes. Carry topology, message size or tensor shape,
+mesh dimension, algorithm/protocol where applicable, software stack, and
+calibration range.
+
+Weight confidence by critical-path contribution. One dominant, poorly calibrated
+all-to-all matters more than a hundred negligible analytical pointwise costs.
+
+Initial calibration priorities:
+
+- measure Blackwell all-to-all directly (already item 1 of the TODO block in
+  `nccl_cost_model.py`);
+- compare compute estimates against representative generated kernels; validate
+  or replace the 70% efficiency assumption and the 7 µs floor;
+- contain the fallback all-to-all heuristic, or route it to the NCCL path;
+- develop the overlap-aware re-ranking path in capability 2;
+- record the exact topology and software stack for every measurement.
+
+These gate high-confidence performance claims. They do **not** block structured
+analysis, explicitly low-confidence estimates, or correctness verification,
+provided unreliable paths are visible and optionally fatal.
+
+### 2. Two-stage overlap evaluation
+
+Overlap cannot be fixed by pointing the ILP at the graph simulator, because the
+two operate at different points in the pipeline.
+
+`apply_prefetch_discount` scales `comm_cost` on decision variables and must run
+before `get_solution()`; it is part of building the objective.
+`estimate_graph_metrics` walks a `GraphModule` looking for collective nodes and
+`wait_tensor` syncs, so it runs only after a *chosen* plan has been lowered by
+`apply_sharding`. The ILP needs a per-decision-variable scalar available
+pre-lowering; the simulator produces a whole-graph number available only
+post-lowering. Using the simulator inside the search would mean lowering and
+scheduling every candidate.
+
+Use two stages:
+
+1. Search with a documented approximate overlap term in the ILP objective.
+2. Lower and schedule a small, diverse set of candidates.
+3. Estimate their exposed communication with graph-level simulation.
+4. Re-rank the candidates, and when measurements justify it, update the
+   approximate overlap model used in stage 1.
+
+Retain **both** scores in the plan artifact, as `search_objective_score` and
+`step_time_us`. The first is deliberately not denominated in microseconds: the
+ILP objective mixes estimated compute and communication time with a unitless
+placement-transition tie-breaker and per-cluster multiplicities, so it ranks
+plans without predicting a duration. Only the post-lowering figure is a time
+estimate.
+
+When the two disagree, the disagreement is the signal — it says scheduling
+changed the ranking, which is precisely what the approximate term failed to
+capture, and it is the input that improves the approximation.
+
+### 3. `analyze`: structured coverage before planning
+
+Replace a Boolean support check with a report that stays useful when planning
+cannot proceed. It should attempt capture; identify trace breaks and source
+locations; classify tensor-producing regions using the taxonomy; report candidate
+counts and search-space size; identify replicate-only and opaque regions; and
+estimate whether any representable strategy can satisfy the memory constraints.
+
+Present repairs as possibilities. Wrapping a region in `local_map` may be a good
+suggestion, but it must not be asserted as the correct fix: the tool cannot infer
+the intended distributed semantics of a region it failed to analyze.
+
+### 4. Machine-readable failures
+
+Stable codes with structured context; human-readable messages rendered *from* the
+data.
+
+```json
+{
+  "error": "REPLICATE_ONLY_REGION",
+  "node_id": "mm_14",
+  "module_path": "layers.3.attention.wq",
+  "op": "aten.mm.default",
+  "source": {"file": "model.py", "line": 142},
+  "shapes": [[8192, 4096], [4096, 4096]],
+  "detail": "no sharded strategy available; plan falls back to replication",
+  "estimated_cost_us": 812.0
+}
+```
+
+Error codes: `TRACE_FAILED`, `UNSUPPORTED_OP`, `REPLICATE_ONLY_REGION`,
+`PLAN_NOT_REPRESENTABLE`, `PLAN_GRAPH_MISMATCH`, `PLAN_VERSION_MISMATCH`,
+`INFEASIBLE_CONSTRAINTS`, `MEMORY_OVER_BUDGET`, `TOPOLOGY_PROFILE_MISSING`,
+`TOPOLOGY_PROFILE_UNSUPPORTED`, `INPUT_SHAPE_MISMATCH`, `MESH_MISMATCH`,
+`PYTORCH_VERSION_UNSUPPORTED`, `PLAN_SESSION_EXPIRED`.
+
+`TOPOLOGY_PROFILE_MISSING` means no profile was supplied.
+`TOPOLOGY_PROFILE_UNSUPPORTED` means one was supplied that has no calibration
+behind it. The repairs differ: supply a profile, versus calibrate one or select a
+supported one.
+
+Warning codes, emitted into `warnings` and promotable to errors through `policy`:
+`FALLBACK_COST_PATH`, `EXTRAPOLATED_CRITICAL_TERM`, `OPAQUE_REGION_UNPRICED`,
+`PLAN_RESCORED_WITH_NEW_COST_MODEL`.
+
+The three plan-rejection codes are distinct failures with distinct repairs:
+
+| Code | Meaning | Repair |
+|---|---|---|
+| `PLAN_NOT_REPRESENTABLE` | the strategy is not in the candidate space | change the plan, or extend the space |
+| `PLAN_GRAPH_MISMATCH` | the plan was built against a different graph | re-capture and re-plan |
+| `PLAN_VERSION_MISMATCH` | the schema or strategy-space version is incompatible | re-plan against the current strategy space |
+
+Collapsing the third into the second sends callers down the wrong path after
+every upgrade.
+
+A **cost-model** version change is not a version mismatch. The placements remain
+legal and representable; only their price moved. Re-score the plan under the new
+model, emit `PLAN_RESCORED_WITH_NEW_COST_MODEL` carrying the old and new scores,
+and let the caller decide. Re-planning is advisable when the ranking changes, not
+automatically required.
+
+A generic infeasibility result does not identify the minimal contradictory
+constraint set. That needs an irreducible-infeasible-subset analysis, which CBC
+does not provide for free. Until it exists, distinguish known conflicts from
+hypotheses rather than implying a diagnosis.
+
+`export_json.py` already extracts node, `module_path`, and source location.
+
+### 5. Explanations as data
+
+Promote `get_json`, `get_log`, `explain_placement`, `print_costs_for_node`,
+`diff_solutions`, optimizer serialization, and
+`visualizer/build_display_from_json.py` into supported return artifacts. An
+explanation should answer: why this placement; which alternatives were legal and
+at what cost; which constraint eliminated a requested one; which edges dominate
+communication and which tensors dominate memory; what changes under another mesh
+or budget; and which conclusions depend on fallback or extrapolated costs.
+
+### 6. Tiered verification
+
+| Tier | Claim | Substrate |
+|---|---|---|
+| 1 Structural | graph, shapes, placements, boundaries, collective symmetry are valid | fake tensors and graph analysis |
+| 2 Simulated numerical | forward values and gradients match an unsharded reference | `LocalTensorMode`, real values |
+| 3 Small cluster | real collectives, parity, checkpointing, repeat determinism, compilation | small real mesh |
+| 4 Target | memory, throughput, compile behavior, baselines measured | intended topology |
+
+`tests/test_correctness.py` is the foundation for Tier 2, but it exercises the
+direct joint-graph path — that is **not** equivalent to verifying the public
+`apply_placement()` path, and the two must not be conflated in a response. Its
+docstring records the blockers to the stronger claim:
+
+1. `ProcessGroup` objects from `compile_on_one_rank` are not deepcopy-safe,
+   breaking `extract_forward_graph`'s deepcopy of the joint graph.
+2. AOT autograd's compiled backward rejects `LocalTensor` tangents because
+   `LocalTensor` does not implement `__coerce_same_metadata_as_tangent__`.
+
+Every tier result records its `inputs_hash`, `random_seed`, and `tolerances`.
+`highest_completed_tier` is `0` until a check has actually run — it is never
+defaulted to 1 on the grounds that structural verification is cheap.
+
+Estimated performance is never presented as measured performance. Calibration
+gates trustworthy performance scoring; it does not gate structural verification,
+numerical verification, or coverage reporting.
+
+### 7. Profile-guided refinement
+
+1. Produce a small, diverse set of feasible plans.
+2. Benchmark selected collectives, kernels, or short training steps.
+3. Store measurements with their precise configuration and scope.
+4. Update **only the model terms justified by those measurements**.
+5. Re-score, and re-solve when the calibration moves a decision.
+6. Preserve predicted and observed values in the plan artifact.
+
+Step 4 is where discipline is required. An aggregate benchmark sets `validation`
+on the aggregate; only a directly benchmarked configuration may change a term's
+`basis` to `measured`.
+
+### 8. Opaque-region cost contracts
+
+`local_map` is an intentional boundary for data-dependent semantics that static
+DTensor placements cannot express. Let such a region declare or supply:
+
+- input and output placement contracts;
+- estimated or measured runtime as a function of the relevant shapes;
+- peak and temporary memory;
+- collective classes and mesh dimensions used internally;
+- calibration provenance for the above;
+- verification hooks.
+
+Without a contract the region stays visible as opaque and lowers whole-plan
+confidence. Richer layout representations may shrink the boundary over time, but
+eliminating it is not a prerequisite for useful global planning, and it is
+probably not achievable for data-dependent routing.
+
+## Benchmarks and trust
+
+The adoption question is empirical:
+
+> Are AutoParallel's plans competitive with strong hand-written plans, and do its
+> estimates rank alternatives accurately enough to guide search?
+
+**Metrics.** Rank correlation is primary for *choosing among* plans. It is not
+sufficient. Absolute error and calibrated intervals matter whenever a number is
+reported rather than compared — expected latency, exposed communication, and
+above all memory, where "does this fit in 80 GB" is a threshold question that
+rank correlation cannot answer.
+
+### Minimal viable benchmark
+
+Ship this early. It does not establish generality; it exercises the measurement,
+attribution, and reporting pipeline end to end.
+
+- LLaMA3-8B, one 1D and one 2D mesh, one supported H100 topology;
+- one strong hand-written TorchTitan FSDP+TP baseline;
+- throughput, exposed communication, peak memory, planning time, numerical
+  parity;
+- predicted and measured critical-path costs;
+- search-objective versus post-lowering score, per capability 2;
+- a classification of every meaningful discrepancy.
+
+### Full matrix
+
+Dense decoders, encoder-decoder, FlexAttention, and MoE; multiple scales, batch
+sizes, and sequence lengths; 1D and 2D meshes then pipeline and hybrid; at least
+two GPU generations, single- and multi-node; throughput, exposed communication,
+peak memory, compile time, planning time; numerical parity and DCP compatibility;
+strong hand-written FSDP, TP, and hybrid baselines.
+
+Report wins, ties, **and losses**, attributing each loss to a strategy-space gap,
+cost-model error, compiler limitation, runtime overhead, or unsupported
+communication pattern. That attribution turns a benchmark into a roadmap, and the
+same measurements calibrate reported confidence.
+
+## Scope boundaries
+
+**No pipeline parallelism.** The optimizer decides intra-stage placement; the
+`_pipelined_*` symbols in `graph_passes/async_tp/` are micro-pipelined TP and
+unrelated. At frontier scale, stage partitioning and scheduling are often necessary.
+State the limitation and plan to compose with a pipeline planner rather than
+absorb one soon.
+
+**`local_map` is a real, partially opaque boundary.** Data-dependent routing
+cannot always be expressed as static DTensor placements. Keeping the boundary is
+legitimate; treating its interior as free or fully understood is not.
+
+**External plans are intentionally constrained at first.** The first `score_plan`
+evaluates selections from the known strategy space. It must not claim to score
+arbitrary programs with unknown communication, scheduling, or rank-dependent
+behavior.
+
+**Private PyTorch dependencies remain a product risk.** Record the build and
+compiler configuration in every artifact; publish a compatibility matrix; isolate
+integration behind narrow adapters; upstream what is reusable.
+
+## Delivery: one vertical slice, then a sequence
+
+This repository has a concentrated contributor base. Parallel tracks presume
+parallel people, so the plan is a single narrow slice that cuts through every
+layer, followed by an ordered expansion.
+
+### Step 1 — the slice
+
+Ship a `score_plan` / `plan` vertical that:
+
+- accepts only AutoParallel-representable plans, rejecting others with
+  `PLAN_NOT_REPRESENTABLE`, `PLAN_GRAPH_MISMATCH`, or `PLAN_VERSION_MISMATCH`;
+- supports exactly one explicitly calibrated H100 topology profile, returning
+  `TOPOLOGY_PROFILE_MISSING` when none is supplied and
+  `TOPOLOGY_PROFILE_UNSUPPORTED` when the supplied profile has no calibration;
+- makes replication, opaque regions, and fallback costs loud, and fatal under
+  strict policy;
+- defines and returns a **minimal v1** request/response schema, carrying
+  versioned provenance, `cost_path`, and critical-path confidence;
+- runs Tier 1 structural verification with a recorded `inputs_hash` and seed;
+- is compared against one strong hand-written baseline.
+
+Do not wait for every cost path or architecture to be calibrated. Limit the
+envelope, reject outside it, and expand from measured evidence.
+
+The slice **contains** the minimum coverage and error-reporting work rather than
+depending on a prior coverage phase: it needs replicate-only visibility and the
+plan-rejection codes, and nothing more. Step 2 broadens what the slice already
+proved.
+
+### Then, in order
+
+2. **Coverage and diagnostics breadth.** Full `analyze` report; the complete
+   error-code set; strict policy modes across all categories.
+3. **Explanations and the warm session.** Promote the existing explanation
+   surfaces to return values; expand and stabilize the slice's minimal v1 schema
+   to cover them; expose `session_id`.
+4. **Verification tiers 1 and 2 as products**, including the two upstream fixes
+   and the public-lowering-path claim. Independent of calibration work; can
+   proceed alongside 3 and 5 when contributors are available.
+5. **Provenance depth and profile-guided refinement.** Per-configuration
+   provenance, `validated` versus `measured` discipline, calibration loop.
+6. **Two-stage overlap evaluation.** Approximate objective term, candidate
+   re-ranking, feedback into the approximation.
+7. **Full benchmark matrix** with loss attribution.
+8. **Breadth and stability.** Activation, optimizer-state, and buffer memory
+   objectives; opaque-region contracts; pipeline composition; context- and
+   expert-parallel modeling; compatibility matrix and narrow adapters.
+
+## Success criteria
+
+- A broad model corpus receives useful coverage reports even when planning fails.
+- Unsupported, opaque, extrapolated, fallback, and replicate-only regions are
+  never silent, and callers always know which cost path produced their numbers.
+- Structural verification catches invalid plans before cluster launch.
+- Numerical verification matches the unsharded reference within declared
+  tolerances, and the claim names its substrate, seed, and tolerance.
+- Solver-generated and caller-proposed plans pass through the same validation and
+  scoring path.
+- Estimated rankings correlate with measurements on supported topologies.
+- Absolute error and reported intervals are calibrated for claims reported as
+  values rather than comparisons.
+- A cost term's construction basis and its validation status are recorded
+  independently, and neither is inferred from the other.
+- Search-objective and post-lowering scores are both retained, and disagreements
+  between them feed the overlap model.
+- Selected plans are competitive with strong hand-written baselines, and every
+  loss has an attributed cause.
+- Re-planning for a new topology is cheaper than authoring and validating a new
+  recipe.
+- Agents can diagnose common failures and explain tradeoffs from structured
+  output alone.
+- Artifacts reproduce within the declared compatibility window, and determinism
+  is tested rather than assumed.
+
+## Division of labor
+
+| Agent or human | AutoParallel |
+|---|---|
+| Interpret goals and deployment constraints | Capture and analyze the derived graph |
+| Produce traceable single-device semantics | Enumerate legal distributed strategies |
+| Propose constraints or representable plans | Search, score, and compare alternatives |
+| Mark explicit custom regions | Validate boundaries and incorporate declared costs |
+| Choose among documented tradeoffs | Return calibrated estimates and uncertainty |
+| Run the selected experiments | Preserve measurements and refine calibration |
+| Explain decisions to the user | Return reproducible evidence and diagnostics |
+
+## Strategic conclusion
+
+Agents reduce the cost of authoring distributed code, so AutoParallel should not
+build its identity around eliminating that code. Its defensible role is trusted
+planning and evidence across changing models, workloads, and hardware.
+
+The moat is the combination of a legal strategy space over the derived
+forward/backward graph, calibrated cost and memory models, executable lowering,
+explicit uncertainty and coverage, correctness and performance verification, and
+reproducible artifacts.
+
+Agents make those capabilities more valuable because they produce more candidates
+and more architecture variants. AutoParallel should be the backend that tells
+them which candidates are legal, which are promising, and what has actually been
+verified — and, just as importantly, which of those three claims it is making.
