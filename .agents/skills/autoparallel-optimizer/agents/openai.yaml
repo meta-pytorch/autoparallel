@@ -1,0 +1,4 @@
+interface:
+  display_name: "AutoParallel Optimizer"
+  short_description: "Optimize and explain AutoParallel sharding plans"
+  default_prompt: "Use $autoparallel-optimizer to optimize and evaluate this model's sharding plan."

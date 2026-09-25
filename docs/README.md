@@ -43,3 +43,9 @@ If you're new to the project, use the reading order below.
 - [AutoParallel in an Agent-Driven World, v3](agent_consumable_codex_v3.md) (draft)
 - [AutoParallel as an Agent-Facing Planner and Plan Evaluator, v4](agent_consumable_claude_v4.md) (draft)
 - [AutoParallel as an Agent-Facing Planner and Plan Evaluator (Codex v4)](agent_consumable_codex_v4.md) (draft)
+
+## Agent workflow
+
+- [AutoParallel Optimizer skill](../.agents/skills/autoparallel-optimizer/SKILL.md) —
+  repository-scoped instructions for planning, inspecting, and evaluating
+  sharding strategies with coding agents
