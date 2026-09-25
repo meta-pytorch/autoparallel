@@ -17,6 +17,8 @@ import pytest
 import torch
 import torch._inductor.fx_passes.bucketing as bucketing_mod
 import torch._inductor.fx_passes.fsdp as fsdp_mod
+from torch._inductor.pattern_matcher import stable_topological_sort
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 # Importing auto_bucketing triggers _patch_fsdp_bucketing() at import time.
 import autoparallel.graph_passes.auto_bucketing as ab  # noqa: F401
@@ -425,3 +427,95 @@ def test_world_bucket_consensus_default_off_avoids_distributed_exchange():
         ab.aten_autobucketing_config.synchronize_world_buckets = saved
 
     assert buckets == [ag_nodes]
+
+
+def _build_hsdp_tp_two_hop_graph(tp_group, fsdp_group, wo_first=False):
+    """Mirror the tp<->fsdp bucket cycle seen on llama3_8b 3d 2x2x8 HSDP+TP.
+
+    Shapes/groups follow the real hops of layer 0:
+    norm weight (R,S0,S0): tp AG [256]->[2048], then fsdp AG [2048]->[4096];
+    wo weight (R,S0,S1): fsdp AG [512,2048]->[1024,2048], then tp AG
+    [512,4096]->[4096,4096]. The real wait->split->getitem->cat between the
+    two wo hops is modeled by one view node (same dependency, same AG input
+    size). Default node order is the real one (norm chain first).
+    Vals are cuda FakeTensors, as in the real graph, because merge_all_gather
+    retraces the bucket under the detected fake mode.
+    """
+    g = torch.fx.Graph()
+    p_norm = g.placeholder("norm")
+    p_norm.meta["val"] = _make_fake_tensor_meta((256,))
+    p_wo = g.placeholder("wo")
+    p_wo.meta["val"] = _make_fake_tensor_meta((512, 2048))
+
+    def norm_chain():
+        tp_norm = _make_ag_node(g, p_norm, tp_group, (2048,), group_size=8)
+        w_tp_norm = _make_wait_node(g, tp_norm)
+        fsdp_norm = _make_ag_node(g, w_tp_norm, fsdp_group, (4096,), group_size=2)
+        return tp_norm, fsdp_norm, _make_wait_node(g, fsdp_norm)
+
+    def wo_chain():
+        fsdp_wo = _make_ag_node(g, p_wo, fsdp_group, (1024, 2048), group_size=2)
+        w_fsdp_wo = _make_wait_node(g, fsdp_wo)
+        wo_tp_in = g.call_function(
+            torch.ops.aten.view.default, (w_fsdp_wo, [512, 4096])
+        )
+        wo_tp_in.meta["val"] = _make_fake_tensor_meta((512, 4096))
+        tp_wo = _make_ag_node(g, wo_tp_in, tp_group, (4096, 4096), group_size=8)
+        return fsdp_wo, tp_wo, _make_wait_node(g, tp_wo)
+
+    if wo_first:
+        fsdp_wo, tp_wo, w_tp_wo = wo_chain()
+        tp_norm, fsdp_norm, w_fsdp_norm = norm_chain()
+    else:
+        tp_norm, fsdp_norm, w_fsdp_norm = norm_chain()
+        fsdp_wo, tp_wo, w_tp_wo = wo_chain()
+    g.output((w_fsdp_norm, w_tp_wo))
+    with FakeTensorMode():
+        for n in g.nodes:
+            if "val" in n.meta:
+                v = n.meta["val"]
+                n.meta["val"] = torch.empty(v.shape, dtype=v.dtype, device="cuda")
+    return _build_gm(g), (tp_norm, fsdp_norm, fsdp_wo, tp_wo)
+
+
+def test_greedy_bucket_rejects_cross_group_cycle():
+    """At the group_size=4 pre-bucket cap, bucketing {tp_norm, tp_wo} and
+    {fsdp_norm, fsdp_wo} makes the two buckets depend on each other. The plan
+    must stay mergeable by torch's merge_all_gather, which resolves the real
+    process groups (fake PG from conftest, sized like the 2x2x8 job)."""
+    tp_pg = torch.distributed.new_group(list(range(8)))
+    fsdp_pg = torch.distributed.new_group([0, 8])
+    gm, (tp_norm, fsdp_norm, fsdp_wo, tp_wo) = _build_hsdp_tp_two_hop_graph(
+        tp_pg.group_name, fsdp_pg.group_name
+    )
+    buckets = _call_greedy_bucket(
+        gm, bucket_cap_mb=fsdp_mod.compute_pre_bucket_cap_mb(4)
+    )
+
+    assert [tp_norm, tp_wo] in buckets
+    assert [fsdp_norm, fsdp_wo] not in buckets
+    bucketing_mod.merge_all_gather(gm, buckets)
+    # OverlapScheduler sorts right after pre-bucketing; a cyclic plan fails here.
+    stable_topological_sort(gm.graph)
+    gm.graph.lint()
+
+
+def test_world_bucket_consensus_rejects_cross_bucket_cycle():
+    """With the wo chain first, fsdp is planned first and keeps
+    {fsdp_wo, fsdp_norm}; the local world plan rejects {tp_wo, tp_norm}, but
+    the peer's more complete canonical plan re-adds it and closes a cycle."""
+    gm, _ = _build_hsdp_tp_two_hop_graph("world", "fsdp", wo_first=True)
+
+    def gather(gathered, local):
+        key = next(iter(local))
+        signatures = local[key][0]
+        gathered[:] = [
+            {key: (signatures, ())},
+            {key: (signatures, ((0, 1),))},
+        ]
+
+    with _world_bucket_consensus(gather):
+        with pytest.raises(RuntimeError, match="cross-bucket cycle"):
+            _call_greedy_bucket(
+                gm, bucket_cap_mb=fsdp_mod.compute_pre_bucket_cap_mb(4)
+            )

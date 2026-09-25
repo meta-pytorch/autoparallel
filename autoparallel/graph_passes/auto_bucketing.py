@@ -36,6 +36,7 @@ def _patch_fsdp_bucketing():
     """
     import torch._inductor.fx_passes.bucketing as bucketing_mod
     import torch._inductor.fx_passes.fsdp as fsdp_mod
+    from torch._inductor.augmented_graph_helper import AugmentedGraphHelper
     from torch._inductor.fx_passes.bucketing import (
         collect_node_descendants,
         is_wait_tensor,
@@ -46,6 +47,28 @@ def _patch_fsdp_bucketing():
         _get_group_size_from_node,
         is_fsdp_all_gather,
     )
+    from torch._inductor.fx_passes.utils import BitsetAncestors
+
+    def _merge_creates_cycle(aug_graph, wait_of, head, node):
+        # Merging node into head's bucket fuses their starts and their waits.
+        # aug_graph already holds every bucket planned so far (all groups), so
+        # a path here means the merge would close a cycle through another
+        # bucket, e.g. tp bucket {norm, wo} <-> fsdp bucket {norm, wo} on a
+        # 2-hop HSDP+TP param gather.
+        head_wait, node_wait = wait_of[head], wait_of[node]
+        return (
+            aug_graph.has_path(head, node)
+            or aug_graph.has_path(node, head)
+            or aug_graph.has_path(head_wait, node_wait)
+            or aug_graph.has_path(node_wait, head_wait)
+        )
+
+    def _record_merge(aug_graph, wait_of, head, node):
+        aug_graph.merge_to_set(head, node)
+        aug_graph.merge_to_set(wait_of[head], wait_of[node])
+
+    def _new_aug_graph(g):
+        return AugmentedGraphHelper(g, BitsetAncestors(list(g.nodes)))
 
     def _patched_identify_fsdp_groups(gm):
         fsdp_counts_by_group = Counter()
@@ -84,12 +107,14 @@ def _patch_fsdp_bucketing():
         ranks = {n.name: i for i, n in enumerate(g.nodes)}
 
         groups = defaultdict(list)
+        wait_of = {}
         for node in g.nodes:
             if is_wait_tensor(node) and filter_node(node.args[0]):
                 if (filter_wait_node is None) or filter_wait_node(node):
                     coll_node = node.args[0]
                     key = node_group_key(coll_node)
                     groups[key].append(coll_node)
+                    wait_of[coll_node] = node
 
         synchronize_world_buckets = (
             aten_autobucketing_config.synchronize_world_buckets
@@ -100,12 +125,16 @@ def _patch_fsdp_bucketing():
             return []
 
         node_descendents = collect_node_descendants(g)
+        # One helper across all groups: buckets of earlier groups stay merged
+        # so later groups cannot form a cross-bucket cycle with them.
+        aug_graph = _new_aug_graph(g)
         max_topo_span = aten_autobucketing_config.max_topo_span
 
         buckets_by_key = {}
         # Metrics aggregated across all groups.
         n_close_bytes = 0
         n_close_span = 0
+        n_skip_cycle = 0
         max_observed_span = 0
 
         for key, nodes in groups.items():
@@ -120,6 +149,11 @@ def _patch_fsdp_bucketing():
             )
             for node in nodes:
                 if node in cur_bucket_descendents:
+                    continue
+                if cur_bucket and _merge_creates_cycle(
+                    aug_graph, wait_of, cur_bucket[0], node
+                ):
+                    n_skip_cycle += 1
                     continue
                 n_val = node.meta["val"]
                 out_size_bytes = n_val.numel() * n_val.element_size()
@@ -165,6 +199,8 @@ def _patch_fsdp_bucketing():
                     )
                 cur_bucket_size_bytes += size_bytes
                 cur_bucket.append(node)
+                if len(cur_bucket) > 1:
+                    _record_merge(aug_graph, wait_of, cur_bucket[0], node)
                 cur_bucket_descendents |= node_descendents[node]
                 if cur_bucket_start_rank is None:
                     cur_bucket_start_rank = node_rank
@@ -250,15 +286,28 @@ def _patch_fsdp_bucketing():
 
         buckets = [bucket for key in groups for bucket in buckets_by_key[key]]
 
+        if synchronize_world_buckets:
+            # Canonical world plans were chosen on another rank; re-validate the
+            # final plan (all groups) for cross-bucket cycles on this graph.
+            check_graph = _new_aug_graph(g)
+            for bucket in buckets:
+                for node in bucket[1:]:
+                    if _merge_creates_cycle(check_graph, wait_of, bucket[0], node):
+                        raise RuntimeError(
+                            "Canonical CP bucket plan creates a cross-bucket cycle"
+                        )
+                    _record_merge(check_graph, wait_of, bucket[0], node)
+
         if buckets:
             logger.info(
                 "greedy_bucket: %d buckets, max_span=%d, "
-                "closed (bytes=%d, span=%d, max_topo_span=%s)",
+                "closed (bytes=%d, span=%d, max_topo_span=%s), skip_cycle=%d",
                 len(buckets),
                 max_observed_span,
                 n_close_bytes,
                 n_close_span,
                 max_topo_span,
+                n_skip_cycle,
             )
         return buckets
 
