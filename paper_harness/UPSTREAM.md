@@ -3,7 +3,7 @@
 ## TorchTitan
 
 The locked source is `kaijian/deepseek-baseline-parity-20260918` in
-`AlbedoWang/torchtitan` at `a25d7db3`. Its history has `383cae9f` as an actual
+`AlbedoWang/torchtitan` at `b32acd82`. Its history has `383cae9f` as an actual
 ancestor and retains the `60517d28` AutoParallel/GraphTrainer integration.
 
 - `383cae9f`: eager SAC treats AutoParallel collectives like other
@@ -35,6 +35,10 @@ ancestor and retains the `60517d28` AutoParallel/GraphTrainer integration.
 - `a25d7db3` sets `insert_overlap_deps=False` in the AutoParallel
   full-Inductor configs, so Inductor's overlap scheduling adds no control
   deps.
+- `b32acd82` passes the ms-converted AutoParallel estimator to Inductor's
+  overlap scheduling (`aten_distributed_optimizations.custom_runtime_estimation`),
+  so it uses the same estimates, including the NCCL cost profile, as the AP
+  pass.
 
 The 3D port includes only the approved legacy-DTensor AP configuration, CP
 input-ownership seam, DP-shard/CP/TP mesh, CP-aware SDPA, DTensor output, and
@@ -78,7 +82,10 @@ is pinned to the commit immediately before the lock/harness-only updates.
   activation remat sees the AP backward region.
 - `46d03f9` is the compatibility cherry-pick of AutoParallel PR #536. It
   passes AutoParallel runtime estimates to the overlap scheduler in
-  milliseconds. It is the runtime pin.
+  milliseconds.
+- `a300c78` rejects cross-bucket cycles in the patched greedy bucketing, so
+  HSDP+TP 2-hop parameter gathers no longer fail the bucket merge's
+  topological sort. It is the runtime pin.
 
 ## Reproduction policy
 

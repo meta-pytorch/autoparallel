@@ -1,14 +1,14 @@
 schema_version = 1
-harness_version = "legacy-dtensor-v14-paper-submission-ms-estimates-no-overlap-deps"
+harness_version = "legacy-dtensor-v15-paper-submission-bucket-cycle-fix-pass2-ap-estimator"
 
 [sources.torchtitan]
 remote = "https://github.com/AlbedoWang/torchtitan.git"
-commit = "a25d7db3ac07c947225ba08ba0b2aafae032edfe"
+commit = "b32acd822695fe3fd34e871af7c51f3bb9952e40"
 dirty_policy = "forbid"
 
 [sources.autoparallel]
 remote = "https://github.com/meta-pytorch/autoparallel.git"
-commit = "46d03f951b0e2c5d4efe60b4f1e19a3213456ac2"
+commit = "a300c7883a57ced0c64f027f4165908aeb80c477"
 dirty_policy = "forbid"
 
 [runtime]
