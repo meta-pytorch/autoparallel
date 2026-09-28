@@ -3,7 +3,7 @@
 ## TorchTitan
 
 The locked source is `kaijian/deepseek-baseline-parity-20260918` in
-`AlbedoWang/torchtitan` at `a68fa447`. Its history has `383cae9f` as an actual
+`AlbedoWang/torchtitan` at `a25d7db3`. Its history has `383cae9f` as an actual
 ancestor and retains the `60517d28` AutoParallel/GraphTrainer integration.
 
 - `383cae9f`: eager SAC treats AutoParallel collectives like other
@@ -32,6 +32,9 @@ ancestor and retains the `60517d28` AutoParallel/GraphTrainer integration.
 - `a68fa447` is the compatibility cherry-pick of TorchTitan PR #4859. It
   reorders HSDP gradient reduction to reduce-scatter before all-reduce in the
   shared GraphTrainer pass pipeline used by manual and AutoParallel modes.
+- `a25d7db3` sets `insert_overlap_deps=False` in the AutoParallel
+  full-Inductor configs, so Inductor's overlap scheduling adds no control
+  deps.
 
 The 3D port includes only the approved legacy-DTensor AP configuration, CP
 input-ownership seam, DP-shard/CP/TP mesh, CP-aware SDPA, DTensor output, and
@@ -72,7 +75,10 @@ is pinned to the commit immediately before the lock/harness-only updates.
   selected campaigns opt into its calibrated `h100_nvswitch_roce_400g` profile.
 - `1e7dae8` keeps the outer autograd context (`grad_fn_seq_nr`) when
   AutoParallel interprets its compiled graphs, so GraphTrainer's selective
-  activation remat sees the AP backward region. It is the runtime pin.
+  activation remat sees the AP backward region.
+- `46d03f9` is the compatibility cherry-pick of AutoParallel PR #536. It
+  passes AutoParallel runtime estimates to the overlap scheduler in
+  milliseconds. It is the runtime pin.
 
 ## Reproduction policy
 

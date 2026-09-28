@@ -1,14 +1,14 @@
 schema_version = 1
-harness_version = "legacy-dtensor-v13-paper-submission-no-local-package-fetch"
+harness_version = "legacy-dtensor-v14-paper-submission-ms-estimates-no-overlap-deps"
 
 [sources.torchtitan]
 remote = "https://github.com/AlbedoWang/torchtitan.git"
-commit = "a68fa447d8f35475c0bf7ab46090838ed6cd79b7"
+commit = "a25d7db3ac07c947225ba08ba0b2aafae032edfe"
 dirty_policy = "forbid"
 
 [sources.autoparallel]
 remote = "https://github.com/meta-pytorch/autoparallel.git"
-commit = "1e7dae837ffb53b452a891e43cba49cd6c793434"
+commit = "46d03f951b0e2c5d4efe60b4f1e19a3213456ac2"
 dirty_policy = "forbid"
 
 [runtime]
