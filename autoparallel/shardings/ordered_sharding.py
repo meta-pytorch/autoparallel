@@ -282,14 +282,34 @@ def _flattened_specs(
 def _orthogonal_partial_reduction_steps(
     source: DTensorSpec, target: DTensorSpec
 ) -> tuple[list[tuple[DTensorSpec, DTensorSpec, int]], DTensorSpec]:
-    """Stage reductions that do not participate in an ordered target layout."""
+    """Stage reductions that do not participate in an ordered target layout.
+
+    Returns the all_reduce steps and the spec they start from: ``target`` with
+    those mesh dims still Partial. The steps run after the ordered part, so its
+    reduce_scatter shrinks the all_reduce payload (the HSDP order).
+    """
     if DTensorSpec.is_default_device_order(target.shard_order):
-        return [], source
+        return [], target
+    reduced_dims = [
+        mesh_dim
+        for mesh_dim, (src, dst) in enumerate(zip(source.placements, target.placements))
+        if isinstance(src, Partial) and isinstance(dst, Replicate)
+    ]
+    if not reduced_dims:
+        return [], target
+    placements = list(target.placements)
+    for mesh_dim in reduced_dims:
+        placements[mesh_dim] = source.placements[mesh_dim]
+    start = DTensorSpec(
+        target.mesh,
+        tuple(placements),
+        tensor_meta=source.tensor_meta,
+        shard_order=target.shard_order,
+        use_strided_shard_as_shard_order=False,
+    )
     steps = []
-    current = source
-    for mesh_dim, (src, dst) in enumerate(zip(source.placements, target.placements)):
-        if not isinstance(src, Partial) or not isinstance(dst, Replicate):
-            continue
+    current = start
+    for mesh_dim in reduced_dims:
         next_placements = list(current.placements)
         next_placements[mesh_dim] = Replicate()
         next_spec = DTensorSpec(
@@ -301,7 +321,7 @@ def _orthogonal_partial_reduction_steps(
         )
         steps.append((current, next_spec, mesh_dim))
         current = next_spec
-    return steps, current
+    return steps, start
 
 
 def _fallback_plan(source: DTensorSpec, target: DTensorSpec) -> Optional[_FallbackPlan]:
@@ -310,10 +330,7 @@ def _fallback_plan(source: DTensorSpec, target: DTensorSpec) -> Optional[_Fallba
         return None
     operations = []
     cost = 0.0
-    reduction_steps, source = _orthogonal_partial_reduction_steps(source, target)
-    for current, next_spec, mesh_dim in reduction_steps:
-        cost += float(redistribute_cost(current, next_spec, [mesh_dim]))
-        operations.append(("all_reduce", (mesh_dim,)))
+    reduction_steps, target = _orthogonal_partial_reduction_steps(source, target)
     if DTensorSpec.is_default_device_order(
         source.shard_order
     ) and DTensorSpec.is_default_device_order(target.shard_order):
@@ -368,6 +385,9 @@ def _fallback_plan(source: DTensorSpec, target: DTensorSpec) -> Optional[_Fallba
     except (AssertionError, RuntimeError, TypeError, ValueError):
         return None
 
+    for current, next_spec, mesh_dim in reduction_steps:
+        cost += float(redistribute_cost(current, next_spec, [mesh_dim]))
+        operations.append(("all_reduce", (mesh_dim,)))
     if tuple(current_placements) != target.placements or not math.isfinite(cost):
         return None
     return _FallbackPlan(tuple(operations), cost)
@@ -412,22 +432,23 @@ def ordered_redistribute_local_tensor(
     # is_default_device_order checks ascending mesh_dims per entry (and
     # returns True for the empty tuple), which is the right consistency
     # criterion.
-    reduction_steps, curr_spec = _orthogonal_partial_reduction_steps(
+    reduction_steps, tgt_spec = _orthogonal_partial_reduction_steps(
         curr_spec, tgt_spec
     )
-    for source, target, _ in reduction_steps:
-        arg = redistribute_local_tensor(arg, source, target)
 
     both_default = DTensorSpec.is_default_device_order(
         curr_spec.shard_order
     ) and DTensorSpec.is_default_device_order(tgt_spec.shard_order)
     if both_default:
         return _optimize_same_nd_sharding_as_1d(arg, curr_spec, tgt_spec)
-    return redistribute_local_tensor(
+    arg = redistribute_local_tensor(
         arg,
         curr_spec,
         tgt_spec,
     )
+    for source, target, _ in reduction_steps:
+        arg = redistribute_local_tensor(arg, source, target)
+    return arg
 
 
 def get_redistributed_input_placements(
@@ -733,7 +754,11 @@ def _plans_for_edges(
 
 
 def _logical_plan(source: DTensorSpec, target: DTensorSpec) -> Optional[_FallbackPlan]:
-    """Return the placement-only plan priced by the solver cost model."""
+    """Return the placement-only plan priced by the solver cost model.
+
+    all_reduce dims are listed and priced last, the order in which
+    ``_orthogonal_partial_reduction_steps`` lowers them.
+    """
     if source.mesh != target.mesh or len(source.placements) != len(target.placements):
         return None
     operations = []
@@ -753,7 +778,9 @@ def _logical_plan(source: DTensorSpec, target: DTensorSpec) -> Optional[_Fallbac
         else:
             return None
         operations.append((kind, (mesh_dim,)))
-    cost = float(redistribute_cost(source, target, list(range(source.mesh.ndim))))
+    operations.sort(key=lambda operation: operation[0] == "all_reduce")
+    order = [mesh_dim for _, (mesh_dim,) in operations]
+    cost = float(redistribute_cost(source, target, order))
     if not math.isfinite(cost):
         return None
     return _FallbackPlan(tuple(operations), cost)
