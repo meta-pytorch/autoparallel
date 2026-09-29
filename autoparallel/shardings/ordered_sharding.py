@@ -175,21 +175,25 @@ def _project_shard_order_by_mesh_priority(
     shards_by_tensor_dim: dict[int, list[int]] = defaultdict(list)
     for mesh_dim, placement in enumerate(spec.placements):
         if isinstance(placement, Shard):
-            if mesh_dim not in mesh_dim_priority:
-                return None
             shards_by_tensor_dim[placement.dim].append(mesh_dim)
 
     projected_order = []
     for tensor_dim in sorted(shards_by_tensor_dim):
         mesh_dims = shards_by_tensor_dim[tensor_dim]
-        source_groups = {mesh_dim_priority[mesh_dim][0] for mesh_dim in mesh_dims}
-        if len(source_groups) != 1:
+        # Mesh dims the storage does not shard (e.g. the HSDP replicate dim)
+        # have no priority: they keep their default slots, and only the
+        # storage-ordered mesh dims are permuted among the remaining slots.
+        ranked = [dim for dim in mesh_dims if dim in mesh_dim_priority]
+        source_groups = {mesh_dim_priority[dim][0] for dim in ranked}
+        if len(source_groups) > 1:
             return None
+        ranked_iter = iter(sorted(ranked, key=lambda dim: mesh_dim_priority[dim][1]))
         projected_order.append(
             ShardOrderEntry(
                 tensor_dim=tensor_dim,
                 mesh_dims=tuple(
-                    sorted(mesh_dims, key=lambda dim: mesh_dim_priority[dim][1])
+                    next(ranked_iter) if dim in mesh_dim_priority else dim
+                    for dim in mesh_dims
                 ),
             )
         )
