@@ -1,0 +1,92 @@
+{
+  "schema_version": 1,
+  "skill": "autoparallel-optimizer",
+  "skill_path": ".agents/skills/autoparallel-optimizer/SKILL.md",
+  "protocol": {
+    "isolation": "Run each case in a fresh worktree and discard it afterwards.",
+    "agent_visible_fields": [
+      "prompt"
+    ],
+    "grader_visible_fields": [
+      "response",
+      "tool_trace",
+      "workspace_diff",
+      "artifacts"
+    ],
+    "repeat_count": 3,
+    "workspace_setup": "Copy workspace_copy entries before invocation; expose only their destination paths to the agent.",
+    "baseline": {
+      "enabled": true,
+      "invocations": [
+        "implicit"
+      ],
+      "same_prompt": true
+    }
+  },
+  "cases": [
+    {
+      "id": "global_spmd_local_shuffle",
+      "mode": "explain",
+      "invocation": "implicit",
+      "skill_expected": true,
+      "workspace_copy": [
+        {
+          "source": "tests/agent_skills/autoparallel_optimizer/fixtures/global_spmd_local_shuffle.py",
+          "destination": "global_spmd_local_shuffle.py"
+        }
+      ],
+      "prompt": "Review global_spmd_local_shuffle.py for use with AutoParallel on 8 GPUs. The current training system invokes the module once per GPU with a local batch of 32, while the AutoParallel trace would receive one logical batch of 256. Tell me whether it is ready to plan as-is and what you would do next. Do not edit files.",
+      "rubric_id": "global_spmd_local_shuffle"
+    },
+    {
+      "id": "infer_device_mesh",
+      "mode": "plan",
+      "invocation": "implicit",
+      "skill_expected": true,
+      "workspace_copy": [],
+      "prompt": "Recommend DeviceMesh candidates for an AutoParallel planning run. We have 16 H100 GPUs in two 8-GPU NVSwitch nodes, contiguous ranks within each node, global batch 128, hidden size 4096, and 32 attention heads. The user did not provide a mesh. Planning advice only; do not run or edit anything.",
+      "rubric_id": "infer_device_mesh"
+    },
+    {
+      "id": "cpu_saved_optimizer_explanation",
+      "mode": "explain",
+      "invocation": "explicit",
+      "skill_expected": true,
+      "workspace_copy": [],
+      "prompt": "Use $autoparallel-optimizer. I only have a CPU machine and a trusted GPU-captured optimizer artifact at artifacts/model.ap. Show the smallest workflow you would use to explain why node mm_3 is replicated and compare it with a forced sharded alternative. Do not execute commands, lower a graph, or modify the artifact.",
+      "rubric_id": "cpu_saved_optimizer_explanation"
+    },
+    {
+      "id": "repair_evaluation_harness",
+      "mode": "evaluate",
+      "invocation": "implicit",
+      "skill_expected": true,
+      "workspace_copy": [
+        {
+          "source": "tests/agent_skills/autoparallel_optimizer/fixtures/evaluation_harness.py",
+          "destination": "evaluation_harness.py"
+        }
+      ],
+      "prompt": "Update evaluation_harness.py so an AutoParallel run emits comparable post-reordering time and memory estimates for both training graph phases. Keep the change in this file and do not add a public library API. Explain what evidence the resulting numbers support.",
+      "rubric_id": "repair_evaluation_harness"
+    },
+    {
+      "id": "recover_infeasible_counterfactual",
+      "mode": "explain",
+      "invocation": "implicit",
+      "skill_expected": true,
+      "workspace_copy": [],
+      "prompt": "An AutoParallel optimizer was feasible until an exploratory placement constraint was added to one node. It also has output and parameter-memory constraints. Describe the diagnostic sequence you would use to recover feasibility and identify the conflicting assumption. Do not retrace or edit code.",
+      "rubric_id": "recover_infeasible_counterfactual"
+    },
+    {
+      "id": "generic_pytorch_tuning",
+      "mode": "negative",
+      "invocation": "implicit",
+      "skill_expected": false,
+      "workspace_copy": [],
+      "prompt": "A single-GPU torch.compile inference service spends most of its time in small pointwise kernels. Suggest a focused profiling and optimization sequence. The model is not distributed and does not use AutoParallel.",
+      "rubric_id": "generic_pytorch_tuning"
+    }
+  ]
+}
