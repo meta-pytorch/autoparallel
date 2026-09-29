@@ -1,5 +1,5 @@
 schema_version = 1
-harness_version = "v18"
+harness_version = "v19"
 
 [sources.torchtitan]
 remote = "https://github.com/AlbedoWang/torchtitan.git"
@@ -7,8 +7,8 @@ commit = "4b46d18d5aaacc656e3573fdf224f06961602697"
 dirty_policy = "forbid"
 
 [sources.autoparallel]
-remote = "https://github.com/meta-pytorch/autoparallel.git"
-commit = "cf5df052ada8ab273ec5ac8f2177e99ddd77d06d"
+remote = "/home/wangkj/workspace/autoparallel"
+commit = "7a14fa2522106758d8fa297fc5216f88a4b566e2"
 dirty_policy = "forbid"
 
 [runtime]

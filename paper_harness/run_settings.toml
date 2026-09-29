@@ -189,3 +189,8 @@ model = "llama3_8b"
 setting = "3d-dps8-cp2-tp4-16k-ro4859-cost535"
 campaign = "campaigns/variants/llama3_8b_3d_long_approx_reduce_order_cost535.toml"
 point = "8x2x4"
+
+[[settings]]
+model = "llama3_8b"
+setting = "4d-dpr2-dps8-cp2-tp4-16k"
+campaign = "campaigns/variants/llama3_8b_4d_dpr2_dps8_cp2_tp4_16k.toml"

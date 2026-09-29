@@ -28,6 +28,7 @@ from torchtitan.models.llama3 import llama3_configs
 from torchtitan.models.llama3 import model_registry as native_llama3_model_registry
 from torchtitan.models.llama3.config_registry import llama3_8b
 
+from .autoparallel_4d import parallelize_autoparallel_4d_llama
 from .buffered_metrics import BufferedMetricsProcessor
 from .io_utils import bool_env, int_env, required_env
 from .replay_data import ReplayDataLoader
@@ -48,6 +49,7 @@ def _native_sdpa_model_spec():
 
 def _base_config():
     world_size = int_env("BENCHMARK_WORLD_SIZE")
+    dp_replicate_degree = int(os.environ.get("BENCHMARK_DP_REPLICATE_DEGREE", "1"))
     dp_degree = int_env("BENCHMARK_DP_DEGREE")
     cp_degree = int_env("BENCHMARK_CP_DEGREE")
     tp_degree = int_env("BENCHMARK_TP_DEGREE")
@@ -55,9 +57,14 @@ def _base_config():
     seq_len = int_env("BENCHMARK_SEQ_LEN")
     total_steps = int_env("BENCHMARK_TOTAL_STEPS")
     log_freq = int_env("BENCHMARK_LOG_FREQ")
+    if dp_replicate_degree < 1 or dp_degree % dp_replicate_degree:
+        raise ValueError(
+            f"Unsupported data parallel split: {dp_degree=} {dp_replicate_degree=}"
+        )
+    dp_shard_degree = dp_degree // dp_replicate_degree
     if dp_degree * cp_degree * tp_degree != world_size:
         raise ValueError(
-            f"DP-shard({dp_degree}) * CP({cp_degree}) * TP({tp_degree}) "
+            f"DP({dp_degree}) * CP({cp_degree}) * TP({tp_degree}) "
             f"must equal world size {world_size}"
         )
 
@@ -89,8 +96,8 @@ def _base_config():
     )
     config.parallelism = replace(
         config.parallelism,
-        data_parallel_replicate_degree=1,
-        data_parallel_shard_degree=dp_degree,
+        data_parallel_replicate_degree=dp_replicate_degree,
+        data_parallel_shard_degree=dp_shard_degree,
         tensor_parallel_degree=tp_degree,
         enable_sequence_parallel=True,
         context_parallel_degree=cp_degree,
@@ -209,7 +216,14 @@ def graph_manual():
 
 
 def graph_autoparallel():
-    return _graph_config(enable_autoparallel=True)
+    config = _graph_config(enable_autoparallel=True)
+    if config.parallelism.data_parallel_replicate_degree > 1:
+        config.model_spec = replace(
+            config.model_spec,
+            name="graph_trainer/llama3/autoparallel_4d",
+            parallelize_fn=parallelize_autoparallel_4d_llama,
+        )
+    return config
 
 
 def torchtitan_main():

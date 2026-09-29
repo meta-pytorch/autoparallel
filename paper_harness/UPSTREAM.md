@@ -106,8 +106,17 @@ is pinned to the commit immediately before the lock/harness-only updates.
   Each rank solves independently, and on Muse Glimmer 4x8x2 the 60 s cap
   truncated the polish at a speed-dependent point: 3 of 64 ranks returned a
   different plan and the job hung in mismatched collectives. The sweep budgets
-  (`bp_iters`, `max_sweeps`, `star_passes`) still bound the solve. It is the
-  runtime pin.
+  (`bp_iters`, `max_sweeps`, `star_passes`) still bound the solve.
+- `9a16ded` (local, cherry-pick of `02ea6f4`) makes view inputs contiguous
+  before DTensor wrapping in static lowering, so `apply_sharding` no longer
+  runs uncached full-mesh clone sharding propagation per view op (hours on the
+  LLaMA 3 4D mesh).
+- `7a14fa2` (local, cherry-pick of `b723cd2`) keeps mesh dims the parameter
+  storage does not shard (the HSDP replicate dim) in place when projecting the
+  storage order onto a gradient producer's inputs. Without it the 4D
+  lm_head-backward tangent keeps the default order and the lowered graph
+  differs per rank (step-1 deadlock). It is the runtime pin; the lock remote is
+  the local repository because the two commits are not pushed.
 
 ## Reproduction policy
 

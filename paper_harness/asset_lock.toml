@@ -78,3 +78,8 @@ tree_sha256 = "cb818a98602bb7ab4b83d855a96294d12780c2d248d82e099abf2cc909211c82"
 relative_path = "llama3_3d_16k_current_dp8"
 file_count = 9
 tree_sha256 = "e8fe82c642d32ce8720134ec525fa9a55401b925e8f7111819913d643972ba10"
+
+[assets.llama3_3d_16k_dp16]
+relative_path = "llama3_3d_16k_current_dp16"
+file_count = 17
+tree_sha256 = "81412b5614a22345a1aec961b31e49dd9c57c8125ec5a9790f15b12254ac52fb"
