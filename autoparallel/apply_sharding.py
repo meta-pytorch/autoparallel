@@ -253,13 +253,14 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
         # In static mode, view ops use DTensor wrapping to convert global
         # shape args to local (DTensor handles the global→local conversion
         # internally). Not needed in dynamic mode since shape args are already
-        # localized above.
+        # localized above. The local tensor is made contiguous before wrapping:
+        # DTensor.contiguous() runs sharding propagation for clone, which is
+        # uncached while tracing and expands to every full-mesh strategy.
         if not self.dynamic and target in _VIEW_OPS and tgt_spec is not None:
             new_args[0] = DTensor.from_local(
-                new_args[0], tgt_spec.mesh, tgt_spec.placements
+                new_args[0].contiguous(), tgt_spec.mesh, tgt_spec.placements
             )
             new_args[0]._spec.shard_order = tgt_spec.shard_order
-            new_args[0] = new_args[0].contiguous()
 
         return new_args, last_tgt_spec
 
