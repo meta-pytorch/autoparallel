@@ -1,5 +1,5 @@
 schema_version = 1
-harness_version = "legacy-dtensor-v15-paper-submission-bucket-cycle-fix-pass2-ap-estimator"
+harness_version = "legacy-dtensor-v16-paper-submission-ordered-rs-before-ar"
 
 [sources.torchtitan]
 remote = "https://github.com/AlbedoWang/torchtitan.git"
@@ -8,7 +8,7 @@ dirty_policy = "forbid"
 
 [sources.autoparallel]
 remote = "https://github.com/meta-pytorch/autoparallel.git"
-commit = "a300c7883a57ced0c64f027f4165908aeb80c477"
+commit = "77cfe2cf9d9f14a766ca67c98a184fcac0ff1b31"
 dirty_policy = "forbid"
 
 [runtime]

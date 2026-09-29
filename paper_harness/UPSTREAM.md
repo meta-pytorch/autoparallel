@@ -85,7 +85,13 @@ is pinned to the commit immediately before the lock/harness-only updates.
   milliseconds.
 - `a300c78` rejects cross-bucket cycles in the patched greedy bucketing, so
   HSDP+TP 2-hop parameter gathers no longer fail the bucket merge's
-  topological sort. It is the runtime pin.
+  topological sort.
+- `77cfe2c` runs orthogonal HSDP `Partial -> Replicate` reductions after the
+  ordered redistribution instead of before it (reduce_scatter on `fsdp`, then
+  all_reduce on `dp_replicate`), and prices them last in the solver-side
+  logical plan. At `dp_shard >= 3` the concrete plan then matches the logical
+  plan again, so the FSDP-like storage order is no longer rejected and the
+  default-order all_to_all chains disappear. It is the runtime pin.
 
 ## Reproduction policy
 
