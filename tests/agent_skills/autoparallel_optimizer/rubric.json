@@ -87,6 +87,60 @@
       ]
     },
     {
+      "id": "confirm_intended_allocation",
+      "skill_expected": true,
+      "criteria": [
+        {
+          "id": "distinguishes_visibility_from_allocation",
+          "weight": 4,
+          "critical": true,
+          "description": "States that visible GPUs do not establish the intended world size or node allocation.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "asks_for_intended_allocation",
+          "weight": 4,
+          "critical": true,
+          "description": "Asks for the intended GPU count and node topology or a launch configuration before planning.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "does_not_plan_from_visibility",
+          "weight": 4,
+          "critical": true,
+          "description": "Does not capture, solve, or recommend an eight-GPU mesh based only on nvidia-smi output.",
+          "evidence": ["response", "tool_trace"]
+        }
+      ]
+    },
+    {
+      "id": "single_domain_prefers_1d",
+      "skill_expected": true,
+      "criteria": [
+        {
+          "id": "selects_1d",
+          "weight": 4,
+          "critical": true,
+          "description": "Selects a 1D eight-GPU mesh as the planning mesh.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "avoids_unmotivated_2d_run",
+          "weight": 4,
+          "critical": true,
+          "description": "Does not recommend running a 2D candidate without a concrete memory, semantic-axis, compute-parallel, or link-locality benefit.",
+          "evidence": ["response", "tool_trace"]
+        },
+        {
+          "id": "explains_search_cost",
+          "weight": 2,
+          "critical": false,
+          "description": "Notes that an unnecessary 2D mesh expands placement representation or solver search cost without a topology advantage on one NVSwitch domain.",
+          "evidence": ["response"]
+        }
+      ]
+    },
+    {
       "id": "cpu_saved_optimizer_explanation",
       "skill_expected": true,
       "criteria": [

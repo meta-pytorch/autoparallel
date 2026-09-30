@@ -30,9 +30,11 @@ does not require a full evaluation report.
   inputs and sharding creates per-rank execution. Audit local-batch shuffles,
   sampling, batch reductions, manual collectives, and rank-dependent branches.
   A successful trace does not prove these semantics.
-- Reuse the user's `DeviceMesh`. If absent, infer a topology-aligned 1D or 2D
-  mesh and label it as a hypothesis. Do not use more than two dimensions;
-  AutoParallel's ILP solve time currently grows impractically.
+- Reuse the user's `DeviceMesh`. If absent, establish the intended GPU and node
+  allocation before planning; visible devices are not proof of the intended
+  world size. Then infer a topology-aligned 1D or 2D mesh and label it as a
+  hypothesis. Do not use more than two dimensions; AutoParallel's ILP solve
+  time currently grows impractically.
 - Trace with global logical input shapes and execute the lowered module with
   local per-rank inputs. Preserve the model's dtype, mixed-precision, launch,
   and initialization conventions.
@@ -54,9 +56,11 @@ provided.
 2. If an adaptation is needed, emit an `SPMD_MODELING_ASSUMPTION` warning with
    the source location, mismatch, and proposed global formulation. Ask before a
    non-trivial or semantics-changing rewrite.
-3. Select the supplied mesh or evaluate a bounded 1D/2D candidate set. Record
-   GPU count, physical topology, mesh shape and names, workload shapes, dtypes,
-   and compiler settings.
+3. Select the supplied mesh or evaluate a bounded candidate set. On one
+   high-bandwidth domain, use 1D unless memory pressure or explicit parallel
+   axes give 2D a concrete purpose. Record how the intended allocation was
+   established, physical topology, mesh shape and names, workload shapes,
+   dtypes, and compiler settings.
 4. Capture once, add only intended boundary and memory constraints, and call
    `optimize_placement()`. This is the plan operation. Note that
    `add_parameter_memory_constraint()` with no arguments sets the upper bound to

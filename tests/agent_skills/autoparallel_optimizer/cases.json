@@ -48,6 +48,24 @@
       "rubric_id": "infer_device_mesh"
     },
     {
+      "id": "confirm_intended_allocation",
+      "mode": "plan",
+      "invocation": "implicit",
+      "skill_expected": true,
+      "workspace_copy": [],
+      "prompt": "Plan AutoParallel sharding for a transformer. nvidia-smi currently shows 8 H100s, but I have not provided a launch configuration, intended GPU count, or node count. Tell me what you would do next. Planning advice only; do not run or edit anything.",
+      "rubric_id": "confirm_intended_allocation"
+    },
+    {
+      "id": "single_domain_prefers_1d",
+      "mode": "plan",
+      "invocation": "implicit",
+      "skill_expected": true,
+      "workspace_copy": [],
+      "prompt": "Recommend a DeviceMesh for an AutoParallel planning run on 8 H100 GPUs in one NVSwitch domain. The model fits on each GPU, has no required tensor-parallel or expert-parallel axis, and uses a global batch of 64. Planning advice only; do not run or edit anything.",
+      "rubric_id": "single_domain_prefers_1d"
+    },
+    {
       "id": "cpu_saved_optimizer_explanation",
       "mode": "explain",
       "invocation": "explicit",

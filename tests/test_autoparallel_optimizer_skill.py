@@ -190,8 +190,24 @@ def test_collector_writes_forward_backward_metrics_and_traces(tmp_path):
         "peak_memory",
     }
     assert metric_fields <= payload["graphs"][0].keys()
+    assert payload["graphs"][0]["placeholder_count"] == 1
+    assert "placeholders" not in payload["graphs"][0]
     assert (tmp_path / "traces/forward_0.json").is_file()
     assert (tmp_path / "traces/backward_0.json").is_file()
+
+
+def test_collector_can_include_placeholder_signatures():
+    collector = ReorderedMetricsCollector(
+        _UnusedMesh(), nccl_topology=None, include_placeholder_signatures=True
+    )
+
+    with collector:
+        collector._post_grad_pass(_make_graph().graph)
+
+    record = collector.records[0]
+    assert record["placeholder_count"] == 1
+    assert len(record["placeholders"]) == 1
+    assert set(record["placeholders"][0]) == {"name", "shape", "dtype"}
 
 
 def test_collector_requires_both_graph_phases():

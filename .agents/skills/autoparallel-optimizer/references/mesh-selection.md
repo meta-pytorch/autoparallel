@@ -18,9 +18,15 @@ Determine:
 - parameter and activation memory pressure;
 - whether model code names or consumes mesh axes such as `dp`, `tp`, or `ep`.
 
+Distinguish GPUs visible to the current shell from GPUs intended for the run.
+`nvidia-smi`, CUDA device count, and host inventory establish availability, not
+the user's planned allocation. Prefer an explicit user statement or launch
+configuration. If neither supplies world size and node count, ask before
+running a plan; do not silently use every visible GPU.
+
 Do not infer a standard eight-GPU node when the supplied topology says
-otherwise. When topology details are unavailable, state the assumption or ask
-for the missing information if it materially changes the choice.
+otherwise. When less consequential topology details are unavailable, state the
+assumption or ask when they materially change the choice.
 
 ## Candidate policy
 
@@ -28,15 +34,17 @@ Honor an explicit user mesh. Otherwise consider only a small set:
 
 1. A 1D baseline `(world_size,)`. Use the semantic dimension name expected by
    the model; `("dp",)` is the common data/FSDP baseline.
-2. One preferred 2D candidate `(dp, parallel)`, where
-   `dp * parallel == world_size`. Usually the inner `parallel` dimension is TP
-   and is named `tp`; for an MoE integration with explicit expert semantics it
-   may instead be `ep`.
+2. When there is a concrete memory, compute-parallel, semantic-axis, or
+   inter-node locality benefit, one preferred 2D candidate `(dp, parallel)`,
+   where `dp * parallel == world_size`. Usually the inner `parallel` dimension
+   is TP and is named `tp`; for an MoE integration with explicit expert
+   semantics it may instead be `ep`.
 3. At most one smaller 2D alternative when divisibility, local batch size, or
    memory makes the preferred candidate doubtful.
 
-Do not enumerate every factorization. Each mesh changes the strategy space and
-requires a separate planning run.
+Do not add a 2D run merely because a factorization exists, and do not enumerate
+every factorization. Each mesh changes the strategy space and requires a
+separate planning run.
 
 ## Choose the preferred 2D factor
 
@@ -73,10 +81,12 @@ tensor/expert sharding valuable, while retaining an outer data/FSDP axis. Also
 prefer it when a 1D mesh would make frequent latency-sensitive collectives span
 slow inter-node links.
 
-On a single node, start with 1D unless the workload benefits from distinct data
-and tensor/expert axes. A 2D shape containing a size-one dimension, such as
-`(1, 8)`, can express those roles but expands the placement representation; use
-it only when the distinction is useful.
+When all intended GPUs are in one high-bandwidth domain, 2D has no link-locality
+advantage over 1D. If the model fits and has no explicit need for separate data
+and tensor/expert axes, select 1D and stop. A 2D shape containing a size-one
+dimension, such as `(1, 8)`, can express those roles but expands the placement
+representation and strategy space; use it only when the distinction has a
+specific benefit.
 
 ## Validate a proposed mesh
 
@@ -106,7 +116,8 @@ Record:
 
 ```text
 source: user | inferred
-world_size
+intended world_size and node count
+allocation source: user | launcher/config
 topology: nodes, GPUs per fast domain, rank-layout assumption
 selected mesh: shape and dimension names
 rationale: memory, model divisibility, batch size, and link locality

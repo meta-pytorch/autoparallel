@@ -19,8 +19,15 @@ code written around `batch_size_per_gpu`, local random permutations, or explicit
 process-group reductions may change meaning when traced over a global logical
 batch. Warn the user and propose an adaptation before proceeding when unclear.
 
-Use a supplied `DeviceMesh`. Otherwise follow `mesh-selection.md` and record the
-inferred 1D or 2D shape, dimension roles, and physical-link rationale.
+Use a supplied `DeviceMesh`. Otherwise follow `mesh-selection.md`: confirm the
+intended GPU and node allocation rather than inferring it from visible devices,
+then record the inferred shape, dimension roles, and physical-link rationale.
+
+Use the real training boundary when plan quality matters. If the supplied model
+returns logits but the actual loss is outside the captured graph, state that the
+plan excludes the loss and is provisional. Include the representative loss in
+the captured module only when that matches the intended integration and the user
+authorized the adaptation.
 
 ## Capture and optimize
 
@@ -138,9 +145,12 @@ model-specific pass explicitly instead of silently changing pass order. It
 identifies backward graphs by `tangents_*` placeholders and uses
 `partitioner_tag` when no tangent placeholder is present. It records every
 specialization and can emit optional forward/backward Perfetto traces with
-`trace_dir=`. Forward and backward must both execute before leaving `with
-collector:` because backward compilation is lazy and the post-grad hook is
-restored when the context exits.
+`trace_dir=`. Metrics contain a compact placeholder count by default; pass
+`include_placeholder_signatures=True` only when shapes and dtypes are needed to
+diagnose specialization, because full signatures are large for parameter-heavy
+graphs. Forward and backward must both execute before leaving `with collector:`
+because backward compilation is lazy and the post-grad hook is restored when
+the context exits.
 
 ## Explore the stable joint graph
 
@@ -180,8 +190,10 @@ For execution, materialize or load initialized parameters after
 `to_empty(device="cuda")`, run compiled forward and backward with local input
 shapes, and check outputs and gradients for finite values. For numerical
 comparison, use the same parameters, inputs, seed, dtype, and tolerances as the
-unsharded reference. LocalTensorMode tests are useful diagnosis but are not the
-public compiled execution path.
+unsharded reference. Call `torch.manual_seed(seed)` on every participating rank
+before DTensor initialization or random DTensor operations; relying on DTensor
+to synchronize rank-zero RNG state is deprecated. LocalTensorMode tests are
+useful diagnosis but are not the public compiled execution path.
 
 Typical durable artifacts are `placements.json`, `optimizer.json`,
 `metrics.json`, and `optimizer.log`. Generate full optimizer state and execution

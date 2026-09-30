@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import json
 import warnings
+from contextlib import AbstractContextManager
 from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Mapping
+from typing import Any, Mapping, cast
 
 import torch
 
@@ -13,7 +14,10 @@ from autoparallel.cost_models.collective_runtime_estimation import (
     get_nccl_topo_config,
     set_nccl_topo_config,
 )
-from autoparallel.cost_models.nccl_cost_model import detect_nccl_topo_config
+from autoparallel.cost_models.nccl_cost_model import (
+    NCCLTopoConfig,
+    detect_nccl_topo_config,
+)
 from autoparallel.graph_passes.auto_bucketing import (
     aten_autobucketing_config,
     aten_autobucketing_reordering_pass,
@@ -74,19 +78,21 @@ class ReorderedMetricsCollector:
         nccl_topology: Any = _DETECT_TOPOLOGY,
         reordering_overrides: Mapping[str, Any] | None = None,
         trace_dir: str | Path | None = None,
+        include_placeholder_signatures: bool = False,
     ) -> None:
         self.mesh = mesh
         self._requested_topology = nccl_topology
         self._reordering_overrides = dict(reordering_overrides or {})
         self.trace_dir = Path(trace_dir) if trace_dir is not None else None
+        self.include_placeholder_signatures = include_placeholder_signatures
         self.records: list[dict[str, Any]] = []
         self.topology_config: Any = None
         self.cost_model: Any = None
         self.cost_model_status = "not_configured"
         self._active = False
-        self._config_patch = None
-        self._previous_topology = None
-        self._previous_max_topo_span = None
+        self._config_patch: AbstractContextManager[None] | None = None
+        self._previous_topology: NCCLTopoConfig | None = None
+        self._previous_max_topo_span: int | None = None
         self.reordering_config: Any = None
         self.runtime_estimator: Any = None
 
@@ -146,12 +152,15 @@ class ReorderedMetricsCollector:
             aten_autobucketing_config.max_topo_span = (
                 self.reordering_config.max_topo_span
             )
-            self._config_patch = torch._inductor.config.patch(
-                {
-                    "reorder_for_peak_memory": False,
-                    "reorder_for_compute_comm_overlap": False,
-                    "post_grad_custom_post_pass": self._post_grad_pass,
-                }
+            self._config_patch = cast(
+                AbstractContextManager[None],
+                torch._inductor.config.patch(
+                    {
+                        "reorder_for_peak_memory": False,
+                        "reorder_for_compute_comm_overlap": False,
+                        "post_grad_custom_post_pass": self._post_grad_pass,
+                    }
+                ),
             )
             self._config_patch.__enter__()
         except BaseException:
@@ -200,9 +209,11 @@ class ReorderedMetricsCollector:
             "phase": phase,
             "compile_index": len(self.records),
             "phase_index": phase_index,
-            "placeholders": _placeholder_signature(graph),
+            "placeholder_count": sum(node.op == "placeholder" for node in graph.nodes),
             **asdict(metrics),
         }
+        if self.include_placeholder_signatures:
+            record["placeholders"] = _placeholder_signature(graph)
         if trace_path is not None:
             record["trace"] = str(trace_path)
         self.records.append(record)
