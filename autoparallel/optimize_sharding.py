@@ -2523,9 +2523,31 @@ class ShardingOptimizer:
         """Shared implementation for add_sharded_input_constraint and
         add_sharded_output_constraint. Only constrains the forward-side node;
         the backward side is handled by add_forward_backward_consistency_constraints."""
+        io_kind = "output" if desc_type is PlainAOTOutput else "input"
         remaining = None
         if placements is not None:
             remaining = {i: p for i, p in enumerate(placements)}
+            missing = sorted(
+                desc.idx for desc in nodes_dict if desc.idx not in remaining
+            )
+            if missing:
+                raise ValueError(
+                    f"Missing {io_kind} constraints at flattened {io_kind} "
+                    f"indices {missing}."
+                )
+
+            invalid = sorted(
+                desc.idx
+                for desc, (node, _companion_node) in nodes_dict.items()
+                if not isinstance(node, torch.fx.Node)
+                and remaining[desc.idx] is not None
+            )
+            if invalid:
+                raise ValueError(
+                    f"Cannot apply placement constraints at flattened {io_kind} "
+                    f"indices {invalid} because they are not tensors. Use None for "
+                    f"these {io_kind} constraints."
+                )
 
         for desc, (node, _companion_node) in nodes_dict.items():
             if placements is None:
@@ -2535,6 +2557,8 @@ class ShardingOptimizer:
                 assert remaining is not None
                 placement = remaining.pop(desc.idx)
 
+            if not isinstance(node, torch.fx.Node):
+                continue
             self.add_node_constraint(node, placement, constraint_name=constraint_name)
 
         ignored = []
@@ -2578,8 +2602,16 @@ class ShardingOptimizer:
         self._constraint_log.append(
             ("add_sharded_output_constraint", {"output_placements": output_placements})
         )
+        output_nodes = get_plain_output_and_tangent_nodes(self.graph)
+        if output_placements is not None:
+            num_outputs = max((desc.idx for desc in output_nodes), default=-1) + 1
+            if len(output_placements) != num_outputs:
+                raise ValueError(
+                    f"Expected {num_outputs} output constraints to match the flattened "
+                    f"output pytree, but got {len(output_placements)}."
+                )
         self._add_io_placement_constraints(
-            nodes_dict=get_plain_output_and_tangent_nodes(self.graph),
+            nodes_dict=output_nodes,
             placements=output_placements,
             desc_type=PlainAOTOutput,
             constraint_name="output_constraint",
