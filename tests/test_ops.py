@@ -525,6 +525,77 @@ class TestDocPackedAttn:
             assert out.dtype == q.dtype
             assert out.grad_fn is not None
 
+    def test_fake_aux_metadata_and_autograd(self):
+        """Auxiliary outputs match the kernel metadata and are non-differentiable."""
+        from torch._subclasses import FakeTensorMode
+
+        with FakeTensorMode():
+            B, S, H, D = 1, 128, 8, 64
+            q = torch.empty(
+                B, S, H, D, dtype=torch.bfloat16, device="cuda", requires_grad=True
+            )
+            k = torch.empty_like(q, requires_grad=True)
+            v = torch.empty_like(q, requires_grad=True)
+            cu = torch.empty(B, 5, dtype=torch.int32, device="cuda")
+            out, lse, rng_state = torch.ops.autoparallel.doc_packed_attn_op(
+                q, k, v, cu, 3, None, [-1, 0], False
+            )
+
+            assert out.requires_grad
+            assert not lse.requires_grad
+            assert not rng_state.requires_grad
+            assert rng_state.dtype == torch.uint64
+
+    def test_flop_count(self):
+        """Both opaque custom ops contribute attention FLOPs to the cost model."""
+        from torch._subclasses import FakeTensorMode
+        from torch.utils.flop_counter import FlopCounterMode
+
+        with FakeTensorMode():
+            B, S, Hq, Hkv, D = 2, 128, 8, 4, 64
+            q = torch.empty(B, S, Hq, D, dtype=torch.bfloat16, device="cuda")
+            k = torch.empty(B, S, Hkv, D, dtype=torch.bfloat16, device="cuda")
+            v = torch.empty_like(k)
+            cu = torch.empty(B, 5, dtype=torch.int32, device="cuda")
+
+            with FlopCounterMode(display=False) as counter:
+                out, lse, rng_state = torch.ops.autoparallel.doc_packed_attn_op(
+                    q, k, v, cu, 4, None, [-1, 0], True
+                )
+            assert counter.get_total_flops() == 4 * B * Hq * S * S * D
+
+            with FlopCounterMode(display=False) as counter:
+                torch.ops.autoparallel.doc_packed_attn_backward_op(
+                    torch.empty_like(out),
+                    q,
+                    k,
+                    v,
+                    out,
+                    lse,
+                    cu,
+                    rng_state,
+                    4,
+                    None,
+                    [-1, 0],
+                )
+            assert counter.get_total_flops() == 10 * B * Hq * S * S * D
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_custom_op_registration(self):
+        """Runtime, fake, autograd, and dynamic AOT metadata remain consistent."""
+        B, S, H, D = 1, 64, 4, 64
+        q = torch.randn(
+            B, S, H, D, dtype=torch.bfloat16, device="cuda", requires_grad=True
+        )
+        k = torch.randn_like(q, requires_grad=True)
+        v = torch.randn_like(q, requires_grad=True)
+        cu = torch.tensor([[0, 32, 64]], dtype=torch.int32, device="cuda")
+
+        torch.library.opcheck(
+            torch.ops.autoparallel.doc_packed_attn_op.default,
+            (q, k, v, cu, 2, None, [-1, 0], False),
+        )
+
     # -- input validation ------------------------------------------------------
 
     def test_gqa_disabled_requires_matching_heads(self):
@@ -825,6 +896,7 @@ class TestDocPackedAttnShardingStrategy:
             assert out_placements[0] == (Shard(0),), out_placements[0]
             assert out_placements[1] == (Shard(1),), out_placements[1]
             assert out_placements[2] == (Replicate(),), out_placements[2]
+            assert spec.output_specs[2].tensor_meta.dtype == torch.uint64
 
     def test_dp_tp_pins_shard0_shard2(self, device_mesh_2d):
         """2D dp×tp mesh, q/k/v pinned (Shard(0), Shard(2)).

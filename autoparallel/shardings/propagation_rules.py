@@ -765,7 +765,7 @@ def doc_packed_attn_op_rule(mesh, op_schema):
     lse_meta = _gen_tensor_meta(
         torch.empty((H_q, B * S), dtype=torch.float32, device="meta")
     )
-    rng_meta = _gen_tensor_meta(torch.empty((2,), dtype=torch.int64, device="meta"))
+    rng_meta = _gen_tensor_meta(torch.empty((2,), dtype=torch.uint64, device="meta"))
 
     return expand_to_full_mesh_op_strategy(
         mesh,

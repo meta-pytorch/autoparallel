@@ -9,6 +9,11 @@ import torch
 
 # Importing triggers registration of torch_attn::_varlen_attn{,_backward}.
 import torch.nn.attention.varlen as _varlen  # noqa: F401
+from torch.utils.flop_counter import (
+    register_flop_formula,
+    sdpa_backward_flop_count,
+    sdpa_flop_count,
+)
 
 
 def permutation(x: torch.Tensor, axis: int = 0, independent: bool = False):
@@ -144,10 +149,23 @@ def _doc_packed_attn_op_fake(
     out = torch.empty_like(query)
     # Matches torch_attn::_varlen_attn fake shapes (after THD flatten):
     #   lse: (num_heads, total_q) float32
-    #   rng_state: (2,) int64 placeholder
+    #   rng_state: (2,) uint64 placeholder
     lse = torch.empty((Hq, B * S), dtype=torch.float32, device=query.device)
-    rng_state = torch.empty((2,), dtype=torch.int64, device=query.device)
+    rng_state = torch.empty((2,), dtype=torch.uint64, device=query.device)
     return out, lse, rng_state
+
+
+@register_flop_formula(torch.ops.autoparallel.doc_packed_attn_op)
+def _doc_packed_attn_forward_flop(query, key, value, *args, **kwargs) -> int:
+    """Count a per-batch upper bound because document lengths are data-dependent."""
+    B, S, H_q, D_q = query
+    B_k, S_k, H_kv, D_k = key
+    B_v, S_v, H_v, D_v = value
+    return sdpa_flop_count(
+        (B, H_q, S, D_q),
+        (B_k, H_kv, S_k, D_k),
+        (B_v, H_v, S_v, D_v),
+    )
 
 
 def _doc_packed_attn_setup_context(ctx: Any, inputs: tuple, output: Any) -> None:
@@ -162,6 +180,7 @@ def _doc_packed_attn_setup_context(ctx: Any, inputs: tuple, output: Any) -> None
         enable_gqa,
     ) = inputs
     out, lse, rng_state = output
+    ctx.mark_non_differentiable(lse, rng_state)
     ctx.save_for_backward(query, key, value, cu_seq_q, out, lse, rng_state)
     ctx.n_docs = n_docs
     ctx.scale = scale
@@ -233,6 +252,21 @@ def _doc_packed_attn_backward_op_fake(
     window_size: list[int] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     return torch.empty_like(query), torch.empty_like(key), torch.empty_like(value)
+
+
+@register_flop_formula(torch.ops.autoparallel.doc_packed_attn_backward_op)
+def _doc_packed_attn_backward_flop(grad_out, query, key, value, *args, **kwargs) -> int:
+    """Count a per-batch upper bound because document lengths are data-dependent."""
+    B, S, H_q, D_q = query
+    B_k, S_k, H_kv, D_k = key
+    B_v, S_v, H_v, D_v = value
+    B_g, S_g, H_g, D_g = grad_out
+    return sdpa_backward_flop_count(
+        (B_g, H_g, S_g, D_g),
+        (B, H_q, S, D_q),
+        (B_k, H_kv, S_k, D_k),
+        (B_v, H_v, S_v, D_v),
+    )
 
 
 def _doc_packed_attn_backward(
