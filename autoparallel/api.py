@@ -208,7 +208,7 @@ def build_joint_graph(
     else:
         traced_inputs = ForwardInputs(args=(raw_inputs,))
 
-    if fake_mode.shape_env is not None:
+    if not fake_mode.static_shapes:
         args, kwargs = _make_inputs_dynamic(
             (traced_inputs.args, traced_inputs.kwargs), fake_mode
         )
@@ -342,8 +342,11 @@ class AutoParallel:
         self.compiler_fn = _boxed_nop_preserve_node_meta  # type: ignore[assignment]
         self.reshard_after_forward = reshard_after_forward
 
+        # Always attach a ShapeEnv so data-dependent ops (e.g. the MoE .tolist()
+        # splits) can allocate unbacked SymInts. Inputs stay static unless
+        # dynamic=True, matching graph_trainer's minimal_fx_tracer.
+        self.fake_mode.shape_env = ShapeEnv()
         if dynamic:
-            self.fake_mode.shape_env = ShapeEnv()
             self.fake_mode.static_shapes = False
 
         # NB: rest of the construction happens in __enter__
