@@ -105,7 +105,7 @@ class ApproximateShardingSolver:
         bp_iters: int = 400,
         bp_tol: float = 1e-3,
         max_sweeps: int = 12,
-        max_time_s: float = 60.0,
+        max_time_s: float = math.inf,
         star_passes: int = 2,
         max_star_children: int = 32,
         group_domain_limit: int = 512,
@@ -115,6 +115,10 @@ class ApproximateShardingSolver:
         self.bp_iters = bp_iters
         self.bp_tol = bp_tol
         self.max_sweeps = max_sweeps
+        # Every rank solves independently, so a wall-clock cap that truncates the
+        # search makes the assignment depend on process speed: a slow rank lowers
+        # a different graph and its collectives mismatch. Unbounded by default;
+        # bp_iters, max_sweeps and star_passes bound the solve.
         self.max_time_s = max_time_s
         self.star_passes = star_passes
         self.max_star_children = max_star_children
@@ -1206,7 +1210,7 @@ class ApproximateShardingSolver:
         # ~100 sweeps, drop, plateau again, then drop to the optimum), so neither
         # an energy-plateau counter nor a message-delta threshold detects true
         # convergence without stopping on a false plateau. We therefore run a
-        # fixed sweep budget (bounded by the time deadline), which is enough for
+        # fixed sweep budget (and the deadline, if set), which is enough for
         # the slowest converger observed, and an exact fixed point ends early.
         best_e = INF
         best_snap = None
