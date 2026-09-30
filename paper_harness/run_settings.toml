@@ -184,3 +184,21 @@ model = "llama3_8b"
 setting = "3d-dps8-cp2-tp4-16k-ro4859-cost535"
 campaign = "campaigns/variants/llama3_8b_3d_long_approx_reduce_order_cost535.toml"
 point = "8x2x4"
+
+[[settings]]
+model = "deepseek_v3_16b"
+setting = "3d-dps4-tp2-ep4-sp-apgt-static"
+campaign = "campaigns/variants/deepseek_v3_16b_tp_ep_apgt_static.toml"
+point = "3d-dps4-tp2-ep4-sp"
+
+[[settings]]
+model = "deepseek_v3_16b"
+setting = "3d-dps4-tp4-ep8-sp-apgt-static"
+campaign = "campaigns/variants/deepseek_v3_16b_tp_ep_apgt_static.toml"
+point = "3d-dps4-tp4-ep8-sp"
+
+[[settings]]
+model = "deepseek_v3_16b"
+setting = "3d-dps4-tp8-ep16-sp-apgt-static"
+campaign = "campaigns/variants/deepseek_v3_16b_tp_ep_apgt_static.toml"
+point = "3d-dps4-tp8-ep16-sp"

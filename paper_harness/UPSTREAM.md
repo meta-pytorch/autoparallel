@@ -39,6 +39,10 @@ ancestor and retains the `60517d28` AutoParallel/GraphTrainer integration.
   overlap scheduling (`aten_distributed_optimizations.custom_runtime_estimation`),
   so it uses the same estimates, including the NCCL cost profile, as the AP
   pass.
+- `19452efb` (local branch `agent/dsv3-static-shapes-v16-20260929`, child of
+  `b32acd82`) drops `dynamic=True` from the DeepSeek V3 AutoParallel entry
+  point, so AutoParallel traces with static shapes. It is the runtime pin; the
+  lock remote is the local repository because the commit is not pushed.
 
 The 3D port includes only the approved legacy-DTensor AP configuration, CP
 input-ownership seam, DP-shard/CP/TP mesh, CP-aware SDPA, DTensor output, and
@@ -91,7 +95,13 @@ is pinned to the commit immediately before the lock/harness-only updates.
   all_reduce on `dp_replicate`), and prices them last in the solver-side
   logical plan. At `dp_shard >= 3` the concrete plan then matches the logical
   plan again, so the FSDP-like storage order is no longer rejected and the
-  default-order all_to_all chains disappear. It is the runtime pin.
+  default-order all_to_all chains disappear.
+- `3e7aeb6` (local branch `agent/dsv3-static-shapes-v16-20260929`, child of
+  `77cfe2c`) always attaches a ShapeEnv, so the MoE token-split `.tolist()`
+  gets unbacked SymInts under static shapes, and aliases declared forward
+  local_map outputs so the solver can still redistribute them. It is the
+  runtime pin; the lock remote is the local repository because the commit is
+  not pushed.
 
 ## Reproduction policy
 
