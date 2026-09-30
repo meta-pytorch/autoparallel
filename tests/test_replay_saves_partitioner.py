@@ -530,6 +530,82 @@ def test_replay_saves_partitioner_does_not_save_must_recompute():
     assert "add_tensor" not in bw_placeholders
 
 
+@pytest.mark.parametrize("backward_tag", ["is_backward", "must_be_in_backward"])
+def test_replay_saves_partitioner_ignores_propagated_backward_save_tags(
+    backward_tag,
+):
+    """Ignore replay tags copied onto backward-generated nodes.
+
+    Explicit MUST_SAVE remains authoritative regardless of node provenance.
+    """
+    graph = torch.fx.Graph()
+    x = graph.placeholder("primals_1")
+    x.meta["val"] = torch.randn(4, device="meta")
+    tangent = graph.placeholder("tangents_1")
+    tangent.meta["val"] = torch.randn(4, device="meta")
+
+    saved = graph.call_function(torch.ops.aten.clone.default, args=(x,))
+    saved.meta.update(
+        {
+            "val": torch.randn(4, device="meta"),
+            "custom": {"ap_must_save": True},
+            "partitioner_tag": "is_forward",
+        }
+    )
+    propagated = graph.call_function(torch.ops.aten.sin.default, args=(saved,))
+    propagated.meta.update(
+        {
+            "val": torch.randn(4, device="meta"),
+            "custom": {"ap_must_save": True},
+            "partitioner_tag": backward_tag,
+        }
+    )
+    forced = graph.call_function(torch.ops.aten.cos.default, args=(saved,))
+    forced.meta.update(
+        {
+            "val": torch.randn(4, device="meta"),
+            "custom": {"ap_must_save": True},
+            "partitioner_tag": "is_backward",
+            "recompute": CheckpointPolicy.MUST_SAVE,
+        }
+    )
+    propagated_grad = graph.call_function(
+        torch.ops.aten.mul.Tensor, args=(propagated, tangent)
+    )
+    propagated_grad.meta["val"] = torch.randn(4, device="meta")
+    forced_grad = graph.call_function(torch.ops.aten.mul.Tensor, args=(forced, tangent))
+    forced_grad.meta["val"] = torch.randn(4, device="meta")
+    backward = graph.call_function(
+        torch.ops.aten.add.Tensor, args=(propagated_grad, forced_grad)
+    )
+    backward.meta["val"] = torch.randn(4, device="meta")
+    output = graph.output((x, backward))
+    output.meta["desc"] = [None, None]
+
+    gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+    fw, bw = _ReplaySavesPartitioner()(
+        gm,
+        [torch.randn(4), torch.randn(4)],
+        num_fwd_outputs=1,
+    )
+
+    fw_output_names = {
+        node.name
+        for node in next(node for node in fw.graph.nodes if node.op == "output").args[0]
+        if isinstance(node, torch.fx.Node)
+    }
+    bw_placeholder_names = {
+        node.name for node in bw.graph.nodes if node.op == "placeholder"
+    }
+    assert saved.name in fw_output_names
+    assert forced.name in fw_output_names
+    assert propagated.name not in fw_output_names
+    assert saved.name in bw_placeholder_names
+    assert forced.name in bw_placeholder_names
+    assert propagated.name not in bw_placeholder_names
+    assert any(node.target is torch.ops.aten.sin.default for node in bw.graph.nodes)
+
+
 def test_replay_saves_partitioner_must_recompute_blocks_multi_output_save():
     """MUST_RECOMPUTE on a multi-output op blocks saving its getitem
     children, even when ap_must_save is also set. Documents the invariant
@@ -844,6 +920,118 @@ _MESH_FLATTEN_FAKE_XFAIL_REASON = (
     "FakeTensorMode on CI torch nightly; see comment block above. Cannot "
     "reproduce locally on torch 2.14.0.dev20260615+cu130."
 )
+
+
+@apply_cuda_patches
+def test_replay_saves_partitioner_reshards_tiny_mlp_in_backward(
+    monkeypatch, record_property
+):
+    """The production backend retains a shard and re-gathers it in backward."""
+    from autoparallel.api import AutoParallel
+
+    input_size = 784
+    hidden_size = 256
+    output_size = 10
+
+    class TinyMLP(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.fc1 = torch.nn.Linear(input_size, hidden_size, bias=False)
+            self.relu = torch.nn.ReLU()
+            self.fc2 = torch.nn.Linear(hidden_size, output_size, bias=False)
+
+        def forward(self, x):
+            x = x.flatten(1)
+            return self.fc2(self.relu(self.fc1(x)))
+
+    mesh = torch.distributed.device_mesh.init_device_mesh(
+        "cuda", (8,), mesh_dim_names=("tiny_dp",)
+    )
+    global_batch = 8192
+
+    with torch.device("meta"):
+        model = TinyMLP()
+
+    with AutoParallel(
+        model,
+        lambda: torch.randn(global_batch, 1, 28, 28, device="cuda"),
+        mesh,
+    ) as autop:
+        autop.add_input_constraints([(Shard(0),)])
+        autop.add_output_constraints([(Shard(0),)])
+        matmuls = [
+            node
+            for node in autop.gm.graph.find_nodes(
+                op="call_function", target=torch.ops.aten.mm.default
+            )
+            if node.meta.get("partitioner_tag") == "is_forward"
+        ]
+        assert len(matmuls) == 2
+        # Fix the parameter storage layouts that produce the FSDP gathers
+        for index, node in enumerate(matmuls):
+            weight = node.all_input_nodes[1]
+            while weight.op != "placeholder":
+                weight = weight.all_input_nodes[0]
+            autop.sharding_optimizer.add_node_constraint(weight, (Shard(index),))
+        parallel_mod = autop.apply_placement(autop.optimize_placement())
+
+    parallel_mod.to_empty(device="cuda")
+    for parameter in parallel_mod.parameters():
+        torch.nn.init.normal_(parameter)
+
+    captured = {}
+    original_partition = _ReplaySavesPartitioner.__call__
+
+    def capture_partition(partitioner, *args, **kwargs):
+        fw_module, bw_module = original_partition(partitioner, *args, **kwargs)
+        all_gather = torch.ops._c10d_functional.all_gather_into_tensor.default
+        wait = torch.ops._c10d_functional.wait_tensor.default
+        fw_output = next(node for node in fw_module.graph.nodes if node.op == "output")
+        saved_nodes = fw_output.args[0][kwargs["num_fwd_outputs"] :]
+        captured["backward_saved_bytes"] = sum(
+            node.meta["val"].numel() * node.meta["val"].element_size()
+            for node in saved_nodes
+            if isinstance(node, torch.fx.Node)
+            and isinstance(node.meta.get("val"), torch.Tensor)
+            and node.meta.get("partitioner_tag")
+            in ("is_backward", "must_be_in_backward")
+        )
+        bw_all_gathers = bw_module.graph.find_nodes(
+            op="call_function", target=all_gather
+        )
+        assert len(bw_all_gathers) == 1
+        gather = bw_all_gathers[0]
+        shard = gather.args[0]
+        captured["gather_uses_saved_shard"] = (
+            isinstance(shard, torch.fx.Node) and shard.op == "placeholder"
+        )
+        captured["has_single_wait"] = (
+            len(gather.users) == 1 and next(iter(gather.users)).target is wait
+        )
+        captured["shard_bytes"] = (
+            shard.meta["val"].numel() * shard.meta["val"].element_size()
+        )
+        captured["gathered_bytes"] = (
+            gather.meta["val"].numel() * gather.meta["val"].element_size()
+        )
+        return fw_module, bw_module
+
+    monkeypatch.setattr(_ReplaySavesPartitioner, "__call__", capture_partition)
+    compiled = torch.compile(parallel_mod, backend=autoparallel_backend())
+    x = torch.randn(global_batch // mesh.size(), 1, 28, 28, device="cuda")
+    compiled(x).sum().backward()
+
+    # Retain only the local parameter shard across forward and re-gather it
+    # exactly once for backward, as required by reshard_after_forward.
+    assert captured["backward_saved_bytes"] == 0
+    assert captured["gather_uses_saved_shard"]
+    assert captured["has_single_wait"]
+    assert captured["gathered_bytes"] == mesh.size() * captured["shard_bytes"]
+    avoided_retained_bytes = captured["gathered_bytes"] - captured["shard_bytes"]
+    assert avoided_retained_bytes == (mesh.size() - 1) * captured["shard_bytes"]
+    record_property("saved_parameter_shard_bytes", captured["shard_bytes"])
+    record_property("gathered_parameter_bytes", captured["gathered_bytes"])
+    record_property("avoided_retained_parameter_bytes", avoided_retained_bytes)
 
 
 @pytest.mark.xfail(reason=_MESH_FLATTEN_FAKE_XFAIL_REASON, strict=False)
