@@ -34,6 +34,7 @@ from .graph_passes.graph_utils import (
     _replace_view_mm_view_with_einsum,
     assert_has_no_collectives,
     cleanup_graph,
+    eliminate_alias_round_trips,
     fix_scatter_on_aliased_inputs,
     functionalize_fresh_index_put_mutations,
     update_joint_with_descriptors,
@@ -402,6 +403,10 @@ class AutoParallel:
         self._assert_entered()
 
         self.sharding_placement = self.sharding_optimizer.get_solution(verbose=False)
+
+        eliminated = eliminate_alias_round_trips(self.gm, self.sharding_placement)
+        if eliminated:
+            logger.info("Eliminated %d alias redistribution round-trips", eliminated)
 
         if verbose:
             logger.info(self.sharding_optimizer.get_log(verbose=True))
