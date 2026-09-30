@@ -704,12 +704,11 @@ class TestDocPackedAttn:
         )
         out_ref.backward(grad)
 
-        # bf16 epsilon ~ 8e-3; allow ~4x headroom because flash and SDPA
-        # accumulate dk across the sequence dim in different orders, and
-        # GQA broadcasting compounds rounding for the longest single-doc cases.
-        tol = 3e-2
+        # Allow 4x dtype epsilon because flash and SDPA accumulate dk across
+        # the sequence dim in different orders, and GQA compounds rounding.
+        tol = 4 * torch.finfo(q.dtype).eps
         assert torch.isfinite(out).all()
-        assert (out - out_ref).abs().max().item() < tol, (
+        assert (out - out_ref).abs().max().item() <= tol, (
             f"forward parity failure: max_abs_diff="
             f"{(out - out_ref).abs().max().item():.2e}"
         )
@@ -719,7 +718,7 @@ class TestDocPackedAttn:
             ("v", v.grad, v_ref.grad),
         ]:
             diff = (g - g_ref).abs().max().item()
-            assert diff < tol, f"{name_g}.grad parity failure: max_abs_diff={diff:.2e}"
+            assert diff <= tol, f"{name_g}.grad parity failure: max_abs_diff={diff:.2e}"
 
     # -- padding semantics -----------------------------------------------------
 
