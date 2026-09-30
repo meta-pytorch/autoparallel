@@ -19,6 +19,9 @@ from torch.distributed.tensor._op_schema import OpSpec
 from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
 
 from autoparallel.api import AutoParallel
+from autoparallel.cost_models.collective_runtime_estimation import (
+    estimate_strategy_comms_cost,
+)
 from autoparallel.shardings.ordered_sharding import (
     _consumer_boundary_for_input,
     _fallback_plan,
@@ -1509,6 +1512,24 @@ def test_hsdp_order_plan_preserves_orthogonal_all_reduce():
         assert concrete is not None
         assert concrete.operations == expected_operations
         assert concrete.all_to_all_count == 0
+
+
+def test_solver_prices_orthogonal_all_reduce_after_reduce_scatter():
+    # Muse Glimmer 30B w1 gradient on the dp_replicate x dp_shard x tp mesh.
+    mesh = torch.distributed.device_mesh.DeviceMesh(
+        "cuda", torch.arange(64).reshape(4, 8, 2)
+    )
+    shape = (19968, 6656)
+    storage = _spec_with_meta(mesh, (Replicate(), Shard(0), Shard(0)), shape)
+    for grad_placements in (
+        (Partial(), Partial(), Partial()),
+        (Partial(), Shard(0), Partial()),
+    ):
+        grad = _spec_with_meta(mesh, grad_placements, shape, torch.float32)
+        logical = _logical_plan(grad, storage)
+        assert logical is not None
+        assert logical.operations[-1] == ("all_reduce", (0,))
+        assert estimate_strategy_comms_cost(grad, storage) == logical.cost
 
 
 def test_consumer_boundary_ignores_arguments_without_a_sharding_entry():

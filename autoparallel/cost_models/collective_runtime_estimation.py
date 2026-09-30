@@ -256,6 +256,14 @@ def estimate_strategy_comms_cost(src_spec, tgt_spec):
         p.is_shard() for p in tgt_spec.placements
     ):
         order = [1, 0]
+    # A reduce_scatter shrinks the payload of an all_reduce on another mesh
+    # dim, so price the all_reduce last, as lowering stages it
+    # (_orthogonal_partial_reduction_steps, _logical_plan).
+    pairs = list(zip(src_spec.placements, tgt_spec.placements))
+    if any(src.is_partial() and dst.is_shard() for src, dst in pairs):
+        order.sort(
+            key=lambda i: pairs[i][0].is_partial() and pairs[i][1].is_replicate()
+        )
     cost = redistribute_cost(src_spec, tgt_spec, order)
     if key is not None:
         _comms_cost_cache[key] = cost
