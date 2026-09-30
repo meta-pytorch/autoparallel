@@ -44,6 +44,9 @@ with AutoParallel(model, input_fn, mesh, mp_policy=mp_policy) as autop:
     parallel_model = autop.apply_placement(placement)
 ```
 
+Output constraints align with the flattened output pytree. Use `None` for
+non-tensor leaves, for example `[(Shard(0),), None]` for `(logits, None)`.
+
 Omitting the parameter-memory call leaves replication legal. Calling it with no
 arguments is different: it uses `low=0` and `high=1 / world_size`, requiring the
 aggregate parameter storage to fit the fully-sharded upper bound. Apply a
