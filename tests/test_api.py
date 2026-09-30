@@ -300,6 +300,68 @@ def test_inference_mode_compilation(device_mesh_1d):
     assert parallel_mod is not None
 
 
+@pytest.mark.parametrize(
+    "output_constraints",
+    [
+        [(Shard(0),), None],
+        [None, None],
+    ],
+)
+def test_output_constraints_with_non_tensor_leaf(device_mesh_1d, output_constraints):
+    class Model(nn.Module):
+        def forward(self, x):
+            return x + 1, None
+
+    def input_fn():
+        return (torch.rand(512, 8, device="cuda"),)
+
+    with AutoParallel(Model(), input_fn, device_mesh_1d, cost_model=None) as autop:
+        autop.add_output_constraints(output_constraints)
+        autop.optimize_placement()
+
+
+def test_non_tensor_output_rejects_placement_constraint(device_mesh_1d):
+    class Model(nn.Module):
+        def forward(self, x):
+            return x + 1, 7
+
+    def input_fn():
+        return (torch.rand(512, 8, device="cuda"),)
+
+    with AutoParallel(Model(), input_fn, device_mesh_1d, cost_model=None) as autop:
+        with pytest.raises(
+            ValueError,
+            match=(
+                r"flattened output indices \[1\].*not tensors.*"
+                r"None for these output constraints"
+            ),
+        ):
+            autop.add_output_constraints([(Shard(0),), (Shard(0),)])
+
+
+@pytest.mark.parametrize("constraint_count", [1, 3])
+def test_output_constraint_count_must_match_flattened_outputs(
+    device_mesh_1d, constraint_count
+):
+    class Model(nn.Module):
+        def forward(self, x):
+            return x + 1, None
+
+    def input_fn():
+        return (torch.rand(512, 8, device="cuda"),)
+
+    constraints = [(Shard(0),)] + [None] * (constraint_count - 1)
+    with AutoParallel(Model(), input_fn, device_mesh_1d, cost_model=None) as autop:
+        with pytest.raises(
+            ValueError,
+            match=(
+                rf"Expected 2 output constraints to match the flattened output pytree, "
+                rf"but got {constraint_count}"
+            ),
+        ):
+            autop.add_output_constraints(constraints)
+
+
 def test_moduledict_preservation(device_mesh_1d):
     """Test that nn.ModuleDict structure is preserved during _assign_attr."""
     dim = 128
