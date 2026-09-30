@@ -20,7 +20,7 @@ dependencies = [
     "torch>=2.7.0",
     "typing_extensions>=4.0.0",
     "filecheck",
-    "pulp"
+    "pulp==3.2.1"
 ]
 
 [project.urls]
