@@ -374,9 +374,10 @@ def _make_local_args(gm, physical_placements):
     """Create local tensors for each placeholder via DTensor redistribute.
 
     Uses DTensor's redistribute to compute correct local shapes and strides.
-    When the FakeTensorMode has a ShapeEnv (dynamic shapes), re-creates the
-    local tensors with fresh SymInts for batch-dependent dims. The caller
-    must swap the ShapeEnv to a fresh one before calling this function.
+    When the FakeTensorMode traces dynamic shapes (static_shapes=False),
+    re-creates the local tensors with fresh SymInts for batch-dependent dims.
+    The caller must swap the ShapeEnv to a fresh one before calling this
+    function.
     """
     from torch.fx.experimental.symbolic_shapes import (
         DimDynamic,
@@ -420,7 +421,7 @@ def _make_local_args(gm, physical_placements):
         # like the batch dim, not a guarded model constant like hidden_dim
         # whose expr collapsed to a number), or if uneven sharding causes
         # rank-varying local sizes.
-        if isinstance(tensor, FakeTensor) and tensor.fake_mode.shape_env is not None:
+        if isinstance(tensor, FakeTensor) and not tensor.fake_mode.static_shapes:
             dynamic_sizes = [
                 DimDynamic.DYNAMIC
                 if (isinstance(s, torch.SymInt) and not s.node.expr.is_number)
