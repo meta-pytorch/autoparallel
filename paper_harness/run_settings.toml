@@ -202,3 +202,9 @@ model = "deepseek_v3_16b"
 setting = "3d-dps4-tp8-ep16-sp-apgt-static"
 campaign = "campaigns/variants/deepseek_v3_16b_tp_ep_apgt_static.toml"
 point = "3d-dps4-tp8-ep16-sp"
+
+[[settings]]
+model = "deepseek_v3_16b"
+setting = "3d-dps4-tp2-ep4-sp-apgt-static-torch-trace"
+campaign = "campaigns/variants/deepseek_v3_16b_tp_ep_apgt_static_torch_trace.toml"
+point = "3d-dps4-tp2-ep4-sp"

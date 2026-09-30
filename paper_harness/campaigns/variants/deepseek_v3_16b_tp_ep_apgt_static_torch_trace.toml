@@ -1,0 +1,96 @@
+schema_version = 1
+name = "dsv3-16b-apgt-static-torch-trace"
+description = "DeepSeek V3 16B AutoParallel GraphTrainer static-shape (dynamic=False) compile with TORCH_TRACE on every rank of the 2x2x2 mesh (dp_shard 4, tp 2, ep 4) for tlparse"
+workload = "deepseek_v3_16b"
+
+[model]
+flavor = "16B"
+attention_backend = "sdpa"
+
+[data]
+mode = "streaming"
+identity = "index_manifest"
+dataset = "allenai/c4"
+revision = "1588ec454efa1a09f29cd18ddd04fe05fc8653a2"
+identity_manifest = "{harness}/data/index_manifests/deepseek_v3_16b_tp_ep.json"
+identity_manifest_sha256 = "79a9d5cacbdfadb9df416f4157690f491c752a785ec282d1adcbdac031afeaaf"
+
+[training]
+local_batch_size = 2
+global_batch_size = 8
+seq_len = 4096
+
+[parallelism]
+data_parallel_replicate_degree = 1
+data_parallel_shard_degree = 4
+tensor_parallel_degree = 8
+enable_sequence_parallel = true
+context_parallel_degree = 1
+pipeline_parallel_degree = 1
+expert_parallel_degree = 16
+
+[metrics]
+save_for_all_ranks = true
+
+[mast]
+nodes = 4
+nproc_per_node = 8
+hardware = "grandteton_80g_roce"
+locality = "dc;pci1"
+gpu_name_contains = "H100"
+retries = 0
+master_port = 29500
+phase_timeout_seconds = 21600
+
+[mast.environment]
+BENCHMARK_WORLD_SIZE = "32"
+BENCHMARK_DP_DEGREE = "4"
+BENCHMARK_EP_DEGREE = "16"
+BENCHMARK_TP_DEGREE = "8"
+BENCHMARK_LOCAL_BATCH_SIZE = "2"
+BENCHMARK_GLOBAL_BATCH_SIZE = "8"
+C4_SHARD_ROOT = "{asset:offline_c4}"
+DEEPSEEK_TOKENIZER_DIR = "{asset:deepseek_tokenizer}"
+FIXED_REPLAY_BATCHES = "10"
+AP_COLLECTIVE_MUST_SAVE_EXPECTATION = "off"
+HF_HUB_OFFLINE = "1"
+HF_DATASETS_OFFLINE = "1"
+PYTORCH_ALLOC_CONF = "expandable_segments:True"
+TORCHINDUCTOR_CUDAGRAPHS = "0"
+
+[artifacts]
+required_assets = ["offline_c4", "deepseek_tokenizer"]
+warmup_steps = 5
+
+[[arms]]
+name = "apgt"
+profile = "apgt_validated_v1"
+module = "workloads.deepseek_v3.perf_configs"
+config = "autoparallel_graphtrainer_16b"
+[arms.overrides]
+"compile.autoparallel_solver" = "approx"
+[arms.environment]
+BENCHMARK_CONFIGURATION = "autoparallel_graphtrainer"
+EXPERIMENT_ARM = "G"
+
+[[phases]]
+name = "torch_trace"
+kind = "torch_trace"
+arms = ["apgt"]
+trace_ranks = [0, 1, 2, 3, 4, 5, 6, 7]
+[phases.overrides]
+"comm.init_timeout_seconds" = 14400
+"training.steps" = 3
+"profiler.enable_profiling" = false
+"profiler.enable_memory_snapshot" = false
+"metrics.log_freq" = 5
+
+[[matrix.points]]
+name = "3d-dps4-tp2-ep4-sp"
+[matrix.points.settings]
+"mast.nodes" = 1
+"parallelism.tensor_parallel_degree" = 2
+"parallelism.expert_parallel_degree" = 4
+"mast.environment.BENCHMARK_WORLD_SIZE" = "8"
+"mast.environment.BENCHMARK_EP_DEGREE" = "4"
+"mast.environment.BENCHMARK_TP_DEGREE" = "2"
