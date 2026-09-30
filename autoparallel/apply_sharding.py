@@ -426,10 +426,13 @@ def _make_local_args(gm, physical_placements):
                     device=tensor.device,
                 )
 
-        sharded = DTensor.from_local(
-            concrete_tensor, mesh, curr_placement
-        ).redistribute(mesh, spec.placements)
-        local = sharded.to_local()
+        # These are example inputs for tracing, so use the current rank's concrete
+        # shape. Rank-dependent coordinates are captured during graph lowering.
+        with torch.compiler.config.patch(compile_on_one_rank=False):
+            sharded = DTensor.from_local(
+                concrete_tensor, mesh, curr_placement
+            ).redistribute(mesh, spec.placements)
+            local = sharded.to_local()
 
         # For dynamic shapes, re-create with fresh SymInts.
         # A dim is DYNAMIC if it's genuinely symbolic (a free SymInt variable
