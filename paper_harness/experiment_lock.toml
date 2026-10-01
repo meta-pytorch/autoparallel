@@ -1,13 +1,13 @@
 schema_version = 1
-harness_version = "legacy-dtensor-v16-paper-submission-ordered-rs-before-ar-dsv3-static-shapes-local"
+harness_version = "legacy-dtensor-v16-paper-submission-ordered-rs-before-ar-dsv3-static-shapes"
 
 [sources.torchtitan]
-remote = "/home/wangkj/workspace/torchtitan"
+remote = "https://github.com/AlbedoWang/torchtitan.git"
 commit = "19452efb459bb508d6625f0fde3f037a3b9cf26c"
 dirty_policy = "forbid"
 
 [sources.autoparallel]
-remote = "/home/wangkj/workspace/autoparallel"
+remote = "https://github.com/meta-pytorch/autoparallel.git"
 commit = "3e7aeb62512c539e2c33c2ec985f79a18cd40317"
 dirty_policy = "forbid"
 
