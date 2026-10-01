@@ -51,6 +51,16 @@ ancestor and retains the `60517d28` AutoParallel/GraphTrainer integration.
   (v20: ring attention traces per-CP-rank graphs and pass 2 orders mesh_cp
   collectives differently across CP ranks); the lock remote is the local
   repository because the commit is not pushed.
+- `3b24e620` (local branch `agent/ulysses-cp-20261001`, child of `cf091127`)
+  replaces SDPA ring-attention CP with Ulysses all-to-all in all three arms:
+  `apply_cp_to_forward` (tt, graph_trainer manual) uses funcol
+  `all_to_all_single` on the CP group, and the AutoParallel CP local_map body
+  uses `autoparallel.collectives.all_to_all("cp")`. Every CP rank traces the
+  same graph (ring attention did not, and v20-v22 apgt hung on mesh_cp order).
+  Ulysses needs contiguous sequence shards, so the LLaMA 3 3D/4D settings use
+  `context_parallel_load_balancer=None` and the trainer rejects default-backend
+  SDPA CP with a load balancer. It is the runtime pin; the lock remote is the
+  local repository because the commit is not pushed.
 
 The 3D port includes only the approved legacy-DTensor AP configuration, CP
 input-ownership seam, DP-shard/CP/TP mesh, CP-aware SDPA, DTensor output, and

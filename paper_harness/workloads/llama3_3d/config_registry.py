@@ -101,7 +101,7 @@ def _base_config():
         tensor_parallel_degree=tp_degree,
         enable_sequence_parallel=True,
         context_parallel_degree=cp_degree,
-        context_parallel_load_balancer="headtail",
+        context_parallel_load_balancer=None,
         pipeline_parallel_degree=1,
         expert_parallel_degree=1,
     )
