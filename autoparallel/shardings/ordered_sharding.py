@@ -3,6 +3,7 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+import itertools
 import math
 import operator
 from collections import Counter, defaultdict
@@ -395,6 +396,57 @@ def _fallback_plan(source: DTensorSpec, target: DTensorSpec) -> Optional[_Fallba
     if tuple(current_placements) != target.placements or not math.isfinite(cost):
         return None
     return _FallbackPlan(tuple(operations), cost)
+
+
+def _has_per_mesh_dim_plan(source: DTensorSpec, target: DTensorSpec) -> bool:
+    """Whether one step per changed mesh dim, in some order, redistributes source
+    to target with both in the default shard order.
+
+    This is the plan redistribute_cost prices. A step can only remove the
+    innermost mesh dim sharding a tensor dim and appends the mesh dim it
+    shards to, so when a tensor dim is sharded over several mesh dims some
+    redistributions have no such plan (S0S0S1S0 -> S0RS1S0 lowers to
+    all_to_all(3), all_gather(1), all_to_all(3)).
+    """
+
+    def default_order(spec: DTensorSpec) -> dict[int, list[int]]:
+        order: dict[int, list[int]] = defaultdict(list)
+        for mesh_dim, p in enumerate(spec.placements):
+            if isinstance(p, Shard):
+                order[p.dim].append(mesh_dim)
+        return order
+
+    changed = [
+        mesh_dim
+        for mesh_dim, (src, dst) in enumerate(zip(source.placements, target.placements))
+        if src != dst
+    ]
+    target_order = default_order(target)
+    for steps in itertools.permutations(changed):
+        order = default_order(source)
+        for mesh_dim in steps:
+            src, dst = source.placements[mesh_dim], target.placements[mesh_dim]
+            if isinstance(src, Shard):
+                if order[src.dim][-1] != mesh_dim:
+                    break
+                order[src.dim].pop()
+            if isinstance(dst, Shard):
+                order[dst.dim].append(mesh_dim)
+        else:
+            if {dim: dims for dim, dims in order.items() if dims} == target_order:
+                return True
+    return False
+
+
+def default_order_redistribute_cost(
+    source: DTensorSpec, target: DTensorSpec
+) -> Optional[float]:
+    """Cost of the plan lowering emits for a default-order redistribution that
+    has no per-mesh-dim plan, else None (redistribute_cost prices it)."""
+    if _has_per_mesh_dim_plan(source, target):
+        return None
+    plan = _fallback_plan(source, target)
+    return None if plan is None else plan.cost
 
 
 def _optimize_same_nd_sharding_as_1d(

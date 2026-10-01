@@ -104,6 +104,7 @@ from .graph_passes.graph_utils import (
     build_param_derived_set,
     build_terminal_derived_set,
 )
+from .shardings.ordered_sharding import default_order_redistribute_cost
 from .shardings.placement_options import (
     get_placement_options_for_node,
     reset_placement_options_cache,
@@ -192,6 +193,10 @@ def concretize_args(args):
         return x
 
     return tree_map_only((torch.SymInt, FakeTensor), concretize, args)
+
+
+def _redistribution_key(src_spec, tgt_spec):
+    return src_spec.placements, tgt_spec.placements, src_spec.tensor_meta
 
 
 def _produces_tensor(val):
@@ -456,6 +461,14 @@ class ShardingOptimizer:
             clusters = get_identical_regions(self.gm.graph, self.strats)
             logger.debug(f"Found {len(clusters)} clusters in {time.time() - t:.2f}s")
             self.create_cluster_links(clusters)
+
+        # Lowering picks a shard order only for parameter and gradient chains
+        # (compute_optimal_placement_order_for_parameters); every other tensor
+        # keeps the default order. Default-order redistributions without a
+        # per-mesh-dim plan are priced by the plan lowering emits once a solve
+        # selects them (_price_selected_redistributions).
+        self._ordered_storage: Optional[tuple[set, set]] = None
+        self._lowered_costs: dict[tuple, float] = {}
 
         t0 = time.perf_counter()
         self.decision_vars = self._build_decision_vars()
@@ -776,19 +789,87 @@ class ShardingOptimizer:
         comm_cost = default_comm_cost
         sharding_transition_cost = 0
 
-        if producer_strategy is not None:
-            src_spec = producer_strategy.strategies[inp_idx].output_specs
-            # TODO: operator.getitem being special is something
-            # we might want to change in the future
-            if node.target == operator.getitem:
-                src_spec = src_spec[node.args[1]]
-            tgt_spec = output_strategy.input_specs[argi]
-            if isinstance(src_spec, DTensorSpec) and isinstance(tgt_spec, DTensorSpec):
-                comm_cost = estimate_strategy_comms_cost(src_spec, tgt_spec)
-                if src_spec.placements != tgt_spec.placements:
-                    sharding_transition_cost = 1
+        specs = self._edge_specs(
+            node, output_strategy, argi, inp_idx, producer_strategy
+        )
+        if specs is not None:
+            src_spec, tgt_spec = specs
+            comm_cost = estimate_strategy_comms_cost(src_spec, tgt_spec)
+            if self._lowered_costs:
+                lowered = self._lowered_costs.get(
+                    _redistribution_key(src_spec, tgt_spec)
+                )
+                if lowered is not None and not self._has_ordered_storage(node, argi):
+                    comm_cost = lowered
+            if src_spec.placements != tgt_spec.placements:
+                sharding_transition_cost = 1
 
         return comm_cost, sharding_transition_cost
+
+    @staticmethod
+    def _edge_specs(node, output_strategy, argi, inp_idx, producer_strategy):
+        if producer_strategy is None:
+            return None
+        src_spec = producer_strategy.strategies[inp_idx].output_specs
+        # TODO: operator.getitem being special is something
+        # we might want to change in the future
+        if node.target == operator.getitem:
+            src_spec = src_spec[node.args[1]]
+        tgt_spec = output_strategy.input_specs[argi]
+        if isinstance(src_spec, DTensorSpec) and isinstance(tgt_spec, DTensorSpec):
+            return src_spec, tgt_spec
+        return None
+
+    def _has_ordered_storage(self, node, argi):
+        if self._ordered_storage is None:
+            self._ordered_storage = (
+                build_param_derived_set(self.graph),
+                build_terminal_derived_set(self.graph),
+            )
+        producers, consumers = self._ordered_storage
+        if node in consumers:
+            return True
+        input_nodes = self._all_input_nodes(node)
+        return argi < len(input_nodes) and input_nodes[argi] in producers
+
+    def _price_selected_redistributions(self):
+        """Price the selected default-order redistributions that have no
+        per-mesh-dim plan by the plan lowering emits for them, and return how
+        many were newly priced.
+
+        estimate_strategy_comms_cost prices one collective per changed mesh
+        dim, which some redistributions of a tensor dim sharded over several
+        mesh dims cannot lower to. Pricing every such candidate edge would need
+        a graph-planner search per edge, so only the selected ones are priced;
+        the caller re-solves until a solve selects no unpriced one.
+        """
+        new = 0
+        for node_idx, argi, out_idx, inp_idx in self.selected_keys:
+            node = self.nodes[node_idx]
+            if self._has_ordered_storage(node, argi):
+                continue
+            input_nodes = self._all_input_nodes(node)
+            if argi >= len(input_nodes):
+                continue
+            specs = self._edge_specs(
+                node,
+                self.strats[node].strategies[out_idx],
+                argi,
+                inp_idx,
+                self.strats[input_nodes[argi]],
+            )
+            if specs is None:
+                continue
+            key = _redistribution_key(*specs)
+            if key in self._lowered_costs or not math.isfinite(
+                estimate_strategy_comms_cost(*specs)
+            ):
+                continue
+            cost = default_order_redistribute_cost(*specs)
+            if cost is not None:
+                self._lowered_costs[key] = cost
+                new += 1
+        return new
 
     def _build_decision_vars(self):
         """Build DecisionVar entries for every (node_idx, argi, out_idx, inp_idx)
