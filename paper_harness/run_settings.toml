@@ -32,77 +32,6 @@ point = "128gpu"
 
 [[settings]]
 model = "llama3_8b"
-setting = "3d-dp2-cp2-tp2"
-campaign = "campaigns/llama3_8b_3d.toml"
-
-[[settings]]
-model = "llama3_8b"
-setting = "seqlen-2k"
-campaign = "campaigns/llama3_8b_seqlen.toml"
-point = "2k"
-
-[[settings]]
-model = "llama3_8b"
-setting = "seqlen-4k"
-campaign = "campaigns/llama3_8b_seqlen.toml"
-point = "4k"
-
-[[settings]]
-model = "llama3_8b"
-setting = "seqlen-8k"
-campaign = "campaigns/llama3_8b_seqlen.toml"
-point = "8k"
-
-[[settings]]
-model = "llama3_8b"
-setting = "seqlen-16k"
-campaign = "campaigns/llama3_8b_seqlen.toml"
-point = "16k"
-
-[[settings]]
-model = "llama3_8b"
-setting = "seqlen-32k"
-campaign = "campaigns/llama3_8b_seqlen.toml"
-point = "32k"
-
-[[settings]]
-model = "muse_glimmer_30b"
-setting = "2d-16gpu"
-campaign = "campaigns/muse_glimmer_30b.toml"
-point = "16gpu"
-
-[[settings]]
-model = "muse_glimmer_30b"
-setting = "2d-32gpu"
-campaign = "campaigns/muse_glimmer_30b.toml"
-point = "32gpu"
-
-[[settings]]
-model = "muse_glimmer_30b"
-setting = "2d-64gpu"
-campaign = "campaigns/muse_glimmer_30b.toml"
-point = "64gpu"
-
-[[settings]]
-model = "muse_glimmer_30b"
-setting = "2d-128gpu"
-campaign = "campaigns/muse_glimmer_30b.toml"
-point = "128gpu"
-
-[[settings]]
-model = "deepseek_v3_16b"
-setting = "efsdp-ep-16gpu"
-campaign = "campaigns/deepseek_v3_16b.toml"
-point = "16gpu"
-
-[[settings]]
-model = "deepseek_v3_16b"
-setting = "efsdp-ep-32gpu"
-campaign = "campaigns/deepseek_v3_16b.toml"
-point = "32gpu"
-
-[[settings]]
-model = "llama3_8b"
 setting = "1d-fsdp8"
 campaign = "campaigns/llama3_8b_2d.toml"
 point = "1d-fsdp8"
@@ -115,74 +44,19 @@ point = "16gpu"
 
 [[settings]]
 model = "llama3_8b"
-setting = "3d-dps4-cp2-tp4"
-campaign = "campaigns/llama3_8b_3d_dps4_cp2_tp4.toml"
-
-[[settings]]
-model = "muse_glimmer_30b"
-setting = "1d-fsdp8"
-campaign = "campaigns/muse_glimmer_30b.toml"
-point = "1d-fsdp8"
-
-[[settings]]
-model = "muse_glimmer_30b"
-setting = "2d-dps8-tp2"
-campaign = "campaigns/muse_glimmer_30b.toml"
-point = "16gpu"
-
-[[settings]]
-model = "deepseek_v3_16b"
-setting = "1d-tp8-ep8-sp"
-campaign = "campaigns/deepseek_v3_16b_tp_ep.toml"
-point = "1d-tp8-ep8-sp"
-
-[[settings]]
-model = "deepseek_v3_16b"
-setting = "2d-dps2-tp8-ep8-sp"
-campaign = "campaigns/deepseek_v3_16b_tp_ep.toml"
-point = "2d-dps2-tp8-ep8-sp"
-
-[[settings]]
-model = "deepseek_v3_16b"
-setting = "3d-dps4-tp8-ep16-sp"
-campaign = "campaigns/deepseek_v3_16b_tp_ep.toml"
-point = "3d-dps4-tp8-ep16-sp"
-
-[[settings]]
-model = "llama3_8b"
 setting = "3d-dpr2-dps2-tp8-paper-merged"
 campaign = "campaigns/variants/llama3_8b_3d_2x2x8.toml"
 
 [[settings]]
-model = "muse_glimmer_30b"
-setting = "3d-dpr2-dps8-tp2-paper-merged"
-campaign = "campaigns/variants/muse_glimmer_30b_3d_2x8x2.toml"
-
-[[settings]]
-model = "muse_glimmer_30b"
-setting = "3d-dpr4-dps8-tp2"
-campaign = "campaigns/variants/muse_glimmer_30b_3d_4x8x2.toml"
-
-[[settings]]
 model = "llama3_8b"
-setting = "3d-dpr2-dps2-tp8-a2a-sac-timeout60"
-campaign = "campaigns/variants/llama3_8b_3d_2x2x8_timeout60.toml"
-
-[[settings]]
-model = "llama3_8b"
-setting = "3d-dpr2-dps2-tp8-apgt-trace-timeout60"
-campaign = "campaigns/variants/llama3_8b_3d_2x2x8_apgt_trace_timeout60.toml"
+setting = "3d-dpr2-dps4-tp8-paper-merged"
+campaign = "campaigns/variants/llama3_8b_3d_2x4x8.toml"
 
 [[settings]]
 model = "llama3_8b"
 setting = "3d-dps2-cp2-tp4-16k-ro4859-cost535"
 campaign = "campaigns/variants/llama3_8b_3d_long_approx_reduce_order_cost535.toml"
 point = "2x2x4"
-
-[[settings]]
-model = "llama3_8b"
-setting = "3d-dps4-cp2-tp4-16k-f738-ro4859-cost535"
-campaign = "campaigns/variants/llama3_8b_3d_dps4_cp2_tp4_16k_f738_reduce_order_cost535.toml"
 
 [[settings]]
 model = "llama3_8b"

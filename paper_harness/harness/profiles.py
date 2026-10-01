@@ -25,63 +25,57 @@ def _expect(config: dict[str, Any], expected: dict[str, Any]) -> None:
         raise CampaignError(f"profile contract mismatch: {mismatches}")
 
 
+GRAPH_TRAINER_COMPILE = (
+    "torchtitan.experiments.graph_trainer.configs.GraphTrainerCompileConfig"
+)
+GRAPH_TRAINER_FULL_INDUCTOR = {
+    "compile._class": GRAPH_TRAINER_COMPILE,
+    "compile.memory_policy": "eager",
+    "compile.inductor_compilation": "full",
+    "compile.numerics_changing_optim": False,
+    "compile.enable_fsdp_ag_rs_overlap": False,
+    "compile.enable_fsdp_dense_region_overlap": False,
+    "compile.disable_passes": ["cuda_graph_pass"],
+}
+
+
 def validate_profile(arm: Arm, config: dict[str, Any]) -> dict[str, Any]:
-    if arm.profile == "tt_main_default_v1":
-        model_spec_name = str(_get(config, "model_spec.name"))
-        if "graphtrainer" in model_spec_name.replace("_", "").lower():
-            raise CampaignError(
-                "tt_main_default_v1 cannot use a GraphTrainer model spec"
+    """Check the serialized TorchTitan config against the arm's profile."""
+    root = str(_get(config, "_class"))
+    graph_trainer = root.startswith("torchtitan.experiments.graph_trainer.")
+    if arm.profile in {"tt_eager", "tt_compiled_loss"}:
+        if graph_trainer:
+            raise CampaignError(f"{arm.profile} cannot use a GraphTrainer config")
+        if arm.profile == "tt_eager":
+            _expect(config, {"compile": None})
+        else:
+            _expect(
+                config,
+                {
+                    "compile._class": "torchtitan.config.configs.CompileConfig",
+                    "compile.components": ["loss"],
+                    "compile.backend": "inductor",
+                },
             )
-        _expect(
-            config,
-            {
-                "compile.enable": True,
-                "compile.backend": "inductor",
-            },
-        )
-    elif arm.profile == "gt_manual_eager_v1":
-        _expect(
-            config,
-            {
-                "compile.enable": True,
-                "compile.backend": "aot_eager",
-                "compile.mode": "aot_fx_trace",
-                "compile.memory_policy": "eager",
-                "compile.inductor_compilation": "full",
-                "compile.numerics_changing_optim": False,
-                "compile.enable_fsdp_ag_rs_overlap": False,
-                "compile.enable_fsdp_dense_region_overlap": False,
-                "compile.enable_autoparallel": False,
-            },
-        )
-        if set(_get(config, "compile.disable_passes")) != {"cudagraph_pass"}:
-            raise CampaignError(
-                "gt_manual_eager_v1 requires only cudagraph_pass to be disabled"
-            )
-    elif arm.profile == "apgt_validated_v1":
-        _expect(
-            config,
-            {
-                "compile.enable": True,
-                "compile.backend": "aot_eager",
-                "compile.mode": "aot_fx_trace",
-                "compile.memory_policy": "eager",
-                "compile.inductor_compilation": "full",
-                "compile.numerics_changing_optim": False,
-                "compile.enable_fsdp_ag_rs_overlap": False,
-                "compile.enable_fsdp_dense_region_overlap": False,
-                "compile.enable_autoparallel": True,
-            },
-        )
-        if set(_get(config, "compile.disable_passes")) != {"cudagraph_pass"}:
-            raise CampaignError(
-                "apgt_validated_v1 requires only cudagraph_pass to be disabled"
-            )
+    elif arm.profile in {"gt", "apgt"}:
+        if not graph_trainer:
+            raise CampaignError(f"{arm.profile} requires a GraphTrainer config")
+        _expect(config, GRAPH_TRAINER_FULL_INDUCTOR)
+        _expect(config, {"compile.enable_autoparallel": arm.profile == "apgt"})
+        if arm.profile == "apgt":
+            _expect(config, {"compile.use_autoparallel_defaults": True})
     else:
         raise CampaignError(f"unknown profile {arm.profile!r}")
 
-    if set(_get(config, "compile.components")) != {"model", "loss"}:
-        raise CampaignError(f"{arm.profile} must compile model and loss")
+    _expect(
+        config,
+        {
+            "activation_checkpoint._class": (
+                "torchtitan.distributed.activation_checkpoint.SelectiveAC.Config"
+            ),
+            "training.disable_cuda_graphs": True,
+        },
+    )
     return {"arm": arm.name, "profile": arm.profile, "status": "passed"}
 
 
@@ -89,26 +83,34 @@ def validate_apgt_source(torchtitan_root: Path) -> dict[str, Any]:
     graph_root = torchtitan_root / "torchtitan/experiments/graph_trainer"
     passes_path = graph_root / "passes.py"
     api_path = graph_root / "autoparallel_api.py"
-    trainer_path = graph_root / "trainer.py"
-    if not all(path.is_file() for path in (passes_path, api_path, trainer_path)):
+    configs_path = graph_root / "configs.py"
+    parallelize_path = graph_root / "llama3/parallelize_autoparallel.py"
+    paths = (passes_path, api_path, configs_path, parallelize_path)
+    if not all(path.is_file() for path in paths):
         raise CampaignError("TorchTitan source lacks GraphTrainer AutoParallel files")
 
     evidence = {
         passes_path: (
             "if config.compile.enable_autoparallel:",
-            "joint_transformer_block_bucketing_reordering_pass",
+            "autobucketing_reordering_pass",
             "_autoparallel_inductor_configs",
             "full_inductor_configs=full_inductor_configs",
         ),
         api_path: (
             "aten_distributed_optimizations.enable_overlap_scheduling",
             "aten_distributed_optimizations.collective_bucketing",
+            "aten_distributed_optimizations.custom_runtime_estimation",
             "aten_autobucketing_reordering_pass",
-            "autoparallel_manages_context_parallel_input",
         ),
-        trainer_path: (
-            "autoparallel_manages_context_parallel_input",
-            "dist_utils.set_pg_timeouts",
+        configs_path: (
+            "use_autoparallel_defaults",
+            "autoparallel_solver",
+        ),
+        parallelize_path: (
+            "LocalMapVarlenAttention.from_inner(",
+            "SplitFeedForward.from_fused(",
+            'collectives.all_to_all(x, None, None, "cp")',
+            'autop.add_parameter_axis_constraint("dp_replicate", Replicate())',
         ),
     }
     missing = [
@@ -119,13 +121,11 @@ def validate_apgt_source(torchtitan_root: Path) -> dict[str, Any]:
     ]
     if missing:
         raise CampaignError(
-            "source does not satisfy apgt_validated_v1; missing evidence: " f"{missing}"
+            f"source does not satisfy the apgt profile; missing evidence: {missing}"
         )
     return {
         "status": "passed",
-        "passes_path": str(passes_path.resolve()),
-        "autoparallel_api_path": str(api_path.resolve()),
-        "trainer_path": str(trainer_path.resolve()),
+        **{f"{path.stem}_path": str(path.resolve()) for path in paths},
     }
 
 

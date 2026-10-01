@@ -43,8 +43,19 @@ def _pythonpath(*paths: Path) -> str:
     return os.pathsep.join(values)
 
 
+def expanded_spec(spec: dict[str, Any], expand) -> dict[str, Any]:
+    """Apply ``expand`` to the string settings of a ``harness.tt_config`` spec."""
+    return {
+        **spec,
+        "settings": {
+            path: expand(value) if isinstance(value, str) else value
+            for path, value in spec["settings"].items()
+        },
+    }
+
+
 def _probe_config(
-    argv: list[str],
+    spec: dict[str, Any],
     *,
     torchtitan_root: Path,
     autoparallel_root: Path,
@@ -53,7 +64,7 @@ def _probe_config(
     extra_env: dict[str, str],
 ) -> dict[str, Any]:
     request = output.with_suffix(".request.json")
-    write_json(request, {"argv": argv})
+    write_json(request, {"spec": spec})
     repo_root = Path(__file__).resolve().parents[1]
     env = dict(os.environ)
     env.update(
@@ -83,8 +94,8 @@ def _probe_config(
     request.unlink(missing_ok=True)
     if result.returncode:
         raise CampaignError(
-            "TorchTitan ConfigManager rejected the resolved arguments:\n"
-            f"command argv={argv!r}\nstdout={result.stdout}\nstderr={result.stderr}"
+            "harness.tt_config rejected the resolved TorchTitan config:\n"
+            f"spec={spec!r}\nstdout={result.stdout}\nstderr={result.stderr}"
         )
     return json.loads(output.read_text())
 
@@ -185,8 +196,8 @@ def validate_campaign(
 
     profiles = {arm.profile for arm in campaign.arms}
     contract: dict[str, Any] = {}
-    if "apgt_validated_v1" in profiles:
-        contract["apgt_validated_v1"] = validate_apgt_source(torchtitan_root)
+    if "apgt" in profiles:
+        contract["apgt"] = validate_apgt_source(torchtitan_root)
         if int(campaign.raw["parallelism"]["data_parallel_replicate_degree"]) > 1:
             contract["parameter_axis_constraint"] = (
                 validate_parameter_axis_constraint_source(autoparallel_root)
@@ -226,9 +237,7 @@ def validate_campaign(
                         "{harness}", str(Path(__file__).resolve().parents[1])
                     )
 
-                argv = []
-                for token in campaign.phase_arm_args(phase, arm):
-                    argv.append(expand(token))
+                spec = expanded_spec(campaign.phase_arm_spec(phase, arm), expand)
                 raw_probe_env = dict(campaign.raw["mast"].get("environment", {}))
                 raw_probe_env.update(campaign.phase_arm_environment(phase, arm))
                 raw_probe_env.setdefault("BENCHMARK_PHASE", phase.kind)
@@ -249,7 +258,7 @@ def validate_campaign(
                     key: expand(str(value)) for key, value in raw_probe_env.items()
                 }
                 config = _probe_config(
-                    argv,
+                    spec,
                     torchtitan_root=torchtitan_root,
                     autoparallel_root=autoparallel_root,
                     output=path,

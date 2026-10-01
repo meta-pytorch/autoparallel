@@ -15,7 +15,8 @@ from pathlib import Path
 from .campaign import load_campaign, write_json
 from .parity import IGNORED_PATHS, validate_pair
 from .profiles import validate_profile
-from .validation import _probe_config
+from .tt_config import ENVIRONMENT_KEY
+from .validation import _probe_config, expanded_spec
 
 
 def _sha256(path: Path) -> str:
@@ -42,15 +43,6 @@ def _expand(value: str, *, payload: Path, output: Path) -> str:
         name = value[start + len("{asset:") : end]
         value = value[:start] + str(payload / "assets" / name) + value[end + 1 :]
     return value
-
-
-def _set_boolean_option(argv: list[str], path: str, enabled: bool) -> list[str]:
-    positive = f"--{path.replace('_', '-')}"
-    section, name = positive.rsplit(".", 1)
-    negative = f"{section}.no-{name}"
-    return [token for token in argv if token not in {positive, negative}] + [
-        positive if enabled else negative
-    ]
 
 
 def _tee_run(command: list[str], *, cwd: Path, env: dict[str, str], log: Path) -> int:
@@ -227,10 +219,10 @@ def _audit_runtime_configs(
         for arm_name in phase.arms:
             arm = campaign.arm(arm_name)
             output = run_root / phase.name / arm_name
-            argv = [
-                _expand(token, payload=payload, output=output)
-                for token in campaign.phase_arm_args(phase, arm)
-            ]
+            spec = expanded_spec(
+                campaign.phase_arm_spec(phase, arm),
+                lambda value: _expand(value, payload=payload, output=output),
+            )
             extra_env = dict(base_env)
             extra_env.update(
                 {
@@ -251,7 +243,7 @@ def _audit_runtime_configs(
             path = output_root / phase.name / f"{arm_name}.json"
             path.parent.mkdir(parents=True, exist_ok=True)
             config = _probe_config(
-                argv,
+                spec,
                 torchtitan_root=payload / "torchtitan",
                 autoparallel_root=payload / "autoparallel",
                 output=path,
@@ -275,7 +267,7 @@ def _audit_runtime_configs(
                 ignored_paths=IGNORED_PATHS
                 | {
                     "hf_assets_path",
-                    "checkpoint.initial_load_path",
+                    "checkpointer.initial_load_path",
                     "compile.autoparallel_placements_load_path",
                     "compile.autoparallel_placements_save_path",
                 },
@@ -473,18 +465,15 @@ def main() -> None:
             else:
                 env.pop("TORCH_TRACE", None)
 
-            argv = [
-                _expand(token, payload=payload, output=output)
-                for token in phase["argv_by_arm"][arm_name]
-            ]
+            spec = expanded_spec(
+                phase["tt_config_by_arm"][arm_name],
+                lambda value: _expand(value, payload=payload, output=output),
+            )
             if phase["kind"] in {"trace", "kineto"}:
-                argv = _set_boolean_option(
-                    argv,
-                    "profiler.enable-profiling",
-                    rank in phase["trace_ranks"],
+                spec["settings"]["profiler.enable_profiling"] = (
+                    rank in phase["trace_ranks"]
                 )
-            if not any(token in {"--dump-folder", "--dump_folder"} for token in argv):
-                argv.extend(("--dump-folder", str(output / "job")))
+            env[ENVIRONMENT_KEY] = json.dumps(spec, sort_keys=True)
             command = [
                 "timeout",
                 "--signal=TERM",
@@ -493,7 +482,12 @@ def main() -> None:
                 sys.executable,
                 "-m",
                 "torchtitan.train",
-                *argv,
+                "--module",
+                "harness.tt_config",
+                "--config",
+                "resolved",
+                "--output-dir",
+                str(output / "job"),
             ]
             try:
                 status = _tee_run(

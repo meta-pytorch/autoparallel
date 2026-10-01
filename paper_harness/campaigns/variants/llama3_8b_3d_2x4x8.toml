@@ -1,11 +1,11 @@
 schema_version = 1
-name = "llama3-8b-3d-2x2x8-hsdp-timeout60"
-description = "Pinned LLaMA 3 8B MainTrainer, GraphTrainer, and AutoParallel on a dp_replicate 2 x dp_shard 2 x tp 8 mesh with a 60-minute initialization timeout"
+name = "llama3-8b-3d-2x4x8-hsdp"
+description = "Pinned LLaMA 3 8B MainTrainer, GraphTrainer, and AutoParallel on a dp_replicate 2 x dp_shard 4 x tp 8 mesh"
 workload = "llama3_8b_3d_hsdp"
 
 [model]
 flavor = "8B"
-attention_backend = "sdpa"
+attention_backend = "varlen"
 
 [data]
 mode = "replay"
@@ -17,39 +17,39 @@ identity_manifest_sha256 = "2f17a4bdf5328e6b9949d5c78ee66fb59393fba7f1c7d55cc827
 preflight_auditor = "workloads.llama3_2d.input_preflight"
 
 [training]
-local_batch_size = 2
-global_batch_size = 8
-gradient_accumulation_steps = 1
-seq_len = 8192
+max_context_length = 8192
+num_tokens_per_microbatch_per_dp_rank = 16384
+num_tokens_per_train_step = 131072
 
 [parallelism]
 data_parallel_replicate_degree = 2
-data_parallel_shard_degree = 2
+data_parallel_shard_degree = 4
 tensor_parallel_degree = 8
 context_parallel_degree = 1
 pipeline_parallel_degree = 1
 
-[checkpoint]
-enable = true
+[dataloader]
+max_num_documents = 2
+
+[checkpointer]
 folder = "checkpoint"
 initial_load_path = "{asset:llama3_3d_seed_checkpoint}"
 initial_load_model_only = true
 initial_load_in_hf = true
 load_only = true
-create_seed_checkpoint = false
 
 [comparison]
 declared_variable = "training_parallelization_compile_stack"
-allowed_config_paths = ["compile.*", "model_spec.name"]
+allowed_config_paths = ["compile.*", "_class", "model._class"]
 allowed_environment_keys = ["BENCHMARK_CONFIGURATION", "EXPERIMENT_ARM"]
 pairs = [
-  ["tt_main_tp", "gt_manual"],
   ["gt_manual", "apgt_hsdp"],
-  ["tt_main_tp", "apgt_hsdp"],
+  ["tt_eager", "apgt_hsdp"],
+  ["tt_compiled_loss", "apgt_hsdp"],
 ]
 
 [mast]
-nodes = 4
+nodes = 8
 nproc_per_node = 8
 hardware = "grandteton_80g_roce"
 locality = "dc;pci1"
@@ -59,12 +59,12 @@ master_port = 29500
 phase_timeout_seconds = 7200
 
 [mast.environment]
+AUTOPARALLEL_NCCL_COST_MODEL_PROFILE = "h100_nvswitch_roce_400g"
 BENCHMARK_MODEL = "8B"
-BENCHMARK_WORLD_SIZE = "32"
+BENCHMARK_WORLD_SIZE = "64"
 BENCHMARK_TP_DEGREE = "8"
-BENCHMARK_DP_DEGREE = "4"
-BENCHMARK_DP_REPLICATE_DEGREE = "2"
-BENCHMARK_GLOBAL_BATCH_SIZE = "8"
+BENCHMARK_DP_DEGREE = "8"
+BENCHMARK_GLOBAL_BATCH_SIZE = "16"
 LLAMA_TOKENIZER_DIR = "{asset:llama_tokenizer}"
 REPLAY_TENSORS_PATH = "{asset:llama_replay}/replay_tokens.pt"
 REPLAY_MANIFEST_PATH = "{asset:llama_replay}/manifest.json"
@@ -79,20 +79,30 @@ required_assets = ["llama_tokenizer", "llama_replay", "llama3_3d_seed_checkpoint
 warmup_steps = 5
 
 [[arms]]
-name = "tt_main_tp"
-profile = "tt_main_default_v1"
+name = "tt_eager"
+profile = "tt_eager"
 module = "workloads.llama3_2d.perf_configs"
-config = "torchtitan_baseline_8b"
+config = "torchtitan_eager_8b"
 [arms.environment]
-BENCHMARK_CONFIGURATION = "torchtitan_baseline"
+BENCHMARK_CONFIGURATION = "torchtitan_eager"
 EXPERIMENT_ARM = "T"
 AP_COLLECTIVE_MUST_SAVE_EXPECTATION = "off"
 
 [[arms]]
-name = "gt_manual"
-profile = "gt_manual_eager_v1"
+name = "tt_compiled_loss"
+profile = "tt_compiled_loss"
 module = "workloads.llama3_2d.perf_configs"
-config = "graphtrainer_manual_eager_8b"
+config = "torchtitan_compiled_loss_8b"
+[arms.environment]
+BENCHMARK_CONFIGURATION = "torchtitan_compiled_loss"
+EXPERIMENT_ARM = "L"
+AP_COLLECTIVE_MUST_SAVE_EXPECTATION = "off"
+
+[[arms]]
+name = "gt_manual"
+profile = "gt"
+module = "workloads.llama3_2d.perf_configs"
+config = "graphtrainer_manual_8b"
 [arms.environment]
 BENCHMARK_CONFIGURATION = "graphtrainer_manual"
 EXPERIMENT_ARM = "M"
@@ -100,9 +110,9 @@ AP_COLLECTIVE_MUST_SAVE_EXPECTATION = "off"
 
 [[arms]]
 name = "apgt_hsdp"
-profile = "apgt_validated_v1"
-module = "workloads.llama3_3d_hsdp.perf_configs"
-config = "autoparallel_graphtrainer_hsdp_8b"
+profile = "apgt"
+module = "workloads.llama3_2d.perf_configs"
+config = "autoparallel_graphtrainer_8b"
 [arms.overrides]
 "compile.autoparallel_solver" = "approx"
 [arms.environment]
@@ -113,9 +123,8 @@ AP_COLLECTIVE_MUST_SAVE_EXPECTATION = "off"
 [[phases]]
 name = "performance"
 kind = "performance"
-arms = ["tt_main_tp", "gt_manual", "apgt_hsdp"]
+arms = ["tt_eager", "tt_compiled_loss", "apgt_hsdp"]
 [phases.overrides]
-"comm.init_timeout_seconds" = 3600
 "training.steps" = 25
 "profiler.enable_profiling" = false
 "profiler.enable_memory_snapshot" = false
@@ -124,10 +133,9 @@ arms = ["tt_main_tp", "gt_manual", "apgt_hsdp"]
 [[phases]]
 name = "trace"
 kind = "trace"
-arms = ["tt_main_tp", "gt_manual", "apgt_hsdp"]
+arms = ["tt_eager", "tt_compiled_loss", "apgt_hsdp"]
 trace_ranks = [0]
 [phases.overrides]
-"comm.init_timeout_seconds" = 3600
 "training.steps" = 6
 "profiler.enable_profiling" = true
 "profiler.enable_memory_snapshot" = false

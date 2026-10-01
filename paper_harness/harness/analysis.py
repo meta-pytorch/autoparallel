@@ -17,11 +17,10 @@ from .sources import manifest_digest, tree_manifest
 
 TIMER_EVENTS = (
     "step_end",
-    "gc_collect_end",
     "fetching_batch_end",
-    "post_dataloading_process_end",
-    "fwd_bwd_end",
-    "optim_end",
+    "preprocess_inputs_end",
+    "forward_backward_end",
+    "optim_step_end",
     "collect_dist_metrics_end",
     "checkpoint_save_end",
 )
@@ -902,19 +901,7 @@ def _primary_measurement(campaign: Campaign, run_root: Path) -> dict[str, Any] |
 def _pair_summaries(campaign: Campaign, phases: dict[str, Any]) -> list[dict[str, Any]]:
     rows = []
     pairs = campaign.raw.get("comparison", {}).get("pairs", [])
-    training = campaign.raw.get("training", {})
-    global_batch = int(training.get("global_batch_size", -1))
-    if global_batch < 0:
-        parallelism = campaign.raw.get("parallelism", {})
-        dp_degree = int(parallelism.get("data_parallel_replicate_degree", 1)) * int(
-            parallelism.get("data_parallel_shard_degree", 1)
-        )
-        global_batch = (
-            int(training["local_batch_size"])
-            * dp_degree
-            * int(training.get("gradient_accumulation_steps", 1))
-        )
-    tokens_per_step = global_batch * int(training["seq_len"])
+    tokens_per_step = int(campaign.raw["training"]["num_tokens_per_train_step"])
     phase_by_arm = _performance_phase_by_arm(campaign)
     for baseline, treatment in pairs:
         if baseline not in phase_by_arm or treatment not in phase_by_arm:

@@ -54,6 +54,11 @@ def audit(
     if observed != manifest["tensor_sha256"]:
         raise RuntimeError("replay tensor hashes differ from the manifest")
     parallelism = resolved["parallelism"]
+    training = resolved["training"]
+    dp_degree = (
+        parallelism["data_parallel_replicate_degree"]
+        * parallelism["data_parallel_shard_degree"]
+    )
     return {
         "status": "passed",
         "manifest": str(manifest_path),
@@ -62,10 +67,8 @@ def audit(
         "tensor_sha256": observed,
         "shape": list(expected_shape),
         "logical_mapping": {
-            "dp_degree": parallelism["data_parallel_replicate_degree"]
-            * parallelism["data_parallel_shard_degree"],
-            "gradient_accumulation_steps": resolved["training"][
-                "gradient_accumulation_steps"
-            ],
+            "dp_degree": dp_degree,
+            "gradient_accumulation_steps": training["num_tokens_per_train_step"]
+            // (training["num_tokens_per_microbatch_per_dp_rank"] * dp_degree),
         },
     }

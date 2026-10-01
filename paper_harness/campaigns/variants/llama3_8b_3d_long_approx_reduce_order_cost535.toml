@@ -5,7 +5,7 @@ workload = "llama3_8b_3d"
 
 [model]
 flavor = "8B"
-attention_backend = "flash_sdpa"
+attention_backend = "varlen"
 
 [data]
 mode = "replay"
@@ -17,9 +17,9 @@ identity_manifest_sha256 = "5ea8bdf061731d970da4541d1b96ea115702abb783bf18a064cb
 runtime_input_hash_audit = true
 
 [training]
-local_batch_size = 2
-global_batch_size = 4
-seq_len = 16384
+max_context_length = 16384
+num_tokens_per_microbatch_per_dp_rank = 32768
+num_tokens_per_train_step = 65536
 
 [parallelism]
 data_parallel_replicate_degree = 1
@@ -28,14 +28,24 @@ tensor_parallel_degree = 4
 context_parallel_degree = 2
 pipeline_parallel_degree = 1
 
+[dataloader]
+max_num_documents = 2
+
+[checkpointer]
+folder = "checkpoint"
+initial_load_path = "{asset:llama3_3d_seed_checkpoint}"
+initial_load_model_only = true
+initial_load_in_hf = true
+load_only = true
+
 [comparison]
 declared_variable = "trainer_parallelization_compile_stack"
-allowed_config_paths = ["compile.*", "model_spec.name"]
-allowed_environment_keys = ["BENCHMARK_ARM"]
+allowed_config_paths = ["compile.*", "_class", "model._class"]
+allowed_environment_keys = ["BENCHMARK_CONFIGURATION"]
 pairs = [
-  ["tt_main", "gt_manual_cp"],
-  ["tt_main", "apgt_cp"],
   ["gt_manual_cp", "apgt_cp"],
+  ["tt_eager", "apgt_cp"],
+  ["tt_compiled_loss", "apgt_cp"],
 ]
 
 [measurement.primary]
@@ -62,10 +72,11 @@ BENCHMARK_CP_DEGREE = "2"
 BENCHMARK_TP_DEGREE = "4"
 BENCHMARK_LOCAL_BATCH_SIZE = "2"
 BENCHMARK_SEQ_LEN = "16384"
-BENCHMARK_SEED_CHECKPOINT = "{asset:llama3_3d_seed_checkpoint}"
 LLAMA_TOKENIZER_DIR = "{asset:llama_tokenizer}"
 BENCHMARK_REPLAY_ROOT = "{asset:llama3_3d_16k_dp2}"
-BENCHMARK_REPLAY_MANIFEST_SHA256 = "5ea8bdf061731d970da4541d1b96ea115702abb783bf18a064cbf64d9aa4a7f4"
+HF_HUB_OFFLINE = "1"
+HF_DATASETS_OFFLINE = "1"
+HF_HUB_DISABLE_XET = "1"
 PYTORCH_ALLOC_CONF = "expandable_segments:True"
 TORCHINDUCTOR_CUDAGRAPHS = "0"
 
@@ -80,85 +91,84 @@ required_assets = [
 warmup_steps = 5
 
 [[arms]]
-name = "tt_main"
-profile = "tt_main_default_v1"
+name = "tt_eager"
+profile = "tt_eager"
 module = "workloads.llama3_3d.config_registry"
-config = "torchtitan_main"
+config = "torchtitan_eager_8b"
 [arms.environment]
-BENCHMARK_ARM = "tt_main"
+BENCHMARK_CONFIGURATION = "torchtitan_eager"
+
+[[arms]]
+name = "tt_compiled_loss"
+profile = "tt_compiled_loss"
+module = "workloads.llama3_3d.config_registry"
+config = "torchtitan_compiled_loss_8b"
+[arms.environment]
+BENCHMARK_CONFIGURATION = "torchtitan_compiled_loss"
 
 [[arms]]
 name = "gt_manual_cp"
-profile = "gt_manual_eager_v1"
+profile = "gt"
 module = "workloads.llama3_3d.config_registry"
-config = "graph_manual"
+config = "graphtrainer_manual_8b"
 [arms.environment]
-BENCHMARK_ARM = "graph_manual"
+BENCHMARK_CONFIGURATION = "graphtrainer_manual"
 
 [[arms]]
 name = "apgt_cp"
-profile = "apgt_validated_v1"
+profile = "apgt"
 module = "workloads.llama3_3d.config_registry"
-config = "graph_autoparallel"
+config = "autoparallel_graphtrainer_8b"
 [arms.overrides]
 "compile.autoparallel_solver" = "approx"
 [arms.environment]
-BENCHMARK_ARM = "graph_autoparallel"
+BENCHMARK_CONFIGURATION = "autoparallel_graphtrainer"
 
 [[phases]]
 name = "performance"
 kind = "performance"
-arms = ["tt_main", "gt_manual_cp", "apgt_cp"]
-[phases.environment]
-BENCHMARK_PHASE = "steady"
-BENCHMARK_TOTAL_STEPS = "25"
-BENCHMARK_LOG_FREQ = "5"
-BENCHMARK_ENABLE_KINETO = "0"
-BENCHMARK_ENABLE_MEMORY_SNAPSHOT = "0"
-BENCHMARK_STRUCTURED_LOGGING = "1"
-BENCHMARK_PROFILE_FREQ = "25"
-BENCHMARK_PROFILE_ACTIVE = "1"
-BENCHMARK_PROFILE_WARMUP = "0"
+arms = ["tt_eager", "tt_compiled_loss", "apgt_cp"]
+[phases.overrides]
+"training.steps" = 25
+"profiler.enable_profiling" = false
+"profiler.enable_memory_snapshot" = false
+"metrics.log_freq" = 5
 
 [[phases]]
 name = "trace"
 kind = "trace"
-arms = ["tt_main", "gt_manual_cp", "apgt_cp"]
+arms = ["tt_eager", "tt_compiled_loss", "apgt_cp"]
 trace_ranks = [0]
-[phases.environment]
-BENCHMARK_PHASE = "profile"
-BENCHMARK_TOTAL_STEPS = "6"
-BENCHMARK_LOG_FREQ = "1"
-BENCHMARK_ENABLE_KINETO = "1"
-BENCHMARK_ENABLE_MEMORY_SNAPSHOT = "0"
-BENCHMARK_STRUCTURED_LOGGING = "1"
-BENCHMARK_PROFILE_RANK = "0"
-BENCHMARK_PROFILE_FREQ = "6"
-BENCHMARK_PROFILE_ACTIVE = "3"
-BENCHMARK_PROFILE_WARMUP = "0"
+[phases.overrides]
+"training.steps" = 6
+"profiler.enable_profiling" = true
+"profiler.enable_memory_snapshot" = false
+"profiler.profile_freq" = 6
+"profiler.profiler_warmup" = 0
+"profiler.profiler_active" = 3
+"profiler.profiler_repeat" = 1
+"metrics.log_freq" = 1
 
 [[matrix.points]]
 name = "2x2x4"
 [matrix.points.settings]
 "mast.nodes" = 2
 "parallelism.data_parallel_shard_degree" = 2
-"training.global_batch_size" = 4
+"training.num_tokens_per_train_step" = 65536
 "mast.environment.BENCHMARK_WORLD_SIZE" = "16"
 "mast.environment.BENCHMARK_DP_DEGREE" = "2"
 "data.identity_manifest" = "{asset:llama3_3d_16k_dp2}/manifest.json"
 "data.identity_manifest_sha256" = "5ea8bdf061731d970da4541d1b96ea115702abb783bf18a064cbf64d9aa4a7f4"
 "mast.environment.BENCHMARK_REPLAY_ROOT" = "{asset:llama3_3d_16k_dp2}"
-"mast.environment.BENCHMARK_REPLAY_MANIFEST_SHA256" = "5ea8bdf061731d970da4541d1b96ea115702abb783bf18a064cbf64d9aa4a7f4"
 
 [[matrix.points]]
 name = "8x2x4"
 [matrix.points.settings]
 "mast.nodes" = 8
 "parallelism.data_parallel_shard_degree" = 8
-"training.global_batch_size" = 16
+"training.num_tokens_per_train_step" = 262144
 "mast.environment.BENCHMARK_WORLD_SIZE" = "64"
 "mast.environment.BENCHMARK_DP_DEGREE" = "8"
 "data.identity_manifest" = "{asset:llama3_3d_16k_dp8}/manifest.json"
 "data.identity_manifest_sha256" = "9a46acb8b75c7f3eaebdf8549231967a8b16f4efce95de3061cd3e844f49c219"
 "mast.environment.BENCHMARK_REPLAY_ROOT" = "{asset:llama3_3d_16k_dp8}"
-"mast.environment.BENCHMARK_REPLAY_MANIFEST_SHA256" = "9a46acb8b75c7f3eaebdf8549231967a8b16f4efce95de3061cd3e844f49c219"

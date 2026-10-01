@@ -1,3 +1,11 @@
+"""LLaMA 3 8B arms shared by the 2D, HSDP, and 3D campaigns.
+
+Every arm starts from TorchTitan's ``llama3_8b`` recipe with varlen attention
+and replays the same pre-tokenized C4 samples, ``LOCAL_BATCH_SIZE`` per
+microbatch. Campaign settings choose the mesh, token batch, checkpoint, and
+phase knobs.
+"""
+
 from __future__ import annotations
 
 import json
@@ -7,135 +15,29 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 import torch
-from torch.utils.data import IterableDataset
-from torchtitan.components.dataloader import ParallelAwareDataloader
+from torch.distributed.tensor import DTensor
+from torchtitan.components.checkpointer import CheckpointManager
 from torchtitan.components.loss import CrossEntropyLoss
-from torchtitan.components.lr_scheduler import LRSchedulersContainer
-from torchtitan.components.optimizer import default_adamw
 from torchtitan.config import CompileConfig
-from torchtitan.distributed.activation_checkpoint import SelectiveAC
+from torchtitan.config.transform.base import convert_config_type
 from torchtitan.experiments.graph_trainer.configs import (
     GraphTrainerCompileConfig,
     to_graph_trainer_config,
 )
-from torchtitan.experiments.graph_trainer.llama3 import model_registry
+from torchtitan.experiments.graph_trainer.llama3 import GraphTrainerLlama3Model
 from torchtitan.models.common.config_utils import decoder_vocab_size
-from torchtitan.models.llama3.config_registry import llama3_8b
+from torchtitan.models.llama3 import build_model_config, Llama3Model
+from torchtitan_recipes.models.llama3 import llama3_8b
+from workloads.llama3_3d.replay_data import ReplayDataLoader
 from workloads.parameter_state import register_post_load_parameter_audit
-
-C4_REPO = "allenai/c4"
-C4_REVISION = "1588ec454efa1a09f29cd18ddd04fe05fc8653a2"
-C4_TRAIN_SHARDS = 1024
-C4_SHARD_METADATA = {
-    0: (
-        319308785,
-        "8ef8d75b0e045dec4aa5123a671b4564466b0707086a7ed1ba8721626dfffbc9",
-    ),
-    1: (
-        318039285,
-        "b945059cd1a343cabe311881b7840a6f0363f570e745a0eff0e687e266f6b55d",
-    ),
-    2: (
-        319748667,
-        "2967dc7e587ced6ecb9ba617ad2d4c44901467969de5bf5b0f5a9e5b70555d75",
-    ),
-    3: (
-        318564193,
-        "b79d9abef5741578929be0d59db9ca652a8276207ef18a944b7a5f11fef5beb6",
-    ),
-    4: (
-        318579884,
-        "cd9f98eac2bc6062f55d9a36bd744cc924a78ea2fd998830e0034e4456f5d014",
-    ),
-    5: (
-        318003681,
-        "8ac5907a54dbc7ab9c14624448c7c3f6afed33af9d0a855f1eae955e62e255b9",
-    ),
-    6: (
-        318495137,
-        "8fd9b9a4b74c9414466b245ebda7db041e7bd8603971de51b5db782bd758aac7",
-    ),
-    7: (
-        318417273,
-        "41dd377a1ba6b72eab0260c39c626fe45ab6b649d42d57b311d3ba21a0337cd0",
-    ),
-    8: (
-        318131845,
-        "64da652c235f089a0b52f6db5883ef5f1e9c31edc4c950332b34dd12439c99a5",
-    ),
-    9: (
-        318185592,
-        "807a548efbb10153c9eff0df5733a97a1b51ab1743242530de1b02a8ea17ace7",
-    ),
-    10: (
-        319045292,
-        "3bd0f6f664069c3bd964ce48ceae60ba47b55b54745a4b00c207bdb3a1926b17",
-    ),
-    11: (
-        319686980,
-        "5baa0c010083459ba58e34b4e93bb758caa878f7db6fba0528921329fa1a6cc5",
-    ),
-    12: (
-        320119088,
-        "fdee7442c06856e2c4b7665cc51978e9011b5e0a2112c30dd15bc9e53818842d",
-    ),
-    13: (
-        319474856,
-        "a4ab3b24087781c3577945492525696e182ffd7ca5265b958f49803a02867ecf",
-    ),
-    14: (
-        319693210,
-        "62215b2451e71b117018ef73570c944aff890624b384c538950b64c37f184c49",
-    ),
-    15: (
-        318427305,
-        "9893c9f413a1223e7b535527829bcd6df3219929fb1abf8f2a114dd8f6ea0919",
-    ),
-}
-DATASET_NAME = "c4_llama8b_topology_invariant_replay"
-
-MODEL_FLAVOR = os.environ.get("BENCHMARK_MODEL", "8B")
-if MODEL_FLAVOR != "8B":
-    raise ValueError(f"Unsupported BENCHMARK_MODEL={MODEL_FLAVOR!r}")
-
-WORLD_SIZE = int(os.environ["BENCHMARK_WORLD_SIZE"])
-TP_DEGREE = int(os.environ["BENCHMARK_TP_DEGREE"])
-if (WORLD_SIZE, TP_DEGREE) not in {
-    (8, 4),
-    (16, 8),
-    (32, 8),
-    (64, 8),
-    (128, 8),
-    (8, 1),
-    (16, 1),
-    (32, 1),
-    (64, 1),
-    (128, 1),
-}:
-    raise ValueError(f"Unsupported mesh: {WORLD_SIZE=} {TP_DEGREE=}")
-DP_DEGREE = WORLD_SIZE // TP_DEGREE
-DP_REPLICATE_DEGREE = int(os.environ.get("BENCHMARK_DP_REPLICATE_DEGREE", "1"))
-if DP_REPLICATE_DEGREE < 1 or DP_DEGREE % DP_REPLICATE_DEGREE:
-    raise ValueError(
-        f"Unsupported data parallel split: {DP_DEGREE=} {DP_REPLICATE_DEGREE=}"
-    )
-DP_SHARD_DEGREE = DP_DEGREE // DP_REPLICATE_DEGREE
 
 LOCAL_BATCH_SIZE = 2
 SEQ_LEN = 8192
-GLOBAL_BATCH_SIZE = int(os.environ["BENCHMARK_GLOBAL_BATCH_SIZE"])
-if GLOBAL_BATCH_SIZE % (LOCAL_BATCH_SIZE * DP_DEGREE) != 0:
-    raise ValueError(
-        "Global batch must equal local batch per DP rank * DP degree * "
-        "an integer gradient accumulation count"
-    )
-GRADIENT_ACCUMULATION_STEPS = GLOBAL_BATCH_SIZE // (LOCAL_BATCH_SIZE * DP_DEGREE)
-PLACEMENT_GLOBAL_BATCH_SIZE = LOCAL_BATCH_SIZE * DP_DEGREE
-REPLAY_SLOTS = 10
+AUTOPARALLEL_CONFIGURATION = "autoparallel_graphtrainer"
 
 
 def _write_inductor_path_audit() -> None:
-    """Assert and record the configuration-specific Inductor hook state."""
+    """Assert and record that only AutoParallel loads its bucketing hooks."""
     import torch._inductor.fx_passes.bucketing as bucketing_mod
     import torch._inductor.fx_passes.fsdp as fsdp_mod
 
@@ -150,13 +52,8 @@ def _write_inductor_path_audit() -> None:
         ),
     }
     patch_active = all("_patch_fsdp_bucketing" in value for value in functions.values())
-    custom_post_pass = torch._inductor.config.post_grad_custom_post_pass
     configuration = os.environ["BENCHMARK_CONFIGURATION"]
-    expected_patch_active = configuration in {
-        "autoparallel_backend_example_scheduling",
-        "autoparallel_graphtrainer",
-        "autoparallel_graphtrainer_current",
-    }
+    expected_patch_active = configuration == AUTOPARALLEL_CONFIGURATION
     if patch_active != expected_patch_active:
         raise RuntimeError(
             "Unexpected AutoParallel bucketing hook state for "
@@ -168,16 +65,13 @@ def _write_inductor_path_audit() -> None:
             f"Unexpected AutoParallel bucketing module state for {configuration}: "
             f"loaded={module_loaded}"
         )
-    expected_process_custom_pass = (
-        configuration == "autoparallel_backend_example_scheduling"
-    )
-    if (custom_post_pass is not None) != expected_process_custom_pass:
+    # AutoParallel passes its post-grad scheduler per compile, never globally.
+    custom_post_pass = torch._inductor.config.post_grad_custom_post_pass
+    if custom_post_pass is not None:
         raise RuntimeError(
-            f"Unexpected custom post-grad scheduler for {configuration}: "
-            f"present={custom_post_pass is not None}"
+            f"Unexpected global post-grad scheduler for {configuration}: "
+            f"{custom_post_pass!r}"
         )
-    if custom_post_pass is not None and not callable(custom_post_pass):
-        raise RuntimeError("Configured post-grad scheduler is not callable")
 
     audit_dir = Path(os.environ["MODULE_ISOLATION_AUDIT_DIR"])
     audit_dir.mkdir(parents=True, exist_ok=True)
@@ -187,245 +81,185 @@ def _write_inductor_path_audit() -> None:
         "autoparallel_bucketing_hook_active": patch_active,
         "autoparallel_bucketing_module_loaded": module_loaded,
         "functions": functions,
-        "post_grad_custom_post_pass_present": custom_post_pass is not None,
-        "post_grad_custom_post_pass_callable": (
-            None
-            if custom_post_pass is None
-            else f"{custom_post_pass.__module__}.{custom_post_pass.__qualname__}"
-        ),
+        "post_grad_custom_post_pass_present": False,
     }
     output = audit_dir / f"rank_{int(os.environ['RANK']):02d}.json"
     output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
 
 
-def _register_post_load_audits(optimizers, model_parts, parallel_dims):
-    _write_inductor_path_audit()
-    register_post_load_parameter_audit(optimizers, model_parts, parallel_dims)
+def _write_placement_audit(model_parts) -> None:
+    """Record AutoParallel parameter placements; each must replicate on dp_replicate.
 
-
-class TopologyInvariantReplayDataset(IterableDataset):
-    def __init__(
-        self,
-        replay_path: Path,
-        *,
-        dp_rank: int,
-        dp_world_size: int,
-        local_batch_size: int,
-    ) -> None:
-        if dp_world_size != DP_DEGREE:
-            raise ValueError(
-                f"Expected replay dp_world_size={DP_DEGREE}, got {dp_world_size}"
-            )
-        if local_batch_size != LOCAL_BATCH_SIZE:
-            raise ValueError(
-                f"Expected local batch {LOCAL_BATCH_SIZE}, got {local_batch_size}"
-            )
-        payload = torch.load(
-            replay_path, map_location="cpu", mmap=True, weights_only=True
-        )
-        expected_shape = (REPLAY_SLOTS, 256, SEQ_LEN)
-        for name in ("input", "positions", "labels"):
-            tensor = payload.get(name)
+    This is the evidence that the HSDP arms share one parameter layout rule,
+    rather than a plan that happens to fit the memory budget.
+    """
+    parameters = {}
+    violations = []
+    for model_part in model_parts:
+        for name, parameter in model_part.named_parameters():
+            if not isinstance(parameter, DTensor):
+                raise RuntimeError(f"AutoParallel parameter {name} is not a DTensor")
+            names = parameter.device_mesh.mesh_dim_names
+            parameters[name] = {
+                "shape": list(parameter.shape),
+                "mesh_shape": list(parameter.device_mesh.shape),
+                "mesh_dim_names": list(names),
+                "placements": [str(placement) for placement in parameter.placements],
+            }
             if (
-                not isinstance(tensor, torch.Tensor)
-                or tuple(tensor.shape) != expected_shape
+                "dp_replicate" not in names
+                or not parameter.placements[names.index("dp_replicate")].is_replicate()
             ):
-                raise ValueError(
-                    f"Replay tensor {name!r} has invalid shape: "
-                    f"{None if tensor is None else tuple(tensor.shape)}"
-                )
-            if tensor.dtype != torch.int64:
-                raise ValueError(f"Replay tensor {name!r} must be int64")
-        self.payload = payload
-        self.dp_rank = dp_rank
-        self.dp_world_size = dp_world_size
-        self.local_batch_size = local_batch_size
+                violations.append(name)
 
-    def __iter__(self):
-        slot = 0
-        accumulation_index = 0
-        while True:
-            first = (
-                accumulation_index * self.dp_world_size + self.dp_rank
-            ) * self.local_batch_size
-            for sample_index in range(first, first + self.local_batch_size):
-                yield (
-                    {
-                        "input": self.payload["input"][slot, sample_index],
-                        "positions": self.payload["positions"][slot, sample_index],
-                    },
-                    self.payload["labels"][slot, sample_index],
-                )
-            accumulation_index += 1
-            if accumulation_index == GRADIENT_ACCUMULATION_STEPS:
-                accumulation_index = 0
-                slot = (slot + 1) % REPLAY_SLOTS
+    audit = {
+        "rank": int(os.environ["RANK"]),
+        "parameter_count": len(parameters),
+        "parameter_placements": parameters,
+        "replicate_axis_violations": violations,
+    }
+    audit_dir = Path(os.environ["PLACEMENT_AUDIT_DIR"])
+    audit_dir.mkdir(parents=True, exist_ok=True)
+    (audit_dir / f"rank_{int(os.environ['RANK']):03d}.json").write_text(
+        json.dumps(audit, indent=2, sort_keys=True) + "\n"
+    )
+    if violations:
+        raise RuntimeError(
+            f"{len(violations)} parameters are not replicated on the "
+            f"'dp_replicate' mesh axis: {violations[:8]}"
+        )
 
 
-class AuditedReplayDataLoader(ParallelAwareDataloader):
+def _register_audits(optimizers, model_parts, parallelism_context) -> None:
+    _write_inductor_path_audit()
+    if (
+        os.environ["BENCHMARK_CONFIGURATION"] == AUTOPARALLEL_CONFIGURATION
+        and parallelism_context.dp_replicate > 1
+    ):
+        _write_placement_audit(model_parts)
+    register_post_load_parameter_audit(optimizers, model_parts, parallelism_context)
+
+
+class HarnessLlama3Model(Llama3Model):
+    """``Llama3Model`` that writes the harness audits once optimizers exist."""
+
     @dataclass(kw_only=True, slots=True)
-    class Config(ParallelAwareDataloader.Config):
+    class Config(Llama3Model.Config):
         pass
 
-    def __init__(
-        self,
-        config: Config,
-        *,
-        dp_world_size: int,
-        dp_rank: int,
-        tokenizer,
-        seq_len: int,
-        local_batch_size: int,
-        snapshot_every_n_steps: int | None = 1,
-        **kwargs,
-    ) -> None:
-        del kwargs, tokenizer
-        if seq_len != SEQ_LEN:
-            raise ValueError(f"Expected sequence length {SEQ_LEN}, got {seq_len}")
-        dataset = TopologyInvariantReplayDataset(
-            Path(os.environ["REPLAY_TENSORS_PATH"]),
-            dp_rank=dp_rank,
-            dp_world_size=dp_world_size,
-            local_batch_size=local_batch_size,
-        )
-        super().__init__(
-            dataset,
-            dp_rank=dp_rank,
-            dp_world_size=dp_world_size,
-            num_workers=config.num_workers,
-            persistent_workers=config.persistent_workers,
-            pin_memory=config.pin_memory,
-            prefetch_factor=config.prefetch_factor,
-            snapshot_every_n_steps=snapshot_every_n_steps,
-            batch_size=local_batch_size,
-        )
-
-    def __iter__(self):
-        source = super().__iter__()
-        while True:
-            input_dict, labels = next(source)
-            yield dict(input_dict), labels
+    @classmethod
+    def _register_optimizer_hooks(cls, optimizers, model_parts, parallelism_context):
+        super()._register_optimizer_hooks(optimizers, model_parts, parallelism_context)
+        _register_audits(optimizers, model_parts, parallelism_context)
 
 
-def _base_config():
-    config = llama3_8b()
-    config.comm = replace(config.comm, init_timeout_seconds=1200)
-    config.model_spec = model_registry(MODEL_FLAVOR, attn_backend="sdpa")
-    config.model_spec = replace(
-        config.model_spec,
-        post_optimizer_build_fn=_register_post_load_audits,
-    )
-    config.hf_assets_path = os.environ["LLAMA_TOKENIZER_DIR"]
-    config.loss = CrossEntropyLoss.Config(
-        global_vocab_size=decoder_vocab_size(config.model_spec)
-    )
-    config.dataloader = AuditedReplayDataLoader.Config(dataset=DATASET_NAME)
-    config.optimizer = default_adamw(lr=3e-4)
-    config.lr_scheduler = LRSchedulersContainer.Config(warmup_steps=200)
-    config.training = replace(
-        config.training,
-        local_batch_size=LOCAL_BATCH_SIZE,
-        global_batch_size=GLOBAL_BATCH_SIZE,
-        seq_len=SEQ_LEN,
-        steps=28,
-        dtype="float32",
-        mixed_precision_param="bfloat16",
-        mixed_precision_reduce="float32",
-        max_norm=1.0,
-    )
-    config.parallelism = replace(
-        config.parallelism,
-        data_parallel_replicate_degree=DP_REPLICATE_DEGREE,
-        data_parallel_shard_degree=DP_SHARD_DEGREE,
-        tensor_parallel_degree=TP_DEGREE,
-        enable_sequence_parallel=True,
-        context_parallel_degree=1,
-        pipeline_parallel_degree=1,
-        expert_parallel_degree=1,
-        fsdp_reshard_after_forward="default",
-    )
-    config.activation_checkpoint = SelectiveAC.Config()
-    config.metrics = replace(
-        config.metrics,
-        log_freq=5,
-        enable_tensorboard=True,
-        save_for_all_ranks=True,
-        enable_wandb=False,
-        disable_color_printing=True,
-    )
-    config.profiler = replace(
-        config.profiler,
-        enable_profiling=True,
-        profile_freq=28,
-        profiler_warmup=0,
-        profiler_active=3,
-        profiler_repeat=1,
-        enable_memory_snapshot=False,
-    )
-    config.validator = replace(config.validator, enable=False)
-    config.debug = replace(
-        config.debug,
-        seed=42,
-        deterministic=False,
-        deterministic_warn_only=False,
-        enable_structured_logging=True,
-        print_config=False,
-        save_config_file="config.json",
-    )
-    config.checkpoint = replace(
-        config.checkpoint,
-        enable=False,
-        load_only=False,
-        initial_load_path=None,
-        initial_load_model_only=False,
-        create_seed_checkpoint=False,
-    )
-    return config
+class HarnessGraphTrainerLlama3Model(GraphTrainerLlama3Model):
+    """``GraphTrainerLlama3Model`` that writes the harness audits."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(GraphTrainerLlama3Model.Config):
+        pass
+
+    @classmethod
+    def _register_optimizer_hooks(cls, optimizers, model_parts, parallelism_context):
+        super()._register_optimizer_hooks(optimizers, model_parts, parallelism_context)
+        _register_audits(optimizers, model_parts, parallelism_context)
 
 
-def _graph_config(*, enable_autoparallel: bool):
-    config = to_graph_trainer_config(_base_config(), model_registry)
-    config.profiler = replace(config.profiler, trace_post_processor=None)
-    config.compile = GraphTrainerCompileConfig(
-        enable=True,
-        components=["model", "loss"],
-        memory_policy="eager",
-        inductor_compilation="full",
-        disable_passes=["cudagraph_pass"],
-        enable_autoparallel=enable_autoparallel,
+def llama3_8b_config(*, seq_len: int):
+    """The ``llama3_8b`` recipe with varlen attention and the C4 replay."""
+    config = llama3_8b(seq_len=seq_len)
+    model = convert_config_type(
+        build_model_config("8B", seq_len=seq_len, attn_backend="varlen"),
+        HarnessLlama3Model,
     )
-    return config
+    return replace(
+        config,
+        model=model,
+        loss=CrossEntropyLoss.Config(global_vocab_size=decoder_vocab_size(model)),
+        hf_assets_path=os.environ["LLAMA_TOKENIZER_DIR"],
+        dataloader=ReplayDataLoader.Config(max_num_documents=LOCAL_BATCH_SIZE),
+        training=replace(
+            config.training,
+            num_tokens_per_microbatch_per_dp_rank=LOCAL_BATCH_SIZE * seq_len,
+            steps=28,
+            disable_cuda_graphs=True,
+        ),
+        metrics=replace(
+            config.metrics,
+            log_freq=5,
+            enable_tensorboard=True,
+            save_for_all_ranks=True,
+            enable_wandb=False,
+            disable_color_printing=True,
+        ),
+        profiler=replace(
+            config.profiler,
+            enable_profiling=True,
+            profile_freq=28,
+            profiler_warmup=0,
+            profiler_active=3,
+            profiler_repeat=1,
+            enable_memory_snapshot=False,
+        ),
+        debug=replace(
+            config.debug,
+            seed=42,
+            deterministic=False,
+            deterministic_warn_only=False,
+            enable_structured_logging=True,
+            print_config=False,
+            save_config_file="config.json",
+        ),
+        comm=replace(config.comm, init_timeout_seconds=1200),
+        checkpointer=CheckpointManager.Config(load_only=True),
+    )
 
 
-def graphtrainer_manual_eager_8b():
-    return _graph_config(enable_autoparallel=False)
+def compiled_loss_config(config):
+    """Compile only the loss, with Inductor."""
+    return replace(
+        config, compile=CompileConfig(components=["loss"], backend="inductor")
+    )
+
+
+def graph_trainer_config(config, *, enable_autoparallel: bool):
+    """Move a ``llama3_8b_config`` onto GraphTrainer with full Inductor."""
+    config = to_graph_trainer_config(config, HarnessGraphTrainerLlama3Model.Config)
+    return replace(
+        config,
+        compile=GraphTrainerCompileConfig(
+            memory_policy="eager",
+            inductor_compilation="full",
+            disable_passes=["cuda_graph_pass"],
+            enable_autoparallel=enable_autoparallel,
+        ),
+    )
+
+
+def torchtitan_eager_8b():
+    return llama3_8b_config(seq_len=SEQ_LEN)
+
+
+def torchtitan_compiled_loss_8b():
+    return compiled_loss_config(llama3_8b_config(seq_len=SEQ_LEN))
+
+
+def graphtrainer_manual_8b():
+    return graph_trainer_config(
+        llama3_8b_config(seq_len=SEQ_LEN), enable_autoparallel=False
+    )
 
 
 def autoparallel_graphtrainer_8b():
-    return _graph_config(enable_autoparallel=True)
-
-
-def torchtitan_baseline_8b():
-    if "autoparallel.graph_passes.auto_bucketing" in sys.modules:
-        raise RuntimeError("Native TorchTitan baseline was polluted by AutoParallel")
-    from torchtitan.models.llama3.parallelize import parallelize_llama
-
-    config = _base_config()
-    config.model_spec = replace(
-        config.model_spec,
-        name="torchtitan/native_compile/llama3",
-        parallelize_fn=parallelize_llama,
+    return graph_trainer_config(
+        llama3_8b_config(seq_len=SEQ_LEN), enable_autoparallel=True
     )
-    config.compile = CompileConfig(
-        enable=True,
-        components=["model", "loss"],
-        backend="inductor",
-    )
-    return config
 
 
 EXPERIMENT_CONFIGS = (
-    "torchtitan_baseline_8b",
-    "graphtrainer_manual_eager_8b",
+    "torchtitan_eager_8b",
+    "torchtitan_compiled_loss_8b",
+    "graphtrainer_manual_8b",
     "autoparallel_graphtrainer_8b",
 )

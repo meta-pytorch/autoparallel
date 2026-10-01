@@ -37,9 +37,6 @@ def load_experiment_lock(path: Path = LOCK_PATH) -> dict[str, Any]:
     runtime = lock.get("runtime")
     if not isinstance(runtime, dict) or not runtime.get("conda_fbpkg"):
         raise CampaignError("experiment lock requires a runtime conda_fbpkg")
-    execution = lock.get("execution")
-    if not isinstance(execution, dict) or execution.get("spmd_backend") != "default":
-        raise CampaignError("experiment lock requires spmd_backend='default'")
     return lock
 
 

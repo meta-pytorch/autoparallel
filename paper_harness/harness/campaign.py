@@ -13,31 +13,27 @@ class CampaignError(ValueError):
     pass
 
 
-PROFILES = {
-    "tt_main_default_v1",
-    "gt_manual_eager_v1",
-    "apgt_validated_v1",
-}
+PROFILES = {"tt_eager", "tt_compiled_loss", "gt", "apgt"}
 PHASE_KINDS = {"correctness", "performance", "kineto", "torch_trace", "trace"}
 CONFIG_SECTIONS = {
     "training",
     "parallelism",
     "compile",
     "activation_checkpoint",
-    "optimizer",
-    "lr_scheduler",
+    "optim",
     "metrics",
     "profiler",
     "debug",
-    "checkpoint",
+    "checkpointer",
     "validator",
     "comm",
+    "dataloader",
 }
-HARNESS_ONLY_SETTINGS = {"training.gradient_accumulation_steps"}
 RESERVED_ENVIRONMENT_KEYS = {
     "CONDA_DIR",
     "DUMP_DIR",
     "HARNESS_PAYLOAD_ROOT",
+    "HARNESS_TT_CONFIG",
     "LOCAL_RANK",
     "LOCAL_WORLD_SIZE",
     "MASTER_ADDR",
@@ -67,14 +63,14 @@ TOP_LEVEL_KEYS = {
     "precision",
     "activation_checkpoint",
     "compile",
-    "optimizer",
-    "lr_scheduler",
+    "optim",
     "metrics",
     "profiler",
     "debug",
-    "checkpoint",
+    "checkpointer",
     "validator",
     "comm",
+    "dataloader",
     "torchtitan",
     "autoparallel",
     "comparison",
@@ -98,7 +94,6 @@ class Arm:
     module: str
     config: str
     overrides: dict[str, Any]
-    args: tuple[str, ...]
     environment: dict[str, str]
 
 
@@ -108,7 +103,6 @@ class Phase:
     kind: str
     arms: tuple[str, ...]
     overrides: dict[str, Any]
-    args: tuple[str, ...]
     trace_ranks: tuple[int, ...]
     environment: dict[str, str]
 
@@ -162,13 +156,13 @@ class Campaign:
             values[key] = value
         return values
 
-    def phase_arm_args(self, phase: Phase, arm: Arm) -> list[str]:
-        values = self.phase_arm_settings(phase, arm)
-        args = ["--module", arm.module, "--config", arm.config]
-        args.extend(settings_to_argv(values))
-        args.extend(arm.args)
-        args.extend(phase.args)
-        return args
+    def phase_arm_spec(self, phase: Phase, arm: Arm) -> dict[str, Any]:
+        """Return the ``harness.tt_config`` input for one phase and arm."""
+        return {
+            "module": arm.module,
+            "config": arm.config,
+            "settings": self.phase_arm_settings(phase, arm),
+        }
 
     def phase_arm_settings(self, phase: Phase, arm: Arm) -> dict[str, Any]:
         values = self.common_overrides()
@@ -210,8 +204,8 @@ class Campaign:
                 "kind": phase.kind,
                 "arms": list(phase.arms),
                 "trace_ranks": list(phase.trace_ranks),
-                "argv_by_arm": {
-                    arm_name: self.phase_arm_args(phase, self.arm(arm_name))
+                "tt_config_by_arm": {
+                    arm_name: self.phase_arm_spec(phase, self.arm(arm_name))
                     for arm_name in phase.arms
                 },
                 "environment_by_arm": {
@@ -242,30 +236,6 @@ def _merge_unique(
         if not isinstance(key, str) or "." not in key:
             raise CampaignError(f"{owner} setting {key!r} must be a dotted path")
         target[key] = value
-
-
-def _option_name(path: str, *, enabled: bool | None = None) -> str:
-    pieces = path.replace("_", "-").split(".")
-    if enabled is False:
-        pieces[-1] = f"no-{pieces[-1]}"
-    return "--" + ".".join(pieces)
-
-
-def settings_to_argv(settings: dict[str, Any]) -> list[str]:
-    result: list[str] = []
-    for path, value in sorted(settings.items()):
-        if path in HARNESS_ONLY_SETTINGS:
-            continue
-        if not path or any(not part for part in path.split(".")):
-            raise CampaignError(f"invalid TorchTitan setting path {path!r}")
-        if isinstance(value, bool):
-            result.append(_option_name(path, enabled=value))
-        elif isinstance(value, list):
-            result.append(_option_name(path))
-            result.append(",".join(str(item) for item in value))
-        elif value is not None:
-            result.extend((_option_name(path), str(value)))
-    return result
 
 
 def _string_list(value: Any, *, field: str) -> tuple[str, ...]:
@@ -308,7 +278,6 @@ def _parse_arms(raw: dict[str, Any]) -> tuple[Arm, ...]:
                 module=str(row["module"]),
                 config=str(row["config"]),
                 overrides=dict(overrides),
-                args=_string_list(row.get("args", []), field=f"arms[{index}].args"),
                 environment=_string_map(
                     row.get("environment", {}), field=f"arms[{index}].environment"
                 ),
@@ -361,7 +330,6 @@ def _parse_phases(raw: dict[str, Any], arm_names: set[str]) -> tuple[Phase, ...]
                 kind=kind,
                 arms=arms,
                 overrides=dict(overrides),
-                args=_string_list(row.get("args", []), field=f"phases[{index}].args"),
                 trace_ranks=tuple(trace_ranks),
                 environment=_string_map(
                     row.get("environment", {}), field=f"phases[{index}].environment"
@@ -601,7 +569,6 @@ def _validate_campaign(campaign: Campaign) -> None:
         for arm_name in phase.arms:
             arm = campaign.arm(arm_name)
             settings = campaign.phase_arm_settings(phase, arm)
-            campaign.phase_arm_args(phase, arm)
             degree_names = (
                 "data_parallel_replicate_degree",
                 "data_parallel_shard_degree",
@@ -618,20 +585,19 @@ def _validate_campaign(campaign: Campaign) -> None:
                     f"phase {phase.name!r} arm {arm_name!r} parallel mesh product "
                     f"{product} does not equal world size {campaign.world_size}"
                 )
-            local_batch = settings.get("training.local_batch_size")
-            global_batch = settings.get("training.global_batch_size")
-            grad_accum = int(settings.get("training.gradient_accumulation_steps", 1))
-            if (
-                isinstance(local_batch, int)
-                and isinstance(global_batch, int)
-                and global_batch > 0
+            max_context = settings.get("training.max_context_length")
+            microbatch = settings.get("training.num_tokens_per_microbatch_per_dp_rank")
+            train_step = settings.get("training.num_tokens_per_train_step")
+            if all(isinstance(value, int) for value in (max_context, microbatch)) and (
+                isinstance(train_step, int) and train_step > 0
             ):
-                expected = local_batch * degrees[0] * degrees[1] * grad_accum
-                if global_batch != expected:
+                data_parallel = degrees[0] * degrees[1]
+                if microbatch % max_context or train_step % (microbatch * data_parallel):
                     raise CampaignError(
-                        f"phase {phase.name!r} arm {arm_name!r} global batch "
-                        f"{global_batch} != local batch {local_batch} * DP "
-                        f"{degrees[0] * degrees[1]} * gradient accumulation {grad_accum}"
+                        f"phase {phase.name!r} arm {arm_name!r} train step tokens "
+                        f"{train_step} must be a multiple of microbatch tokens "
+                        f"{microbatch} * DP {data_parallel}, and microbatch tokens "
+                        f"a multiple of max context length {max_context}"
                     )
                 environment = {
                     **mast.get("environment", {}),
@@ -639,10 +605,12 @@ def _validate_campaign(campaign: Campaign) -> None:
                 }
                 expected_environment = {
                     "BENCHMARK_WORLD_SIZE": campaign.world_size,
-                    "BENCHMARK_DP_DEGREE": degrees[0] * degrees[1],
+                    "BENCHMARK_DP_DEGREE": data_parallel,
+                    "BENCHMARK_CP_DEGREE": degrees[2],
                     "BENCHMARK_TP_DEGREE": degrees[3],
-                    "BENCHMARK_LOCAL_BATCH_SIZE": local_batch,
-                    "BENCHMARK_GLOBAL_BATCH_SIZE": global_batch,
+                    "BENCHMARK_SEQ_LEN": max_context,
+                    "BENCHMARK_LOCAL_BATCH_SIZE": microbatch // max_context,
+                    "BENCHMARK_GLOBAL_BATCH_SIZE": train_step // max_context,
                 }
                 for key, expected_value in expected_environment.items():
                     if key in environment and int(environment[key]) != expected_value:
@@ -724,14 +692,6 @@ def _apply_mode(raw: dict[str, Any], mode: str) -> dict[str, Any]:
             "metrics.log_freq": 1,
         }
     )
-    functional.setdefault("environment", {}).update(
-        {
-            "BENCHMARK_TOTAL_STEPS": "2",
-            "BENCHMARK_LOG_FREQ": "1",
-            "BENCHMARK_ENABLE_KINETO": "0",
-            "BENCHMARK_ENABLE_MEMORY_SNAPSHOT": "0",
-        }
-    )
     trace_smoke = copy.deepcopy(trace)
     trace_smoke["name"] = "trace_smoke"
     trace_smoke["kind"] = "trace"
@@ -747,17 +707,6 @@ def _apply_mode(raw: dict[str, Any], mode: str) -> dict[str, Any]:
             "profiler.profiler_active": 1,
             "profiler.profiler_repeat": 1,
             "metrics.log_freq": 1,
-        }
-    )
-    trace_smoke.setdefault("environment", {}).update(
-        {
-            "BENCHMARK_TOTAL_STEPS": "2",
-            "BENCHMARK_LOG_FREQ": "1",
-            "BENCHMARK_ENABLE_KINETO": "1",
-            "BENCHMARK_ENABLE_MEMORY_SNAPSHOT": "0",
-            "BENCHMARK_PROFILE_FREQ": "2",
-            "BENCHMARK_PROFILE_ACTIVE": "1",
-            "BENCHMARK_PROFILE_WARMUP": "0",
         }
     )
     result["phases"] = [functional, trace_smoke]
@@ -776,39 +725,10 @@ def _inject_experiment_lock(raw: dict[str, Any]) -> dict[str, Any]:
         raise CampaignError(
             "campaign runtime pins are forbidden; use experiment_lock.toml"
         )
-    if raw.get("parallelism", {}).get("spmd_backend") is not None:
-        raise CampaignError(
-            "campaign spmd_backend is forbidden; use experiment_lock.toml"
-        )
-    native = raw.get("torchtitan", {}).get("overrides", {})
-    if isinstance(native, dict) and "parallelism.spmd_backend" in native:
-        raise CampaignError(
-            "campaign spmd_backend is forbidden; use experiment_lock.toml"
-        )
-    for owner in ("arms", "phases"):
-        for row in raw.get(owner, []):
-            if isinstance(row, dict) and "parallelism.spmd_backend" in row.get(
-                "overrides", {}
-            ):
-                raise CampaignError(
-                    f"{owner} spmd_backend override is forbidden; "
-                    "use experiment_lock.toml"
-                )
-    for point in raw.get("matrix", {}).get("points", []):
-        if isinstance(point, dict) and "parallelism.spmd_backend" in point.get(
-            "settings", {}
-        ):
-            raise CampaignError(
-                "matrix spmd_backend override is forbidden; use experiment_lock.toml"
-            )
-
     lock = load_experiment_lock()
     result = copy.deepcopy(raw)
     result["sources"] = copy.deepcopy(lock["sources"])
     result.setdefault("mast", {})["conda_fbpkg"] = lock["runtime"]["conda_fbpkg"]
-    result.setdefault("parallelism", {})["spmd_backend"] = lock["execution"][
-        "spmd_backend"
-    ]
     return result
 
 
