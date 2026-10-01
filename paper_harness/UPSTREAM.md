@@ -3,7 +3,7 @@
 ## TorchTitan
 
 The locked source is `kaijian/deepseek-baseline-parity-20260918` in
-`AlbedoWang/torchtitan` at `7966c411`. Its history has `383cae9f` as an actual
+`AlbedoWang/torchtitan` at `4b46d18d`. Its history has `383cae9f` as an actual
 ancestor and retains the `60517d28` AutoParallel/GraphTrainer integration.
 
 - `383cae9f`: eager SAC treats AutoParallel collectives like other
@@ -42,6 +42,8 @@ ancestor and retains the `60517d28` AutoParallel/GraphTrainer integration.
 - `7966c411` tunes Inductor's overlap-scheduling parameters for the
   AutoParallel full-Inductor compile: `compute_overlap_multipler=0.5` and
   `max_compute_pre_fetch` 10 -> 20.
+- `4b46d18d` restores `max_compute_pre_fetch` to 10 and keeps
+  `compute_overlap_multipler=0.5`.
 
 The 3D port includes only the approved legacy-DTensor AP configuration, CP
 input-ownership seam, DP-shard/CP/TP mesh, CP-aware SDPA, DTensor output, and
