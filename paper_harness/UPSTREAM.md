@@ -115,8 +115,15 @@ is pinned to the commit immediately before the lock/harness-only updates.
   storage does not shard (the HSDP replicate dim) in place when projecting the
   storage order onto a gradient producer's inputs. Without it the 4D
   lm_head-backward tangent keeps the default order and the lowered graph
-  differs per rank (step-1 deadlock). It is the runtime pin; the lock remote is
-  the local repository because the two commits are not pushed.
+  differs per rank (step-1 deadlock).
+- `62a6085` (local) orders a parameter's storage by the mesh dims its forward
+  chain releases (never-released outermost, later releases further out) when
+  the earlier ordered-storage gates left it unordered, and keeps the order only
+  if every param/grad chain edge then runs exactly the collectives the solver
+  priced. On the LLaMA 3 4D mesh the earlier gates ordered only lm_head, so
+  FSDP gathers and gradient reductions lowered to unpriced all_to_all chains.
+  It is the runtime pin; the lock remote is the local repository because the
+  three commits are not pushed.
 
 ## Reproduction policy
 

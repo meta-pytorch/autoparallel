@@ -1,5 +1,5 @@
 schema_version = 1
-harness_version = "v19"
+harness_version = "v20"
 
 [sources.torchtitan]
 remote = "https://github.com/AlbedoWang/torchtitan.git"
@@ -8,7 +8,7 @@ dirty_policy = "forbid"
 
 [sources.autoparallel]
 remote = "/home/wangkj/workspace/autoparallel"
-commit = "7a14fa2522106758d8fa297fc5216f88a4b566e2"
+commit = "62a60850a653a69bf0a42d8cf79577fdbf258d31"
 dirty_policy = "forbid"
 
 [runtime]
