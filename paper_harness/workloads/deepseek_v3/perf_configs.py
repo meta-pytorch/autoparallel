@@ -358,8 +358,8 @@ def _base_config():
     config = deepseek_v3_16b()
     config.comm = replace(
         config.comm,
-        init_timeout_seconds=1200,
-        train_timeout_seconds=1200,
+        init_timeout_seconds=7200,
+        train_timeout_seconds=7200,
     )
     config.model_spec = graph_model_registry(MODEL_FLAVOR, attn_backend="sdpa")
     config.model_spec = replace(

@@ -159,6 +159,11 @@ setting = "3d-dpr2-dps8-tp2-paper-merged"
 campaign = "campaigns/variants/muse_glimmer_30b_3d_2x8x2.toml"
 
 [[settings]]
+model = "muse_glimmer_30b"
+setting = "3d-dpr4-dps8-tp2"
+campaign = "campaigns/variants/muse_glimmer_30b_3d_4x8x2.toml"
+
+[[settings]]
 model = "llama3_8b"
 setting = "3d-dpr2-dps2-tp8-a2a-sac-timeout60"
 campaign = "campaigns/variants/llama3_8b_3d_2x2x8_timeout60.toml"

@@ -3,7 +3,7 @@
 ## TorchTitan
 
 The locked source is `kaijian/deepseek-baseline-parity-20260918` in
-`AlbedoWang/torchtitan` at `b32acd82`. Its history has `383cae9f` as an actual
+`AlbedoWang/torchtitan` at `7966c411`. Its history has `383cae9f` as an actual
 ancestor and retains the `60517d28` AutoParallel/GraphTrainer integration.
 
 - `383cae9f`: eager SAC treats AutoParallel collectives like other
@@ -39,6 +39,9 @@ ancestor and retains the `60517d28` AutoParallel/GraphTrainer integration.
   overlap scheduling (`aten_distributed_optimizations.custom_runtime_estimation`),
   so it uses the same estimates, including the NCCL cost profile, as the AP
   pass.
+- `7966c411` tunes Inductor's overlap-scheduling parameters for the
+  AutoParallel full-Inductor compile: `compute_overlap_multipler=0.5` and
+  `max_compute_pre_fetch` 10 -> 20.
 
 The 3D port includes only the approved legacy-DTensor AP configuration, CP
 input-ownership seam, DP-shard/CP/TP mesh, CP-aware SDPA, DTensor output, and
@@ -91,7 +94,18 @@ is pinned to the commit immediately before the lock/harness-only updates.
   all_reduce on `dp_replicate`), and prices them last in the solver-side
   logical plan. At `dp_shard >= 3` the concrete plan then matches the logical
   plan again, so the FSDP-like storage order is no longer rejected and the
-  default-order all_to_all chains disappear. It is the runtime pin.
+  default-order all_to_all chains disappear.
+- `952e69d` prices the same orthogonal `Partial -> Replicate` reductions last
+  in the solver's edge cost (`estimate_strategy_comms_cost`) whenever the edge
+  also has a `Partial -> Shard` mesh dim, as lowering runs them. Before, 3D
+  gradients were priced all_reduce-first, which pushed Muse Glimmer 4x8x2 to
+  gather activations over `fsdp` through tp all_to_all chains.
+- `cf5df05` leaves the approximate solver's `max_time_s` unbounded by default.
+  Each rank solves independently, and on Muse Glimmer 4x8x2 the 60 s cap
+  truncated the polish at a speed-dependent point: 3 of 64 ranks returned a
+  different plan and the job hung in mismatched collectives. The sweep budgets
+  (`bp_iters`, `max_sweeps`, `star_passes`) still bound the solve. It is the
+  runtime pin.
 
 ## Reproduction policy
 

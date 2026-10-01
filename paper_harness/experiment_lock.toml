@@ -1,14 +1,14 @@
 schema_version = 1
-harness_version = "legacy-dtensor-v16-paper-submission-ordered-rs-before-ar"
+harness_version = "v17"
 
 [sources.torchtitan]
 remote = "https://github.com/AlbedoWang/torchtitan.git"
-commit = "b32acd822695fe3fd34e871af7c51f3bb9952e40"
+commit = "7966c4111ae4ec063de9c3f0e7e0ed436a141ffc"
 dirty_policy = "forbid"
 
 [sources.autoparallel]
 remote = "https://github.com/meta-pytorch/autoparallel.git"
-commit = "77cfe2cf9d9f14a766ca67c98a184fcac0ff1b31"
+commit = "cf5df052ada8ab273ec5ac8f2177e99ddd77d06d"
 dirty_policy = "forbid"
 
 [runtime]
