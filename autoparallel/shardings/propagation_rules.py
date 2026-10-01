@@ -40,8 +40,10 @@ from torch.distributed.tensor._ops._view_ops import (
 from torch.distributed.tensor._ops.utils import (
     expand_to_full_mesh_op_strategy,
     generate_redistribute_costs,
+    is_tensor_dim_sharded,
     is_tensor_shardable,
     normalize_dim,
+    shift_shard_dims_after_remove,
 )
 from torch.distributed.tensor.placement_types import (
     Partial,
@@ -477,6 +479,30 @@ def split_with_sizes_rule(mesh, op_schema):
 
         s = OpSpec(output_specs, input_specs=(input_specs,))
         s.redistribute_cost = [redistribute_costs]
+        strats.append(s)
+    return OpStrategy(strats)
+
+
+@register_rule(torch.ops.aten.unbind.int)
+def unbind_rule(mesh, op_schema):
+    """DTensor's unbind strategy raises if any input strategy is sharded on
+    the unbind dim; skip those instead and let the solver redistribute."""
+    op_spec = op_schema.args_schema[0]
+    dim = op_schema.args_schema[1] if len(op_schema.args_schema) > 1 else 0
+    dim = normalize_dim(dim, op_spec.ndim)
+    strats = []
+    for strat in op_spec.strategies:
+        input_specs = strat.output_spec
+        if is_tensor_dim_sharded(input_specs, dim=dim):
+            continue
+        inp_t = _build_meta_tensor(input_specs.tensor_meta)
+        placements = tuple(shift_shard_dims_after_remove(input_specs.placements, dim))
+        output_specs = tuple(
+            DTensorSpec(mesh, placements, tensor_meta=_gen_tensor_meta(out_t))
+            for out_t in inp_t.unbind(dim)
+        )
+        s = OpSpec(output_specs, input_specs=(input_specs,))
+        s.redistribute_cost = [generate_redistribute_costs(op_spec, input_specs)]
         strats.append(s)
     return OpStrategy(strats)
 
