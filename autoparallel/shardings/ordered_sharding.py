@@ -5,7 +5,7 @@
 
 import math
 import operator
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from typing import Optional, Union
 
@@ -1197,6 +1197,159 @@ def _multi_boundary_adjoint_improves_fallback(
     return multi_boundary_plan
 
 
+def _release_order_storage_order(
+    storage: tuple[Placement, ...],
+    forward: list[tuple[torch.fx.Node, DTensorSpec, DTensorSpec]],
+) -> Optional[ShardOrder]:
+    """Order storage shards so that every forward gather releases the innermost one.
+
+    A mesh dim the chain releases later sits outside the ones it released
+    earlier, and mesh dims it never releases sit outermost. Mesh dims released
+    by the same redistribution are ordered as in
+    ``_infer_fsdplike_storage_order``, so they are gathered in ascending order.
+    """
+    released_at: dict[int, int] = {}
+    for index, (_, source, target) in enumerate(forward):
+        for mesh_dim, (src, dst) in enumerate(
+            zip(source.placements, target.placements)
+        ):
+            if isinstance(src, Shard) and isinstance(dst, Replicate):
+                released_at.setdefault(mesh_dim, index)
+
+    def outer_first(mesh_dim: int) -> tuple[int, int, int]:
+        if mesh_dim not in released_at:
+            return (0, 0, mesh_dim)
+        return (1, -released_at[mesh_dim], -mesh_dim)
+
+    mesh_dims_by_tensor_dim: dict[int, list[int]] = defaultdict(list)
+    for mesh_dim, placement in enumerate(storage):
+        if isinstance(placement, Shard):
+            mesh_dims_by_tensor_dim[placement.dim].append(mesh_dim)
+    preferred_order = tuple(
+        ShardOrderEntry(
+            tensor_dim=tensor_dim,
+            mesh_dims=tuple(sorted(mesh_dims, key=outer_first)),
+        )
+        for tensor_dim, mesh_dims in sorted(mesh_dims_by_tensor_dim.items())
+    )
+    default_order = DTensorSpec.compute_default_shard_order(storage)
+    return preferred_order if preferred_order != default_order else None
+
+
+def _collectives_by_mesh_dim(plan: _FallbackPlan) -> Counter[tuple[str, int]]:
+    return Counter(
+        (kind, mesh_dim)
+        for kind, mesh_dims in plan.operations
+        for mesh_dim in mesh_dims
+    )
+
+
+def _release_order_plan(
+    storage: DTensorSpec,
+    param_chain: list[torch.fx.Node],
+    grad_chain: list[torch.fx.Node],
+    sharding_placement: dict[torch.fx.Node, OpSpec],
+) -> Optional[dict[torch.fx.Node, OrderInfo]]:
+    """Order a parameter whose default layout runs collectives the solver did not price.
+
+    The adjoint gates above infer the storage order from one boundary, which is
+    enough while one gather leaves at most one shard per tensor dim. With more
+    shards left (e.g. FSDP x CP x TP), only the release order of the whole
+    forward chain lets every gather take the innermost shard. The order is
+    carried through both chains by mesh priority, so it survives the permutes
+    between the storage and its consumers. It is kept only if every chain
+    redistribution then runs exactly the collectives the solver priced, the
+    chains cost less than in default order, and the order is default wherever
+    a value crosses into or out of the chains without a priced redistribution.
+    """
+    param_prefix = _unambiguous_param_prefix(param_chain)
+    grad_prefix = _unambiguous_grad_prefix(grad_chain)
+    forward = _get_chain_redistributions(param_prefix, sharding_placement)
+    backward = _get_chain_redistributions(grad_prefix, sharding_placement)
+    if not forward or not backward:
+        return None
+    preferred_order = _release_order_storage_order(storage.placements, forward)
+    if preferred_order is None:
+        return None
+    chain_nodes = param_prefix + grad_prefix
+    if not _order_reaches_every_boundary(chain_nodes, sharding_placement):
+        return None
+    order_info = OrderInfo(preferred_order, project_by_mesh_priority=True)
+    order_map = {node: order_info for node in chain_nodes}
+
+    def is_default(spec: DTensorSpec) -> bool:
+        return _project_order_info(
+            order_info, spec
+        ) == DTensorSpec.compute_default_shard_order(spec.placements)
+
+    edges = forward + backward
+    try:
+        candidate_edges = [_ordered_edge(edge, order_map) for edge in edges]
+        for node in chain_nodes:
+            outside = [
+                user
+                for user in node.users
+                if user not in order_map and user in sharding_placement
+            ]
+            if not outside:
+                continue
+            output = sharding_placement[node].output_specs
+            if not isinstance(output, DTensorSpec) or not is_default(output):
+                return None
+            for user in outside:
+                user_edges = _input_edges(user, sharding_placement)
+                if user_edges is None or not all(
+                    is_default(target)
+                    for _, input_node, _, target in user_edges
+                    if input_node is node
+                ):
+                    return None
+        entry = _input_edges(grad_prefix[-1], sharding_placement)
+        if entry is None or len(entry) != 1:
+            return None
+        # Compare against the unconverted input spec, as redistribute_tensor
+        # does: a reorder on an edge that keeps a Partial would also reduce it.
+        _, _, entry_source, entry_target = entry[0]
+        entry_placements = sharding_placement[grad_prefix[-1]].input_specs[0].placements
+        if entry_source.placements == entry_placements and not is_default(entry_target):
+            return None
+        grad_output = sharding_placement[grad_prefix[0]].output_specs
+        if not isinstance(grad_output, DTensorSpec):
+            return None
+        physical_storage = DTensorSpec._convert_shard_order_to_StridedShard(
+            _project_order_info(order_info, storage), storage.placements, storage.mesh
+        )
+        physical_grad = DTensorSpec._convert_shard_order_to_StridedShard(
+            _project_order_info(order_info, grad_output),
+            grad_output.placements,
+            grad_output.mesh,
+        )
+    except (AssertionError, RuntimeError, TypeError, ValueError):
+        return None
+    if physical_storage != physical_grad:
+        return None
+
+    candidate_plans = _plans_for_edges(candidate_edges)
+    baseline_plans = _plans_for_edges([_default_edge(edge) for edge in edges])
+    solver_plans = [_logical_plan(source, target) for _, source, target in edges]
+    if candidate_plans is None or baseline_plans is None:
+        return None
+    expected = []
+    for plan in solver_plans:
+        if plan is None:
+            return None
+        expected.append(_collectives_by_mesh_dim(plan))
+    if [_collectives_by_mesh_dim(plan) for plan in baseline_plans] == expected:
+        return None
+    if [_collectives_by_mesh_dim(plan) for plan in candidate_plans] != expected:
+        return None
+    if sum(plan.cost for plan in candidate_plans) >= sum(
+        plan.cost for plan in baseline_plans
+    ):
+        return None
+    return order_map
+
+
 def build_param_grad_linear_chains(
     param_and_grad_nodes: list[tuple[torch.fx.Node, Optional[torch.fx.Node]]],
 ) -> tuple[
@@ -1467,6 +1620,29 @@ def compute_optimal_placement_order_for_parameters(
         ):
             continue
         redistribute_node_order.update(pair_order)
+
+    for (
+        param_node,
+        grad_node,
+        (param_curr_plc, _),
+        (_, grad_tgt_plc),
+    ) in matched_param_grad_pairs:
+        if param_node in redistribute_node_order or param_curr_plc != grad_tgt_plc:
+            continue
+        storage = sharding_placement[param_node].output_specs
+        if not isinstance(storage, DTensorSpec):
+            continue
+        release_order = _release_order_plan(
+            storage,
+            source_to_chain[param_node],
+            source_to_chain[grad_node],
+            sharding_placement,
+        )
+        if release_order is None or any(
+            node in redistribute_node_order for node in release_order
+        ):
+            continue
+        redistribute_node_order.update(release_order)
 
     # Apply shard_order metadata to nodes
     for node, order_info in redistribute_node_order.items():
