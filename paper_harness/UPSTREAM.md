@@ -129,8 +129,13 @@ is pinned to the commit immediately before the lock/harness-only updates.
   if every param/grad chain edge then runs exactly the collectives the solver
   priced. On the LLaMA 3 4D mesh the earlier gates ordered only lm_head, so
   FSDP gathers and gradient reductions lowered to unpriced all_to_all chains.
-  It is the runtime pin; the lock remote is the local repository because the
-  three commits are not pushed.
+- `98b20b4` (local) prices the default-order redistributions an approximate
+  solve selects that have no one-collective-per-mesh-dim plan by the plan
+  lowering emits for them, and re-solves until no unpriced one is selected.
+  On the LLaMA 3 4D 2x2x2x2 mesh, gathering the middle mesh dim of S0S0S1S0
+  activations lowered to all_to_all, all_gather, all_to_all priced as one
+  all_gather. It is the runtime pin; the lock remote is the local repository
+  because the four commits are not pushed.
 
 ## Reproduction policy
 
