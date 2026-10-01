@@ -44,6 +44,13 @@ ancestor and retains the `60517d28` AutoParallel/GraphTrainer integration.
   `max_compute_pre_fetch` 10 -> 20.
 - `4b46d18d` restores `max_compute_pre_fetch` to 10 and keeps
   `compute_overlap_multipler=0.5`.
+- `cf091127` (local branch `agent/apgt-no-pass2-20261001`, child of
+  `4b46d18d`) sets `aten_distributed_optimizations.enable_overlap_scheduling`
+  to False, so Inductor runs no overlap pass (pass 2) after the AP
+  reordering/bucketing pass. Experiment pin for the LLaMA 3 8B 4D CP hang
+  (v20: ring attention traces per-CP-rank graphs and pass 2 orders mesh_cp
+  collectives differently across CP ranks); the lock remote is the local
+  repository because the commit is not pushed.
 
 The 3D port includes only the approved legacy-DTensor AP configuration, CP
 input-ownership seam, DP-shard/CP/TP mesh, CP-aware SDPA, DTensor output, and
