@@ -1130,10 +1130,8 @@ def build_attention(
     use_flex_attn: bool,
     attn_mask_type: str,
     fixed_block_size: int | None = None,
-    context_parallel_mesh: DeviceMesh | None = None,
     scale: float | None = None,
     kernel_options: dict | None = None,
-    block_mask: BlockMask | None = None,
 ):
     if fixed_block_size is not None and not use_flex_attn:
         raise ValueError(
@@ -1141,17 +1139,6 @@ def build_attention(
         )
     if attn_mask_type != "causal":
         raise ValueError("TorchTitan with SDPA currently only supports causal mask.")
-    if context_parallel_mesh is not None:
-        from autoparallel import make_context_parallel
-
-        return make_context_parallel(
-            context_parallel_mesh,
-            kind="flex_attention" if use_flex_attn else "sdpa",
-            is_causal=True,
-            scale=scale,
-            block_mask=block_mask,
-            kernel_options=kernel_options,
-        )
     if use_flex_attn:
 
         def flex(
@@ -1594,13 +1581,12 @@ class Attention(nn.Module):
             mscale = 0.1 * attn_config.mscale * math.log(rope_cfg.rope_factor) + 1.0
             self.softmax_scale = self.softmax_scale * mscale * mscale
 
-        # Context parallel follows the mesh: when it has a "cp" axis, run
-        # attention through the CP local_map (cp shards sequence).
-        self.context_parallel = (
+        if (
             mesh is not None
             and mesh.mesh_dim_names is not None
             and "cp" in mesh.mesh_dim_names
-        )
+        ):
+            raise ValueError("DeepSeekV3Model attention does not support a cp axis.")
         self.use_flex_attn = isinstance(
             attn_config.inner_attention, FlexAttentionConfig
         )
@@ -1611,32 +1597,19 @@ class Attention(nn.Module):
             attn_config.inner_attention.kernel_options if self.use_flex_attn else None
         )
 
-        def build_inner_attention(block_mask: BlockMask | None = None):
-            return build_attention(
-                self.use_flex_attn,
-                getattr(attn_config, "mask_type", "causal"),
-                fixed_block_size=fixed_block_size,
-                context_parallel_mesh=mesh if self.context_parallel else None,
-                scale=self.softmax_scale,
-                kernel_options=kernel_options,
-                block_mask=block_mask,
-            )
-
-        self._build_inner_attention = build_inner_attention
-        self.inner_attention = build_inner_attention()
-
-    def set_context_parallel_block_mask_template(self, block_mask: BlockMask) -> None:
-        if not self.context_parallel or not self.use_flex_attn:
-            return
-        self.inner_attention = self._build_inner_attention(block_mask)
-        self._build_inner_attention = None
+        self.inner_attention = build_attention(
+            self.use_flex_attn,
+            getattr(attn_config, "mask_type", "causal"),
+            fixed_block_size=fixed_block_size,
+            scale=self.softmax_scale,
+            kernel_options=kernel_options,
+        )
 
     def forward(
         self,
         x: torch.Tensor,
         freqs_cis: torch.Tensor,
         attention_masks: BlockMask | None = None,
-        document_ids: torch.Tensor | None = None,
     ):
         """
         Forward pass for the Multi-Head Latent Attention (MLA) Layer.
@@ -1716,22 +1689,7 @@ class Attention(nn.Module):
         if self.use_flex_attn:
             if attention_masks is None:
                 raise ValueError("FlexAttention requires a BlockMask.")
-            if self.context_parallel:
-                if document_ids is None:
-                    raise ValueError(
-                        "Context-parallel FlexAttention requires document IDs."
-                    )
-                output = self.inner_attention(
-                    q,
-                    k,
-                    v,
-                    block_mask=attention_masks,
-                    mask_mod_buffers=(document_ids,),
-                )
-            else:
-                output = self.inner_attention(q, k, v, block_mask=attention_masks)
-        elif self.context_parallel:
-            output = self.inner_attention(q, k, v)
+            output = self.inner_attention(q, k, v, block_mask=attention_masks)
         else:
             output = self.inner_attention(q, k, v, scale=self.softmax_scale)
 
@@ -1835,7 +1793,6 @@ class TransformerBlock(nn.Module):
         x: torch.Tensor,
         freqs_cis: torch.Tensor,
         attention_masks: BlockMask | None = None,
-        document_ids: torch.Tensor | None = None,
     ):
         """
         Forward pass for the Transformer block.
@@ -1851,7 +1808,6 @@ class TransformerBlock(nn.Module):
             _rms_norm_compute(x, self.attention_norm, self.compute_dtype),
             freqs_cis,
             attention_masks,
-            document_ids,
         )
         if self.moe_enabled:
             x = x + self.moe(_rms_norm_compute(x, self.ffn_norm, self.compute_dtype))
@@ -1949,14 +1905,9 @@ class DeepSeekV3Model(nn.Module):
             if positions is None
             else self.freqs_cis[positions]
         )
-        document_ids = (
-            torch.cumsum((positions == 0).int(), dim=1) - 1
-            if attention_masks is not None and positions is not None
-            else None
-        )
 
         for layer in self.layers.values():
-            h = layer(h, freqs_cis, attention_masks, document_ids)
+            h = layer(h, freqs_cis, attention_masks)
         # These call sites use the functional helpers instead of the submodule
         # forward, so _annotate_module_fqns never tags them. graph_trainer's
         # selective-activation-remat bounds its remat regions on the "lm_head"
@@ -1989,9 +1940,6 @@ class DeepSeekV3Model(nn.Module):
             inner_attention.block_size,
         )
 
-    def set_context_parallel_block_mask_template(self, block_mask: BlockMask) -> None:
-        for layer in self.layers.values():
-            layer.attention.set_context_parallel_block_mask_template(block_mask)
 
 
 def _init_weights_tok_embeddings(self: DeepSeekV3Model, seed: int | None = None):

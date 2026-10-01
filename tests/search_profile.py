@@ -110,14 +110,14 @@ def fake_cuda_context(stack):
 def make_llama(model_name, mesh_shape):
     from autoparallel._testing.models.llama3 import Transformer, TransformerModelArgs
 
+    # 3D/4D profiles used a cp axis, which needed the removed ring-attention
+    # local_map in the LLaMA testing model.
     names = {
         1: ("fsdp",),
         2: ("fsdp", "tp"),
-        3: ("dp_shard", "cp", "tp"),
-        4: ("dp_replicate", "dp_shard", "cp", "tp"),
     }.get(len(mesh_shape))
     if names is None:
-        raise ValueError(f"LLaMA profiles require a 1D to 4D mesh, got {mesh_shape}")
+        raise ValueError(f"LLaMA profiles require a 1D or 2D mesh, got {mesh_shape}")
     seq_len = 2048
     vocab_size = 128256
     mesh = torch.distributed.device_mesh.init_device_mesh(
@@ -128,7 +128,6 @@ def make_llama(model_name, mesh_shape):
         "rope_theta": 500000,
         "vocab_size": vocab_size,
         "max_seq_len": seq_len,
-        "context_parallel_mesh": mesh if "cp" in names else None,
     }
     with torch.device("meta"):
         model = Transformer(TransformerModelArgs(**config))
@@ -137,28 +136,11 @@ def make_llama(model_name, mesh_shape):
     def input_fn():
         return torch.randint(0, vocab_size, (batch_size, seq_len), device="cuda")
 
-    input_placement = tuple(
-        Shard(1)
-        if name == "cp"
-        else Replicate()
-        if name == "tp"
-        else Shard(0)
-        for name in names
-    )
-    output_placement = tuple(
-        Shard(1)
-        if name == "cp"
-        else Shard(2)
-        if name == "tp"
-        else Shard(0)
-        for name in names
-    )
+    input_placement = tuple(Replicate() if name == "tp" else Shard(0) for name in names)
+    output_placement = tuple(Shard(2) if name == "tp" else Shard(0) for name in names)
     expanded = {
         "family": "llama3",
-        "config": {
-            key: value for key, value in config.items() if key != "context_parallel_mesh"
-        },
-        "context_parallel_attention": "cp" in names,
+        "config": config,
         "batch_size": batch_size,
         "sequence_length": seq_len,
         "mesh_shape": list(mesh_shape),

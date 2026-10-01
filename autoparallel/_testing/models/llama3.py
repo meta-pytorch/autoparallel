@@ -10,7 +10,6 @@ from typing import ClassVar, Literal, Optional
 import torch
 import torch.nn.functional as F
 from torch import nn
-from torch.distributed.device_mesh import DeviceMesh
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 
@@ -59,20 +58,7 @@ def build_attention(
     use_flex_attn: bool,
     attn_mask_type: str,
     fixed_block_size: Optional[int] = None,
-    context_parallel_mesh: Optional[DeviceMesh] = None,
 ):
-    if context_parallel_mesh is not None:
-        if use_flex_attn:
-            raise ValueError("FlexAttention is not compatible with CP yet.")
-        if fixed_block_size is not None:
-            raise ValueError("SDPA currently does not support fixed_block_size.")
-        if attn_mask_type != "causal":
-            raise ValueError("SDPA currently only supports causal mask.")
-
-        from autoparallel import make_context_parallel
-
-        return make_context_parallel(context_parallel_mesh, kind="sdpa", is_causal=True)
-
     if use_flex_attn:
         raise NotImplementedError()
         # return FlexAttention(attn_mask_type, fixed_block_size)
@@ -103,7 +89,6 @@ class TransformerModelArgs:
 
     use_flex_attn: bool = False
     attn_mask_type: str = "causal"
-    context_parallel_mesh: Optional[DeviceMesh] = None
     eos_id: int = 0
 
     def update_from_config(self, job_config, tokenizer) -> None:
@@ -282,11 +267,7 @@ class Attention(nn.Module):
         self.wo = nn.Linear(
             model_args.n_heads * self.head_dim, model_args.dim, bias=False
         )
-        self.sdpa = build_attention(
-            model_args.use_flex_attn,
-            model_args.attn_mask_type,
-            context_parallel_mesh=model_args.context_parallel_mesh,
-        )
+        self.sdpa = build_attention(model_args.use_flex_attn, model_args.attn_mask_type)
 
     def init_weights(self, init_std: float):
         for linear in (self.wq, self.wk, self.wv):

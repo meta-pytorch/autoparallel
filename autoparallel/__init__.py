@@ -3,13 +3,6 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
-from autoparallel._context_parallel import (
-    ContextParallelPlacements,
-    context_parallel_attention_placements,
-    make_context_parallel,
-    make_context_parallel_body,
-    make_context_parallel_sdpa,
-)
 from autoparallel.api import AutoParallel, auto_parallel
 from autoparallel.collectives import with_sharding_constraint
 from autoparallel.compile import autoparallel_backend
@@ -23,15 +16,10 @@ from autoparallel.moe import (
 __all__ = [
     "auto_parallel",
     "AutoParallel",
-    "ContextParallelPlacements",
     "autoparallel_backend",
-    "context_parallel_attention_placements",
     "ForwardInputs",
     "MoEMeshRoles",
     "build_moe_local_map_placements",
     "build_moe_mesh",
-    "make_context_parallel",
-    "make_context_parallel_body",
-    "make_context_parallel_sdpa",
     "with_sharding_constraint",
 ]
