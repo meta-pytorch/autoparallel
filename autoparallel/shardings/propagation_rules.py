@@ -701,8 +701,9 @@ def stack_strategy(mesh, op_schema: OpSchema):
     common_input_ndim = first_input_strategy.ndim
 
     dim = cast(int, op_schema.args_schema[1]) if len(op_schema.args_schema) > 1 else 0
-    # normalize the dim to be within the common input ndim
-    dim = normalize_dim(dim, common_input_ndim)
+    # normalize the dim to be within the output ndim (input ndim + 1),
+    # since stack inserts a new dimension
+    dim = normalize_dim(dim, common_input_ndim + 1)
 
     possible_input_strategies: PlacementList = [Replicate()] + [  # type: ignore[assignment]
         Shard(i) for i in range(common_input_ndim)
