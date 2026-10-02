@@ -382,6 +382,12 @@ class AutoParallel:
         self.sharding_optimizer.add_parameter_memory_constraint(low, high)
 
     def add_input_constraints(self, constraints):
+        """Constrain flattened input leaves.
+
+        A placement tuple is explicit, ``None`` keeps the default batch
+        ``Shard(0)`` behavior for tensors, and ``UNCONSTRAINED`` omits the
+        constraint. Non-tensor leaves use ``None``.
+        """
         self._assert_entered()
 
         assert self.input_constraints is None, "Input constraints have already been set"
@@ -389,6 +395,12 @@ class AutoParallel:
         self.input_constraints = constraints
 
     def add_output_constraints(self, constraints):
+        """Constrain flattened output leaves.
+
+        A placement tuple is explicit, ``None`` keeps the default batch
+        ``Shard(0)`` behavior for tensors, and ``UNCONSTRAINED`` omits the
+        constraint. Non-tensor leaves use ``None``.
+        """
         self._assert_entered()
 
         assert (

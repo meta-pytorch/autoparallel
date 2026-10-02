@@ -76,6 +76,7 @@ import tempfile
 import time
 from collections import defaultdict
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Optional
 
 import pulp
@@ -106,6 +107,13 @@ from .shardings.placement_options import get_placement_options_for_node
 from .shardings.propagation_rules import _create_all_options
 
 logger = logging.getLogger(__name__)
+
+
+class BoundaryConstraint(Enum):
+    UNCONSTRAINED = "unconstrained"
+
+
+UNCONSTRAINED = BoundaryConstraint.UNCONSTRAINED
 
 
 def concretize_symint(val):
@@ -1729,6 +1737,14 @@ class ShardingOptimizer:
         add_sharded_output_constraint. Only constrains the forward-side node;
         the backward side is handled by add_forward_backward_consistency_constraints."""
         io_kind = "output" if desc_type is PlainAOTOutput else "input"
+
+        def is_tensor_node(node):
+            if not isinstance(node, torch.fx.Node):
+                return False
+            if "val" in node.meta:
+                return isinstance(node.meta["val"], torch.Tensor)
+            return node.meta.get("is_tensor_value", True)
+
         remaining = None
         if placements is not None:
             remaining = {i: p for i, p in enumerate(placements)}
@@ -1744,8 +1760,8 @@ class ShardingOptimizer:
             invalid = sorted(
                 desc.idx
                 for desc, (node, _companion_node) in nodes_dict.items()
-                if not isinstance(node, torch.fx.Node)
-                and remaining[desc.idx] is not None
+                if not is_tensor_node(node)
+                and remaining[desc.idx] not in (None, UNCONSTRAINED)
             )
             if invalid:
                 raise ValueError(
@@ -1762,14 +1778,16 @@ class ShardingOptimizer:
                 assert remaining is not None
                 placement = remaining.pop(desc.idx)
 
-            if not isinstance(node, torch.fx.Node):
+            if not is_tensor_node(node):
+                continue
+            if placement is UNCONSTRAINED:
                 continue
             self.add_node_constraint(node, placement, constraint_name=constraint_name)
 
         ignored = []
         if remaining is not None:
             for i, p in remaining.items():
-                if p is not None:
+                if p not in (None, UNCONSTRAINED):
                     ignored.append(i)
 
         if ignored:
@@ -1795,8 +1813,8 @@ class ShardingOptimizer:
                 "placeholder node for these inputs.  "
                 "This typically occurs because some inputs aliased each other; inspect the "
                 "joint graph from tlparse for more details.  "
-                "You can either remove an explicit placement for this input (replace it with "
-                "None) or clone the inputs before tracing to remove aliasing."
+                "You can either leave this tensor unconstrained with UNCONSTRAINED "
+                "or clone the inputs before tracing to remove aliasing."
             ),
         )
 
@@ -1826,8 +1844,8 @@ class ShardingOptimizer:
                 "output node for these inputs.  "
                 "This typically occurs because some outputs aliased each other; inspect the "
                 "joint graph from tlparse for more details.  "
-                "You can either remove an explicit placement for this output (replace it with "
-                "None), stop the model from returning aliases of the tensor or clone the "
+                "You can either leave this tensor unconstrained with UNCONSTRAINED, "
+                "stop the model from returning aliases of the tensor or clone the "
                 "outputs before returning them from the graph to avoid aliasing."
             ),
         )
