@@ -255,10 +255,17 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
         # internally). Not needed in dynamic mode since shape args are already
         # localized above. The local tensor is made contiguous before wrapping:
         # DTensor.contiguous() runs sharding propagation for clone, which is
-        # uncached while tracing and expands to every full-mesh strategy.
+        # uncached while tracing and expands to every full-mesh strategy. The
+        # global shape and contiguous stride are passed explicitly because
+        # from_local cannot infer the global stride of a dim sharded to local
+        # size 1.
         if not self.dynamic and target in _VIEW_OPS and tgt_spec is not None:
             new_args[0] = DTensor.from_local(
-                new_args[0].contiguous(), tgt_spec.mesh, tgt_spec.placements
+                new_args[0].contiguous(),
+                tgt_spec.mesh,
+                tgt_spec.placements,
+                shape=tgt_spec.shape,
+                stride=torch._prims_common.make_contiguous_strides_for(tgt_spec.shape),
             )
             new_args[0]._spec.shard_order = tgt_spec.shard_order
 
