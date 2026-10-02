@@ -359,23 +359,52 @@ class ShardingOptimizer:
         problem uses key2's variable in place of key1."""
         for cluster_group in clusters:
             cluster0 = cluster_group[0]
+            group_links = {}
+            error = None
             for cluster_i in cluster_group[1:]:
+                if len(cluster_i) != len(cluster0):
+                    error = (
+                        f"region lengths differ ({len(cluster0)} and {len(cluster_i)})"
+                    )
+                    break
                 for n0, ni in zip(cluster0, cluster_i):
+                    if n0.op != ni.op or n0.target != ni.target:
+                        error = (
+                            f"{n0} and {ni} have different operators "
+                            f"({n0.target} and {ni.target})"
+                        )
+                        break
+                    input_arity_n0 = len(self._all_input_nodes(n0))
+                    input_arity_ni = len(self._all_input_nodes(ni))
+                    if input_arity_n0 != input_arity_ni:
+                        error = (
+                            f"{n0} and {ni} have different input arity "
+                            f"({input_arity_n0} and {input_arity_ni})"
+                        )
+                        break
                     idx0 = self.node_map[n0]
                     idx1 = self.node_map[ni]
                     options_n0 = list(self.walk_over_options(n0))
                     options_ni = list(self.walk_over_options(ni))
-                    assert options_n0 == options_ni, (
-                        f"Problem with graph clustering: {n0} and {ni} don't have the same number "
-                        "of input/output placements. Please report a bug"
-                    )
+                    if options_n0 != options_ni:
+                        error = (
+                            f"{n0} and {ni} have different input/output placement "
+                            "structure"
+                        )
+                        break
                     for argi, out_idx, inp_idx in options_n0:
-                        self.cluster_links[(idx1, argi, out_idx, inp_idx)] = (
+                        group_links[(idx1, argi, out_idx, inp_idx)] = (
                             idx0,
                             argi,
                             out_idx,
                             inp_idx,
                         )
+                if error is not None:
+                    break
+            if error is not None:
+                logger.warning("Skipping malformed graph cluster: %s", error)
+                continue
+            self.cluster_links.update(group_links)
 
     def _all_input_nodes(self, node):
         """Variant of node.all_input_nodes that preserves duplicate nodes.

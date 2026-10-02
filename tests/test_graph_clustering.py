@@ -4,6 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 
 from collections import Counter
+from unittest.mock import Mock
 
 import torch
 from torch.distributed.fsdp import MixedPrecisionPolicy
@@ -14,6 +15,7 @@ from autoparallel._testing.models.llama3 import Transformer, TransformerModelArg
 from autoparallel.api import AutoParallel
 from autoparallel.export_json import _get_layer_index
 from autoparallel.graph_passes.graph_clustering import get_identical_regions
+from autoparallel.optimize_sharding import ShardingOptimizer
 
 
 def _clustered_nodes(clusters):
@@ -23,6 +25,58 @@ def _clustered_nodes(clusters):
         for region in group:
             clustered.update(region)
     return clustered
+
+
+def test_cluster_sort_preserves_node_correspondence():
+    graph = torch.fx.Graph()
+    x = graph.placeholder("x")
+    y = graph.placeholder("y")
+    sin_x = graph.call_function(torch.sin, (x,))
+    cos_x = graph.call_function(torch.cos, (x,))
+    add_x = graph.call_function(torch.add, (sin_x, cos_x))
+    cos_y = graph.call_function(torch.cos, (y,))
+    sin_y = graph.call_function(torch.sin, (y,))
+    add_y = graph.call_function(torch.add, (sin_y, cos_y))
+    graph.output((add_x, add_y))
+
+    value = torch.empty(2)
+    repeated_nodes = (sin_x, cos_x, add_x, cos_y, sin_y, add_y)
+    for node in repeated_nodes:
+        node.meta["val"] = value
+    strategies = dict.fromkeys(repeated_nodes, "strategy")
+
+    clusters = get_identical_regions(graph, strategies)
+    group = next(
+        group
+        for group in clusters
+        if len(group) == 2 and {region[-1] for region in group} == {add_x, add_y}
+    )
+
+    assert [node.target for node in group[0]] == [node.target for node in group[1]]
+    assert list(graph.nodes).index(cos_y) < list(graph.nodes).index(sin_y)
+    assert group[1].index(sin_y) < group[1].index(cos_y)
+
+
+def test_malformed_cluster_is_discarded_atomically(caplog):
+    graph = torch.fx.Graph()
+    x = graph.placeholder("x")
+    y = graph.placeholder("y")
+    sin_x = graph.call_function(torch.sin, (x,))
+    cos_x = graph.call_function(torch.cos, (sin_x,))
+    sin_y = graph.call_function(torch.sin, (y,))
+    tan_y = graph.call_function(torch.tan, (sin_y,))
+
+    optimizer = ShardingOptimizer.__new__(ShardingOptimizer)
+    optimizer.cluster_links = {}
+    optimizer.strats = dict.fromkeys(graph.nodes, Mock())
+    optimizer.nodes = list(optimizer.strats)
+    optimizer.node_map = {node: index for index, node in enumerate(optimizer.nodes)}
+    optimizer.walk_over_options = lambda node: iter([(0, 0, 0)])
+
+    optimizer.create_cluster_links([[[sin_x, cos_x], [sin_y, tan_y]]])
+
+    assert optimizer.cluster_links == {}
+    assert "Skipping malformed graph cluster" in caplog.text
 
 
 def _clustering_stats(graph, strats, clusters, n_layers):
