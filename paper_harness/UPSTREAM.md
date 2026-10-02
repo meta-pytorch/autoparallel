@@ -2,8 +2,9 @@
 
 ## TorchTitan
 
-The locked source is `kaijian/deepseek-baseline-parity-20260918` in
-`AlbedoWang/torchtitan` at `4b46d18d`. Its history has `383cae9f` as an actual
+The locked source is `kaijian/ap-submission-4d` in `AlbedoWang/torchtitan` at
+`3b24e620`, a child of `4b46d18d` on
+`kaijian/deepseek-baseline-parity-20260918`. Its history has `383cae9f` as an actual
 ancestor and retains the `60517d28` AutoParallel/GraphTrainer integration.
 
 - `383cae9f`: eager SAC treats AutoParallel collectives like other
@@ -44,14 +45,12 @@ ancestor and retains the `60517d28` AutoParallel/GraphTrainer integration.
   `max_compute_pre_fetch` 10 -> 20.
 - `4b46d18d` restores `max_compute_pre_fetch` to 10 and keeps
   `compute_overlap_multipler=0.5`.
-- `cf091127` (local branch `agent/apgt-no-pass2-20261001`, child of
-  `4b46d18d`) sets `aten_distributed_optimizations.enable_overlap_scheduling`
+- `cf091127` (child of `4b46d18d`) sets `aten_distributed_optimizations.enable_overlap_scheduling`
   to False, so Inductor runs no overlap pass (pass 2) after the AP
   reordering/bucketing pass. Experiment pin for the LLaMA 3 8B 4D CP hang
   (v20: ring attention traces per-CP-rank graphs and pass 2 orders mesh_cp
-  collectives differently across CP ranks); the lock remote is the local
-  repository because the commit is not pushed.
-- `3b24e620` (local branch `agent/ulysses-cp-20261001`, child of `cf091127`)
+  collectives differently across CP ranks).
+- `3b24e620` (child of `cf091127`)
   replaces SDPA ring-attention CP with Ulysses all-to-all in all three arms:
   `apply_cp_to_forward` (tt, graph_trainer manual) uses funcol
   `all_to_all_single` on the CP group, and the AutoParallel CP local_map body
@@ -59,8 +58,7 @@ ancestor and retains the `60517d28` AutoParallel/GraphTrainer integration.
   same graph (ring attention did not, and v20-v22 apgt hung on mesh_cp order).
   Ulysses needs contiguous sequence shards, so the LLaMA 3 3D/4D settings use
   `context_parallel_load_balancer=None` and the trainer rejects default-backend
-  SDPA CP with a load balancer. It is the runtime pin; the lock remote is the
-  local repository because the commit is not pushed.
+  SDPA CP with a load balancer. It is the runtime pin.
 
 The 3D port includes only the approved legacy-DTensor AP configuration, CP
 input-ownership seam, DP-shard/CP/TP mesh, CP-aware SDPA, DTensor output, and
@@ -69,8 +67,10 @@ intentionally excluded.
 
 ## AutoParallel
 
-The maintained harness remains on `kaijian/paper-submission`. Runtime source
-is pinned to the commit immediately before the lock/harness-only updates.
+The maintained harness remains on `kaijian/paper-submission`; the 4D line
+(v19-v24) is on `kaijian/paper-submission-4d`, which merges the runtime
+commits `9a16ded`..`98b20b4` at their original SHAs. Runtime source is pinned
+to the commit immediately before the lock/harness-only updates.
 
 - `b8ace2a5` is represented by replay `3408588`.
 - `570bf072` is represented by the equivalent cuDNN broadcast-mask fix at
@@ -124,28 +124,27 @@ is pinned to the commit immediately before the lock/harness-only updates.
   truncated the polish at a speed-dependent point: 3 of 64 ranks returned a
   different plan and the job hung in mismatched collectives. The sweep budgets
   (`bp_iters`, `max_sweeps`, `star_passes`) still bound the solve.
-- `9a16ded` (local, cherry-pick of `02ea6f4`) makes view inputs contiguous
+- `9a16ded` (cherry-pick of `02ea6f4`) makes view inputs contiguous
   before DTensor wrapping in static lowering, so `apply_sharding` no longer
   runs uncached full-mesh clone sharding propagation per view op (hours on the
   LLaMA 3 4D mesh).
-- `7a14fa2` (local, cherry-pick of `b723cd2`) keeps mesh dims the parameter
+- `7a14fa2` (cherry-pick of `b723cd2`) keeps mesh dims the parameter
   storage does not shard (the HSDP replicate dim) in place when projecting the
   storage order onto a gradient producer's inputs. Without it the 4D
   lm_head-backward tangent keeps the default order and the lowered graph
   differs per rank (step-1 deadlock).
-- `62a6085` (local) orders a parameter's storage by the mesh dims its forward
+- `62a6085` orders a parameter's storage by the mesh dims its forward
   chain releases (never-released outermost, later releases further out) when
   the earlier ordered-storage gates left it unordered, and keeps the order only
   if every param/grad chain edge then runs exactly the collectives the solver
   priced. On the LLaMA 3 4D mesh the earlier gates ordered only lm_head, so
   FSDP gathers and gradient reductions lowered to unpriced all_to_all chains.
-- `98b20b4` (local) prices the default-order redistributions an approximate
+- `98b20b4` prices the default-order redistributions an approximate
   solve selects that have no one-collective-per-mesh-dim plan by the plan
   lowering emits for them, and re-solves until no unpriced one is selected.
   On the LLaMA 3 4D 2x2x2x2 mesh, gathering the middle mesh dim of S0S0S1S0
   activations lowered to all_to_all, all_gather, all_to_all priced as one
-  all_gather. It is the runtime pin; the lock remote is the local repository
-  because the four commits are not pushed.
+  all_gather. It is the runtime pin.
 
 ## Reproduction policy
 
