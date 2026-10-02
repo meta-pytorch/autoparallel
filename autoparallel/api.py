@@ -705,8 +705,9 @@ def auto_parallel(
             - Tensor: Assumed Replicate on all mesh dimensions
             Can also be a callable that returns the above.
         out_shardings: Output sharding specification as a pytree matching the
-            model output structure. Each leaf should be a tuple of Placements.
-            For a single output, can be just the placement tuple.
+            model output structure. Each leaf should be a tuple of Placements or
+            ``UNCONSTRAINED`` to let the optimizer choose its placement. For a
+            single output, this can be just the placement tuple or marker.
             Examples:
                 - Single output: (Shard(0), Replicate())
                 - Tuple output: ((Shard(0),), (Shard(0),))
