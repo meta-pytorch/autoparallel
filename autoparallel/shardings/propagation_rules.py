@@ -39,8 +39,10 @@ from torch.distributed.tensor._ops._view_ops import (
 from torch.distributed.tensor._ops.utils import (
     expand_to_full_mesh_op_strategy,
     generate_redistribute_costs,
+    is_tensor_dim_sharded,
     is_tensor_shardable,
     normalize_dim,
+    shift_shard_dims_after_remove,
 )
 from torch.distributed.tensor.placement_types import (
     Partial,
@@ -54,7 +56,11 @@ from ..cast_parametrization import dtype_cast  # noqa
 
 # need to import this to have doc_packed_attn_op registered
 from ..ops import doc_packed_attn  # noqa: F401
-from .dtensor_sharding_helpers import _try_single_dim_strategy, get_op_strategy
+from .dtensor_sharding_helpers import (
+    _try_single_dim_strategy,
+    get_op_strategy,
+    replicate_op_strategy,
+)
 
 _op_rules = {}
 
@@ -570,7 +576,38 @@ def convert_element_type_rule(mesh, op_schema):
 
 @register_rule(torch.ops.aten._unsafe_index.Tensor)
 def _unsafe_index_rule(mesh, op_schema):
-    raise NotImplementedError()
+    return replicate_op_strategy(op_schema)
+
+
+@register_rule(torch.ops.aten.unbind.int)
+def unbind_rule(mesh, op_schema):
+    input_strategy = op_schema.args_schema[0]
+    if not isinstance(input_strategy, OpStrategy):
+        raise AssertionError(f"Expected OpStrategy, got {type(input_strategy)}")
+    input_ndim = input_strategy.ndim
+    input_shape = input_strategy.shape
+    dim = op_schema.args_schema[1] if len(op_schema.args_schema) > 1 else 0
+    dim = normalize_dim(dim, input_ndim)
+
+    strategies = []
+    for input_option in input_strategy.strategies:
+        input_spec = input_option.output_spec
+        if is_tensor_dim_sharded(input_spec, dim=dim):
+            continue
+        output_placements = shift_shard_dims_after_remove(input_spec.placements, dim)
+        output_specs = tuple(
+            DTensorSpec(mesh, tuple(output_placements)) for _ in range(input_shape[dim])
+        )
+        strategies.append(
+            OpSpec(
+                output_specs=output_specs,
+                input_specs=(input_spec,),
+                redistribute_cost=[
+                    generate_redistribute_costs(input_strategy, input_spec)
+                ],
+            )
+        )
+    return OpStrategy(strategies)
 
 
 def _einsum_single_dim_strategy(op, args_schema, kwargs_schema):
