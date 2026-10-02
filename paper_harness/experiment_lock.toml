@@ -8,7 +8,7 @@ dirty_policy = "forbid"
 
 [sources.autoparallel]
 remote = "/home/wangkj/workspace/autoparallel"
-commit = "92d30083ebbb7c7e3f974260313d5aceefc1203f"
+commit = "73e001b8eb3c2226aaa6759b36e64af9dda7e66d"
 dirty_policy = "forbid"
 
 [runtime]
