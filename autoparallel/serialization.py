@@ -188,6 +188,7 @@ def save_optimizer(opt, path):
             list(opt.mesh.mesh_dim_names) if opt.mesh.mesh_dim_names else None
         ),
         "force_grad_reduce_in_higher_precision": opt.force_grad_reduce_in_higher_precision,
+        "persistent_aliases": opt.persistent_aliases,
         "strats_by_name": strats_by_name,
         "dv_costs_node_names": save_node_names,
         "dv_costs_keys": dv_costs_keys,
@@ -260,6 +261,7 @@ def load_optimizer(cls, path):
     opt.force_grad_reduce_in_higher_precision = save_dict[
         "force_grad_reduce_in_higher_precision"
     ]
+    opt.persistent_aliases = save_dict.get("persistent_aliases", {})
     opt._constraint_log = []
     opt._memory_constraint = None
     opt._node_constraint_names = {}

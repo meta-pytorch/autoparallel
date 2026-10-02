@@ -23,16 +23,22 @@ def _build_alias_map(
     registers the same tensor under multiple FQNs only one survives. This
     function detects the aliases so they can be re-registered later.
     """
+    return {
+        fqn: canonical
+        for fqn, canonical in _build_state_alias_map(named_iter_fn).items()
+        if fqn != canonical
+    }
+
+
+def _build_state_alias_map(
+    named_iter_fn: Callable[..., Any],
+) -> dict[str, str]:
     canonical_by_id: dict[int, str] = {}
-    canonical_fqns: set[str] = set()
-    for fqn, tensor in named_iter_fn():
-        canonical_by_id[id(tensor)] = fqn
-        canonical_fqns.add(fqn)
-    alias_map: dict[str, str] = {}
+    aliases = {}
     for fqn, tensor in named_iter_fn(remove_duplicate=False):
-        if fqn not in canonical_fqns and id(tensor) in canonical_by_id:
-            alias_map[fqn] = canonical_by_id[id(tensor)]
-    return alias_map
+        canonical = canonical_by_id.setdefault(id(tensor), fqn)
+        aliases[fqn] = canonical
+    return aliases
 
 
 def _build_module_alias_map(model: torch.nn.Module) -> dict[str, str]:
