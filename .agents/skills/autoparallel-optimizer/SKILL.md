@@ -35,6 +35,9 @@ does not require a full evaluation report.
   world size. Then infer a topology-aligned 1D or 2D mesh and label it as a
   hypothesis. Do not use more than two dimensions; AutoParallel's ILP solve
   time currently grows impractically.
+- Require an explicit or detected NCCL topology for a final multi-node plan.
+  Treat the PyTorch fallback as provisional rather than silently ranking a
+  deployment with the wrong link model.
 - Trace with global logical input shapes and execute the lowered module with
   local per-rank inputs. Preserve the model's dtype, mixed-precision, launch,
   and initialization conventions.
@@ -47,7 +50,11 @@ before comparing costs. Read
 [references/global-spmd-modeling.md](references/global-spmd-modeling.md) when
 the forward may assume process-local execution. Read
 [references/mesh-selection.md](references/mesh-selection.md) when no mesh was
-provided.
+provided. Read
+[references/full-shard-planning.md](references/full-shard-planning.md) when a
+plan uses a near-`1 / world_size` memory bound, materially fully shards
+parameters, applies a prefetch discount, or puts latency-sensitive TP on a
+slower mesh axis.
 
 ## Method
 
@@ -59,17 +66,23 @@ provided.
 3. Select the supplied mesh or evaluate a bounded candidate set. On one
    high-bandwidth domain, use 1D unless memory pressure or explicit parallel
    axes give 2D a concrete purpose. Record how the intended allocation was
-   established, physical topology, mesh shape and names, workload shapes,
-   dtypes, and compiler settings.
+   established, physical topology, mesh shape and names, global batch,
+   effective DP degree and local batch, workload shapes, dtypes, and compiler
+   settings.
 4. Capture once, add only intended boundary and memory constraints, and call
    `optimize_placement()`. This is the plan operation. Note that
    `add_parameter_memory_constraint()` with no arguments sets the upper bound to
-   `1 / world_size`; it is not a neutral constraint.
+   `1 / world_size`; it is not a neutral constraint. For relaxed bounds, report
+   the selected byte-weighted parameter fraction separately: the current
+   constraint averages per-tensor sharding ratios rather than parameter bytes.
 5. Save placements, `get_json()`, and optionally the full optimizer before
    experimentation. Explore the stable joint graph by adding node constraints,
    calling `resolve()` and `diff_solutions()`, then removing the temporary
    constraints. Retrace only when graph-producing inputs or configuration
-   change.
+   change. For a full-shard plan whose serial and overlap assumptions may rank
+   placements differently, build the bounded candidate envelope in
+   `full-shard-planning.md`; do not tune a discount until it produces a desired
+   placement.
 6. For evaluation, preserve one communication cost model from planning through
    compile and graph estimation. Use
    `scripts/collect_reordered_metrics.py`; record when NCCL detection returns
@@ -92,6 +105,8 @@ provided.
   reordered estimates disagree.
 - Report forward and backward peak memory separately. Do not count the optimizer
   update unless it was separately captured and evaluated.
+- Treat a prefetch discount as a sensitivity assumption, not evidence that the
+  selected overlap is realizable. A zero discount is an optimistic endpoint.
 - Treat `local_map` regions as opaque unless they have an explicit cost or
   benchmark.
 
@@ -99,13 +114,23 @@ provided.
 
 - On capture failure, reduce to the smallest failing submodule and preserve the
   original traceback. Do not automatically hide it behind `local_map`.
+- If repeated-subgraph clustering alone asserts that linked nodes have
+  different strategy counts, retry once with `repeated_subgraphs=False`, retain
+  the clustering failure, and do not describe the fallback as equivalent
+  clustered coverage.
 - On infeasibility, remove temporary node constraints first, then relax output
   or memory constraints one at a time and report what restored feasibility.
 - On unexpected replication, inspect the parameter-memory constraint and the
   communication discount configuration.
+- On topology inversion, separate persistent parameter placement from heavy
+  compute placement, inspect the largest parameter-derived redistributions, and
+  apply the full-shard uncertainty workflow before recommending the plan.
 - On metric failure, verify that compilation produced partitioned graphs, that
   forward and backward both ran, and that planning and evaluation shared the
   same topology configuration.
+- A successful solve is not lowering evidence. Preserve failures caused by
+  uneven-shard padding, fixed views, tied parameters, or missing aliased
+  buffers instead of reporting the ILP placement as usable.
 - Consult `docs/troubleshooting.md` for established repository procedures.
 
 ## Output
@@ -116,3 +141,6 @@ summary, placements, SPMD audit, and artifact paths. For **Evaluate**, add
 separate forward/backward `GraphMetrics` and the cost-model status. For
 **Validate or measure**, state exactly what compiled, executed, was numerically
 compared, or was timed. Say `estimated` unless a target-hardware run was timed.
+For a provisional full-shard result, also provide the confidence card specified
+in `full-shard-planning.md` and return competing candidates rather than a false
+single optimum.

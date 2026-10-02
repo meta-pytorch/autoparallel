@@ -77,14 +77,13 @@ def test_classify_graph_phase_uses_tangents_and_partitioner_tags():
     assert classify_graph_phase(forward.graph) == "backward"
 
 
-def test_classify_graph_phase_rejects_ambiguous_tags():
+def test_classify_graph_phase_treats_mixed_tags_without_tangents_as_forward():
     gm = make_fx(lambda x: torch.cos(torch.sin(x)), tracing_mode="fake")(torch.ones(4))
     call_nodes = [node for node in gm.graph.nodes if node.op == "call_function"]
     call_nodes[0].meta["partitioner_tag"] = "is_forward"
     call_nodes[1].meta["partitioner_tag"] = "is_backward"
 
-    with pytest.raises(RuntimeError, match="mixed partitioner tags"):
-        classify_graph_phase(gm.graph)
+    assert classify_graph_phase(gm.graph) == "forward"
 
 
 def test_collector_restores_global_state_after_exception():

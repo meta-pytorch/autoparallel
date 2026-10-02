@@ -98,6 +98,15 @@
       "rubric_id": "recover_infeasible_counterfactual"
     },
     {
+      "id": "full_shard_overlap_uncertainty",
+      "mode": "plan",
+      "invocation": "implicit",
+      "skill_expected": true,
+      "workspace_copy": [],
+      "prompt": "An AutoParallel run on 512 H100s uses a (64, 8) mesh and a 1/512 parameter-memory upper bound. With undiscounted communication it selects large linear collectives on the 64-rank inter-node axis; when parameter prefetch communication is treated as free it instead selects 512-way FSDP and batch sharding. Explain how you would turn these results into an actionable recommendation without running a broad hyperparameter sweep. Planning advice only; do not execute or edit anything.",
+      "rubric_id": "full_shard_overlap_uncertainty"
+    },
+    {
       "id": "generic_pytorch_tuning",
       "mode": "negative",
       "invocation": "implicit",

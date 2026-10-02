@@ -95,6 +95,8 @@ Before capture, check:
 - the product of mesh dimensions equals the allocated world size;
 - global batch and explicitly batch-sharded inputs are compatible with the DP
   factor;
+- the resulting local batch per DP group is valid and large enough for the
+  model and representative kernels;
 - important tensor dimensions and head/expert counts support the proposed inner
   factor where those strategies are expected;
 - the global-SPMD model audit uses the same DP degree;
@@ -120,7 +122,8 @@ intended world_size and node count
 allocation source: user | launcher/config
 topology: nodes, GPUs per fast domain, rank-layout assumption
 selected mesh: shape and dimension names
-rationale: memory, model divisibility, batch size, and link locality
+rationale: memory, model divisibility, global batch, effective DP degree,
+  local batch per DP group, and link locality
 alternatives evaluated or rejected
 ```
 

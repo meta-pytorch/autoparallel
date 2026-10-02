@@ -54,11 +54,6 @@ def classify_graph_phase(graph: torch.fx.Graph) -> str:
     }
     if tags == {"is_backward"}:
         return "backward"
-    if "is_backward" in tags:
-        raise RuntimeError(
-            "Cannot classify a graph with mixed partitioner tags and no tangent "
-            "placeholder"
-        )
     return "forward"
 
 

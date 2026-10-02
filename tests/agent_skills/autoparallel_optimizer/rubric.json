@@ -271,6 +271,61 @@
       ]
     },
     {
+      "id": "full_shard_overlap_uncertainty",
+      "skill_expected": true,
+      "criteria": [
+        {
+          "id": "builds_bounded_endpoint_envelope",
+          "weight": 4,
+          "critical": true,
+          "description": "Treats the undiscounted and zero-discount results as pessimistic and optimistic placement endpoints, deduplicates placement families, and does not recommend a broad discount sweep.",
+          "evidence": ["response", "tool_trace"]
+        },
+        {
+          "id": "labels_zero_discount_optimistic",
+          "weight": 4,
+          "critical": true,
+          "description": "States that free prefetch communication is an optimistic sensitivity assumption rather than an executable performance prediction.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "uses_independent_optimizer_state",
+          "weight": 3,
+          "critical": true,
+          "description": "Notes that prefetch discounting mutates costs and requires a fresh capture or independently loaded saved optimizer for comparable endpoints.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "separates_storage_compute_and_topology",
+          "weight": 4,
+          "critical": true,
+          "description": "Separates persistent parameter placement from heavy-operation compute placement and flags latency-sensitive inter-node TP as topology inversion requiring investigation rather than automatic acceptance or forced reversal.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "evaluates_distinct_candidates_after_lowering",
+          "weight": 4,
+          "critical": true,
+          "description": "Proposes lowering only distinct candidates with the same NCCL topology, activation-checkpointing, and autobucketing configuration, then comparing forward/backward exposed communication and peak memory.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "reports_memory_and_batch_scope",
+          "weight": 2,
+          "critical": false,
+          "description": "Reports achieved byte-weighted parameter storage, distinguishes it from total training or transient memory, and checks effective DP degree and local batch.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "returns_provisional_confidence",
+          "weight": 3,
+          "critical": true,
+          "description": "Returns a provisional candidate set or confidence card when endpoint placements differ instead of claiming one ILP result is the final optimum.",
+          "evidence": ["response"]
+        }
+      ]
+    },
+    {
       "id": "generic_pytorch_tuning",
       "skill_expected": false,
       "criteria": [

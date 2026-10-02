@@ -53,16 +53,33 @@ with AutoParallel(model, input_fn, mesh, mp_policy=mp_policy) as autop:
 
 Output constraints align with the flattened output pytree. Use `None` for
 non-tensor leaves, for example `[(Shard(0),), None]` for `(logits, None)`.
+Omit `add_input_constraints()` or `add_output_constraints()` entirely when the
+boundary should be unconstrained. Passing `None` as the whole argument is not
+an unconstrained request: the underlying node constraint interprets a tensor
+placement of `None` as the default batch `Shard(0)` placement.
 
 Omitting the parameter-memory call leaves replication legal. Calling it with no
-arguments is different: it uses `low=0` and `high=1 / world_size`, requiring the
-aggregate parameter storage to fit the fully-sharded upper bound. Apply a
-prefetch discount only when the target execution is expected to realize that
-overlap, and always record its scale.
+arguments is different: it uses `low=0` and `high=1 / world_size`, forcing
+sufficiently shardable parameters toward their minimum local fraction. The
+current constraint averages per-tensor sharding ratios; for relaxed bounds,
+compute the selected byte-weighted fraction separately rather than describing
+the bound as a byte budget.
+
+Apply a prefetch discount only as an explicit sensitivity assumption and always
+record its scale. The operation mutates communication costs in place, so load a
+fresh saved optimizer or recapture before comparing another scale. For a
+full-shard plan, follow `full-shard-planning.md` rather than tuning the scale
+until a desired placement appears.
 
 Capture the placement, `get_json()["summary"]`, exact constraints, discount,
 mesh, and communication cost model before leaving the context. Save the full
 optimizer with `save()` when repeated counterfactual analysis is likely.
+
+Repeated-subgraph clustering is optional compression of the ILP, not a reason
+to discard an otherwise supported graph. If clustering asserts that two linked
+nodes have different input/output strategy counts, preserve the assertion and
+retry once with `repeated_subgraphs=False`. Do not use this retry for unrelated
+capture or strategy failures.
 
 `optimize_placement()` also emits `autoparallel_sharding_optimizer_log` and
 `autoparallel_solution` structured trace artifacts. Set `TORCH_TRACE` to a trace
@@ -139,11 +156,15 @@ The helper detects the NCCL topology by default, passes that same object to
 AutoParallel through `collector.cost_model`, records whether the result is NCCL
 or a PyTorch fallback, and restores the prior global state. Pass an explicit
 `NCCLTopoConfig` as `nccl_topology=` for non-standard hardware.
+Do not treat a multi-node fallback result as a final deployment ranking; obtain
+or construct the topology profile, or report the evaluation as provisional.
 
 The helper refuses an already configured `post_grad_custom_post_pass`; compose a
 model-specific pass explicitly instead of silently changing pass order. It
-identifies backward graphs by `tangents_*` placeholders and uses
-`partitioner_tag` when no tangent placeholder is present. It records every
+identifies backward graphs by `tangents_*` placeholders and treats an
+all-`is_backward` graph as backward when no tangent placeholder is present.
+Mixed partitioner tags can survive recomputation in a partitioned forward
+graph, so they do not make the phase ambiguous by themselves. It records every
 specialization and can emit optional forward/backward Perfetto traces with
 `trace_dir=`. Metrics contain a compact placeholder count by default; pass
 `include_placeholder_signatures=True` only when shapes and dtypes are needed to
@@ -199,3 +220,7 @@ Typical durable artifacts are `placements.json`, `optimizer.json`,
 `metrics.json`, and `optimizer.log`. Generate full optimizer state and execution
 traces only when repeated exploration or timeline debugging warrants their
 size.
+
+For a full-shard or topology-inverted plan, include the confidence card from
+`full-shard-planning.md` and preserve the serial and optimistic endpoint
+artifacts independently.
