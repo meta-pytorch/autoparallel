@@ -33,7 +33,7 @@ point = "128gpu"
 [[settings]]
 model = "llama3_8b"
 setting = "1d-fsdp8"
-campaign = "campaigns/llama3_8b_2d.toml"
+campaign = "campaigns/variants/llama3_8b_2d_1d_fsdp8.toml"
 point = "1d-fsdp8"
 
 [[settings]]

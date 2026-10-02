@@ -1,0 +1,152 @@
+schema_version = 1
+name = "llama3-8b-2d-unified"
+description = "LLaMA 3 8B 1D FSDP8 without tt_eager (eager TorchTitan main exceeds 80 GB at 16384 tokens per rank)"
+workload = "llama3_8b_2d"
+
+[model]
+flavor = "8B"
+attention_backend = "varlen"
+
+[data]
+mode = "replay"
+identity = "manifest"
+dataset = "allenai/c4"
+revision = "1588ec454efa1a09f29cd18ddd04fe05fc8653a2"
+identity_manifest = "{asset:llama_replay}/manifest.json"
+identity_manifest_sha256 = "2f17a4bdf5328e6b9949d5c78ee66fb59393fba7f1c7d55cc827cc5923237020"
+preflight_auditor = "workloads.llama3_2d.input_preflight"
+
+[training]
+max_context_length = 8192
+num_tokens_per_microbatch_per_dp_rank = 16384
+num_tokens_per_train_step = 32768
+
+[parallelism]
+data_parallel_replicate_degree = 1
+data_parallel_shard_degree = 2
+tensor_parallel_degree = 4
+context_parallel_degree = 1
+pipeline_parallel_degree = 1
+
+[dataloader]
+max_num_documents = 2
+
+[checkpointer]
+folder = "checkpoint"
+initial_load_path = "{asset:llama3_3d_seed_checkpoint}"
+initial_load_model_only = true
+initial_load_in_hf = true
+load_only = true
+
+[comparison]
+declared_variable = "training_parallelization_compile_stack"
+allowed_config_paths = ["compile.*", "_class", "model._class"]
+allowed_environment_keys = ["BENCHMARK_CONFIGURATION", "EXPERIMENT_ARM", "BENCHMARK_TP_DEGREE"]
+pairs = [["tt_compiled_loss", "apgt"]]
+
+[mast]
+nodes = 1
+nproc_per_node = 8
+hardware = "grandteton_80g_roce"
+locality = "dc;pci1"
+gpu_name_contains = "H100"
+retries = 0
+master_port = 29500
+phase_timeout_seconds = 7200
+
+[mast.environment]
+AUTOPARALLEL_NCCL_COST_MODEL_PROFILE = "h100_nvswitch_roce_400g"
+BENCHMARK_MODEL = "8B"
+BENCHMARK_WORLD_SIZE = "8"
+BENCHMARK_TP_DEGREE = "4"
+BENCHMARK_GLOBAL_BATCH_SIZE = "4"
+LLAMA_TOKENIZER_DIR = "{asset:llama_tokenizer}"
+REPLAY_TENSORS_PATH = "{asset:llama_replay}/replay_tokens.pt"
+REPLAY_MANIFEST_PATH = "{asset:llama_replay}/manifest.json"
+HF_HUB_OFFLINE = "1"
+HF_DATASETS_OFFLINE = "1"
+HF_HUB_DISABLE_XET = "1"
+PYTORCH_ALLOC_CONF = "expandable_segments:True"
+TORCHINDUCTOR_CUDAGRAPHS = "0"
+
+[artifacts]
+required_assets = ["llama_tokenizer", "llama_replay", "llama3_3d_seed_checkpoint"]
+warmup_steps = 5
+
+[[arms]]
+name = "tt_eager"
+profile = "tt_eager"
+module = "workloads.llama3_2d.perf_configs"
+config = "torchtitan_eager_8b"
+[arms.environment]
+BENCHMARK_CONFIGURATION = "torchtitan_eager"
+EXPERIMENT_ARM = "T"
+AP_COLLECTIVE_MUST_SAVE_EXPECTATION = "off"
+
+[[arms]]
+name = "tt_compiled_loss"
+profile = "tt_compiled_loss"
+module = "workloads.llama3_2d.perf_configs"
+config = "torchtitan_compiled_loss_8b"
+[arms.environment]
+BENCHMARK_CONFIGURATION = "torchtitan_compiled_loss"
+EXPERIMENT_ARM = "L"
+AP_COLLECTIVE_MUST_SAVE_EXPECTATION = "off"
+
+[[arms]]
+name = "gt_manual"
+profile = "gt"
+module = "workloads.llama3_2d.perf_configs"
+config = "graphtrainer_manual_8b"
+[arms.environment]
+BENCHMARK_CONFIGURATION = "graphtrainer_manual"
+EXPERIMENT_ARM = "M"
+AP_COLLECTIVE_MUST_SAVE_EXPECTATION = "off"
+
+[[arms]]
+name = "apgt"
+profile = "apgt"
+module = "workloads.llama3_2d.perf_configs"
+config = "autoparallel_graphtrainer_8b"
+[arms.overrides]
+"compile.autoparallel_solver" = "approx"
+[arms.environment]
+BENCHMARK_CONFIGURATION = "autoparallel_graphtrainer"
+EXPERIMENT_ARM = "G"
+AP_COLLECTIVE_MUST_SAVE_EXPECTATION = "off"
+
+[[phases]]
+name = "performance"
+kind = "performance"
+arms = ["tt_compiled_loss", "apgt"]
+[phases.overrides]
+"training.steps" = 25
+"profiler.enable_profiling" = false
+"profiler.enable_memory_snapshot" = false
+"metrics.log_freq" = 5
+
+[[phases]]
+name = "trace"
+kind = "trace"
+arms = ["tt_compiled_loss", "apgt"]
+trace_ranks = [0]
+[phases.overrides]
+"training.steps" = 6
+"profiler.enable_profiling" = true
+"profiler.enable_memory_snapshot" = false
+"profiler.profile_freq" = 6
+"profiler.profiler_warmup" = 0
+"profiler.profiler_active" = 3
+"profiler.profiler_repeat" = 1
+"metrics.log_freq" = 1
+
+[[matrix.points]]
+name = "1d-fsdp8"
+[matrix.points.settings]
+"mast.nodes" = 1
+"parallelism.data_parallel_shard_degree" = 8
+"parallelism.tensor_parallel_degree" = 1
+"training.num_tokens_per_train_step" = 131072
+"mast.environment.BENCHMARK_WORLD_SIZE" = "8"
+"mast.environment.BENCHMARK_TP_DEGREE" = "1"
+"mast.environment.BENCHMARK_GLOBAL_BATCH_SIZE" = "16"
