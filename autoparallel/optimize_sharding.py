@@ -80,8 +80,14 @@ from typing import Any, Optional
 
 import pulp
 import torch
-from torch._functorch._aot_autograd.descriptors import PlainAOTInput, PlainAOTOutput
+from torch._functorch._aot_autograd.descriptors import (
+    InputMutationAOTOutput,
+    PlainAOTInput,
+    PlainAOTOutput,
+)
 from torch._functorch._aot_autograd.fx_utils import (
+    get_all_input_and_grad_nodes,
+    get_all_output_and_tangent_nodes,
     get_param_and_grad_nodes,
     get_param_nodes,
     get_plain_input_and_grad_nodes,
@@ -817,7 +823,36 @@ class ShardingOptimizer:
         self.add_output_input_consistent_constraint()
         self.add_inf_cost_constraint()
         self.add_forward_backward_consistency_constraints()
+        self.add_input_mutation_constraints()
         self.add_grad_reduce_dtype_constraints()
+
+    def add_input_mutation_constraints(self):
+        inputs = get_all_input_and_grad_nodes(self.graph)
+        outputs = get_all_output_and_tangent_nodes(self.graph)
+        for desc, (mutation_node, tangent_node) in outputs.items():
+            if not isinstance(desc, InputMutationAOTOutput):
+                continue
+            input_pair = inputs.get(desc.mutated_input)
+            if input_pair is None:
+                raise RuntimeError(
+                    f"Unsupported mutation output for input {desc.mutated_input}"
+                )
+            input_node, _grad_node = input_pair
+            if not isinstance(input_node, torch.fx.Node) or not isinstance(
+                mutation_node, torch.fx.Node
+            ):
+                raise RuntimeError(
+                    f"Unsupported non-tensor mutation for input {desc.mutated_input}"
+                )
+            self._add_paired_output_constraint(
+                input_node, mutation_node, "input_mutation_constraint"
+            )
+            if isinstance(tangent_node, torch.fx.Node):
+                self._add_paired_output_constraint(
+                    mutation_node,
+                    tangent_node,
+                    "grad_input_mutation_constraint",
+                )
 
     # ---- Prefetch overlap ----
 
