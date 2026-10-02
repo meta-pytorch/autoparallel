@@ -27,9 +27,15 @@ from __future__ import annotations
 import functools
 import logging
 import math
+import os
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING
+
+from .h100_nvswitch_roce_400g import (
+    H100_NVSWITCH_ROCE_400G_RUNTIME_RAMPS,
+    H100_NVSWITCH_ROCE_400G_RUNTIME_TABLES,
+)
 
 if TYPE_CHECKING:
     from torch.distributed.tensor import DeviceMesh
@@ -41,6 +47,11 @@ class GpuArch(Enum):
     AMPERE = 0  # A100
     HOPPER = 1  # H100/H200
     BLACKWELL = 2  # B200/GB200
+
+
+class NCCLCostModelProfile(Enum):
+    DEFAULT = "default"
+    H100_NVSWITCH_ROCE_400G = "h100_nvswitch_roce_400g"
 
 
 class NCCLFunc(Enum):
@@ -80,6 +91,7 @@ class NCCLTopoConfig:
     has_collnet: bool = False  # Enables CollNet Direct/Chain (SHARP)
     # Additional network latency beyond base hw latency (us)
     net_latency: float = 0.0
+    profile: NCCLCostModelProfile = NCCLCostModelProfile.DEFAULT
 
 
 @dataclass
@@ -1175,6 +1187,12 @@ def nccl_collective_time(
          corrections for NVLSTree BW ramp and Tree correction factor.
       3. All other configs: NCCL algo selection loop (tuning.cc port).
     """
+    profile_time = _profile_collective_time(
+        _PROFILE_FUNCTION_NAMES[func], n_bytes, topo, config
+    )
+    if profile_time is not None:
+        return profile_time
+
     is_hopper_nvswitch = (
         config.arch in (GpuArch.HOPPER, GpuArch.BLACKWELL) and config.has_nvswitch
     )
@@ -1241,6 +1259,10 @@ def nccl_all_to_all_cost(
          below some size threshold. Unlikely to matter for sharding decisions
          which typically involve large tensors.
     """
+    profile_time = _profile_collective_time("all_to_all", n_bytes, topo, config)
+    if profile_time is not None:
+        return profile_time
+
     n_ranks = topo.n_ranks
     n_nodes = topo.n_nodes
     _s = NCCLProto.SIMPLE.value
@@ -1347,6 +1369,43 @@ _CANONICAL_GPUS_PER_NODE = (
 )
 
 
+_PROFILE_FUNCTION_NAMES = {
+    NCCLFunc.ALLGATHER: "all_gather",
+    NCCLFunc.REDUCESCATTER: "reduce_scatter",
+    NCCLFunc.ALLREDUCE: "all_reduce",
+}
+
+
+def _profile_collective_time(
+    collective: str, n_bytes: int, topo: MeshDimTopo, config: NCCLTopoConfig
+) -> float | None:
+    if (
+        config.profile != NCCLCostModelProfile.H100_NVSWITCH_ROCE_400G
+        or config.arch != GpuArch.HOPPER
+    ):
+        return None
+    key = (topo.n_nodes, topo.ppn)
+    parameters = H100_NVSWITCH_ROCE_400G_RUNTIME_TABLES[collective].get(key)
+    ramp = H100_NVSWITCH_ROCE_400G_RUNTIME_RAMPS[collective].get(key)
+    if parameters is None or ramp is None:
+        return None
+    latency, peak_bw = parameters
+    per_rank_bytes = n_bytes // topo.n_ranks
+    effective_bw = peak_bw * _interp_correction(ramp, per_rank_bytes)
+    return latency + n_bytes / (1000.0 * effective_bw)
+
+
+def _configured_cost_model_profile() -> NCCLCostModelProfile:
+    value = os.environ.get("AUTOPARALLEL_NCCL_COST_MODEL_PROFILE", "default")
+    try:
+        return NCCLCostModelProfile(value)
+    except ValueError as error:
+        choices = ", ".join(profile.value for profile in NCCLCostModelProfile)
+        raise ValueError(
+            f"Unknown NCCL cost model profile {value!r}; expected one of: {choices}"
+        ) from error
+
+
 def detect_nccl_topo_config(mesh: "DeviceMesh") -> NCCLTopoConfig | None:
     """Auto-detect GPU architecture and build an NCCLTopoConfig from the mesh.
 
@@ -1404,7 +1463,11 @@ def detect_nccl_topo_config(mesh: "DeviceMesh") -> NCCLTopoConfig | None:
     if matched_name == "A100":
         return a100_topo_config(num_nodes=num_nodes, gpus_per_node=gpus_per_node)
     elif matched_name in ("H100", "H200"):
-        return h100_topo_config(num_nodes=num_nodes, gpus_per_node=gpus_per_node)
+        return h100_topo_config(
+            num_nodes=num_nodes,
+            gpus_per_node=gpus_per_node,
+            profile=_configured_cost_model_profile(),
+        )
     elif matched_name in ("B200", "GB200"):
         return gb200_topo_config(num_nodes=num_nodes, gpus_per_node=gpus_per_node)
     return None
