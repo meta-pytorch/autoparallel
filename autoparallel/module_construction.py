@@ -23,21 +23,15 @@ def _build_alias_map(
     registers the same tensor under multiple FQNs only one survives. This
     function detects the aliases so they can be re-registered later.
     """
-    return {
-        fqn: canonical
-        for fqn, canonical in _build_state_alias_map(named_iter_fn).items()
-        if fqn != canonical
-    }
-
-
-def _build_state_alias_map(
-    named_iter_fn: Callable[..., Any],
-) -> dict[str, str]:
     canonical_by_id: dict[int, str] = {}
-    aliases = {}
+    canonical_fqns: set[str] = set()
+    for fqn, tensor in named_iter_fn():
+        canonical_by_id[id(tensor)] = fqn
+        canonical_fqns.add(fqn)
+    aliases: dict[str, str] = {}
     for fqn, tensor in named_iter_fn(remove_duplicate=False):
-        canonical = canonical_by_id.setdefault(id(tensor), fqn)
-        aliases[fqn] = canonical
+        if fqn not in canonical_fqns and id(tensor) in canonical_by_id:
+            aliases[fqn] = canonical_by_id[id(tensor)]
     return aliases
 
 
@@ -248,5 +242,28 @@ def make_parallel_module(
         if k not in mod._modules:
             mod._modules[k] = v
 
+    original_to_empty = mod.to_empty
+
+    def alias_preserving_to_empty(*args, **kwargs):  # type: ignore[no-untyped-def]
+        result = original_to_empty(*args, **kwargs)
+        for alias_fqn, canonical_fqn in param_alias_map.items():
+            _assign_attr(
+                result.get_parameter(canonical_fqn),
+                result,
+                ref_model,
+                alias_fqn,
+                attr_kind=_AttrKind.PARAMETER,
+            )
+        for alias_fqn, canonical_fqn in buffer_alias_map.items():
+            _assign_attr(
+                result.get_buffer(canonical_fqn),
+                result,
+                ref_model,
+                alias_fqn,
+                attr_kind=_AttrKind.BUFFER,
+            )
+        return result
+
+    mod.to_empty = alias_preserving_to_empty  # type: ignore[assignment]
     wrap_init_weights(mod)
     return mod

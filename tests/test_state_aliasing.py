@@ -10,6 +10,7 @@ import torch
 from conftest import apply_cuda_patches
 from torch import nn
 from torch._functorch._aot_autograd.descriptors import BufferAOTInput, ParamAOTInput
+from torch._functorch._aot_autograd.fx_utils import get_named_buffer_nodes
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
 from autoparallel.api import AutoParallel
@@ -31,10 +32,7 @@ def _make_alias_optimizer(mesh):
     output.meta["desc"] = [None]
 
     gm = torch.fx.GraphModule(torch.nn.Module(), graph)
-    aliases = {
-        "embedding.weight": "embedding.weight",
-        "decoder.weight": "embedding.weight",
-    }
+    aliases = {"decoder.weight": "embedding.weight"}
     optimizer = ShardingOptimizer(gm, mesh, persistent_aliases=aliases)
     return optimizer, embedding, decoder
 
@@ -70,14 +68,8 @@ def test_aliased_state_is_materialized_once():
     output.meta["desc"] = [None, None]
     gm = torch.fx.GraphModule(torch.nn.Module(), graph)
 
-    param_aliases = {
-        "embedding.weight": "embedding.weight",
-        "decoder.weight": "embedding.weight",
-    }
-    buffer_aliases = {
-        "observer.enabled": "observer.enabled",
-        "activation_post_process.enabled": "observer.enabled",
-    }
+    param_aliases = {"decoder.weight": "embedding.weight"}
+    buffer_aliases = {"activation_post_process.enabled": "observer.enabled"}
     physical_placements = {parameter: object(), buffer: object()}
 
     with patch(
@@ -145,3 +137,55 @@ def test_tied_weight_executes_with_summed_gradient(device_mesh_1d):
         parallel_model.embedding.weight.grad.to_local(),
         weight_1.grad + weight_2.grad,
     )
+
+
+class AliasedBufferModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.register_buffer("freqs", torch.zeros(512, 8))
+        self.rope = nn.Module()
+        self.rope.register_buffer("cache", self.freqs)
+
+    def forward(self, x):
+        return x + self.freqs + self.rope.cache
+
+    def init_weights(self):
+        self.freqs.fill_(1)
+
+
+@apply_cuda_patches
+def test_aliased_buffers_share_placement_and_runtime_object(device_mesh_1d):
+    def input_fn():
+        return torch.randn(512, 8, device="cuda")
+
+    with torch.device("meta"):
+        model = AliasedBufferModel()
+    with AutoParallel(
+        model, input_fn, device_mesh_1d, repeated_subgraphs=False
+    ) as autop:
+        buffer_nodes = get_named_buffer_nodes(autop.sharding_optimizer.graph)
+        assert set(buffer_nodes) == {"freqs", "rope.cache"}
+        autop.sharding_optimizer.add_node_constraint(buffer_nodes["freqs"], (Shard(0),))
+        autop.sharding_optimizer.add_node_constraint(
+            buffer_nodes["rope.cache"], (Replicate(),)
+        )
+        with pytest.raises(RuntimeError, match="could not find a feasible solution"):
+            autop.optimize_placement()
+
+    with torch.device("meta"):
+        model = AliasedBufferModel()
+    with AutoParallel(
+        model, input_fn, device_mesh_1d, repeated_subgraphs=False
+    ) as autop:
+        autop.add_input_constraints([(Replicate(),)])
+        autop.add_output_constraints([(Replicate(),)])
+        solution = autop.optimize_placement()
+        parallel_model = autop.apply_placement(solution)
+
+    assert parallel_model.freqs is parallel_model.rope.cache
+    parallel_model.to_empty(device="cuda")
+    parallel_model.init_weights()
+    assert parallel_model.freqs is parallel_model.rope.cache
+
+    x = torch.randn(512, 8, device="cuda")
+    torch.testing.assert_close(parallel_model(x), x + 2)
