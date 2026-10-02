@@ -4,15 +4,17 @@
 # LICENSE file in the root directory of this source tree.
 
 import torch
+from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor._dtensor_spec import (
     DTensorSpec,
     ShardOrderEntry,
     TensorMeta,
 )
+from torch.distributed.tensor._op_schema import OpSpec
 from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
 from torch.fx.experimental.proxy_tensor import make_fx
 
-from autoparallel.apply_sharding import _compute_shard_order
+from autoparallel.apply_sharding import _compute_shard_order, _lower_to_parallel_graph
 from autoparallel.shardings.ordered_sharding import ordered_redistribute_local_tensor
 
 
@@ -70,6 +72,47 @@ def _make_tensor_meta(shape):
         torch.empty(shape, device="meta").stride(),
         torch.float32,
     )
+
+
+def test_static_view_preserves_uneven_global_shape():
+    reference_input = (
+        torch.arange(30, dtype=torch.float32).reshape(2, 15).requires_grad_()
+    )
+    reference_output = reference_input.view(2, 15)
+    reference_output.sum().backward()
+
+    for ranks, columns in (
+        (list(range(8)), slice(0, 2)),
+        ([1, 2, 3, 4, 5, 6, 7, 0], slice(14, 15)),
+    ):
+        mesh = DeviceMesh("cpu", ranks, _init_backend=False)
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        viewed = graph.call_function(torch.ops.aten.view.default, (x, [2, 15]))
+        graph.output(viewed)
+        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+
+        tensor_meta = _make_tensor_meta((2, 15))
+        spec = DTensorSpec(mesh, (Shard(1),), tensor_meta=tensor_meta)
+        placements = {
+            x: OpSpec(output_specs=spec, input_specs=(spec,)),
+            viewed: OpSpec(output_specs=spec, input_specs=(spec,)),
+        }
+        x.meta["val"] = reference_input.detach().to("meta")
+        viewed.meta["val"] = reference_output.detach().to("meta")
+
+        local_tensor = reference_input.detach()[:, columns].clone().requires_grad_()
+        parallel_gm = _lower_to_parallel_graph(
+            gm,
+            placements,
+            [local_tensor],
+            param_placement_order={},
+        )
+        actual = parallel_gm(local_tensor)
+        actual.sum().backward()
+
+        torch.testing.assert_close(actual, reference_output.detach()[:, columns])
+        torch.testing.assert_close(local_tensor.grad, reference_input.grad[:, columns])
 
 
 class TestOrderedRedistributeFusion:
