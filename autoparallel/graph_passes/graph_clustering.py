@@ -21,6 +21,7 @@ from torch._dynamo.graph_region_tracker import (
     Node,
     Region,
     _populate_recursive_ancestor_map,
+    _sort_with_ref_region,
     fully_expand_region_group,
     operator,
     tree_flatten,
@@ -30,17 +31,6 @@ from torch.distributed.tensor._op_schema import OpStrategy
 
 logger: logging.Logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
-
-
-def _sort_with_reference_region(
-    region_group: list[Region], topological_ranking: dict[Node, int]
-) -> None:
-    reference = region_group[0]
-    permutation = sorted(
-        range(len(reference)), key=lambda index: topological_ranking[reference[index]]
-    )
-    for region in region_group:
-        region[:] = [region[index] for index in permutation]
 
 
 def _extract_args(arg: Any) -> Any:
@@ -192,7 +182,11 @@ def get_identical_regions(
             node_to_recursive_ancestors,
             _is_identical,
         )
-        _sort_with_reference_region(region_group, topological_ranking)
+        index_to_rank = {
+            index: topological_ranking[node]
+            for index, node in enumerate(region_group[0])
+        }
+        _sort_with_ref_region(index_to_rank, region_group)
 
     region_groups = [
         region_group for region_group in region_groups if len(region_group[0]) > 1
