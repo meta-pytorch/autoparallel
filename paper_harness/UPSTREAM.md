@@ -2,9 +2,9 @@
 
 ## TorchTitan
 
-The locked source is `kaijian/ap-submission-4d` in `AlbedoWang/torchtitan` at
-`3b24e620`, a child of `4b46d18d` on
-`kaijian/deepseek-baseline-parity-20260918`. Its history has `383cae9f` as an actual
+The locked source is local `85c216d5`, a child of `3b24e620`
+(`kaijian/ap-submission-4d` in `AlbedoWang/torchtitan`), which is a child of
+`4b46d18d` on `kaijian/deepseek-baseline-parity-20260918`. Its history has `383cae9f` as an actual
 ancestor and retains the `60517d28` AutoParallel/GraphTrainer integration.
 
 - `383cae9f`: eager SAC treats AutoParallel collectives like other
@@ -58,7 +58,12 @@ ancestor and retains the `60517d28` AutoParallel/GraphTrainer integration.
   same graph (ring attention did not, and v20-v22 apgt hung on mesh_cp order).
   Ulysses needs contiguous sequence shards, so the LLaMA 3 3D/4D settings use
   `context_parallel_load_balancer=None` and the trainer rejects default-backend
-  SDPA CP with a load balancer. It is the runtime pin.
+  SDPA CP with a load balancer.
+- `85c216d5` (local branch `agent/tt-pass2-on-20261002`, child of `3b24e620`)
+  restores `enable_overlap_scheduling=True` (the `4b46d18d` setting): with
+  Ulysses every CP rank traces the same graph, so the reason for `cf091127` no
+  longer holds. It is the runtime pin; the lock remote is the local repository
+  because the commit is not pushed.
 
 The 3D port includes only the approved legacy-DTensor AP configuration, CP
 input-ownership seam, DP-shard/CP/TP mesh, CP-aware SDPA, DTensor output, and
