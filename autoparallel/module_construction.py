@@ -28,11 +28,11 @@ def _build_alias_map(
     for fqn, tensor in named_iter_fn():
         canonical_by_id[id(tensor)] = fqn
         canonical_fqns.add(fqn)
-    alias_map: dict[str, str] = {}
+    aliases: dict[str, str] = {}
     for fqn, tensor in named_iter_fn(remove_duplicate=False):
         if fqn not in canonical_fqns and id(tensor) in canonical_by_id:
-            alias_map[fqn] = canonical_by_id[id(tensor)]
-    return alias_map
+            aliases[fqn] = canonical_by_id[id(tensor)]
+    return aliases
 
 
 def _build_module_alias_map(model: torch.nn.Module) -> dict[str, str]:
@@ -242,5 +242,28 @@ def make_parallel_module(
         if k not in mod._modules:
             mod._modules[k] = v
 
+    original_to_empty = mod.to_empty
+
+    def alias_preserving_to_empty(*args, **kwargs):  # type: ignore[no-untyped-def]
+        result = original_to_empty(*args, **kwargs)
+        for alias_fqn, canonical_fqn in param_alias_map.items():
+            _assign_attr(
+                result.get_parameter(canonical_fqn),
+                result,
+                ref_model,
+                alias_fqn,
+                attr_kind=_AttrKind.PARAMETER,
+            )
+        for alias_fqn, canonical_fqn in buffer_alias_map.items():
+            _assign_attr(
+                result.get_buffer(canonical_fqn),
+                result,
+                ref_model,
+                alias_fqn,
+                attr_kind=_AttrKind.BUFFER,
+            )
+        return result
+
+    mod.to_empty = alias_preserving_to_empty  # type: ignore[assignment]
     wrap_init_weights(mod)
     return mod

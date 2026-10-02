@@ -45,7 +45,7 @@ from .input_validation import (
     _flatten_out_shardings,
     flatten_and_convert_inputs_to_local_shapes,
 )
-from .module_construction import make_parallel_module
+from .module_construction import _build_alias_map, make_parallel_module
 from .optimize_sharding import ShardingOptimizer
 from .shardings.placement_options import _get_device_from_mesh
 from .tracing import (
@@ -265,6 +265,8 @@ class AutoParallel:
             apply_dtype_cast(model, self.mp_policy)
 
         self.model = move_to_fake(model, self.fake_mode, device)
+        self.param_aliases = _build_alias_map(self.model.named_parameters)
+        self.buffer_aliases = _build_alias_map(self.model.named_buffers)
         self.input_fn = input_fn
         self.mesh = mesh
         self.compiler_fn = _boxed_nop_preserve_node_meta  # type: ignore[assignment]
@@ -323,6 +325,7 @@ class AutoParallel:
                 self.mesh,
                 force_grad_reduce_in_higher_precision,
                 repeated_subgraphs=self.repeated_subgraphs,
+                persistent_aliases={**self.param_aliases, **self.buffer_aliases},
             )
 
             self.sharding_optimizer = sharding_optimizer
@@ -471,6 +474,8 @@ class AutoParallel:
                 sharding_placement,
                 self.joint_with_descriptors.params_spec,
                 self.joint_with_descriptors.buffers_spec,
+                self.param_aliases,
+                self.buffer_aliases,
             )
         t_apply = time.perf_counter()
         # clean it up by removing the added aliases from previous pass

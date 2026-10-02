@@ -192,7 +192,10 @@ def test_param_alias_reregistered():
             self.lm_head.weight = self.embed.weight
 
         def forward(self, x):
-            return self.embed(x)
+            return self.lm_head(self.embed(x))
+
+        def init_weights(self):
+            nn.init.ones_(self.embed.weight)
 
     with torch.device("meta"):
         model = Model()
@@ -205,6 +208,21 @@ def test_param_alias_reregistered():
 
     assert hasattr(mod, "lm_head")
     assert mod.get_parameter("lm_head.weight") is mod.get_parameter("embed.weight")
+
+    mod.to_empty(device="cpu")
+    assert mod.get_parameter("lm_head.weight") is mod.get_parameter("embed.weight")
+    mod.init_weights()
+    assert mod.get_parameter("lm_head.weight") is mod.get_parameter("embed.weight")
+
+    x = torch.randn(4, dim)
+    actual = mod(x).sum()
+    actual.backward()
+
+    weight_1 = mod.embed.weight.detach().clone().requires_grad_()
+    weight_2 = mod.embed.weight.detach().clone().requires_grad_()
+    expected = nn.functional.linear(nn.functional.linear(x, weight_1), weight_2).sum()
+    expected.backward()
+    torch.testing.assert_close(mod.embed.weight.grad, weight_1.grad + weight_2.grad)
 
 
 def test_buffer_alias_reregistered():
