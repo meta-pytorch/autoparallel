@@ -104,7 +104,10 @@ from .graph_passes.graph_utils import (
     build_param_derived_set,
     build_terminal_derived_set,
 )
-from .shardings.ordered_sharding import default_order_redistribute_cost
+from .shardings.ordered_sharding import (
+    build_param_grad_linear_chains,
+    default_order_redistribute_cost,
+)
 from .shardings.placement_options import (
     get_placement_options_for_node,
     reset_placement_options_cache,
@@ -467,7 +470,7 @@ class ShardingOptimizer:
         # keeps the default order. Default-order redistributions without a
         # per-mesh-dim plan are priced by the plan lowering emits once a solve
         # selects them (_price_selected_redistributions).
-        self._ordered_storage: Optional[tuple[set, set]] = None
+        self._ordered_storage: Optional[set] = None
         self._lowered_costs: dict[tuple, float] = {}
 
         t0 = time.perf_counter()
@@ -821,16 +824,24 @@ class ShardingOptimizer:
         return None
 
     def _has_ordered_storage(self, node, argi):
+        # The nodes lowering can order: the parameter and gradient linear
+        # chains and the single producer a gradient chain starts from
+        # (ordered_sharding._producer_order_plan).
         if self._ordered_storage is None:
-            self._ordered_storage = (
-                build_param_derived_set(self.graph),
-                build_terminal_derived_set(self.graph),
+            param_and_grad = list(get_param_and_grad_nodes(self.graph).values())
+            node_to_source, source_to_chain = build_param_grad_linear_chains(
+                param_and_grad
             )
-        producers, consumers = self._ordered_storage
-        if node in consumers:
+            ordered = set(node_to_source)
+            for _, grad in param_and_grad:
+                chain = source_to_chain.get(grad)
+                if chain and len(chain[-1].all_input_nodes) == 1:
+                    ordered.add(chain[-1].all_input_nodes[0])
+            self._ordered_storage = ordered
+        if node in self._ordered_storage:
             return True
         input_nodes = self._all_input_nodes(node)
-        return argi < len(input_nodes) and input_nodes[argi] in producers
+        return argi < len(input_nodes) and input_nodes[argi] in self._ordered_storage
 
     def _price_selected_redistributions(self):
         """Price the selected default-order redistributions that have no
