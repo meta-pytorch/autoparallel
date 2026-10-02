@@ -18,15 +18,10 @@ second job when `job_id.txt` exists.
 
 Valid settings are declared in `run_settings.toml`:
 
-- `llama3_8b`: `2d-8gpu`, `2d-16gpu`, `2d-32gpu`, `2d-64gpu`,
-  `2d-128gpu`, `1d-fsdp8`, `2d-dps2-tp8`, `3d-dp2-cp2-tp2`,
-  `3d-dps4-cp2-tp4`, `3d-dpr2-dps2-tp8-paper-merged`, and
-  `seqlen-{2k,4k,8k,16k,32k}`;
-- `muse_glimmer_30b`: `1d-fsdp8`, `2d-dps8-tp2`, and
-  `2d-{16gpu,32gpu,64gpu,128gpu}`, plus
-  `3d-dpr2-dps8-tp2-paper-merged`;
-- `deepseek_v3_16b`: `efsdp-ep-{16gpu,32gpu}`, `1d-tp8-ep8-sp`,
-  `2d-dps2-tp8-ep8-sp`, and `3d-dps4-tp8-ep16-sp`.
+- `llama3_8b`: `2d-8gpu`, `2d-16gpu`, `2d-32gpu`, `2d-64gpu`, `2d-128gpu`,
+  `1d-fsdp8`, `2d-dps2-tp8`, `3d-dpr2-dps2-tp8-paper-merged`,
+  `3d-dpr2-dps4-tp8-paper-merged`, `3d-dps2-cp2-tp4-16k-ro4859-cost535`, and
+  `3d-dps8-cp2-tp4-16k-ro4859-cost535`.
 
 `HARNESS_WORKSPACE_ROOT` may select the parent directory for task records. It
 does not affect experiment inputs or source versions.
@@ -36,12 +31,11 @@ does not affect experiment inputs or source versions.
 `experiment_lock.toml` is the only authority for:
 
 - exact TorchTitan and AutoParallel commits and remotes;
-- `torchtitan_conda_prod:902` and exact runtime versions;
-- the legacy/default DTensor backend.
+- `torchtitan_conda_prod:967` and exact runtime versions.
 
-Campaigns cannot declare source revisions, conda packages, or
-`parallelism.spmd_backend`. Validation rejects such overrides. The source trees
-must be clean and at the exact locked commits.
+Campaigns cannot declare source revisions or conda packages. Validation
+rejects such overrides. The source trees must be clean and at the exact locked
+commits.
 
 `asset_lock.toml` pins the internal OilFS workspace, relative paths, file
 counts, and content hashes for every model, tokenizer, replay, placement, and
@@ -54,14 +48,14 @@ requires a version bump and manifest regeneration.
 
 ## Execution profiles
 
-- `tt_main_default_v1`: native TorchTitan model/parallelizer with ordinary
-  Inductor compilation.
-- `gt_manual_eager_v1`: GraphTrainer with eager memory policy and full Inductor
-  compilation.
-- `apgt_validated_v1`: AutoParallel + GraphTrainer validated defaults.
+- `tt_eager`: native TorchTitan model/parallelizer without compilation.
+- `tt_compiled_loss`: native TorchTitan with only the loss compiled by
+  Inductor (`compile.components=["loss"]`).
+- `gt`: GraphTrainer with eager memory policy and full Inductor compilation.
+- `apgt`: AutoParallel + GraphTrainer validated defaults.
 
 All active settings set `TORCHINDUCTOR_CUDAGRAPHS=0`. Both GraphTrainer
-profiles use full Inductor compilation and disable `cudagraph_pass`.
+profiles use full Inductor compilation and disable `cuda_graph_pass`.
 
 MainTrainer and manual GraphTrainer never import or invoke the AutoParallel
 parallelizer. The AutoParallel profile is the only profile that enables

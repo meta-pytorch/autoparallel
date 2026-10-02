@@ -1,9 +1,51 @@
-# Unified legacy-DTensor stack provenance
+# Unified stack provenance
 
 ## TorchTitan
 
-The locked source is `kaijian/deepseek-baseline-parity-20260918` in
-`AlbedoWang/torchtitan` at `4b46d18d`. Its history has `383cae9f` as an actual
+The locked source is `kaijian/spmd_types_ap` in `AlbedoWang/torchtitan` at
+`4169eb3e`: upstream main `6ff806fb` (#4974) plus the commits below, which
+move the v18 fork features onto main. Main uses spmd_types as its only
+distributed backend.
+
+- `9fcbb85b` uses AutoParallel overlap scheduling in the AutoParallel Inductor
+  compile. It ports fork `60517d28` (Inductor configs and pass selection),
+  `a25d7db3`, `b32acd82`, and `7966c411` + `4b46d18d`
+  (`compute_overlap_multipler=0.5`, `max_compute_pre_fetch` 10).
+- `646e5fce` annotates the AutoParallel model copy with module FQNs and keeps
+  the traced kwargs order in `AutoParallelGraph` (fork `60517d28` b, c).
+- `c22b866b` preserves tied parameter aliases in `minimal_fx_tracer` (fork
+  `60517d28` d).
+- `11cac8d3` adds `use_autoparallel_defaults`, `autoparallel_solver`, and the
+  placement save/load paths (fork `8eec9e6f`, `59f126f8` a).
+- `bdadd26f` applies process-group timeouts to the dense storage and sparse
+  mesh groups (fork `59f126f8` d, `c59ce51a`).
+- `fd299bc4` splits FSDP buckets over the full graph and re-sorts after
+  overlap moves (fork `4a297d02`).
+- `b7ce5238` reduce-scatters HSDP gradients before the replicate all-reduce
+  (fork `a68fa447`).
+- `f034b3f5` saves AutoParallel all-to-all/linear boundaries under eager SAC
+  (fork `6df7bc5f`, `69e752e3`, `2876c9ac`, `63d411f9`, `e8068c44`,
+  squashed).
+- `fe0bab28` runs the llama3 AutoParallel parallelizer on the present subset
+  of the `dp_replicate`/`dp_shard`/`cp`/`tp` mesh and replaces the fork's
+  ring-attention CP (`59f126f8` b, c) with Ulysses varlen CP: the cp
+  all-to-alls run inside an AutoParallel `local_map` around
+  `VarlenInnerAttention`.
+- `4169eb3e` gives the llama3 AutoParallel model separate w1/w3 feed-forward
+  weights (`SplitFeedForward`), so the solver keeps them column-parallel on
+  tp.
+
+Not carried: the `60517d28` (e) / `383cae9f` memory-policy hunk (net zero),
+`94e596cc` (bucket-plan consensus for ring CP; Ulysses graphs are SPMD), and
+the DeepSeek V3 and Muse Glimmer commits (`58b458293`, `26c329bd`,
+`8ceafd62`, `0dcc68c3`). `run_settings.toml` lists only llama3 settings in
+v19.
+
+### v18 fork (historical)
+
+Up to harness v18 the locked source was
+`kaijian/deepseek-baseline-parity-20260918` in `AlbedoWang/torchtitan` at
+`4b46d18d`, a fork of upstream `4b71e5fe`. Its history has `383cae9f` as an actual
 ancestor and retains the `60517d28` AutoParallel/GraphTrainer integration.
 
 - `383cae9f`: eager SAC treats AutoParallel collectives like other
@@ -52,8 +94,9 @@ intentionally excluded.
 
 ## AutoParallel
 
-The maintained harness remains on `kaijian/paper-submission`. Runtime source
-is pinned to the commit immediately before the lock/harness-only updates.
+Harness v19 is on `kaijian/spmd_types`; v18 remains on
+`kaijian/paper-submission`. Runtime source is pinned to the commit
+immediately before the lock/harness-only updates.
 
 - `b8ace2a5` is represented by replay `3408588`.
 - `570bf072` is represented by the equivalent cuDNN broadcast-mask fix at
@@ -107,12 +150,27 @@ is pinned to the commit immediately before the lock/harness-only updates.
   truncated the polish at a speed-dependent point: 3 of 64 ranks returned a
   different plan and the job hung in mismatched collectives. The sweep budgets
   (`bp_iters`, `max_sweeps`, `star_passes`) still bound the solve. It is the
-  runtime pin.
+  v18 runtime pin.
+- `8570a10` removes ring-attention context parallelism.
+- `90391fc`, `aba199e`, `a4d8dc0`, `8f1c74a`, and `094498d` are cherry-picks
+  of AutoParallel main PRs #530, #528, #531, #538, and #537.
+- `ebfd81d` normalizes the stack dim against the output ndim, and `92d3008`
+  adds an `aten.unbind.int` sharding rule.
+- `81dd292`, `149bbaa`, `f4ee949`, and `cff5b8b` make view inputs contiguous
+  before DTensor wrapping, keep unsharded-storage mesh dims in place when
+  projecting producer shard order, order 4D parameter storage by forward
+  release order, and price selected default-order redistributions by their
+  lowered plan.
+- `1fafde2` passes the global shape and stride to `DTensor.from_local` for
+  those view inputs.
+- `73e001b` skips lowered-plan pricing only for the nodes lowering can order
+  (parameter/gradient chains and the gradient producer). It is the runtime
+  pin.
 
 ## Reproduction policy
 
 `experiment_lock.toml` is authoritative. Active campaigns contain no source
-or runtime pins and cannot override the locked `default` DTensor backend.
+or runtime pins.
 Original campaign files are preserved under `provenance/campaigns/`.
 
 A moving branch name is not evidence for a result. Every report records the
