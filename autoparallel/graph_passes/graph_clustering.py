@@ -32,6 +32,17 @@ logger: logging.Logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 
+def _sort_with_reference_region(
+    region_group: list[Region], topological_ranking: dict[Node, int]
+) -> None:
+    reference = region_group[0]
+    permutation = sorted(
+        range(len(reference)), key=lambda index: topological_ranking[reference[index]]
+    )
+    for region in region_group:
+        region[:] = [region[index] for index in permutation]
+
+
 def _extract_args(arg: Any) -> Any:
     if isinstance(arg, Node):
         return arg.meta.get("val")
@@ -181,9 +192,7 @@ def get_identical_regions(
             node_to_recursive_ancestors,
             _is_identical,
         )
-        # sort topologically
-        for region in region_group:
-            region.sort(key=lambda n: topological_ranking[n])
+        _sort_with_reference_region(region_group, topological_ranking)
 
     region_groups = [
         region_group for region_group in region_groups if len(region_group[0]) > 1
