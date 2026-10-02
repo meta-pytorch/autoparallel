@@ -56,11 +56,7 @@ from ..cast_parametrization import dtype_cast  # noqa
 
 # need to import this to have doc_packed_attn_op registered
 from ..ops import doc_packed_attn  # noqa: F401
-from .dtensor_sharding_helpers import (
-    _try_single_dim_strategy,
-    get_op_strategy,
-    replicate_op_strategy,
-)
+from .dtensor_sharding_helpers import _try_single_dim_strategy, get_op_strategy
 
 _op_rules = {}
 
@@ -576,7 +572,7 @@ def convert_element_type_rule(mesh, op_schema):
 
 @register_rule(torch.ops.aten._unsafe_index.Tensor)
 def _unsafe_index_rule(mesh, op_schema):
-    return replicate_op_strategy(op_schema)
+    return get_op_strategy(torch.ops.aten.index.Tensor, op_schema)
 
 
 @register_rule(torch.ops.aten.unbind.int)

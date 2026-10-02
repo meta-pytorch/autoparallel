@@ -21,26 +21,38 @@ def _mesh(request, fixture):
 
 
 @pytest.mark.parametrize("fixture", ["device_mesh_1d", "device_mesh_2d"])
-def test_unsafe_index_strategy_is_replicated(request, fixture):
+def test_unsafe_index_reuses_index_strategy(request, fixture):
     mesh = _mesh(request, fixture)
     data = torch.empty(256, 16, device="meta")
     index = torch.empty(256, dtype=torch.int64, device="meta")
     data_strategy = _create_all_options(mesh, data.shape, tensor=data)
-    index_strategy = _create_all_options(mesh, index.shape, tensor=index)
+    index_input_strategy = _create_all_options(mesh, index.shape, tensor=index)
 
-    strategy = get_placement_options(
-        mesh,
-        torch.ops.aten._unsafe_index.Tensor,
-        (data_strategy, [index_strategy, None]),
-        (data, [index, None]),
-        {},
-    )
+    def get_strategy(op):
+        return get_placement_options(
+            mesh,
+            op,
+            (data_strategy, [index_input_strategy, None]),
+            (data, [index, None]),
+            {},
+        )
 
-    assert len(strategy.strategies) == 1
-    option = strategy.strategies[0]
-    replicated = (Replicate(),) * mesh.ndim
-    assert option.output_specs.placements == replicated
-    assert all(spec.placements == replicated for spec in option.input_specs)
+    unsafe_strategy = get_strategy(torch.ops.aten._unsafe_index.Tensor)
+    reference_strategy = get_strategy(torch.ops.aten.index.Tensor)
+
+    assert len(unsafe_strategy.strategies) > 1
+    assert len(unsafe_strategy.strategies) == len(reference_strategy.strategies)
+    for unsafe_option, index_option in zip(
+        unsafe_strategy.strategies, reference_strategy.strategies
+    ):
+        assert (
+            unsafe_option.output_specs.placements
+            == index_option.output_specs.placements
+        )
+        assert [spec.placements for spec in unsafe_option.input_specs] == [
+            spec.placements for spec in index_option.input_specs
+        ]
+        assert unsafe_option.redistribute_cost == index_option.redistribute_cost
 
 
 @pytest.mark.parametrize("fixture", ["device_mesh_1d", "device_mesh_2d"])
