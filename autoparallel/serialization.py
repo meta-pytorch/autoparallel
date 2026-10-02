@@ -174,7 +174,9 @@ def save_optimizer(opt, path):
     # Deepcopy the graph and keep only picklable metadata
     graph_copy = copy.deepcopy(opt.graph)
     for node in graph_copy.nodes:
-        node.meta["is_tensor_value"] = isinstance(node.meta.get("val"), torch.Tensor)
+        node.meta.setdefault(
+            "is_tensor_value", isinstance(node.meta.get("val"), torch.Tensor)
+        )
         meta = {k: v for k, v in node.meta.items() if k in _SAVE_META_KEYS}
         if node.name in module_paths:
             meta["module_path"] = module_paths[node.name]

@@ -4,6 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import tempfile
+from unittest.mock import patch
 
 import torch
 from conftest import apply_cuda_patches
@@ -87,5 +88,15 @@ def test_boundary_constraint_states(device_mesh_1d):
             if name == "add_sharded_input_constraint"
         )
         assert input_log["input_placements"][2] is UNCONSTRAINED
+
+        markers = {
+            node.name: node.meta["is_tensor_value"] for node in loaded.graph.nodes
+        }
+        with patch("torch.save") as save:
+            loaded.save("unused.ap")
+        resaved_graph = save.call_args.args[0]["graph"]
+        assert {
+            node.name: node.meta["is_tensor_value"] for node in resaved_graph.nodes
+        } == markers
 
         autop.apply_placement(solution)
