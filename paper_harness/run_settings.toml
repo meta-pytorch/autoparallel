@@ -214,3 +214,8 @@ campaign = "campaigns/variants/llama3_8b_4d_dpr2_dps2_cp2_tp2_16k_trace.toml"
 model = "llama3_8b"
 setting = "4d-dpr4-dps4-cp2-tp4-16k"
 campaign = "campaigns/variants/llama3_8b_4d_dpr4_dps4_cp2_tp4_16k.toml"
+
+[[settings]]
+model = "llama3_8b"
+setting = "4d-dpr4-dps4-cp2-tp4-16k-trace"
+campaign = "campaigns/variants/llama3_8b_4d_dpr4_dps4_cp2_tp4_16k_trace.toml"
