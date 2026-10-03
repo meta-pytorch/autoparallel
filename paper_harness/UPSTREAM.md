@@ -2,8 +2,8 @@
 
 ## TorchTitan
 
-The locked source is local `85c216d5`, a child of `3b24e620`
-(`kaijian/ap-submission-4d` in `AlbedoWang/torchtitan`), which is a child of
+The locked source is local `c0fac771`, a child of local `85c216d5`, a child of
+`3b24e620` (`kaijian/ap-submission-4d` in `AlbedoWang/torchtitan`), which is a child of
 `4b46d18d` on `kaijian/deepseek-baseline-parity-20260918`. Its history has `383cae9f` as an actual
 ancestor and retains the `60517d28` AutoParallel/GraphTrainer integration.
 
@@ -62,8 +62,14 @@ ancestor and retains the `60517d28` AutoParallel/GraphTrainer integration.
 - `85c216d5` (local branch `agent/tt-pass2-on-20261002`, child of `3b24e620`)
   restores `enable_overlap_scheduling=True` (the `4b46d18d` setting): with
   Ulysses every CP rank traces the same graph, so the reason for `cf091127` no
-  longer holds. It is the runtime pin; the lock remote is the local repository
-  because the commit is not pushed.
+  longer holds.
+- `c0fac771` (local branch `agent/tt-ap-est-mesh-20261002`, child of `85c216d5`)
+  builds the AutoParallel runtime estimator on the mesh AutoParallel lowered the
+  model on, recorded by `AutoParallelGraph.apply_placement_for_fx_module`.
+  Before, it used the TorchTitan legacy (dp_replicate, fsdp, tp) mesh, whose
+  process groups differ from the AutoParallel mesh for 4D, 3D CP, and EP, so the
+  estimator priced every collective on the flattened world. It is the runtime
+  pin; the lock remote is the local repository because the commit is not pushed.
 
 The 3D port includes only the approved legacy-DTensor AP configuration, CP
 input-ownership seam, DP-shard/CP/TP mesh, CP-aware SDPA, DTensor output, and
