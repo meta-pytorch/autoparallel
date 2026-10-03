@@ -399,6 +399,11 @@ class AutoParallel:
             tuple(self.mesh.shape),
             input_constraints=self.input_constraints,
             output_constraints=self.output_constraints,
+            parameter_axis_constraints=[
+                args
+                for kind, args in self._pending_constraints
+                if kind == "parameter_axis"
+            ],
             cost_model=self.cost_model,
             force_grad_reduce_in_higher_precision=self.force_grad_reduce_in_higher_precision,
             repeated_subgraphs=self.repeated_subgraphs,

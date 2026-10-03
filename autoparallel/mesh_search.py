@@ -305,6 +305,7 @@ def _build_split_dim_seed(
     *,
     input_constraints=None,
     output_constraints=None,
+    parameter_axis_constraints: list[tuple[int, Placement]] | None = None,
     cost_model: Any = "nccl",
     force_grad_reduce_in_higher_precision: bool = False,
     repeated_subgraphs: bool = True,
@@ -321,6 +322,9 @@ def _build_split_dim_seed(
         mesh_shape: Target mesh shape.
         input_constraints: Optional user input placement constraints.
         output_constraints: Optional user output placement constraints.
+        parameter_axis_constraints: Optional ``(axis, placement)`` parameter
+            axis rules; each one also constrains the one-dimensional solve of
+            its axis.
         cost_model: Cost model identifier or NCCL topology config.
         force_grad_reduce_in_higher_precision: Whether gradient reductions use
             higher precision costs.
@@ -355,9 +359,17 @@ def _build_split_dim_seed(
     for dim_idx, size in enumerate(mesh_shape):
         dim_inputs = _project_constraints_to_dim(input_constraints, dim_idx, ndim)
         dim_outputs = _project_constraints_to_dim(output_constraints, dim_idx, ndim)
+        dim_parameter_placements = tuple(
+            placement
+            for axis, placement in parameter_axis_constraints or ()
+            if axis == dim_idx
+        )
         key = _split_dim_seed_cache_key(
             int(size),
-            _constraint_cache_key(dim_inputs, dim_outputs),
+            (
+                *_constraint_cache_key(dim_inputs, dim_outputs),
+                tuple(_placement_code(p) for p in dim_parameter_placements),
+            ),
             seed_cost_model,
             mesh_shape,
             dim_idx,
@@ -393,6 +405,8 @@ def _build_split_dim_seed(
                     if dim_outputs is not None:
                         opt.add_sharded_output_constraint(dim_outputs)
                     opt.add_parameter_memory_constraint(0.0, memory_high_fn(int(size)))
+                    for placement in dim_parameter_placements:
+                        opt.add_parameter_axis_constraint(0, placement)
                     solution = opt.get_solution()
             finally:
                 set_nccl_topo_config(prev)
