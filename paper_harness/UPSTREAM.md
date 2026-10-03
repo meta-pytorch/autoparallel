@@ -155,7 +155,16 @@ to the commit immediately before the lock/harness-only updates.
   lowering emits for them, and re-solves until no unpriced one is selected.
   On the LLaMA 3 4D 2x2x2x2 mesh, gathering the middle mesh dim of S0S0S1S0
   activations lowered to all_to_all, all_gather, all_to_all priced as one
-  all_gather. It is the runtime pin.
+  all_gather.
+- `0a551aa` (local branch `agent/seed-param-axis-20261003`, child of `98b20b4`)
+  makes the split-dim strategy seed honor `add_parameter_axis_constraint`: the
+  one-dimensional seed solve of a constrained mesh dim gets the same parameter
+  placement constraint as the full problem. Before, the seed sharded parameters
+  on that dim (1/size memory cap), so the strategy-radius ball around the seed
+  excluded the solver's best parameter storage; on the LLaMA 3 4D mesh
+  feed_forward.w2 was stored S0 on tp and paid a tp all_to_all every step. It is
+  the runtime pin; the lock remote is the local repository because the commit
+  is not pushed.
 
 ## Reproduction policy
 
