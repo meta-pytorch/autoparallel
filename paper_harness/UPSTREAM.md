@@ -2,8 +2,8 @@
 
 ## TorchTitan
 
-The locked source is local `c0fac771`, a child of local `85c216d5`, a child of
-`3b24e620` (`kaijian/ap-submission-4d` in `AlbedoWang/torchtitan`), which is a child of
+The locked source is `kaijian/ap-submission-4d` in `AlbedoWang/torchtitan` at
+`c0fac771`, a child of `85c216d5`, a child of `3b24e620`, which is a child of
 `4b46d18d` on `kaijian/deepseek-baseline-parity-20260918`. Its history has `383cae9f` as an actual
 ancestor and retains the `60517d28` AutoParallel/GraphTrainer integration.
 
@@ -59,17 +59,17 @@ ancestor and retains the `60517d28` AutoParallel/GraphTrainer integration.
   Ulysses needs contiguous sequence shards, so the LLaMA 3 3D/4D settings use
   `context_parallel_load_balancer=None` and the trainer rejects default-backend
   SDPA CP with a load balancer.
-- `85c216d5` (local branch `agent/tt-pass2-on-20261002`, child of `3b24e620`)
+- `85c216d5` (child of `3b24e620`)
   restores `enable_overlap_scheduling=True` (the `4b46d18d` setting): with
   Ulysses every CP rank traces the same graph, so the reason for `cf091127` no
   longer holds.
-- `c0fac771` (local branch `agent/tt-ap-est-mesh-20261002`, child of `85c216d5`)
+- `c0fac771` (child of `85c216d5`)
   builds the AutoParallel runtime estimator on the mesh AutoParallel lowered the
   model on, recorded by `AutoParallelGraph.apply_placement_for_fx_module`.
   Before, it used the TorchTitan legacy (dp_replicate, fsdp, tp) mesh, whose
   process groups differ from the AutoParallel mesh for 4D, 3D CP, and EP, so the
   estimator priced every collective on the flattened world. It is the runtime
-  pin; the lock remote is the local repository because the commit is not pushed.
+  pin.
 
 The 3D port includes only the approved legacy-DTensor AP configuration, CP
 input-ownership seam, DP-shard/CP/TP mesh, CP-aware SDPA, DTensor output, and
@@ -79,9 +79,10 @@ intentionally excluded.
 ## AutoParallel
 
 The maintained harness remains on `kaijian/paper-submission`; the 4D line
-(v19-v24) is on `kaijian/paper-submission-4d`, which merges the runtime
-commits `9a16ded`..`98b20b4` at their original SHAs. Runtime source is pinned
-to the commit immediately before the lock/harness-only updates.
+(v19-v30) is on `kaijian/paper-submission-4d`, which merges the runtime
+commits `9a16ded`..`98b20b4` and `0a551aa` at their original SHAs. Runtime
+source is pinned to the commit immediately before the lock/harness-only
+updates.
 
 - `b8ace2a5` is represented by replay `3408588`.
 - `570bf072` is represented by the equivalent cuDNN broadcast-mask fix at
@@ -156,15 +157,14 @@ to the commit immediately before the lock/harness-only updates.
   On the LLaMA 3 4D 2x2x2x2 mesh, gathering the middle mesh dim of S0S0S1S0
   activations lowered to all_to_all, all_gather, all_to_all priced as one
   all_gather.
-- `0a551aa` (local branch `agent/seed-param-axis-20261003`, child of `98b20b4`)
+- `0a551aa` (child of `98b20b4`)
   makes the split-dim strategy seed honor `add_parameter_axis_constraint`: the
   one-dimensional seed solve of a constrained mesh dim gets the same parameter
   placement constraint as the full problem. Before, the seed sharded parameters
   on that dim (1/size memory cap), so the strategy-radius ball around the seed
   excluded the solver's best parameter storage; on the LLaMA 3 4D mesh
   feed_forward.w2 was stored S0 on tp and paid a tp all_to_all every step. It is
-  the runtime pin; the lock remote is the local repository because the commit
-  is not pushed.
+  the runtime pin.
 
 ## Reproduction policy
 
