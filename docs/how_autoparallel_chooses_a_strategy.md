@@ -104,8 +104,9 @@ cost and prefer to replicate parameters instead. But in practice, the
 all-gather can overlap with the previous layer's compute — it's
 effectively free.
 
-`apply_prefetch_discount` models this overlap by scaling down
-communication costs for edges that can be prefetched:
+`apply_prefetch_discount` models this overlap by setting an objective-time
+communication scale for edges that can be prefetched. It preserves the base
+costs, and a later call replaces rather than compounds the scale:
 
 - **Forward**: edges where the producer is "parameter-derived" — meaning
   its value comes from a model parameter, such as a weight cast or view

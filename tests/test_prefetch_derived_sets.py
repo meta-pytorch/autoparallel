@@ -5,6 +5,7 @@
 
 """Tests for build_param_derived_set and build_terminal_derived_set."""
 
+import pulp
 import pytest
 import torch
 import torch.fx
@@ -20,6 +21,7 @@ from autoparallel.graph_passes.graph_utils import (
     build_param_derived_set,
     build_terminal_derived_set,
 )
+from autoparallel.optimize_sharding import DecisionVar, ShardingOptimizer
 
 # ---------------------------------------------------------------------------
 # Helpers for building synthetic joint FX graphs
@@ -258,6 +260,52 @@ class FFN(torch.nn.Module):
         return self.linear2(self.linear1(x))
 
 
+def test_prefetch_discount_replaces_scale_without_mutating_costs():
+    optimizer = ShardingOptimizer.__new__(ShardingOptimizer)
+    key = (0, 0, 0, 0)
+    illegal_key = (1, 0, 0, 0)
+    variable = pulp.LpVariable("prefetch_test", cat=pulp.LpBinary)
+    illegal_variable = pulp.LpVariable("prefetch_illegal", cat=pulp.LpBinary)
+    decision = DecisionVar(
+        var=variable,
+        cost=16.0,
+        compute_cost=5.0,
+        comm_cost=10.0,
+        sharding_transition_cost=1.0,
+        strategy=None,
+        output_spec=None,
+        input_spec=None,
+    )
+    illegal_decision = DecisionVar(
+        var=illegal_variable,
+        cost=10000.0,
+        compute_cost=0.0,
+        comm_cost=float("inf"),
+        sharding_transition_cost=0.0,
+        strategy=None,
+        output_spec=None,
+        input_spec=None,
+    )
+    optimizer.decision_vars = {key: decision, illegal_key: illegal_decision}
+    optimizer.cluster_links = {}
+    optimizer._root_to_linked = {}
+    optimizer._prefetch_discount = 1.0
+    optimizer._prefetchable_keys = {key, illegal_key}
+    optimizer.prob = pulp.LpProblem("prefetch_test", pulp.LpMinimize)
+
+    assert optimizer.apply_prefetch_discount(0.5) == 2
+    optimizer._set_objective()
+    assert optimizer.prob.objective[variable] == pytest.approx(11.0)
+    assert optimizer.prob.objective[illegal_variable] == 10000.0
+    assert decision.cost == 16.0
+    assert decision.comm_cost == 10.0
+
+    optimizer.apply_prefetch_discount(0.0)
+    assert optimizer.prob.objective[variable] == pytest.approx(6.0)
+    assert decision.cost == 16.0
+    assert decision.comm_cost == 10.0
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @apply_cuda_patches
 def test_apply_prefetch_discount(device_mesh_2d):
@@ -283,14 +331,21 @@ def test_apply_prefetch_discount(device_mesh_2d):
 
         assert len(original_costs) > 0, "Expected some edges with nonzero comm cost"
 
-        n_modified = optimizer.apply_prefetch_discount(scale=0.0)
-        assert n_modified > 0, "Expected some decision vars to be modified"
+        n_affected = optimizer.apply_prefetch_discount(scale=0.5)
+        assert n_affected > 0, "Expected some decision vars to be discounted"
+        assert all(
+            optimizer.decision_vars[key].comm_cost == cost
+            for key, cost in original_costs.items()
+        )
 
-        # Verify modified vars have comm_cost == 0 and cost is recomputed
-        n_zeroed = 0
-        for key, dv in optimizer.decision_vars.items():
-            if key in original_costs and dv.comm_cost == 0.0:
-                assert dv.cost == dv.compute_cost + dv.sharding_transition_cost
-                n_zeroed += 1
+        optimizer._set_objective()
+        key = next(iter(optimizer._get_prefetchable_keys()))
+        dv = optimizer.decision_vars[key]
+        multiplier = 1 + len(optimizer._root_to_linked.get(key, []))
+        expected = (dv.cost - 0.5 * dv.comm_cost) * multiplier
+        assert optimizer.prob.objective[dv.var] == pytest.approx(expected)
 
-        assert n_zeroed > 0, "Expected some edges to be zeroed out"
+        optimizer.apply_prefetch_discount(scale=0.0)
+        expected = (dv.cost - dv.comm_cost) * multiplier
+        assert optimizer.prob.objective[dv.var] == pytest.approx(expected)
+        assert dv.comm_cost == original_costs[key]
