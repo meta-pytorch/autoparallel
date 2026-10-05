@@ -252,6 +252,7 @@ def _assign_order_info_to_chain(
 def compute_optimal_placement_order_for_parameters(
     module: torch.fx.GraphModule,
     sharding_placement: dict[torch.fx.Node, OpSpec],
+    excluded_param_fqns: set[str] | None = None,
 ) -> dict[torch.fx.Node, OrderInfo]:
     """
     Compute the optimal placement order for parameters and gradients.
@@ -325,6 +326,9 @@ def compute_optimal_placement_order_for_parameters(
         (param_curr_plc, param_tgt_plc),
         (grad_curr_plc, grad_tgt_plc),
     ) in matched_param_grad_pairs:
+        desc = param_node.meta.get("desc")
+        if excluded_param_fqns and getattr(desc, "target", None) in excluded_param_fqns:
+            continue
         # Skip if param source placement doesn't match grad target placement
         if param_curr_plc != grad_tgt_plc:
             continue

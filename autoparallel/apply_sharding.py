@@ -577,32 +577,74 @@ def _copy_descriptors_and_rename_placeholders(source_gm, target_gm):
     target_gm.recompile()
 
 
-def _shard_params_and_buffers(gm, physical_placements, params_spec, buffers_spec):
+def _materialize_aliased_state(
+    spec_fqns,
+    fqn_to_node,
+    physical_placements,
+    aliases,
+    make_parameter,
+):
+    group_to_node = {}
+    for fqn, node in fqn_to_node.items():
+        group_to_node.setdefault(aliases.get(fqn, fqn), node)
+
+    materialized = {}
+    result = {}
+    for fqn in spec_fqns:
+        group = aliases.get(fqn, fqn)
+        node = fqn_to_node.get(fqn, group_to_node.get(group))
+        if node is None:
+            raise KeyError(
+                f"No captured state node for {fqn!r} or its alias group {group!r}"
+            )
+        if group not in materialized:
+            tensor = shard_node_given_placements(node, physical_placements[node])
+            materialized[group] = nn.Parameter(tensor) if make_parameter else tensor
+        result[fqn] = materialized[group]
+    return result
+
+
+def _shard_params_and_buffers(
+    gm,
+    physical_placements,
+    params_spec,
+    buffers_spec,
+    param_aliases=None,
+    buffer_aliases=None,
+):
     """Shard parameters and buffers according to the sharding placement."""
     # NB: ok to NOT use the parallel_gm here because we will just reapply the
     # correct sharding placement via sharding_placement
     fqn_to_param = get_named_param_nodes(gm.graph)
     fqn_to_buffer = get_named_buffer_nodes(gm.graph)
 
-    sharded_param_dict = {}
-    for fqn in params_spec:
-        n = fqn_to_param[fqn]
-        with unset_fake_temporarily():
-            sharded_param_dict[fqn] = nn.Parameter(
-                shard_node_given_placements(n, physical_placements[n])
-            )
-
-    sharded_buffer_dict = {}
-    for fqn in buffers_spec:
-        n = fqn_to_buffer[fqn]
-        sharded_buffer_dict[fqn] = shard_node_given_placements(
-            n, physical_placements[n]
+    with unset_fake_temporarily():
+        sharded_param_dict = _materialize_aliased_state(
+            params_spec,
+            fqn_to_param,
+            physical_placements,
+            param_aliases or {},
+            make_parameter=True,
         )
+    sharded_buffer_dict = _materialize_aliased_state(
+        buffers_spec,
+        fqn_to_buffer,
+        physical_placements,
+        buffer_aliases or {},
+        make_parameter=False,
+    )
 
     return sharded_param_dict, sharded_buffer_dict
 
 
-def apply_sharding_to_model(gm, sharding_placement, params_spec, buffers_spec):
+def apply_sharding_to_model(
+    gm,
+    sharding_placement,
+    params_spec,
+    buffers_spec,
+    param_aliases=None,
+    buffer_aliases=None,
+):
     t0 = time.perf_counter()
     dynamic = _has_symbolic_shapes(gm)
 
@@ -632,8 +674,15 @@ def apply_sharding_to_model(gm, sharding_placement, params_spec, buffers_spec):
             fake_mode.shape_env = ShapeEnv()
             fake_mode.static_shapes = False
 
+    captured_param_groups = {}
+    for fqn in get_named_param_nodes(gm.graph):
+        group = (param_aliases or {}).get(fqn, fqn)
+        captured_param_groups.setdefault(group, []).append(fqn)
+    aliased_param_fqns = {
+        fqn for fqns in captured_param_groups.values() if len(fqns) > 1 for fqn in fqns
+    }
     param_placement_order = compute_optimal_placement_order_for_parameters(
-        gm, sharding_placement
+        gm, sharding_placement, excluded_param_fqns=aliased_param_fqns
     )
     physical_placements = _build_physical_placements(
         sharding_placement, param_placement_order
@@ -657,7 +706,12 @@ def apply_sharding_to_model(gm, sharding_placement, params_spec, buffers_spec):
     t3 = time.perf_counter()
 
     sharded_param_dict, sharded_buffer_dict = _shard_params_and_buffers(
-        gm, physical_placements, params_spec, buffers_spec
+        gm,
+        physical_placements,
+        params_spec,
+        buffers_spec,
+        param_aliases,
+        buffer_aliases,
     )
     t4 = time.perf_counter()
 
