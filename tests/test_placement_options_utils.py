@@ -11,6 +11,7 @@ from torch.distributed.tensor.placement_types import Replicate, Shard
 
 from autoparallel.shardings.placement_options import (
     fill_missing_redistribute_cost,
+    get_placement_options,
     keep_unique_configs,
     propagate_tensor_meta,
 )
@@ -20,6 +21,29 @@ from autoparallel.shardings.propagation_rules import remove_invalid_configs
 def _make_tensor_meta(shape, dtype=torch.float32):
     t = torch.empty(shape, dtype=dtype, device="meta")
     return TensorMeta(t.shape, t.stride(), t.dtype)
+
+
+@pytest.mark.parametrize(
+    ("op", "args"),
+    [
+        (torch.ops.aten.randint.default, (10, [4, 8])),
+        (torch.ops.aten.randint.low, (2, 10, [4, 8])),
+        (torch.ops.aten.arange.start_step, (2, 10, 2)),
+    ],
+)
+def test_no_input_tensor_producer_is_replicated(device_mesh_1d, op, args):
+    strategy = get_placement_options(
+        device_mesh_1d,
+        op,
+        args,
+        args,
+        {"device": "meta"},
+    )
+
+    assert len(strategy.strategies) == 1
+    spec = strategy.strategies[0]
+    assert spec.output_specs.placements == (Replicate(),)
+    assert list(spec.input_specs) == [spec.output_specs]
 
 
 # ===== remove_invalid_configs =====

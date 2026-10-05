@@ -76,12 +76,19 @@ import tempfile
 import time
 from collections import defaultdict
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Optional
 
 import pulp
 import torch
-from torch._functorch._aot_autograd.descriptors import PlainAOTInput, PlainAOTOutput
+from torch._functorch._aot_autograd.descriptors import (
+    InputMutationAOTOutput,
+    PlainAOTInput,
+    PlainAOTOutput,
+)
 from torch._functorch._aot_autograd.fx_utils import (
+    get_all_input_and_grad_nodes,
+    get_all_output_and_tangent_nodes,
     get_param_and_grad_nodes,
     get_param_nodes,
     get_plain_input_and_grad_nodes,
@@ -106,6 +113,13 @@ from .shardings.placement_options import get_placement_options_for_node
 from .shardings.propagation_rules import _create_all_options
 
 logger = logging.getLogger(__name__)
+
+
+class BoundaryConstraint(Enum):
+    UNCONSTRAINED = "unconstrained"
+
+
+UNCONSTRAINED = BoundaryConstraint.UNCONSTRAINED
 
 
 def concretize_symint(val):
@@ -359,23 +373,52 @@ class ShardingOptimizer:
         problem uses key2's variable in place of key1."""
         for cluster_group in clusters:
             cluster0 = cluster_group[0]
+            group_links = {}
+            error = None
             for cluster_i in cluster_group[1:]:
+                if len(cluster_i) != len(cluster0):
+                    error = (
+                        f"region lengths differ ({len(cluster0)} and {len(cluster_i)})"
+                    )
+                    break
                 for n0, ni in zip(cluster0, cluster_i):
+                    if n0.op != ni.op or n0.target != ni.target:
+                        error = (
+                            f"{n0} and {ni} have different operators "
+                            f"({n0.target} and {ni.target})"
+                        )
+                        break
+                    input_arity_n0 = len(self._all_input_nodes(n0))
+                    input_arity_ni = len(self._all_input_nodes(ni))
+                    if input_arity_n0 != input_arity_ni:
+                        error = (
+                            f"{n0} and {ni} have different input arity "
+                            f"({input_arity_n0} and {input_arity_ni})"
+                        )
+                        break
                     idx0 = self.node_map[n0]
                     idx1 = self.node_map[ni]
                     options_n0 = list(self.walk_over_options(n0))
                     options_ni = list(self.walk_over_options(ni))
-                    assert options_n0 == options_ni, (
-                        f"Problem with graph clustering: {n0} and {ni} don't have the same number "
-                        "of input/output placements. Please report a bug"
-                    )
+                    if options_n0 != options_ni:
+                        error = (
+                            f"{n0} and {ni} have different input/output placement "
+                            "structure"
+                        )
+                        break
                     for argi, out_idx, inp_idx in options_n0:
-                        self.cluster_links[(idx1, argi, out_idx, inp_idx)] = (
+                        group_links[(idx1, argi, out_idx, inp_idx)] = (
                             idx0,
                             argi,
                             out_idx,
                             inp_idx,
                         )
+                if error is not None:
+                    break
+            if error is not None:
+                logger.warning("Skipping malformed graph cluster: %s", error)
+                continue
+            self.cluster_links.update(group_links)
 
     def _all_input_nodes(self, node):
         """Variant of node.all_input_nodes that preserves duplicate nodes.
@@ -817,7 +860,36 @@ class ShardingOptimizer:
         self.add_output_input_consistent_constraint()
         self.add_inf_cost_constraint()
         self.add_forward_backward_consistency_constraints()
+        self.add_input_mutation_constraints()
         self.add_grad_reduce_dtype_constraints()
+
+    def add_input_mutation_constraints(self):
+        inputs = get_all_input_and_grad_nodes(self.graph)
+        outputs = get_all_output_and_tangent_nodes(self.graph)
+        for desc, (mutation_node, tangent_node) in outputs.items():
+            if not isinstance(desc, InputMutationAOTOutput):
+                continue
+            input_pair = inputs.get(desc.mutated_input)
+            if input_pair is None:
+                raise RuntimeError(
+                    f"Unsupported mutation output for input {desc.mutated_input}"
+                )
+            input_node, _grad_node = input_pair
+            if not isinstance(input_node, torch.fx.Node) or not isinstance(
+                mutation_node, torch.fx.Node
+            ):
+                raise RuntimeError(
+                    f"Unsupported non-tensor mutation for input {desc.mutated_input}"
+                )
+            self._add_paired_output_constraint(
+                input_node, mutation_node, "input_mutation_constraint"
+            )
+            if isinstance(tangent_node, torch.fx.Node):
+                self._add_paired_output_constraint(
+                    mutation_node,
+                    tangent_node,
+                    "grad_input_mutation_constraint",
+                )
 
     # ---- Prefetch overlap ----
 
@@ -1729,6 +1801,14 @@ class ShardingOptimizer:
         add_sharded_output_constraint. Only constrains the forward-side node;
         the backward side is handled by add_forward_backward_consistency_constraints."""
         io_kind = "output" if desc_type is PlainAOTOutput else "input"
+
+        def is_tensor_node(node):
+            if not isinstance(node, torch.fx.Node):
+                return False
+            if "val" in node.meta:
+                return isinstance(node.meta["val"], torch.Tensor)
+            return node.meta.get("is_tensor_value", True)
+
         remaining = None
         if placements is not None:
             remaining = {i: p for i, p in enumerate(placements)}
@@ -1744,8 +1824,8 @@ class ShardingOptimizer:
             invalid = sorted(
                 desc.idx
                 for desc, (node, _companion_node) in nodes_dict.items()
-                if not isinstance(node, torch.fx.Node)
-                and remaining[desc.idx] is not None
+                if not is_tensor_node(node)
+                and remaining[desc.idx] not in (None, UNCONSTRAINED)
             )
             if invalid:
                 raise ValueError(
@@ -1762,14 +1842,16 @@ class ShardingOptimizer:
                 assert remaining is not None
                 placement = remaining.pop(desc.idx)
 
-            if not isinstance(node, torch.fx.Node):
+            if not is_tensor_node(node):
+                continue
+            if placement is UNCONSTRAINED:
                 continue
             self.add_node_constraint(node, placement, constraint_name=constraint_name)
 
         ignored = []
         if remaining is not None:
             for i, p in remaining.items():
-                if p is not None:
+                if p not in (None, UNCONSTRAINED):
                     ignored.append(i)
 
         if ignored:
@@ -1795,8 +1877,8 @@ class ShardingOptimizer:
                 "placeholder node for these inputs.  "
                 "This typically occurs because some inputs aliased each other; inspect the "
                 "joint graph from tlparse for more details.  "
-                "You can either remove an explicit placement for this input (replace it with "
-                "None) or clone the inputs before tracing to remove aliasing."
+                "You can either leave this tensor unconstrained with UNCONSTRAINED "
+                "or clone the inputs before tracing to remove aliasing."
             ),
         )
 
@@ -1826,8 +1908,8 @@ class ShardingOptimizer:
                 "output node for these inputs.  "
                 "This typically occurs because some outputs aliased each other; inspect the "
                 "joint graph from tlparse for more details.  "
-                "You can either remove an explicit placement for this output (replace it with "
-                "None), stop the model from returning aliases of the tensor or clone the "
+                "You can either leave this tensor unconstrained with UNCONSTRAINED, "
+                "stop the model from returning aliases of the tensor or clone the "
                 "outputs before returning them from the graph to avoid aliasing."
             ),
         )

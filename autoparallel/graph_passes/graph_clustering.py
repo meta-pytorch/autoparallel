@@ -21,6 +21,7 @@ from torch._dynamo.graph_region_tracker import (
     Node,
     Region,
     _populate_recursive_ancestor_map,
+    _sort_with_ref_region,
     fully_expand_region_group,
     operator,
     tree_flatten,
@@ -181,9 +182,11 @@ def get_identical_regions(
             node_to_recursive_ancestors,
             _is_identical,
         )
-        # sort topologically
-        for region in region_group:
-            region.sort(key=lambda n: topological_ranking[n])
+        index_to_rank = {
+            index: topological_ranking[node]
+            for index, node in enumerate(region_group[0])
+        }
+        _sort_with_ref_region(index_to_rank, region_group)
 
     region_groups = [
         region_group for region_group in region_groups if len(region_group[0]) > 1

@@ -269,8 +269,17 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
         # internally). Not needed in dynamic mode since shape args are already
         # localized above.
         if not self.dynamic and target in _VIEW_OPS and tgt_spec is not None:
+            global_metadata = {}
+            if tgt_spec.tensor_meta is not None:
+                global_metadata = {
+                    "shape": tgt_spec.tensor_meta.shape,
+                    "stride": tgt_spec.tensor_meta.stride,
+                }
             new_args[0] = DTensor.from_local(
-                new_args[0], tgt_spec.mesh, tgt_spec.placements
+                new_args[0],
+                tgt_spec.mesh,
+                tgt_spec.placements,
+                **global_metadata,
             )
             new_args[0]._spec.shard_order = tgt_spec.shard_order
             new_args[0] = new_args[0].contiguous()
