@@ -8,6 +8,7 @@ from contextlib import ExitStack
 import torch
 from conftest import apply_cuda_patches
 from torch import nn
+from torch._functorch._aot_autograd.descriptors import ParamAOTInput
 from torch._functorch._aot_autograd.fx_utils import get_param_and_grad_nodes
 from torch._functorch.aot_autograd import aot_export_joint_with_descriptors
 from torch.distributed._tensor.placement_types import DTensorSpec
@@ -665,6 +666,10 @@ def test_compute_optimal_placement_order_ss_to_rs_with_grad_chain_redistribution
         placement_order = compute_optimal_placement_order_for_parameters(
             gm, sharding_placement
         )
+        param.meta["desc"] = ParamAOTInput("tied.weight")
+        excluded_order = compute_optimal_placement_order_for_parameters(
+            gm, sharding_placement, excluded_param_fqns={"tied.weight"}
+        )
 
     # The optimization must still match: param and grad_alias should be present
     assert param in placement_order, (
@@ -681,6 +686,7 @@ def test_compute_optimal_placement_order_ss_to_rs_with_grad_chain_redistribution
     # Verify backward chain ordering
     assert placement_order[grad_alias].need_reorder is True
     assert placement_order[grad_alias].is_target_reversed_order is True
+    assert excluded_order == {}
 
 
 def test_compute_optimal_placement_order_verifies_redistribution_map(device_mesh_2d):

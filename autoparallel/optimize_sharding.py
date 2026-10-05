@@ -82,7 +82,9 @@ from typing import Any, Optional
 import pulp
 import torch
 from torch._functorch._aot_autograd.descriptors import (
+    BufferAOTInput,
     InputMutationAOTOutput,
+    ParamAOTInput,
     PlainAOTInput,
     PlainAOTOutput,
 )
@@ -238,6 +240,7 @@ class ShardingOptimizer:
         mesh,
         force_grad_reduce_in_higher_precision=False,
         repeated_subgraphs=False,
+        persistent_aliases=None,
     ):
         self.orig_gm = gm
         # The optimizer works on a concretized copy of the graph where all
@@ -253,6 +256,7 @@ class ShardingOptimizer:
         self.force_grad_reduce_in_higher_precision = (
             force_grad_reduce_in_higher_precision
         )
+        self.persistent_aliases = persistent_aliases or {}
         self._constraint_log: list[tuple[str, dict]] = []
         self._memory_constraint: tuple[float, float] | None = None
         # Maps ILP constraint name → node_name for active node constraints,
@@ -860,8 +864,29 @@ class ShardingOptimizer:
         self.add_output_input_consistent_constraint()
         self.add_inf_cost_constraint()
         self.add_forward_backward_consistency_constraints()
+        self.add_persistent_alias_constraints()
         self.add_input_mutation_constraints()
         self.add_grad_reduce_dtype_constraints()
+
+    def _get_persistent_alias_groups(self, descriptor_type=None):
+        groups = defaultdict(list)
+        for node in self.graph.find_nodes(op="placeholder"):
+            desc = node.meta.get("desc")
+            if not isinstance(desc, (ParamAOTInput, BufferAOTInput)):
+                continue
+            if descriptor_type is not None and not isinstance(desc, descriptor_type):
+                continue
+            canonical = self.persistent_aliases.get(desc.target, desc.target)
+            groups[canonical].append(node)
+        return groups
+
+    def add_persistent_alias_constraints(self):
+        for nodes in self._get_persistent_alias_groups().values():
+            root = nodes[0]
+            for node in nodes[1:]:
+                self._add_paired_output_constraint(
+                    root, node, "persistent_alias_constraint"
+                )
 
     def add_input_mutation_constraints(self):
         inputs = get_all_input_and_grad_nodes(self.graph)
@@ -1714,13 +1739,13 @@ class ShardingOptimizer:
 
         user_constrained_names = set(self._node_constraint_names.values())
 
-        param_nodes: list[torch.fx.Node] = get_param_nodes(self.graph)
         elms: list[pulp.LpAffineExpression] = []
         budget_low: float = 0.0
         budget_high: float = 0.0
-        for node in param_nodes:
-            if node.name in user_constrained_names:
+        for nodes in self._get_persistent_alias_groups(ParamAOTInput).values():
+            if any(node.name in user_constrained_names for node in nodes):
                 continue
+            node = nodes[0]
             node_idx = self.node_map[node]
             num_out_strat = len(self.strats[node].strategies)
             ratios: list[float] = []
