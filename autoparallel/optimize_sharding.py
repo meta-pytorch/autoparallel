@@ -259,6 +259,8 @@ class ShardingOptimizer:
         self.persistent_aliases = persistent_aliases or {}
         self._constraint_log: list[tuple[str, dict]] = []
         self._memory_constraint: tuple[float, float] | None = None
+        self._prefetch_discount = 1.0
+        self._prefetchable_keys: set[tuple[int, int, int, int]] | None = None
         # Maps ILP constraint name → node_name for active node constraints,
         # so that _apply_memory_constraint can exclude constrained params and
         # remove_constraints can keep this in sync.
@@ -927,20 +929,10 @@ class ShardingOptimizer:
 
     # ---- Prefetch overlap ----
 
-    def apply_prefetch_discount(self, scale=0.0):
-        """Discount communication costs for prefetchable edges.
+    def _get_prefetchable_keys(self):
+        if self._prefetchable_keys is not None:
+            return self._prefetchable_keys
 
-        Scales down comm costs for:
-        - Forward: edges where the producer is parameter-derived (FSDP
-          all-gathers that can be prefetched ahead of compute)
-        - Backward: edges into terminal-derived nodes (gradient
-          reduce-scatters that can overlap with earlier backward compute)
-
-        Must be called before get_solution(). A scale of 0.0 means fully
-        overlapped (free); 1.0 means no discount.
-
-        Returns the number of decision vars modified.
-        """
         param_derived = build_param_derived_set(self.graph)
         terminal_derived = build_terminal_derived_set(self.graph)
 
@@ -954,9 +946,9 @@ class ShardingOptimizer:
             ),
         )
 
-        n_modified = 0
-        for key, dv in self.decision_vars.items():
-            node_idx, argi, out_idx, inp_idx = key
+        keys = set()
+        for key in self.decision_vars:
+            node_idx, argi, _out_idx, _inp_idx = key
             node = self.nodes[node_idx]
 
             input_nodes = self._all_input_nodes(node)
@@ -965,30 +957,59 @@ class ShardingOptimizer:
             producer = input_nodes[argi]
 
             is_prefetchable = producer in param_derived or node in terminal_derived
-            if is_prefetchable and dv.comm_cost > 0 and math.isfinite(dv.comm_cost):
-                dv.comm_cost *= scale
-                dv.cost = dv.comm_cost + dv.compute_cost + dv.sharding_transition_cost
-                n_modified += 1
+            if is_prefetchable:
+                keys.add(key)
+
+        self._prefetchable_keys = keys
+        return keys
+
+    def apply_prefetch_discount(self, scale=0.0):
+        """Set the objective discount for prefetchable communication.
+
+        A scale of 0.0 treats eligible communication as fully overlapped, while
+        1.0 leaves it undiscounted. The scale is applied when the objective is
+        built; decision-variable costs remain unchanged, and repeated calls
+        replace rather than compound the previous scale.
+
+        Returns the number of affected decision variables.
+        """
+        if not 0.0 <= scale <= 1.0:
+            raise ValueError(f"scale must be between 0 and 1, got {scale}")
+
+        self._prefetch_discount = float(scale)
+        prefetchable_keys = self._get_prefetchable_keys()
+        if self.prob.objective is not None:
+            self._set_objective()
 
         logger.debug(
-            "apply_prefetch_discount(scale=%.2f): modified %d decision vars "
-            "(%d param-derived nodes, %d terminal-derived nodes)",
+            "apply_prefetch_discount(scale=%.2f): configured %d decision vars",
             scale,
-            n_modified,
-            len(param_derived),
-            len(terminal_derived),
+            len(prefetchable_keys),
         )
-        return n_modified
+        return len(prefetchable_keys)
 
     # ---- Solution ----
+
+    def _get_comm_scale(self, key):
+        if self._prefetch_discount == 1.0:
+            return 1.0
+        root_key = self.cluster_links.get(key, key)
+        if root_key in self._get_prefetchable_keys():
+            return self._prefetch_discount
+        return 1.0
 
     def _set_objective(self):
         """Add the cost minimization objective to the ILP."""
         terms = []
         for key, dv in self.decision_vars.items():
             multiplier = 1 + len(self._root_to_linked.get(key, []))
-            terms.append(dv.var * dv.cost * multiplier)
-        self.prob += pulp.lpSum(terms)
+            comm_scale = self._get_comm_scale(key)
+            if comm_scale == 1.0 or not math.isfinite(dv.comm_cost):
+                cost = dv.cost
+            else:
+                cost = dv.cost + dv.comm_cost * (comm_scale - 1.0)
+            terms.append(dv.var * cost * multiplier)
+        self.prob.setObjective(pulp.lpSum(terms))
 
     def _solve(self, verbose=False):
         self._apply_memory_constraint()
@@ -1124,15 +1145,13 @@ class ShardingOptimizer:
                 )
                 changes[key].append(node)
 
-        # Compute objective values from selected_keys for current solution
-        # (solution_b is the current state after last solve)
-        # Translate to concrete nodes for internal cost computation
+        # Report undiscounted costs so this breakdown matches get_json().
         cost_a = self._compute_solution_cost(self._to_concrete_solution(solution_a))
         cost_b = self._compute_solution_cost(self._to_concrete_solution(solution_b))
 
         lines = []
         lines.append(
-            f"Objective: {cost_a['total']:.1f} -> {cost_b['total']:.1f} "
+            f"Base cost: {cost_a['total']:.1f} -> {cost_b['total']:.1f} "
             f"({cost_b['total'] - cost_a['total']:+.1f})"
         )
         lines.append(
@@ -1160,7 +1179,7 @@ class ShardingOptimizer:
         return result
 
     def _compute_solution_cost(self, solution):
-        """Compute the total cost breakdown for a given solution."""
+        """Compute the undiscounted base cost breakdown for a solution."""
         total_compute = 0.0
         total_comm = 0.0
         total_transition = 0.0
@@ -1280,6 +1299,11 @@ class ShardingOptimizer:
             },
             selected_dvs=selected_by_node,
             cluster_roots=cluster_roots,
+        )
+        result["summary"]["prefetch_discount"] = self._prefetch_discount
+        search_objective = pulp.value(self.prob.objective)
+        result["summary"]["search_objective"] = (
+            search_objective if search_objective is not None else 0.0
         )
         result["summary"]["clustering"] = {
             "linked_nodes": len({key[0] for key in self.cluster_links}),

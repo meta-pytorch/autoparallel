@@ -126,6 +126,7 @@ def test_save_load_roundtrip(device_mesh_1d):
         autop.add_input_constraints([(Shard(0),)])
         autop.add_output_constraints([(Shard(0),)])
         opt = autop.sharding_optimizer
+        opt.apply_prefetch_discount(0.25)
         opt.skipped_clusters = [{"reason": "test", "regions": [["a"], ["b"]]}]
         opt.get_solution()
 
@@ -140,6 +141,7 @@ def test_save_load_roundtrip(device_mesh_1d):
     # Should have a mesh placeholder
     assert isinstance(loaded.mesh, _MeshPlaceholder)
     assert loaded.mesh.shape == tuple(opt.mesh.shape)
+    assert loaded._prefetch_discount == 0.25
     assert loaded.skipped_clusters == opt.skipped_clusters
 
     # Should be able to produce JSON
