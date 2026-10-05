@@ -314,16 +314,29 @@ class aten_autobucketing_config:
     _counter = 0
 
 
+def _runtime_estimation_ms(estimate_us, node, override_size=None):
+    # AutoParallel estimates are in microseconds. The overlap scheduler expects
+    # milliseconds and stores compute estimates in Inductor's benchmark cache,
+    # which Inductor's own overlap scheduling pass later reads.
+    runtime_us = estimate_us(node, override_size)
+    return None if runtime_us is None else runtime_us / 1000
+
+
 def aten_autobucketing_reordering_pass(
     gm: torch.fx.Graph, configs: "aten_autobucketing_config"
 ) -> torch.fx.GraphModule:
     assert gm.owning_module is not None
 
+    custom_runtime_estimation = configs.custom_runtime_estimation
+    if custom_runtime_estimation is not None:
+        custom_runtime_estimation = partial(
+            _runtime_estimation_ms, custom_runtime_estimation
+        )
     new_gm = schedule_overlap_bucketing(
         gm.owning_module,
         collective_bucketing=configs.collective_bucketing,
         max_compute_pre_fetch=configs.max_compute_pre_fetch,
-        custom_runtime_estimation=configs.custom_runtime_estimation,
+        custom_runtime_estimation=custom_runtime_estimation,
         compute_overlap_multipler=configs.compute_overlap_multipler,
         max_in_flight_gb=configs.max_in_flight_gb,
         max_coll_distance=configs.max_coll_distance,
