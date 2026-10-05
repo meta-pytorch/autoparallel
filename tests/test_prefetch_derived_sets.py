@@ -5,6 +5,8 @@
 
 """Tests for build_param_derived_set and build_terminal_derived_set."""
 
+from types import SimpleNamespace
+
 import pulp
 import pytest
 import torch
@@ -304,6 +306,115 @@ def test_prefetch_discount_replaces_scale_without_mutating_costs():
     assert optimizer.prob.objective[variable] == pytest.approx(6.0)
     assert decision.cost == 16.0
     assert decision.comm_cost == 10.0
+
+
+def test_default_prefetch_scale_skips_key_classification(monkeypatch):
+    optimizer = ShardingOptimizer.__new__(ShardingOptimizer)
+    optimizer._prefetch_discount = 1.0
+
+    def fail():
+        pytest.fail("default scale should not classify prefetchable keys")
+
+    monkeypatch.setattr(optimizer, "_get_prefetchable_keys", fail)
+
+    assert optimizer._get_comm_scale((0, 0, 0, 0)) == 1.0
+
+
+def test_prefetchable_key_cache_is_cost_independent():
+    graph = torch.fx.Graph()
+    parameter = _make_placeholder(graph, "parameter", ParamAOTInput("weight"))
+    consumer = _make_call(graph, parameter)
+    _make_output(graph, [consumer], [PlainAOTOutput(0)])
+
+    zero_key = (1, 0, 0, 0)
+    infinite_key = (1, 0, 1, 0)
+    optimizer = ShardingOptimizer.__new__(ShardingOptimizer)
+    optimizer.graph = graph
+    optimizer.nodes = [parameter, consumer]
+    optimizer.decision_vars = {
+        zero_key: DecisionVar(
+            var=pulp.LpVariable("prefetch_zero", cat=pulp.LpBinary),
+            cost=1.0,
+            compute_cost=1.0,
+            comm_cost=0.0,
+            sharding_transition_cost=0.0,
+            strategy=None,
+            output_spec=None,
+            input_spec=None,
+        ),
+        infinite_key: DecisionVar(
+            var=pulp.LpVariable("prefetch_infinite", cat=pulp.LpBinary),
+            cost=10000.0,
+            compute_cost=0.0,
+            comm_cost=float("inf"),
+            sharding_transition_cost=0.0,
+            strategy=None,
+            output_spec=None,
+            input_spec=None,
+        ),
+    }
+    optimizer._prefetchable_keys = None
+    optimizer._all_input_nodes = lambda node: list(node.all_input_nodes)
+
+    assert optimizer._get_prefetchable_keys() == {zero_key, infinite_key}
+
+
+def test_solution_cost_breakdown_remains_undiscounted(monkeypatch):
+    producer = object()
+    consumer = object()
+    producer_strategy = SimpleNamespace(
+        input_specs=[], output_specs=None, redistribute_cost=[]
+    )
+    consumer_strategy = SimpleNamespace(
+        input_specs=[None], output_specs=None, redistribute_cost=[[10.0]]
+    )
+    decisions = {
+        0: DecisionVar(
+            var=pulp.LpVariable("producer", cat=pulp.LpBinary),
+            cost=2.0,
+            compute_cost=2.0,
+            comm_cost=0.0,
+            sharding_transition_cost=0.0,
+            strategy=producer_strategy,
+            output_spec=None,
+            input_spec=None,
+        ),
+        1: DecisionVar(
+            var=pulp.LpVariable("consumer", cat=pulp.LpBinary),
+            cost=15.0,
+            compute_cost=5.0,
+            comm_cost=10.0,
+            sharding_transition_cost=0.0,
+            strategy=consumer_strategy,
+            output_spec=None,
+            input_spec=None,
+        ),
+    }
+    optimizer = ShardingOptimizer.__new__(ShardingOptimizer)
+    optimizer.strats = {
+        producer: SimpleNamespace(strategies=[producer_strategy]),
+        consumer: SimpleNamespace(strategies=[consumer_strategy]),
+    }
+    optimizer.node_map = {producer: 0, consumer: 1}
+    optimizer._all_input_nodes = lambda node: [] if node is producer else [producer]
+    optimizer._resolve_decision_var = lambda key: decisions[key[0]]
+    optimizer._prefetch_discount = 0.0
+
+    def fail(_key):
+        pytest.fail("base cost breakdown should not apply the prefetch scale")
+
+    monkeypatch.setattr(optimizer, "_get_comm_scale", fail)
+
+    costs = optimizer._compute_solution_cost(
+        {producer: producer_strategy, consumer: consumer_strategy}
+    )
+
+    assert costs == {
+        "total": 17.0,
+        "compute": 7.0,
+        "comm": 10.0,
+        "transition": 0.0,
+    }
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")

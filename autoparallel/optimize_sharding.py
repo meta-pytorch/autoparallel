@@ -938,7 +938,7 @@ class ShardingOptimizer:
         )
 
         keys = set()
-        for key, dv in self.decision_vars.items():
+        for key in self.decision_vars:
             node_idx, argi, _out_idx, _inp_idx = key
             node = self.nodes[node_idx]
 
@@ -948,7 +948,7 @@ class ShardingOptimizer:
             producer = input_nodes[argi]
 
             is_prefetchable = producer in param_derived or node in terminal_derived
-            if is_prefetchable and dv.comm_cost > 0 and math.isfinite(dv.comm_cost):
+            if is_prefetchable:
                 keys.add(key)
 
         self._prefetchable_keys = keys
@@ -982,6 +982,8 @@ class ShardingOptimizer:
     # ---- Solution ----
 
     def _get_comm_scale(self, key):
+        if self._prefetch_discount == 1.0:
+            return 1.0
         root_key = self.cluster_links.get(key, key)
         if root_key in self._get_prefetchable_keys():
             return self._prefetch_discount
@@ -1134,15 +1136,13 @@ class ShardingOptimizer:
                 )
                 changes[key].append(node)
 
-        # Compute objective values from selected_keys for current solution
-        # (solution_b is the current state after last solve)
-        # Translate to concrete nodes for internal cost computation
+        # Report undiscounted costs so this breakdown matches get_json().
         cost_a = self._compute_solution_cost(self._to_concrete_solution(solution_a))
         cost_b = self._compute_solution_cost(self._to_concrete_solution(solution_b))
 
         lines = []
         lines.append(
-            f"Objective: {cost_a['total']:.1f} -> {cost_b['total']:.1f} "
+            f"Base cost: {cost_a['total']:.1f} -> {cost_b['total']:.1f} "
             f"({cost_b['total'] - cost_a['total']:+.1f})"
         )
         lines.append(
@@ -1170,7 +1170,7 @@ class ShardingOptimizer:
         return result
 
     def _compute_solution_cost(self, solution):
-        """Compute the total cost breakdown for a given solution."""
+        """Compute the undiscounted base cost breakdown for a solution."""
         total_compute = 0.0
         total_comm = 0.0
         total_transition = 0.0
@@ -1207,8 +1207,7 @@ class ShardingOptimizer:
                     continue
                 comm = strategy.redistribute_cost[argi][pred_out_idx]
                 if math.isfinite(comm):
-                    key = (node_idx, argi, out_idx, pred_out_idx)
-                    total_comm += comm * self._get_comm_scale(key)
+                    total_comm += comm
 
                 # Transition cost
                 pred_spec = pred_strategy.output_specs
