@@ -1123,8 +1123,10 @@ def _resolve_table_row(
     tabulated = sorted(n for n, p in table if p == ppn)
     i = min(bisect.bisect(tabulated, n_nodes), len(tabulated) - 1)
     lo, hi = tabulated[i - 1], tabulated[i]
-    x = math.log2 if log_latency else float
-    lat_t = (x(n_nodes) - x(hi)) / (x(hi) - x(lo))
+    if log_latency:
+        lat_t = math.log2(n_nodes / hi) / math.log2(hi / lo)
+    else:
+        lat_t = (n_nodes - hi) / (hi - lo)
     bw_t = min(0.0, math.log2(n_nodes / hi) / math.log2(hi / lo))
 
     def derive(lo_entry, hi_entry):

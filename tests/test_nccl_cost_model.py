@@ -1475,7 +1475,6 @@ class TestTableRowResolution:
     @pytest.mark.parametrize("table,log_latency", _TABLES)
     def test_latency_follows_closed_form(self, table, log_latency):
         """Ring latency is linear in n_nodes, Tree/NVLSTree in log2(n_nodes)."""
-        x = math.log2 if log_latency else float
         for ppn in {p for _, p in table}:
             lo_row, hi_row = table[(16, ppn)], table[(32, ppn)]
             for n_nodes in (3, 6, 12, 24, 48, 64, 128, 256):
@@ -1485,8 +1484,11 @@ class TestTableRowResolution:
                     _table_entries(lo_row),
                     _table_entries(hi_row),
                 ):
-                    slope = (lat_hi - lat_lo) / (x(32) - x(16))
-                    expected = lat_hi + slope * (x(n_nodes) - x(32))
+                    if log_latency:
+                        t = math.log2(n_nodes / 32) / math.log2(32 / 16)
+                    else:
+                        t = (n_nodes - 32) / (32 - 16)
+                    expected = lat_hi + t * (lat_hi - lat_lo)
                     assert lat == pytest.approx(expected, rel=1e-12)
 
     @pytest.mark.parametrize("table,log_latency", _TABLES)
