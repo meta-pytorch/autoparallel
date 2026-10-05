@@ -157,6 +157,7 @@ def test_export_json_produces_valid_structure(device_mesh_1d):
     assert "compute" in data["summary"]
     assert data["summary"]["prefetch_discount"] == 1.0
     assert data["summary"]["search_objective"] is not None
+    assert data["summary"]["clustering"]["skipped_groups"] == []
 
     # Mesh should have shape
     assert "shape" in data["mesh"]

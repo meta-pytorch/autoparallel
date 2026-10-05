@@ -279,6 +279,7 @@ class ShardingOptimizer:
         get_placement_options_timer().report()
 
         self.cluster_links: dict[tuple, tuple] = {}
+        self.skipped_clusters: list[dict[str, Any]] = []
         if repeated_subgraphs:
             t = time.time()
             clusters = get_identical_regions(self.gm.graph, self.strats)
@@ -423,6 +424,14 @@ class ShardingOptimizer:
                     break
             if error is not None:
                 logger.warning("Skipping malformed graph cluster: %s", error)
+                self.skipped_clusters.append(
+                    {
+                        "reason": error,
+                        "regions": [
+                            [node.name for node in region] for region in cluster_group
+                        ],
+                    }
+                )
                 continue
             self.cluster_links.update(group_links)
 
@@ -1296,6 +1305,10 @@ class ShardingOptimizer:
         result["summary"]["search_objective"] = (
             search_objective if search_objective is not None else 0.0
         )
+        result["summary"]["clustering"] = {
+            "linked_nodes": len({key[0] for key in self.cluster_links}),
+            "skipped_groups": self.skipped_clusters,
+        }
         return result
 
     def get_strategy(self, node):
