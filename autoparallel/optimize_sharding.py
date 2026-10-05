@@ -1629,8 +1629,14 @@ class ShardingOptimizer:
                 continue
 
             # Only constrain if it downcasts
-            storage_dtype = param.meta["val"].dtype
-            cast_dtype = n.meta["val"].dtype
+            storage_meta = param.meta.get("val")
+            if storage_meta is None:
+                storage_meta = param.meta["tensor_meta"]
+            cast_meta = n.meta.get("val")
+            if cast_meta is None:
+                cast_meta = n.meta["tensor_meta"]
+            storage_dtype = storage_meta.dtype
+            cast_dtype = cast_meta.dtype
             if cast_dtype.itemsize >= storage_dtype.itemsize:
                 continue
 
