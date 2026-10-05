@@ -207,6 +207,8 @@ def test_param_alias_reregistered():
     mod = make_parallel_module(model, param_dict, buffer_dict)
 
     assert hasattr(mod, "lm_head")
+    assert "to_empty" in type(mod).__dict__
+    assert "to_empty" not in mod.__dict__
     assert mod.get_parameter("lm_head.weight") is mod.get_parameter("embed.weight")
 
     mod.to_empty(device="cpu")
