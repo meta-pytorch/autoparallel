@@ -130,7 +130,8 @@ parameter_memory_budget=(None, None)
 
 In the current implementation, `low=None, high=None` means “use the default
 bounds,” which effectively pushes parameter memory toward being divided across
-ranks.
+ranks. The normalized bounds weight tensors by bytes and count aliased storage
+once. They do not represent optimizer state, activations, or transient buffers.
 
 ## What the optimizer is choosing
 

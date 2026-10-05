@@ -58,6 +58,47 @@ def test_aliased_parameter_memory_is_counted_once(device_mesh_1d):
     assert all(f"n={root.name}" in variable.name for variable in constraint)
 
 
+@apply_cuda_patches
+def test_parameter_memory_constraint_is_weighted_by_bytes(device_mesh_1d):
+    graph = torch.fx.Graph()
+    large = graph.placeholder("large")
+    small = graph.placeholder("small")
+    output = graph.output((large, small))
+    large.meta["val"] = torch.empty(1024, device="meta")
+    small.meta["val"] = torch.empty(256, device="meta")
+    large.meta["desc"] = ParamAOTInput("large")
+    small.meta["desc"] = ParamAOTInput("small")
+    output.meta["desc"] = [None, None]
+
+    optimizer = ShardingOptimizer(
+        torch.fx.GraphModule(torch.nn.Module(), graph), device_mesh_1d
+    )
+    optimizer.add_parameter_memory_constraint(0.0, 1.0)
+    optimizer._apply_memory_constraint()
+    constraint = optimizer.prob.constraints["memory_constraint_high"]
+
+    coefficients = {}
+    for node in (large, small):
+        node = optimizer._normalize_node(node)
+        replicate_idx = next(
+            index
+            for index, strategy in enumerate(optimizer.strats[node].strategies)
+            if strategy.output_specs.placements == (Replicate(),)
+        )
+        variable = optimizer._resolve_decision_var(
+            (optimizer.node_map[node], 0, replicate_idx, 0)
+        ).var
+        coefficients[node.name] = constraint[variable]
+
+    assert coefficients["large"] == 4 * coefficients["small"]
+
+    optimizer.get_solution()
+    summary = optimizer.get_json()["summary"]["parameter_storage"]
+    assert summary["global_bytes"] == (1024 + 256) * 4
+    assert summary["tensor_count"] == 2
+    assert summary["local_to_global_fraction"] is not None
+
+
 def test_aliased_state_is_materialized_once():
     graph = torch.fx.Graph()
     parameter = graph.placeholder("parameter")

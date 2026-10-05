@@ -88,7 +88,8 @@ Optional `MixedPrecisionPolicy` used when building the parallelized model.
 
 Optional `(low, high)` pair controlling parameter memory constraints. Passing
 `(None, None)` uses the current default bounds and is often appropriate for
-training workloads.
+training workloads. Bounds are normalized fractions of byte-weighted persistent
+parameter storage; the default upper bound is `1 / world_size`.
 
 #### `dynamic`
 
@@ -154,7 +155,9 @@ autop.add_parameter_memory_constraint(low=None, high=None)
 ```
 
 Without this, the optimizer may choose to replicate parameters if that lowers
-communication cost.
+communication cost. The normalized bounds are byte-weighted and cover
+persistent parameters rather than optimizer state, activations, or transient
+materialization buffers.
 
 ### 5. Optimize placements
 

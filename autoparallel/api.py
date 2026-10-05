@@ -370,8 +370,13 @@ class AutoParallel:
         self.joint_with_descriptors = result.joint_with_descriptors
         self._traced_inputs = result.traced_inputs
 
-    # TODO: Specify what the low/high meaning is (percentage?)
     def add_parameter_memory_constraint(self, low=None, high=None):
+        """Constrain byte-weighted persistent parameter storage.
+
+        Bounds are normalized fractions of global parameter bytes. ``None``
+        selects the default lower bound of zero or upper bound of
+        ``1 / world_size``.
+        """
         self._assert_entered()
 
         # by default, divide the parameters by the world size
@@ -718,8 +723,9 @@ def auto_parallel(
                 - Tuple output: ((Shard(0),), (Shard(0),))
                 - Dict output: {"logits": (Shard(0),), "loss": (Replicate(),)}
         mp_policy: Optional mixed precision policy.
-        parameter_memory_budget: Optional (low, high) bounds for parameter memory.
-            Each bound is a float multiplier or None for unbounded.
+        parameter_memory_budget: Optional normalized ``(low, high)`` bounds for
+            byte-weighted persistent parameter storage. A ``None`` element uses
+            the default lower bound of zero or upper bound of ``1 / world_size``.
         dynamic: If True, trace with symbolic batch dimensions so the parallel
             model accepts arbitrary batch sizes at runtime.
 

@@ -155,6 +155,11 @@ def test_export_json_produces_valid_structure(device_mesh_1d):
     assert "total" in data["summary"]
     assert "comm" in data["summary"]
     assert "compute" in data["summary"]
+    storage = data["summary"]["parameter_storage"]
+    assert storage["global_bytes"] > 0
+    assert 0 < storage["local_bytes"] <= storage["global_bytes"]
+    assert 0 < storage["local_to_global_fraction"] <= 1
+    assert storage["tensor_count"] == len(list(model.parameters()))
 
     # Mesh should have shape
     assert "shape" in data["mesh"]
