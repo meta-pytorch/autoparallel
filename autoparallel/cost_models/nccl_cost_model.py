@@ -24,12 +24,13 @@ Two layers:
 
 from __future__ import annotations
 
+import bisect
 import functools
 import logging
 import math
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from torch.distributed.tensor import DeviceMesh
@@ -707,8 +708,11 @@ def _depth_scaled_ring_correction(n_nodes: int) -> tuple[float, ...]:
     doubles. We clamp each entry to at most 2x the previous entry so that
     the Ring BW correction does not grow by more than 2x per log-size step
     after depth scaling.
+
+    The exponent is held at its 32-node value above 32 nodes: it is unfitted
+    there, and growing it further collapses mid-size bandwidth.
     """
-    exp = 1.0 + 0.2 * (_log2i(n_nodes) - 2)
+    exp = 1.0 + 0.2 * (min(_log2i(n_nodes), _log2i(32)) - 2)
     table = list(_RING_CORRECTION_FACTOR)
     for i, corr in enumerate(table):
         if corr < 1.0:
@@ -758,6 +762,11 @@ _BLACKWELL_BW_SCALE = 640.0 / 320.0  # Blackwell/Hopper bw_intra ratio
 # Each table maps (n_nodes, ppn) to per-protocol (lat_us, bw_gbps) tuples
 # in (LL, LL128, SIMPLE) order. AG and RS are symmetric on H100 NVSwitch.
 # Blackwell reuses these tables with BW scaled by _BLACKWELL_BW_SCALE.
+#
+# On every row, Ring latency is exactly linear in n_nodes and Tree/NVLSTree
+# latency exactly linear in log2(n_nodes); BW is non-increasing in n_nodes
+# and converges (Ring algo BW is busBw * nRanks / nSteps). Rows for other
+# node counts are derived from this structure by _resolve_table_row().
 
 # fmt: off
 # AllGather / ReduceScatter — Ring algo (the only eligible algo for AG/RS)
@@ -928,7 +937,7 @@ _A2A_BW_CORRECTION = 0.7
 # Multi-node AllToAll on NVSwitch Hopper+: empirical latency (us) fitted from
 # nccl-tests alltoall_perf on H100 at 2/4/8 nodes (0-byte messages). AllToAll
 # decomposes into concurrent P2P transfers so latency grows much slower than
-# Ring-style sequential steps.
+# Ring-style sequential steps. Extrapolated linearly above 32 nodes.
 _A2A_MULTI_NODE_LAT_POINTS = ((2, 37.0), (4, 42.0), (8, 60.0), (16, 98.0), (32, 290.0))
 
 # NIC efficiency overhead for multi-node AllToAll P2P. At low node counts,
@@ -990,6 +999,10 @@ def _interp_clamped(points: tuple[tuple[int, float], ...], x: int) -> float:
             t = (x - x0) / (x1 - x0)
             return y0 + t * (y1 - y0)
     return points[-1][1]
+
+
+def _is_hopper_nvswitch(config: NCCLTopoConfig) -> bool:
+    return config.arch in (GpuArch.HOPPER, GpuArch.BLACKWELL) and config.has_nvswitch
 
 
 def _get_n_channels(config: NCCLTopoConfig) -> int:
@@ -1078,6 +1091,52 @@ def _table_algo_time(
 _PROTOS = (NCCLProto.LL, NCCLProto.LL128, NCCLProto.SIMPLE)
 
 
+def _table_coverage(table: dict[tuple[int, int], Any], n_nodes: int, ppn: int) -> str:
+    """How _resolve_table_row() obtains the (n_nodes, ppn) row of a tuning table."""
+    tabulated = [n for n, p in table if p == ppn]
+    if (n_nodes, ppn) in table:
+        return "table"
+    if len(tabulated) < 2 or n_nodes < min(tabulated):
+        return "algo_loop"
+    return "interpolated" if n_nodes < max(tabulated) else "extrapolated"
+
+
+def _resolve_table_row(
+    table: dict[tuple[int, int], Any], n_nodes: int, ppn: int, log_latency: bool
+) -> Any:
+    """Return the tuning-table row for (n_nodes, ppn), or None to use the algo loop.
+
+    Tabulated keys return the stored row. Otherwise the row is derived from
+    the two tabulated node counts bracketing n_nodes, or the two largest
+    ones above the table: latency follows its closed form, linear in n_nodes
+    (Ring) or in log2(n_nodes) (Tree/NVLSTree, ``log_latency=True``); BW is
+    linear in log2(n_nodes) and held at the largest row above the table.
+    Ring BW converges from above, so the held value is at most
+    nRanks / (nRanks - 1) of the limit (~3% high for ppn=1); Tree BW is
+    already constant. Extrapolated rows are unmeasured.
+    """
+    coverage = _table_coverage(table, n_nodes, ppn)
+    if coverage == "table":
+        return table[(n_nodes, ppn)]
+    if coverage == "algo_loop":
+        return None
+    tabulated = sorted(n for n, p in table if p == ppn)
+    i = min(bisect.bisect(tabulated, n_nodes), len(tabulated) - 1)
+    lo, hi = tabulated[i - 1], tabulated[i]
+    x = math.log2 if log_latency else float
+    lat_t = (x(n_nodes) - x(hi)) / (x(hi) - x(lo))
+    bw_t = min(0.0, math.log2(n_nodes / hi) / math.log2(hi / lo))
+
+    def derive(lo_entry, hi_entry):
+        (lat_lo, bw_lo), (lat_hi, bw_hi) = lo_entry, hi_entry
+        return lat_hi + lat_t * (lat_hi - lat_lo), bw_hi + bw_t * (bw_hi - bw_lo)
+
+    lo_row, hi_row = table[(lo, ppn)], table[(hi, ppn)]
+    if isinstance(lo_row[0], tuple):
+        return tuple(derive(a, b) for a, b in zip(lo_row, hi_row))
+    return derive(lo_row, hi_row)
+
+
 def _table_collective_time(
     func: NCCLFunc,
     n_bytes: int,
@@ -1086,8 +1145,9 @@ def _table_collective_time(
 ) -> float | None:
     """Table-driven multi-node cost for Hopper+ NVSwitch.
 
-    Returns estimated time in microseconds, or None if the (n_nodes, ppn)
-    combination is not in the table (caller should fall back to the algo loop).
+    Returns estimated time in microseconds, or None if ppn has no table rows
+    (caller should fall back to the algo loop). Untabulated node counts use
+    rows derived by _resolve_table_row().
 
     For AG/RS the only table algo is Ring. For AR, all algos (Ring, Tree,
     NVLSTree) are in the table, but Ring is excluded because the tuning table
@@ -1096,14 +1156,14 @@ def _table_collective_time(
     factor), so excluding Ring here lets the algo loop provide the Ring
     candidate while Tree/NVLSTree come from the table.
     """
-    key = (topo.n_nodes, topo.ppn)
+    n_nodes, ppn = topo.n_nodes, topo.ppn
     bw_scale = _BLACKWELL_BW_SCALE if config.arch == GpuArch.BLACKWELL else 1.0
     is_full_mesh = topo.ppn == config.gpus_per_node
 
     best = float("inf")
 
     if func in (NCCLFunc.ALLGATHER, NCCLFunc.REDUCESCATTER):
-        row = _H100_AGRS_RING.get(key)
+        row = _resolve_table_row(_H100_AGRS_RING, n_nodes, ppn, log_latency=False)
         if row is None:
             return None
         for i, proto in enumerate(_PROTOS):
@@ -1123,7 +1183,7 @@ def _table_collective_time(
         # AllReduce: Tree + NVLSTree from table (Ring from algo loop via caller)
         has_any = False
 
-        tree_row = _H100_AR_TREE.get(key)
+        tree_row = _resolve_table_row(_H100_AR_TREE, n_nodes, ppn, log_latency=True)
         if tree_row is not None:
             has_any = True
             for i, proto in enumerate(_PROTOS):
@@ -1139,7 +1199,9 @@ def _table_collective_time(
                 )
                 best = min(best, t)
 
-        nvls_tree = _H100_AR_NVLS_TREE.get(key)
+        nvls_tree = _resolve_table_row(
+            _H100_AR_NVLS_TREE, n_nodes, ppn, log_latency=True
+        )
         if nvls_tree is not None:
             has_any = True
             lat, bw = nvls_tree
@@ -1171,13 +1233,13 @@ def nccl_collective_time(
     Three dispatch paths for Hopper+ with NVSwitch:
       1. Intra-node: empirical BW/lat from nccl-tests at 2/4/8 GPUs.
       2. Multi-node: table-driven model using NCCL's topology-discovered
-         (lat, bw) constants per (n_nodes, ppn), with size-dependent
-         corrections for NVLSTree BW ramp and Tree correction factor.
-      3. All other configs: NCCL algo selection loop (tuning.cc port).
+         (lat, bw) constants per (n_nodes, ppn), interpolated or
+         extrapolated over n_nodes, with size-dependent corrections for
+         NVLSTree BW ramp and Tree correction factor.
+      3. All other configs, including ppn values without table rows: NCCL
+         algo selection loop (tuning.cc port).
     """
-    is_hopper_nvswitch = (
-        config.arch in (GpuArch.HOPPER, GpuArch.BLACKWELL) and config.has_nvswitch
-    )
+    is_hopper_nvswitch = _is_hopper_nvswitch(config)
 
     # Path 1: NVSwitch empirical path for Hopper+ intra-node
     if is_hopper_nvswitch and topo.n_nodes == 1:
@@ -1258,7 +1320,12 @@ def nccl_all_to_all_cost(
     # into concurrent P2P transfers; the bottleneck is per-GPU NIC bandwidth,
     # not Ring-style sequential steps.
     if n_nodes > 1 and config.has_nvswitch:
-        lat = _interp_clamped(_A2A_MULTI_NODE_LAT_POINTS, n_nodes)
+        (n_lo, lat_lo), (n_hi, lat_hi) = _A2A_MULTI_NODE_LAT_POINTS[-2:]
+        if n_nodes > n_hi:
+            # Unmeasured: extrapolate linearly from the last two points.
+            lat = lat_hi + (n_nodes - n_hi) * (lat_hi - lat_lo) / (n_hi - n_lo)
+        else:
+            lat = _interp_clamped(_A2A_MULTI_NODE_LAT_POINTS, n_nodes)
         remote_fraction = (n_ranks - topo.ppn) / n_ranks
         nic_bw = config.bw_inter * (1.0 - _A2A_NIC_OVERHEAD / n_nodes)
         if nic_bw <= 0:
@@ -1334,6 +1401,38 @@ def nccl_reduce_scatter_cost(
     n_bytes: int, topo: MeshDimTopo, config: NCCLTopoConfig
 ) -> float:
     return nccl_collective_time(NCCLFunc.REDUCESCATTER, n_bytes, topo, config)
+
+
+def nccl_cost_coverage(
+    config: NCCLTopoConfig, mesh_shape: tuple[int, ...]
+) -> tuple[str, ...]:
+    """Report how collectives are priced on each dimension of a mesh.
+
+    Returns one label per mesh dimension, followed by one for the flattened
+    mesh when there is more than one dimension (fused multi-dimension
+    collectives run on it). Labels:
+      - "intra_node_empirical": Hopper+ NVSwitch single-node nccl-tests fit.
+      - "table": tabulated (n_nodes, ppn) tuning-table row.
+      - "interpolated": row derived between tabulated node counts.
+      - "extrapolated": row derived above the largest tabulated node count;
+        unmeasured. AllToAll latency is extrapolated there too.
+      - "algo_loop": tuning.cc algo selection loop, used for configs other
+        than Hopper+ NVSwitch and for ppn values without table rows.
+    """
+    dims = [(tuple(mesh_shape), dim) for dim in range(len(mesh_shape))]
+    if len(mesh_shape) > 1:
+        dims.append(((math.prod(mesh_shape),), 0))
+    if not _is_hopper_nvswitch(config):
+        return ("algo_loop",) * len(dims)
+    labels = []
+    for shape, dim in dims:
+        topo = derive_mesh_dim_topo(config, shape, dim)
+        if topo.n_nodes == 1:
+            labels.append("intra_node_empirical")
+        else:
+            # The AllReduce tables use the same node counts per ppn.
+            labels.append(_table_coverage(_H100_AGRS_RING, topo.n_nodes, topo.ppn))
+    return tuple(labels)
 
 
 # Ordered from most specific to least specific to avoid substring
