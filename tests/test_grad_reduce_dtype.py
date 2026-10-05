@@ -10,6 +10,7 @@ from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor.placement_types import Shard
 
 from autoparallel.api import AutoParallel
+from autoparallel.optimize_sharding import ShardingOptimizer
 
 
 class SimpleLinear(nn.Module):
@@ -34,6 +35,29 @@ class StackedLinear(nn.Module):
         for layer in self.layers:
             x = layer(x)
         return x
+
+
+def test_grad_reduce_dtype_accepts_serialized_tensor_metadata(monkeypatch):
+    graph = torch.fx.Graph()
+    param = graph.placeholder("param")
+    cast = graph.call_function(torch.ops.autoparallel.dtype_cast.default, (param,))
+    graph.output(cast)
+    param.meta["tensor_meta"] = torch.empty(1, dtype=torch.float32).to("meta")
+    cast.meta["tensor_meta"] = torch.empty(1, dtype=torch.bfloat16).to("meta")
+
+    optimizer = ShardingOptimizer.__new__(ShardingOptimizer)
+    optimizer.graph = graph
+    optimizer.nodes = [cast]
+    optimizer.node_map = {cast: 0}
+    optimizer.decision_vars = {}
+    optimizer.force_grad_reduce_in_higher_precision = False
+
+    monkeypatch.setattr(
+        "autoparallel.optimize_sharding.get_param_and_grad_nodes",
+        lambda _graph: {"param": (param, None)},
+    )
+
+    optimizer.add_grad_reduce_dtype_constraints()
 
 
 def _run_autop(mesh, model_fn, input_fn, mp_policy, repeated_subgraphs=False):
