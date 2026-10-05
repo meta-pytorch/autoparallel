@@ -26,7 +26,8 @@ Valid settings are declared in `run_settings.toml`:
   `2d-{16gpu,32gpu,64gpu,128gpu}`, plus
   `3d-dpr2-dps8-tp2-paper-merged`;
 - `deepseek_v3_16b`: `efsdp-ep-{16gpu,32gpu}`, `1d-tp8-ep8-sp`,
-  `2d-dps2-tp8-ep8-sp`, and `3d-dps4-tp8-ep16-sp`.
+  `2d-dps2-tp8-ep8-sp`, `3d-dps4-tp8-ep16-sp`, and the 8K-sequence
+  `3d-dps4-tp8-ep16-sp-8k`.
 
 `HARNESS_WORKSPACE_ROOT` may select the parent directory for task records. It
 does not affect experiment inputs or source versions.

@@ -3,7 +3,8 @@
 ## TorchTitan
 
 The locked source is `kaijian/ap-submission-4d` in `AlbedoWang/torchtitan` at
-`c0fac771`, a child of `85c216d5`, a child of `3b24e620`, which is a child of
+`db5a3e88`, a child of `a38beb86`, a child of `c0fac771`, a child of
+`85c216d5`, a child of `3b24e620`, which is a child of
 `4b46d18d` on `kaijian/deepseek-baseline-parity-20260918`. Its history has `383cae9f` as an actual
 ancestor and retains the `60517d28` AutoParallel/GraphTrainer integration.
 
@@ -68,7 +69,16 @@ ancestor and retains the `60517d28` AutoParallel/GraphTrainer integration.
   model on, recorded by `AutoParallelGraph.apply_placement_for_fx_module`.
   Before, it used the TorchTitan legacy (dp_replicate, fsdp, tp) mesh, whose
   process groups differ from the AutoParallel mesh for 4D, 3D CP, and EP, so the
-  estimator priced every collective on the flattened world. It is the runtime
+  estimator priced every collective on the flattened world.
+- `a38beb86` (child of `c0fac771`, cherry-pick of `19452efb`) drops
+  `dynamic=True` from the DeepSeek V3 AutoParallel trace, so it uses
+  AutoParallel's default static shapes.
+- `db5a3e88` (child of `a38beb86`) backports pytorch/pytorch#199485 by
+  replacing `OverlapPreservingBucketer.restore_to_event` from
+  `autoparallel_api`. After a rejected bucket probe, the locked torch re-adds
+  the `next_event -> node` timeline edge only when there is no `prev_event`,
+  but removes the `next_event -> prev_event` bypass whenever both exist, so
+  Inductor overlap scheduling (pass 2) loses that ordering. It is the runtime
   pin.
 
 The 3D port includes only the approved legacy-DTensor AP configuration, CP
@@ -79,7 +89,7 @@ intentionally excluded.
 ## AutoParallel
 
 The maintained harness remains on `kaijian/paper-submission`; the 4D line
-(v19-v30) is on `kaijian/paper-submission-4d`, which merges the runtime
+(v19-v37) is on `kaijian/paper-submission-4d`, which merges the runtime
 commits `9a16ded`..`98b20b4` and `0a551aa` at their original SHAs. Runtime
 source is pinned to the commit immediately before the lock/harness-only
 updates.
@@ -163,8 +173,12 @@ updates.
   placement constraint as the full problem. Before, the seed sharded parameters
   on that dim (1/size memory cap), so the strategy-radius ball around the seed
   excluded the solver's best parameter storage; on the LLaMA 3 4D mesh
-  feed_forward.w2 was stored S0 on tp and paid a tp all_to_all every step. It is
-  the runtime pin.
+  feed_forward.w2 was stored S0 on tp and paid a tp all_to_all every step.
+- `8d37073` (child of the v30 harness commit `5900959`, cherry-pick of
+  `3e7aeb6`) always attaches a ShapeEnv and tests `static_shapes` instead of
+  `shape_env is not None` for dynamic tracing, so the static DeepSeek V3 trace
+  has a ShapeEnv for the MoE `.tolist()` unbacked SymInts. `_add_alias` also
+  aliases forward local_map outputs. It is the runtime pin.
 
 ## Reproduction policy
 

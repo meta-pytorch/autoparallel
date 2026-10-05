@@ -10,6 +10,7 @@ from pathlib import Path
 
 import torch
 from datasets import Features, Value, load_dataset
+from torch._inductor.config import aten_distributed_optimizations as dist_opts
 from torch.distributed.tensor import DTensor
 from torchtitan.components.dataloader import ParallelAwareDataloader
 from torchtitan.components.loss import CrossEntropyLoss
@@ -77,6 +78,10 @@ if WORLD_SIZE % EP_DEGREE or EP_DEGREE % TP_DEGREE:
     )
 DP_DEGREE = WORLD_SIZE // TP_DEGREE
 EFSDP_DEGREE = WORLD_SIZE // EP_DEGREE
+
+# Inductor overlap scheduling: warn and drop extra deps that would close a cycle
+# instead of raising.
+dist_opts.overlap_scheduling_autofix_cycles = True
 
 LOCAL_BATCH_SIZE = int(os.environ.get("BENCHMARK_LOCAL_BATCH_SIZE", "4"))
 if LOCAL_BATCH_SIZE < 1:

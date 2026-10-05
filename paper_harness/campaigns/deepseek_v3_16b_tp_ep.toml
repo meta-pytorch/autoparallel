@@ -104,7 +104,7 @@ EXPERIMENT_ARM = "G"
 [[phases]]
 name = "performance"
 kind = "performance"
-arms = ["tt_main", "gt_manual", "apgt"]
+arms = ["tt_main", "apgt", "gt_manual"]
 [phases.overrides]
 "training.steps" = 25
 "profiler.enable_profiling" = false
@@ -114,7 +114,7 @@ arms = ["tt_main", "gt_manual", "apgt"]
 [[phases]]
 name = "trace"
 kind = "trace"
-arms = ["tt_main", "gt_manual", "apgt"]
+arms = ["tt_main", "apgt", "gt_manual"]
 trace_ranks = [0]
 [phases.overrides]
 "training.steps" = 6
@@ -164,3 +164,20 @@ name = "3d-dps4-tp8-ep16-sp"
 "mast.environment.BENCHMARK_DP_DEGREE" = "4"
 "mast.environment.BENCHMARK_EP_DEGREE" = "16"
 "mast.environment.BENCHMARK_GLOBAL_BATCH_SIZE" = "8"
+
+[[matrix.points]]
+name = "3d-dps4-tp8-ep16-sp-8k"
+[matrix.points.settings]
+"mast.nodes" = 4
+"mast.phase_timeout_seconds" = 21600
+"comm.init_timeout_seconds" = 14400
+"parallelism.data_parallel_shard_degree" = 4
+"parallelism.tensor_parallel_degree" = 8
+"parallelism.expert_parallel_degree" = 16
+"training.global_batch_size" = 8
+"training.seq_len" = 8192
+"mast.environment.BENCHMARK_WORLD_SIZE" = "32"
+"mast.environment.BENCHMARK_DP_DEGREE" = "4"
+"mast.environment.BENCHMARK_EP_DEGREE" = "16"
+"mast.environment.BENCHMARK_GLOBAL_BATCH_SIZE" = "8"
+"mast.environment.TORCHINDUCTOR_COMPILE_THREADS" = "8"
