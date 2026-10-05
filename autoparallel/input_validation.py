@@ -281,16 +281,18 @@ def _build_input_fn_from_sample(
 
 def _flatten_out_shardings(
     out_shardings: Any,
-) -> list[tuple[Any, ...]]:
+) -> list[Any]:
     """
-    Flatten out_shardings to a list of placement tuples.
+    Flatten out_shardings to a list of boundary constraints.
 
     The out_shardings should match the structure of the model output.
-    Each leaf should be a tuple of Placements.
+    Each leaf should be a tuple of Placements or ``UNCONSTRAINED``.
 
-    Handles nested structures by recursively walking until we find placement tuples.
+    Handles nested structures by recursively walking until we find constraint leaves.
     """
     from torch.distributed.tensor.placement_types import Placement
+
+    from .optimize_sharding import UNCONSTRAINED
 
     def is_placement_tuple(obj: Any) -> bool:
         if not isinstance(obj, tuple):
@@ -299,26 +301,25 @@ def _flatten_out_shardings(
             return False
         return all(isinstance(p, Placement) for p in obj)
 
-    def collect_placement_tuples(obj: Any, result: list) -> None:
-        """Recursively collect placement tuples from a nested structure."""
-        if is_placement_tuple(obj):
+    def collect_constraints(obj: Any, result: list) -> None:
+        if obj is UNCONSTRAINED or is_placement_tuple(obj):
             result.append(obj)
         elif isinstance(obj, (list, tuple)):
             for item in obj:
-                collect_placement_tuples(item, result)
+                collect_constraints(item, result)
         elif isinstance(obj, dict):
             for item in obj.values():
-                collect_placement_tuples(item, result)
+                collect_constraints(item, result)
         else:
             raise TypeError(
-                f"out_shardings must contain tuples of Placements, "
+                "out_shardings must contain tuples of Placements or UNCONSTRAINED, "
                 f"got {type(obj)}: {obj}"
             )
 
-    result: list[tuple[Any, ...]] = []
-    collect_placement_tuples(out_shardings, result)
+    result: list[Any] = []
+    collect_constraints(out_shardings, result)
 
     if not result:
-        raise ValueError("out_shardings must contain at least one placement tuple")
+        raise ValueError("out_shardings must contain at least one boundary constraint")
 
     return result

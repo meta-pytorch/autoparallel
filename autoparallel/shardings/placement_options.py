@@ -211,6 +211,28 @@ def _copy_op_strategy(op_strategy):
     )
 
 
+def _replicated_no_input_strategy(mesh, output_meta):
+    if not isinstance(output_meta, TensorMeta):
+        raise NotImplementedError(
+            "No-input tensor producers with multiple or non-tensor outputs need "
+            "an explicit sharding rule"
+        )
+    output_spec = DTensorSpec(
+        mesh,
+        (Replicate(),) * mesh.ndim,
+        tensor_meta=output_meta,
+    )
+    return OpStrategy(
+        [
+            OpSpec(
+                output_specs=output_spec,
+                input_specs=[output_spec],
+                redistribute_cost=[[0.0]],
+            )
+        ]
+    )
+
+
 _placement_options_cache: dict[tuple, OpStrategy] = {}
 
 
@@ -329,8 +351,22 @@ def get_placement_options(mesh, op, specs, user_args, user_kwargs):
     if op in _op_rules:
         out_strat = _op_rules[op](mesh, op_schema)
     else:
-        with with_implicit_strategies():
-            out_strat = get_op_strategy(op, op_schema)
+        has_tensor_input = any(
+            isinstance(arg, torch.Tensor)
+            for arg in tree_flatten((user_args, user_kwargs))[0]
+        )
+        if not has_tensor_input:
+            output_meta, _ = _get_meta_tensors_for_op(op, user_args, user_kwargs)
+            try:
+                out_strat = _replicated_no_input_strategy(mesh, output_meta)
+            except NotImplementedError as error:
+                raise NotImplementedError(
+                    f"Operator {op} produces tensors without tensor inputs but "
+                    "does not have a supported factory strategy"
+                ) from error
+        else:
+            with with_implicit_strategies():
+                out_strat = get_op_strategy(op, op_schema)
     t1 = time.perf_counter()
 
     # operator.getitem is self-contained: its input is a tuple of tensors
