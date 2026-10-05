@@ -54,6 +54,14 @@ def _make_graph(*, backward=False):
     return gm
 
 
+def _use_zero_runtime_estimator(collector):
+    def estimator(_node):
+        return 0.0
+
+    collector.runtime_estimator = estimator
+    collector.reordering_config.custom_runtime_estimation = estimator
+
+
 @pytest.fixture(autouse=True)
 def preserve_collector_globals():
     topology = get_nccl_topo_config()
@@ -148,6 +156,19 @@ def test_collector_rejects_conflicting_post_grad_pass():
                 pass
 
 
+def test_collector_callback_is_safe_for_nested_config_copy():
+    collector = ReorderedMetricsCollector(_UnusedMesh(), nccl_topology=None)
+
+    with collector:
+        _use_zero_runtime_estimator(collector)
+        torch._inductor.config.get_config_copy()
+        callback = torch._inductor.config.post_grad_custom_post_pass
+        assert callback is collector_module._run_active_post_grad_pass
+        callback(_make_graph().graph)
+
+    assert [record["phase"] for record in collector.records] == ["forward"]
+
+
 def test_collector_rejects_inductor_overlap_scheduling():
     collector = ReorderedMetricsCollector(_UnusedMesh(), nccl_topology=None)
     forward = _make_graph()
@@ -168,6 +189,7 @@ def test_collector_writes_forward_backward_metrics_and_traces(tmp_path):
     )
 
     with collector:
+        _use_zero_runtime_estimator(collector)
         collector._post_grad_pass(_make_graph().graph)
         collector._post_grad_pass(_make_graph(backward=True).graph)
 
@@ -201,6 +223,7 @@ def test_collector_can_include_placeholder_signatures():
     )
 
     with collector:
+        _use_zero_runtime_estimator(collector)
         collector._post_grad_pass(_make_graph().graph)
 
     record = collector.records[0]
@@ -269,3 +292,10 @@ def test_blind_eval_cases_and_rubrics_are_consistent():
             set(criterion["evidence"]) <= evidence_fields
             for criterion in item["criteria"]
         )
+
+
+def test_claude_and_codex_use_the_same_skill():
+    claude_skill = ROOT / ".claude/skills/autoparallel-optimizer"
+
+    assert claude_skill.is_symlink()
+    assert claude_skill.resolve() == SKILL_ROOT.resolve()

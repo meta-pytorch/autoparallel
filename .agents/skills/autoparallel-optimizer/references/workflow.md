@@ -53,33 +53,34 @@ with AutoParallel(model, input_fn, mesh, mp_policy=mp_policy) as autop:
 
 Output constraints align with the flattened output pytree. Use `None` for
 non-tensor leaves, for example `[(Shard(0),), None]` for `(logits, None)`.
-Omit `add_input_constraints()` or `add_output_constraints()` entirely when the
-boundary should be unconstrained. Passing `None` as the whole argument is not
-an unconstrained request: the underlying node constraint interprets a tensor
-placement of `None` as the default batch `Shard(0)` placement.
+Use `UNCONSTRAINED`, imported from `autoparallel`, for a tensor leaf whose
+placement the solver should choose. `None` retains the default batch `Shard(0)`
+behavior for tensor leaves, so it is not an unconstrained request. Omit the
+whole constraint call only when every boundary tensor is unconstrained.
 
 Omitting the parameter-memory call leaves replication legal. Calling it with no
 arguments is different: it uses `low=0` and `high=1 / world_size`, forcing
-sufficiently shardable parameters toward their minimum local fraction. The
-current constraint averages per-tensor sharding ratios; for relaxed bounds,
-compute the selected byte-weighted fraction separately rather than describing
-the bound as a byte budget.
+sufficiently shardable parameters toward their minimum local fraction. Bounds
+are normalized fractions of byte-weighted persistent parameter storage. Record
+the achieved values from `get_json()["summary"]["parameter_storage"]`.
 
 Apply a prefetch discount only as an explicit sensitivity assumption and always
-record its scale. The operation mutates communication costs in place, so load a
-fresh saved optimizer or recapture before comparing another scale. For a
-full-shard plan, follow `full-shard-planning.md` rather than tuning the scale
-until a desired placement appears.
+record its scale. Repeated calls replace the objective scale without mutating
+the base communication costs, so endpoint solves can reuse one optimizer. Save
+each placement and JSON result before the next solve. For a full-shard plan,
+follow `full-shard-planning.md` rather than tuning the scale until a desired
+placement appears.
 
 Capture the placement, `get_json()["summary"]`, exact constraints, discount,
 mesh, and communication cost model before leaving the context. Save the full
 optimizer with `save()` when repeated counterfactual analysis is likely.
 
 Repeated-subgraph clustering is optional compression of the ILP, not a reason
-to discard an otherwise supported graph. If clustering asserts that two linked
-nodes have different input/output strategy counts, preserve the assertion and
-retry once with `repeated_subgraphs=False`. Do not use this retry for unrelated
-capture or strategy failures.
+to discard an otherwise supported graph. AutoParallel skips malformed groups
+atomically and records them in the JSON clustering summary. Preserve and report
+those diagnostics because the solve used less compression. Retry with
+`repeated_subgraphs=False` only for comparison or an older checkout that still
+aborts.
 
 `optimize_placement()` also emits `autoparallel_sharding_optimizer_log` and
 `autoparallel_solution` structured trace artifacts. Set `TORCH_TRACE` to a trace

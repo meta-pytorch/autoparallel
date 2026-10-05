@@ -72,9 +72,9 @@ slower mesh axis.
 4. Capture once, add only intended boundary and memory constraints, and call
    `optimize_placement()`. This is the plan operation. Note that
    `add_parameter_memory_constraint()` with no arguments sets the upper bound to
-   `1 / world_size`; it is not a neutral constraint. For relaxed bounds, report
-   the selected byte-weighted parameter fraction separately: the current
-   constraint averages per-tensor sharding ratios rather than parameter bytes.
+   `1 / world_size`; it is not a neutral constraint. The normalized bound is
+   byte-weighted, and `get_json()["summary"]["parameter_storage"]` reports the
+   achieved persistent parameter bytes and fraction.
 5. Save placements, `get_json()`, and optionally the full optimizer before
    experimentation. Explore the stable joint graph by adding node constraints,
    calling `resolve()` and `diff_solutions()`, then removing the temporary
@@ -114,10 +114,10 @@ slower mesh axis.
 
 - On capture failure, reduce to the smallest failing submodule and preserve the
   original traceback. Do not automatically hide it behind `local_map`.
-- If repeated-subgraph clustering alone asserts that linked nodes have
-  different strategy counts, retry once with `repeated_subgraphs=False`, retain
-  the clustering failure, and do not describe the fallback as equivalent
-  clustered coverage.
+- Inspect the JSON clustering summary and warnings for malformed groups that
+  were skipped. Report the resulting loss of ILP compression; do not retry the
+  entire graph without clustering unless comparison or an older checkout
+  requires it.
 - On infeasibility, remove temporary node constraints first, then relax output
   or memory constraints one at a time and report what restored feasibility.
 - On unexpected replication, inspect the parameter-memory constraint and the
@@ -128,9 +128,9 @@ slower mesh axis.
 - On metric failure, verify that compilation produced partitioned graphs, that
   forward and backward both ran, and that planning and evaluation shared the
   same topology configuration.
-- A successful solve is not lowering evidence. Preserve failures caused by
-  uneven-shard padding, fixed views, tied parameters, or missing aliased
-  buffers instead of reporting the ILP placement as usable.
+- A successful solve is not lowering evidence. Preserve failures from custom
+  operations, dynamic rank-dependent shapes, initialization, or compiler
+  transformations instead of reporting the ILP placement as usable.
 - Consult `docs/troubleshooting.md` for established repository procedures.
 
 ## Output

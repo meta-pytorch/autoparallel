@@ -37,6 +37,13 @@ _REORDERING_FIELDS = (
     "max_topo_span",
     "collective_bucketing",
 )
+_ACTIVE_COLLECTOR: ReorderedMetricsCollector | None = None
+
+
+def _run_active_post_grad_pass(graph: torch.fx.Graph) -> torch.fx.GraphModule:
+    if _ACTIVE_COLLECTOR is None:
+        raise RuntimeError("No active ReorderedMetricsCollector")
+    return _ACTIVE_COLLECTOR._post_grad_pass(graph)
 
 
 def classify_graph_phase(graph: torch.fx.Graph) -> str:
@@ -92,8 +99,12 @@ class ReorderedMetricsCollector:
         self.runtime_estimator: Any = None
 
     def __enter__(self) -> "ReorderedMetricsCollector":
+        global _ACTIVE_COLLECTOR
+
         if self._active:
             raise RuntimeError("ReorderedMetricsCollector is not reentrant")
+        if _ACTIVE_COLLECTOR is not None:
+            raise RuntimeError("Another ReorderedMetricsCollector is already active")
         if torch._inductor.config.post_grad_custom_post_pass is not None:
             raise RuntimeError(
                 "post_grad_custom_post_pass is already configured; compose the "
@@ -153,12 +164,15 @@ class ReorderedMetricsCollector:
                     {
                         "reorder_for_peak_memory": False,
                         "reorder_for_compute_comm_overlap": False,
-                        "post_grad_custom_post_pass": self._post_grad_pass,
+                        "post_grad_custom_post_pass": _run_active_post_grad_pass,
                     }
                 ),
             )
             self._config_patch.__enter__()
+            _ACTIVE_COLLECTOR = self
         except BaseException:
+            if _ACTIVE_COLLECTOR is self:
+                _ACTIVE_COLLECTOR = None
             set_nccl_topo_config(self._previous_topology)
             aten_autobucketing_config.max_topo_span = self._previous_max_topo_span
             raise
@@ -166,10 +180,14 @@ class ReorderedMetricsCollector:
         return self
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:
+        global _ACTIVE_COLLECTOR
+
         try:
             assert self._config_patch is not None
             self._config_patch.__exit__(exc_type, exc_value, traceback)
         finally:
+            if _ACTIVE_COLLECTOR is self:
+                _ACTIVE_COLLECTOR = None
             set_nccl_topo_config(self._previous_topology)
             aten_autobucketing_config.max_topo_span = self._previous_max_topo_span
             self._active = False

@@ -15,6 +15,9 @@ Look for constructs whose meaning may depend on a process-local batch or rank:
 
 - `torch.randperm`, random sampling, sample dropping, masking, or stochastic
   routing along the batch dimension;
+- no-input random factories whose output is labeled replicated: independently
+  executing the factory on every rank does not guarantee equal values after
+  rank-local RNG consumption diverges;
 - indexing, gathering, scattering, sorting, or top-k over a locally flattened
   batch;
 - reductions or normalization over batch elements, masked-token counts, or

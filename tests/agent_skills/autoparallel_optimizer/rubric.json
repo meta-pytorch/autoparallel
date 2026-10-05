@@ -292,7 +292,7 @@
           "id": "uses_independent_optimizer_state",
           "weight": 3,
           "critical": true,
-          "description": "Notes that prefetch discounting mutates costs and requires a fresh capture or independently loaded saved optimizer for comparable endpoints.",
+          "description": "Applies and records each endpoint scale explicitly, saves each result before the next solve, and does not claim that repeated discount calls compound or require recapture.",
           "evidence": ["response"]
         },
         {

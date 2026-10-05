@@ -11,16 +11,14 @@ parameter toward its minimum local fraction. It constrains persistent parameter
 placement; it does not model the full training-memory peak, optimizer state,
 activation checkpointing, or the lifetime of materialized FSDP buffers.
 
-The current memory constraint averages each parameter tensor's local sharding
-ratio with equal weight. It is not byte-weighted. This distinction is usually
-irrelevant at the exact fully-sharded endpoint, but it matters for relaxed
-bounds and heterogeneous tensor sizes. Always compute the selected local
-parameter bytes after solving.
+The memory constraint weights each parameter tensor by bytes and counts aliased
+storage once. Its normalized bound still covers persistent parameter storage,
+not optimizer state, activations, or materialized communication buffers. Record
+the achieved local and global bytes from the JSON summary after solving.
 
-`apply_prefetch_discount(scale)` multiplies eligible communication costs in
-place. Repeated calls compound and cannot reconstruct the undiscounted costs.
-Use a fresh capture or reload the same undiscounted saved optimizer for each
-endpoint.
+`apply_prefetch_discount(scale)` sets an objective-time scale while preserving
+the base communication costs. Repeated calls replace the prior scale. Save each
+endpoint's placements and JSON before solving the next one.
 
 The discount is candidate-independent even though realizable overlap depends on
 the placement, bucket sizes, available compute, collective resources, and live
@@ -29,15 +27,15 @@ that is circular evidence.
 
 ## Build a bounded placement envelope
 
-Capture once and retain enough optimizer state to reproduce independent solves.
+Capture once and retain enough optimizer state and artifacts to reproduce each solve.
 Use at most these candidates unless the user asks for a sweep:
 
 1. **Serial endpoint:** no prefetch discount. This is a pessimistic overlap
    proxy, not a runtime upper bound with guaranteed estimator accuracy.
-2. **Optimistic endpoint:** `apply_prefetch_discount(scale=0.0)` on a fresh
-   optimizer. This treats eligible parameter and terminal communication as
-   free; it is not an executable prediction and excludes transient-buffer
-   pressure.
+2. **Optimistic endpoint:** set `apply_prefetch_discount(scale=0.0)` after
+   saving the serial result, then solve again. This treats eligible parameter
+   and terminal communication as free; it is not an executable prediction and
+   excludes transient-buffer pressure.
 3. **Compute-placement baseline, when diagnostic value justifies one more
    solve:** remove or omit the parameter-memory constraint. This shows the
    preferred compute layout but is not a viable training plan until persistent

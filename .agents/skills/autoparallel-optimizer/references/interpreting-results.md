@@ -2,18 +2,21 @@
 
 ## ILP objective
 
-Use `sharding_optimizer.get_json()["summary"]` for the selected plan's total,
-compute, communication, and transition costs. Compute and communication are
-runtime estimates in microseconds. The transition cost is a `1.0` tie-breaker
-that favors fewer redistribution steps when equal-cost redistributions could be
-fused; do not present it as a measured kernel-launch cost.
+Use `sharding_optimizer.get_json()["summary"]` for the selected plan's base
+total, compute, communication, and transition costs. `search_objective` is the
+actual objective after any prefetch scale; with undiscounted communication it
+matches the base total. Compute and communication are runtime estimates in
+microseconds. The transition cost is a `1.0` tie-breaker that favors fewer
+redistribution steps when equal-cost redistributions could be fused; do not
+present it as a measured kernel-launch cost.
 
 With undiscounted communication, the sum is a modeled serial upper-bound proxy
 for forward-plus-backward runtime: it ignores communication/compute overlap,
 while its component models remain approximate. If
-`apply_prefetch_discount(scale < 1)` was used, call the objective a discounted
-latency proxy and report the scale. A zero scale is an optimistic endpoint, not
-evidence that all eligible communication is hidden.
+`apply_prefetch_discount(scale < 1)` was used, call `search_objective` a
+discounted latency proxy and report the scale. The base cost breakdown remains
+undiscounted. A zero scale is an optimistic endpoint, not evidence that all
+eligible communication is hidden.
 
 The discount applies one scale across candidate placements. Realized exposure
 can change with collective sizes, bucket composition, available compute,
@@ -56,11 +59,12 @@ A mesh change alters both legal strategies and collective costs. Treat 1D and
 2D meshes as separate optimization runs and record why an inferred mesh was
 chosen.
 
-For a full-shard sensitivity comparison, use independently loaded serial and
-zero-discount optimizers. If their material parameter and heavy-compute layouts
-agree, report endpoint stability. If they differ, retain the distinct layouts
-as provisional candidates and compare post-reordering metrics; do not select an
-intermediate scale merely because it produces a familiar strategy.
+For a full-shard sensitivity comparison, solve and save the serial endpoint,
+then replace the objective scale and solve the zero-discount endpoint. If their
+material parameter and heavy-compute layouts agree, report endpoint stability.
+If they differ, retain the distinct layouts as provisional candidates and
+compare post-reordering metrics; do not select an intermediate scale merely
+because it produces a familiar strategy.
 
 ## Evidence ladder
 
@@ -78,13 +82,11 @@ Numerical and target checks can still expose implementation, compiler,
 custom-op, or opaque-region defects.
 
 Treat placement application as a separate legality gate. Strategy propagation
-may admit a shard whose local shape is ceil-padded when a dimension is not
-divisible by the mesh. A later fixed `view` can reject that padded shape.
-Likewise, tied parameters or aliased buffers can plan successfully but be
-reconstructed with an incompatible local shape or missing state. Report these
-as lowering failures, and use a replicated counterfactual to isolate the cause
-when useful; do not silently substitute that counterfactual for the selected
-plan.
+cannot establish that custom operations, dynamic rank-dependent shapes, model
+initialization, or later compiler transformations preserve the planned
+contract. Report such failures at their actual evidence level, and use a
+replicated counterfactual to isolate the cause when useful; do not silently
+substitute that counterfactual for the selected plan.
 
 ## Boundaries
 
@@ -95,9 +97,8 @@ plan.
   communication.
 - Dynamic-shape costs use traced shape hints unless the estimator models the
   range explicitly.
-- The parameter-memory constraint currently averages per-tensor local ratios,
-  not local parameter bytes. Report the achieved byte-weighted fraction for a
-  relaxed constraint.
+- Parameter-memory bounds and the reported achieved fraction cover persistent
+  parameter bytes, not total training memory.
 - Persistent parameter memory excludes optimizer state, activation peaks, and
   transient materialization buffers unless those were evaluated separately.
 - Full optimizer state is trusted, version-coupled pickle data. Placement JSON
