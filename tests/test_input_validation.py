@@ -9,11 +9,13 @@ from torch import nn
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
+from autoparallel import UNCONSTRAINED
 from autoparallel.api import auto_parallel
 from autoparallel.input_validation import (
     ForwardInputs,
     _check_forward_args,
     _extract_input_info,
+    _flatten_out_shardings,
     _make_input_fn,
     flatten_and_convert_inputs_to_local_shapes,
 )
@@ -51,6 +53,13 @@ def test_check_forward_args_non_tensor_value():
 
     with pytest.raises(ValueError, match="value"):
         _check_forward_args((99,), expected)
+
+
+def test_flatten_out_shardings_accepts_unconstrained():
+    assert _flatten_out_shardings(UNCONSTRAINED) == [UNCONSTRAINED]
+    assert _flatten_out_shardings(
+        {"free": UNCONSTRAINED, "nested": [(Shard(0),), (Replicate(),)]}
+    ) == [UNCONSTRAINED, (Shard(0),), (Replicate(),)]
 
 
 def test_flatten_and_convert_inputs_to_local_shapes(device_mesh_1d):
@@ -144,6 +153,31 @@ def test_forward_input_validation_integration(device_mesh_1d):
 
     with pytest.raises(TypeError, match="Tensor"):
         parallel_mod(42)
+
+
+def test_auto_parallel_accepts_unconstrained_output(device_mesh_1d):
+    class Model(nn.Module):
+        def forward(self, x):
+            return torch.sin(x)
+
+    with torch.device("meta"):
+        model = Model()
+
+    local_batch_size = 512 // device_mesh_1d.size()
+    x = DTensor.from_local(
+        torch.rand(local_batch_size, 8, device="cuda"),
+        device_mesh_1d,
+        [Shard(0)],
+    )
+    parallel_mod = auto_parallel(
+        model,
+        device_mesh_1d,
+        sample_inputs=(x,),
+        out_shardings=UNCONSTRAINED,
+    )
+
+    output = parallel_mod(torch.rand(local_batch_size, 8, device="cuda"))
+    assert output.shape == (local_batch_size, 8)
 
 
 def test_flatten_and_convert_inputs_to_local_shapes_dict_pytree(device_mesh_1d):

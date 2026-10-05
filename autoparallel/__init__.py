@@ -7,11 +7,13 @@ from autoparallel.api import AutoParallel, auto_parallel
 from autoparallel.collectives import with_sharding_constraint
 from autoparallel.compile import autoparallel_backend
 from autoparallel.input_validation import ForwardInputs
+from autoparallel.optimize_sharding import UNCONSTRAINED
 
 __all__ = [
     "auto_parallel",
     "AutoParallel",
     "autoparallel_backend",
     "ForwardInputs",
+    "UNCONSTRAINED",
     "with_sharding_constraint",
 ]
