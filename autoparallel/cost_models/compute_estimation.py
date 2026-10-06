@@ -94,6 +94,8 @@ DEVICE_LIMITS: Tuple[DeviceLimit, ...] = (
             torch.float32: 2200 // 2,
             torch.float16: 4500 // 2,
             torch.bfloat16: 4500 // 2,
+            torch.float8_e4m3fn: 9000 // 2,
+            torch.float8_e5m2: 9000 // 2,
             torch.int8: 9000 // 2,
         },
     ),
