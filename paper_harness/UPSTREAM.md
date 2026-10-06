@@ -84,8 +84,23 @@ ancestor and retains the `60517d28` AutoParallel/GraphTrainer integration.
   unbacked `all_to_all_single` split size (the MoE dispatch `.tolist()` counts)
   without a hint gets `override_optimization_hint(a2a input rows // group
   size)`. Inductor's buffer-reuse planning otherwise sizes those buffers with
-  `fallback=0`. It applies to both GraphTrainer arms. It is the runtime pin; the
-  lock remote is the local repository because the commit is not pushed.
+  `fallback=0`. It applies to both GraphTrainer arms.
+- `95a4747d` (local branch `agent/dsv3-p2-uneven-fsdp-20261005`, child of
+  `bf68f079`) backports upstream `e4fdd2fc` (pytorch/torchtitan#4593,
+  `simple_fsdp.py` only): SimpleFSDP passes the TP/EP-local shape and stride
+  to `DTensor.from_local` instead of inferring them, so uneven DP shards (DSv3
+  dense w1 has 1368 TP-local rows, uneven over dp_shard 16) keep the right
+  global size in GraphTrainer manual. The fork's rewrap of the gathered tensor
+  on the TP/EP mesh also gets the input's global shape and stride.
+- `7e7d90e1` (same branch, child of `95a4747d`) backports upstream `0a3e5e0c`
+  (pytorch/torchtitan#4934, `fsdp_passes.py` only, without the chunk-ownership
+  handling this base does not have): `deduplicate_fsdp_unshard_chains_pass`
+  keeps an unshard chain that still has consumers as canonical and drops dead
+  duplicates without substituting them. Shard(1) expert FSDP (dp_shard 16 x
+  tp 8 / EP 32 > 64 experts) otherwise replaced the live reconstructed expert
+  weight with a dead chain's raw gathered shard, so `_grouped_mm` failed in
+  GraphTrainer manual. It is the runtime pin; the lock remote is the local
+  repository because the commits are not pushed.
 
 The 3D port includes only the approved legacy-DTensor AP configuration, CP
 input-ownership seam, DP-shard/CP/TP mesh, CP-aware SDPA, DTensor output, and

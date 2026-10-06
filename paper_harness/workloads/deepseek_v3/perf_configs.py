@@ -37,6 +37,8 @@ from torchtitan.hf_datasets.text_datasets import (
 from torchtitan.models.common.config_utils import decoder_vocab_size
 from torchtitan.models.deepseek_v3.config_registry import deepseek_v3_16b
 
+from .autoparallel_4d import parallelize_autoparallel_4d_deepseekv3
+
 C4_REPO = "allenai/c4"
 C4_REVISION = "1588ec454efa1a09f29cd18ddd04fe05fc8653a2"
 C4_TRAIN_SHARDS = 1024
@@ -78,6 +80,12 @@ if WORLD_SIZE % EP_DEGREE or EP_DEGREE % TP_DEGREE:
     )
 DP_DEGREE = WORLD_SIZE // TP_DEGREE
 EFSDP_DEGREE = WORLD_SIZE // EP_DEGREE
+DP_REPLICATE_DEGREE = int(os.environ.get("BENCHMARK_DP_REPLICATE_DEGREE", "1"))
+if DP_REPLICATE_DEGREE < 1 or DP_DEGREE % DP_REPLICATE_DEGREE:
+    raise ValueError(
+        "Data parallel replicate degree must divide the data parallel degree: "
+        f"{DP_DEGREE=} {DP_REPLICATE_DEGREE=}"
+    )
 
 # Inductor overlap scheduling: warn and drop extra deps that would close a cycle
 # instead of raising.
@@ -390,8 +398,8 @@ def _base_config():
     )
     config.parallelism = replace(
         config.parallelism,
-        data_parallel_replicate_degree=1,
-        data_parallel_shard_degree=DP_DEGREE,
+        data_parallel_replicate_degree=DP_REPLICATE_DEGREE,
+        data_parallel_shard_degree=DP_DEGREE // DP_REPLICATE_DEGREE,
         tensor_parallel_degree=TP_DEGREE,
         enable_sequence_parallel=TP_DEGREE > 1,
         context_parallel_degree=1,
@@ -438,7 +446,7 @@ def _base_config():
     return config
 
 
-def autoparallel_graphtrainer_16b():
+def _graph_trainer_config():
     config = to_graph_trainer_config(_base_config(), graph_model_registry)
     config.model_spec = replace(
         config.model_spec,
@@ -455,8 +463,19 @@ def autoparallel_graphtrainer_16b():
     return config
 
 
+def autoparallel_graphtrainer_16b():
+    config = _graph_trainer_config()
+    if DP_REPLICATE_DEGREE > 1:
+        config.model_spec = replace(
+            config.model_spec,
+            name="graph_trainer/deepseek_v3/autoparallel_4d",
+            parallelize_fn=parallelize_autoparallel_4d_deepseekv3,
+        )
+    return config
+
+
 def graphtrainer_manual_16b():
-    config = autoparallel_graphtrainer_16b()
+    config = _graph_trainer_config()
     config.compile = replace(config.compile, enable_autoparallel=False)
     return config
 

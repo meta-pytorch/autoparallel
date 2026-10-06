@@ -1,9 +1,9 @@
 schema_version = 1
-harness_version = "v40"
+harness_version = "v42"
 
 [sources.torchtitan]
 remote = "/home/wangkj/workspace/torchtitan"
-commit = "bf68f0791e2f278bfdc1185878b1b9ecf4a36ad6"
+commit = "7e7d90e100dbb4548d8d254119d4f219f5ea1a42"
 dirty_policy = "forbid"
 
 [sources.autoparallel]

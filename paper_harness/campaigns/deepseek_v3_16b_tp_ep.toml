@@ -181,3 +181,56 @@ name = "3d-dps4-tp8-ep16-sp-8k"
 "mast.environment.BENCHMARK_EP_DEGREE" = "16"
 "mast.environment.BENCHMARK_GLOBAL_BATCH_SIZE" = "8"
 "mast.environment.TORCHINDUCTOR_COMPILE_THREADS" = "8"
+
+[[matrix.points]]
+name = "3d-dps8-tp8-ep16-sp-8k"
+[matrix.points.settings]
+"mast.nodes" = 8
+"mast.phase_timeout_seconds" = 21600
+"comm.init_timeout_seconds" = 14400
+"parallelism.data_parallel_shard_degree" = 8
+"parallelism.tensor_parallel_degree" = 8
+"parallelism.expert_parallel_degree" = 16
+"training.global_batch_size" = 16
+"training.seq_len" = 8192
+"mast.environment.BENCHMARK_WORLD_SIZE" = "64"
+"mast.environment.BENCHMARK_DP_DEGREE" = "8"
+"mast.environment.BENCHMARK_EP_DEGREE" = "16"
+"mast.environment.BENCHMARK_GLOBAL_BATCH_SIZE" = "16"
+"mast.environment.TORCHINDUCTOR_COMPILE_THREADS" = "8"
+
+[[matrix.points]]
+name = "3d-dps16-tp8-ep32-sp-8k"
+[matrix.points.settings]
+"mast.nodes" = 16
+"mast.phase_timeout_seconds" = 43200
+"comm.init_timeout_seconds" = 21600
+"parallelism.data_parallel_shard_degree" = 16
+"parallelism.tensor_parallel_degree" = 8
+"parallelism.expert_parallel_degree" = 32
+"training.global_batch_size" = 32
+"training.seq_len" = 8192
+"mast.environment.BENCHMARK_WORLD_SIZE" = "128"
+"mast.environment.BENCHMARK_DP_DEGREE" = "16"
+"mast.environment.BENCHMARK_EP_DEGREE" = "32"
+"mast.environment.BENCHMARK_GLOBAL_BATCH_SIZE" = "32"
+"mast.environment.TORCHINDUCTOR_COMPILE_THREADS" = "8"
+
+[[matrix.points]]
+name = "4d-dpr2-dps8-tp8-ep32-sp-8k"
+[matrix.points.settings]
+"mast.nodes" = 16
+"mast.phase_timeout_seconds" = 43200
+"comm.init_timeout_seconds" = 21600
+"parallelism.data_parallel_replicate_degree" = 2
+"parallelism.data_parallel_shard_degree" = 8
+"parallelism.tensor_parallel_degree" = 8
+"parallelism.expert_parallel_degree" = 32
+"training.global_batch_size" = 32
+"training.seq_len" = 8192
+"mast.environment.BENCHMARK_WORLD_SIZE" = "128"
+"mast.environment.BENCHMARK_DP_REPLICATE_DEGREE" = "2"
+"mast.environment.BENCHMARK_DP_DEGREE" = "16"
+"mast.environment.BENCHMARK_EP_DEGREE" = "32"
+"mast.environment.BENCHMARK_GLOBAL_BATCH_SIZE" = "32"
+"mast.environment.TORCHINDUCTOR_COMPILE_THREADS" = "8"
