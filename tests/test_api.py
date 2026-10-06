@@ -49,6 +49,30 @@ def test_from_meta_model(device_mesh_1d):
     assert isinstance(auto_p.model.get_buffer("buf"), torch._subclasses.FakeTensor)
 
 
+def test_from_real_model_preserves_parameter_aliases(device_mesh_1d):
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embedding = nn.Embedding(16, 8)
+            self.decoder = nn.Linear(8, 16, bias=False)
+            self.decoder.weight = self.embedding.weight
+
+        def forward(self, x):
+            return self.decoder(self.embedding(x))
+
+    model = Model()
+
+    auto_p = AutoParallel(
+        model,
+        lambda: torch.zeros(4, dtype=torch.long, device="cuda"),
+        device_mesh_1d,
+    )
+
+    assert model.embedding.weight.device.type == "cpu"
+    assert auto_p.model.embedding.weight is auto_p.model.decoder.weight
+    assert auto_p.param_aliases == {"decoder.weight": "embedding.weight"}
+
+
 def test_fx_graph_annotate(device_mesh_1d):
     dim = 128
 

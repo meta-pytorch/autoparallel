@@ -36,6 +36,21 @@ def _get_decomp_table():
     return decomp_table
 
 
+def copy_model_to_meta(model: torch.nn.Module) -> torch.nn.Module:
+    """Copy a module to meta without losing parameter or buffer aliases."""
+    memo: dict[int, torch.Tensor] = {}
+    for _, parameter in model.named_parameters(remove_duplicate=False):
+        if id(parameter) not in memo:
+            tensor = torch.empty_like(parameter, device="meta")
+            memo[id(parameter)] = torch.nn.Parameter(
+                tensor, requires_grad=parameter.requires_grad
+            )
+    for _, buffer in model.named_buffers(remove_duplicate=False):
+        if id(buffer) not in memo:
+            memo[id(buffer)] = torch.empty_like(buffer, device="meta")
+    return copy.deepcopy(model, memo)
+
+
 def move_to_fake(model: torch.nn.Module, mode: FakeTensorMode, device: torch.device):
     """
     Move the model to the fake mode and move the weights to the fake device

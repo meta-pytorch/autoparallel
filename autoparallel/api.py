@@ -3,7 +3,6 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
-import copy
 import json
 import logging
 import operator
@@ -52,6 +51,7 @@ from .shardings.placement_options import _get_device_from_mesh
 from .tracing import (
     _add_unused_params_and_buffers,
     _get_decomp_table,
+    copy_model_to_meta,
     enable_local_map_wrapping,
     move_to_fake,
 )
@@ -233,7 +233,8 @@ class AutoParallel:
     """
     Args:
         mesh: Defines placement options.
-        The meta model is moved to a fake device based on mesh.device_type.
+        The model is copied to meta and moved to a fake device based on
+        mesh.device_type.
     """
 
     def __init__(
@@ -258,9 +259,7 @@ class AutoParallel:
         self.mp_policy = mp_policy
         self.cost_model = cost_model
         self.repeated_subgraphs = repeated_subgraphs
-        # copy user model to avoid modifying it in-place
-        # in dtype casting and move_to_fake
-        model = copy.deepcopy(model)
+        model = copy_model_to_meta(model)
 
         if self.mp_policy is not None:
             apply_dtype_cast(model, self.mp_policy)
