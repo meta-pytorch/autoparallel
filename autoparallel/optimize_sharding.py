@@ -56,7 +56,7 @@ subject to the following constraint categories:
    5a. Input/Output constraints: x_{i,a,o*,j*} = 1 for specified (o*,j*)
        → Implemented in: add_sharded_input_constraint(), add_sharded_output_constraint()
 
-   5b. Memory constraints: Σ_{params} (size_ratio * x_{param}) ≤ memory_limit
+   5b. Memory constraints: Σ_{params} (local_bytes * x_{param}) ≤ memory_limit
        → Implemented in: add_parameter_memory_constraint()
 
    5c. Forward-backward consistency: x_{fwd} = x_{bwd} for paired nodes
@@ -1266,6 +1266,33 @@ class ShardingOptimizer:
             violated_constraints_log=self.get_violated_constraints_log(),
         )
 
+    def _get_parameter_storage_summary(self, solution):
+        global_bytes = 0
+        local_bytes = 0
+        tensor_count = 0
+        for nodes in self._get_persistent_alias_groups(ParamAOTInput).values():
+            node = nodes[0]
+            strategy = solution.get(node)
+            if strategy is None or not isinstance(strategy.output_specs, DTensorSpec):
+                continue
+            spec = strategy.output_specs
+            if spec.tensor_meta is None:
+                continue
+            tensor_count += 1
+            element_size = spec.tensor_meta.dtype.itemsize
+            global_bytes += math.prod(spec.tensor_meta.shape) * element_size
+            local_shape, _ = _get_sharded_shape_stride(spec)
+            local_bytes += math.prod(local_shape) * element_size
+
+        return {
+            "global_bytes": global_bytes,
+            "local_bytes": local_bytes,
+            "local_to_global_fraction": (
+                local_bytes / global_bytes if global_bytes else None
+            ),
+            "tensor_count": tensor_count,
+        }
+
     def get_json(self):
         from autoparallel.export_json import (
             _normalize_cluster_layer,
@@ -1290,15 +1317,19 @@ class ShardingOptimizer:
 
         _normalize_cluster_layer(cluster_roots)
 
+        solution = {
+            node: next(iter(dvs_by_argi.values())).strategy
+            for node, dvs_by_argi in selected_by_node.items()
+        }
         result = export_sharding_json(
             graph=self.graph,
             mesh=self.mesh,
-            solution={
-                node: next(iter(dvs_by_argi.values())).strategy
-                for node, dvs_by_argi in selected_by_node.items()
-            },
+            solution=solution,
             selected_dvs=selected_by_node,
             cluster_roots=cluster_roots,
+        )
+        result["summary"]["parameter_storage"] = self._get_parameter_storage_summary(
+            solution
         )
         result["summary"]["prefetch_discount"] = self._prefetch_discount
         search_objective = pulp.value(self.prob.objective)
@@ -1749,7 +1780,8 @@ class ShardingOptimizer:
     ):
         """USER (Category 5b): Constrain total parameter memory usage.
 
-        Σ_{params} (size_ratio * x_{param}) ≤ memory_limit
+        The normalized bounds are applied to byte-weighted persistent parameter
+        storage. Aliased parameters are counted once.
 
         The actual ILP constraints are added lazily at solve time so that
         node constraints registered after this call are still respected.
@@ -1786,13 +1818,14 @@ class ShardingOptimizer:
         elms: list[pulp.LpAffineExpression] = []
         budget_low: float = 0.0
         budget_high: float = 0.0
+        total_global_bytes = 0
         for nodes in self._get_persistent_alias_groups(ParamAOTInput).values():
             if any(node.name in user_constrained_names for node in nodes):
                 continue
             node = nodes[0]
             node_idx = self.node_map[node]
             num_out_strat = len(self.strats[node].strategies)
-            ratios: list[float] = []
+            local_bytes: list[int] = []
             for out_idx in range(num_out_strat):
                 dv = self._resolve_decision_var((node_idx, 0, out_idx, 0))
                 spec: DTensorSpec = dv.input_spec
@@ -1801,15 +1834,27 @@ class ShardingOptimizer:
                 new_tensor_shape, _ = _get_sharded_shape_stride(spec)
                 new_size: int = math.prod(new_tensor_shape)
                 old_size: int = math.prod(tensor_shape)
-                ratio = new_size / old_size
-                ratios.append(ratio)
-                elms.append(dv.var * ratio)
-            best_ratio: float = min(ratios)
-            budget_low += max(best_ratio, memory_factor_low)
-            budget_high += max(best_ratio, memory_factor_high)
+                element_size = spec.tensor_meta.dtype.itemsize
+                strategy_bytes = new_size * element_size
+                global_bytes = old_size * element_size
+                local_bytes.append(strategy_bytes)
+                elms.append(dv.var * strategy_bytes)
+            minimum_bytes = min(local_bytes)
+            total_global_bytes += global_bytes
+            budget_low += max(minimum_bytes, global_bytes * memory_factor_low)
+            budget_high += max(minimum_bytes, global_bytes * memory_factor_high)
 
-        self.prob += (pulp.lpSum(elms) <= budget_high, "memory_constraint_high")
-        self.prob += (pulp.lpSum(elms) >= budget_low, "memory_constraint_low")
+        if total_global_bytes == 0:
+            return
+        normalized_storage = pulp.lpSum(elms) / total_global_bytes
+        self.prob += (
+            normalized_storage <= budget_high / total_global_bytes,
+            "memory_constraint_high",
+        )
+        self.prob += (
+            normalized_storage >= budget_low / total_global_bytes,
+            "memory_constraint_low",
+        )
 
     def add_node_constraint(self, node, placement=None, constraint_name=None):
         """USER (Category 5d): Force a specific placement for a node.
