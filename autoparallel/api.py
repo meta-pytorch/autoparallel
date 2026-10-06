@@ -15,6 +15,7 @@ from typing import Any, Callable, Optional, Union
 
 import torch
 from torch._dynamo.functional_export import _dynamo_graph_capture_for_export
+from torch._dynamo.utils import warn_once
 from torch._functorch.aot_autograd import (
     aot_compile_joint_with_descriptors,
     aot_export_joint_with_descriptors,
@@ -294,7 +295,9 @@ class AutoParallel:
             )
             from .cost_models.nccl_cost_model import (
                 NCCLTopoConfig,
+                _is_hopper_nvswitch,
                 detect_nccl_topo_config,
+                nccl_cost_coverage,
             )
 
             self._prev_nccl_config = get_nccl_topo_config()
@@ -304,6 +307,17 @@ class AutoParallel:
                 set_nccl_topo_config(detect_nccl_topo_config(self.mesh))
             else:
                 set_nccl_topo_config(None)
+            nccl_config = get_nccl_topo_config()
+            if nccl_config is not None and _is_hopper_nvswitch(nccl_config):
+                mesh_shape = tuple(self.mesh.shape)
+                coverage = nccl_cost_coverage(nccl_config, mesh_shape)
+                if {"extrapolated", "algo_loop"} & set(coverage):
+                    warn_once(
+                        f"NCCL cost model coverage for mesh {mesh_shape} is "
+                        f"{coverage} (see nccl_cost_coverage). "
+                        "Extrapolated collective costs are unmeasured, and "
+                        "algo_loop ones use the uncalibrated tuning.cc fallback."
+                    )
 
             self.stack.enter_context(self.mesh)
 
