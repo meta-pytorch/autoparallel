@@ -3,6 +3,7 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+import heapq
 import itertools
 import math
 import operator
@@ -13,6 +14,7 @@ from typing import Optional, Union
 import torch
 from torch._functorch._aot_autograd.fx_utils import get_param_and_grad_nodes
 from torch.distributed.tensor._dtensor_spec import (
+    _StridedShardNotDecodableError,
     DTensorSpec,
     ShardOrder,
     ShardOrderEntry,
@@ -21,9 +23,12 @@ from torch.distributed.tensor._op_schema import OpSpec
 from torch.distributed.tensor._redistribute import (
     _gen_transform_infos_non_cached,
     _optimize_transform_infos,
+    _redistribute_cost_sort_key,
+    DTensorRedistributePlanner,
     redistribute_local_tensor,
 )
 from torch.distributed.tensor.placement_types import (  # noqa
+    _StridedShard,
     Partial,
     Placement,
     Replicate,
@@ -329,8 +334,166 @@ def _orthogonal_partial_reduction_steps(
     return steps, start
 
 
-def _fallback_plan(source: DTensorSpec, target: DTensorSpec) -> Optional[_FallbackPlan]:
-    """Propagate one redistribution through DTensor and price its actual steps."""
+class MemoizedRedistributePlanner(DTensorRedistributePlanner):
+    """DTensor's graph-based redistribute planner, memoized for pricing many
+    redistributions of one tensor: state transitions are priced once, and one
+    resumable min-cost search per source state serves every target.
+
+    find_min_cost_path pops states in a fixed order and returns the path with
+    which it first pops the target, so resuming one search for each later
+    target returns the same paths: the plans are the ones the uncached planner
+    finds."""
+
+    def __init__(self, device_mesh, dtensor_meta, next_states: Optional[dict] = None):
+        """next_states may be shared by the planners of tensors with the same
+        mesh and ndim: get_next_state's states depend on those, not on the
+        tensor's shape (only their costs do)."""
+        super().__init__(device_mesh, dtensor_meta)
+        self._next_states = {} if next_states is None else next_states
+        self._state_ids: dict = {}
+        self._states: list = []
+        self._transitions: dict = {}
+        self._searches: dict = {}
+        # one_step_redistribute_cost reads the two specs' placements (and the
+        # fixed mesh and tensor meta), not their shard orders.
+        cost_function = self.cost_function
+        costs: dict = {}
+
+        def placement_cost_function(src_state, dst_state):
+            key = (src_state.placements, dst_state.placements)
+            cost = costs.get(key)
+            if cost is None:
+                cost = costs[key] = cost_function(src_state, dst_state)
+            return cost
+
+        self.cost_function = placement_cost_function
+
+    def _use_targets_of(self, src_state, dst_state):
+        """Make get_next_state see the Partial reduce ops and _StridedShard
+        targets of this redistribution only, as on a planner that has served
+        no other (generate_graph_based_transform_infos collects them across
+        calls), and return them in the order get_next_state iterates them.
+
+        The extra targets the DTensor planner would have collected only add
+        zero-cost Replicate -> Partial states, whose exits (all_reduce,
+        reduce_scatter) cost more than the Replicate state's, so they change
+        neither the pop order of the other states nor the min-cost paths."""
+        self.partial_reduce_ops_in_target = set()
+        self.strided_shard_placements_in_target = set()
+        for placement in dst_state.placements:
+            if isinstance(placement, _StridedShard):
+                self.strided_shard_placements_in_target.add(placement)
+        for placement in itertools.chain(src_state.placements, dst_state.placements):
+            if isinstance(placement, Partial):
+                self.partial_reduce_ops_in_target.add(placement.reduce_op)
+        return (
+            tuple(self.partial_reduce_ops_in_target),
+            tuple(self.strided_shard_placements_in_target),
+        )
+
+    def _state_id(self, state):
+        state_id = self._state_ids.get(state)
+        if state_id is None:
+            state_id = self._state_ids[state] = len(self._states)
+            self._states.append(state)
+        return state_id
+
+    def _next_state_ids(self, state_id, targets_key):
+        key = (state_id, targets_key)
+        transitions = self._transitions.get(key)
+        if transitions is None:
+            state = self._states[state_id]
+            shared_key = (state, targets_key)
+            next_states = self._next_states.get(shared_key)
+            if next_states is None:
+                costs = self.get_next_state(
+                    state.placements, state.tensor_dim_to_mesh_dim
+                )
+                self._next_states[shared_key] = list(costs)
+            else:
+                costs = {s: self.cost_function(state, s) for s in next_states}
+            transitions = [(self._state_id(s), c) for s, c in costs.items()]
+            self._transitions[key] = transitions
+        return transitions
+
+    def find_min_cost_path(self, src_state, dst_state):
+        targets_key = self._use_targets_of(src_state, dst_state)
+        key = (self._state_id(src_state), targets_key)
+        search = self._searches.get(key)
+        if search is None:
+            search = self._searches[key] = _MinCostSearch(key[0])
+        dst_id = self._state_id(dst_state)
+        parents, pq, best = search.parents, search.pq, search.best
+        counter = search.counter
+        heappop, heappush = heapq.heappop, heapq.heappush
+        # DTensorRedistributePlanner.find_min_cost_path, resumed until it pops
+        # dst_id; every popped state is expanded, as in a search that runs to
+        # completion. An entry whose sort key does not beat one already pushed
+        # for its state is not pushed: it would pop after that one, as stale.
+        while dst_id not in parents and pq:
+            _, _, cost, state_id, parent = heappop(pq)
+            if state_id in parents:
+                continue
+            parents[state_id] = parent
+            for next_id, transition_cost in self._next_state_ids(state_id, targets_key):
+                if next_id in parents:
+                    continue
+                new_cost = cost + transition_cost
+                sort_key = _redistribute_cost_sort_key(new_cost)
+                if next_id in best and not sort_key < best[next_id]:
+                    continue
+                best[next_id] = sort_key
+                counter += 1
+                heappush(pq, (sort_key, counter, new_cost, next_id, state_id))
+        search.counter = counter
+        if dst_id not in parents:
+            raise AssertionError(
+                f"No path found from src_state {src_state} to dst_state {dst_state}"
+            )
+        path = []
+        state_id = dst_id
+        while state_id is not None:
+            path.append(self._states[state_id])
+            state_id = parents[state_id]
+        return path[::-1]
+
+
+class _MinCostSearch:
+    """A resumable min-cost search from one state: its heap, push counter, the
+    best sort key pushed per state and the state each popped state was first
+    popped from."""
+
+    def __init__(self, src_id):
+        self.pq = [(0.0, 0, 0.0, src_id, None)]
+        self.counter = 0
+        self.parents: dict = {}
+        self.best = {src_id: 0.0}
+
+
+def _graph_based_transform_infos(source, target, planner):
+    """_gen_transform_infos_non_cached(..., use_graph_based_transform=True) on
+    the given planner."""
+    if planner is None:
+        return _gen_transform_infos_non_cached(
+            source, target, use_graph_based_transform=True
+        )
+    try:
+        return planner.generate_graph_based_transform_infos(
+            source, target, source.shape
+        )
+    except _StridedShardNotDecodableError:
+        return planner.generate_greedy_transform_infos(source, target)
+
+
+def _fallback_plan(
+    source: DTensorSpec,
+    target: DTensorSpec,
+    planner: Optional[MemoizedRedistributePlanner] = None,
+) -> Optional[_FallbackPlan]:
+    """Propagate one redistribution through DTensor and price its actual steps.
+
+    planner (for source's mesh and tensor_meta) reuses transitions across
+    calls; by default DTensor's cached planner is used."""
     if source.mesh != target.mesh or source.tensor_meta is None:
         return None
     operations = []
@@ -354,11 +517,7 @@ def _fallback_plan(source: DTensorSpec, target: DTensorSpec) -> Optional[_Fallba
             return _FallbackPlan(tuple(operations), cost)
     try:
         transforms = _optimize_transform_infos(
-            _gen_transform_infos_non_cached(
-                source,
-                target,
-                use_graph_based_transform=True,
-            ),
+            _graph_based_transform_infos(source, target, planner),
             source.mesh,
             source.placements,
             target.placements,
@@ -439,13 +598,15 @@ def _has_per_mesh_dim_plan(source: DTensorSpec, target: DTensorSpec) -> bool:
 
 
 def default_order_redistribute_cost(
-    source: DTensorSpec, target: DTensorSpec
+    source: DTensorSpec,
+    target: DTensorSpec,
+    planner: Optional[MemoizedRedistributePlanner] = None,
 ) -> Optional[float]:
     """Cost of the plan lowering emits for a default-order redistribution that
     has no per-mesh-dim plan, else None (redistribute_cost prices it)."""
     if _has_per_mesh_dim_plan(source, target):
         return None
-    plan = _fallback_plan(source, target)
+    plan = _fallback_plan(source, target, planner)
     return None if plan is None else plan.cost
 
 
