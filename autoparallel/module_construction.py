@@ -159,6 +159,26 @@ def make_parallel_module(
         def __init__(self):
             torch.nn.Module.__init__(self)
 
+        def to_empty(self, *, device, recurse=True):  # type: ignore[no-untyped-def]
+            result = super().to_empty(device=device, recurse=recurse)
+            for alias_fqn, canonical_fqn in param_alias_map.items():
+                _assign_attr(
+                    result.get_parameter(canonical_fqn),
+                    result,
+                    ref_model,
+                    alias_fqn,
+                    attr_kind=_AttrKind.PARAMETER,
+                )
+            for alias_fqn, canonical_fqn in buffer_alias_map.items():
+                _assign_attr(
+                    result.get_buffer(canonical_fqn),
+                    result,
+                    ref_model,
+                    alias_fqn,
+                    attr_kind=_AttrKind.BUFFER,
+                )
+            return result
+
     if forward_fn is not None:
         ParallelModule.forward = forward_fn
 
@@ -242,28 +262,5 @@ def make_parallel_module(
         if k not in mod._modules:
             mod._modules[k] = v
 
-    original_to_empty = mod.to_empty
-
-    def alias_preserving_to_empty(*args, **kwargs):  # type: ignore[no-untyped-def]
-        result = original_to_empty(*args, **kwargs)
-        for alias_fqn, canonical_fqn in param_alias_map.items():
-            _assign_attr(
-                result.get_parameter(canonical_fqn),
-                result,
-                ref_model,
-                alias_fqn,
-                attr_kind=_AttrKind.PARAMETER,
-            )
-        for alias_fqn, canonical_fqn in buffer_alias_map.items():
-            _assign_attr(
-                result.get_buffer(canonical_fqn),
-                result,
-                ref_model,
-                alias_fqn,
-                attr_kind=_AttrKind.BUFFER,
-            )
-        return result
-
-    mod.to_empty = alias_preserving_to_empty  # type: ignore[assignment]
     wrap_init_weights(mod)
     return mod

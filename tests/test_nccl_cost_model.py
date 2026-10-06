@@ -3,6 +3,8 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+import math
+
 import pytest
 
 from autoparallel.cost_models.nccl_cost_model import (
@@ -10,6 +12,11 @@ from autoparallel.cost_models.nccl_cost_model import (
     _A2A_NIC_OVERHEAD,
     _A2A_NIC_RAMP_FACTOR,
     _BLACKWELL_BW_SCALE,
+    _H100_AGRS_RING,
+    _H100_AR_NVLS_TREE,
+    _H100_AR_RING,
+    _H100_AR_TREE,
+    _PROTOS,
     _RING_CORRECTION_FACTOR,
     GpuArch,
     NCCLAlgo,
@@ -25,6 +32,8 @@ from autoparallel.cost_models.nccl_cost_model import (
     _interp_correction,
     _log2i,
     _nccl_algo_time,
+    _resolve_table_row,
+    _table_algo_time,
     _table_collective_time,
     a100_topo_config,
     derive_mesh_dim_topo,
@@ -35,6 +44,7 @@ from autoparallel.cost_models.nccl_cost_model import (
     nccl_allgather_cost,
     nccl_allreduce_cost,
     nccl_collective_time,
+    nccl_cost_coverage,
     nccl_reduce_scatter_cost,
 )
 
@@ -1266,9 +1276,9 @@ class TestMultiNodeTableDriven:
         assert rs < ar, f"RS ({rs}) should be cheaper than AR ({ar}) at ppn=1"
 
     def test_table_returns_none_for_unknown_config(self):
-        """Table should return None for (n_nodes, ppn) not in the table."""
-        config = h100_topo_config(num_nodes=64)
-        topo = derive_mesh_dim_topo(config, (512,), 0)
+        """Table should return None for a ppn without table rows."""
+        config = h100_topo_config(num_nodes=4, gpus_per_node=16)
+        topo = derive_mesh_dim_topo(config, (64,), 0)
         n_bytes = 1 << 30
         result = _table_collective_time(NCCLFunc.ALLREDUCE, n_bytes, topo, config)
         assert result is None
@@ -1380,3 +1390,269 @@ class TestInterpCorrection:
                 f"cost_below={cost_below:.2f}, cost_above={cost_above:.2f}, "
                 f"ratio={ratio:.3f} (>15% jump)"
             )
+
+
+# ---- Table rows for untabulated node counts ----
+
+_TABLES = (
+    (_H100_AGRS_RING, False),
+    (_H100_AR_RING, False),
+    (_H100_AR_TREE, True),
+    (_H100_AR_NVLS_TREE, True),
+)
+_GRID_NODES = (2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 128, 256)
+_GRID_SIZES = tuple(1 << k for k in range(6, 31))  # 64 B to 1 GB
+_GRID_FUNCS = (NCCLFunc.ALLGATHER, NCCLFunc.REDUCESCATTER, NCCLFunc.ALLREDUCE)
+
+
+def _table_entries(row):
+    return row if isinstance(row[0], tuple) else (row,)
+
+
+def _grid_cost(func, n_bytes, n_nodes, ppn):
+    config = h100_topo_config(num_nodes=n_nodes)
+    # Outer dim of an (n_nodes * ppn, 8 // ppn) mesh spans n_nodes at ppn.
+    topo = derive_mesh_dim_topo(config, (n_nodes * ppn, 8 // ppn), 0)
+    assert (topo.n_nodes, topo.ppn) == (n_nodes, ppn)
+    return nccl_collective_time(func, n_bytes, topo, config)
+
+
+class TestTableRowResolution:
+    @pytest.mark.parametrize("table,log_latency", _TABLES)
+    def test_tabulated_rows_returned_unchanged(self, table, log_latency):
+        for (n_nodes, ppn), row in table.items():
+            assert _resolve_table_row(table, n_nodes, ppn, log_latency) is row
+
+    @pytest.mark.parametrize("func", _GRID_FUNCS)
+    def test_tabulated_costs_bitwise_identical(self, func):
+        """Tabulated keys are priced exactly as by an exact-key row lookup."""
+        for n_nodes, ppn in _H100_AGRS_RING:
+            config = h100_topo_config(num_nodes=n_nodes)
+            topo = derive_mesh_dim_topo(config, (n_nodes * ppn, 8 // ppn), 0)
+            key = (n_nodes, ppn)
+            for n_bytes in _GRID_SIZES:
+                if func == NCCLFunc.ALLREDUCE:
+                    candidates = [
+                        _table_algo_time(
+                            NCCLAlgo.TREE, proto, lat, bw, func, n_bytes, topo
+                        )
+                        for proto, (lat, bw) in zip(_PROTOS, _H100_AR_TREE[key])
+                    ]
+                    if key in _H100_AR_NVLS_TREE:
+                        lat, bw = _H100_AR_NVLS_TREE[key]
+                        candidates.append(
+                            _table_algo_time(
+                                NCCLAlgo.NVLS_TREE,
+                                NCCLProto.SIMPLE,
+                                lat,
+                                bw,
+                                func,
+                                n_bytes,
+                                topo,
+                            )
+                        )
+                    candidates += [
+                        _nccl_algo_time(func, NCCLAlgo.RING, p, n_bytes, topo, config)
+                        for p in _PROTOS
+                    ]
+                else:
+                    candidates = [
+                        _table_algo_time(
+                            NCCLAlgo.RING,
+                            proto,
+                            lat,
+                            bw,
+                            func,
+                            n_bytes,
+                            topo,
+                            is_full_mesh=ppn == 8,
+                        )
+                        for proto, (lat, bw) in zip(_PROTOS, _H100_AGRS_RING[key])
+                    ]
+                cost = nccl_collective_time(func, n_bytes, topo, config)
+                assert cost == min(candidates), (key, n_bytes)
+
+    @pytest.mark.parametrize("table,log_latency", _TABLES)
+    def test_latency_follows_closed_form(self, table, log_latency):
+        """Ring latency is linear in n_nodes, Tree/NVLSTree in log2(n_nodes)."""
+        for ppn in {p for _, p in table}:
+            lo_row, hi_row = table[(16, ppn)], table[(32, ppn)]
+            for n_nodes in (3, 6, 12, 24, 48, 64, 128, 256):
+                row = _resolve_table_row(table, n_nodes, ppn, log_latency)
+                for (lat, _), (lat_lo, _), (lat_hi, _) in zip(
+                    _table_entries(row),
+                    _table_entries(lo_row),
+                    _table_entries(hi_row),
+                ):
+                    if log_latency:
+                        t = math.log2(n_nodes / 32) / math.log2(32 / 16)
+                    else:
+                        t = (n_nodes - 32) / (32 - 16)
+                    expected = lat_hi + t * (lat_hi - lat_lo)
+                    assert lat == pytest.approx(expected, rel=1e-12)
+
+    @pytest.mark.parametrize("table,log_latency", _TABLES)
+    def test_bw_interpolated_in_log2_nodes(self, table, log_latency):
+        for ppn in {p for _, p in table}:
+            for n_nodes, lo, hi in ((3, 2, 4), (6, 4, 8), (12, 8, 16), (24, 16, 32)):
+                if (lo, ppn) not in table:
+                    continue
+                row = _resolve_table_row(table, n_nodes, ppn, log_latency)
+                t = math.log2(n_nodes / lo) / math.log2(hi / lo)
+                for (_, bw), (_, bw_lo), (_, bw_hi) in zip(
+                    _table_entries(row),
+                    _table_entries(table[(lo, ppn)]),
+                    _table_entries(table[(hi, ppn)]),
+                ):
+                    assert bw == pytest.approx(bw_lo + t * (bw_hi - bw_lo), rel=1e-12)
+                    assert bw_hi <= bw <= bw_lo
+
+    @pytest.mark.parametrize("table,log_latency", _TABLES)
+    def test_bw_held_above_largest_node_count(self, table, log_latency):
+        for ppn in {p for _, p in table}:
+            largest = _table_entries(table[(32, ppn)])
+            for n_nodes in (48, 64, 128, 256):
+                row = _resolve_table_row(table, n_nodes, ppn, log_latency)
+                assert [bw for _, bw in _table_entries(row)] == [
+                    bw for _, bw in largest
+                ]
+
+    def test_untabulated_ppn_returns_none(self):
+        for table, log_latency in _TABLES:
+            assert _resolve_table_row(table, 64, 16, log_latency) is None
+
+    def test_depth_scaled_ring_exponent_held_above_32_nodes(self):
+        for n_nodes in (64, 128, 256):
+            assert _depth_scaled_ring_correction(
+                n_nodes
+            ) == _depth_scaled_ring_correction(32)
+
+    def test_all_to_all_latency_extrapolated_above_32_nodes(self):
+        (n_lo, lat_lo), (n_hi, lat_hi) = _A2A_MULTI_NODE_LAT_POINTS[-2:]
+        assert n_hi == 32
+        for n_nodes in (48, 64, 128):
+            config = h100_topo_config(num_nodes=n_nodes)
+            topo = derive_mesh_dim_topo(config, (n_nodes, 8), 0)
+            slope = (lat_hi - lat_lo) / (n_hi - n_lo)
+            expected = lat_hi + slope * (n_nodes - n_hi)
+            assert nccl_all_to_all_cost(0, topo, config) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("ppn", [1, 2, 4, 8])
+@pytest.mark.parametrize("func", _GRID_FUNCS)
+class TestNodeCountContinuity:
+    def test_cost_non_decreasing_in_node_count(self, func, ppn):
+        for n_bytes in _GRID_SIZES:
+            costs = [_grid_cost(func, n_bytes, n, ppn) for n in _GRID_NODES]
+            for n_nodes, prev, cost in zip(_GRID_NODES[1:], costs, costs[1:]):
+                assert cost >= prev, (n_nodes, n_bytes, prev, cost)
+
+    def test_cost_at_most_2_2x_per_node_doubling(self, func, ppn):
+        for n_nodes in _GRID_NODES:
+            # 2 -> 4 nodes compares two tabulated rows, which are kept as is. It
+            # exceeds 2.2x for AR at ppn <= 2, whose 2-node Ring candidate uses
+            # intra-node BW, and for AG/RS at ppn=8 near 256 KB, where per-GPU
+            # bytes cross the 8-16 KB step of _TABLE_RING_FULL_MESH_RAMP.
+            if 2 * n_nodes not in _GRID_NODES or n_nodes == 2:
+                continue
+            for n_bytes in _GRID_SIZES:
+                cost = _grid_cost(func, n_bytes, n_nodes, ppn)
+                doubled = _grid_cost(func, n_bytes, 2 * n_nodes, ppn)
+                assert doubled <= 2.2 * cost, (n_nodes, n_bytes, cost, doubled)
+
+    def test_cost_monotone_in_bytes(self, func, ppn):
+        for n_nodes in _GRID_NODES:
+            costs = [_grid_cost(func, b, n_nodes, ppn) for b in _GRID_SIZES]
+            for n_bytes, prev, cost in zip(_GRID_SIZES[1:], costs, costs[1:]):
+                assert cost >= prev, (n_nodes, n_bytes, prev, cost)
+
+
+# ---- Coverage reporting ----
+
+
+class TestNCCLCostCoverage:
+    def test_labels(self):
+        intra = "intra_node_empirical"
+        # Per mesh dim, then the flattened mesh for multi-dim meshes.
+        assert nccl_cost_coverage(h100_topo_config(num_nodes=32), (32, 8)) == (
+            "table",
+            intra,
+            "table",
+        )
+        assert nccl_cost_coverage(h100_topo_config(num_nodes=24), (24, 8)) == (
+            "interpolated",
+            intra,
+            "interpolated",
+        )
+        assert nccl_cost_coverage(h100_topo_config(num_nodes=64), (64, 8)) == (
+            "extrapolated",
+            intra,
+            "extrapolated",
+        )
+        assert nccl_cost_coverage(h100_topo_config(num_nodes=6), (12, 4)) == (
+            "interpolated",
+            intra,
+            "interpolated",
+        )
+        assert nccl_cost_coverage(h100_topo_config(num_nodes=8), (64,)) == ("table",)
+        assert nccl_cost_coverage(h100_topo_config(), (8,)) == (intra,)
+        no_rows = h100_topo_config(num_nodes=4, gpus_per_node=16)
+        assert nccl_cost_coverage(no_rows, (64,)) == ("algo_loop",)
+        assert (
+            nccl_cost_coverage(a100_topo_config(num_nodes=2), (2, 8))
+            == ("algo_loop",) * 3
+        )
+
+    def test_algo_loop_label_matches_table_fallback(self):
+        for config, mesh_shape in [
+            (h100_topo_config(num_nodes=64), (64, 8)),
+            (h100_topo_config(num_nodes=3), (24,)),
+            (h100_topo_config(num_nodes=4, gpus_per_node=16), (64,)),
+        ]:
+            label = nccl_cost_coverage(config, mesh_shape)[0]
+            topo = derive_mesh_dim_topo(config, mesh_shape, 0)
+            for func in _GRID_FUNCS:
+                result = _table_collective_time(func, 1 << 20, topo, config)
+                assert (result is None) == (label == "algo_loop")
+
+    def test_warning_fires_once(self, device_mesh_1d, monkeypatch):
+        """AutoParallel.__enter__ warns once for a mesh priced off the tables."""
+        from unittest.mock import patch
+
+        import torch
+        import torch._dynamo.utils
+        from torch import nn
+
+        import autoparallel.cost_models.collective_runtime_estimation as cre
+        from autoparallel.api import AutoParallel
+
+        def input_fn():
+            return (torch.rand(256, 8, device="cuda"),)
+
+        # __enter__ is stopped right after the cost model is configured, so
+        # __exit__ never restores the previous config; monkeypatch does.
+        monkeypatch.setattr(cre, "_nccl_topo_config", cre.get_nccl_topo_config())
+        monkeypatch.setattr(torch._dynamo.utils, "warn_once_cache", set())
+        # 256 ranks span 32 nodes at 8 GPUs/node (tabulated), 64 at 4 GPUs/node.
+        configs = [
+            h100_topo_config(num_nodes=32),
+            h100_topo_config(num_nodes=64, gpus_per_node=4),
+            h100_topo_config(num_nodes=64, gpus_per_node=4),
+        ]
+        with patch("torch.cuda.current_device", return_value=0), patch.object(
+            AutoParallel, "build_model_graph", side_effect=RuntimeError("stop")
+        ), pytest.warns(UserWarning) as record:
+            for config in configs:
+                with torch.device("meta"):
+                    model = nn.Linear(8, 8)
+                autop = AutoParallel(model, input_fn, device_mesh_1d, cost_model=config)
+                with pytest.raises(RuntimeError, match="stop"):
+                    autop.__enter__()
+        messages = [str(w.message) for w in record]
+        coverage = [m for m in messages if "NCCL cost model coverage" in m]
+        assert coverage == [
+            "NCCL cost model coverage for mesh (256,) is ('extrapolated',) "
+            "(see nccl_cost_coverage). Extrapolated collective costs are "
+            "unmeasured, and algo_loop ones use the uncalibrated tuning.cc "
+            "fallback."
+        ]

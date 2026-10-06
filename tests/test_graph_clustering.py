@@ -68,6 +68,7 @@ def test_malformed_cluster_is_discarded_atomically(caplog):
 
     optimizer = ShardingOptimizer.__new__(ShardingOptimizer)
     optimizer.cluster_links = {}
+    optimizer.skipped_clusters = []
     optimizer.strats = dict.fromkeys(graph.nodes, Mock())
     optimizer.nodes = list(optimizer.strats)
     optimizer.node_map = {node: index for index, node in enumerate(optimizer.nodes)}
@@ -76,6 +77,13 @@ def test_malformed_cluster_is_discarded_atomically(caplog):
     optimizer.create_cluster_links([[[sin_x, cos_x], [sin_y, tan_y]]])
 
     assert optimizer.cluster_links == {}
+    assert optimizer.skipped_clusters == [
+        {
+            "reason": f"{cos_x} and {tan_y} have different operators "
+            f"({cos_x.target} and {tan_y.target})",
+            "regions": [[sin_x.name, cos_x.name], [sin_y.name, tan_y.name]],
+        }
+    ]
     assert "Skipping malformed graph cluster" in caplog.text
 
 
