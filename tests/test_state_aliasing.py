@@ -37,6 +37,7 @@ def _make_alias_optimizer(mesh):
     return optimizer, embedding, decoder
 
 
+@apply_cuda_patches
 def test_aliased_parameters_cannot_select_different_placements(device_mesh_1d):
     optimizer, embedding, decoder = _make_alias_optimizer(device_mesh_1d)
     optimizer.add_node_constraint(embedding, (Shard(0),))
@@ -46,6 +47,7 @@ def test_aliased_parameters_cannot_select_different_placements(device_mesh_1d):
         optimizer._solve()
 
 
+@apply_cuda_patches
 def test_aliased_parameter_memory_is_counted_once(device_mesh_1d):
     optimizer, _, _ = _make_alias_optimizer(device_mesh_1d)
     optimizer.add_parameter_memory_constraint(0.0, 1.0)
