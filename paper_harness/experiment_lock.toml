@@ -1,14 +1,14 @@
 schema_version = 1
-harness_version = "v37"
+harness_version = "v40"
 
 [sources.torchtitan]
-remote = "https://github.com/AlbedoWang/torchtitan.git"
-commit = "db5a3e8880813b93617677db608b034db8c79040"
+remote = "/home/wangkj/workspace/torchtitan"
+commit = "bf68f0791e2f278bfdc1185878b1b9ecf4a36ad6"
 dirty_policy = "forbid"
 
 [sources.autoparallel]
-remote = "https://github.com/meta-pytorch/autoparallel.git"
-commit = "8d37073e0441faa49d86d2b18ed7dff7ae0b859e"
+remote = "/home/wangkj/workspace/autoparallel"
+commit = "bb3faf14907b524760f2fdf6042ee4bad5ab3731"
 dirty_policy = "forbid"
 
 [runtime]

@@ -78,8 +78,14 @@ ancestor and retains the `60517d28` AutoParallel/GraphTrainer integration.
   `autoparallel_api`. After a rejected bucket probe, the locked torch re-adds
   the `next_event -> node` timeline edge only when there is no `prev_event`,
   but removes the `next_event -> prev_event` bypass whenever both exist, so
-  Inductor overlap scheduling (pass 2) loses that ordering. It is the runtime
-  pin.
+  Inductor overlap scheduling (pass 2) loses that ordering.
+- `bf68f079` (local branch `agent/dsv3-memgap-p2-20261005`, child of
+  `db5a3e88`) adds `hint_all_to_all_split_sizes_pass` before Inductor: every
+  unbacked `all_to_all_single` split size (the MoE dispatch `.tolist()` counts)
+  without a hint gets `override_optimization_hint(a2a input rows // group
+  size)`. Inductor's buffer-reuse planning otherwise sizes those buffers with
+  `fallback=0`. It applies to both GraphTrainer arms. It is the runtime pin; the
+  lock remote is the local repository because the commit is not pushed.
 
 The 3D port includes only the approved legacy-DTensor AP configuration, CP
 input-ownership seam, DP-shard/CP/TP mesh, CP-aware SDPA, DTensor output, and
@@ -178,7 +184,15 @@ updates.
   `3e7aeb6`) always attaches a ShapeEnv and tests `static_shapes` instead of
   `shape_env is not None` for dynamic tracing, so the static DeepSeek V3 trace
   has a ShapeEnv for the MoE `.tolist()` unbacked SymInts. `_add_alias` also
-  aliases forward local_map outputs. It is the runtime pin.
+  aliases forward local_map outputs.
+- `bb3faf1` (local branch `agent/dsv3-memgap-p1-20261005`, child of
+  `8d37073`) rewrites `aten.split` / `split_with_sizes` of dtypes Inductor
+  falls back on (complex64) into one `aten.slice` per used chunk after
+  `cleanup_graph` in `_apply_placement_common`. Inductor's memory estimator
+  charges every fallback split sharing an alias root (DeepSeek V3's per-layer
+  RoPE `freqs_cis` redistributions) for all their outputs, which corrupts the
+  peak estimate used for buffer reuse. It is the runtime pin; the lock remote is
+  the local repository because the commit is not pushed.
 
 ## Reproduction policy
 
