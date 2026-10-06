@@ -25,3 +25,4 @@ If you're new to the project, use the reading order below.
 
 - [Using `local_map` for MoE and Custom Communication Patterns](local_map_and_moe.md)
 - [Saving and Loading Optimizer State](save_load.md)
+- [Measuring Communication Costs for Your Cluster](measured_comm_tables.md)

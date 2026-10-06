@@ -158,8 +158,8 @@ _NCCL_TESTS_OUTPUT = """\
 #       size         count      type   redop    root     time   algbw   busbw #wrong     time   algbw   busbw #wrong
 #        (B)    (elements)                               (us)  (GB/s)  (GB/s)            (us)  (GB/s)  (GB/s)
            0             0     float    none      -1     0.29    0.00    0.00      0     0.26    0.00    0.00      0
-        2048           128     float    none      -1    20.50    0.10    0.08      0    19.90    0.10    0.08      0
-        4096           256     float    none      -1    21.25    0.19    0.14  {wrong}    20.10    0.20    0.15    N/A
+        2048           128     float    none      -1    {t0:.2f}    0.10    0.08      0    19.90    0.10    0.08      0
+        4096           256     float    none      -1    {t1:.2f}    0.19    0.14  {wrong}    20.10    0.20    0.15    N/A
 # Out of bounds values : 0 OK
 # Avg bus bandwidth    : 0.11
 #
@@ -167,10 +167,14 @@ _NCCL_TESTS_OUTPUT = """\
 """
 
 
-def _write_output(tmp_path, name, binary, third_host="host-b", wrong="0"):
+def _write_output(
+    tmp_path, name, binary, third_host="host-b", wrong="0", times=(20.5, 21.25)
+):
     path = tmp_path / name
     path.write_text(
-        _NCCL_TESTS_OUTPUT.format(binary=binary, third_host=third_host, wrong=wrong)
+        _NCCL_TESTS_OUTPUT.format(
+            binary=binary, third_host=third_host, wrong=wrong, t0=times[0], t1=times[1]
+        )
     )
     return str(path)
 
@@ -201,11 +205,25 @@ class TestFromNcclTests:
         with pytest.raises(ValueError, match=match):
             MeasuredCommTable.from_nccl_tests([path], 2)
 
-    def test_rejects_duplicate_keys(self, tmp_path):
+    def test_repeated_runs_take_the_median(self, tmp_path):
+        paths = [
+            _write_output(tmp_path, f"run{i}.txt", "all_gather_perf", times=times)
+            for i, times in enumerate([(20.0, 40.0), (26.0, 30.0), (21.0, 33.0)])
+        ]
+        table = MeasuredCommTable.from_nccl_tests(paths, 2)
+        assert table.curves == {("allgather", 2, 2): ((2048, 4096), (21.0, 33.0))}
+
+    def test_repeated_runs_need_the_same_sizes(self, tmp_path):
         paths = [
             _write_output(tmp_path, f"run{i}.txt", "all_gather_perf") for i in range(2)
         ]
-        with pytest.raises(ValueError, match="duplicate"):
+        with open(paths[1]) as f:
+            text = f.read()
+        with open(paths[1], "w") as f:
+            f.write(
+                text.replace("        4096           256", "        8192           512")
+            )
+        with pytest.raises(ValueError, match="different sizes"):
             MeasuredCommTable.from_nccl_tests(paths, 2)
 
 

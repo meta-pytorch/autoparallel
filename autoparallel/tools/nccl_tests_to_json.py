@@ -6,8 +6,10 @@
 """Convert nccl-tests outputs into a MeasuredCommTable JSON file.
 
 Each input is the stdout of one all_gather_perf, reduce_scatter_perf,
-all_reduce_perf or alltoall_perf run without NCCL_TESTS_SPLIT_MASK. The
-collective, node count and ranks per node are read from its header.
+all_reduce_perf or alltoall_perf run without NCCL_TESTS_SPLIT_MASK, e.g. from
+nccl_tests_sweep.sh. The collective, node count and ranks per node are read
+from its header, and repeated runs of a key are combined by their median.
+See docs/measured_comm_tables.md for the full procedure.
 
 Example:
     python -m autoparallel.tools.nccl_tests_to_json results/*.txt \\

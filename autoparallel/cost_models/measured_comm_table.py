@@ -26,6 +26,7 @@ import bisect
 import collections
 import json
 import re
+import statistics
 from dataclasses import dataclass, field
 
 COLLECTIVES = ("allgather", "reduce_scatter", "allreduce", "all_to_all")
@@ -180,13 +181,20 @@ class MeasuredCommTable:
         Each file is one run of all_gather_perf, reduce_scatter_perf,
         all_reduce_perf or alltoall_perf. The collective, node count and ranks
         per node come from its header; times are the out-of-place column.
+        Repeated runs of a key, e.g. on different allocations, are combined
+        by taking the median time at each size.
         """
-        curves: dict[CurveKey, tuple[tuple[int, ...], tuple[float, ...]]] = {}
+        runs = collections.defaultdict(list)
         for path in paths:
             key, curve = _parse_nccl_tests(path)
-            if key in curves:
-                raise ValueError(f"{path}: duplicate measurement for {key}")
-            curves[key] = curve
+            runs[key].append(curve)
+        curves = {}
+        for key, key_runs in runs.items():
+            sizes = key_runs[0][0]
+            if any(run_sizes != sizes for run_sizes, _ in key_runs):
+                raise ValueError(f"Runs of {key} measured different sizes")
+            times = zip(*(run_times for _, run_times in key_runs))
+            curves[key] = (sizes, tuple(statistics.median(t) for t in times))
         return cls(gpus_per_node, curves, provenance or {})
 
 
