@@ -8,7 +8,7 @@ import json
 import logging
 import operator
 import time
-from contextlib import ExitStack, contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, Callable, Optional, Union
@@ -51,6 +51,7 @@ from .optimize_sharding import ShardingOptimizer
 from .shardings.placement_options import _get_device_from_mesh
 from .tracing import (
     _add_unused_params_and_buffers,
+    _enable_fused_qat_observer_tracing,
     _get_decomp_table,
     _resize_qat_weight_observer_buffers,
     enable_local_map_wrapping,
@@ -183,21 +184,11 @@ def build_joint_graph(
         )
         traced_inputs = ForwardInputs(args=args, kwargs=kwargs)
 
-    from torch.ao.quantization.fake_quantize import FusedMovingAvgObsFakeQuantize
-
-    trace_qat = any(
-        isinstance(module, FusedMovingAvgObsFakeQuantize) for module in model.modules()
-    )
-    skipped_tracing = (
-        torch._dynamo.config.patch(dont_skip_tracing=True)
-        if trace_qat
-        else nullcontext()
-    )
     with (
         set_dtype_cast(True),
         enable_local_map_wrapping(),
         torch._dynamo.utils._disable_saved_tensors_hooks_during_tracing(),
-        skipped_tracing,
+        _enable_fused_qat_observer_tracing(model),
     ):
         torch_ir_with_fqn = _dynamo_graph_capture_for_export(model)(
             *traced_inputs.args, **traced_inputs.kwargs

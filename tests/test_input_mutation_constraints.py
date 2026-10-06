@@ -168,6 +168,7 @@ def test_buffer_mutation_is_constrained(device_mesh_1d):
 def test_per_channel_qat_mutation_uses_channel_sized_buffers(device_mesh_1d):
     with torch.device("meta"):
         model = PerChannelQATLinear()
+    original_forward = FusedMovingAvgObsFakeQuantize.forward
 
     def input_fn():
         return torch.randn(device_mesh_1d.size() * 2, 4, device="cuda")
@@ -191,3 +192,5 @@ def test_per_channel_qat_mutation_uses_channel_sized_buffers(device_mesh_1d):
             )
 
         assert shapes == [((8,), (8,))] * 4
+
+    assert FusedMovingAvgObsFakeQuantize.forward is original_forward

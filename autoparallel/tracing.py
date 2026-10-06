@@ -5,10 +5,12 @@
 
 import copy
 from contextlib import contextmanager
+from typing import Any
 
 import torch
 from torch._inductor.decomposition import select_decomp_table
 from torch._subclasses import FakeTensorMode
+from torch.ao.quantization.fake_quantize import FusedMovingAvgObsFakeQuantize
 
 
 def _get_decomp_table():
@@ -37,9 +39,11 @@ def _get_decomp_table():
 
 
 def _resize_qat_weight_observer_buffers(model: torch.nn.Module) -> None:
-    """Match fresh per-channel QAT buffers to their first real-call shape."""
-    from torch.ao.quantization.fake_quantize import FusedMovingAvgObsFakeQuantize
+    """Correct stale shapes returned by the fused observer's fake implementation.
 
+    Fresh per-channel weight observers have scalar or empty buffers, while the
+    first real call returns channel-sized mutation outputs.
+    """
     for module in model.modules():
         observer = getattr(module, "weight_fake_quant", None)
         weight = getattr(module, "weight", None)
@@ -58,6 +62,24 @@ def _resize_qat_weight_observer_buffers(model: torch.nn.Module) -> None:
         ):
             if buffer.shape != (channels,):
                 buffer.resize_(channels)
+
+
+@contextmanager
+def _enable_fused_qat_observer_tracing(model: torch.nn.Module):
+    has_fused_observer = any(
+        isinstance(module, FusedMovingAvgObsFakeQuantize) for module in model.modules()
+    )
+    if not has_fused_observer:
+        yield
+        return
+
+    observer_cls: Any = FusedMovingAvgObsFakeQuantize
+    original_forward = observer_cls.forward
+    observer_cls.forward = torch._dynamo.dont_skip_tracing(original_forward)
+    try:
+        yield
+    finally:
+        observer_cls.forward = original_forward
 
 
 def move_to_fake(model: torch.nn.Module, mode: FakeTensorMode, device: torch.device):
