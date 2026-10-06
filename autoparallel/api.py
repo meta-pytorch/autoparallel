@@ -302,15 +302,26 @@ class AutoParallel:
 
             self._prev_nccl_config = get_nccl_topo_config()
             if isinstance(self.cost_model, NCCLTopoConfig):
-                set_nccl_topo_config(self.cost_model)
+                nccl_config = self.cost_model
             elif self.cost_model == "nccl":
-                set_nccl_topo_config(detect_nccl_topo_config(self.mesh))
+                nccl_config = detect_nccl_topo_config(self.mesh)
             else:
-                set_nccl_topo_config(None)
-            nccl_config = get_nccl_topo_config()
-            if nccl_config is not None and _is_hopper_nvswitch(nccl_config):
+                nccl_config = None
+            if nccl_config is not None and (
+                nccl_config.measured_table is not None
+                or _is_hopper_nvswitch(nccl_config)
+            ):
                 mesh_shape = tuple(self.mesh.shape)
                 coverage = nccl_cost_coverage(nccl_config, mesh_shape)
+                if "missing" in coverage:
+                    raise ValueError(
+                        f"The measured NCCL table does not cover mesh "
+                        f"{mesh_shape}: coverage is {coverage} (see "
+                        "nccl_cost_coverage). Every collective needs a curve "
+                        "for each single-node (n_nodes, ppn) key, and at "
+                        "least two node counts with the same ppn, the "
+                        "smallest at or below n_nodes, for multi-node keys."
+                    )
                 if {"extrapolated", "algo_loop"} & set(coverage):
                     warn_once(
                         f"NCCL cost model coverage for mesh {mesh_shape} is "
@@ -318,6 +329,7 @@ class AutoParallel:
                         "Extrapolated collective costs are unmeasured, and "
                         "algo_loop ones use the uncalibrated tuning.cc fallback."
                     )
+            set_nccl_topo_config(nccl_config)
 
             self.stack.enter_context(self.mesh)
 

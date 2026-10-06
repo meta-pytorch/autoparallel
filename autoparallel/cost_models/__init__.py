@@ -3,6 +3,7 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+from .measured_comm_table import MeasuredCommTable  # noqa: F401
 from .nccl_cost_model import (  # noqa: F401
     NCCLTopoConfig,
     a100_topo_config,

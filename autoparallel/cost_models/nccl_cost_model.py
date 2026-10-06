@@ -32,6 +32,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Any
 
+from .measured_comm_table import MeasuredCommTable
+
 if TYPE_CHECKING:
     from torch.distributed.tensor import DeviceMesh
 
@@ -81,6 +83,21 @@ class NCCLTopoConfig:
     has_collnet: bool = False  # Enables CollNet Direct/Chain (SHARP)
     # Additional network latency beyond base hw latency (us)
     net_latency: float = 0.0
+    # Measured collective timings that replace the model below for every
+    # collective; meshes it does not cover are rejected rather than mixing
+    # measured and modeled costs.
+    measured_table: MeasuredCommTable | None = None
+
+    def __post_init__(self):
+        if (
+            self.measured_table is not None
+            and self.measured_table.gpus_per_node != self.gpus_per_node
+        ):
+            raise ValueError(
+                f"measured_table was measured with "
+                f"{self.measured_table.gpus_per_node} GPUs per node, but the "
+                f"config has {self.gpus_per_node}"
+            )
 
 
 @dataclass
@@ -1224,6 +1241,13 @@ def _table_collective_time(
     return best
 
 
+_MEASURED_COLLECTIVES = {
+    NCCLFunc.ALLGATHER: "allgather",
+    NCCLFunc.REDUCESCATTER: "reduce_scatter",
+    NCCLFunc.ALLREDUCE: "allreduce",
+}
+
+
 def nccl_collective_time(
     func: NCCLFunc,
     n_bytes: int,
@@ -1232,7 +1256,8 @@ def nccl_collective_time(
 ) -> float:
     """Pick the best algorithm+protocol and return estimated time in microseconds.
 
-    Three dispatch paths for Hopper+ with NVSwitch:
+    Configs with a measured_table are priced from it instead. Otherwise, three
+    dispatch paths for Hopper+ with NVSwitch:
       1. Intra-node: empirical BW/lat from nccl-tests at 2/4/8 GPUs.
       2. Multi-node: table-driven model using NCCL's topology-discovered
          (lat, bw) constants per (n_nodes, ppn), interpolated or
@@ -1241,6 +1266,11 @@ def nccl_collective_time(
       3. All other configs, including ppn values without table rows: NCCL
          algo selection loop (tuning.cc port).
     """
+    if config.measured_table is not None:
+        return config.measured_table.time_us(
+            _MEASURED_COLLECTIVES[func], topo.n_nodes, topo.ppn, n_bytes
+        )
+
     is_hopper_nvswitch = _is_hopper_nvswitch(config)
 
     # Path 1: NVSwitch empirical path for Hopper+ intra-node
@@ -1305,6 +1335,11 @@ def nccl_all_to_all_cost(
          below some size threshold. Unlikely to matter for sharding decisions
          which typically involve large tensors.
     """
+    if config.measured_table is not None:
+        return config.measured_table.time_us(
+            "all_to_all", topo.n_nodes, topo.ppn, n_bytes
+        )
+
     n_ranks = topo.n_ranks
     n_nodes = topo.n_nodes
     _s = NCCLProto.SIMPLE.value
@@ -1420,16 +1455,20 @@ def nccl_cost_coverage(
         unmeasured. AllToAll latency is extrapolated there too.
       - "algo_loop": tuning.cc algo selection loop, used for configs other
         than Hopper+ NVSwitch and for ppn values without table rows.
+    Configs with a measured_table get MeasuredCommTable.coverage() labels:
+    "measured", "interpolated", "extrapolated", or "missing".
     """
     dims = [(tuple(mesh_shape), dim) for dim in range(len(mesh_shape))]
     if len(mesh_shape) > 1:
         dims.append(((math.prod(mesh_shape),), 0))
-    if not _is_hopper_nvswitch(config):
+    if config.measured_table is None and not _is_hopper_nvswitch(config):
         return ("algo_loop",) * len(dims)
     labels = []
     for shape, dim in dims:
         topo = derive_mesh_dim_topo(config, shape, dim)
-        if topo.n_nodes == 1:
+        if config.measured_table is not None:
+            labels.append(config.measured_table.coverage(topo.n_nodes, topo.ppn))
+        elif topo.n_nodes == 1:
             labels.append("intra_node_empirical")
         else:
             # The AllReduce tables use the same node counts per ppn.
