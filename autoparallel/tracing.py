@@ -36,6 +36,30 @@ def _get_decomp_table():
     return decomp_table
 
 
+def _resize_qat_weight_observer_buffers(model: torch.nn.Module) -> None:
+    """Match fresh per-channel QAT buffers to their first real-call shape."""
+    from torch.ao.quantization.fake_quantize import FusedMovingAvgObsFakeQuantize
+
+    for module in model.modules():
+        observer = getattr(module, "weight_fake_quant", None)
+        weight = getattr(module, "weight", None)
+        if (
+            not isinstance(observer, FusedMovingAvgObsFakeQuantize)
+            or not observer.is_per_channel
+            or not isinstance(weight, torch.Tensor)
+        ):
+            continue
+        channels = weight.shape[observer.ch_axis]
+        for buffer in (
+            observer.scale,
+            observer.zero_point,
+            observer.activation_post_process.min_val,
+            observer.activation_post_process.max_val,
+        ):
+            if buffer.shape != (channels,):
+                buffer.resize_(channels)
+
+
 def move_to_fake(model: torch.nn.Module, mode: FakeTensorMode, device: torch.device):
     """
     Move the model to the fake mode and move the weights to the fake device

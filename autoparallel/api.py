@@ -8,7 +8,7 @@ import json
 import logging
 import operator
 import time
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, Callable, Optional, Union
@@ -52,6 +52,7 @@ from .shardings.placement_options import _get_device_from_mesh
 from .tracing import (
     _add_unused_params_and_buffers,
     _get_decomp_table,
+    _resize_qat_weight_observer_buffers,
     enable_local_map_wrapping,
     move_to_fake,
 )
@@ -182,10 +183,21 @@ def build_joint_graph(
         )
         traced_inputs = ForwardInputs(args=args, kwargs=kwargs)
 
+    from torch.ao.quantization.fake_quantize import FusedMovingAvgObsFakeQuantize
+
+    trace_qat = any(
+        isinstance(module, FusedMovingAvgObsFakeQuantize) for module in model.modules()
+    )
+    skipped_tracing = (
+        torch._dynamo.config.patch(dont_skip_tracing=True)
+        if trace_qat
+        else nullcontext()
+    )
     with (
         set_dtype_cast(True),
         enable_local_map_wrapping(),
         torch._dynamo.utils._disable_saved_tensors_hooks_during_tracing(),
+        skipped_tracing,
     ):
         torch_ir_with_fqn = _dynamo_graph_capture_for_export(model)(
             *traced_inputs.args, **traced_inputs.kwargs
@@ -265,6 +277,7 @@ class AutoParallel:
         if self.mp_policy is not None:
             apply_dtype_cast(model, self.mp_policy)
 
+        _resize_qat_weight_observer_buffers(model)
         self.model = move_to_fake(model, self.fake_mode, device)
         self.param_aliases = _build_alias_map(self.model.named_parameters)
         self.buffer_aliases = _build_alias_map(self.model.named_buffers)

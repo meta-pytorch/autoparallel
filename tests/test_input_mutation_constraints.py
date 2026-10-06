@@ -15,6 +15,8 @@ from torch._functorch._aot_autograd.fx_utils import (
     get_all_input_and_grad_nodes,
     get_all_output_and_tangent_nodes,
 )
+from torch.ao.quantization.fake_quantize import FusedMovingAvgObsFakeQuantize
+from torch.ao.quantization.observer import MovingAveragePerChannelMinMaxObserver
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
 from autoparallel.api import AutoParallel
@@ -35,6 +37,22 @@ class BufferMutation(nn.Module):
     def forward(self, x):
         self.state.add_(x.mean(0))
         return x + self.state
+
+
+class PerChannelQATLinear(nn.Linear):
+    def __init__(self):
+        super().__init__(4, 8)
+        self.weight_fake_quant = FusedMovingAvgObsFakeQuantize(
+            observer=MovingAveragePerChannelMinMaxObserver,
+            quant_min=-128,
+            quant_max=127,
+            dtype=torch.qint8,
+            qscheme=torch.per_channel_symmetric,
+            ch_axis=0,
+        )
+
+    def forward(self, x):
+        return nn.functional.linear(x, self.weight_fake_quant(self.weight), self.bias)
 
 
 def _get_mutation_pair(optimizer):
@@ -144,3 +162,32 @@ def test_buffer_mutation_is_constrained(device_mesh_1d):
             "input_mutation_constraint" in name
             for name in autop.sharding_optimizer.prob.constraints
         )
+
+
+@apply_cuda_patches
+def test_per_channel_qat_mutation_uses_channel_sized_buffers(device_mesh_1d):
+    with torch.device("meta"):
+        model = PerChannelQATLinear()
+
+    def input_fn():
+        return torch.randn(device_mesh_1d.size() * 2, 4, device="cuda")
+
+    with AutoParallel(
+        model, input_fn, device_mesh_1d, repeated_subgraphs=False
+    ) as autop:
+        inputs = get_all_input_and_grad_nodes(autop.sharding_optimizer.graph)
+        outputs = get_all_output_and_tangent_nodes(autop.sharding_optimizer.graph)
+        shapes = []
+        for desc, (mutation_node, _tangent) in outputs.items():
+            if not isinstance(desc, InputMutationAOTOutput) or not isinstance(
+                desc.mutated_input, BufferAOTInput
+            ):
+                continue
+            if "weight_fake_quant" not in desc.mutated_input.target:
+                continue
+            input_node, _grad = inputs[desc.mutated_input]
+            shapes.append(
+                (input_node.meta["val"].shape, mutation_node.meta["val"].shape)
+            )
+
+        assert shapes == [((8,), (8,))] * 4
