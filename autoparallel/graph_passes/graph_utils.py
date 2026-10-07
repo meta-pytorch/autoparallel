@@ -249,6 +249,57 @@ def functionalize_fresh_index_put_mutations(gm: torch.fx.GraphModule) -> bool:
     return changed
 
 
+def canonicalize_fallback_split_to_slice(gm: torch.fx.GraphModule) -> int:
+    """Rewrite split + getitem into one aten.slice per used chunk for dtypes
+    Inductor cannot lower (e.g. complex64).
+
+    Inductor compiles such a split as a FallbackKernel with a MultiOutputLayout,
+    and its memory estimator charges every split that shares an alias root
+    (e.g. the per-layer RoPE redistributions of one freqs_cis) for all their
+    outputs, which corrupts the peak estimate used for buffer reuse. A slice has
+    the same sizes, strides and storage offset as the getitem view.
+    """
+    from torch._inductor.lowering import fallback_node_due_to_unsupported_type
+
+    graph = gm.graph
+    splits = [
+        *graph.find_nodes(op="call_function", target=torch.ops.aten.split.Tensor),
+        *graph.find_nodes(
+            op="call_function", target=torch.ops.aten.split_with_sizes.default
+        ),
+    ]
+    rewritten = 0
+    for node in splits:
+        if not fallback_node_due_to_unsupported_type(node):
+            continue
+        if not all(u.target is operator.getitem for u in node.users):
+            continue
+        x = node.args[0]
+        dim = node.kwargs.get("dim", node.args[2] if len(node.args) > 2 else 0)
+        dim %= x.meta["val"].dim()
+        sizes = [out.shape[dim] for out in node.meta["val"]]
+        if not all(isinstance(s, int) for s in sizes):
+            continue
+        for user in list(node.users):
+            if user.users:
+                start = sum(sizes[: user.args[1]])
+                with graph.inserting_before(user):
+                    slice_node = graph.call_function(
+                        torch.ops.aten.slice.Tensor,
+                        (x, dim, start, start + sizes[user.args[1]]),
+                    )
+                slice_node.meta = user.meta.copy()
+                user.replace_all_uses_with(slice_node)
+            graph.erase_node(user)
+        graph.erase_node(node)
+        rewritten += 1
+
+    if rewritten:
+        graph.lint()
+        gm.recompile()
+    return rewritten
+
+
 def fix_scatter_on_aliased_inputs(graph: torch.fx.Graph) -> None:
     """Insert clone before scatter ops whose input has zero strides (aliased from expand).
 

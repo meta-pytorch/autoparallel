@@ -41,6 +41,7 @@ from .graph_passes.graph_utils import (
     _add_alias,
     _replace_view_mm_view_with_einsum,
     assert_has_no_collectives,
+    canonicalize_fallback_split_to_slice,
     cleanup_graph,
     fix_scatter_on_aliased_inputs,
     functionalize_fresh_index_put_mutations,
@@ -771,6 +772,8 @@ class AutoParallel:
         # clean it up by removing the added aliases from previous pass
         # as well as redundant views
         cleanup_graph(parallel_gm, aggressive=True)
+        if n_split := canonicalize_fallback_split_to_slice(parallel_gm):
+            logger.info("Rewrote %d fallback-dtype splits as slices", n_split)
         t_cleanup = time.perf_counter()
 
         trace_structured(
