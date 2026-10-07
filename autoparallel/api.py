@@ -616,14 +616,6 @@ class AutoParallel:
 
             approx = ApproximateShardingSolver(opt, **(approximate_options or {}))
             self.sharding_placement = approx.get_solution(verbose=verbose)
-            while n := opt._price_selected_redistributions():
-                logger.info(
-                    "Re-solving after pricing %d selected redistributions by "
-                    "their lowered plan",
-                    n,
-                )
-                approx = ApproximateShardingSolver(opt, **(approximate_options or {}))
-                self.sharding_placement = approx.get_solution(verbose=verbose)
         elif solver == "ilp":
             if opt.prob is None:
                 raise RuntimeError(

@@ -9,6 +9,7 @@ import pulp
 import pytest
 import torch
 from conftest import apply_cuda_patches
+from torch._functorch._aot_autograd.descriptors import PlainAOTInput, PlainAOTOutput
 from torch._subclasses.fake_tensor import unset_fake_temporarily
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import MixedPrecisionPolicy
@@ -162,12 +163,14 @@ def test_split_dim_preserves_complete_rmsnorm_seeded_edge():
     output_value = torch.empty((256,), device="meta")
     graph = torch.fx.Graph()
     input_node = graph.placeholder("input")
+    input_node.meta["desc"] = PlainAOTInput(0)
     sum_node = graph.call_function(torch.ops.aten.sum.dim_IntList, (input_node, [0, 1]))
     dtype_node = graph.call_function(
         torch.ops.autoparallel.dtype_cast.default, (sum_node, torch.float32)
     )
     alias_node = graph.call_function(torch.ops.aten.alias.default, (dtype_node,))
-    output_node = graph.output(alias_node)
+    output_node = graph.output((alias_node,))
+    output_node.meta["desc"] = [PlainAOTOutput(0)]
     input_node.meta["val"] = input_value
     sum_node.meta["val"] = output_value
     dtype_node.meta["val"] = output_value

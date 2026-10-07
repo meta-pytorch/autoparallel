@@ -88,7 +88,7 @@ from torch._functorch._aot_autograd.fx_utils import (
     get_plain_input_and_grad_nodes,
     get_plain_output_and_tangent_nodes,
 )
-from torch.distributed.tensor._dtensor_spec import DTensorSpec
+from torch.distributed.tensor._dtensor_spec import DTensorSpec, TensorMeta
 from torch.distributed.tensor._op_schema import OpSpec, OpStrategy
 from torch.distributed.tensor.placement_types import Placement, Replicate, Shard
 from torch.utils._pytree import tree_map_only
@@ -104,7 +104,10 @@ from .graph_passes.graph_utils import (
     build_param_derived_set,
     build_terminal_derived_set,
 )
-from .shardings.ordered_sharding import default_order_redistribute_cost
+from .shardings.ordered_sharding import (
+    default_order_redistribute_cost,
+    MemoizedRedistributePlanner,
+)
 from .shardings.placement_options import (
     get_placement_options_for_node,
     reset_placement_options_cache,
@@ -196,7 +199,14 @@ def concretize_args(args):
 
 
 def _redistribution_key(src_spec, tgt_spec):
-    return src_spec.placements, tgt_spec.placements, src_spec.tensor_meta
+    return (
+        src_spec.placements,
+        src_spec.shard_order,
+        src_spec.tensor_meta,
+        tgt_spec.placements,
+        tgt_spec.shard_order,
+        tgt_spec.tensor_meta,
+    )
 
 
 def _produces_tensor(val):
@@ -465,10 +475,12 @@ class ShardingOptimizer:
         # Lowering picks a shard order only for parameter and gradient chains
         # (compute_optimal_placement_order_for_parameters); every other tensor
         # keeps the default order. Default-order redistributions without a
-        # per-mesh-dim plan are priced by the plan lowering emits once a solve
-        # selects them (_price_selected_redistributions).
+        # per-mesh-dim plan are priced by the plan lowering emits for them
+        # (_lowered_cost).
         self._ordered_storage: Optional[tuple[set, set]] = None
-        self._lowered_costs: dict[tuple, float] = {}
+        self._lowered_costs: dict[tuple, Optional[float]] = {}
+        self._planners: dict[TensorMeta, MemoizedRedistributePlanner] = {}
+        self._planner_next_states: dict[int, dict] = defaultdict(dict)
 
         t0 = time.perf_counter()
         self.decision_vars = self._build_decision_vars()
@@ -795,14 +807,18 @@ class ShardingOptimizer:
         if specs is not None:
             src_spec, tgt_spec = specs
             comm_cost = estimate_strategy_comms_cost(src_spec, tgt_spec)
-            if self._lowered_costs:
-                lowered = self._lowered_costs.get(
-                    _redistribution_key(src_spec, tgt_spec)
-                )
-                if lowered is not None and not self._has_ordered_storage(node, argi):
-                    comm_cost = lowered
             if src_spec.placements != tgt_spec.placements:
                 sharding_transition_cost = 1
+                # One step per changed mesh dim always exists when only one
+                # mesh dim exists (see _has_per_mesh_dim_plan).
+                if (
+                    len(src_spec.placements) > 1
+                    and math.isfinite(comm_cost)
+                    and not self._has_ordered_storage(node, argi)
+                ):
+                    lowered = self._lowered_cost(src_spec, tgt_spec)
+                    if lowered is not None:
+                        comm_cost = lowered
 
         return comm_cost, sharding_transition_cost
 
@@ -832,44 +848,32 @@ class ShardingOptimizer:
         input_nodes = self._all_input_nodes(node)
         return argi < len(input_nodes) and input_nodes[argi] in producers
 
-    def _price_selected_redistributions(self):
-        """Price the selected default-order redistributions that have no
-        per-mesh-dim plan by the plan lowering emits for them, and return how
-        many were newly priced.
+    def _lowered_cost(self, src_spec, tgt_spec):
+        """Cost of the plan lowering emits for a default-order redistribution
+        without a per-mesh-dim plan, else None (memoized).
 
         estimate_strategy_comms_cost prices one collective per changed mesh
         dim, which some redistributions of a tensor dim sharded over several
-        mesh dims cannot lower to. Pricing every such candidate edge would need
-        a graph-planner search per edge, so only the selected ones are priced;
-        the caller re-solves until a solve selects no unpriced one.
+        mesh dims cannot lower to.
         """
-        new = 0
-        for node_idx, argi, out_idx, inp_idx in self.selected_keys:
-            node = self.nodes[node_idx]
-            if self._has_ordered_storage(node, argi):
-                continue
-            input_nodes = self._all_input_nodes(node)
-            if argi >= len(input_nodes):
-                continue
-            specs = self._edge_specs(
-                node,
-                self.strats[node].strategies[out_idx],
-                argi,
-                inp_idx,
-                self.strats[input_nodes[argi]],
+        key = _redistribution_key(src_spec, tgt_spec)
+        try:
+            hash(key)  # tensor_meta may hold SymInts
+        except TypeError:
+            return default_order_redistribute_cost(src_spec, tgt_spec)
+        if key not in self._lowered_costs:
+            planner = self._planners.get(src_spec.tensor_meta)
+            if planner is None:
+                planner = MemoizedRedistributePlanner(
+                    src_spec.mesh,
+                    src_spec.tensor_meta,
+                    self._planner_next_states[len(src_spec.tensor_meta.shape)],
+                )
+                self._planners[src_spec.tensor_meta] = planner
+            self._lowered_costs[key] = default_order_redistribute_cost(
+                src_spec, tgt_spec, planner
             )
-            if specs is None:
-                continue
-            key = _redistribution_key(*specs)
-            if key in self._lowered_costs or not math.isfinite(
-                estimate_strategy_comms_cost(*specs)
-            ):
-                continue
-            cost = default_order_redistribute_cost(*specs)
-            if cost is not None:
-                self._lowered_costs[key] = cost
-                new += 1
-        return new
+        return self._lowered_costs[key]
 
     def _build_decision_vars(self):
         """Build DecisionVar entries for every (node_idx, argi, out_idx, inp_idx)
