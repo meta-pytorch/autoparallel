@@ -330,12 +330,16 @@ class AutoParallel:
                         "algo_loop ones use the uncalibrated tuning.cc fallback."
                     )
             set_nccl_topo_config(nccl_config)
+            self.stack.callback(set_nccl_topo_config, self._prev_nccl_config)
 
             self.stack.enter_context(self.mesh)
 
             self.build_model_graph()
-            self.old_inductor_comprehensive_padding = (
-                torch._inductor.config.comprehensive_padding
+            self.stack.callback(
+                setattr,
+                torch._inductor.config,
+                "comprehensive_padding",
+                torch._inductor.config.comprehensive_padding,
             )
             torch._inductor.config.comprehensive_padding = False
 
@@ -369,12 +373,6 @@ class AutoParallel:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        from .cost_models.collective_runtime_estimation import set_nccl_topo_config
-
-        set_nccl_topo_config(self._prev_nccl_config)
-        torch._inductor.config.comprehensive_padding = (
-            self.old_inductor_comprehensive_padding
-        )
         self.active = None
         return self.stack.__exit__(exc_type, exc_val, exc_tb)
 

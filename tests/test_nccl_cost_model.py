@@ -1629,10 +1629,8 @@ class TestNCCLCostCoverage:
         def input_fn():
             return (torch.rand(256, 8, device="cuda"),)
 
-        # __enter__ is stopped right after the cost model is configured, so
-        # __exit__ never restores the previous config; monkeypatch does.
-        monkeypatch.setattr(cre, "_nccl_topo_config", cre.get_nccl_topo_config())
         monkeypatch.setattr(torch._dynamo.utils, "warn_once_cache", set())
+        previous = cre.get_nccl_topo_config()
         # 256 ranks span 32 nodes at 8 GPUs/node (tabulated), 64 at 4 GPUs/node.
         configs = [
             h100_topo_config(num_nodes=32),
@@ -1648,6 +1646,7 @@ class TestNCCLCostCoverage:
                 autop = AutoParallel(model, input_fn, device_mesh_1d, cost_model=config)
                 with pytest.raises(RuntimeError, match="stop"):
                     autop.__enter__()
+                assert cre.get_nccl_topo_config() is previous
         messages = [str(w.message) for w in record]
         coverage = [m for m in messages if "NCCL cost model coverage" in m]
         assert coverage == [

@@ -286,7 +286,19 @@ class TestNCCLCostModelIntegration:
             table.time_us("allreduce", 1, 8, 3000)
         )
 
-    def test_autoparallel_rejects_uncovered_mesh(self, device_mesh_1d):
+    @pytest.mark.parametrize(
+        "keys, error, match",
+        [
+            # 256 ranks at 8 GPUs/node need (32 nodes, ppn 8), which needs at
+            # least two multi-node counts for ppn 8.
+            (((1, 8), (2, 8)), ValueError, r"does not cover mesh \(256,\)"),
+            # Covered, so entry fails later, in ShardingOptimizer.
+            (((1, 8), (2, 8), (4, 8)), RuntimeError, "stop"),
+        ],
+    )
+    def test_autoparallel_restores_global_state_when_enter_fails(
+        self, device_mesh_1d, keys, error, match
+    ):
         from unittest.mock import patch
 
         import torch
@@ -298,16 +310,21 @@ class TestNCCLCostModelIntegration:
         def input_fn():
             return (torch.rand(256, 8, device="cuda"),)
 
-        # 256 ranks at 8 GPUs/node need (32 nodes, ppn 8), which needs at
-        # least two multi-node counts for ppn 8.
-        config = h100_topo_config(
-            num_nodes=32, measured_table=_table(keys=((1, 8), (2, 8)))
-        )
+        config = h100_topo_config(num_nodes=32, measured_table=_table(keys=keys))
+
+        def failing_sharding_optimizer(*args, **kwargs):
+            assert cre.get_nccl_topo_config() is config
+            assert torch._inductor.config.comprehensive_padding is False
+            raise RuntimeError("stop")
+
         previous = cre.get_nccl_topo_config()
-        with patch("torch.cuda.current_device", return_value=0):
+        with patch("torch.cuda.current_device", return_value=0), patch(
+            "autoparallel.api.ShardingOptimizer", failing_sharding_optimizer
+        ), torch._inductor.config.patch(comprehensive_padding=True):
             with torch.device("meta"):
                 model = nn.Linear(8, 8)
             autop = AutoParallel(model, input_fn, device_mesh_1d, cost_model=config)
-            with pytest.raises(ValueError, match=r"does not cover mesh \(256,\)"):
+            with pytest.raises(error, match=match):
                 autop.__enter__()
+            assert torch._inductor.config.comprehensive_padding is True
         assert cre.get_nccl_topo_config() is previous
