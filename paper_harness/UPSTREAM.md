@@ -3,6 +3,7 @@
 ## TorchTitan
 
 The locked source is `kaijian/ap-submission-4d` in `AlbedoWang/torchtitan` at
+`7e7d90e1`, a child of `95a4747d`, a child of `bf68f079`, a child of
 `db5a3e88`, a child of `a38beb86`, a child of `c0fac771`, a child of
 `85c216d5`, a child of `3b24e620`, which is a child of
 `4b46d18d` on `kaijian/deepseek-baseline-parity-20260918`. Its history has `383cae9f` as an actual
@@ -79,28 +80,27 @@ ancestor and retains the `60517d28` AutoParallel/GraphTrainer integration.
   the `next_event -> node` timeline edge only when there is no `prev_event`,
   but removes the `next_event -> prev_event` bypass whenever both exist, so
   Inductor overlap scheduling (pass 2) loses that ordering.
-- `bf68f079` (local branch `agent/dsv3-memgap-p2-20261005`, child of
-  `db5a3e88`) adds `hint_all_to_all_split_sizes_pass` before Inductor: every
-  unbacked `all_to_all_single` split size (the MoE dispatch `.tolist()` counts)
-  without a hint gets `override_optimization_hint(a2a input rows // group
-  size)`. Inductor's buffer-reuse planning otherwise sizes those buffers with
-  `fallback=0`. It applies to both GraphTrainer arms.
-- `95a4747d` (local branch `agent/dsv3-p2-uneven-fsdp-20261005`, child of
-  `bf68f079`) backports upstream `e4fdd2fc` (pytorch/torchtitan#4593,
-  `simple_fsdp.py` only): SimpleFSDP passes the TP/EP-local shape and stride
-  to `DTensor.from_local` instead of inferring them, so uneven DP shards (DSv3
-  dense w1 has 1368 TP-local rows, uneven over dp_shard 16) keep the right
-  global size in GraphTrainer manual. The fork's rewrap of the gathered tensor
-  on the TP/EP mesh also gets the input's global shape and stride.
-- `7e7d90e1` (same branch, child of `95a4747d`) backports upstream `0a3e5e0c`
+- `bf68f079` (child of `db5a3e88`) adds `hint_all_to_all_split_sizes_pass`
+  before Inductor: every unbacked `all_to_all_single` split size (the MoE
+  dispatch `.tolist()` counts) without a hint gets
+  `override_optimization_hint(a2a input rows // group size)`. Inductor's
+  buffer-reuse planning otherwise sizes those buffers with `fallback=0`. It
+  applies to both GraphTrainer arms.
+- `95a4747d` (child of `bf68f079`) backports upstream `e4fdd2fc`
+  (pytorch/torchtitan#4593, `simple_fsdp.py` only): SimpleFSDP passes the
+  TP/EP-local shape and stride to `DTensor.from_local` instead of inferring
+  them, so uneven DP shards (DSv3 dense w1 has 1368 TP-local rows, uneven over
+  dp_shard 16) keep the right global size in GraphTrainer manual. The fork's
+  rewrap of the gathered tensor on the TP/EP mesh also gets the input's global
+  shape and stride.
+- `7e7d90e1` (child of `95a4747d`) backports upstream `0a3e5e0c`
   (pytorch/torchtitan#4934, `fsdp_passes.py` only, without the chunk-ownership
   handling this base does not have): `deduplicate_fsdp_unshard_chains_pass`
   keeps an unshard chain that still has consumers as canonical and drops dead
-  duplicates without substituting them. Shard(1) expert FSDP (dp_shard 16 x
-  tp 8 / EP 32 > 64 experts) otherwise replaced the live reconstructed expert
-  weight with a dead chain's raw gathered shard, so `_grouped_mm` failed in
-  GraphTrainer manual. It is the runtime pin; the lock remote is the local
-  repository because the commits are not pushed.
+  duplicates without substituting them. Shard(1) expert FSDP (dp_shard 16 x tp 8
+  / EP 32 > 64 experts) otherwise replaced the live reconstructed expert weight
+  with a dead chain's raw gathered shard, so `_grouped_mm` failed in
+  GraphTrainer manual. It is the runtime pin.
 
 The 3D port includes only the approved legacy-DTensor AP configuration, CP
 input-ownership seam, DP-shard/CP/TP mesh, CP-aware SDPA, DTensor output, and
@@ -110,10 +110,9 @@ intentionally excluded.
 ## AutoParallel
 
 The maintained harness remains on `kaijian/paper-submission`; the 4D line
-(v19-v37) is on `kaijian/paper-submission-4d`, which merges the runtime
-commits `9a16ded`..`98b20b4` and `0a551aa` at their original SHAs. Runtime
-source is pinned to the commit immediately before the lock/harness-only
-updates.
+(v19-v51) is on `kaijian/paper-submission-4d`, which merges the runtime commits
+`9a16ded`..`98b20b4`, `0a551aa`, and `bb3faf1` at their original SHAs. Runtime
+source is pinned to the commit immediately before the lock/harness-only updates.
 
 - `b8ace2a5` is represented by replay `3408588`.
 - `570bf072` is represented by the equivalent cuDNN broadcast-mask fix at
@@ -200,14 +199,12 @@ updates.
   `shape_env is not None` for dynamic tracing, so the static DeepSeek V3 trace
   has a ShapeEnv for the MoE `.tolist()` unbacked SymInts. `_add_alias` also
   aliases forward local_map outputs.
-- `bb3faf1` (local branch `agent/dsv3-memgap-p1-20261005`, child of
-  `8d37073`) rewrites `aten.split` / `split_with_sizes` of dtypes Inductor
-  falls back on (complex64) into one `aten.slice` per used chunk after
-  `cleanup_graph` in `_apply_placement_common`. Inductor's memory estimator
-  charges every fallback split sharing an alias root (DeepSeek V3's per-layer
-  RoPE `freqs_cis` redistributions) for all their outputs, which corrupts the
-  peak estimate used for buffer reuse. It is the runtime pin; the lock remote is
-  the local repository because the commit is not pushed.
+- `bb3faf1` (child of `8d37073`) rewrites `aten.split` / `split_with_sizes` of
+  dtypes Inductor falls back on (complex64) into one `aten.slice` per used chunk
+  after `cleanup_graph` in `_apply_placement_common`. Inductor's memory
+  estimator charges every fallback split sharing an alias root (DeepSeek V3's
+  per-layer RoPE `freqs_cis` redistributions) for all their outputs, which
+  corrupts the peak estimate used for buffer reuse. It is the runtime pin.
 
 ## Reproduction policy
 
