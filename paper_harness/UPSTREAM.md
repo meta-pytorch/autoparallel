@@ -110,8 +110,8 @@ intentionally excluded.
 ## AutoParallel
 
 The maintained harness remains on `kaijian/paper-submission`; the 4D line
-(v19-v51) is on `kaijian/paper-submission-4d`, which merges the runtime commits
-`9a16ded`..`98b20b4`, `0a551aa`, and `bb3faf1` at their original SHAs. Runtime
+(v19-v51, v1.0) is on `kaijian/paper-submission-4d`, which merges the runtime
+commits `9a16ded`..`98b20b4`, `0a551aa`, `bb3faf1`, and `9479e5e` at their original SHAs. Runtime
 source is pinned to the commit immediately before the lock/harness-only updates.
 
 - `b8ace2a5` is represented by replay `3408588`.
@@ -204,7 +204,14 @@ source is pinned to the commit immediately before the lock/harness-only updates.
   after `cleanup_graph` in `_apply_placement_common`. Inductor's memory
   estimator charges every fallback split sharing an alias root (DeepSeek V3's
   per-layer RoPE `freqs_cis` redistributions) for all their outputs, which
-  corrupts the peak estimate used for buffer reuse. It is the runtime pin.
+  corrupts the peak estimate used for buffer reuse.
+- `9479e5e` (child of `bb3faf1`) replaces the `98b20b4` re-solve loop with one
+  approximate solve: when edge costs are computed, every default-order
+  redistribution without a one-collective-per-mesh-dim plan (outside ordered
+  storage) is priced by the plan lowering emits. `MemoizedRedistributePlanner`
+  memoizes DTensor's graph-based planner (transitions shared per tensor ndim,
+  costs keyed by placements, one resumable search per source state) and returns
+  the paths the uncached planner finds. It is the runtime pin.
 
 ## Reproduction policy
 
