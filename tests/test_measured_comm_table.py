@@ -110,6 +110,15 @@ class TestLookup:
         assert partial.coverage(2, 1) == "missing"
         assert partial.coverage(3, 1) == "missing"
 
+    def test_single_rank_costs_nothing(self):
+        table = _table()
+        assert table.coverage(1, 1) == "no_communication"
+        for collective in COLLECTIVES:
+            assert table.time_us(collective, 1, 1, 1 << 20) == 0.0
+        config = h100_topo_config(num_nodes=8, measured_table=table)
+        # The size-1 dimension of (4, 8, 1) is a single rank.
+        assert nccl_cost_coverage(config, (4, 8, 1))[2] == "no_communication"
+
     @pytest.mark.parametrize(
         "curve, match",
         [

@@ -17,6 +17,7 @@ Lookups interpolate linearly in bytes, hold the smallest measured size below
 it, and extend the last segment above the largest. Multi-node counts without
 a curve are interpolated linearly in n_nodes between measured counts, or
 extrapolated from the two largest ones with the slope clamped at >= 0.
+A single rank (n_nodes=1, ppn=1) communicates nothing and costs zero.
 Anything else, including untabulated single-node keys, has no cost and raises.
 """
 
@@ -75,6 +76,8 @@ class MeasuredCommTable:
                 bisect.insort(self._multi_node_counts[(collective, ppn)], n_nodes)
 
     def time_us(self, collective: str, n_nodes: int, ppn: int, n_bytes: int) -> float:
+        if n_nodes == ppn == 1:
+            return 0.0
         nodes = self._bracketing_nodes(collective, n_nodes, ppn)
         if nodes is None:
             raise KeyError(
@@ -94,9 +97,11 @@ class MeasuredCommTable:
     def coverage(self, n_nodes: int, ppn: int) -> str:
         """Label for how every collective is priced at (n_nodes, ppn).
 
-        One of "measured", "interpolated", "extrapolated", or "missing" when
-        some collective has no cost.
+        One of "measured", "interpolated", "extrapolated", "missing" when
+        some collective has no cost, or "no_communication" for a single rank.
         """
+        if n_nodes == ppn == 1:
+            return "no_communication"
         brackets = []
         for collective in COLLECTIVES:
             nodes = self._bracketing_nodes(collective, n_nodes, ppn)

@@ -57,7 +57,9 @@ for test in all_gather_perf reduce_scatter_perf all_reduce_perf alltoall_perf; d
                 continue
             fi
             out="$OUT_DIR/${test%_perf}_${nodes}n_${ppn}ppn${RUN_TAG:+_$RUN_TAG}.txt"
-            cmd=(srun --nodes="$nodes" --ntasks-per-node="$ppn" --gpus-per-node="$ppn"
+            # Set --ntasks explicitly: the allocation exports its own task count.
+            cmd=(srun --nodes="$nodes" --ntasks="$((nodes * ppn))"
+                --ntasks-per-node="$ppn" --gpus-per-node="$ppn"
                 "${NCCL_TESTS_BUILD:-nccl-tests/build}/${test}${BINARY_SUFFIX}" -g 1
                 $NCCL_TESTS_ARGS)
             if [[ -n "${DRY_RUN:-}" ]]; then

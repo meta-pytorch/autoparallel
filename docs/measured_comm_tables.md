@@ -51,7 +51,8 @@ produce:
 Lookups between measured node counts are interpolated linearly in `n_nodes`.
 Above `N` they are extrapolated from the two largest counts, which is
 reported as `extrapolated` and becomes unreliable beyond about 2x `N`.
-Single-node keys are never derived, so they must be measured.
+Single-node keys are never derived, so they must be measured. Mesh dimensions
+of size 1 need no measurements: a single rank communicates nothing.
 
 ## 1. Build nccl-tests against PyTorch's NCCL
 

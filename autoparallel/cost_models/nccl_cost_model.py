@@ -1456,7 +1456,8 @@ def nccl_cost_coverage(
       - "algo_loop": tuning.cc algo selection loop, used for configs other
         than Hopper+ NVSwitch and for ppn values without table rows.
     Configs with a measured_table get MeasuredCommTable.coverage() labels:
-    "measured", "interpolated", "extrapolated", or "missing".
+    "measured", "interpolated", "extrapolated", "missing", or
+    "no_communication" for single-rank dimensions.
     """
     dims = [(tuple(mesh_shape), dim) for dim in range(len(mesh_shape))]
     if len(mesh_shape) > 1:
