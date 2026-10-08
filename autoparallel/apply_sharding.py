@@ -583,6 +583,7 @@ def _materialize_aliased_state(
     physical_placements,
     aliases,
     make_parameter,
+    parameter_requires_grad_by_fqn=None,
 ):
     group_to_node = {}
     for fqn, node in fqn_to_node.items():
@@ -599,7 +600,18 @@ def _materialize_aliased_state(
             )
         if group not in materialized:
             tensor = shard_node_given_placements(node, physical_placements[node])
-            materialized[group] = nn.Parameter(tensor) if make_parameter else tensor
+            if make_parameter:
+                requires_grad = (
+                    True
+                    if parameter_requires_grad_by_fqn is None
+                    else parameter_requires_grad_by_fqn[fqn]
+                )
+                materialized[group] = nn.Parameter(
+                    tensor,
+                    requires_grad=requires_grad,
+                )
+            else:
+                materialized[group] = tensor
         result[fqn] = materialized[group]
     return result
 
@@ -611,6 +623,7 @@ def _shard_params_and_buffers(
     buffers_spec,
     param_aliases=None,
     buffer_aliases=None,
+    parameter_requires_grad_by_fqn=None,
 ):
     """Shard parameters and buffers according to the sharding placement."""
     # NB: ok to NOT use the parallel_gm here because we will just reapply the
@@ -625,6 +638,7 @@ def _shard_params_and_buffers(
             physical_placements,
             param_aliases or {},
             make_parameter=True,
+            parameter_requires_grad_by_fqn=parameter_requires_grad_by_fqn,
         )
     sharded_buffer_dict = _materialize_aliased_state(
         buffers_spec,
@@ -644,6 +658,7 @@ def apply_sharding_to_model(
     buffers_spec,
     param_aliases=None,
     buffer_aliases=None,
+    parameter_requires_grad_by_fqn=None,
 ):
     t0 = time.perf_counter()
     dynamic = _has_symbolic_shapes(gm)
@@ -712,6 +727,7 @@ def apply_sharding_to_model(
         buffers_spec,
         param_aliases,
         buffer_aliases,
+        parameter_requires_grad_by_fqn,
     )
     t4 = time.perf_counter()
 
