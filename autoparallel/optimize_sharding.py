@@ -241,6 +241,7 @@ class ShardingOptimizer:
         force_grad_reduce_in_higher_precision=False,
         repeated_subgraphs=False,
         persistent_aliases=None,
+        solver_time_limit_seconds: float | None = None,
     ):
         self.orig_gm = gm
         # The optimizer works on a concretized copy of the graph where all
@@ -257,6 +258,9 @@ class ShardingOptimizer:
             force_grad_reduce_in_higher_precision
         )
         self.persistent_aliases = persistent_aliases or {}
+        if solver_time_limit_seconds is not None and solver_time_limit_seconds <= 0:
+            raise ValueError("solver_time_limit_seconds must be positive")
+        self.solver_time_limit_seconds = solver_time_limit_seconds
         self._constraint_log: list[tuple[str, dict]] = []
         self._memory_constraint: tuple[float, float] | None = None
         self._prefetch_discount = 1.0
@@ -1013,7 +1017,10 @@ class ShardingOptimizer:
 
     def _solve(self, verbose=False):
         self._apply_memory_constraint()
-        solver = pulp.PULP_CBC_CMD(msg=verbose)
+        solver = pulp.PULP_CBC_CMD(
+            msg=verbose,
+            timeLimit=self.solver_time_limit_seconds,
+        )
         # Use a dedicated temp directory for PuLP's intermediate files (.mps,
         # .sol, etc.) so they are always cleaned up, even if the process is
         # killed.  Without this, leftover files can fill up /tmp (tmpfs).
@@ -1021,13 +1028,26 @@ class ShardingOptimizer:
             solver.tmpDir = tmpdir
             self.prob.solve(solver)
 
-        self.selected_keys = [
-            key for key, dv in self.decision_vars.items() if dv.var.value() == 1
-        ]
-        for root_key in list(self.selected_keys):
-            self.selected_keys.extend(self._root_to_linked.get(root_key, []))
-
-        if self.prob.status == -1:
+        reached_time_limit = (
+            self.solver_time_limit_seconds is not None
+            and self.prob.solutionTime >= self.solver_time_limit_seconds
+        )
+        if reached_time_limit and (
+            self.prob.status != pulp.LpStatusOptimal
+            or self.prob.sol_status != pulp.LpSolutionOptimal
+        ):
+            status = pulp.LpStatus.get(self.prob.status, str(self.prob.status))
+            solution_status = pulp.LpSolution.get(
+                self.prob.sol_status, str(self.prob.sol_status)
+            )
+            raise TimeoutError(
+                "AutoParallel sharding solve did not prove an optimal solution "
+                f"within {self.solver_time_limit_seconds:g} seconds "
+                f"(status={status}, solution_status={solution_status}). "
+                "PuLP elapsed time includes problem-file setup; retry with a "
+                "larger limit to distinguish a near-deadline solver result."
+            )
+        if self.prob.status == pulp.LpStatusInfeasible:
             logger.warning(self.get_violated_constraints_log())
             raise RuntimeError(
                 "The sharding optimizer could not find a feasible solution. "
@@ -1037,6 +1057,23 @@ class ShardingOptimizer:
                 "constraints, and consider relaxing input/output constraints or "
                 "using a larger mesh."
             )
+        if self.prob.status != pulp.LpStatusOptimal:
+            status = pulp.LpStatus.get(self.prob.status, str(self.prob.status))
+            raise RuntimeError(f"AutoParallel sharding solve failed (status={status})")
+        if self.prob.sol_status != pulp.LpSolutionOptimal:
+            solution_status = pulp.LpSolution.get(
+                self.prob.sol_status, str(self.prob.sol_status)
+            )
+            raise RuntimeError(
+                "AutoParallel sharding solve returned a non-optimal solution "
+                f"(solution_status={solution_status})"
+            )
+
+        self.selected_keys = [
+            key for key, dv in self.decision_vars.items() if dv.var.value() == 1
+        ]
+        for root_key in list(self.selected_keys):
+            self.selected_keys.extend(self._root_to_linked.get(root_key, []))
 
     def _extract_and_validate_solution(self):
         """Validate the ILP solution and return the optimal strategy per node."""

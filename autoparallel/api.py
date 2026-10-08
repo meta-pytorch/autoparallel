@@ -234,6 +234,9 @@ class AutoParallel:
     Args:
         mesh: Defines placement options.
         The meta model is moved to a fake device based on mesh.device_type.
+        solver_time_limit_seconds: Optional CBC optimality deadline. The solve
+        raises ``TimeoutError`` instead of accepting an unproven incumbent when
+        the deadline expires.
     """
 
     def __init__(
@@ -246,6 +249,7 @@ class AutoParallel:
         dynamic: bool = False,
         cost_model: Any = "nccl",
         repeated_subgraphs: bool = True,
+        solver_time_limit_seconds: float | None = None,
     ):
         self.stack = ExitStack()
         self.fake_mode = (
@@ -258,6 +262,7 @@ class AutoParallel:
         self.mp_policy = mp_policy
         self.cost_model = cost_model
         self.repeated_subgraphs = repeated_subgraphs
+        self.solver_time_limit_seconds = solver_time_limit_seconds
         # copy user model to avoid modifying it in-place
         # in dtype casting and move_to_fake
         model = copy.deepcopy(model)
@@ -340,6 +345,7 @@ class AutoParallel:
                 force_grad_reduce_in_higher_precision,
                 repeated_subgraphs=self.repeated_subgraphs,
                 persistent_aliases={**self.param_aliases, **self.buffer_aliases},
+                solver_time_limit_seconds=self.solver_time_limit_seconds,
             )
 
             self.sharding_optimizer = sharding_optimizer
@@ -450,16 +456,6 @@ class AutoParallel:
                 verbose=True, colored=False
             ),
         )
-
-        if self.sharding_optimizer.prob.status == -1:
-            raise RuntimeError(
-                "The sharding optimizer could not find a feasible solution. "
-                "This typically means the user-specified constraints are "
-                "contradictory or the device mesh is too small for the requested "
-                "sharding. Check the WARNING log for the list of violated "
-                "constraints, and consider relaxing input/output constraints or "
-                "using a larger mesh."
-            )
 
         trace_structured(
             "artifact",

@@ -261,5 +261,6 @@ def test_loaded_optimizer_resolve_without_memory_constraint(device_mesh_1d):
         opt.save(f.name)
         loaded = type(opt).load(f.name)
 
+    assert loaded.solver_time_limit_seconds is None
     solution = loaded.resolve()
     assert len(solution) > 0

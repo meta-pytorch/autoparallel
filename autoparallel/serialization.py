@@ -194,6 +194,7 @@ def save_optimizer(opt, path):
         "force_grad_reduce_in_higher_precision": opt.force_grad_reduce_in_higher_precision,
         "persistent_aliases": opt.persistent_aliases,
         "prefetch_discount": opt._prefetch_discount,
+        "solver_time_limit_seconds": opt.solver_time_limit_seconds,
         "skipped_clusters": opt.skipped_clusters,
         "strats_by_name": strats_by_name,
         "dv_costs_node_names": save_node_names,
@@ -269,6 +270,7 @@ def load_optimizer(cls, path):
     ]
     opt.persistent_aliases = save_dict.get("persistent_aliases", {})
     opt._prefetch_discount = save_dict.get("prefetch_discount", 1.0)
+    opt.solver_time_limit_seconds = save_dict.get("solver_time_limit_seconds")
     opt._prefetchable_keys = None
     opt.skipped_clusters = save_dict.get("skipped_clusters", [])
     opt._constraint_log = []
