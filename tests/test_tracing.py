@@ -6,12 +6,41 @@
 import torch
 import torch.nn as nn
 from torch._subclasses.fake_tensor import FakeTensorMode
+from torch.ao.quantization.fake_quantize import FusedMovingAvgObsFakeQuantize
+from torch.ao.quantization.observer import MovingAveragePerChannelMinMaxObserver
 
-from autoparallel.tracing import move_to_fake
+from autoparallel.tracing import _resize_qat_weight_observer_buffers, move_to_fake
 
 
 def _make_fake_mode():
     return FakeTensorMode()
+
+
+def test_resize_qat_weight_observer_buffers():
+    class QATLinear(nn.Linear):
+        def __init__(self):
+            super().__init__(4, 8)
+            self.weight_fake_quant = FusedMovingAvgObsFakeQuantize(
+                observer=MovingAveragePerChannelMinMaxObserver,
+                quant_min=-128,
+                quant_max=127,
+                dtype=torch.qint8,
+                qscheme=torch.per_channel_symmetric,
+                ch_axis=0,
+            )
+
+    with torch.device("meta"):
+        model = QATLinear()
+
+    assert model.weight_fake_quant.scale.shape == (1,)
+    assert model.weight_fake_quant.activation_post_process.min_val.shape == (0,)
+
+    _resize_qat_weight_observer_buffers(model)
+
+    assert model.weight_fake_quant.scale.shape == (8,)
+    assert model.weight_fake_quant.zero_point.shape == (8,)
+    assert model.weight_fake_quant.activation_post_process.min_val.shape == (8,)
+    assert model.weight_fake_quant.activation_post_process.max_val.shape == (8,)
 
 
 def test_move_to_fake_param_alias():
