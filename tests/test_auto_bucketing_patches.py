@@ -10,6 +10,8 @@ The patches are installed at module import time, so importing
 auto_bucketing replaces the originals in PyTorch's bucketing/fsdp modules.
 """
 
+from unittest.mock import patch
+
 import torch
 import torch._inductor.fx_passes.bucketing as bucketing_mod
 import torch._inductor.fx_passes.fsdp as fsdp_mod
@@ -45,6 +47,15 @@ def _make_wait_node(g, ag):
     return w
 
 
+def _make_ar_node(g, x, group_name, dtype=torch.float32):
+    ar = g.call_function(
+        torch.ops._c10d_functional.all_reduce.default,
+        (x, "sum", group_name),
+    )
+    ar.meta["val"] = _make_fake_tensor_meta((1024,), dtype)
+    return ar
+
+
 def _build_gm(graph):
     return torch.fx.GraphModule(torch.nn.Module(), graph)
 
@@ -71,6 +82,42 @@ def test_identify_fsdp_groups_picks_primary_group():
 
     assert list(groups) == ["dp"], f"expected only primary 'dp', got {list(groups)}"
     assert group_size == 8
+
+
+def test_identify_fsdp_groups_preserves_first_match_group_size():
+    g = torch.fx.Graph()
+    placeholders = [g.placeholder(f"p{i}") for i in range(4)]
+    for ph in placeholders:
+        ph.meta["val"] = _make_fake_tensor_meta((1024,))
+    _make_ag_node(g, placeholders[0], "tp", (2048,), group_size=2)
+    for placeholder in placeholders[1:]:
+        _make_ag_node(g, placeholder, "dp", (8192,), group_size=8)
+    g.output(())
+
+    groups, group_size = fsdp_mod.identify_fsdp_groups(_build_gm(g))
+
+    assert list(groups) == ["dp"]
+    assert group_size == 2
+
+
+def test_identify_fsdp_groups_can_include_all_all_reduce_groups():
+    g = torch.fx.Graph()
+    dp_input = g.placeholder("dp_input")
+    tp_input = g.placeholder("tp_input")
+    dp_input.meta["val"] = _make_fake_tensor_meta((1024,), torch.bfloat16)
+    tp_input.meta["val"] = _make_fake_tensor_meta((1024,), torch.float32)
+    _make_ag_node(g, dp_input, "dp", (8192,), group_size=8)
+    _make_wait_node(g, _make_ar_node(g, tp_input, "tp"))
+    g.output(())
+
+    saved = ab.aten_autobucketing_config.bucket_all_all_reduce_groups
+    ab.aten_autobucketing_config.bucket_all_all_reduce_groups = True
+    try:
+        groups, _ = fsdp_mod.identify_fsdp_groups(_build_gm(g))
+    finally:
+        ab.aten_autobucketing_config.bucket_all_all_reduce_groups = saved
+
+    assert list(groups) == ["dp", "tp"]
 
 
 def test_identify_fsdp_groups_handles_no_fsdp_ags():
@@ -158,6 +205,71 @@ def test_greedy_bucket_merges_within_caps():
 
     assert len(buckets) == 1, f"expected 1 bucket, got {len(buckets)}"
     assert len(buckets[0]) == 4, f"expected 4 AGs in bucket, got {len(buckets[0])}"
+
+
+def test_greedy_bucket_records_diagnostics_only_in_active_pass():
+    gm, _, _ = _build_ag_chain_graph(n_ags=4, ag_shape_bytes_each=1024)
+    diagnostics = {"greedy_bucket_calls": []}
+    token = ab._active_bucketing_diagnostics.set(diagnostics)
+    try:
+        buckets = _call_greedy_bucket(gm, bucket_cap_mb=10.0)
+    finally:
+        ab._active_bucketing_diagnostics.reset(token)
+
+    assert len(buckets) == 1
+    assert ab._active_bucketing_diagnostics.get() is None
+    assert diagnostics["greedy_bucket_calls"] == [
+        {
+            "candidate_count": 4,
+            "group_count": 1,
+            "groups": [
+                {
+                    "group_key": ["dp", "torch.bfloat16"],
+                    "candidate_count": 4,
+                    "candidate_bytes": 4096,
+                    "bucket_count": 1,
+                    "bucketed_member_count": 4,
+                    "dependency_blocked_count": 0,
+                }
+            ],
+            "candidate_bytes": 4096,
+            "largest_candidate_bytes": 1024,
+            "bucket_count": 1,
+            "bucketed_member_count": 4,
+            "dependency_blocked_count": 0,
+            "unbucketed_candidate_count": 0,
+            "closed_for_bytes_count": 0,
+            "closed_for_span_count": 0,
+            "maximum_bucket_span": 9,
+            "max_topo_span": 1500,
+        }
+    ]
+
+
+def test_reordering_pass_publishes_and_resets_diagnostics():
+    graph = torch.fx.Graph()
+    graph.output(())
+    gm = _build_gm(graph)
+    saved = ab.aten_autobucketing_config.save_trace
+    ab.aten_autobucketing_config.save_trace = False
+    try:
+        with patch.object(
+            ab, "schedule_overlap_bucketing", return_value=gm
+        ), patch.object(ab, "trace_structured") as trace:
+            result = ab.aten_autobucketing_reordering_pass(
+                gm.graph, ab.aten_autobucketing_config
+            )
+    finally:
+        ab.aten_autobucketing_config.save_trace = saved
+
+    assert ab._active_bucketing_diagnostics.get() is None
+    assert result.meta["autoparallel_bucketing_diagnostics"] == {
+        "collective_counts_before": {},
+        "group_selection": None,
+        "greedy_bucket_calls": [],
+        "collective_counts_after": {},
+    }
+    trace.assert_called_once()
 
 
 def test_greedy_bucket_splits_on_bytes_cap():
