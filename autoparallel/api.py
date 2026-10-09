@@ -507,6 +507,12 @@ class AutoParallel:
                 self.joint_with_descriptors.buffers_spec,
                 self.param_aliases,
                 self.buffer_aliases,
+                {
+                    fqn: parameter.requires_grad
+                    for fqn, parameter in self.model.named_parameters(
+                        remove_duplicate=False
+                    )
+                },
             )
         t_apply = time.perf_counter()
         # clean it up by removing the added aliases from previous pass

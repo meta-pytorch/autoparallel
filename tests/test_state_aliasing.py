@@ -133,6 +133,76 @@ def test_aliased_state_is_materialized_once():
     assert buffers["observer.enabled"] is buffers["activation_post_process.enabled"]
 
 
+def test_materialized_parameters_preserve_requires_grad_mask():
+    graph = torch.fx.Graph()
+    parameters = [
+        graph.placeholder(name) for name in ("frozen", "trainable", "unused_trainable")
+    ]
+    output = graph.output(tuple(parameters))
+    fqns = [
+        "frozen.weight",
+        "trainable.weight",
+        "unused_trainable.weight",
+    ]
+    for parameter, fqn in zip(parameters, fqns):
+        parameter.meta["desc"] = ParamAOTInput(fqn)
+        parameter.meta["val"] = torch.empty(2, device="meta", requires_grad=False)
+    output.meta["desc"] = [None]
+    gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+
+    with patch(
+        "autoparallel.apply_sharding.shard_node_given_placements",
+        return_value=torch.ones(2),
+    ):
+        params, _ = _shard_params_and_buffers(
+            gm,
+            {parameter: object() for parameter in parameters},
+            fqns,
+            [],
+            parameter_requires_grad_by_fqn={
+                "frozen.weight": False,
+                "trainable.weight": True,
+                "unused_trainable.weight": True,
+            },
+        )
+
+    assert params["frozen.weight"].requires_grad is False
+    assert params["trainable.weight"].requires_grad is True
+    assert params["unused_trainable.weight"].requires_grad is True
+
+
+@apply_cuda_patches
+def test_lowering_preserves_unused_trainable_parameter(device_mesh_1d):
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.frozen = nn.Linear(4, 4, bias=False)
+            self.trainable = nn.Linear(4, 4, bias=False)
+            self.unused_trainable = nn.Linear(4, 4, bias=False)
+            self.frozen.weight.requires_grad_(False)
+
+        def forward(self, x):
+            return self.trainable(self.frozen(x))
+
+    with torch.device("meta"):
+        model = Model()
+
+    def input_fn():
+        return torch.randn(device_mesh_1d.size(), 4, device="cuda")
+
+    with AutoParallel(
+        model, input_fn, device_mesh_1d, repeated_subgraphs=False
+    ) as autop:
+        autop.add_input_constraints([(Shard(0),)])
+        autop.add_output_constraints([(Shard(0),)])
+        parallel_model = autop.apply_placement(autop.optimize_placement())
+
+    parameters = dict(parallel_model.named_parameters())
+    assert parameters["frozen.weight"].requires_grad is False
+    assert parameters["trainable.weight"].requires_grad is True
+    assert parameters["unused_trainable.weight"].requires_grad is True
+
+
 @apply_cuda_patches
 def test_tied_weight_executes_with_summed_gradient(device_mesh_1d):
     class Model(nn.Module):
