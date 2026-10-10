@@ -105,16 +105,41 @@ def _infer_fsdplike_storage_order(
     return preferred_order if preferred_order != default_order else None
 
 
+def _orthogonal_reduction_dims(
+    storage: tuple[Placement, ...],
+    grad_source: tuple[Placement, ...],
+    forward_placements: list[tuple[Placement, ...]],
+) -> frozenset[int]:
+    """Mesh dims the parameter keeps Replicate through every forward boundary
+    while its gradient arrives Partial (e.g. the replicate axis of HSDP).
+
+    Their reduction is an independent all_reduce that lowering stages after
+    the ordered part (``_orthogonal_partial_reduction_steps``), so it does not
+    constrain the storage order.
+    """
+    return frozenset(
+        mesh_dim
+        for mesh_dim, (stored, source) in enumerate(zip(storage, grad_source))
+        if isinstance(stored, Replicate)
+        and isinstance(source, Partial)
+        and all(isinstance(p[mesh_dim], Replicate) for p in forward_placements)
+    )
+
+
 def _matches_adjoint_gradient_pattern(
     param_source: tuple[Placement, ...],
     param_target: tuple[Placement, ...],
     grad_source: tuple[Placement, ...],
     grad_target: tuple[Placement, ...],
 ) -> bool:
-    """Check that the gradient redistribution is the parameter gather's adjoint."""
-    if grad_target != param_source:
+    """Check that the gradient redistribution is the parameter gather's adjoint,
+    up to orthogonal reductions."""
+    if grad_target != param_source or len(grad_source) != len(param_source):
         return False
 
+    orthogonal_reduction_dims = _orthogonal_reduction_dims(
+        param_source, grad_source, [param_target]
+    )
     expected_grad_source = tuple(
         (
             Partial()
@@ -123,7 +148,12 @@ def _matches_adjoint_gradient_pattern(
         )
         for param_src, param_dst in zip(param_source, param_target)
     )
-    return grad_source == expected_grad_source
+    return all(
+        mesh_dim in orthogonal_reduction_dims or source == expected
+        for mesh_dim, (source, expected) in enumerate(
+            zip(grad_source, expected_grad_source)
+        )
+    )
 
 
 # Keep the old private name for callers of the original PR #529 helper.
@@ -1183,24 +1213,22 @@ def _matches_multi_boundary_gradient_source(
     if len(storage) != len(grad_source):
         return None
     backward_dims = set(backward_order)
-    orthogonal_reduction_dims = set()
+    orthogonal_reduction_dims = _orthogonal_reduction_dims(
+        storage,
+        grad_source,
+        [
+            spec.placements
+            for _, edge_source, edge_target in forward
+            for spec in (edge_source, edge_target)
+        ],
+    )
     for mesh_dim, (stored, source) in enumerate(zip(storage, grad_source)):
         if mesh_dim in backward_dims:
             if not isinstance(stored, Shard) or not isinstance(source, Partial):
                 return None
-        elif stored == source:
-            continue
-        elif isinstance(stored, Replicate) and isinstance(source, Partial):
-            if any(
-                edge_source.placements[mesh_dim] != stored
-                or edge_target.placements[mesh_dim] != stored
-                for _, edge_source, edge_target in forward
-            ):
-                return None
-            orthogonal_reduction_dims.add(mesh_dim)
-        else:
+        elif stored != source and mesh_dim not in orthogonal_reduction_dims:
             return None
-    return frozenset(orthogonal_reduction_dims)
+    return orthogonal_reduction_dims
 
 
 def _planned_collective_order(
