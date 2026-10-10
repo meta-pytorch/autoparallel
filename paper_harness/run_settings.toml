@@ -243,3 +243,13 @@ campaign = "campaigns/variants/llama3_8b_4d_dpr4_dps4_cp2_tp4_16k.toml"
 model = "llama3_8b"
 setting = "4d-dpr4-dps4-cp2-tp4-16k-trace"
 campaign = "campaigns/variants/llama3_8b_4d_dpr4_dps4_cp2_tp4_16k_trace.toml"
+
+[[settings]]
+model = "llama3_70b"
+setting = "2d-dps16-tp8"
+campaign = "campaigns/variants/llama3_70b_2d_dps16_tp8.toml"
+
+[[settings]]
+model = "qwen3_32b"
+setting = "2d-dps16-tp8"
+campaign = "campaigns/variants/qwen3_32b_2d_dps16_tp8.toml"

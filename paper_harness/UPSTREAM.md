@@ -3,7 +3,7 @@
 ## TorchTitan
 
 The locked source is `kaijian/ap-submission-4d` in `AlbedoWang/torchtitan` at
-`7e7d90e1`, a child of `95a4747d`, a child of `bf68f079`, a child of
+`14f98fe1`, a child of `4cc0bb61`, a child of `7e7d90e1`, a child of `95a4747d`, a child of `bf68f079`, a child of
 `db5a3e88`, a child of `a38beb86`, a child of `c0fac771`, a child of
 `85c216d5`, a child of `3b24e620`, which is a child of
 `4b46d18d` on `kaijian/deepseek-baseline-parity-20260918`. Its history has `383cae9f` as an actual
@@ -100,7 +100,16 @@ ancestor and retains the `60517d28` AutoParallel/GraphTrainer integration.
   duplicates without substituting them. Shard(1) expert FSDP (dp_shard 16 x tp 8
   / EP 32 > 64 experts) otherwise replaced the live reconstructed expert weight
   with a dead chain's raw gathered shard, so `_grouped_mm` failed in
-  GraphTrainer manual. It is the runtime pin.
+  GraphTrainer manual.
+- `4cc0bb61` (child of `7e7d90e1`) routes the GraphTrainer Qwen3 model through
+  the AutoParallel parallelizer when `compile.enable_autoparallel` is set
+  (`graph_trainer/qwen3/__init__.py`), as for LLaMA 3, for the Qwen3 32B
+  setting.
+- `14f98fe1` (child of `4cc0bb61`) sets
+  `aten_distributed_optimizations.compute_overlap_multipler` to 1.0 for the
+  AutoParallel full-Inductor compile, so Inductor's overlap pass (pass 2) counts
+  each AP compute estimate in full toward hiding a collective (was 0.5 since
+  `7966c411`). It is the runtime pin.
 
 The 3D port includes only the approved legacy-DTensor AP configuration, CP
 input-ownership seam, DP-shard/CP/TP mesh, CP-aware SDPA, DTensor output, and
@@ -110,8 +119,8 @@ intentionally excluded.
 ## AutoParallel
 
 The maintained harness remains on `kaijian/paper-submission`; the 4D line
-(v19-v51, v1.0) is on `kaijian/paper-submission-4d`, which merges the runtime
-commits `9a16ded`..`98b20b4`, `0a551aa`, `bb3faf1`, and `9479e5e` at their original SHAs. Runtime
+(v19-v51, v1.0, v1.0.1) is on `kaijian/paper-submission-4d`, which merges the runtime
+commits `9a16ded`..`98b20b4`, `0a551aa`, `bb3faf1`, `9479e5e`, and `7bb86e9` at their original SHAs. Runtime
 source is pinned to the commit immediately before the lock/harness-only updates.
 
 - `b8ace2a5` is represented by replay `3408588`.
@@ -211,7 +220,15 @@ source is pinned to the commit immediately before the lock/harness-only updates.
   storage) is priced by the plan lowering emits. `MemoizedRedistributePlanner`
   memoizes DTensor's graph-based planner (transitions shared per tensor ndim,
   costs keyed by placements, one resumable search per source state) and returns
-  the paths the uncached planner finds. It is the runtime pin.
+  the paths the uncached planner finds.
+- `7bb86e9` (child of `9479e5e`) lets the exact-adjoint storage-order gate
+  (`_matches_adjoint_gradient_pattern`) accept a Partial gradient on a mesh dim
+  the parameter keeps Replicate through every forward boundary (the replicate
+  axis of HSDP): an independent all_reduce that lowering stages after the
+  ordered part. The rule is shared with `_matches_multi_boundary_gradient_source`
+  through `_orthogonal_reduction_dims`. Parameters whose only boundary is a
+  multi-input consumer (DeepSeek V3 routed experts feeding the MoE `local_map`)
+  now get the ordered storage the solver prices. It is the runtime pin.
 
 ## Reproduction policy
 

@@ -19,6 +19,9 @@ from torchtitan.experiments.graph_trainer.configs import (
     to_graph_trainer_config,
 )
 from torchtitan.experiments.graph_trainer.llama3 import model_registry
+from torchtitan.experiments.graph_trainer.qwen3 import (
+    model_registry as qwen3_model_registry,
+)
 from torchtitan.models.common.config_utils import decoder_vocab_size
 from torchtitan.models.llama3.config_registry import llama3_8b
 from workloads.parameter_state import register_post_load_parameter_audit
@@ -95,7 +98,7 @@ C4_SHARD_METADATA = {
 DATASET_NAME = "c4_llama8b_topology_invariant_replay"
 
 MODEL_FLAVOR = os.environ.get("BENCHMARK_MODEL", "8B")
-if MODEL_FLAVOR != "8B":
+if MODEL_FLAVOR not in {"8B", "70B", "32B"}:  # 32B: Qwen3 (*_qwen3_32b configs)
     raise ValueError(f"Unsupported BENCHMARK_MODEL={MODEL_FLAVOR!r}")
 
 WORLD_SIZE = int(os.environ["BENCHMARK_WORLD_SIZE"])
@@ -307,10 +310,10 @@ class AuditedReplayDataLoader(ParallelAwareDataloader):
             yield dict(input_dict), labels
 
 
-def _base_config():
+def _base_config(registry=model_registry):
     config = llama3_8b()
     config.comm = replace(config.comm, init_timeout_seconds=1200)
-    config.model_spec = model_registry(MODEL_FLAVOR, attn_backend="sdpa")
+    config.model_spec = registry(MODEL_FLAVOR, attn_backend="sdpa")
     config.model_spec = replace(
         config.model_spec,
         post_optimizer_build_fn=_register_post_load_audits,
@@ -383,8 +386,8 @@ def _base_config():
     return config
 
 
-def _graph_config(*, enable_autoparallel: bool):
-    config = to_graph_trainer_config(_base_config(), model_registry)
+def _graph_config(*, enable_autoparallel: bool, registry=model_registry):
+    config = to_graph_trainer_config(_base_config(registry), registry)
     config.profiler = replace(config.profiler, trace_post_processor=None)
     config.compile = GraphTrainerCompileConfig(
         enable=True,
@@ -405,16 +408,18 @@ def autoparallel_graphtrainer_8b():
     return _graph_config(enable_autoparallel=True)
 
 
-def torchtitan_baseline_8b():
+def autoparallel_graphtrainer_qwen3_32b():
+    return _graph_config(enable_autoparallel=True, registry=qwen3_model_registry)
+
+
+def _torchtitan_baseline(registry, name, parallelize_fn):
     if "autoparallel.graph_passes.auto_bucketing" in sys.modules:
         raise RuntimeError("Native TorchTitan baseline was polluted by AutoParallel")
-    from torchtitan.models.llama3.parallelize import parallelize_llama
-
-    config = _base_config()
+    config = _base_config(registry)
     config.model_spec = replace(
         config.model_spec,
-        name="torchtitan/native_compile/llama3",
-        parallelize_fn=parallelize_llama,
+        name=name,
+        parallelize_fn=parallelize_fn,
     )
     config.compile = CompileConfig(
         enable=True,
@@ -424,8 +429,26 @@ def torchtitan_baseline_8b():
     return config
 
 
+def torchtitan_baseline_8b():
+    from torchtitan.models.llama3.parallelize import parallelize_llama
+
+    return _torchtitan_baseline(
+        model_registry, "torchtitan/native_compile/llama3", parallelize_llama
+    )
+
+
+def torchtitan_baseline_qwen3_32b():
+    from torchtitan.models.qwen3.parallelize import parallelize_qwen3
+
+    return _torchtitan_baseline(
+        qwen3_model_registry, "torchtitan/native_compile/qwen3", parallelize_qwen3
+    )
+
+
 EXPERIMENT_CONFIGS = (
     "torchtitan_baseline_8b",
+    "torchtitan_baseline_qwen3_32b",
     "graphtrainer_manual_eager_8b",
     "autoparallel_graphtrainer_8b",
+    "autoparallel_graphtrainer_qwen3_32b",
 )
