@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "kind": "profiled-default-adamw-local-parameter-cost-calibration",
+  "model": "optimizer_kernel_us = intercept + slope * local_parameter_gib",
+  "intercept_us": 98.95563711015438,
+  "slope_us_per_local_parameter_gib": 7289.257222420391,
+  "calibration": {
+    "case_count": 2,
+    "point_count": 6,
+    "local_parameter_gib_min": 0.15607776958495378,
+    "local_parameter_gib_max": 2.0832366943359375,
+    "maximum_in_sample_kernel_relative_error": 0.01962432346325487,
+    "maximum_prospective_kernel_relative_error": 0.007444601818523797,
+    "prospective_case_count": 4,
+    "prospective_point_count": 10,
+    "prospective_winner_accuracy": 1.0,
+    "maximum_prospective_full_step_relative_error": 0.14803174029669128,
+    "maximum_contemporaneous_base_full_step_relative_error": 0.0013642356132374277
+  },
+  "platform": {
+    "accelerator": "H100",
+    "pytorch_build": "2.15.0.dev20261002+cu132",
+    "compute_dtype": "bfloat16",
+    "persistent_parameter_dtype": "float32",
+    "realized_optimizer_kernel_family": "foreach"
+  },
+  "optimizer_contract": {
+    "optimizer": "AdamW",
+    "gradient_accumulation_steps": 1,
+    "update_frequency": "once_per_step",
+    "gradient_dtype": "float32",
+    "moment_dtype": "float32",
+    "state_placement": "matches_parameter_placement"
+  },
+  "source_run_ids": [
+    "20261008T020646Z-62338f395154",
+    "20261008T020940Z-6f86dc62a02e",
+    "20261008T021052Z-b0bfaf13a487",
+    "20261008T021218Z-191b77238be2",
+    "20261008T021425Z-ce7ac303a3ae",
+    "20261008T021609Z-da7f56b36372"
+  ],
+  "prospective_report_ids": [
+    "20261008T022133Z-f2829e21961c",
+    "20261008T025916Z-58bdb9359af1",
+    "20261008T031735Z-fe27e2e4a2fd",
+    "20261008T035524Z-77023f799b4c"
+  ],
+  "use": "screening_only",
+  "limitations": [
+    "kernel-family applicability must be established for every candidate",
+    "the partial-step base needs its own contemporaneous or temporal-drift envelope",
+    "scale extrapolation outside the calibrated local-parameter range is unsupported"
+  ]
+}

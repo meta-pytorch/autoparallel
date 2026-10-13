@@ -171,6 +171,7 @@ def _patch_fsdp_bucketing():
         largest_candidate_bytes = 0
         dependency_blocked_count = 0
         bucketed_member_count = 0
+        collective_type_counts: Counter[str] = Counter()
         group_diagnostics = []
 
         for key, nodes in groups.items():
@@ -187,6 +188,7 @@ def _patch_fsdp_bucketing():
                 bucket_cap_mb_by_bucket_idx(cur_bucket_id) * 1024 * 1024
             )
             for node in nodes:
+                collective_type_counts[str(node.target)] += 1
                 n_val = node.meta["val"]
                 out_size_bytes = n_val.numel() * n_val.element_size()
                 n_input_val = node.all_input_nodes[0].meta["val"]
@@ -278,6 +280,7 @@ def _patch_fsdp_bucketing():
         _record_greedy_bucket_diagnostic(
             {
                 "candidate_count": candidate_count,
+                "collective_type_counts": dict(sorted(collective_type_counts.items())),
                 "group_count": len(groups),
                 "groups": group_diagnostics,
                 "candidate_bytes": candidate_bytes,

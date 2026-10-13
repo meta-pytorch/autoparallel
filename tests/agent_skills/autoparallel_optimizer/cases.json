@@ -1,0 +1,319 @@
+{
+  "schema_version": 1,
+  "skill": "autoparallel-optimizer",
+  "skill_path": ".agents/skills/autoparallel-optimizer/SKILL.md",
+  "protocol": {
+    "isolation": "Run each case in a fresh worktree and discard it afterwards.",
+    "agent_preamble": "Read-only inspection of available local guidance and task fixtures is always allowed and does not count as executing project code. Follow each task's own permissions for project execution and file edits.",
+    "agent_visible_fields": [
+      "agent_preamble",
+      "prompt"
+    ],
+    "grader_visible_fields": [
+      "response",
+      "tool_trace",
+      "workspace_diff",
+      "artifacts"
+    ],
+    "repeat_count": 3,
+    "workspace_setup": "Copy workspace_copy entries before invocation; expose only their destination paths to the agent.",
+    "baseline": {
+      "enabled": true,
+      "invocations": [
+        "implicit"
+      ],
+      "same_prompt": true
+    }
+  },
+  "cases": [
+    {
+      "id": "global_spmd_local_shuffle",
+      "mode": "explain",
+      "invocation": "implicit",
+      "skill_expected": true,
+      "workspace_copy": [
+        {
+          "source": "tests/agent_skills/autoparallel_optimizer/fixtures/global_spmd_local_shuffle.py",
+          "destination": "global_spmd_local_shuffle.py"
+        }
+      ],
+      "prompt": "Review global_spmd_local_shuffle.py for use with AutoParallel on 8 GPUs. The current training system invokes the module once per GPU with a local batch of 32, while the AutoParallel trace would receive one logical batch of 256. Tell me whether it is ready to plan as-is and what you would do next. Do not edit files.",
+      "rubric_id": "global_spmd_local_shuffle"
+    },
+    {
+      "id": "infer_device_mesh",
+      "mode": "plan",
+      "invocation": "implicit",
+      "skill_expected": true,
+      "workspace_copy": [],
+      "prompt": "Recommend DeviceMesh candidates for an AutoParallel planning run. We have 16 H100 GPUs in two 8-GPU NVSwitch nodes, contiguous ranks within each node, global batch 128, hidden size 4096, and 32 attention heads. The user did not provide a mesh. Planning advice only; do not run or edit anything.",
+      "rubric_id": "infer_device_mesh"
+    },
+    {
+      "id": "confirm_intended_allocation",
+      "mode": "plan",
+      "invocation": "implicit",
+      "skill_expected": true,
+      "workspace_copy": [],
+      "prompt": "Plan AutoParallel sharding for a transformer. nvidia-smi currently shows 8 H100s, but I have not provided a launch configuration, intended GPU count, or node count. Tell me what you would do next. Planning advice only; do not run or edit anything.",
+      "rubric_id": "confirm_intended_allocation"
+    },
+    {
+      "id": "single_domain_prefers_1d",
+      "mode": "plan",
+      "invocation": "implicit",
+      "skill_expected": true,
+      "workspace_copy": [],
+      "prompt": "Recommend a DeviceMesh for an AutoParallel planning run on 8 H100 GPUs in one NVSwitch domain. The model fits on each GPU, has no required tensor-parallel or expert-parallel axis, and uses a global batch of 64. Planning advice only; do not run or edit anything.",
+      "rubric_id": "single_domain_prefers_1d"
+    },
+    {
+      "id": "cpu_saved_optimizer_explanation",
+      "mode": "explain",
+      "invocation": "explicit",
+      "skill_expected": true,
+      "workspace_copy": [],
+      "prompt": "Use $autoparallel-optimizer. I only have a CPU machine and a trusted GPU-captured optimizer artifact at artifacts/model.ap. Show the smallest workflow you would use to explain why node mm_3 is replicated and compare it with a forced sharded alternative. Do not load the artifact, execute project code, lower a graph, or modify anything.",
+      "rubric_id": "cpu_saved_optimizer_explanation"
+    },
+    {
+      "id": "repair_evaluation_harness",
+      "mode": "evaluate",
+      "invocation": "implicit",
+      "skill_expected": true,
+      "workspace_copy": [
+        {
+          "source": "tests/agent_skills/autoparallel_optimizer/fixtures/evaluation_harness.py",
+          "destination": "evaluation_harness.py"
+        }
+      ],
+      "prompt": "Update evaluation_harness.py so an AutoParallel run emits comparable post-reordering time and memory estimates for both training graph phases. Keep the change in this file and do not add a public library API. Explain what evidence the resulting numbers support.",
+      "rubric_id": "repair_evaluation_harness"
+    },
+    {
+      "id": "recover_infeasible_counterfactual",
+      "mode": "explain",
+      "invocation": "implicit",
+      "skill_expected": true,
+      "workspace_copy": [],
+      "prompt": "An AutoParallel optimizer was feasible until an exploratory placement constraint was added to one node. It also has output and parameter-memory constraints. Describe the diagnostic sequence you would use to recover feasibility and identify the conflicting assumption. Do not retrace or edit code.",
+      "rubric_id": "recover_infeasible_counterfactual"
+    },
+    {
+      "id": "full_shard_overlap_uncertainty",
+      "mode": "plan",
+      "invocation": "implicit",
+      "skill_expected": true,
+      "workspace_copy": [],
+      "prompt": "An AutoParallel run on 512 H100s uses a (64, 8) mesh and a 1/512 parameter-memory upper bound. With undiscounted communication it selects large linear collectives on the 64-rank inter-node axis; when parameter prefetch communication is treated as free it instead selects 512-way FSDP and batch sharding. Explain how you would turn these results into an actionable recommendation without running a broad hyperparameter sweep. Planning advice only; do not execute or edit anything.",
+      "rubric_id": "full_shard_overlap_uncertainty"
+    },
+    {
+      "id": "underfilled_synthetic_workload",
+      "mode": "explain",
+      "invocation": "implicit",
+      "skill_expected": true,
+      "workspace_copy": [],
+      "prompt": "An eight-GPU AutoParallel smoke run used global batch 8 only because it was divisible by the GPU count. More than 99% of selected graph nodes were replicated, and DDP fits in memory. Explain what this result establishes, how you would determine whether sharding rules are missing, and what controlled follow-up is justified. The production batch configuration is not available. Do not run or edit anything.",
+      "rubric_id": "underfilled_synthetic_workload"
+    },
+    {
+      "id": "explicit_global_batch_is_authoritative",
+      "mode": "plan",
+      "invocation": "implicit",
+      "skill_expected": true,
+      "workspace_copy": [],
+      "prompt": "Plan an AutoParallel evaluation on an eight-GPU 1D data-parallel mesh. The training configuration explicitly sets global batch 96 for each forward/backward step, with gradient accumulation 1. State the capture and execution batch shapes you would use and how you would treat any batch-sensitivity experiment. Planning advice only; do not run or edit anything.",
+      "rubric_id": "explicit_global_batch_is_authoritative"
+    },
+    {
+      "id": "optimizer_state_memory_gate",
+      "mode": "explain",
+      "invocation": "implicit",
+      "skill_expected": true,
+      "workspace_copy": [],
+      "prompt": "Choose between AutoParallel and FSDP for an 80 GiB production training limit. Both ran the same forward/loss/backward boundary. AutoParallel is faster and peaked at 74 GiB with 4 GiB of local FP32 parameters; FSDP peaked at 55 GiB with 2 GiB of local FP32 parameters. The intended optimizer is AdamW with two FP32 moment tensors, which were not materialized or timed. Explain the memory calculation, decision, and evidence labels. Do not run or edit anything.",
+      "rubric_id": "optimizer_state_memory_gate"
+    },
+    {
+      "id": "optimizer_performance_boundary",
+      "mode": "explain",
+      "invocation": "implicit",
+      "skill_expected": true,
+      "workspace_copy": [],
+      "prompt": "AutoParallel measured 38 ms and DDP measured 41 ms for the same forward/loss/backward training boundary. The production step uses AdamW, but optimizer.step was excluded and there is no optimizer-update cost calibration. DDP is already integrated and both strategies fit memory. Can I accept AutoParallel as the faster production training strategy? Explain the decision and next evidence needed. Do not run or edit anything.",
+      "rubric_id": "optimizer_performance_boundary"
+    },
+    {
+      "id": "optimizer_objective_mismatch",
+      "mode": "explain",
+      "invocation": "implicit",
+      "skill_expected": true,
+      "workspace_copy": [],
+      "prompt": "AutoParallel exposes sharded output options on 98% of tensor nodes and beats FSDP for forward/loss/backward, but retains 69% of global parameter bytes per rank versus FSDP's 12.5%. With the same AdamW implementation, the complete measured step is slower for AutoParallel and FSDP also uses less memory. Diagnose the result and choose the production strategy. Do not run or edit anything.",
+      "rubric_id": "optimizer_objective_mismatch"
+    },
+    {
+      "id": "optimizer_cost_envelope_uncertainty",
+      "mode": "explain",
+      "invocation": "implicit",
+      "skill_expected": true,
+      "workspace_copy": [],
+      "prompt": "A frozen H100 default-AdamW cost model uses local parameter bytes plus a fixed dispatch term. It predicted all three held-out strategy winners correctly, but its maximum prospective full-step error was 14%. On a new comparable encoder, it predicts AutoParallel is 6% faster than the existing DDP integration. Hardware, framework version, dtype policy, and realized foreach kernel family match, but no full-step target measurement exists. Can I accept AutoParallel for production throughput? Explain how to use the model and uncertainty. Do not run or edit anything.",
+      "rubric_id": "optimizer_cost_envelope_uncertainty"
+    },
+    {
+      "id": "time_to_ready_amortization",
+      "mode": "explain",
+      "invocation": "implicit",
+      "skill_expected": true,
+      "workspace_copy": [],
+      "prompt": "AutoParallel has 50 ms steady-state steps and takes 60 seconds to reach its first compiled step. Existing DDP has 60 ms steps and takes 10 seconds to become ready. The intended job runs exactly 1,000 steps and both strategies otherwise meet the bar. Which strategy should be used, what is the break-even point, and how should the report label these timings? Do not run or edit anything.",
+      "rubric_id": "time_to_ready_amortization"
+    },
+    {
+      "id": "independent_launch_variance",
+      "mode": "explain",
+      "invocation": "implicit",
+      "skill_expected": true,
+      "workspace_copy": [],
+      "prompt": "AutoParallel is 3% faster than an existing DDP integration. Both have tight p10-p90 timing ranges over 20 iterations, but each strategy was measured in only one process launch. Is this robustly competitive enough to switch production training? Explain the decision and next measurement. Do not run or edit anything.",
+      "rubric_id": "independent_launch_variance"
+    },
+    {
+      "id": "pareto_dominance_overrides_latency_tolerance",
+      "mode": "explain",
+      "invocation": "implicit",
+      "skill_expected": true,
+      "workspace_copy": [],
+      "prompt": "Across three independent eight-GPU launches, AutoParallel takes 448 ms per complete AdamW step, peaks at 61 GiB, and reaches its first compiled step in 80 seconds. Native FSDP takes 427 ms, peaks at 38 GiB, and reaches its first step in 8 seconds. Both satisfy correctness and hard feasibility requirements. The configured latency tolerance is 5%, so AutoParallel is technically within tolerance. Which strategy should production use, and how should the result be classified? Do not run or edit anything.",
+      "rubric_id": "pareto_dominance_overrides_latency_tolerance"
+    },
+    {
+      "id": "composed_cost_model_base_drift",
+      "mode": "explain",
+      "invocation": "implicit",
+      "skill_expected": true,
+      "workspace_copy": [],
+      "prompt": "A frozen optimizer-kernel model predicts held-out AdamW update time within 1%. To predict a new complete step, it is added to a forward/loss/backward measurement from one launch performed yesterday. Comparable partial-step templates have shown 15% temporal drift, while the composed point estimate says AutoParallel is 8% faster than an existing FSDP integration. No current target measurement exists. Can AutoParallel be accepted? Explain the evidence classification and next control. Do not run or edit anything.",
+      "rubric_id": "composed_cost_model_base_drift"
+    },
+    {
+      "id": "meta_runtime_estimate_routing",
+      "mode": "explain",
+      "invocation": "implicit",
+      "skill_expected": true,
+      "workspace_copy": [],
+      "prompt": "A meta/fake-tensor sweep over an unmaterialized model predicts AutoParallel will be 20% faster than an existing FSDP integration. The global meta-objective calibration has 10% median leave-one-out error but 68% maximum held-out error across architectures, and there is no regime-specific calibration or target run for this model. Can the meta result select AutoParallel for production? Explain what it is useful for and the next evidence needed. Do not run or edit anything.",
+      "rubric_id": "meta_runtime_estimate_routing"
+    },
+    {
+      "id": "gradient_accumulation_cycle_boundary",
+      "mode": "explain",
+      "invocation": "implicit",
+      "skill_expected": true,
+      "workspace_copy": [],
+      "prompt": "Production uses gradient accumulation 4 with reduction suppressed on the first three microsteps. AutoParallel measures 85 ms for a no-sync microstep, 100 ms for the final synchronized microstep, and 40 ms for optimizer.step. DDP measures 70 ms, 140 ms, and 20 ms for the same three components. Launch envelopes do not overlap and both pass memory/correctness bars. Which strategy wins the actual update cycle, and what boundary must be reported? Do not run or edit anything.",
+      "rubric_id": "gradient_accumulation_cycle_boundary"
+    },
+    {
+      "id": "feedback_catalog_freshness",
+      "mode": "explain",
+      "invocation": "explicit",
+      "skill_expected": true,
+      "workspace_copy": [],
+      "prompt": "Use $autoparallel-optimizer. An AutoParallel report bundle finalized successfully in the centralized root, but its run ID is absent from catalog-v1.json. feedback-status-v1.json is stale and no supervised refresh watcher is running. Explain whether the report is lost, how to make it visible to the feedback loop, and what should remain immutable. Do not run refresh or project commands or edit anything.",
+      "rubric_id": "feedback_catalog_freshness"
+    },
+    {
+      "id": "world_size_routing_crossover",
+      "mode": "explain",
+      "invocation": "implicit",
+      "skill_expected": true,
+      "workspace_copy": [],
+      "prompt": "The same Bloom training job uses global batch 16 and default AdamW. Across three launches on two GPUs, FSDP is faster than AutoParallel, uses less peak memory, and has lower startup. Across three launches on four GPUs, AutoParallel is robustly fastest, while FSDP still uses less memory and starts faster. Production will use two GPUs, but the four-GPU report is newer. Can the reports share a decision ID, and which strategy should production use? Also explain the topology requirement for a two-GPU sub-allocation on an eight-GPU H100 NVSwitch host. Do not run or edit anything.",
+      "rubric_id": "world_size_routing_crossover"
+    },
+    {
+      "id": "gradient_clipping_boundary",
+      "mode": "explain",
+      "invocation": "implicit",
+      "skill_expected": true,
+      "workspace_copy": [],
+      "prompt": "AutoParallel is 10% faster than an existing DDP integration for a measured forward/loss/backward/default-AdamW step. Production additionally clips the global L2 gradient norm to 1.0 after backward and before optimizer.step. Neither strategy's clipping work or collectives were measured or modeled. Can AutoParallel be accepted from the unclipped comparison? Explain the routing decision, measurement boundary, and report identity. Do not run or edit anything.",
+      "rubric_id": "gradient_clipping_boundary"
+    },
+    {
+      "id": "frozen_parameter_trainability",
+      "mode": "explain",
+      "invocation": "implicit",
+      "skill_expected": true,
+      "workspace_copy": [],
+      "prompt": "A last-block-only fine-tuning job starts with 2.24 GB of FP32 parameters, of which 50 MB are trainable. After AutoParallel lowering, all 2.24 GB report requires_grad=True and the AdamW optimizer contains the whole model. Native DDP preserves the source mask and executes. Can the AutoParallel timing be used, which strategy should be selected, and how should AdamW training-state memory be calculated after the lowering bug is fixed? Do not run or edit anything.",
+      "rubric_id": "frozen_parameter_trainability"
+    },
+    {
+      "id": "fsdp_template_compatibility",
+      "mode": "explain",
+      "invocation": "implicit",
+      "skill_expected": true,
+      "workspace_copy": [],
+      "prompt": "For a T5 training job, block-wrapped FSDP is the fastest native baseline but emits a warning that an output view may silently lose its pre-backward all-gather hook. Root-only FSDP removes the warning but is much slower than warning-free DDP, and both fit memory. AutoParallel is below its performance bar. Which fallback is qualified, and how should the two FSDP results be represented? Do not run or edit anything.",
+      "rubric_id": "fsdp_template_compatibility"
+    },
+    {
+      "id": "torchbench_uneven_shard_fixed_view",
+      "mode": "explain",
+      "invocation": "implicit",
+      "skill_expected": true,
+      "workspace_copy": [],
+      "prompt": "A TorchBench BERT_pytorch AutoParallel run on eight ranks produced a feasible ILP plan, but apply_placement fails at a fixed view: an unevenly sharded logical width of 20,005 is reconstructed as 20,008. A fully replicated counterfactual lowers. Classify the evidence, explain the likely failure boundary, and give a bounded validation plan. Do not run or edit anything.",
+      "rubric_id": "torchbench_uneven_shard_fixed_view"
+    },
+    {
+      "id": "torchbench_tied_weight_placement",
+      "mode": "explain",
+      "invocation": "implicit",
+      "skill_expected": true,
+      "workspace_copy": [],
+      "prompt": "A TorchBench hf_Bert plan assigns an S(1) placement to bert.embeddings.word_embeddings.weight and replicated placement to cls.predictions.decoder.weight, although both FQNs are the same tied Parameter in the source model. Construction restores the alias, then execution fails because the decoder receives the local shard shape. Diagnose the result and state what must pass before any performance evidence can be used. Do not run or edit anything.",
+      "rubric_id": "torchbench_tied_weight_placement"
+    },
+    {
+      "id": "torchbench_qat_buffer_alias",
+      "mode": "explain",
+      "invocation": "implicit",
+      "skill_expected": true,
+      "workspace_copy": [],
+      "prompt": "A TorchBench quantization-aware training model has two registered FQNs for the same observer buffer. AutoParallel solves, but apply_placement raises a missing-buffer KeyError because only the canonical captured descriptor exists. Explain how to classify and isolate this failure, the state invariant a fix must preserve, and what evidence would close it. Do not run or edit anything.",
+      "rubric_id": "torchbench_qat_buffer_alias"
+    },
+    {
+      "id": "torchbench_repeated_subgraph_retry",
+      "mode": "explain",
+      "invocation": "implicit",
+      "skill_expected": true,
+      "workspace_copy": [],
+      "prompt": "A TorchBench resnet18 planning run aborts while linking repeated regions because unrelated operators are paired. Retrying with repeated_subgraphs disabled produces a feasible plan. Explain what the retry establishes, how the malformed group should be handled, and which comparisons are needed before treating clustered and unclustered planning as equivalent. Do not run or edit anything.",
+      "rubric_id": "torchbench_repeated_subgraph_retry"
+    },
+    {
+      "id": "torchbench_manual_collective_semantics",
+      "mode": "explain",
+      "invocation": "implicit",
+      "skill_expected": true,
+      "workspace_copy": [],
+      "prompt": "A TorchBench contrastive model was written for one process-local batch per rank. Its forward path performs a rank-local shuffle and explicit distributed gathers, while AutoParallel would trace one enlarged logical batch. Is the model ready for AutoParallel planning as-is, and how should the team proceed if the intended shuffle semantics are not yet specified? Do not run or edit anything.",
+      "rubric_id": "torchbench_manual_collective_semantics"
+    },
+    {
+      "id": "generic_pytorch_tuning",
+      "mode": "negative",
+      "invocation": "implicit",
+      "skill_expected": false,
+      "workspace_copy": [],
+      "prompt": "A single-GPU torch.compile inference service spends most of its time in small pointwise kernels. Suggest a focused profiling and optimization sequence. The model is not distributed and does not use AutoParallel.",
+      "rubric_id": "generic_pytorch_tuning"
+    }
+  ]
+}
