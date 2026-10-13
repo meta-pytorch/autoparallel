@@ -6,18 +6,23 @@
 """
 Save/load for ShardingOptimizer state.
 
-Handles full optimizer serialization (save/load) and lightweight
-placement serialization (save_placements/load_placements).
+Handles full optimizer serialization (save/load), compact optimizer replay
+(save_replay/load_replay), and lightweight placement serialization
+(save_placements/load_placements).
 """
 
+import gzip
 import json
 import logging
+import math
 import operator
 import time
 from collections import defaultdict
+from dataclasses import dataclass
 
 import pulp
 import torch
+from torch.utils._pytree import tree_map_only
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -61,6 +66,15 @@ def _resolve_target(target_str):
     )
 
 
+def _resolve_higher_order_operator(name):
+    try:
+        return getattr(torch.ops.higher_order, name)
+    except AttributeError as error:
+        raise RuntimeError(
+            f"Cannot resolve serialized higher-order operator {name!r}"
+        ) from error
+
+
 def _patch_op_overload_pickle():
     """Temporarily add pickle support to OpOverload so FX graphs with custom
     ops can be serialized. Returns a context manager that removes the patch
@@ -71,11 +85,17 @@ def _patch_op_overload_pickle():
     def _patch():
         had_reduce = hasattr(torch._ops.OpOverload, "__reduce__")
         old_reduce = getattr(torch._ops.OpOverload, "__reduce__", None)
+        had_hop_reduce = hasattr(torch._ops.HigherOrderOperator, "__reduce__")
+        old_hop_reduce = getattr(torch._ops.HigherOrderOperator, "__reduce__", None)
 
         def _reduce(self):
             return (_resolve_target, (str(self),))
 
+        def _reduce_hop(self):
+            return (_resolve_higher_order_operator, (self.name(),))
+
         torch._ops.OpOverload.__reduce__ = _reduce
+        torch._ops.HigherOrderOperator.__reduce__ = _reduce_hop
         try:
             yield
         finally:
@@ -83,6 +103,10 @@ def _patch_op_overload_pickle():
                 torch._ops.OpOverload.__reduce__ = old_reduce
             else:
                 del torch._ops.OpOverload.__reduce__
+            if had_hop_reduce:
+                torch._ops.HigherOrderOperator.__reduce__ = old_hop_reduce
+            else:
+                del torch._ops.HigherOrderOperator.__reduce__
 
     return _patch()
 
@@ -100,6 +124,201 @@ _SAVE_META_KEYS = {
     "recompute",
     "is_tensor_value",
 }
+
+_REPLAY_META_KEYS = _SAVE_META_KEYS | {"local_map_kwargs", "val"}
+
+
+@dataclass(frozen=True)
+class _ReplayMeshRef:
+    pass
+
+
+def _make_replay_graph_module(graph_module):
+    from torch.distributed.device_mesh import DeviceMesh
+
+    from autoparallel.export_json import _extract_module_path, _get_phase
+
+    copied = torch.fx.Graph()
+    node_map = {}
+    for node in graph_module.graph.nodes:
+        new_node = copied.node_copy(node, lambda input_node: node_map[input_node])
+        meta = {
+            key: tree_map_only(DeviceMesh, lambda _: _ReplayMeshRef(), value)
+            for key, value in node.meta.items()
+            if key in _REPLAY_META_KEYS
+        }
+        module_path = _extract_module_path(node)
+        if module_path is not None:
+            meta["module_path"] = module_path
+        if node.op not in ("placeholder", "output"):
+            meta["phase"] = _get_phase(node)
+        new_node.meta = meta
+        node_map[node] = new_node
+    replay_graph_module = torch.fx.GraphModule(graph_module, copied)
+    replay_graph_module.meta = {}
+    return replay_graph_module
+
+
+def _encode_replay_graph(graph_module):
+    from torch.fx._graph_pickler import GraphPickler, Options
+
+    replay_graph_module = _make_replay_graph_module(graph_module)
+    return GraphPickler.dumps(
+        replay_graph_module,
+        Options(
+            ops_filter=None,
+            node_metadata_key_filter=lambda key: key in _REPLAY_META_KEYS,
+        ),
+    )
+
+
+def _decode_replay_graph(data, fake_mode):
+    from torch.fx._graph_pickler import GraphPickler
+
+    graph_module = GraphPickler.loads(data, fake_mode)
+    if not isinstance(graph_module, torch.fx.GraphModule):
+        raise RuntimeError("Optimizer replay graph did not decode to an FX GraphModule")
+    graph_module.graph.lint()
+    return graph_module
+
+
+def _replay_constraints(opt, saved_log):
+    nodes_by_name = {node.name: node for node in opt.graph.nodes}
+    for method_name, saved_kwargs in saved_log:
+        # These composite calls are followed by the add_node_constraint calls
+        # that they expanded into. Replaying both would duplicate the ILP rows.
+        if method_name in {
+            "add_sharded_input_constraint",
+            "add_sharded_output_constraint",
+        }:
+            continue
+        kwargs = dict(saved_kwargs)
+        if method_name == "remove_constraints":
+            memory_names = {"memory_constraint_high", "memory_constraint_low"}
+            for name in kwargs["names"]:
+                opt.prob.constraints.pop(name, None)
+                opt._node_constraint_names.pop(name, None)
+                if name in memory_names:
+                    opt._memory_constraint = None
+            continue
+        if "node_name" in kwargs:
+            node_name = kwargs.pop("node_name")
+            kwargs["node"] = nodes_by_name[node_name]
+        getattr(opt, method_name)(**kwargs)
+    opt._constraint_log = list(saved_log)
+
+
+def save_optimizer_replay(opt, path):
+    """Save the graph and compact inputs needed to regenerate an optimizer."""
+    module_nodes = [node.name for node in opt.graph.nodes if node.op == "call_module"]
+    if module_nodes:
+        raise RuntimeError(
+            "Optimizer replay requires a functional FX graph, but found module "
+            f"calls at nodes: {module_nodes}"
+        )
+
+    payload = {
+        "version": 1,
+        "torch_git_version": torch.version.git_version,
+        "graph_module": _encode_replay_graph(opt.gm),
+        "mesh": {
+            "device_type": opt.mesh.device_type,
+            "shape": list(opt.mesh.shape),
+            "dim_names": (
+                list(opt.mesh.mesh_dim_names) if opt.mesh.mesh_dim_names else None
+            ),
+        },
+        "cost_model_device": {
+            "name": opt.cost_model_device_name,
+            "count": opt.cost_model_device_count,
+        },
+        "optimizer": {
+            "force_grad_reduce_in_higher_precision": (
+                opt.force_grad_reduce_in_higher_precision
+            ),
+            "repeated_subgraphs": opt.repeated_subgraphs,
+            "persistent_aliases": opt.persistent_aliases,
+            "solver_time_limit_seconds": opt.solver_time_limit_seconds,
+            "prefetch_discount": opt._prefetch_discount,
+            "constraint_log": opt._constraint_log,
+        },
+        "nccl_topology_config": opt.nccl_topology_config,
+    }
+    with gzip.open(path, "wb") as replay_file:
+        torch.save(payload, replay_file)
+
+
+def load_optimizer_replay(cls, path):
+    """Regenerate a ShardingOptimizer from a compact graph replay seed."""
+    from torch._subclasses.fake_tensor import FakeTensorMode, unset_fake_temporarily
+    from torch.distributed.device_mesh import DeviceMesh
+    from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+    from autoparallel.cost_models.collective_runtime_estimation import (
+        get_nccl_topo_config,
+        override_cost_model_device_count,
+        set_nccl_topo_config,
+    )
+    from autoparallel.cost_models.compute_estimation import (
+        override_cost_model_device_name,
+    )
+
+    with gzip.open(path, "rb") as replay_file:
+        payload = torch.load(replay_file, weights_only=False)
+    version = payload.get("version")
+    if version != 1:
+        raise RuntimeError(f"Unsupported optimizer replay version: {version}")
+    if payload.get("torch_git_version") != torch.version.git_version:
+        raise RuntimeError(
+            "Optimizer replay requires the capture PyTorch revision "
+            f"({payload.get('torch_git_version')}), but the current revision is "
+            f"{torch.version.git_version}"
+        )
+
+    mesh_config = payload["mesh"]
+    shape = tuple(mesh_config["shape"])
+    with unset_fake_temporarily():
+        mesh_values = torch.arange(math.prod(shape)).reshape(shape)
+        mesh = DeviceMesh(
+            mesh_config["device_type"],
+            mesh_values,
+            mesh_dim_names=(
+                tuple(mesh_config["dim_names"]) if mesh_config["dim_names"] else None
+            ),
+            _init_backend=False,
+            _rank=0,
+        )
+
+    fake_mode = FakeTensorMode(shape_env=ShapeEnv(), static_shapes=False)
+    graph_module = _decode_replay_graph(payload["graph_module"], fake_mode)
+    for node in graph_module.graph.nodes:
+        node.meta = tree_map_only(_ReplayMeshRef, lambda _: mesh, node.meta)
+
+    config = payload["optimizer"]
+    device_config = payload["cost_model_device"]
+    previous_topology = get_nccl_topo_config()
+    try:
+        set_nccl_topo_config(payload["nccl_topology_config"])
+        with (
+            override_cost_model_device_name(device_config["name"]),
+            override_cost_model_device_count(device_config["count"]),
+            fake_mode,
+        ):
+            opt = cls(
+                graph_module,
+                mesh,
+                config["force_grad_reduce_in_higher_precision"],
+                repeated_subgraphs=config["repeated_subgraphs"],
+                persistent_aliases=config["persistent_aliases"],
+                solver_time_limit_seconds=config["solver_time_limit_seconds"],
+            )
+    finally:
+        set_nccl_topo_config(previous_topology)
+
+    _replay_constraints(opt, config["constraint_log"])
+    if config["prefetch_discount"] != 1.0:
+        opt.apply_prefetch_discount(config["prefetch_discount"])
+    return opt
 
 
 def save_optimizer(opt, path):
@@ -351,20 +570,8 @@ def load_optimizer(cls, path):
     t5 = time.perf_counter()
     logger.debug("load: add_default_constraints took %.3fs", t5 - t4)
 
-    # Replay user constraints. Suppress logging during replay so the
-    # loaded log is an exact copy of the original, not an expanded version
-    # (e.g., add_sharded_input_constraint internally calls add_node_constraint
-    # which would double-log).
     saved_log = list(save_dict["constraint_log"])
-    for method_name, kwargs in saved_log:
-        method = getattr(opt, method_name)
-        # Resolve node names back to node objects
-        if "node_name" in kwargs:
-            kwargs = dict(kwargs)
-            node_name = kwargs.pop("node_name")
-            kwargs["node"] = nodes_by_name[node_name]
-        method(**kwargs)
-    opt._constraint_log = saved_log
+    _replay_constraints(opt, saved_log)
     t6 = time.perf_counter()
     logger.debug("load: constraint replay took %.3fs", t6 - t5)
 
