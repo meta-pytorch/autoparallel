@@ -215,7 +215,7 @@ def _normalize_cluster_layer(cluster_roots):
 
 
 def _json_shape(shape) -> list[int | str]:
-    result = []
+    result: list[int | str] = []
     for dim in shape:
         if isinstance(dim, torch.SymInt):
             hint = dim.node.hint
