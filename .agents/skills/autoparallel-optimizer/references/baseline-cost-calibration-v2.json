@@ -1,0 +1,46 @@
+{
+  "schema_version": 2,
+  "kind": "huggingface-native-baseline-relative-calibration",
+  "boundary": "forward-loss-backward-no-optimizer",
+  "platform": {
+    "accelerator": "H100",
+    "world_size": 8,
+    "compute_dtype": "bfloat16",
+    "gradient_dtype": "float32"
+  },
+  "strategies": {
+    "ddp": {
+      "method": "median-log-offset",
+      "offset": -0.16640217922653514,
+      "point_count": 11,
+      "family_holdout_winner_accuracy": 1.0,
+      "family_holdout_median_relative_error": 0.02795952291375075,
+      "family_holdout_maximum_multiplicative_error": 1.4529552780079782
+    },
+    "fsdp": {
+      "method": "log-structural",
+      "feature_order": [
+        "intercept",
+        "log_modeled_ratio",
+        "log_parameter_bytes",
+        "log_schedule_unit_count"
+      ],
+      "coefficients": [
+        -7.8560076032458275,
+        2.478948328306222,
+        0.4078594213877831,
+        -0.4893431419028059
+      ],
+      "point_count": 15,
+      "family_holdout_winner_accuracy": 1.0,
+      "family_holdout_median_relative_error": 0.10022997696907536,
+      "family_holdout_maximum_multiplicative_error": 1.4292247195794783
+    }
+  },
+  "use": "screening_only",
+  "limitations": [
+    "calibration predicts relative winner direction, not target runtime",
+    "the maximum family-held-out error must be retained in routing envelopes",
+    "activation memory and optimizer update require separate matched models"
+  ]
+}

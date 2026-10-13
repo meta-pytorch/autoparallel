@@ -432,6 +432,25 @@ def test_optimizer_construction_resets_comms_cost_cache(device_mesh_1d):
     reset_cache.assert_called_once_with()
 
 
+@apply_cuda_patches
+def test_save_replay_escapes_active_fake_tensor_mode(device_mesh_1d):
+    dim = 64
+    with torch.device("meta"):
+        model = _SimpleModel(dim)
+
+    autop = _setup_autop(model, dim, device_mesh_1d)
+    with tempfile.NamedTemporaryFile(suffix=".pt.gz") as replay_file:
+        with autop:
+            autop.add_input_constraints([(Shard(0),)])
+            autop.add_output_constraints([(Shard(0),)])
+            autop.optimize_placement()
+            autop.sharding_optimizer.save_replay(replay_file.name)
+
+        loaded = type(autop.sharding_optimizer).load_replay(replay_file.name)
+
+    assert len(loaded.nodes) == len(autop.sharding_optimizer.nodes)
+
+
 # ---- save_placements/load_placements roundtrip tests ----
 
 
