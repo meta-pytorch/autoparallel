@@ -3,13 +3,20 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+import json
+from types import SimpleNamespace
+
 import torch
 from conftest import apply_cuda_patches
 from torch import nn
 from torch.distributed.tensor.placement_types import Shard
 
 from autoparallel.api import AutoParallel
-from autoparallel.export_json import _get_layer_index, _normalize_cluster_layer
+from autoparallel.export_json import (
+    _extract_shape_dtype,
+    _get_layer_index,
+    _normalize_cluster_layer,
+)
 
 
 class _RepeatedLayerModel(nn.Module):
@@ -125,6 +132,23 @@ def test_normalize_cluster_layer_empty():
 
 
 # ---- export_sharding_json tests ----
+
+
+def test_extract_shape_dtype_serializes_unbacked_symints():
+    from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+    symbolic_dim = ShapeEnv().create_unbacked_symint()
+    node = SimpleNamespace(
+        meta={
+            "tensor_meta": SimpleNamespace(shape=(symbolic_dim, 4), dtype=torch.float32)
+        }
+    )
+
+    shape, dtype = _extract_shape_dtype(node)
+
+    assert shape == [str(symbolic_dim), 4]
+    assert dtype == "float32"
+    json.dumps(shape)
 
 
 @apply_cuda_patches

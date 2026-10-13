@@ -5,8 +5,11 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from functools import lru_cache
 from typing import cast
 
+import torch
 import torch.distributed.tensor._dtensor_spec as dtensor_spec
 from torch._prims_common import check_contiguous_sizes_strides
 from torch.distributed.tensor._collective_utils import (
@@ -29,6 +32,41 @@ from .nccl_cost_model import (
 )
 
 _nccl_topo_config: NCCLTopoConfig | None = None
+_cost_model_device_count: int | None = None
+
+
+def get_cost_model_device_count(device_type: str) -> int:
+    if _cost_model_device_count is not None:
+        return _cost_model_device_count
+    return torch.get_device_module(device_type).device_count()
+
+
+@contextmanager
+def override_cost_model_device_count(device_count: int):
+    global _cost_model_device_count
+    previous = _cost_model_device_count
+    _cost_model_device_count = device_count
+    try:
+        yield
+    finally:
+        _cost_model_device_count = previous
+
+
+@lru_cache(None)
+def _build_mesh_topo(mesh, devices_per_host: int) -> MeshTopoInfo:
+    # Match MeshTopoInfo.build_from_mesh in PyTorch's _collective_utils.
+    bandwidth = [87.7] * mesh.ndim
+    latency = [0.6] * mesh.ndim
+    devices = [1] * mesh.ndim
+    total_devices = 1
+    for mesh_dim in reversed(range(mesh.ndim)):
+        dim_devices = mesh.size(mesh_dim)
+        devices[mesh_dim] = dim_devices
+        total_devices *= dim_devices
+        if total_devices > devices_per_host:
+            bandwidth[mesh_dim] *= 0.22
+            latency[mesh_dim] = 2.7
+    return MeshTopoInfo(mesh, devices, bandwidth, latency)
 
 
 def set_nccl_topo_config(config: NCCLTopoConfig | None) -> None:
@@ -139,7 +177,10 @@ def redistribute_cost(
             return float("inf")
         return 0.0
 
-    mesh_topo = MeshTopoInfo.build_from_mesh(current_spec.mesh)
+    mesh_topo = _build_mesh_topo(
+        current_spec.mesh,
+        get_cost_model_device_count(current_spec.mesh.device_type),
+    )
     cost = 0.0
     comm_bytes_gb = (
         spec_to_bytes(current_spec) / current_spec.num_shards / 1024 / 1024 / 1024

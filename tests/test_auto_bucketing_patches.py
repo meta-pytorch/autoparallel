@@ -208,7 +208,10 @@ def test_greedy_bucket_merges_within_caps():
 
 
 def test_greedy_bucket_records_diagnostics_only_in_active_pass():
-    gm, _, _ = _build_ag_chain_graph(n_ags=4, ag_shape_bytes_each=1024)
+    gm, ag_nodes, _ = _build_ag_chain_graph(n_ags=4, ag_shape_bytes_each=1024)
+    group_key = [
+        str(component) for component in bucketing_mod._ag_group_key(ag_nodes[0])
+    ]
     diagnostics = {"greedy_bucket_calls": []}
     token = ab._active_bucketing_diagnostics.set(diagnostics)
     try:
@@ -224,7 +227,7 @@ def test_greedy_bucket_records_diagnostics_only_in_active_pass():
             "group_count": 1,
             "groups": [
                 {
-                    "group_key": ["dp", "torch.bfloat16"],
+                    "group_key": group_key,
                     "candidate_count": 4,
                     "candidate_bytes": 4096,
                     "bucket_count": 1,

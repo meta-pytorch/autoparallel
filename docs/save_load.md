@@ -1,10 +1,11 @@
 # Saving and Loading Optimizer State
 
-AutoParallel provides three serialization APIs for different workflows:
+AutoParallel provides four serialization APIs for different workflows:
 
 | API | What it saves | Size | Use case |
 |-----|--------------|------|----------|
 | `save()` / `load()` | Full optimizer: graph, strategies, costs, constraints, solution | Large (~300MB for LLaMA-3 8B) | Offline exploration, re-solving, what-if analysis |
+| `save_replay()` / `load_replay()` | Joint FX graph, tensor metadata, mesh, topology, and optimizer inputs | Small | Regenerating strategies and the ILP offline |
 | `save_placements()` / `load_placements()` | Per-node placement choices (output + input specs) | Small (~100KB) | Reapplying a solution in a training script |
 | `get_json()` | Rich export for visualization (nodes, edges, costs, clusters, source info) | Medium (~2MB) | Feeding the HTML visualizer |
 
@@ -49,7 +50,37 @@ opt.resolve()
 
 No original model code or distributed process group is needed in the notebook. A GPU is not required for loading, inspecting, or re-solving.
 
-## Workflow 2: Reuse placements in a training script
+## Workflow 2: Regenerate the optimizer from a compact replay
+
+Use a replay when storing the full strategy space would be too expensive and
+paying the optimizer construction cost again is acceptable.
+
+```python
+# === Script: trace and save compact reconstruction inputs ===
+with AutoParallel(model, input_fn, mesh, mp_policy) as autop:
+    autop.add_input_constraints([x_sharding])
+    autop.add_output_constraints([out_sharding])
+    autop.sharding_optimizer.save_replay("optimizer-replay.pt.gz")
+```
+
+```python
+# === Offline process: regenerate strategies and solve ===
+from autoparallel.optimize_sharding import ShardingOptimizer
+
+opt = ShardingOptimizer.load_replay("optimizer-replay.pt.gz")
+solution = opt.get_solution()
+```
+
+The replay contains no generated strategies, decision-variable costs, or
+selected solution. Loading reconstructs them from the saved graph and mesh
+using the loading AutoParallel implementation. A different AutoParallel
+revision therefore regenerates the optimizer with its own strategy and cost
+logic. Replay requires the exact capture PyTorch revision. The capture device
+name, device count, and communication topology are replayed, so loading does
+not require a GPU or process group. Replay supports offline cost-model solving,
+not applying placements to the original model.
+
+## Workflow 3: Reuse placements in a training script
 
 Save the optimizer's placement choices as a lightweight JSON file, then reuse them in a later run without calling `optimize_placement()` again. Tracing and ILP construction still happen — only the solve step is skipped.
 
@@ -74,7 +105,7 @@ with AutoParallel(model, input_fn, mesh, mp_policy) as autop:
 
 The placements file is a small JSON with the mesh shape, dim names, and per-node output + input placement strings. `load_placements` validates that the mesh matches and finds the exact strategy by matching both output and input specs.
 
-## Workflow 3: Generate visualization HTML
+## Workflow 4: Generate visualization HTML
 
 ```python
 with AutoParallel(model, input_fn, mesh, mp_policy) as autop:
@@ -99,5 +130,6 @@ data = opt.get_json()
 ## Requirements and limitations
 
 - **`save()` / `load()`**: Uses `torch.save` (pickle). Same-codebase, same-PyTorch-version only. Custom ops must be registered before loading (the loader imports `autoparallel.cast_parametrization` automatically).
+- **`save_replay()` / `load_replay()`**: Uses PyTorch's private FX `GraphPickler` inside a gzip-compressed `torch.save` artifact. Inputs must be trusted and use the exact capture PyTorch revision. A different AutoParallel revision uses its own regeneration logic and can produce different results. Model-defined custom operators must be registered before loading. Loading regenerates the optimizer and can be as expensive as the original optimizer construction.
 - **`save_placements()` / `load_placements()`**: Plain JSON. Portable across runs, but the model graph and mesh must match. `load_placements()` validates mesh shape and dim names, and verifies that every saved node name exists in the current graph.
 - **`get_json()`**: Requires a solved optimizer — call `get_solution()` or `optimize_placement()` first, or load a saved optimizer that already contains a solution. The output is a Python dict, not written to disk — serialize it yourself if needed.

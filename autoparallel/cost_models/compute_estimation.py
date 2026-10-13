@@ -3,6 +3,7 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Dict, Tuple
 
@@ -11,6 +12,25 @@ from torch._subclasses.fake_tensor import unset_fake_temporarily
 from torch.utils._mode_utils import no_dispatch
 from torch.utils._pytree import tree_flatten, tree_map_only
 from torch.utils.flop_counter import FlopCounterMode, register_flop_formula
+
+_cost_model_device_name: str | None = None
+
+
+def get_cost_model_device_name() -> str:
+    if _cost_model_device_name is not None:
+        return _cost_model_device_name
+    return torch.get_device_module().get_device_name(None)
+
+
+@contextmanager
+def override_cost_model_device_name(device_name: str):
+    global _cost_model_device_name
+    previous = _cost_model_device_name
+    _cost_model_device_name = device_name
+    try:
+        yield
+    finally:
+        _cost_model_device_name = previous
 
 
 @register_flop_formula(torch.ops.aten.einsum, get_raw=True)
@@ -260,8 +280,7 @@ DEVICE_LIMITS: Tuple[DeviceLimit, ...] = (
 
 
 def _get_device_limit():
-    device = None
-    device_name = torch.get_device_module().get_device_name(device)
+    device_name = get_cost_model_device_name()
 
     # Find matching device limit
     device_limit = None

@@ -100,10 +100,18 @@ from torch.distributed.tensor._dtensor_spec import DTensorSpec
 from torch.distributed.tensor.placement_types import Placement, Replicate, Shard
 from torch.utils._pytree import tree_map_only
 
-from .cost_models.collective_runtime_estimation import estimate_strategy_comms_cost
+from .cost_models.collective_runtime_estimation import (
+    estimate_strategy_comms_cost,
+    get_cost_model_device_count,
+    get_nccl_topo_config,
+    reset_comms_cost_cache,
+)
 from .cost_models.compute_estimation import (
     _get_sharded_shape_stride,
     estimate_strategy_runtime_cost,
+    get_cost_model_device_name,
+    override_cost_model_device_name,
+    reset_compute_cost_cache,
 )
 from .graph_passes.graph_clustering import get_identical_regions
 from .graph_passes.graph_utils import (
@@ -111,7 +119,10 @@ from .graph_passes.graph_utils import (
     build_param_derived_set,
     build_terminal_derived_set,
 )
-from .shardings.placement_options import get_placement_options_for_node
+from .shardings.placement_options import (
+    get_placement_options_for_node,
+    reset_placement_options_cache,
+)
 from .shardings.propagation_rules import _create_all_options
 
 logger = logging.getLogger(__name__)
@@ -243,6 +254,9 @@ class ShardingOptimizer:
         persistent_aliases=None,
         solver_time_limit_seconds: float | None = None,
     ):
+        reset_placement_options_cache()
+        reset_compute_cost_cache()
+        reset_comms_cost_cache()
         self.orig_gm = gm
         # The optimizer works on a concretized copy of the graph where all
         # symbolic shapes are replaced with their concrete hint values. This
@@ -257,7 +271,11 @@ class ShardingOptimizer:
         self.force_grad_reduce_in_higher_precision = (
             force_grad_reduce_in_higher_precision
         )
+        self.repeated_subgraphs = repeated_subgraphs
         self.persistent_aliases = persistent_aliases or {}
+        self.cost_model_device_name = get_cost_model_device_name()
+        self.cost_model_device_count = get_cost_model_device_count(mesh.device_type)
+        self.nccl_topology_config = get_nccl_topo_config()
         if solver_time_limit_seconds is not None and solver_time_limit_seconds <= 0:
             raise ValueError("solver_time_limit_seconds must be positive")
         self.solver_time_limit_seconds = solver_time_limit_seconds
@@ -1145,12 +1163,14 @@ class ShardingOptimizer:
     def remove_constraints(self, names):
         """Remove constraints by name, allowing re-solve to revert to the
         unconstrained optimum."""
+        names = list(names)
         memory_names = {"memory_constraint_high", "memory_constraint_low"}
         for name in names:
             del self.prob.constraints[name]
             self._node_constraint_names.pop(name, None)
             if name in memory_names:
                 self._memory_constraint = None
+        self._constraint_log.append(("remove_constraints", {"names": names}))
 
     def diff_solutions(self, solution_a, solution_b):
         """Compare two solutions and report placement changes and cost diffs.
@@ -1395,12 +1415,25 @@ class ShardingOptimizer:
 
         save_optimizer(self, path)
 
+    def save_replay(self, path):
+        """Save a compact graph seed that can regenerate this optimizer."""
+        from autoparallel.serialization import save_optimizer_replay
+
+        save_optimizer_replay(self, path)
+
     @classmethod
     def load(cls, path):
         """Load optimizer state saved with save()."""
         from autoparallel.serialization import load_optimizer
 
         return load_optimizer(cls, path)
+
+    @classmethod
+    def load_replay(cls, path):
+        """Regenerate an optimizer from a compact graph replay seed."""
+        from autoparallel.serialization import load_optimizer_replay
+
+        return load_optimizer_replay(cls, path)
 
     def save_placements(self, path):
         """Save the current placement choices as a lightweight JSON file."""
@@ -1509,7 +1542,8 @@ class ShardingOptimizer:
                 continue
 
             chosen_placement_str = _pretty_print_spec(chosen_spec)
-            chosen_compute = estimate_strategy_runtime_cost(node, chosen_strategy)
+            with override_cost_model_device_name(self.cost_model_device_name):
+                chosen_compute = estimate_strategy_runtime_cost(node, chosen_strategy)
 
             # Compute communication cost for the chosen strategy: sum
             # redistribute_cost across all args using predecessors' chosen
@@ -1530,7 +1564,10 @@ class ShardingOptimizer:
 
             if target_out_idx is not None:
                 target_strategy = op_strategy.strategies[target_out_idx]
-                target_compute = estimate_strategy_runtime_cost(node, target_strategy)
+                with override_cost_model_device_name(self.cost_model_device_name):
+                    target_compute = estimate_strategy_runtime_cost(
+                        node, target_strategy
+                    )
 
                 # Compute communication cost for the target strategy:
                 # assume each predecessor also uses target_placement. If a
