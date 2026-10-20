@@ -21,7 +21,7 @@ def _get_decomp_table():
     decomp_table.pop(torch.ops.aten.embedding_dense_backward.default)
     decomp_table.pop(torch.ops.aten.native_layer_norm_backward.default, None)
     decomp_table.pop(torch.ops.aten._softmax_backward_data.default)
-    decomp_table.pop(torch.ops.aten._softmax.default)
+    decomp_table.pop(torch.ops.aten._softmax.default, None)
     decomp_table.pop(torch.ops.aten.stack.default)
 
     # decompose addmm to allow for TP on mm
