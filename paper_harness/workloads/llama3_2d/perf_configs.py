@@ -11,7 +11,10 @@ from torch.utils.data import IterableDataset
 from torchtitan.components.dataloader import ParallelAwareDataloader
 from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
-from torchtitan.components.optimizer import default_adamw
+from torchtitan.components.optimizer import (
+    default_adamw,
+    register_moe_load_balancing_hook,
+)
 from torchtitan.config import CompileConfig
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.experiments.graph_trainer.configs import (
@@ -98,7 +101,8 @@ C4_SHARD_METADATA = {
 DATASET_NAME = "c4_llama8b_topology_invariant_replay"
 
 MODEL_FLAVOR = os.environ.get("BENCHMARK_MODEL", "8B")
-if MODEL_FLAVOR not in {"8B", "70B", "32B"}:  # 32B: Qwen3 (*_qwen3_32b configs)
+# 32B / 30B-A3B: Qwen3 (*_qwen3_32b / *_qwen3_30b_a3b configs)
+if MODEL_FLAVOR not in {"8B", "70B", "32B", "30B-A3B"}:
     raise ValueError(f"Unsupported BENCHMARK_MODEL={MODEL_FLAVOR!r}")
 
 WORLD_SIZE = int(os.environ["BENCHMARK_WORLD_SIZE"])
@@ -109,6 +113,7 @@ if (WORLD_SIZE, TP_DEGREE) not in {
     (32, 8),
     (64, 8),
     (128, 8),
+    (64, 4),
     (8, 1),
     (16, 1),
     (32, 1),
@@ -123,6 +128,12 @@ if DP_REPLICATE_DEGREE < 1 or DP_DEGREE % DP_REPLICATE_DEGREE:
         f"Unsupported data parallel split: {DP_DEGREE=} {DP_REPLICATE_DEGREE=}"
     )
 DP_SHARD_DEGREE = DP_DEGREE // DP_REPLICATE_DEGREE
+EP_DEGREE = int(os.environ.get("BENCHMARK_EP_DEGREE", "1"))
+if EP_DEGREE > 1 and (WORLD_SIZE % EP_DEGREE or EP_DEGREE % TP_DEGREE):
+    raise ValueError(
+        "Expert parallelism must divide the world and fold TP: "
+        f"{WORLD_SIZE=} {EP_DEGREE=} {TP_DEGREE=}"
+    )
 
 LOCAL_BATCH_SIZE = 2
 SEQ_LEN = 8192
@@ -204,6 +215,11 @@ def _write_inductor_path_audit() -> None:
 def _register_post_load_audits(optimizers, model_parts, parallel_dims):
     _write_inductor_path_audit()
     register_post_load_parameter_audit(optimizers, model_parts, parallel_dims)
+
+
+def _register_post_load_audits_and_moe_hook(optimizers, model_parts, parallel_dims):
+    _register_post_load_audits(optimizers, model_parts, parallel_dims)
+    register_moe_load_balancing_hook(optimizers, model_parts, parallel_dims)
 
 
 class TopologyInvariantReplayDataset(IterableDataset):
@@ -344,7 +360,7 @@ def _base_config(registry=model_registry):
         enable_sequence_parallel=True,
         context_parallel_degree=1,
         pipeline_parallel_degree=1,
-        expert_parallel_degree=1,
+        expert_parallel_degree=EP_DEGREE,
         fsdp_reshard_after_forward="default",
     )
     config.activation_checkpoint = SelectiveAC.Config()
@@ -412,6 +428,20 @@ def autoparallel_graphtrainer_qwen3_32b():
     return _graph_config(enable_autoparallel=True, registry=qwen3_model_registry)
 
 
+def _with_moe_load_balancing(config):
+    config.model_spec = replace(
+        config.model_spec,
+        post_optimizer_build_fn=_register_post_load_audits_and_moe_hook,
+    )
+    return config
+
+
+def autoparallel_graphtrainer_qwen3_30b_a3b():
+    return _with_moe_load_balancing(
+        _graph_config(enable_autoparallel=True, registry=qwen3_model_registry)
+    )
+
+
 def _torchtitan_baseline(registry, name, parallelize_fn):
     if "autoparallel.graph_passes.auto_bucketing" in sys.modules:
         raise RuntimeError("Native TorchTitan baseline was polluted by AutoParallel")
@@ -445,10 +475,16 @@ def torchtitan_baseline_qwen3_32b():
     )
 
 
+def torchtitan_baseline_qwen3_30b_a3b():
+    return _with_moe_load_balancing(torchtitan_baseline_qwen3_32b())
+
+
 EXPERIMENT_CONFIGS = (
     "torchtitan_baseline_8b",
     "torchtitan_baseline_qwen3_32b",
+    "torchtitan_baseline_qwen3_30b_a3b",
     "graphtrainer_manual_eager_8b",
     "autoparallel_graphtrainer_8b",
     "autoparallel_graphtrainer_qwen3_32b",
+    "autoparallel_graphtrainer_qwen3_30b_a3b",
 )

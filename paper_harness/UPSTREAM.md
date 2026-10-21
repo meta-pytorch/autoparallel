@@ -109,7 +109,12 @@ ancestor and retains the `60517d28` AutoParallel/GraphTrainer integration.
   `aten_distributed_optimizations.compute_overlap_multipler` to 1.0 for the
   AutoParallel full-Inductor compile, so Inductor's overlap pass (pass 2) counts
   each AP compute estimate in full toward hiding a collective (was 0.5 since
-  `7966c411`). It is the runtime pin.
+  `7966c411`). It is the `kaijian/paper-submission` (v1.0.1-v1.0.9) runtime pin.
+- `39d6e333` (child of `14f98fe1`, fork branch
+  `kaijian/qwen3-moe-autoparallel`) routes Qwen3 MoE flavors with
+  `compile.enable_autoparallel` to `parallelize_autoparallel_qwen3_moe`, which
+  builds AutoParallel's local_map Qwen3 model on `build_moe_mesh` like the
+  DeepSeek V3 route; dense Qwen3 stays on the LLaMA route. It is the runtime pin.
 
 The 3D port includes only the approved legacy-DTensor AP configuration, CP
 input-ownership seam, DP-shard/CP/TP mesh, CP-aware SDPA, DTensor output, and
@@ -228,7 +233,14 @@ source is pinned to the commit immediately before the lock/harness-only updates.
   ordered part. The rule is shared with `_matches_multi_boundary_gradient_source`
   through `_orthogonal_reduction_dims`. Parameters whose only boundary is a
   multi-input consumer (DeepSeek V3 routed experts feeding the MoE `local_map`)
-  now get the ordered storage the solver prices. It is the runtime pin.
+  now get the ordered storage the solver prices. It is the `kaijian/paper-submission`
+  (v1.0.1-v1.0.9) runtime pin.
+- `717791b` (child of `7bb86e9`, merged into `kaijian/paper-submission-qwen3-moe`)
+  adds
+  `autoparallel/_testing/models/qwen3.py` from `e84906d` aligned with the
+  TorchTitan Qwen3 MoE (config layout, fused QKV, MP-cast expert weights,
+  tokens_per_expert for the load-balancing hook, positions, norm/lm_head FQN
+  annotations, TorchTitan Qwen3 MoE initialization). It is the runtime pin.
 
 ## Reproduction policy
 

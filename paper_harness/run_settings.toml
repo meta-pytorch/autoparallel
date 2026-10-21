@@ -253,3 +253,8 @@ campaign = "campaigns/variants/llama3_70b_2d_dps16_tp8.toml"
 model = "qwen3_32b"
 setting = "2d-dps16-tp8"
 campaign = "campaigns/variants/qwen3_32b_2d_dps16_tp8.toml"
+
+[[settings]]
+model = "qwen3_30b_a3b"
+setting = "2d-dps16-tp4-ep4"
+campaign = "campaigns/variants/qwen3_30b_a3b_2d_dps16_tp4_ep4.toml"
