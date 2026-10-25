@@ -224,6 +224,9 @@ def test_greedy_bucket_records_diagnostics_only_in_active_pass():
     assert diagnostics["greedy_bucket_calls"] == [
         {
             "candidate_count": 4,
+            "collective_type_counts": {
+                "_c10d_functional.all_gather_into_tensor.default": 4
+            },
             "group_count": 1,
             "groups": [
                 {

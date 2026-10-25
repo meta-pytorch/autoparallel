@@ -1,0 +1,150 @@
+# Full-shard planning and overlap uncertainty
+
+Use this workflow only when parameter storage is near fully sharded, prefetch
+assumptions materially affect the objective, or the selected compute layout is
+topology-inverted. Ordinary plans do not need these extra solves.
+
+## What the solver does and does not establish
+
+A `1 / world_size` parameter bound forces every sufficiently shardable
+parameter toward its minimum local fraction. It constrains persistent parameter
+placement; it does not model the full training-memory peak, optimizer state,
+activation checkpointing, or the lifetime of materialized FSDP buffers.
+
+The memory constraint weights each parameter tensor by bytes and counts aliased
+storage once. Its normalized bound still covers persistent parameter storage,
+not optimizer state, activations, or materialized communication buffers. Record
+the achieved local and global bytes from the JSON summary after solving.
+
+`apply_prefetch_discount(scale)` sets an objective-time scale while preserving
+the base communication costs. Repeated calls replace the prior scale. Save each
+endpoint's placements and JSON before solving the next one.
+
+The discount is candidate-independent even though realizable overlap depends on
+the placement, bucket sizes, available compute, collective resources, and live
+buffer memory. Do not tune the scalar to make the solver emit a preferred plan;
+that is circular evidence.
+
+## Build a bounded placement envelope
+
+Capture once and retain enough optimizer state and artifacts to reproduce each solve.
+Use at most these candidates unless the user asks for a sweep:
+
+Before changing the prefetch scale, write the serial placements and optimizer
+JSON to their own immutable artifact paths. Write the optimistic endpoint to
+different paths after its solve. If optimizer state itself cannot be
+serialized, record the capture, constraints, cost-model identity, and exact
+rebuild sequence; a later view of one mutated optimizer object is not evidence
+for both endpoints.
+
+1. **Serial endpoint:** no prefetch discount. This is a pessimistic overlap
+   proxy, not a runtime upper bound with guaranteed estimator accuracy.
+2. **Optimistic endpoint:** set `apply_prefetch_discount(scale=0.0)` after
+   saving the serial result, then solve again. This treats eligible parameter
+   and terminal communication as free; it is not an executable prediction and
+   excludes transient-buffer pressure.
+3. **Compute-placement baseline, when diagnostic value justifies one more
+   solve:** remove or omit the parameter-memory constraint. This shows the
+   preferred compute layout but is not a viable training plan until persistent
+   state is assessed.
+
+Do not run intermediate discount values by default. Deduplicate candidates by
+their persistent parameter placements, heavy forward/backward operation
+placements, and dominant redistribution families.
+
+If the serial and optimistic endpoints choose substantially the same layout,
+call the placement overlap-robust within the modeled endpoints. If they differ,
+do not select an intermediate discount as truth. Return the distinct placement
+families as a provisional candidate set and evaluate them after lowering.
+
+Do not leave endpoint bookkeeping implicit. A complete recommendation names
+the serial endpoint pessimistic and the zero-discount endpoint optimistic and
+non-executable, identifies independently saved artifacts, states how placement
+families were deduplicated, separates persistent storage from heavy-operation
+compute placement, and reports effective DP degree and local batch. When the
+families differ, it also holds topology, activation checkpointing, and
+autobucketing fixed during lowering and keeps the result provisional.
+
+## Inspect storage, compute, and topology separately
+
+For each candidate, report:
+
+- its independently saved placement and optimizer-summary artifact paths;
+- parameter placements by count and by global parameter bytes;
+- achieved local parameter bytes and byte-weighted fraction;
+- heavy matmul, attention, normalization, embedding, and output placements;
+- which physical mesh axis carries latency-sensitive TP or EP collectives;
+- the largest parameter-derived, terminal-gradient, and activation
+  redistributions;
+- global batch, effective DP degree, and local batch per DP group.
+
+Mesh dimension names are intentions, not constraints on the ILP. Flag a
+topology inversion when large-model compute uses a slow inter-node axis while a
+fast intra-node axis primarily shards batch or tokens. Investigate it; do not
+automatically force the conventional orientation.
+
+Distinguish these two fully-sharded storage regimes:
+
+```text
+pure FSDP: persistent S(dp)S(tp) -> compute R(dp)R(tp)
+FSDP + TP: persistent S(dp)S(tp) -> compute R(dp)S(tp)
+```
+
+They may have identical persistent parameter memory. FSDP + TP retains a
+smaller materialized weight and trades parameter communication for TP
+activation communication. A zero prefetch discount erases much of that
+advantage and therefore tends to favor pure FSDP when batch parallelism is
+available.
+
+## Report memory without claiming a pre-AC peak
+
+Separate quantities that are known before graph partitioning from those that
+are not:
+
+- Report persistent parameter bytes exactly from the selected placements.
+- Estimate gradients, master weights, optimizer moments, and teacher state only
+  from the stated training dtypes and ownership assumptions. Label estimates.
+- Do not claim an activation or total peak before forward/backward partitioning,
+  AC selection, and scheduling.
+- After lowering, report forward and backward peaks separately, including
+  materialized parameter and communication buffers represented by the
+  estimator.
+
+## Evaluate only distinct lowered candidates
+
+Apply and lower the distinct envelope candidates with the same topology,
+mixed-precision policy, AC configuration, and autobucketing settings. Use the
+actual reordering pass to collect forward and backward critical path, exposed
+communication, and peak memory. A discounted ILP objective does not replace
+this evaluation. Record collective counts before and after bucketing when they
+are available. Two plans with similar heavy-compute DP/TP roles can lower very
+differently when their persistent placements produce different materialization
+groups or prevent compiler-realizable buckets. Also report candidate-specific
+initialization or lowering warnings that globally materialize a sharded value.
+
+When lowering is unavailable, keep the recommendation provisional and state
+which candidate-dependent overlap or memory signal is missing. Do not report
+the optimistic endpoint as the selected deployment.
+
+## Confidence card
+
+Include this card for a full-shard plan:
+
+```text
+SPMD semantics: audited | unresolved
+topology model: explicit NCCL | detected NCCL | PyTorch fallback
+memory scope: persistent parameters | estimated persistent state | post-AC peak
+overlap sensitivity: stable endpoints | placement-changing
+evidence: ILP-feasible | lowered | compiled | numerically checked | measured
+recommendation: final | provisional candidate set
+endpoint artifacts: serial paths | optimistic paths
+```
+
+A final recommendation requires resolved SPMD semantics, an appropriate
+topology model, and evidence beyond a placement-changing discounted ILP. Target
+measurement is still needed when modeled candidates are close.
+
+When the candidate is also being compared with DDP or FSDP, use
+`baseline-counterfactuals.md`. The reordered estimate is one expected point;
+include serial and optimistic legal-overlap endpoints plus calibration error
+before making a relative-quality claim.

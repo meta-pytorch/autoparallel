@@ -25,3 +25,9 @@ If you're new to the project, use the reading order below.
 
 - [Using `local_map` for MoE and Custom Communication Patterns](local_map_and_moe.md)
 - [Saving and Loading Optimizer State](save_load.md)
+
+## Agent workflow
+
+- [AutoParallel Optimizer skill](../.agents/skills/autoparallel-optimizer/SKILL.md) —
+  repository-scoped instructions for planning, inspecting, and evaluating
+  sharding strategies with coding agents

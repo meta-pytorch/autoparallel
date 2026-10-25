@@ -1,0 +1,1125 @@
+{
+  "schema_version": 1,
+  "scoring": {
+    "criterion_scale": {
+      "0": "Absent, contradicted, or materially incorrect.",
+      "0.5": "Partially satisfied but incomplete or weakly evidenced.",
+      "1": "Fully satisfied with evidence from the response, trace, diff, or artifacts."
+    },
+    "weighted_score": "sum(score * weight) / sum(weight)",
+    "pass_threshold": 0.85,
+    "critical_rule": "Every critical criterion must score 1."
+  },
+  "rubrics": [
+    {
+      "id": "global_spmd_local_shuffle",
+      "skill_expected": true,
+      "criteria": [
+        {
+          "id": "identifies_semantic_change",
+          "weight": 4,
+          "critical": true,
+          "description": "Identifies that randperm operated on a process-local batch before AutoParallel but would permute the global logical batch after capture.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "emits_spmd_warning",
+          "weight": 3,
+          "critical": true,
+          "description": "Raises a clear SPMD modeling warning with the affected location and semantic risk instead of treating successful tracing as proof of correctness.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "proposes_grouped_formulation",
+          "weight": 2,
+          "critical": false,
+          "description": "Proposes preserving replica and local-batch structure or using the independent permutation construct before flattening.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "does_not_rewrite",
+          "weight": 3,
+          "critical": true,
+          "description": "Does not edit the model and asks the user to confirm the intended stochastic semantics before a non-trivial adaptation.",
+          "evidence": ["tool_trace", "workspace_diff", "response"]
+        }
+      ]
+    },
+    {
+      "id": "infer_device_mesh",
+      "skill_expected": true,
+      "criteria": [
+        {
+          "id": "bounded_candidates",
+          "weight": 3,
+          "critical": true,
+          "description": "Considers a 1D baseline and a small 2D candidate set without enumerating every factorization.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "topology_aligned_candidate",
+          "weight": 4,
+          "critical": true,
+          "description": "Recommends the topology-aligned (2, 8) candidate with the inner dimension mapped to the intra-node fast domain.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "no_three_dimensional_mesh",
+          "weight": 4,
+          "critical": true,
+          "description": "Does not recommend a mesh with more than two dimensions and relates that limit to ILP solve cost.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "checks_divisibility_and_batch",
+          "weight": 2,
+          "critical": false,
+          "description": "Checks model-dimension divisibility, DP batch compatibility, and rank layout before treating the mesh as valid.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "labels_inference",
+          "weight": 2,
+          "critical": true,
+          "description": "Labels the mesh as an inferred optimization hypothesis and proposes independent plan comparisons.",
+          "evidence": ["response"]
+        }
+      ]
+    },
+    {
+      "id": "confirm_intended_allocation",
+      "skill_expected": true,
+      "criteria": [
+        {
+          "id": "distinguishes_visibility_from_allocation",
+          "weight": 4,
+          "critical": true,
+          "description": "States that visible GPUs do not establish the intended world size or node allocation.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "asks_for_intended_allocation",
+          "weight": 4,
+          "critical": true,
+          "description": "Asks for the intended GPU count and node topology or a launch configuration before planning.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "does_not_plan_from_visibility",
+          "weight": 4,
+          "critical": true,
+          "description": "Does not capture, solve, or recommend an eight-GPU mesh based only on nvidia-smi output.",
+          "evidence": ["response", "tool_trace"]
+        }
+      ]
+    },
+    {
+      "id": "single_domain_prefers_1d",
+      "skill_expected": true,
+      "criteria": [
+        {
+          "id": "selects_1d",
+          "weight": 4,
+          "critical": true,
+          "description": "Selects a 1D eight-GPU mesh as the planning mesh.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "avoids_unmotivated_2d_run",
+          "weight": 4,
+          "critical": true,
+          "description": "Does not recommend running a 2D candidate without a concrete memory, semantic-axis, compute-parallel, or link-locality benefit.",
+          "evidence": ["response", "tool_trace"]
+        },
+        {
+          "id": "explains_search_cost",
+          "weight": 2,
+          "critical": false,
+          "description": "Notes that an unnecessary 2D mesh expands placement representation or solver search cost without a topology advantage on one NVSwitch domain.",
+          "evidence": ["response"]
+        }
+      ]
+    },
+    {
+      "id": "cpu_saved_optimizer_explanation",
+      "skill_expected": true,
+      "criteria": [
+        {
+          "id": "loads_without_capture",
+          "weight": 4,
+          "critical": true,
+          "description": "Uses ShardingOptimizer.load on the trusted artifact and does not attempt CPU graph capture.",
+          "evidence": ["response", "tool_trace"]
+        },
+        {
+          "id": "uses_stable_graph_nodes",
+          "weight": 2,
+          "critical": false,
+          "description": "Finds the requested node in the saved optimizer graph and uses its stable name directly.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "counterfactual_loop",
+          "weight": 4,
+          "critical": true,
+          "description": "Shows add constraint, resolve, diff, remove returned constraint names, and resolve again to restore the baseline state.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "stays_explain_only",
+          "weight": 3,
+          "critical": true,
+          "description": "Does not lower, compile, benchmark, modify the artifact, or claim target execution evidence.",
+          "evidence": ["response", "tool_trace", "workspace_diff"]
+        },
+        {
+          "id": "mentions_registration_caveat",
+          "weight": 1,
+          "critical": false,
+          "description": "Notes that non-ATen custom operations may need registration modules available when loading.",
+          "evidence": ["response"]
+        }
+      ]
+    },
+    {
+      "id": "repair_evaluation_harness",
+      "skill_expected": true,
+      "criteria": [
+        {
+          "id": "one_cost_model_lifetime",
+          "weight": 4,
+          "critical": true,
+          "description": "Keeps one topology configuration active across planning, compilation, and metrics, and passes collector.cost_model to AutoParallel.",
+          "evidence": ["workspace_diff", "response"]
+        },
+        {
+          "id": "single_overlap_scheduler",
+          "weight": 4,
+          "critical": true,
+          "description": "Uses the collector's post-grad scheduler and disables overlap scheduling in autoparallel_backend.",
+          "evidence": ["workspace_diff"]
+        },
+        {
+          "id": "runs_both_phases_in_context",
+          "weight": 4,
+          "critical": true,
+          "description": "Runs forward and backward before leaving the collector context so lazy backward compilation is observed.",
+          "evidence": ["workspace_diff"]
+        },
+        {
+          "id": "requires_and_writes_metrics",
+          "weight": 3,
+          "critical": true,
+          "description": "Requires forward and backward records and writes the collector JSON artifact.",
+          "evidence": ["workspace_diff", "artifacts"]
+        },
+        {
+          "id": "labels_modeled_evidence",
+          "weight": 2,
+          "critical": true,
+          "description": "Calls the results estimated rather than measured and keeps them separate from ILP objective values.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "notes_unpinned_post_grad_order",
+          "weight": 1,
+          "critical": false,
+          "description": "Notes that the current AutoParallel pass does not insert overlap control dependencies, so later Inductor scheduling or fusion may move the measured order.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "no_public_api_change",
+          "weight": 2,
+          "critical": true,
+          "description": "Changes only the isolated harness and does not add or modify a public AutoParallel API.",
+          "evidence": ["workspace_diff"]
+        }
+      ]
+    },
+    {
+      "id": "recover_infeasible_counterfactual",
+      "skill_expected": true,
+      "criteria": [
+        {
+          "id": "removes_temporary_constraint_first",
+          "weight": 4,
+          "critical": true,
+          "description": "Removes the exploratory node-constraint names and resolves before changing intended deployment constraints.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "relaxes_one_constraint_at_a_time",
+          "weight": 3,
+          "critical": true,
+          "description": "Tests output and memory constraints separately rather than dropping both at once.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "reports_causal_change",
+          "weight": 2,
+          "critical": true,
+          "description": "Records which specific relaxation restores feasibility and does not present the relaxed plan as the original deployment.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "does_not_retrace",
+          "weight": 2,
+          "critical": true,
+          "description": "Reuses the stable optimizer graph and does not retrace or lower during diagnosis.",
+          "evidence": ["response", "tool_trace"]
+        }
+      ]
+    },
+    {
+      "id": "full_shard_overlap_uncertainty",
+      "skill_expected": true,
+      "criteria": [
+        {
+          "id": "builds_bounded_endpoint_envelope",
+          "weight": 4,
+          "critical": true,
+          "description": "Treats the undiscounted and zero-discount results as pessimistic and optimistic placement endpoints, deduplicates placement families, and does not recommend a broad discount sweep.",
+          "evidence": ["response", "tool_trace"]
+        },
+        {
+          "id": "labels_zero_discount_optimistic",
+          "weight": 4,
+          "critical": true,
+          "description": "States that free prefetch communication is an optimistic sensitivity assumption rather than an executable performance prediction.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "uses_independent_optimizer_state",
+          "weight": 2,
+          "critical": false,
+          "description": "Preserves the two endpoint placements as distinct artifacts for later lowering and does not claim that discount calls compound or require recapture.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "separates_storage_compute_and_topology",
+          "weight": 4,
+          "critical": true,
+          "description": "Separates persistent parameter placement from heavy-operation compute placement and flags latency-sensitive inter-node TP as topology inversion requiring investigation rather than automatic acceptance or forced reversal.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "evaluates_distinct_candidates_after_lowering",
+          "weight": 4,
+          "critical": true,
+          "description": "Proposes lowering only distinct candidates with the same NCCL topology, activation-checkpointing, and autobucketing configuration, then comparing forward/backward exposed communication and peak memory.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "reports_memory_and_batch_scope",
+          "weight": 2,
+          "critical": false,
+          "description": "Reports achieved byte-weighted parameter storage, distinguishes it from total training or transient memory, and checks effective DP degree and local batch.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "returns_provisional_confidence",
+          "weight": 3,
+          "critical": true,
+          "description": "Returns a provisional candidate set or confidence card when endpoint placements differ instead of claiming one ILP result is the final optimum.",
+          "evidence": ["response"]
+        }
+      ]
+    },
+    {
+      "id": "underfilled_synthetic_workload",
+      "skill_expected": true,
+      "criteria": [
+        {
+          "id": "rejects_world_size_batch_default",
+          "weight": 4,
+          "critical": true,
+          "description": "States that GPU count does not define global batch and that the synthetic local-batch-one smoke point is not representative quality evidence.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "separates_coverage_from_selection",
+          "weight": 4,
+          "critical": true,
+          "description": "Does not infer missing propagation rules from selected placements alone and proposes distinguishing replicate-only option sets and implicit fallbacks from replicated choices with sharded alternatives.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "preserves_unknown_production_workload",
+          "weight": 4,
+          "critical": true,
+          "description": "Does not silently invent or enlarge the missing production microbatch and does not transfer a result from a larger synthetic batch to production routing.",
+          "evidence": ["response", "tool_trace"]
+        },
+        {
+          "id": "bounded_sensitivity",
+          "weight": 3,
+          "critical": true,
+          "description": "Proposes at most one or two larger local-microbatch points for a controlled sensitivity experiment, holds the remaining execution contract fixed, and uses an aligned baseline for each point.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "keeps_smoke_claim_narrow",
+          "weight": 2,
+          "critical": true,
+          "description": "Limits the original run to smoke or workload-sensitivity evidence and requests the real training configuration before making a production strategy decision.",
+          "evidence": ["response"]
+        }
+      ]
+    },
+    {
+      "id": "explicit_global_batch_is_authoritative",
+      "skill_expected": true,
+      "criteria": [
+        {
+          "id": "uses_exact_global_batch_for_capture",
+          "weight": 5,
+          "critical": true,
+          "description": "Uses global batch 96 for the global logical AutoParallel capture input rather than substituting world size or another benchmark batch.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "derives_local_batch_from_dp",
+          "weight": 5,
+          "critical": true,
+          "description": "Derives and uses local batch 12 for execution from global batch 96 divided by the eight-way DP degree.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "checks_batch_contract",
+          "weight": 3,
+          "critical": true,
+          "description": "Checks divisibility and keeps the reported global batch, captured input shape, effective DP degree, and executed local shape consistent.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "separates_sensitivity_runs",
+          "weight": 3,
+          "critical": true,
+          "description": "Treats any different batch as a separately reported sensitivity configuration and does not use it in place of the specified batch-96 evaluation.",
+          "evidence": ["response", "tool_trace"]
+        }
+      ]
+    },
+    {
+      "id": "optimizer_state_memory_gate",
+      "skill_expected": true,
+      "criteria": [
+        {
+          "id": "projects_missing_moments",
+          "weight": 5,
+          "critical": true,
+          "description": "Adds the two absent local FP32 AdamW moment tensors: 8 GiB for AutoParallel and 4 GiB for FSDP, without double-counting parameters or gradients already present at the measured boundary.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "rejects_autoparallel_memory",
+          "weight": 5,
+          "critical": true,
+          "description": "Projects AutoParallel to 82 GiB before operational reserve and therefore rejects its otherwise faster result under the 80 GiB production limit.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "selects_feasible_fsdp",
+          "weight": 4,
+          "critical": true,
+          "description": "Projects FSDP to 59 GiB before reserve and selects it as the feasible fallback, subject to the same remaining acceptance checks.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "separates_evidence_labels",
+          "weight": 3,
+          "critical": true,
+          "description": "Labels latency and forward/backward peak as measured, optimizer-state memory as analytical, and records OPTIMIZER_STATE_MEMORY_INFEASIBLE rather than calling the projected peak measured.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "requires_headroom",
+          "weight": 2,
+          "critical": false,
+          "description": "Notes that the complete production decision must also reserve explicit operational headroom instead of accepting an exact-capacity fit.",
+          "evidence": ["response"]
+        }
+      ]
+    },
+    {
+      "id": "optimizer_performance_boundary",
+      "skill_expected": true,
+      "criteria": [
+        {
+          "id": "does_not_accept_partial_ranking",
+          "weight": 5,
+          "critical": true,
+          "description": "Does not accept AutoParallel for production training speed from a forward/loss/backward-only latency win when optimizer update cost is missing.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "identifies_placement_dependent_optimizer_cost",
+          "weight": 4,
+          "critical": true,
+          "description": "Explains that parameter placement changes optimizer work and DTensor dispatch overhead, so the full-step ranking may differ.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "records_inconclusive_reason",
+          "weight": 4,
+          "critical": true,
+          "description": "Treats end-to-end competitiveness as inconclusive or comparison_unavailable with OPTIMIZER_PERFORMANCE_UNMODELED or STEP_BOUNDARY_MISMATCH.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "preserves_existing_ddp",
+          "weight": 3,
+          "critical": true,
+          "description": "Preserves the working DDP integration until aligned full-step evidence meets the acceptance bar.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "requests_aligned_evidence",
+          "weight": 3,
+          "critical": true,
+          "description": "Requests aligned AdamW-step measurements or a versioned held-out-calibrated optimizer-cost envelope for both strategies with the same optimizer implementation and settings.",
+          "evidence": ["response"]
+        }
+      ]
+    },
+    {
+      "id": "optimizer_objective_mismatch",
+      "skill_expected": true,
+      "criteria": [
+        {
+          "id": "does_not_blame_propagation",
+          "weight": 5,
+          "critical": true,
+          "description": "Does not diagnose missing sharding propagation merely from the selected placements because 98% of tensor nodes exposed sharded alternatives.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "identifies_objective_boundary",
+          "weight": 5,
+          "critical": true,
+          "description": "Explains that the current sharding objective prices forward/backward but not placement-dependent eager optimizer update work, so retaining more local parameters can reverse the full-step ranking.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "selects_fsdp",
+          "weight": 4,
+          "critical": true,
+          "description": "Selects measured optimizer-inclusive FSDP because it is faster and smaller for the intended production boundary.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "records_stable_finding",
+          "weight": 3,
+          "critical": true,
+          "description": "Records OPTIMIZER_COST_MISSING_FROM_OBJECTIVE and preserves the supplied numeric parameter-storage fractions plus the supplied partial- and full-boundary results for improvement work. Exact latency or memory values are not present in the prompt and must not be invented; preserving the stated qualitative win/loss and memory ordering is full credit.",
+          "evidence": ["response"]
+        }
+      ]
+    },
+    {
+      "id": "optimizer_cost_envelope_uncertainty",
+      "skill_expected": true,
+      "criteria": [
+        {
+          "id": "uses_regime_matched_model",
+          "weight": 4,
+          "critical": true,
+          "description": "Recognizes that the model is applicable only because hardware, framework, dtype policy, and realized optimizer kernel family match its calibrated regime.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "retains_prospective_error",
+          "weight": 5,
+          "critical": true,
+          "description": "Carries the 14% maximum relevant prospective error into the latency envelope instead of relying on winner accuracy or the 6% point-estimate advantage.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "does_not_accept_overlapping_envelopes",
+          "weight": 5,
+          "critical": true,
+          "description": "Does not accept AutoParallel because a 6% modeled advantage is not robust to the calibrated error envelope; keeps DDP and labels the result inconclusive or schedule-sensitive.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "labels_modeled_evidence",
+          "weight": 3,
+          "critical": true,
+          "description": "Labels the comparison modeled rather than measured and asks for aligned full-step evidence if a stronger decision is needed.",
+          "evidence": ["response"]
+        }
+      ]
+    },
+    {
+      "id": "time_to_ready_amortization",
+      "skill_expected": true,
+      "criteria": [
+        {
+          "id": "computes_finite_job_time",
+          "weight": 5,
+          "critical": true,
+          "description": "Computes approximately 110 seconds for AutoParallel and 70 seconds for DDP over 1,000 steps, including startup and steady-state execution.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "selects_ddp_for_short_job",
+          "weight": 5,
+          "critical": true,
+          "description": "Selects DDP for the specified 1,000-step job even though AutoParallel has higher steady-state throughput.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "computes_break_even",
+          "weight": 4,
+          "critical": true,
+          "description": "Reports a 5,000-step break-even from the 50-second startup difference divided by the 10 ms per-step saving.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "separates_evidence_scopes",
+          "weight": 3,
+          "critical": true,
+          "description": "Separates time-to-ready from steady-state step latency, labels the finite-job totals as projected or derived, and does not call all startup time compiler-only time.",
+          "evidence": ["response"]
+        }
+      ]
+    },
+    {
+      "id": "independent_launch_variance",
+      "skill_expected": true,
+      "criteria": [
+        {
+          "id": "separates_variance_scopes",
+          "weight": 5,
+          "critical": true,
+          "description": "Explains that tight iteration samples inside one process do not measure process-launch, compilation, allocator, or system-state variance.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "does_not_accept_close_single_launch",
+          "weight": 5,
+          "critical": true,
+          "description": "Does not call the 3% single-launch result robustly competitive or switch the production integration from that evidence.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "records_launch_variance_reason",
+          "weight": 4,
+          "critical": true,
+          "description": "Classifies the result as schedule-sensitive or inconclusive and records MEASURED_LAUNCH_VARIANCE_UNMODELED.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "requests_independent_repeats",
+          "weight": 4,
+          "critical": true,
+          "description": "Requests independent launches of both strategies under the same configuration and a combined launch-level envelope or distribution.",
+          "evidence": ["response"]
+        }
+      ]
+    },
+    {
+      "id": "pareto_dominance_overrides_latency_tolerance",
+      "skill_expected": true,
+      "criteria": [
+        {
+          "id": "recognizes_pareto_dominance",
+          "weight": 5,
+          "critical": true,
+          "description": "Recognizes that FSDP is robustly better on complete-step latency, peak memory, and time-to-ready rather than treating the 5% tolerance as an AutoParallel win.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "selects_fsdp",
+          "weight": 5,
+          "critical": true,
+          "description": "Selects native FSDP for production unless the user explicitly accepts a different documented tradeoff.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "records_pareto_verdict",
+          "weight": 4,
+          "critical": true,
+          "description": "Classifies AutoParallel as Pareto-dominated or below the relative-quality bar rather than robustly competitive.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "uses_robust_envelopes",
+          "weight": 1,
+          "critical": false,
+          "description": "Uses the stated independent-launch and complete-step evidence rather than inventing a weighted score, and does not claim stronger uncertainty evidence than the prompt provides.",
+          "evidence": ["response"]
+        }
+      ]
+    },
+    {
+      "id": "composed_cost_model_base_drift",
+      "skill_expected": true,
+      "criteria": [
+        {
+          "id": "separates_base_and_increment_uncertainty",
+          "weight": 5,
+          "critical": true,
+          "description": "Separates uncertainty in the historical forward/backward base from the validated optimizer increment instead of treating the entire composed prediction as below 1% error.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "does_not_accept_eight_percent_point_win",
+          "weight": 5,
+          "critical": true,
+          "description": "Does not accept AutoParallel because the 8% point-estimate advantage is inside the applicable 15% base-drift uncertainty.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "keeps_existing_fsdp",
+          "weight": 4,
+          "critical": true,
+          "description": "Classifies the comparison as schedule-sensitive or inconclusive and preserves the existing FSDP integration.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "requests_contemporaneous_base_control",
+          "weight": 4,
+          "critical": true,
+          "description": "Requests contemporaneous independent-launch partial-step measurements, or a validated temporal-drift envelope, before recomposing the full-step estimate and uses COMPOSED_FULL_STEP_BASE_DRIFT when a refreshed control explains the miss.",
+          "evidence": ["response"]
+        }
+      ]
+    },
+    {
+      "id": "meta_runtime_estimate_routing",
+      "skill_expected": true,
+      "criteria": [
+        {
+          "id": "labels_meta_as_modeled",
+          "weight": 5,
+          "critical": true,
+          "description": "Labels the meta result as modeled candidate-ranking evidence rather than measured runtime evidence.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "retains_worst_held_out_error",
+          "weight": 5,
+          "critical": true,
+          "description": "Uses the applicable 68% maximum held-out error rather than the 10% median, so the 20% point-estimate advantage is not robust.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "does_not_select_autoparallel",
+          "weight": 5,
+          "critical": true,
+          "description": "Keeps the existing FSDP integration and classifies AutoParallel as inconclusive or schedule-sensitive instead of accepting it for production.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "states_valid_meta_uses",
+          "weight": 3,
+          "critical": true,
+          "description": "Uses meta execution for legality, memory and scale exploration, candidate ranking, and prioritizing target measurements, and requests a regime-matched bound or aligned target run for routing.",
+          "evidence": ["response"]
+        }
+      ]
+    },
+    {
+      "id": "gradient_accumulation_cycle_boundary",
+      "skill_expected": true,
+      "criteria": [
+        {
+          "id": "computes_autoparallel_cycle",
+          "weight": 5,
+          "critical": true,
+          "description": "Computes the AutoParallel accumulation cycle as 3 * 85 + 100 + 40 = 395 ms, or 98.75 ms amortized per microstep.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "computes_ddp_cycle",
+          "weight": 5,
+          "critical": true,
+          "description": "Computes the DDP accumulation cycle as 3 * 70 + 140 + 20 = 370 ms, or 92.5 ms amortized per microstep.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "selects_ddp",
+          "weight": 5,
+          "critical": true,
+          "description": "Selects DDP for the actual update cycle even though AutoParallel's isolated synchronized-microstep-plus-update sum is lower.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "preserves_frequency_semantics",
+          "weight": 4,
+          "critical": true,
+          "description": "Reports the full accumulation cycle, preserving three no-sync microsteps, one synchronized microstep, and one optimizer update rather than multiplying the wrong boundary; any amortized value must use that cycle.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "uses_compatible_ddp_template",
+          "weight": 1,
+          "critical": false,
+          "description": "Records no-sync frequency and uses static_graph=false for compiled DDP when synchronization alternates, unless that exact static-graph template has already executed successfully.",
+          "evidence": ["response"]
+        }
+      ]
+    },
+    {
+      "id": "feedback_catalog_freshness",
+      "skill_expected": true,
+      "criteria": [
+        {
+          "id": "distinguishes_bundle_from_catalog",
+          "weight": 5,
+          "critical": true,
+          "description": "Explains that the finalized bundle is durable and not lost; the catalog is a derived snapshot that can lag it.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "requires_refresh_service",
+          "weight": 5,
+          "critical": true,
+          "description": "Does not treat report finalization as catalog publication and calls for refresh_report_feedback.py as a one-shot handoff or a cluster-supervised --watch process.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "checks_health_and_visibility",
+          "weight": 4,
+          "critical": true,
+          "description": "Checks feedback-status-v1.json for a successful non-stale refresh, verifies the run ID appears in the rebuilt catalog, and checks the rebuilt queue inputs without requiring the run to become a queue candidate.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "preserves_immutable_bundles",
+          "weight": 4,
+          "critical": true,
+          "description": "Keeps finalized report bundles immutable and allows only the refresh workflow to rebuild the derived catalog, queue, and health files.",
+          "evidence": ["response"]
+        }
+      ]
+    },
+    {
+      "id": "world_size_routing_crossover",
+      "skill_expected": true,
+      "criteria": [
+        {
+          "id": "keeps_mesh_decisions_separate",
+          "weight": 5,
+          "critical": true,
+          "description": "Treats two- and four-GPU meshes as different routing contracts with different decision IDs rather than letting the newer report supersede the target mesh.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "selects_two_gpu_fsdp",
+          "weight": 5,
+          "critical": true,
+          "description": "Selects FSDP for the requested two-GPU production deployment because that mesh's replicated evidence Pareto-dominates AutoParallel.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "explains_mesh_changes_plan",
+          "weight": 4,
+          "critical": true,
+          "description": "Explains that changing world size changes local batch, collective scale, and potentially the optimized placement, so timing evidence cannot be pooled across meshes.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "supplies_suballocation_topology",
+          "weight": 4,
+          "critical": true,
+          "description": "Requires an explicit NCCL topology describing the allocated two-rank H100 NVSwitch communicator when canonical eight-GPU detection cannot represent the sub-allocation, rather than accepting a fallback cost model or pretending unused GPUs are ranks.",
+          "evidence": ["response"]
+        }
+      ]
+    },
+    {
+      "id": "gradient_clipping_boundary",
+      "skill_expected": true,
+      "criteria": [
+        {
+          "id": "rejects_unclipped_proxy",
+          "weight": 5,
+          "critical": true,
+          "description": "Does not accept AutoParallel from the unclipped timing and labels production competitiveness inconclusive or comparison unavailable.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "preserves_clip_semantics",
+          "weight": 5,
+          "critical": true,
+          "description": "Requires the same global-L2 clipping algorithm, max norm 1.0, placement after backward and before optimizer.step, and update frequency for AutoParallel and DDP.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "includes_clip_collective",
+          "weight": 4,
+          "critical": true,
+          "description": "Includes clipping's local norm work and any global reduction in the complete measured or modeled step boundary for each placement.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "uses_distinct_decision_identity",
+          "weight": 3,
+          "critical": true,
+          "description": "Treats the clipped production contract as distinct from the unclipped report while keeping exact retries and baselines linked under the clipped decision ID.",
+          "evidence": ["response"]
+        }
+      ]
+    },
+    {
+      "id": "frozen_parameter_trainability",
+      "skill_expected": true,
+      "criteria": [
+        {
+          "id": "rejects_semantically_invalid_timing",
+          "weight": 5,
+          "critical": true,
+          "description": "Rejects the AutoParallel run as a semantic failure because lowering changed the trainability mask and optimizer membership; does not use its timing for production routing.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "selects_valid_ddp_fallback",
+          "weight": 5,
+          "critical": true,
+          "description": "Selects the executed DDP integration while AutoParallel is fixed and re-evaluated under the exact fine-tuning contract.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "requires_post_lowering_invariant",
+          "weight": 4,
+          "critical": true,
+          "description": "Requires a per-FQN requires-grad and optimizer-group invariant after lowering or wrapping before execution evidence is accepted.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "computes_frozen_memory_scope",
+          "weight": 5,
+          "critical": true,
+          "description": "For FP32 AdamW, counts 2.24 GB of persistent parameters plus gradient and two moment copies only for the 50 MB trainable subset: 2.24 GB + 3 * 0.05 GB = 2.39 GB, before activations and headroom.",
+          "evidence": ["response"]
+        }
+      ]
+    },
+    {
+      "id": "fsdp_template_compatibility",
+      "skill_expected": true,
+      "criteria": [
+        {
+          "id": "rejects_warned_template_for_routing",
+          "weight": 5,
+          "critical": true,
+          "description": "Treats the warned block-wrapped FSDP result as performance-only and does not select it from latency despite it being fastest.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "selects_warning_free_ddp",
+          "weight": 5,
+          "critical": true,
+          "description": "Selects DDP as the correctness-qualified fallback because it is warning-free, feasible, and faster than the warning-free root-only FSDP template.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "keeps_template_qualification_specific",
+          "weight": 4,
+          "critical": true,
+          "description": "Records qualification per FSDP template rather than declaring all FSDP infeasible for T5; preserves both the warned block result and safe root-only result with distinct template identities.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "includes_safe_template_costs",
+          "weight": 1,
+          "critical": false,
+          "description": "Retains the prompt's relative latency and memory-feasibility evidence for root-only FSDP and notes that any new warning-free template must retain its real startup, memory, and copy costs.",
+          "evidence": ["response"]
+        }
+      ]
+    },
+    {
+      "id": "torchbench_uneven_shard_fixed_view",
+      "skill_expected": true,
+      "criteria": [
+        {
+          "id": "keeps_solve_and_lowering_evidence_distinct",
+          "weight": 5,
+          "critical": true,
+          "description": "Classifies the selected plan as ILP-feasible but failed during placement application, and does not claim successful AutoParallel execution or performance.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "diagnoses_logical_shape_reconstruction",
+          "weight": 5,
+          "critical": true,
+          "description": "Identifies loss of the logical global shape or stride when reconstructing the uneven local shard, including the shorter final rank rather than assuming every rank has the ceiling-sized extent.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "uses_replicated_plan_as_diagnostic_only",
+          "weight": 4,
+          "critical": true,
+          "description": "Uses the lowering replicated counterfactual to isolate a sharded realizability problem without silently selecting it or treating it as production performance evidence.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "closes_with_lowering_and_numerical_checks",
+          "weight": 4,
+          "critical": true,
+          "description": "Requires preserving logical metadata or excluding the specific unrealizable placement, then checks placement application on long and short ranks plus output shapes, values, and gradients against an unsharded reference.",
+          "evidence": ["response"]
+        }
+      ]
+    },
+    {
+      "id": "torchbench_tied_weight_placement",
+      "skill_expected": true,
+      "criteria": [
+        {
+          "id": "treats_alias_break_as_semantic_failure",
+          "weight": 5,
+          "critical": true,
+          "description": "Treats the incompatible tied-weight placements and runtime shape error as a semantic or execution failure, not usable performance evidence.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "requires_one_alias_placement_contract",
+          "weight": 5,
+          "critical": true,
+          "description": "Requires source-identity alias groups to share one compatible persistent placement rather than optimizing the two FQNs independently.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "checks_post_lowering_alias_invariant",
+          "weight": 5,
+          "critical": true,
+          "description": "Checks after lowering that both FQNs remain the same runtime Parameter with a compatible placement and local shape, then validates outputs and gradients against the tied reference.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "routes_to_qualified_fallback_until_retest",
+          "weight": 1,
+          "critical": false,
+          "description": "Requires a fresh AutoParallel evaluation under the exact tied-weight contract after the fix and, when production routing is in scope, retains a qualified native fallback.",
+          "evidence": ["response"]
+        }
+      ]
+    },
+    {
+      "id": "torchbench_qat_buffer_alias",
+      "skill_expected": true,
+      "criteria": [
+        {
+          "id": "classifies_application_failure",
+          "weight": 5,
+          "critical": true,
+          "description": "Distinguishes the successful solve from the placement-application alias failure and makes no execution or performance claim.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "maps_aliases_through_canonical_descriptor",
+          "weight": 5,
+          "critical": true,
+          "description": "Maps registered aliases through one canonical captured descriptor and preserves one shared runtime buffer rather than cloning or independently placing state.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "preserves_mutable_buffer_contract",
+          "weight": 4,
+          "critical": true,
+          "description": "Requires aliased observer state to preserve shared identity, placement, mutation, update, and serialization semantics rather than merely avoiding the lookup error.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "requires_targeted_state_validation",
+          "weight": 4,
+          "critical": true,
+          "description": "Calls for a minimized alias regression plus successful apply and QAT execution, shared state-update checks, and comparison with the unpartitioned reference.",
+          "evidence": ["response"]
+        }
+      ]
+    },
+    {
+      "id": "torchbench_repeated_subgraph_retry",
+      "skill_expected": true,
+      "criteria": [
+        {
+          "id": "treats_clustering_as_optional_compression",
+          "weight": 5,
+          "critical": true,
+          "description": "Explains that repeated-subgraph clustering compresses the ILP and that the unclustered retry establishes only a feasible unclustered plan, not lowering or production success.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "skips_malformed_group_atomically",
+          "weight": 5,
+          "critical": true,
+          "description": "Requires validating a complete correspondence group before linking, skipping a malformed group atomically with diagnostics rather than aborting or disabling all clustering.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "compares_clustered_and_unclustered_plans",
+          "weight": 4,
+          "critical": true,
+          "description": "Compares feasible placement families and objective under the same constraints and cost model, while recording skipped groups, solve time, and ILP compression counts.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "retains_downstream_evidence_gates",
+          "weight": 3,
+          "critical": true,
+          "description": "Still requires placement application and later correctness or target evidence before routing; it does not promote the retry from planning evidence.",
+          "evidence": ["response"]
+        }
+      ]
+    },
+    {
+      "id": "torchbench_manual_collective_semantics",
+      "skill_expected": true,
+      "criteria": [
+        {
+          "id": "rejects_as_is_global_spmd_model",
+          "weight": 5,
+          "critical": true,
+          "description": "States that the process-local shuffle and explicit collectives do not directly express the required global logical SPMD computation, so planning is not ready as-is.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "records_specific_semantic_warning",
+          "weight": 4,
+          "critical": true,
+          "description": "Identifies the rank-local shuffle and explicit gathers and explains the local-versus-global semantic risk instead of mechanically deleting collectives or enlarging the batch.",
+          "evidence": ["response"]
+        },
+        {
+          "id": "asks_before_semantic_adaptation",
+          "weight": 5,
+          "critical": true,
+          "description": "Requests the intended independent-per-rank versus global shuffle semantics before a non-trivial rewrite and requires equivalence validation after any authorized adaptation.",
+          "evidence": ["response", "tool_trace"]
+        },
+        {
+          "id": "uses_bounded_boundary_or_fallback",
+          "weight": 3,
+          "critical": true,
+          "description": "When semantics cannot be expressed directly, proposes an explicit local boundary with internal communication called unpriced, or preserves a qualified native fallback without claiming AutoParallel performance.",
+          "evidence": ["response"]
+        }
+      ]
+    },
+    {
+      "id": "generic_pytorch_tuning",
+      "skill_expected": false,
+      "criteria": [
+        {
+          "id": "does_not_route_to_autoparallel",
+          "weight": 5,
+          "critical": true,
+          "description": "Does not invoke or recommend AutoParallel planning, meshes, ILP placement, DTensor sharding, or the skill's collector.",
+          "evidence": ["response", "tool_trace"]
+        },
+        {
+          "id": "answers_single_gpu_request",
+          "weight": 3,
+          "critical": false,
+          "description": "Provides a focused single-GPU profiling and pointwise-kernel optimization sequence.",
+          "evidence": ["response"]
+        }
+      ]
+    }
+  ]
+}

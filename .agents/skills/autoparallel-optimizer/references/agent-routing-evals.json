@@ -1,0 +1,537 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "id": "generic_parallelization_ap_passes",
+      "prompt": "Parallelize this training model across eight GPUs.",
+      "context": "AutoParallel executes within the absolute bar and is robustly competitive with the applicable modeled baselines.",
+      "expected": {
+        "invoke_skill": true,
+        "autoparallel_disposition": "attempt",
+        "autoparallel_outcome": "accepted",
+        "competitiveness_verdict": "robustly_competitive",
+        "benchmark_action": "none",
+        "selected_strategy": "autoparallel",
+        "report_required": true
+      }
+    },
+    {
+      "id": "capture_failure_ddp_fallback",
+      "prompt": "Scale this ordinary data-parallel training job to eight GPUs.",
+      "context": "AutoParallel capture fails within budget and replicated training state fits per rank.",
+      "expected": {
+        "invoke_skill": true,
+        "autoparallel_disposition": "attempt",
+        "autoparallel_outcome": "failed",
+        "competitiveness_verdict": "comparison_unavailable",
+        "benchmark_action": "none",
+        "selected_strategy": "ddp",
+        "report_required": true
+      }
+    },
+    {
+      "id": "memory_bar_fsdp_fallback",
+      "prompt": "Shard this model so that training fits in 80 GB per GPU.",
+      "context": "The AutoParallel plan executes but misses the memory bar; replicated state does not fit.",
+      "expected": {
+        "invoke_skill": true,
+        "autoparallel_disposition": "attempt",
+        "autoparallel_outcome": "below_bar",
+        "competitiveness_verdict": "comparison_unavailable",
+        "benchmark_action": "none",
+        "selected_strategy": "fsdp",
+        "report_required": true
+      }
+    },
+    {
+      "id": "explicit_fsdp_preserved",
+      "prompt": "Use FSDP for this model; it is an integration requirement.",
+      "context": "The user explicitly mandates FSDP.",
+      "expected": {
+        "invoke_skill": true,
+        "autoparallel_disposition": "assess_only",
+        "autoparallel_outcome": "ineligible",
+        "competitiveness_verdict": "comparison_unavailable",
+        "benchmark_action": "none",
+        "selected_strategy": "fsdp",
+        "report_required": true
+      }
+    },
+    {
+      "id": "ddp_oom_does_not_reject_ap",
+      "prompt": "Parallelize this model; the existing DDP run is out of memory.",
+      "context": "AutoParallel executes within memory and every applicable standard baseline is infeasible under the hard memory limit.",
+      "expected": {
+        "invoke_skill": true,
+        "autoparallel_disposition": "attempt",
+        "autoparallel_outcome": "accepted",
+        "competitiveness_verdict": "baseline_infeasible",
+        "benchmark_action": "none",
+        "selected_strategy": "autoparallel",
+        "report_required": true
+      }
+    },
+    {
+      "id": "capture_environment_unavailable",
+      "prompt": "Make this large model train across eight GPUs using an automatic strategy.",
+      "context": "No CUDA capture environment or saved optimizer is available, and replicated state does not fit.",
+      "expected": {
+        "invoke_skill": true,
+        "autoparallel_disposition": "assess_only",
+        "autoparallel_outcome": "ineligible",
+        "competitiveness_verdict": "comparison_unavailable",
+        "benchmark_action": "none",
+        "selected_strategy": "fsdp",
+        "report_required": true
+      }
+    },
+    {
+      "id": "plan_only_is_inconclusive",
+      "prompt": "Parallelize this model for production training.",
+      "context": "AutoParallel reaches an ILP plan but target execution is unavailable; replicated state fits.",
+      "expected": {
+        "invoke_skill": true,
+        "autoparallel_disposition": "attempt",
+        "autoparallel_outcome": "inconclusive",
+        "competitiveness_verdict": "comparison_unavailable",
+        "benchmark_action": "none",
+        "selected_strategy": "ddp",
+        "report_required": true
+      }
+    },
+    {
+      "id": "close_model_preserves_existing_ddp",
+      "prompt": "Try AutoParallel for this model, which already has a working DDP integration.",
+      "context": "AutoParallel meets the absolute bar, but its calibrated latency interval overlaps DDP and the user did not authorize a benchmark.",
+      "expected": {
+        "invoke_skill": true,
+        "autoparallel_disposition": "attempt",
+        "autoparallel_outcome": "below_bar",
+        "competitiveness_verdict": "schedule_sensitive",
+        "benchmark_action": "skip",
+        "selected_strategy": "ddp",
+        "report_required": true
+      }
+    },
+    {
+      "id": "robust_modeled_loss_uses_fsdp",
+      "prompt": "Find the best way to shard this memory-bound model.",
+      "context": "AutoParallel executes and fits, but its optimistic calibrated latency is worse than the applicable FSDP baseline's pessimistic bound.",
+      "expected": {
+        "invoke_skill": true,
+        "autoparallel_disposition": "attempt",
+        "autoparallel_outcome": "below_bar",
+        "competitiveness_verdict": "robustly_worse",
+        "benchmark_action": "none",
+        "selected_strategy": "fsdp",
+        "report_required": true
+      }
+    },
+    {
+      "id": "authorized_close_benchmark",
+      "prompt": "Compare AutoParallel with our DDP implementation and run a short benchmark if the modeled result is close.",
+      "context": "The modeled intervals overlap and the user explicitly authorized the benchmark, which has not run yet.",
+      "expected": {
+        "invoke_skill": true,
+        "autoparallel_disposition": "attempt",
+        "autoparallel_outcome": "inconclusive",
+        "competitiveness_verdict": "schedule_sensitive",
+        "benchmark_action": "run_authorized",
+        "selected_strategy": "none",
+        "report_required": true
+      }
+    },
+    {
+      "id": "missing_template_falls_back_without_benchmark",
+      "prompt": "Parallelize this model across eight GPUs.",
+      "context": "AutoParallel executes, but no faithful baseline template is available and the user did not authorize benchmarking; replicated state fits.",
+      "expected": {
+        "invoke_skill": true,
+        "autoparallel_disposition": "attempt",
+        "autoparallel_outcome": "inconclusive",
+        "competitiveness_verdict": "comparison_unavailable",
+        "benchmark_action": "skip",
+        "selected_strategy": "ddp",
+        "report_required": true
+      }
+    },
+    {
+      "id": "synthetic_underfilled_workload_is_inconclusive",
+      "prompt": "Use a quick synthetic input to decide whether AutoParallel or DDP should train this model on eight GPUs.",
+      "context": "The only available input uses global batch eight solely because it matches world size; the production microbatch and effective batch are unavailable.",
+      "expected": {
+        "invoke_skill": true,
+        "autoparallel_disposition": "attempt",
+        "autoparallel_outcome": "inconclusive",
+        "competitiveness_verdict": "comparison_unavailable",
+        "benchmark_action": "none",
+        "selected_strategy": "none",
+        "report_required": true
+      }
+    },
+    {
+      "id": "explicit_global_batch_is_evaluated",
+      "prompt": "Evaluate AutoParallel on eight GPUs using the configured global batch of 96.",
+      "context": "The batch is per forward/backward microstep, the effective DP degree is eight, and AutoParallel is robustly competitive at this exact workload.",
+      "expected": {
+        "invoke_skill": true,
+        "autoparallel_disposition": "attempt",
+        "autoparallel_outcome": "accepted",
+        "competitiveness_verdict": "robustly_competitive",
+        "benchmark_action": "none",
+        "selected_strategy": "autoparallel",
+        "report_required": true
+      }
+    },
+    {
+      "id": "optimizer_state_overturns_latency_win",
+      "prompt": "Choose a production training strategy after AutoParallel beats FSDP on forward/loss/backward latency.",
+      "context": "The measured AutoParallel boundary fits, but adding the intended sharded AdamW moment tensors exceeds the per-rank memory limit; FSDP fits the complete training state.",
+      "expected": {
+        "invoke_skill": true,
+        "autoparallel_disposition": "attempt",
+        "autoparallel_outcome": "below_bar",
+        "competitiveness_verdict": "robustly_competitive",
+        "benchmark_action": "none",
+        "selected_strategy": "fsdp",
+        "report_required": true
+      }
+    },
+    {
+      "id": "optimizer_performance_missing",
+      "prompt": "Choose the production training strategy after AutoParallel beats DDP on a forward/loss/backward benchmark.",
+      "context": "The intended AdamW update was excluded from measurement and has no calibrated cost model; DDP is already integrated and its complete training state fits.",
+      "expected": {
+        "invoke_skill": true,
+        "autoparallel_disposition": "attempt",
+        "autoparallel_outcome": "inconclusive",
+        "competitiveness_verdict": "comparison_unavailable",
+        "benchmark_action": "none",
+        "selected_strategy": "ddp",
+        "report_required": true
+      }
+    },
+    {
+      "id": "optimizer_objective_miss_uses_fsdp",
+      "prompt": "Choose a production strategy after AutoParallel wins forward/backward but loses the complete AdamW step to FSDP.",
+      "context": "Nearly all graph nodes had sharded options, but the selected plan retains substantially more local parameter bytes than full-shard; measured optimizer-inclusive FSDP is faster and smaller.",
+      "expected": {
+        "invoke_skill": true,
+        "autoparallel_disposition": "attempt",
+        "autoparallel_outcome": "below_bar",
+        "competitiveness_verdict": "robustly_worse",
+        "benchmark_action": "none",
+        "selected_strategy": "fsdp",
+        "report_required": true
+      }
+    },
+    {
+      "id": "optimizer_cost_envelope_overlap_keeps_ddp",
+      "prompt": "Choose between AutoParallel and an existing DDP integration using a frozen optimizer-cost model.",
+      "context": "The regime-matched model predicts AutoParallel is 6% faster, but its maximum relevant prospective full-step error is 14%; no target full-step measurement exists.",
+      "expected": {
+        "invoke_skill": true,
+        "autoparallel_disposition": "attempt",
+        "autoparallel_outcome": "inconclusive",
+        "competitiveness_verdict": "schedule_sensitive",
+        "benchmark_action": "none",
+        "selected_strategy": "ddp",
+        "report_required": true
+      }
+    },
+    {
+      "id": "short_job_time_to_ready_keeps_ddp",
+      "prompt": "Choose between AutoParallel and DDP for a fixed 1,000-step training job.",
+      "context": "AutoParallel needs 60 seconds to become ready and runs 50 ms steps; DDP needs 10 seconds and runs 60 ms steps. Both otherwise meet the bar.",
+      "expected": {
+        "invoke_skill": true,
+        "autoparallel_disposition": "attempt",
+        "autoparallel_outcome": "below_bar",
+        "competitiveness_verdict": "robustly_competitive",
+        "benchmark_action": "none",
+        "selected_strategy": "ddp",
+        "report_required": true
+      }
+    },
+    {
+      "id": "close_single_launch_is_schedule_sensitive",
+      "prompt": "Choose between AutoParallel and an existing DDP integration from a close target benchmark.",
+      "context": "AutoParallel is 3% faster using tight p10-p90 iteration samples, but each strategy ran in only one independent process launch and launch-to-launch variance was not measured.",
+      "expected": {
+        "invoke_skill": true,
+        "autoparallel_disposition": "attempt",
+        "autoparallel_outcome": "inconclusive",
+        "competitiveness_verdict": "schedule_sensitive",
+        "benchmark_action": "none",
+        "selected_strategy": "ddp",
+        "report_required": true
+      }
+    },
+    {
+      "id": "latency_tolerance_does_not_hide_pareto_dominance",
+      "prompt": "Choose between AutoParallel and FSDP for a long production training run.",
+      "context": "Across three independent launches, AutoParallel is 4.7% slower than FSDP while remaining inside the configured 5% latency tolerance. FSDP also has a robustly lower complete-step peak, lower time-to-ready, and both solutions satisfy correctness and hard feasibility bars.",
+      "expected": {
+        "invoke_skill": true,
+        "autoparallel_disposition": "attempt",
+        "autoparallel_outcome": "below_bar",
+        "competitiveness_verdict": "pareto_dominated",
+        "benchmark_action": "none",
+        "selected_strategy": "fsdp",
+        "report_required": true
+      }
+    },
+    {
+      "id": "composed_cost_model_propagates_base_drift",
+      "prompt": "Choose between AutoParallel and an existing FSDP integration from a composed full-step estimate.",
+      "context": "The held-out optimizer-kernel model has below 1% error, but the forward/loss/backward base is an old single launch and comparable historical bases drifted by 15%. The composed point estimate favors AutoParallel by 8%, and no current partial or full-step measurement exists.",
+      "expected": {
+        "invoke_skill": true,
+        "autoparallel_disposition": "attempt",
+        "autoparallel_outcome": "inconclusive",
+        "competitiveness_verdict": "schedule_sensitive",
+        "benchmark_action": "none",
+        "selected_strategy": "fsdp",
+        "report_required": true
+      }
+    },
+    {
+      "id": "meta_runtime_estimate_is_ranking_only",
+      "prompt": "Choose between AutoParallel and an existing FSDP integration without allocating the real model.",
+      "context": "A meta-tensor sweep predicts AutoParallel is 20% faster. Its global meta-to-target calibration has 10% median leave-one-out error and 68% maximum error across architectures; no regime-specific bound or target execution exists.",
+      "expected": {
+        "invoke_skill": true,
+        "autoparallel_disposition": "attempt",
+        "autoparallel_outcome": "inconclusive",
+        "competitiveness_verdict": "schedule_sensitive",
+        "benchmark_action": "none",
+        "selected_strategy": "fsdp",
+        "report_required": true
+      }
+    },
+    {
+      "id": "gradient_accumulation_cycle_changes_winner",
+      "prompt": "Choose between AutoParallel and an existing DDP integration for gradient accumulation four.",
+      "context": "Measured per rank, AutoParallel has 85 ms no-sync microsteps, a 100 ms synchronized microstep, and a 40 ms optimizer update. DDP has 70 ms no-sync microsteps, a 140 ms synchronized microstep, and a 20 ms optimizer update. All other bars pass and the launch envelopes do not overlap.",
+      "expected": {
+        "invoke_skill": true,
+        "autoparallel_disposition": "attempt",
+        "autoparallel_outcome": "below_bar",
+        "competitiveness_verdict": "robustly_worse",
+        "benchmark_action": "none",
+        "selected_strategy": "ddp",
+        "report_required": true
+      }
+    },
+    {
+      "id": "world_size_crossover_keeps_decisions_separate",
+      "prompt": "Choose a strategy for a two-GPU deployment after evaluating the same model on two and four GPUs.",
+      "context": "Global batch 16 and all training semantics are fixed. Across three launches, FSDP Pareto-dominates AutoParallel on two GPUs, while AutoParallel is robustly fastest on four GPUs. The four-GPU report is newer.",
+      "expected": {
+        "invoke_skill": true,
+        "autoparallel_disposition": "attempt",
+        "autoparallel_outcome": "below_bar",
+        "competitiveness_verdict": "pareto_dominated",
+        "benchmark_action": "none",
+        "selected_strategy": "fsdp",
+        "report_required": true
+      }
+    },
+    {
+      "id": "unclipped_timing_does_not_cover_gradient_clipping",
+      "prompt": "Choose between AutoParallel and an existing DDP integration for a job that uses global-norm gradient clipping.",
+      "context": "AutoParallel was 10% faster for an unclipped full AdamW step. Production clips the global L2 norm to 1.0 after backward, but clipping cost and collectives have not been measured or modeled for either placement.",
+      "expected": {
+        "invoke_skill": true,
+        "autoparallel_disposition": "attempt",
+        "autoparallel_outcome": "inconclusive",
+        "competitiveness_verdict": "comparison_unavailable",
+        "benchmark_action": "none",
+        "selected_strategy": "ddp",
+        "report_required": true
+      }
+    },
+    {
+      "id": "frozen_parameter_mask_is_semantic_gate",
+      "prompt": "Choose a strategy for last-block-only fine-tuning after AutoParallel lowering.",
+      "context": "The source model has 50 MB of trainable parameters and 2.24 GB of total parameters. The lowered AutoParallel module reports all 2.24 GB as trainable and the optimizer contains every parameter. DDP preserves the source mask and runs successfully.",
+      "expected": {
+        "invoke_skill": true,
+        "autoparallel_disposition": "attempt",
+        "autoparallel_outcome": "failed",
+        "competitiveness_verdict": "comparison_unavailable",
+        "benchmark_action": "none",
+        "selected_strategy": "ddp",
+        "report_required": true
+      }
+    },
+    {
+      "id": "warned_fsdp_template_is_not_qualified",
+      "prompt": "Choose a fallback for a T5 training job after native baseline evaluation.",
+      "context": "Block-wrapped FSDP is fastest but warns that a returned view may silently lose its pre-backward all-gather hook. Root-only FSDP is warning-free but slower than DDP. DDP executes without compatibility warnings and fits memory.",
+      "expected": {
+        "invoke_skill": true,
+        "autoparallel_disposition": "attempt",
+        "autoparallel_outcome": "below_bar",
+        "competitiveness_verdict": "robustly_worse",
+        "benchmark_action": "none",
+        "selected_strategy": "ddp",
+        "report_required": true
+      }
+    },
+    {
+      "id": "checkpoint_flag_without_realization_is_not_evidence",
+      "prompt": "Choose between AutoParallel and DDP for a training job that requires activation checkpointing.",
+      "context": "The AutoParallel backend was invoked with activation checkpointing enabled, but its saved-tensor graph, backward placeholders, and peak memory are identical to the unchecked run. DDP uses the model's non-reentrant checkpoint policy and has measured results.",
+      "expected": {
+        "invoke_skill": true,
+        "autoparallel_disposition": "attempt",
+        "autoparallel_outcome": "inconclusive",
+        "competitiveness_verdict": "comparison_unavailable",
+        "benchmark_action": "none",
+        "selected_strategy": "ddp",
+        "report_required": true
+      }
+    },
+    {
+      "id": "checkpoint_policy_is_part_of_comparison_contract",
+      "prompt": "Use an existing DDP benchmark to judge a checkpointed AutoParallel plan.",
+      "context": "AutoParallel applies the Hugging Face model's non-reentrant checkpoint policy before capture. The only DDP report was measured without checkpointing. Both execute the same batch and optimizer step boundary.",
+      "expected": {
+        "invoke_skill": true,
+        "autoparallel_disposition": "attempt",
+        "autoparallel_outcome": "inconclusive",
+        "competitiveness_verdict": "comparison_unavailable",
+        "benchmark_action": "none",
+        "selected_strategy": "ddp",
+        "report_required": true
+      }
+    },
+    {
+      "id": "optimizer_parameter_groups_are_semantic_contract",
+      "prompt": "Choose between AutoParallel and DDP for a model trained with two AdamW parameter groups.",
+      "context": "Production applies weight decay 0.1 to matrix parameters and 0.0 to biases and normalization vectors. AutoParallel was benchmarked with a single default AdamW group, while DDP used the production groups. Both runs otherwise match.",
+      "expected": {
+        "invoke_skill": true,
+        "autoparallel_disposition": "attempt",
+        "autoparallel_outcome": "inconclusive",
+        "competitiveness_verdict": "comparison_unavailable",
+        "benchmark_action": "none",
+        "selected_strategy": "ddp",
+        "report_required": true
+      }
+    },
+    {
+      "id": "tied_parameter_aliases_are_semantic_gate",
+      "prompt": "Accept an AutoParallel plan for a language model with tied input embeddings and output projection.",
+      "context": "After lowering, the two parameter FQNs refer to distinct Parameter objects and the optimizer allocates state for both. The native DDP integration preserves the tie.",
+      "expected": {
+        "invoke_skill": true,
+        "autoparallel_disposition": "attempt",
+        "autoparallel_outcome": "failed",
+        "competitiveness_verdict": "comparison_unavailable",
+        "benchmark_action": "none",
+        "selected_strategy": "ddp",
+        "report_required": true
+      }
+    },
+    {
+      "id": "dense_moe_retry_is_not_performance_evidence",
+      "prompt": "Choose a strategy for a Mixtral model after an AutoParallel retry.",
+      "context": "The unmodified sparse MoE fails capture on data-dependent expert selection. A rewrite that evaluates every expert for every token preserves outputs and lowers, but performs much more compute than production. Native FSDP is available.",
+      "expected": {
+        "invoke_skill": true,
+        "autoparallel_disposition": "attempt",
+        "autoparallel_outcome": "failed",
+        "competitiveness_verdict": "comparison_unavailable",
+        "benchmark_action": "none",
+        "selected_strategy": "fsdp",
+        "report_required": true
+      }
+    },
+    {
+      "id": "capture_failure_can_select_eager_native_fallback",
+      "prompt": "Parallelize a sparse MoE whose data-dependent expert routing fails AutoParallel capture.",
+      "context": "One unmodified attempt and one bounded retry cannot capture the production sparse path. Native eager DDP and FSDP both execute the exact full optimizer step; DDP fits with headroom and is the simpler integration. Their eager timings are not comparable to any compiled AutoParallel result.",
+      "expected": {
+        "invoke_skill": true,
+        "autoparallel_disposition": "attempt",
+        "autoparallel_outcome": "failed",
+        "competitiveness_verdict": "comparison_unavailable",
+        "benchmark_action": "none",
+        "selected_strategy": "ddp",
+        "report_required": true
+      }
+    },
+    {
+      "id": "batchnorm_statistics_must_match_baseline",
+      "prompt": "Compare an AutoParallel CNN plan with native DDP and FSDP.",
+      "context": "AutoParallel computes BatchNorm statistics over the global sharded batch and all ranks retain identical running buffers. The faster DDP run used ordinary rank-local BatchNorm. A SyncBatchNorm FSDP-compatible baseline is slower, but AutoParallel is robustly competitive with it and passes every absolute gate.",
+      "expected": {
+        "invoke_skill": true,
+        "autoparallel_disposition": "attempt",
+        "autoparallel_outcome": "accepted",
+        "competitiveness_verdict": "robustly_competitive",
+        "benchmark_action": "none",
+        "selected_strategy": "autoparallel",
+        "report_required": true
+      }
+    },
+    {
+      "id": "startup_break_even_routes_short_job_to_baseline",
+      "prompt": "Choose between AutoParallel and DDP for a 10,000-step training job.",
+      "context": "Across three launches AutoParallel is robustly faster per step, but compilation adds 10 seconds of startup and the measured DDP break-even is 84,000 optimizer steps. Both strategies otherwise pass every gate.",
+      "expected": {
+        "invoke_skill": true,
+        "autoparallel_disposition": "attempt",
+        "autoparallel_outcome": "below_bar",
+        "competitiveness_verdict": "robustly_worse",
+        "benchmark_action": "none",
+        "selected_strategy": "ddp",
+        "report_required": true
+      }
+    },
+    {
+      "id": "required_resume_needs_checkpoint_roundtrip",
+      "prompt": "Choose AutoParallel for a fault-tolerant training job that must resume with optimizer state.",
+      "context": "The AutoParallel full step passes memory and performance gates, but only model weights were saved and no sharded optimizer-state restore or post-load step was tested. The existing DDP integration has a validated model-and-optimizer DCP resume path.",
+      "expected": {
+        "invoke_skill": true,
+        "autoparallel_disposition": "attempt",
+        "autoparallel_outcome": "inconclusive",
+        "competitiveness_verdict": "comparison_unavailable",
+        "benchmark_action": "none",
+        "selected_strategy": "ddp",
+        "report_required": true
+      }
+    },
+    {
+      "id": "replicated_counterfactual_exposes_bucketing_ranking_inversion",
+      "prompt": "Diagnose why a sharded AutoParallel plan loses to fitting DDP.",
+      "context": "The selected plan has a 40 ms objective and measures 52 ms with 145 all-reduces. A diagnostic fully replicated AutoParallel plan has a worse 43 ms objective but measures 39 ms after bucketing to 15 all-reduces. Native DDP measures 35 ms and fits with headroom.",
+      "expected": {
+        "invoke_skill": true,
+        "autoparallel_disposition": "attempt",
+        "autoparallel_outcome": "below_bar",
+        "competitiveness_verdict": "robustly_worse",
+        "benchmark_action": "none",
+        "selected_strategy": "ddp",
+        "report_required": true
+      }
+    },
+    {
+      "id": "unrelated_single_gpu_tuning",
+      "prompt": "Tune the learning rate for this single-GPU experiment.",
+      "context": "No distributed model parallelization is requested.",
+      "expected": {
+        "invoke_skill": false,
+        "autoparallel_disposition": "skip",
+        "autoparallel_outcome": "ineligible",
+        "competitiveness_verdict": "comparison_unavailable",
+        "benchmark_action": "none",
+        "selected_strategy": "none",
+        "report_required": false
+      }
+    }
+  ]
+}
