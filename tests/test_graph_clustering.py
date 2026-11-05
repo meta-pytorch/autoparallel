@@ -70,7 +70,7 @@ def test_malformed_cluster_is_discarded_atomically(caplog):
     optimizer = ShardingOptimizer.__new__(ShardingOptimizer)
     optimizer.cluster_links = {}
     optimizer.skipped_clusters = []
-    optimizer.strats = dict.fromkeys(graph.nodes, Mock())
+    optimizer.strats = dict.fromkeys(graph.nodes, Mock(strategies=[None]))
     optimizer.nodes = list(optimizer.strats)
     optimizer.node_map = {node: index for index, node in enumerate(optimizer.nodes)}
     optimizer.walk_over_options = lambda node: iter([(0, 0, 0)])
