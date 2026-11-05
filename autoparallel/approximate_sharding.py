@@ -41,6 +41,9 @@ _PAIRED_PREFIXES = (
     "grad_param_constraint",
     "grad_input_constraint",
     "grad_output_constraint",
+    "persistent_alias_constraint",
+    "input_mutation_constraint",
+    "grad_input_mutation_constraint",
 )
 
 
@@ -466,10 +469,14 @@ class ApproximateShardingSolver:
 
         Mirrors ShardingOptimizer.add_inf_cost_constraint /
         add_grad_reduce_dtype_constraints / add_forward_backward_consistency_constraints /
+        add_persistent_alias_constraints / add_input_mutation_constraints /
         _add_paired_output_constraint / add_node_constraint /
         add_output_input_consistent_constraint. Verified byte-identical to
         _parse_constraints on a full build (see tests)."""
+        from torch._functorch._aot_autograd.descriptors import InputMutationAOTOutput
         from torch._functorch._aot_autograd.fx_utils import (
+            get_all_input_and_grad_nodes,
+            get_all_output_and_tangent_nodes,
             get_param_and_grad_nodes,
             get_plain_input_and_grad_nodes,
             get_plain_output_and_tangent_nodes,
@@ -583,6 +590,16 @@ class ApproximateShardingSolver:
         for node, tnode in get_plain_output_and_tangent_nodes(opt.graph).values():
             if tnode is not None:
                 add_paired(node, tnode)
+        for nodes in opt._get_persistent_alias_groups().values():
+            for node in nodes[1:]:
+                add_paired(nodes[0], node)
+        inputs = get_all_input_and_grad_nodes(opt.graph)
+        outputs = get_all_output_and_tangent_nodes(opt.graph)
+        for desc, (mutation_node, tangent_node) in outputs.items():
+            if isinstance(desc, InputMutationAOTOutput):
+                add_paired(inputs[desc.mutated_input][0], mutation_node)
+                if isinstance(tangent_node, torch.fx.Node):
+                    add_paired(mutation_node, tangent_node)
 
         # 4. user node/input/output placement restrictions (== add_node_constraint),
         #    replayed from _constraint_log.
@@ -864,11 +881,21 @@ class ApproximateShardingSolver:
         memory_constraint = getattr(opt, "_memory_constraint", None)
         if memory_constraint is None:
             return
-        try:
-            from torch._functorch._aot_autograd.fx_utils import get_param_nodes
+        from torch._functorch._aot_autograd.descriptors import ParamAOTInput
 
-            param_nodes = get_param_nodes(opt.graph)
-        except Exception:
+        # Same units as ShardingOptimizer._apply_memory_constraint: the local
+        # bytes of one node per persistent alias group, as a fraction of the
+        # total global parameter bytes.
+        param_nodes = [
+            nodes[0]
+            for nodes in opt._get_persistent_alias_groups(ParamAOTInput).values()
+        ]
+        global_bytes = {}
+        for node in param_nodes:
+            meta = opt.strats[node].strategies[0].input_specs[0].tensor_meta
+            global_bytes[node] = math.prod(meta.shape) * meta.dtype.itemsize
+        total_bytes = sum(global_bytes.values())
+        if total_bytes == 0:
             return
 
         low_f, high_f = memory_constraint
@@ -877,11 +904,15 @@ class ApproximateShardingSolver:
         for node in param_nodes:
             v = opt.node_map[node]
             param_idxs.append(v)
-            r = {o: self._param_ratio(v, node, o) for o in self.allowed_out.get(v, [])}
+            r = {
+                o: self._param_bytes(v, node, o) / total_bytes
+                for o in self.allowed_out.get(v, [])
+            }
             ratios[v] = r
             best = min(r.values())
-            budget_low += max(best, low_f)
-            budget_high += max(best, high_f)
+            global_frac = global_bytes[node] / total_bytes
+            budget_low += max(best, global_frac * low_f)
+            budget_high += max(best, global_frac * high_f)
 
         tight = abs(budget_high - budget_low) < 1e-9
         if tight:
@@ -900,7 +931,7 @@ class ApproximateShardingSolver:
             "tight": tight,
         }
 
-    def _param_ratio(self, v, node, o):
+    def _param_bytes(self, v, node, o):
         if self._lazy:
             # input_specs[0] is the param's own (redistributed) spec, identical to
             # the eager _surviving_dv(v, 0, o).input_spec but without decision_vars.
@@ -908,7 +939,7 @@ class ApproximateShardingSolver:
         else:
             spec = self._surviving_dv(v, 0, o).input_spec
         new_shape, _ = _get_sharded_shape_stride(spec)
-        return math.prod(new_shape) / math.prod(spec.tensor_meta.shape)
+        return math.prod(new_shape) * spec.tensor_meta.dtype.itemsize
 
     # ------------------------------------------------------------------ #
     # Factor graph (numpy unary + pairwise matrices over groups)

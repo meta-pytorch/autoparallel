@@ -1880,7 +1880,9 @@ class ShardingOptimizer:
             solution
         )
         result["summary"]["prefetch_discount"] = self._prefetch_discount
-        search_objective = pulp.value(self.prob.objective)
+        search_objective = (
+            pulp.value(self.prob.objective) if self.prob is not None else None
+        )
         result["summary"]["search_objective"] = (
             search_objective if search_objective is not None else 0.0
         )
