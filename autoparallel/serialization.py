@@ -494,6 +494,8 @@ def load_optimizer(cls, path):
     opt.skipped_clusters = save_dict.get("skipped_clusters", [])
     opt._constraint_log = []
     opt._memory_constraint = None
+    opt._parameter_axis_constraints = []
+    opt._parameter_axis_constraint_names = []
     opt._node_constraint_names = {}
     opt._name_counters = {}
 
