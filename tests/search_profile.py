@@ -75,7 +75,7 @@ def parse_args(argv=None):
     parser.add_argument("--model", choices=(*LLAMA_CONFIGS, "dsv3"), required=True)
     parser.add_argument("--mesh", help="Comma-separated LLaMA mesh dimensions")
     parser.add_argument("--moe-layout", choices=("2d",))
-    parser.add_argument("--solver", choices=("ilp",), required=True)
+    parser.add_argument("--solver", choices=AutoParallel.SOLVER_CHOICES, required=True)
     parser.add_argument("--revision-label", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--detailed-solution", action="store_true")
@@ -111,7 +111,7 @@ def make_llama(model_name, mesh_shape):
     from autoparallel._testing.models.llama3 import Transformer, TransformerModelArgs
 
     if len(mesh_shape) != 2:
-        raise ValueError(f"LLaMA profiles require a 2D mesh, got {mesh_shape}")
+        raise ValueError(f"PR521 LLaMA profiles require a 2D mesh, got {mesh_shape}")
     seq_len = 2048
     vocab_size = 128256
     config = {
@@ -251,22 +251,15 @@ def solution_details(solution, graph):
 
 
 def cost_contributions(opt):
-    if hasattr(opt, "_cluster_root_key"):
-        selected = {}
-        for key in opt.selected_keys:
-            root_key = opt._cluster_root_key(key)
-            if root_key in opt.decision_vars:
-                selected[root_key] = (
-                    opt.decision_vars[root_key],
-                    1 + len(opt._root_to_copies.get(root_key[0], ())),
-                )
-    else:
-        selected = {
-            key: (opt._resolve_decision_var(key), 1) for key in opt.selected_keys
-        }
+    selected = {}
+    for key in opt.selected_keys:
+        root_key = opt._cluster_root_key(key)
+        if root_key in opt.decision_vars:
+            selected[root_key] = opt.decision_vars[root_key]
     by_node = {}
-    for key, (decision, multiplier) in selected.items():
+    for key, decision in selected.items():
         node_idx, _arg_idx, out_idx, _inp_idx = key
+        multiplier = 1 + len(opt._root_to_copies.get(node_idx, ()))
         row = by_node.setdefault(
             node_idx,
             {
@@ -332,15 +325,27 @@ def validate_args(args):
     return world_size, mesh_shape
 
 
-def validate_solution(objective, solution_nodes, violations, pulp_status):
+def validate_solution(
+    solver,
+    objective,
+    solution_nodes,
+    violations,
+    pulp_status,
+    solution_status,
+):
     if objective is None:
         raise RuntimeError("placement objective is not finite")
     if solution_nodes == 0:
         raise RuntimeError("placement solution is empty")
     if violations:
         raise RuntimeError(f"placement violates {len(violations)} constraints")
-    if pulp_status != "Optimal":
-        raise RuntimeError(f"ILP placement is not optimal: {pulp_status}")
+    if solver == "approx":
+        if solution_status != "Solution Found":
+            raise RuntimeError(
+                f"approximate placement is not feasible: {solution_status}"
+            )
+    elif pulp_status != "Optimal":
+        raise RuntimeError(f"{solver} placement is not optimal: {pulp_status}")
 
 
 def main(argv=None):
@@ -392,13 +397,14 @@ def main(argv=None):
                 ),
                 repeated_subgraphs=True,
                 dynamic=args.model == "dsv3",
+                solver=args.solver,
             )
             enter_started = time.perf_counter()
             stack.enter_context(autop)
             enter_elapsed = time.perf_counter() - enter_started
             opt = autop.sharding_optimizer
             graph_trace_s = autop.profile_graph_trace_s
-            build_enter_s = max(enter_elapsed - graph_trace_s, 0.0)
+            optimizer_init_s = opt.profile["timings"]["init_total_s"]
 
             constraint_started = time.perf_counter()
             autop.add_parameter_memory_constraint(low=None, high=None)
@@ -413,18 +419,28 @@ def main(argv=None):
             unaccounted_s = max(
                 search_total_s
                 - graph_trace_s
-                - build_enter_s
+                - optimizer_init_s
                 - constraint_s
                 - solve_call_s,
                 0.0,
             )
+            profile_key = {
+                "approx": "approximate",
+                "ilp": "ilp",
+                "lp": "lp_relaxation",
+            }[args.solver]
+            solver_profile = opt.profile[profile_key]
             result["timings"].update(
                 {
                     "enter_total_s": enter_elapsed,
                     "graph_trace_s": graph_trace_s,
-                    "build_enter_s": build_enter_s,
+                    "optimizer_init_s": optimizer_init_s,
                     "user_constraints_s": constraint_s,
                     "solve_call_s": solve_call_s,
+                    "factor_build_s": solver_profile.get("build_s"),
+                    "solver_core_s": solver_profile.get(
+                        "solve_s", solver_profile.get("solve_time")
+                    ),
                     "search_total_s": search_total_s,
                     "unaccounted_s": unaccounted_s,
                 }
@@ -443,6 +459,7 @@ def main(argv=None):
                 str(getattr(opt.prob, "sol_status", None)),
             )
             validation = {
+                "solver_status": solver_profile["status"],
                 "pulp_status": pulp_status,
                 "pulp_solution_status": solution_status,
                 "constraint_violations": len(violations),
@@ -454,6 +471,7 @@ def main(argv=None):
                     "placement_sha256": fingerprint,
                     "solution_nodes": solution_nodes,
                     "validation": validation,
+                    "optimizer_profile": opt.profile,
                     "counts": {
                         "graph_nodes": len(list(opt.graph.nodes)),
                         "strategy_nodes": len(opt.strats),
@@ -464,7 +482,14 @@ def main(argv=None):
                     },
                 }
             )
-            validate_solution(objective, solution_nodes, violations, pulp_status)
+            validate_solution(
+                args.solver,
+                objective,
+                solution_nodes,
+                violations,
+                pulp_status,
+                solution_status,
+            )
 
             if args.detailed_solution:
                 contributions = cost_contributions(opt)
