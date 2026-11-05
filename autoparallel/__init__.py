@@ -7,6 +7,11 @@ from autoparallel.api import AutoParallel, auto_parallel
 from autoparallel.collectives import with_sharding_constraint
 from autoparallel.compile import autoparallel_backend
 from autoparallel.input_validation import ForwardInputs
+from autoparallel.moe import (
+    MoEMeshRoles,
+    build_moe_local_map_placements,
+    build_moe_mesh,
+)
 from autoparallel.optimize_sharding import UNCONSTRAINED
 
 __all__ = [
@@ -14,6 +19,9 @@ __all__ = [
     "AutoParallel",
     "autoparallel_backend",
     "ForwardInputs",
+    "MoEMeshRoles",
+    "build_moe_local_map_placements",
+    "build_moe_mesh",
     "UNCONSTRAINED",
     "with_sharding_constraint",
 ]
