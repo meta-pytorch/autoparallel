@@ -237,6 +237,7 @@ class AutoParallel:
         solver_time_limit_seconds: Optional CBC optimality deadline. The solve
         raises ``TimeoutError`` instead of accepting an unproven incumbent when
         the deadline expires.
+        fast_build: Skip DTensor enumeration costs that AutoParallel recomputes.
     """
 
     def __init__(
@@ -250,6 +251,7 @@ class AutoParallel:
         cost_model: Any = "nccl",
         repeated_subgraphs: bool = True,
         solver_time_limit_seconds: float | None = None,
+        fast_build: bool = True,
     ):
         self.stack = ExitStack()
         self.fake_mode = (
@@ -263,6 +265,7 @@ class AutoParallel:
         self.cost_model = cost_model
         self.repeated_subgraphs = repeated_subgraphs
         self.solver_time_limit_seconds = solver_time_limit_seconds
+        self.fast_build = fast_build
         # copy user model to avoid modifying it in-place
         # in dtype casting and move_to_fake
         model = copy.deepcopy(model)
@@ -346,6 +349,7 @@ class AutoParallel:
                 repeated_subgraphs=self.repeated_subgraphs,
                 persistent_aliases={**self.param_aliases, **self.buffer_aliases},
                 solver_time_limit_seconds=self.solver_time_limit_seconds,
+                fast_build=self.fast_build,
             )
 
             self.sharding_optimizer = sharding_optimizer
