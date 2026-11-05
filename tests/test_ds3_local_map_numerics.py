@@ -3,7 +3,7 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Compare 4-GPU AutoParallel DeepSeek-V3 numerics with a single-GPU model."""
+"""Compare distributed AutoParallel DeepSeek-V3 numerics with a single-GPU model."""
 
 import argparse
 import gc
@@ -15,12 +15,15 @@ import torch
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor import DTensor
-from torch.distributed.tensor.placement_types import Shard
+from torch.distributed.tensor.placement_types import Partial, Shard
 
 from autoparallel import AutoParallel, MoEMeshRoles, build_moe_mesh
 from autoparallel._testing.models.dsv3 import DeepSeekV3Model, make_dsv3_config
+from autoparallel.cost_models.collective_runtime_estimation import (
+    estimate_strategy_comms_cost,
+)
+from autoparallel.optimize_sharding import _strategy_matches_seed
 
-_WORLD_SIZE = 4
 _SEQ_LEN = 2048
 _LOCAL_BATCH_SIZE = 1
 _SEED = 0
@@ -35,6 +38,7 @@ _CASES: dict[str, dict[str, int]] = {
     "efsdp_boundary": dict(dp_replicate=1, dp_shard=4, cp=1, tp=1, ep=2),
     "legacy_2d": dict(dp_replicate=2, dp_shard=2, cp=1, tp=1, ep=2),
     "flattened_ep": dict(dp_replicate=1, dp_shard=2, cp=2, tp=1, ep=4),
+    "split_dim_3d": dict(dp_replicate=1, dp_shard=4, cp=1, tp=2, ep=4),
 }
 
 
@@ -62,6 +66,71 @@ def _gather_state_dict(model: torch.nn.Module, rank: int) -> dict[str, torch.Ten
         if rank == 0:
             state_dict[name] = full_value.detach().cpu()
     return state_dict
+
+
+def _validate_split_dim_witnesses(optimizer) -> dict[str, Any]:
+    missing = []
+    witnessed = 0
+    for node, strategies in optimizer.strats.items():
+        if node.op == "output":
+            continue
+        node_seed = optimizer.strategy_seed.get(node.name)
+        if node_seed is None or node_seed.witness is None:
+            continue
+        witnessed += 1
+        if not any(
+            _strategy_matches_seed(strategy, node_seed.witness)
+            for strategy in strategies.strategies
+        ):
+            missing.append(node.name)
+    assert not missing, f"Missing complete strategy witnesses: {missing[:20]}"
+
+    sss = (Shard(0),) * optimizer.mesh.ndim
+    ppp = (Partial("sum"),) * optimizer.mesh.ndim
+    for dtype_node in optimizer.graph.nodes:
+        if dtype_node.target != torch.ops.autoparallel.dtype_cast.default:
+            continue
+        input_nodes = optimizer._all_input_nodes(dtype_node)
+        if len(input_nodes) != 1:
+            continue
+        sum_node = input_nodes[0]
+        if sum_node.target != torch.ops.aten.sum.dim_IntList:
+            continue
+        sum_seed = optimizer.strategy_seed.get(sum_node.name)
+        dtype_seed = optimizer.strategy_seed.get(dtype_node.name)
+        if (
+            sum_seed is None
+            or dtype_seed is None
+            or sum_seed.output_placements != ppp
+            or dtype_seed.output_placements != sss
+        ):
+            continue
+        assert sum_seed.witness is not None
+        assert dtype_seed.witness is not None
+        sum_strategy = next(
+            strategy
+            for strategy in optimizer.strats[sum_node].strategies
+            if _strategy_matches_seed(strategy, sum_seed.witness)
+        )
+        dtype_strategy = next(
+            strategy
+            for strategy in optimizer.strats[dtype_node].strategies
+            if _strategy_matches_seed(strategy, dtype_seed.witness)
+        )
+        edge_cost = estimate_strategy_comms_cost(
+            sum_strategy.output_spec, dtype_strategy.input_specs[0]
+        )
+        assert torch.isfinite(torch.tensor(edge_cost))
+        return {
+            "witnessed_nodes": witnessed,
+            "missing_witnesses": 0,
+            "sum_node": sum_node.name,
+            "dtype_node": dtype_node.name,
+            "producer_placements": [repr(p) for p in ppp],
+            "consumer_input_placements": [repr(p) for p in sss],
+            "edge_cost": edge_cost,
+        }
+    raise AssertionError("Could not find the RMSNorm split-dim seeded edge")
 
 
 def _run_reference(
@@ -105,6 +174,9 @@ def run_numerics_test(case: str, dtype_name: str) -> None:
     device = torch.device("cuda", local_rank)
     compute_dtype = _DTYPES[dtype_name]
     degrees = _CASES[case]
+    world_size = (
+        degrees["dp_replicate"] * degrees["dp_shard"] * degrees["cp"] * degrees["tp"]
+    )
     mesh, roles = build_moe_mesh(
         dp_replicate=degrees["dp_replicate"],
         dp_shard=degrees["dp_shard"],
@@ -113,7 +185,7 @@ def run_numerics_test(case: str, dtype_name: str) -> None:
         ep=degrees["ep"],
     )
     config = make_dsv3_config(num_experts=8, max_seq_len=_SEQ_LEN)
-    global_batch_size = _LOCAL_BATCH_SIZE * _WORLD_SIZE
+    global_batch_size = _LOCAL_BATCH_SIZE * world_size
 
     with torch.device("meta"):
         model = DeepSeekV3Model(
@@ -134,14 +206,27 @@ def run_numerics_test(case: str, dtype_name: str) -> None:
         param_dtype=compute_dtype,
         reduce_dtype=torch.float32,
     )
+    split_dim = case == "split_dim_3d"
     with AutoParallel(
-        model, input_fn, mesh, mp_policy=mp_policy, dynamic=True
+        model,
+        input_fn,
+        mesh,
+        mp_policy=mp_policy,
+        dynamic=True,
+        solver="approx" if split_dim else "ilp",
+        lazy_costs=True if split_dim else None,
+        strategy_radius=2,
     ) as autop:
         autop.add_parameter_memory_constraint(low=None, high=None)
         input_placements = (Shard(0),) * mesh.ndim
         autop.add_input_constraints([input_placements])
         autop.add_output_constraints([input_placements])
         placement = autop.optimize_placement(verbose=False)
+        witness_validation = (
+            _validate_split_dim_witnesses(autop.sharding_optimizer)
+            if split_dim
+            else None
+        )
         parallel_model = autop.apply_placement(placement)
 
     parallel_model.to_empty(device=device)
@@ -156,7 +241,7 @@ def run_numerics_test(case: str, dtype_name: str) -> None:
             (global_batch_size, _SEQ_LEN),
             device=device,
         )
-        scatter_list = list(global_tokens.chunk(_WORLD_SIZE))
+        scatter_list = list(global_tokens.chunk(world_size))
     else:
         global_tokens = None
         scatter_list = None
@@ -285,6 +370,7 @@ def run_numerics_test(case: str, dtype_name: str) -> None:
                 "name": worst_name,
                 "relative_error": worst_error,
             },
+            "witness_validation": witness_validation,
         }
         print(f"NUMERICS_RESULT={json.dumps(result, sort_keys=True)}", flush=True)
         failures = []
@@ -321,11 +407,15 @@ def main():
     parser.add_argument("--dtype", required=True, choices=_DTYPES)
     args = parser.parse_args()
 
+    degrees = _CASES[args.case]
+    world_size = (
+        degrees["dp_replicate"] * degrees["dp_shard"] * degrees["cp"] * degrees["tp"]
+    )
     if (
-        int(os.environ.get("WORLD_SIZE", "1")) != _WORLD_SIZE
-        or torch.cuda.device_count() < _WORLD_SIZE
+        int(os.environ.get("WORLD_SIZE", "1")) != world_size
+        or torch.cuda.device_count() < world_size
     ):
-        parser.error(f"run with torchrun --standalone --nproc-per-node {_WORLD_SIZE}")
+        parser.error(f"run with torchrun --standalone --nproc-per-node {world_size}")
     local_rank = int(os.environ["LOCAL_RANK"])
     device = torch.device("cuda", local_rank)
     torch.cuda.set_device(device)
