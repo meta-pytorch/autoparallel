@@ -5,11 +5,10 @@
 
 """Approximate sharding solver.
 
-Reduces the sharding ILP (see :mod:`optimize_sharding`) to a pairwise MRF over the
-per-node output-strategy indices and solves it with tree-reweighted message passing
-(TRW-S) plus local-search polish, replacing only the CBC/ILP *solve*. It reuses the
-strategies / decision variables / constraints built by ``ShardingOptimizer`` and writes
-its assignment back into the PuLP variables, so it is scored by ``pulp.value(prob.objective)``.
+Reduces the sharding problem to a pairwise MRF over per-node output-strategy
+indices and solves it with tree-reweighted message passing (TRW-S) plus
+local-search polish. It can either reuse eagerly built costs and PuLP constraints
+or derive constraint topology and compute costs on demand without building PuLP.
 """
 
 import logging
@@ -21,8 +20,14 @@ from typing import Any, Optional
 
 import numpy as np
 import pulp
+import torch
+from torch.distributed.tensor._dtensor_spec import DTensorSpec
+from torch.distributed.tensor.placement_types import Replicate, Shard
 
-from .cost_models.compute_estimation import _get_sharded_shape_stride
+from .cost_models.compute_estimation import (
+    _get_sharded_shape_stride,
+    estimate_strategy_runtime_cost,
+)
 from .optimize_sharding import _INVALID_COST
 
 logger = logging.getLogger(__name__)
@@ -115,6 +120,18 @@ class ApproximateShardingSolver:
         self.max_star_children = max_star_children
         self.group_domain_limit = group_domain_limit
 
+        # Lazy build: the optimizer was built with build_costs=False, so no
+        # DecisionVars / edge costs exist. We compute the comm/compute costs that
+        # TRW-S touches on demand (memoized) instead of reading opt.decision_vars.
+        self._lazy = not getattr(optimizer, "build_costs", True)
+        # (root v, argi, out_v, out_p) -> (comm_cost, transition_cost)
+        self._edge_cache: dict[tuple, tuple] = {}
+        self._compute_cache: dict[tuple, float] = {}  # (root v, out) -> per-arg compute
+        # Nodes whose redistribution must be forbidden because they precede a
+        # downcasting dtype_cast (the lazy analogue of the per-key dtype forbidden
+        # the eager build stamps); populated in _topology_direct.
+        self._pre_cast_nodes: set[int] = set()
+
         # Populated by _build_problem().
         self.cost_bearing: list[int] = []
         self.node_mult: dict[int, int] = {}
@@ -172,9 +189,16 @@ class ApproximateShardingSolver:
                 max((g.domain for g in self.groups), default=0),
             )
 
-        # max_time_s bounds TRW-S and polish, not factor construction.
+        # max_time_s bounds the *solve* (TRW-S + polish), so start the clock after
+        # the build. In the lazy build the per-edge costs are computed during
+        # _build_factors (not up front), which can exceed max_time_s on large
+        # meshes; measuring the deadline from t0 would then starve TRW-S of any
+        # sweeps and decode a near-random assignment.
         deadline = t_bf + self.max_time_s
-        # Initialize with TRW-S, then polish the assignment with local search.
+        # TRW-S init, then local-search polish. TRW-S reaches the exact MAP on the
+        # (integral) sharding problem, so the old greedy second candidate it used
+        # to be compared against is strictly dominated and has been dropped; the
+        # polish remains for the memory budget and as a local-search safety net.
         t_bp0 = time.perf_counter()
         mem = self._memory
         if mem is not None and not mem.get("tight"):
@@ -286,7 +310,11 @@ class ApproximateShardingSolver:
             self.allowed_out[opt.node_map[node]] = list(range(len(strat.strategies)))
 
         t = time.perf_counter()
-        paired_edges, authoritative = self._parse_constraints()
+        if opt.prob is None:
+            # Lite build: no PuLP problem was constructed, derive topology directly.
+            paired_edges, authoritative = self._topology_direct()
+        else:
+            paired_edges, authoritative = self._parse_constraints()
         # Flow edges are taken from the ILP's output_input_consistent constraints
         # (the authoritative producer per consumer-arg), NOT from _all_input_nodes:
         # the two disagree for some ops (einsum list-args, alias/backward nodes),
@@ -425,8 +453,214 @@ class ApproximateShardingSolver:
                 self.allowed_out[n] = [o for o in self.allowed_out[n] if o in out_set]
         return paired_edges, authoritative
 
+    def _topology_direct(self):
+        """Compute the same topology (forbidden / out_idx restrictions / paired
+        edges / flow producers) that _parse_constraints extracts, but directly
+        from the graph + cluster_links + _constraint_log, WITHOUT a PuLP problem.
+        This lets the optimizer skip building millions of PuLP variables and
+        constraints when only the approximate solver is used.
+
+        Mirrors ShardingOptimizer.add_inf_cost_constraint /
+        add_grad_reduce_dtype_constraints / add_forward_backward_consistency_constraints /
+        _add_paired_output_constraint / add_node_constraint /
+        add_output_input_consistent_constraint. Verified byte-identical to
+        _parse_constraints on a full build (see tests)."""
+        from torch._functorch._aot_autograd.fx_utils import (
+            get_param_and_grad_nodes,
+            get_plain_input_and_grad_nodes,
+            get_plain_output_and_tangent_nodes,
+        )
+
+        opt = self.opt
+        cl = opt.cluster_links  # node-level: copy node idx -> root node idx
+
+        def rootkey(k):
+            return opt._cluster_root_key(k)
+
+        cluster_linked = set(cl)
+        node_root = dict(cl)
+
+        def nroot(idx):
+            return node_root.get(idx, idx)
+
+        # 1. inf-cost forbidden (== add_inf_cost_constraint).
+        for key, dv in opt.decision_vars.items():
+            if not math.isfinite(dv.cost) or dv.cost == _INVALID_COST:
+                self.forbidden.add(key)
+
+        # 2a. forward param-dtype forbidden (== add_grad_reduce_dtype_constraints
+        #     forward part, unconditional). Force the FSDP allgather to run after
+        #     a downcasting param dtype_cast (in the smaller param_dtype) by
+        #     forbidding any pre-cast redistribution.
+        cast_op = torch.ops.autoparallel.dtype_cast.default
+        fwd_pre_cast: set[int] = set()
+        for param, _grad in get_param_and_grad_nodes(opt.graph).values():
+            n = param
+            while True:
+                if n.target == cast_op:
+                    break
+                users = list(n.users.keys())
+                if len(users) != 1:
+                    break
+                child = users[0]
+                if len(child.all_input_nodes) != 1:
+                    break
+                n = child
+            if n.target != cast_op:
+                continue
+            if n.meta["val"].dtype.itemsize >= param.meta["val"].dtype.itemsize:
+                continue  # only constrain downcasts
+            node = n
+            while node != param:
+                if node in opt.node_map:
+                    fwd_pre_cast.add(opt.node_map[node])
+                node = node.all_input_nodes[0]
+        # In the lazy build there are no decision_vars to stamp, so record the
+        # pre-cast nodes; the lazy edge provider forbids their redistributions.
+        self._pre_cast_nodes.update(fwd_pre_cast)
+        for key, dv in opt.decision_vars.items():
+            if key[0] in fwd_pre_cast and dv.comm_cost > 0:
+                self.forbidden.add(key)
+
+        # 2. grad-reduce-dtype (backward) forbidden
+        #    (== add_grad_reduce_dtype_constraints backward part).
+        if getattr(opt, "force_grad_reduce_in_higher_precision", False):
+            cast_op = torch.ops.autoparallel.dtype_cast.default
+            pre_cast: set[int] = set()
+            for param, grad in get_param_and_grad_nodes(opt.graph).values():
+                if grad is None:
+                    continue
+                chain = [grad]
+                n = grad
+                while len(n.all_input_nodes) == 1:
+                    parent = n.all_input_nodes[0]
+                    if len(parent.all_input_nodes) != 1:
+                        break
+                    chain.append(parent)
+                    n = parent
+                cast_idx = next(
+                    (i for i, nd in enumerate(chain) if nd.target == cast_op), None
+                )
+                if cast_idx is None:
+                    continue
+                for nd in chain[cast_idx:]:
+                    if nd in opt.node_map:
+                        pre_cast.add(opt.node_map[nd])
+            self._pre_cast_nodes.update(pre_cast)
+            for key, dv in opt.decision_vars.items():
+                if key[0] in pre_cast and dv.comm_cost > 0:
+                    self.forbidden.add(key)
+
+        # 3. forward/backward paired output constraints + disables
+        #    (== add_forward_backward_consistency_constraints / _add_paired_output_constraint).
+        paired_edges: list[tuple[int, int, frozenset]] = []
+
+        def add_paired(node_a, node_b):
+            idx_a, idx_b = opt.node_map[node_a], opt.node_map[node_b]
+            strat_a = [str(s.output_specs) for s in opt.strats[node_a].strategies]
+            strat_b = [str(s.output_specs) for s in opt.strats[node_b].strategies]
+            num_inp_a = len(opt.strats[node_a].strategies[0].redistribute_cost[0])
+            for out_idx, sp in enumerate(strat_a):
+                if sp not in strat_b:
+                    for inp in range(num_inp_a):
+                        self.forbidden.add(rootkey((idx_a, 0, out_idx, inp)))
+                    continue
+                out_idx_b = strat_b.index(sp)
+                ra = rootkey((idx_a, 0, out_idx, 0))[0]
+                rb = rootkey((idx_b, 0, out_idx_b, 0))[0]
+                paired_edges.append((ra, rb, frozenset({(out_idx, out_idx_b)})))
+
+        for param, grad in get_param_and_grad_nodes(opt.graph).values():
+            if grad is not None:
+                add_paired(param, grad)
+        for node, gnode in get_plain_input_and_grad_nodes(opt.graph).values():
+            if gnode is not None:
+                add_paired(node, gnode)
+        for node, tnode in get_plain_output_and_tangent_nodes(opt.graph).values():
+            if tnode is not None:
+                add_paired(node, tnode)
+
+        # 4. user node/input/output placement restrictions (== add_node_constraint),
+        #    replayed from _constraint_log.
+        restrict: dict[int, set] = {}
+        for fname, kwargs in getattr(opt, "_constraint_log", []):
+            if fname != "add_node_constraint":
+                continue
+            node = next(
+                (nd for nd in opt.nodes if nd.name == kwargs["node_name"]), None
+            )
+            if node is None or node not in opt.strats:
+                continue
+            placement = kwargs["placement"]
+            if placement is None:
+                placement = (Shard(0),) + (Replicate(),) * (opt.mesh.ndim - 1)
+            out_set = set()
+            for i, s in enumerate(opt.strats[node].strategies):
+                specs = s.output_specs
+                if isinstance(specs, DTensorSpec):
+                    if specs.placements == placement:
+                        out_set.add(i)
+                elif isinstance(specs, (list, tuple)):
+                    for spec in specs:
+                        if isinstance(spec, DTensorSpec):
+                            if spec.placements == placement:
+                                out_set.add(i)
+                            break
+            r = nroot(opt.node_map[node])
+            restrict[r] = restrict.get(r, out_set) & out_set
+        for n_idx, out_set in restrict.items():
+            if n_idx in self.allowed_out:
+                self.allowed_out[n_idx] = [
+                    o for o in self.allowed_out[n_idx] if o in out_set
+                ]
+
+        # 5. flow producers (== add_output_input_consistent_constraint): for each
+        #    consumer-arg, the set of (cluster-resolved) producers feeding it.
+        authoritative: dict[tuple[int, int], set] = {}
+        for node in opt.graph.nodes:
+            if node.op == "output" or node not in opt.node_map:
+                continue
+            p_idx = opt.node_map[node]
+            p_linked = p_idx in cluster_linked
+            p_root = nroot(p_idx)
+            for user in node.users:
+                if user.op == "output" or user not in opt.node_map:
+                    continue
+                u_idx = opt.node_map[user]
+                if p_linked and u_idx in cluster_linked:
+                    continue
+                ain = opt._all_input_nodes(user)
+                argi = next((i for i, x in enumerate(ain) if x is node), None)
+                if argi is None:
+                    continue
+                ispecs = opt.strats[user].strategies[0].input_specs
+                if argi < len(ispecs) and ispecs[argi] is None:
+                    continue
+                authoritative.setdefault((nroot(u_idx), argi), set()).add(p_root)
+
+        return paired_edges, authoritative
+
     def _is_forbidden(self, key) -> bool:
-        """Return whether constraints or invalid-cost pruning removed an edge."""
+        """A strategy edge is forbidden if a constraint ruled it out OR it was
+        pruned for infinite cost. Pruning removes such keys from decision_vars
+        entirely (see ShardingOptimizer._build_decision_vars), so a key missing
+        from decision_vars is just as forbidden as one in ``self.forbidden``.
+
+        In the lazy build there are no decision_vars, so an infinite-cost edge
+        (an invalid redistribution, which the eager build prunes out of
+        decision_vars) is discovered by computing the edge cost on demand and
+        checking finiteness — same notion of forbidden, just learned lazily.
+        Keeping this in sync with the eager pruning is what lets _out_fully_
+        forbidden and candidate pruning drop the same infeasible strategies."""
+        if self._lazy:
+            if key in self.forbidden:
+                return True
+            v, argi, ov, op = key
+            p = self._arg_prod.get(v, {}).get(argi)
+            if p is None:
+                return False  # producer-less arg: 0-cost dummy, never infinite
+            comm, _trans = self._edge_cost(v, argi, ov, op, p)
+            return not math.isfinite(comm)
         return key in self.forbidden or key not in self.opt.decision_vars
 
     def _surviving_dv(self, v, argi, o):
@@ -595,6 +829,8 @@ class ApproximateShardingSolver:
             group.choices = [group.choices[ci] for ci in sorted(keep)]
 
     def _choice_lower_bound(self, v, node, o):
+        if self._lazy:
+            return self._choice_lower_bound_lazy(v, node, o)
         opt = self.opt
         strat = opt.strats[node].strategies[o]
         mult = self.node_mult[v]
@@ -661,7 +897,12 @@ class ApproximateShardingSolver:
         }
 
     def _param_ratio(self, v, node, o):
-        spec = self._surviving_dv(v, 0, o).input_spec
+        if self._lazy:
+            # input_specs[0] is the param's own (redistributed) spec, identical to
+            # the eager _surviving_dv(v, 0, o).input_spec but without decision_vars.
+            spec = self.opt.strats[node].strategies[o].input_specs[0]
+        else:
+            spec = self._surviving_dv(v, 0, o).input_spec
         new_shape, _ = _get_sharded_shape_stride(spec)
         return math.prod(new_shape) / math.prod(spec.tensor_meta.shape)
 
@@ -714,9 +955,125 @@ class ApproximateShardingSolver:
         self.nbrs = [sorted(s) for s in nbr_set]
 
     # ------------------------------------------------------------------ #
+    # Lazy cost provider (build_costs=False): compute on demand, memoized.
+    # These mirror the eager readers below but call the cost estimators
+    # directly instead of reading opt.decision_vars (which is empty).
+    # ------------------------------------------------------------------ #
+    def _compute_cost(self, m, o):
+        """Per-arg compute cost of node m at output strategy o, matching the
+        eager per_arg_compute = estimate_strategy_runtime_cost / num_args."""
+        ck = (m, o)
+        c = self._compute_cache.get(ck)
+        if c is not None:
+            return c
+        node = self.opt.nodes[m]
+        strats = self.opt.strats[node].strategies
+        num_args = max(len(strats[0].input_specs), 1)
+        c = estimate_strategy_runtime_cost(node, strats[o]) / num_args
+        self._compute_cache[ck] = c
+        return c
+
+    def _edge_cost(self, v, argi, ov, op, p):
+        """(comm_cost, transition_cost) for the edge feeding consumer v's arg
+        argi from producer p, with v at output ov and p at output op. Computed
+        via the same estimator the eager build uses (opt._compute_edge_costs) and
+        memoized. comm is INF for an infeasible redistribution or one forbidden
+        because v precedes a downcasting dtype_cast (lazy analogue of the eager
+        per-key dtype/inf pruning)."""
+        ck = (v, argi, ov, op)
+        cached = self._edge_cache.get(ck)
+        if cached is not None:
+            return cached
+        opt = self.opt
+        node = opt.nodes[v]
+        strat = opt.strats[node].strategies[ov]
+        redist = strat.redistribute_cost[argi]
+        default = redist[op] if op < len(redist) else 0.0
+        prod_strat = opt.strats[opt.nodes[p]]
+        comm, trans = opt._compute_edge_costs(
+            node, strat, argi, op, default, prod_strat
+        )
+        if comm > 0 and v in self._pre_cast_nodes:
+            comm = INF
+        result = (comm, trans)
+        self._edge_cache[ck] = result
+        return result
+
+    def _self_cost_vec_lazy(self, m, out_indices):
+        node = self.opt.nodes[m]
+        strats = self.opt.strats[node].strategies
+        out = np.empty(len(out_indices))
+        for i, o in enumerate(out_indices):
+            # Producer-less args contribute 0 comm/transition in the fast build
+            # (their redistribute_cost is the 0.0 enumeration dummy), so the self
+            # cost is just the per-strategy compute over all args.
+            out[i] = self._compute_cost(m, o) * len(strats[o].redistribute_cost)
+        return out
+
+    def _edge_matrix_lazy(self, v, argi, p):
+        opt = self.opt
+        Kv = len(opt.strats[opt.nodes[v]].strategies)
+        Kp = len(opt.strats[opt.nodes[p]].strategies)
+        R = np.full((Kv, Kp), BIG)
+        gv = self.node_to_group[v]
+        gp = self.node_to_group[p]
+        ov_vals = sorted({c[v] for c in self.groups[gv].choices})
+        op_vals = sorted({c[p] for c in self.groups[gp].choices})
+        for ov in ov_vals:
+            for op in op_vals:
+                if (v, argi, ov, op) in self.forbidden:
+                    continue  # constraint-forbidden; infinite-cost => finite check
+                comm, trans = self._edge_cost(v, argi, ov, op, p)
+                if math.isfinite(comm):
+                    R[ov, op] = comm + trans
+        return R
+
+    def _choice_lower_bound_lazy(self, v, node, o):
+        strat = self.opt.strats[node].strategies[o]
+        mult = self.node_mult[v]
+        lb = self._compute_cost(v, o) * len(strat.redistribute_cost) * mult
+        # Include the cheapest feasible comm+transition per producer arg so lazy
+        # candidate ranking is identical to eager ranking.
+        for argi, p in self.input_edges.get(v, []):
+            best = INF
+            for op in range(len(strat.redistribute_cost[argi])):
+                if self._is_forbidden((v, argi, o, op)):
+                    continue
+                comm, trans = self._edge_cost(v, argi, o, op, p)
+                if math.isfinite(comm):
+                    best = min(best, comm + trans)
+            if math.isfinite(best):
+                lb += mult * best
+        return lb
+
+    def _total_objective_lazy(self):
+        total = 0.0
+        for v in self.cost_bearing:
+            node = self.opt.nodes[v]
+            o = self.cur_out[v]
+            strat = self.opt.strats[node].strategies[o]
+            prod = self._arg_prod.get(v, {})
+            n_args = len(strat.redistribute_cost)
+            c = self._compute_cost(v, o) * n_args
+            for argi in range(n_args):
+                p = prod.get(argi)
+                if p is None:
+                    continue  # producer-less arg: 0 comm/transition (fast build)
+                inp = self.cur_out[p]
+                if self._is_forbidden((v, argi, o, inp)):
+                    return INF
+                comm, trans = self._edge_cost(v, argi, o, inp, p)
+                if not math.isfinite(comm):
+                    return INF
+                c += comm + trans
+            total += self.node_mult[v] * c
+        return total
+
     def _self_cost_vec(self, m, out_indices):
         """Vectorized self-cost (compute + producer-less arg costs) for node m
         over an array of out_idx."""
+        if self._lazy:
+            return self._self_cost_vec_lazy(m, out_indices)
         opt = self.opt
         node = opt.nodes[m]
         prod = self._arg_prod.get(m, {})
@@ -747,6 +1104,8 @@ class ApproximateShardingSolver:
         """Raw (Kv, Kp) edge cost matrix R[o_v][o_p] = comm + transition, BIG when
         the (o_v, o_p) combination is forbidden. Only entries that can actually be
         indexed by the group choices are filled; the rest are BIG."""
+        if self._lazy:
+            return self._edge_matrix_lazy(v, argi, p)
         opt = self.opt
         Kv = len(opt.strats[opt.nodes[v]].strategies)
         Kp = len(opt.strats[opt.nodes[p]].strategies)
@@ -1236,6 +1595,8 @@ class ApproximateShardingSolver:
     def total_objective(self):
         """Exact objective of the current assignment via decision_vars (for
         verification); equals pulp.value(prob.objective) after write-back."""
+        if self._lazy:
+            return self._total_objective_lazy()
         total = 0.0
         for v in self.cost_bearing:
             node = self.opt.nodes[v]
@@ -1256,8 +1617,10 @@ class ApproximateShardingSolver:
 
     def _write_back(self):
         opt = self.opt
-        for var in opt.pulp_variables.values():
-            var.varValue = 0
+        has_pulp = bool(opt.pulp_variables)
+        if has_pulp:
+            for var in opt.pulp_variables.values():
+                var.varValue = 0
         selected = []
         feasible = True
         for v in self.cost_bearing:
@@ -1271,20 +1634,29 @@ class ApproximateShardingSolver:
                 key = (v, argi, o, inp)
                 if self._is_forbidden(key):
                     feasible = False
-                if key in opt.pulp_variables:
+                # A pruned key has no PuLP variable; the infeasible flag above
+                # already records it (and raises in _solve).
+                if has_pulp and key in opt.pulp_variables:
                     opt.pulp_variables[key].varValue = 1
                 selected.append(key)
         opt.selected_keys = list(selected)
         for rk in selected:
             opt.selected_keys.extend(opt._linked_option_keys(rk))
-        opt._set_objective()
-        self._violated_constraints = [
-            name
-            for name, constraint in opt.prob.constraints.items()
-            if not constraint.valid(1e-6)
-        ]
-        feasible = feasible and not self._violated_constraints
-        if feasible:
-            opt.prob.status = pulp.LpStatusNotSolved
-            opt.prob.sol_status = pulp.LpSolutionIntegerFeasible
+        # Populate prob.objective (when a PuLP problem exists) so callers can also
+        # score via pulp.value(prob.objective); the returned value uses the
+        # equivalent but cheaper total_objective(). In the lite (no-PuLP) build,
+        # there is no problem to populate.
+        if opt.prob is not None:
+            opt._set_objective()
+            self._violated_constraints = [
+                name
+                for name, constraint in opt.prob.constraints.items()
+                if not constraint.valid(1e-6)
+            ]
+            feasible = feasible and not self._violated_constraints
+            if feasible:
+                opt.prob.status = pulp.LpStatusNotSolved
+                opt.prob.sol_status = pulp.LpSolutionIntegerFeasible
+        else:
+            self._violated_constraints = []
         return INF if not feasible else self.total_objective()
