@@ -290,7 +290,7 @@ def test_prefetch_discount_replaces_scale_without_mutating_costs():
     )
     optimizer.decision_vars = {key: decision, illegal_key: illegal_decision}
     optimizer.cluster_links = {}
-    optimizer._root_to_linked = {}
+    optimizer._root_to_copies = {}
     optimizer._prefetch_discount = 1.0
     optimizer._prefetchable_keys = {key, illegal_key}
     optimizer.prob = pulp.LpProblem("prefetch_test", pulp.LpMinimize)
@@ -397,7 +397,7 @@ def test_solution_cost_breakdown_remains_undiscounted(monkeypatch):
     }
     optimizer.node_map = {producer: 0, consumer: 1}
     optimizer._all_input_nodes = lambda node: [] if node is producer else [producer]
-    optimizer._resolve_decision_var = lambda key: decisions[key[0]]
+    optimizer._find_decision_var = lambda node_idx, argi, out_idx: decisions[node_idx]
     optimizer._prefetch_discount = 0.0
 
     def fail(_key):
@@ -452,7 +452,7 @@ def test_apply_prefetch_discount(device_mesh_2d):
         optimizer._set_objective()
         key = next(iter(optimizer._get_prefetchable_keys()))
         dv = optimizer.decision_vars[key]
-        multiplier = 1 + len(optimizer._root_to_linked.get(key, []))
+        multiplier = 1 + len(optimizer._root_to_copies.get(key[0], ()))
         expected = (dv.cost - 0.5 * dv.comm_cost) * multiplier
         assert optimizer.prob.objective[dv.var] == pytest.approx(expected)
 
