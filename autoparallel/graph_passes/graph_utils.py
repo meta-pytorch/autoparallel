@@ -3,6 +3,7 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+import operator
 from typing import Union
 
 import torch
@@ -12,6 +13,7 @@ from torch._functorch._aot_autograd.fx_utils import (
 )
 from torch._functorch._aot_autograd.subclass_utils import create_subclass_meta
 from torch._functorch.aot_autograd import JointWithDescriptors
+from torch._functorch.partitioners import _has_tag_is_backward
 from torch._inductor.fx_passes.joint_graph import patterns
 from torch._inductor.fx_passes.post_grad import remove_assert_ops, remove_noop_ops
 from torch._inductor.pattern_matcher import stable_topological_sort
@@ -96,6 +98,20 @@ def update_joint_with_descriptors(
     )
 
 
+def _is_forward_local_map_output(node):
+    if node.target is not operator.getitem:
+        return False
+    hop = node.args[0]
+    local_map_kwargs = hop.meta.get("local_map_kwargs") or {}
+    out_placements = local_map_kwargs.get("out_placements") or ()
+    idx = node.args[1]
+    return (
+        not _has_tag_is_backward(hop)
+        and idx < len(out_placements)
+        and out_placements[idx] is not None
+    )
+
+
 def _add_alias(gm, version="v1"):
     """
     Helper function to add alias nodes to every node in the graph
@@ -136,9 +152,14 @@ def _add_alias(gm, version="v1"):
                 node = list(node.users)[0]
             _insert_alias(node)
     elif version == "v2":
-        # for every node that has more than one user
+        # for every node that has more than one user, and for every declared
+        # forward local_map output: its placement is fixed by out_placements,
+        # so the alias is the only point where the solver can redistribute it
+        # (backward outputs are grads, only redistributed after their dtype_cast)
         for node in nodes:
-            if len(node.users) < 2:
+            if len(node.users) < 2 and not (
+                node.users and _is_forward_local_map_output(node)
+            ):
                 continue
             # don't add alias for ops which return tuple for now
             if not isinstance(node.meta["val"], torch.Tensor):
