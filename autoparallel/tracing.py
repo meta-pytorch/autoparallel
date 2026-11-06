@@ -5,10 +5,12 @@
 
 import copy
 from contextlib import contextmanager
+from typing import Any
 
 import torch
 from torch._inductor.decomposition import select_decomp_table
 from torch._subclasses import FakeTensorMode
+from torch.ao.quantization.fake_quantize import FusedMovingAvgObsFakeQuantize
 
 
 def _get_decomp_table():
@@ -34,6 +36,50 @@ def _get_decomp_table():
     # decomp_table = None
 
     return decomp_table
+
+
+def _resize_qat_weight_observer_buffers(model: torch.nn.Module) -> None:
+    """Correct stale shapes returned by the fused observer's fake implementation.
+
+    Fresh per-channel weight observers have scalar or empty buffers, while the
+    first real call returns channel-sized mutation outputs.
+    """
+    for module in model.modules():
+        observer = getattr(module, "weight_fake_quant", None)
+        weight = getattr(module, "weight", None)
+        if (
+            not isinstance(observer, FusedMovingAvgObsFakeQuantize)
+            or not observer.is_per_channel
+            or not isinstance(weight, torch.Tensor)
+        ):
+            continue
+        channels = weight.shape[observer.ch_axis]
+        for buffer in (
+            observer.scale,
+            observer.zero_point,
+            observer.activation_post_process.min_val,
+            observer.activation_post_process.max_val,
+        ):
+            if buffer.shape != (channels,):
+                buffer.resize_(channels)
+
+
+@contextmanager
+def _enable_fused_qat_observer_tracing(model: torch.nn.Module):
+    has_fused_observer = any(
+        isinstance(module, FusedMovingAvgObsFakeQuantize) for module in model.modules()
+    )
+    if not has_fused_observer:
+        yield
+        return
+
+    observer_cls: Any = FusedMovingAvgObsFakeQuantize
+    original_forward = observer_cls.forward
+    observer_cls.forward = torch._dynamo.dont_skip_tracing(original_forward)
+    try:
+        yield
+    finally:
+        observer_cls.forward = original_forward
 
 
 def move_to_fake(model: torch.nn.Module, mode: FakeTensorMode, device: torch.device):
