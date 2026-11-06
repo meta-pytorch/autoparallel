@@ -26,6 +26,7 @@ def _optimizer(problem):
         prob=problem,
         solver_time_limit_seconds=7,
         _apply_memory_constraint=lambda: None,
+        _apply_parameter_axis_constraints=lambda: None,
         get_violated_constraints_log=lambda: "",
     )
 

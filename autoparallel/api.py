@@ -409,6 +409,16 @@ class AutoParallel:
 
         self.sharding_optimizer.add_parameter_memory_constraint(low, high)
 
+    def add_parameter_axis_constraint(self, axis, placement):
+        """Require every parameter to use ``placement`` on one mesh axis.
+
+        ``axis`` is a mesh dimension name or index. The remaining mesh axes stay
+        free for the solver, so this expresses layouts such as HSDP: replicate
+        parameters on the replicate axis and let the solver shard the rest.
+        """
+        self._assert_entered()
+        self.sharding_optimizer.add_parameter_axis_constraint(axis, placement)
+
     def add_input_constraints(self, constraints):
         """Constrain flattened input leaves.
 
