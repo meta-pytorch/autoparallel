@@ -68,6 +68,29 @@ def test_deterministic():
     assert m1 == m2
 
 
+def test_custom_estimator_handles_unbacked_dynamic_shapes(device_mesh_1d):
+    from torch._subclasses.fake_tensor import FakeTensorMode
+    from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+    shape_env = ShapeEnv()
+    fake_mode = FakeTensorMode(shape_env=shape_env)
+    dynamic_size = shape_env.create_unbacked_symint()
+    with fake_mode:
+        value = torch.empty(dynamic_size, 128, device="cuda")
+
+    graph = torch.fx.Graph()
+    input_node = graph.placeholder("input")
+    input_node.meta["val"] = value
+    relu = graph.call_function(torch.ops.aten.relu.default, (input_node,))
+    relu.meta["val"] = value
+    graph.output(relu)
+
+    estimator = make_custom_runtime_estimation(device_mesh_1d)
+    estimate = estimator(relu)
+    assert isinstance(estimate, float)
+    assert estimate >= 0
+
+
 def test_with_autoparallel(device_mesh_1d):
     dim = 128
 
