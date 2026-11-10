@@ -450,10 +450,12 @@ def _make_local_args(gm, physical_placements):
         # rank-varying local sizes.
         if isinstance(tensor, FakeTensor) and tensor.fake_mode.shape_env is not None:
             dynamic_sizes = [
-                DimDynamic.DYNAMIC
-                if (isinstance(s, torch.SymInt) and not s.node.expr.is_number)
-                or _has_rank_varying_size(i, tensor.shape, spec)
-                else DimDynamic.STATIC
+                (
+                    DimDynamic.DYNAMIC
+                    if (isinstance(s, torch.SymInt) and not s.node.expr.is_number)
+                    or _has_rank_varying_size(i, tensor.shape, spec)
+                    else DimDynamic.STATIC
+                )
                 for i, s in enumerate(tensor.shape)
             ]
             # Use unset_fake_temporarily so torch.empty creates a real meta
