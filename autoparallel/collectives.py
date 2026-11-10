@@ -76,9 +76,15 @@ def _get_group_name_from_axis_name(mesh_name):
 
 def axis_size(axis_name):
     mesh = get_mesh_from_global()
-    assert axis_name in mesh.mesh_dim_names
-    axis_dim = mesh.mesh_dim_names.index(axis_name)
-    return mesh.size(axis_dim)
+    if mesh.mesh_dim_names is not None and axis_name in mesh.mesh_dim_names:
+        axis_dim = mesh.mesh_dim_names.index(axis_name)
+        return mesh.size(axis_dim)
+    # Flattened sub-mesh axis (e.g. an EP group folded from several root axes via
+    # ``mesh[...]._flatten(axis_name)``). Resolve the size from the process group
+    # rather than ``mesh[axis_name]``: subscripting builds a submesh that Dynamo
+    # lifts into the local_map HOP inputs, while ``get_group`` (also used by the
+    # collectives) constant-folds during tracing.
+    return mesh.get_group(axis_name).size()
 
 
 def axis_index(axis_name):
@@ -218,8 +224,18 @@ class _AllToAll(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx: Any, grad_output: torch.Tensor):  # type: ignore[override]
-        return _all_to_all(
-            grad_output, ctx.input_split_sizes, ctx.output_split_sizes, ctx.group_name
+        # forward has 4 inputs (x, output_split_sizes, input_split_sizes,
+        # axis_name); return one grad per input (None for the non-tensors).
+        return (
+            _all_to_all(
+                grad_output,
+                ctx.input_split_sizes,
+                ctx.output_split_sizes,
+                ctx.group_name,
+            ),
+            None,
+            None,
+            None,
         )
 
 
