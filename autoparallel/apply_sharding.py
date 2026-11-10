@@ -17,6 +17,7 @@ from torch._functorch._aot_autograd.fx_utils import (
     get_named_param_nodes,
 )
 from torch._inductor.decomposition import select_decomp_table
+from torch._prims_common import make_contiguous_strides_for
 from torch._subclasses.fake_tensor import FakeTensor, unset_fake_temporarily
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor._dtensor_spec import DTensorSpec, ShardOrderEntry
@@ -270,22 +271,25 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
         # In static mode, view ops use DTensor wrapping to convert global
         # shape args to local (DTensor handles the global→local conversion
         # internally). Not needed in dynamic mode since shape args are already
-        # localized above.
+        # localized above. The local tensor is made contiguous before wrapping:
+        # DTensor.contiguous() runs sharding propagation for clone, which is
+        # uncached while tracing and expands to every full-mesh strategy. The
+        # logical stride is therefore the contiguous stride of the logical shape.
         if not self.dynamic and target in _VIEW_OPS and tgt_spec is not None:
             global_metadata = {}
             if tgt_spec.tensor_meta is not None:
+                global_shape = tgt_spec.tensor_meta.shape
                 global_metadata = {
-                    "shape": tgt_spec.tensor_meta.shape,
-                    "stride": tgt_spec.tensor_meta.stride,
+                    "shape": global_shape,
+                    "stride": make_contiguous_strides_for(global_shape),
                 }
             new_args[0] = DTensor.from_local(
-                new_args[0],
+                new_args[0].contiguous(),
                 tgt_spec.mesh,
                 tgt_spec.placements,
                 **global_metadata,
             )
             new_args[0]._spec.shard_order = tgt_spec.shard_order
-            new_args[0] = new_args[0].contiguous()
 
         return new_args, last_tgt_spec
 
@@ -402,9 +406,10 @@ def _make_local_args(gm, physical_placements):
     """Create local tensors for each placeholder via DTensor redistribute.
 
     Uses DTensor's redistribute to compute correct local shapes and strides.
-    When the FakeTensorMode has a ShapeEnv (dynamic shapes), re-creates the
-    local tensors with fresh SymInts for batch-dependent dims. The caller
-    must swap the ShapeEnv to a fresh one before calling this function.
+    When the FakeTensorMode traces dynamic shapes (static_shapes=False),
+    re-creates the local tensors with fresh SymInts for batch-dependent dims.
+    The caller must swap the ShapeEnv to a fresh one before calling this
+    function.
     """
     from torch.fx.experimental.symbolic_shapes import (
         DimDynamic,
@@ -451,7 +456,7 @@ def _make_local_args(gm, physical_placements):
         # like the batch dim, not a guarded model constant like hidden_dim
         # whose expr collapsed to a number), or if uneven sharding causes
         # rank-varying local sizes.
-        if isinstance(tensor, FakeTensor) and tensor.fake_mode.shape_env is not None:
+        if isinstance(tensor, FakeTensor) and not tensor.fake_mode.static_shapes:
             dynamic_sizes = [
                 DimDynamic.DYNAMIC
                 if (isinstance(s, torch.SymInt) and not s.node.expr.is_number)
