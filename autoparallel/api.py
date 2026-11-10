@@ -51,7 +51,9 @@ from .optimize_sharding import ShardingOptimizer
 from .shardings.placement_options import _get_device_from_mesh
 from .tracing import (
     _add_unused_params_and_buffers,
+    _enable_fused_qat_observer_tracing,
     _get_decomp_table,
+    _resize_qat_weight_observer_buffers,
     enable_local_map_wrapping,
     move_to_fake,
 )
@@ -186,6 +188,7 @@ def build_joint_graph(
         set_dtype_cast(True),
         enable_local_map_wrapping(),
         torch._dynamo.utils._disable_saved_tensors_hooks_during_tracing(),
+        _enable_fused_qat_observer_tracing(model),
     ):
         torch_ir_with_fqn = _dynamo_graph_capture_for_export(model)(
             *traced_inputs.args, **traced_inputs.kwargs
@@ -270,6 +273,7 @@ class AutoParallel:
         if self.mp_policy is not None:
             apply_dtype_cast(model, self.mp_policy)
 
+        _resize_qat_weight_observer_buffers(model)
         self.model = move_to_fake(model, self.fake_mode, device)
         self.param_aliases = _build_alias_map(self.model.named_parameters)
         self.buffer_aliases = _build_alias_map(self.model.named_buffers)
