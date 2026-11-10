@@ -84,12 +84,12 @@ def _assign_attr(
         if not hasattr(curr_mod, attr_name):
             # Check if we should create a module matching the ref_module type
             # Navigate to the same location in ref_module
-            ref_curr_mod = ref_module
+            ref_curr_mod: torch.nn.Module | None = ref_module
             for ref_attr_name in prefix[:i]:
                 if hasattr(ref_curr_mod, ref_attr_name):
                     ref_curr_mod = getattr(ref_curr_mod, ref_attr_name)
                 else:
-                    ref_curr_mod = None  # type: ignore[assignment]
+                    ref_curr_mod = None
                     break
 
             # Create an instance of the same type as in ref_module
@@ -117,11 +117,21 @@ def _assign_attr(
         assert isinstance(attr, torch.Tensor)
         ref_curr_mod = ref_module
         for attr_name in prefix:
-            ref_curr_mod = getattr(ref_curr_mod, attr_name)
+            ref_curr_mod = getattr(ref_curr_mod, attr_name, None)
+            if ref_curr_mod is None:
+                break
+        persistent = (
+            ref_curr_mod is not None
+            and field in ref_curr_mod._buffers
+            and field not in ref_curr_mod._non_persistent_buffers_set
+        )
         curr_mod.register_buffer(
             field,
             attr,
-            persistent=field not in ref_curr_mod._non_persistent_buffers_set,
+            # Dynamo may lift closure tensors into the traced GraphModule as
+            # buffers. They are required by the parallel forward, but they are
+            # derived compiler state rather than user model checkpoint state.
+            persistent=persistent,
         )
     else:
         setattr(curr_mod, field, attr)
