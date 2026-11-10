@@ -84,12 +84,12 @@ def _assign_attr(
         if not hasattr(curr_mod, attr_name):
             # Check if we should create a module matching the ref_module type
             # Navigate to the same location in ref_module
-            ref_curr_mod = ref_module
+            ref_curr_mod: torch.nn.Module | None = ref_module
             for ref_attr_name in prefix[:i]:
                 if hasattr(ref_curr_mod, ref_attr_name):
                     ref_curr_mod = getattr(ref_curr_mod, ref_attr_name)
                 else:
-                    ref_curr_mod = None  # type: ignore[assignment]
+                    ref_curr_mod = None
                     break
 
             # Create an instance of the same type as in ref_module
