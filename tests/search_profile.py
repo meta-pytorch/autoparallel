@@ -51,11 +51,9 @@ LLAMA_CONFIGS = {
 }
 
 DSV3_DEGREES = {
-    "dp_replicate": 8,
-    "dp_shard": 8,
-    "cp": 1,
-    "tp": 1,
-    "ep": 8,
+    "2d": {"dp_replicate": 8, "dp_shard": 8, "cp": 1, "tp": 1, "ep": 8},
+    "3d": {"dp_replicate": 1, "dp_shard": 8, "cp": 1, "tp": 8, "ep": 32},
+    "4d": {"dp_replicate": 1, "dp_shard": 16, "cp": 2, "tp": 2, "ep": 8},
 }
 
 
@@ -74,9 +72,10 @@ def parse_args(argv=None):
     )
     parser.add_argument("--model", choices=(*LLAMA_CONFIGS, "dsv3"), required=True)
     parser.add_argument("--mesh", help="Comma-separated LLaMA mesh dimensions")
-    parser.add_argument("--moe-layout", choices=("2d",))
+    parser.add_argument("--moe-layout", choices=tuple(DSV3_DEGREES))
     parser.add_argument("--solver", choices=AutoParallel.SOLVER_CHOICES, required=True)
     parser.add_argument("--lazy-costs", choices=("true", "false"))
+    parser.add_argument("--seeded", action="store_true")
     parser.add_argument("--revision-label", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--detailed-solution", action="store_true")
@@ -148,14 +147,15 @@ def make_llama(model_name, mesh_shape):
     return model, input_fn, mesh, input_placement, output_placement, expanded
 
 
-def make_dsv3():
+def make_dsv3(layout):
     from autoparallel._testing.models.dsv3 import (
         DeepSeekV3Model,
         build_moe_mesh,
         make_dsv3_config,
     )
 
-    mesh, roles = build_moe_mesh(**DSV3_DEGREES)
+    degrees = DSV3_DEGREES[layout]
+    mesh, roles = build_moe_mesh(**degrees)
     config = make_dsv3_config(num_experts=64, max_seq_len=2048)
     with torch.device("meta"):
         model = DeepSeekV3Model(
@@ -178,7 +178,7 @@ def make_dsv3():
             "sequence_length": 2048,
             "batch_size": batch_size,
         },
-        "degrees": DSV3_DEGREES,
+        "degrees": degrees,
         "mesh_shape": list(mesh.shape),
         "mesh_dim_names": list(mesh.mesh_dim_names),
         "ep_axis_names": list(roles.ep_axis_names),
@@ -297,6 +297,8 @@ def run_git(*args):
 
 def git_metadata():
     status = run_git("status", "--short")
+    if status:
+        raise RuntimeError(f"profiling requires a clean Git worktree:\n{status}")
     return {
         "commit": run_git("rev-parse", "HEAD"),
         "branch": run_git("branch", "--show-current"),
@@ -318,10 +320,16 @@ def cpu_model():
 def validate_args(args):
     if args.lazy_costs is not None and args.solver != "approx":
         raise ValueError("--lazy-costs is supported only with --solver approx")
+    if args.seeded and args.solver != "approx":
+        raise ValueError("--seeded is supported only with --solver approx")
     if args.model == "dsv3":
-        if args.moe_layout != "2d" or args.mesh is not None:
-            raise ValueError("dsv3 requires --moe-layout 2d and no --mesh")
-        return 64, None
+        if args.moe_layout is None or args.mesh is not None:
+            raise ValueError("dsv3 requires --moe-layout and no --mesh")
+        degrees = DSV3_DEGREES[args.moe_layout]
+        world_size = math.prod(
+            degrees[name] for name in ("dp_replicate", "dp_shard", "cp", "tp")
+        )
+        return world_size, None
     if args.mesh is None or args.moe_layout is not None:
         raise ValueError("LLaMA requires --mesh and no --moe-layout")
     mesh_shape = tuple(int(part) for part in args.mesh.split(","))
@@ -386,7 +394,7 @@ def main(argv=None):
 
             model_started = time.perf_counter()
             built = (
-                make_dsv3()
+                make_dsv3(args.moe_layout)
                 if args.model == "dsv3"
                 else make_llama(args.model, mesh_shape)
             )
@@ -409,13 +417,12 @@ def main(argv=None):
                 lazy_costs=(
                     None if args.lazy_costs is None else args.lazy_costs == "true"
                 ),
+                strategy_radius=2 if args.seeded else None,
             )
             enter_started = time.perf_counter()
             stack.enter_context(autop)
             enter_elapsed = time.perf_counter() - enter_started
-            opt = autop.sharding_optimizer
             graph_trace_s = autop.profile_graph_trace_s
-            optimizer_init_s = opt.profile["timings"]["init_total_s"]
 
             constraint_started = time.perf_counter()
             autop.add_parameter_memory_constraint(low=None, high=None)
@@ -427,20 +434,27 @@ def main(argv=None):
             solution = autop.optimize_placement(verbose=False)
             solve_call_s = time.perf_counter() - solve_started
             search_total_s = time.perf_counter() - enter_started
-            unaccounted_s = max(
-                search_total_s
-                - graph_trace_s
-                - optimizer_init_s
-                - constraint_s
-                - solve_call_s,
-                0.0,
-            )
+            opt = autop.sharding_optimizer
+            optimizer_init_s = opt.profile["timings"]["init_total_s"]
             profile_key = {
                 "approx": "approximate",
                 "ilp": "ilp",
                 "lp": "lp_relaxation",
             }[args.solver]
             solver_profile = opt.profile[profile_key]
+            factor_build_s = solver_profile.get("build_s")
+            solver_core_s = solver_profile.get(
+                "solve_s", solver_profile.get("solve_time")
+            )
+            unaccounted_s = max(
+                search_total_s
+                - graph_trace_s
+                - optimizer_init_s
+                - constraint_s
+                - (factor_build_s or 0.0)
+                - (solver_core_s or 0.0),
+                0.0,
+            )
             result["timings"].update(
                 {
                     "enter_total_s": enter_elapsed,
@@ -448,10 +462,8 @@ def main(argv=None):
                     "optimizer_init_s": optimizer_init_s,
                     "user_constraints_s": constraint_s,
                     "solve_call_s": solve_call_s,
-                    "factor_build_s": solver_profile.get("build_s"),
-                    "solver_core_s": solver_profile.get(
-                        "solve_s", solver_profile.get("solve_time")
-                    ),
+                    "factor_build_s": factor_build_s,
+                    "solver_core_s": solver_core_s,
                     "search_total_s": search_total_s,
                     "unaccounted_s": unaccounted_s,
                 }
