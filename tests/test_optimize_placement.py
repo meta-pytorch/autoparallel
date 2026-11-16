@@ -898,45 +898,44 @@ def test_repeated_input_args_share_producer_placement(device_mesh_1d):
 
 @apply_cuda_patches
 def test_inf_redistribute_cost_bans_input_placement(device_mesh_1d, tmp_path):
-    """split_with_sizes bans inputs sharded on the split dim with an infinite
+    """DTensor bans converting between Partial reduce types with an infinite
     redistribute cost; the ban must survive edge cost estimation."""
     dim = 1024
     bs = 8 * device_mesh_1d.shape[0]
 
     class Model(nn.Module):
-        def forward(self, x):
-            a, b = F.relu(x).split([bs // 4, bs - bs // 4], dim=0)
-            return a, b
+        def forward(self, x, y):
+            return x.sum(-1, keepdim=True) + y.mean(-1, keepdim=True)
 
     def input_fn():
-        return torch.randn(bs, dim, device="cuda")
+        return torch.randn(bs, dim, device="cuda"), torch.randn(bs, dim, device="cuda")
 
     with torch.device("meta"):
         model = Model()
 
     with AutoParallel(model, input_fn, device_mesh_1d) as autop:
-        autop.add_input_constraints([(Shard(0),)])
-        autop.add_output_constraints([(Replicate(),), (Replicate(),)])
+        autop.add_input_constraints([(Shard(1),), (Shard(1),)])
+        autop.add_output_constraints([(Replicate(),)])
         autop.optimize_placement()
         opt = autop.sharding_optimizer
 
-    (split,) = opt.graph.find_nodes(
-        op="call_function", target=torch.ops.aten.split_with_sizes.default
-    )
-    split_idx = opt.node_map[split]
-    producer_strats = opt.strats[split.args[0]].strategies
-    banned = {
-        i
-        for i, s in enumerate(producer_strats)
-        if any(p.is_shard(0) or p.is_partial() for p in s.output_specs.placements)
-    }
-    assert len(banned) > 0
-    for out_idx, strategy in enumerate(opt.strats[split].strategies):
-        for inp_idx in banned:
-            assert strategy.redistribute_cost[0][inp_idx] == math.inf
-            dv = opt.decision_vars[(split_idx, 0, out_idx, inp_idx)]
-            assert dv.comm_cost == math.inf
-            assert dv.var.value() == 0
+    (add,) = opt.graph.find_nodes(op="call_function", target=torch.ops.aten.add.Tensor)
+    add_idx = opt.node_map[add]
+    n_banned = 0
+    for argi, producer in enumerate(add.args):
+        producer_strats = opt.strats[producer].strategies
+        for out_idx, strategy in enumerate(opt.strats[add].strategies):
+            tgt = strategy.input_specs[argi].placements
+            for inp_idx, src in enumerate(producer_strats):
+                src = src.output_specs.placements
+                if not (src[0].is_partial() and tgt[0].is_partial() and src != tgt):
+                    continue
+                n_banned += 1
+                assert strategy.redistribute_cost[argi][inp_idx] == math.inf
+                dv = opt.decision_vars[(add_idx, argi, out_idx, inp_idx)]
+                assert dv.comm_cost == math.inf
+                assert dv.var.value() == 0
+    assert n_banned > 0
 
     opt.save(tmp_path / "opt.ap")
     loaded = type(opt).load(tmp_path / "opt.ap")
@@ -944,3 +943,33 @@ def test_inf_redistribute_cost_bans_input_placement(device_mesh_1d, tmp_path):
     loaded.resolve()
     for key in loaded.selected_keys:
         assert math.isfinite(loaded._resolve_decision_var(key).comm_cost)
+
+
+@apply_cuda_patches
+def test_split_with_sizes_of_split_dim_sharded_input(device_mesh_1d):
+    """Splitting along a sharded dim must stay feasible by gathering the
+    input before the split."""
+
+    class Model(nn.Module):
+        def forward(self, x):
+            a, b = x.split([512, 1536], dim=0)
+            return a, b
+
+    def input_fn():
+        return torch.randn(2048, 1024, device="cuda")
+
+    with torch.device("meta"):
+        model = Model()
+
+    with AutoParallel(model, input_fn, device_mesh_1d) as autop:
+        autop.add_input_constraints([(Shard(0),)])
+        autop.add_output_constraints([(Replicate(),), (Replicate(),)])
+        solution = autop.optimize_placement()
+        opt = autop.sharding_optimizer
+
+    (split,) = opt.graph.find_nodes(
+        op="call_function", target=torch.ops.aten.split_with_sizes.default
+    )
+    strategy = solution[opt._concrete_to_orig.get(split, split)]
+    assert strategy.input_specs[0].placements == (Replicate(),)
+    assert strategy.input_specs[0].tensor_meta.shape == torch.Size([2048, 1024])
