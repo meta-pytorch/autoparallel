@@ -1,0 +1,415 @@
+{
+  "schema_version": 1,
+  "scoring": {
+    "criterion_scale": {
+      "0": "Absent, contradicted, or materially incorrect.",
+      "0.5": "Partially satisfied but incomplete or weakly evidenced.",
+      "1": "Fully satisfied with evidence from the response, trace, diff, or artifacts."
+    },
+    "weighted_score": "sum(score * weight) / sum(weight)",
+    "pass_threshold": 0.85,
+    "critical_rule": "Every critical criterion must score 1."
+  },
+  "rubrics": [
+    {
+      "id": "global_spmd_local_shuffle",
+      "skill_expected": true,
+      "criteria": [
+        {
+          "id": "identifies_semantic_change",
+          "weight": 4,
+          "critical": true,
+          "description": "Identifies that randperm operated on a process-local batch before AutoParallel but would permute the global logical batch after capture.",
+          "evidence": [
+            "response"
+          ]
+        },
+        {
+          "id": "emits_spmd_warning",
+          "weight": 3,
+          "critical": true,
+          "description": "Raises a clear SPMD modeling warning with the affected location and semantic risk instead of treating successful tracing as proof of correctness.",
+          "evidence": [
+            "response"
+          ]
+        },
+        {
+          "id": "proposes_grouped_formulation",
+          "weight": 2,
+          "critical": false,
+          "description": "Proposes preserving replica and local-batch structure or using the independent permutation construct before flattening.",
+          "evidence": [
+            "response"
+          ]
+        },
+        {
+          "id": "does_not_rewrite",
+          "weight": 3,
+          "critical": true,
+          "description": "Does not edit the model and asks the user to confirm the intended stochastic semantics before a non-trivial adaptation.",
+          "evidence": [
+            "tool_trace",
+            "workspace_diff",
+            "response"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "infer_device_mesh",
+      "skill_expected": true,
+      "criteria": [
+        {
+          "id": "bounded_candidates",
+          "weight": 3,
+          "critical": true,
+          "description": "Considers a 1D baseline and a small 2D candidate set without enumerating every factorization.",
+          "evidence": [
+            "response"
+          ]
+        },
+        {
+          "id": "topology_aligned_candidate",
+          "weight": 4,
+          "critical": true,
+          "description": "Recommends the topology-aligned (2, 8) candidate with the inner dimension mapped to the intra-node fast domain.",
+          "evidence": [
+            "response"
+          ]
+        },
+        {
+          "id": "no_three_dimensional_mesh",
+          "weight": 4,
+          "critical": true,
+          "description": "Does not recommend a mesh with more than two dimensions and relates that limit to ILP solve cost.",
+          "evidence": [
+            "response"
+          ]
+        },
+        {
+          "id": "checks_divisibility_and_batch",
+          "weight": 2,
+          "critical": false,
+          "description": "Checks model-dimension divisibility, DP batch compatibility, and rank layout before treating the mesh as valid.",
+          "evidence": [
+            "response"
+          ]
+        },
+        {
+          "id": "labels_inference",
+          "weight": 2,
+          "critical": true,
+          "description": "Labels the mesh as an inferred optimization hypothesis and proposes independent plan comparisons.",
+          "evidence": [
+            "response"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "cpu_saved_optimizer_explanation",
+      "skill_expected": true,
+      "criteria": [
+        {
+          "id": "loads_without_capture",
+          "weight": 4,
+          "critical": true,
+          "description": "Uses ShardingOptimizer.load on the trusted artifact and does not attempt CPU graph capture.",
+          "evidence": [
+            "response",
+            "tool_trace"
+          ]
+        },
+        {
+          "id": "uses_stable_graph_nodes",
+          "weight": 2,
+          "critical": false,
+          "description": "Finds the requested node in the saved optimizer graph and uses its stable name directly.",
+          "evidence": [
+            "response"
+          ]
+        },
+        {
+          "id": "counterfactual_loop",
+          "weight": 4,
+          "critical": true,
+          "description": "Shows add constraint, resolve, diff, remove returned constraint names, and resolve again to restore the baseline state.",
+          "evidence": [
+            "response"
+          ]
+        },
+        {
+          "id": "stays_explain_only",
+          "weight": 3,
+          "critical": true,
+          "description": "Does not lower, compile, benchmark, modify the artifact, or claim target execution evidence.",
+          "evidence": [
+            "response",
+            "tool_trace",
+            "workspace_diff"
+          ]
+        },
+        {
+          "id": "mentions_registration_caveat",
+          "weight": 1,
+          "critical": false,
+          "description": "Notes that non-ATen custom operations may need registration modules available when loading.",
+          "evidence": [
+            "response"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "repair_evaluation_harness",
+      "skill_expected": true,
+      "criteria": [
+        {
+          "id": "one_cost_model_lifetime",
+          "weight": 4,
+          "critical": true,
+          "description": "Keeps one topology configuration active across planning, compilation, and metrics, and passes collector.cost_model to AutoParallel.",
+          "evidence": [
+            "workspace_diff",
+            "response"
+          ]
+        },
+        {
+          "id": "single_overlap_scheduler",
+          "weight": 4,
+          "critical": true,
+          "description": "Uses the collector's post-grad scheduler and disables overlap scheduling in autoparallel_backend.",
+          "evidence": [
+            "workspace_diff"
+          ]
+        },
+        {
+          "id": "runs_both_phases_in_context",
+          "weight": 4,
+          "critical": true,
+          "description": "Runs forward and backward before leaving the collector context so lazy backward compilation is observed.",
+          "evidence": [
+            "workspace_diff"
+          ]
+        },
+        {
+          "id": "requires_and_writes_metrics",
+          "weight": 3,
+          "critical": true,
+          "description": "Requires forward and backward records and writes the collector JSON artifact.",
+          "evidence": [
+            "workspace_diff",
+            "artifacts"
+          ]
+        },
+        {
+          "id": "labels_modeled_evidence",
+          "weight": 2,
+          "critical": true,
+          "description": "Calls the results estimated rather than measured and keeps them separate from ILP objective values.",
+          "evidence": [
+            "response"
+          ]
+        },
+        {
+          "id": "notes_unpinned_post_grad_order",
+          "weight": 1,
+          "critical": false,
+          "description": "Notes that the current AutoParallel pass does not insert overlap control dependencies, so later Inductor scheduling or fusion may move the measured order.",
+          "evidence": [
+            "response"
+          ]
+        },
+        {
+          "id": "no_public_api_change",
+          "weight": 2,
+          "critical": true,
+          "description": "Changes only the isolated harness and does not add or modify a public AutoParallel API.",
+          "evidence": [
+            "workspace_diff"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "recover_infeasible_counterfactual",
+      "skill_expected": true,
+      "criteria": [
+        {
+          "id": "removes_temporary_constraint_first",
+          "weight": 4,
+          "critical": true,
+          "description": "Removes the exploratory node-constraint names and resolves before changing intended deployment constraints.",
+          "evidence": [
+            "response"
+          ]
+        },
+        {
+          "id": "relaxes_one_constraint_at_a_time",
+          "weight": 3,
+          "critical": true,
+          "description": "Tests output and memory constraints separately rather than dropping both at once.",
+          "evidence": [
+            "response"
+          ]
+        },
+        {
+          "id": "reports_causal_change",
+          "weight": 2,
+          "critical": true,
+          "description": "Records which specific relaxation restores feasibility and does not present the relaxed plan as the original deployment.",
+          "evidence": [
+            "response"
+          ]
+        },
+        {
+          "id": "does_not_retrace",
+          "weight": 2,
+          "critical": true,
+          "description": "Reuses the stable optimizer graph and does not retrace or lower during diagnosis.",
+          "evidence": [
+            "response",
+            "tool_trace"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "full_shard_overlap_uncertainty",
+      "skill_expected": true,
+      "criteria": [
+        {
+          "id": "builds_bounded_endpoint_envelope",
+          "weight": 4,
+          "critical": true,
+          "description": "Treats the undiscounted and zero-discount results as pessimistic and optimistic placement endpoints, deduplicates placement families, and does not recommend a broad discount sweep.",
+          "evidence": [
+            "response",
+            "tool_trace"
+          ]
+        },
+        {
+          "id": "labels_zero_discount_optimistic",
+          "weight": 4,
+          "critical": true,
+          "description": "States that free prefetch communication is an optimistic sensitivity assumption rather than an executable performance prediction.",
+          "evidence": [
+            "response"
+          ]
+        },
+        {
+          "id": "uses_independent_optimizer_state",
+          "weight": 2,
+          "critical": false,
+          "description": "Preserves the two endpoint placements as distinct artifacts for later lowering and does not claim that discount calls compound or require recapture.",
+          "evidence": [
+            "response"
+          ]
+        },
+        {
+          "id": "separates_storage_compute_and_topology",
+          "weight": 4,
+          "critical": true,
+          "description": "Separates persistent parameter placement from heavy-operation compute placement and flags latency-sensitive inter-node TP as topology inversion requiring investigation rather than automatic acceptance or forced reversal.",
+          "evidence": [
+            "response"
+          ]
+        },
+        {
+          "id": "evaluates_distinct_candidates_after_lowering",
+          "weight": 4,
+          "critical": true,
+          "description": "Proposes lowering only distinct candidates with the same NCCL topology, activation-checkpointing, and autobucketing configuration, then comparing forward/backward exposed communication and peak memory.",
+          "evidence": [
+            "response"
+          ]
+        },
+        {
+          "id": "reports_memory_and_batch_scope",
+          "weight": 2,
+          "critical": false,
+          "description": "Reports achieved byte-weighted parameter storage, distinguishes it from total training or transient memory, and checks effective DP degree and local batch.",
+          "evidence": [
+            "response"
+          ]
+        },
+        {
+          "id": "returns_provisional_confidence",
+          "weight": 3,
+          "critical": true,
+          "description": "Returns a provisional candidate set or confidence card when endpoint placements differ instead of claiming one ILP result is the final optimum.",
+          "evidence": [
+            "response"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "torchbench_uneven_shard_fixed_view",
+      "skill_expected": true,
+      "criteria": [
+        {
+          "id": "keeps_solve_and_lowering_evidence_distinct",
+          "weight": 5,
+          "critical": true,
+          "description": "Classifies the selected plan as ILP-feasible but failed during placement application, and does not claim successful AutoParallel execution or performance.",
+          "evidence": [
+            "response"
+          ]
+        },
+        {
+          "id": "diagnoses_logical_shape_reconstruction",
+          "weight": 5,
+          "critical": true,
+          "description": "Identifies loss of the logical global shape or stride when reconstructing the uneven local shard, including the shorter final rank rather than assuming every rank has the ceiling-sized extent.",
+          "evidence": [
+            "response"
+          ]
+        },
+        {
+          "id": "uses_replicated_plan_as_diagnostic_only",
+          "weight": 4,
+          "critical": true,
+          "description": "Uses the lowering replicated counterfactual to isolate a sharded realizability problem without silently selecting it or treating it as production performance evidence.",
+          "evidence": [
+            "response"
+          ]
+        },
+        {
+          "id": "closes_with_lowering_and_numerical_checks",
+          "weight": 4,
+          "critical": true,
+          "description": "Requires preserving logical metadata or excluding the specific unrealizable placement, then checks placement application on long and short ranks plus output shapes, values, and gradients against an unsharded reference.",
+          "evidence": [
+            "response"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "generic_pytorch_tuning",
+      "skill_expected": false,
+      "criteria": [
+        {
+          "id": "does_not_route_to_autoparallel",
+          "weight": 5,
+          "critical": true,
+          "description": "Does not invoke or recommend AutoParallel planning, meshes, ILP placement, DTensor sharding, or the skill's collector.",
+          "evidence": [
+            "response",
+            "tool_trace"
+          ]
+        },
+        {
+          "id": "answers_single_gpu_request",
+          "weight": 3,
+          "critical": false,
+          "description": "Provides a focused single-GPU profiling and pointwise-kernel optimization sequence.",
+          "evidence": [
+            "response"
+          ]
+        }
+      ]
+    }
+  ]
+}
