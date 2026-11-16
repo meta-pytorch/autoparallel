@@ -202,6 +202,16 @@ _expected_node_placements_ffn = [
 ]
 
 
+# The same placements for the einsums the transformer block's 3D matmuls are
+# converted to: abk,kn->abn (fwd and grad input) and abn,abk->kn (grad weight).
+# Activation dims shift by one due to the extra batch dim, and the grad weight
+# output is kn instead of the mm's nk.
+_einsum1 = [(Shard(0), Replicate()), (Replicate(), Shard(1)), (Shard(0), Shard(2))]
+_einsum2 = [(Shard(0), Shard(2)), (Replicate(), Shard(0)), (Shard(0), Partial("sum"))]
+_einsum3 = [(Shard(0), Replicate()), (Shard(0), Shard(2)), (Partial("sum"), Shard(0))]
+_einsum4 = [(Shard(0), Shard(2)), (Shard(0), Replicate()), (Partial("sum"), Shard(1))]
+
+
 _expected_param_placements_transformer_block = [
     (Shard(0), Shard(0)),
     (Shard(0), Shard(0)),
@@ -212,24 +222,24 @@ _expected_param_placements_transformer_block = [
 ]
 
 _expected_node_placements_transformer_block = [
-    _mm1,
-    _mm1,
-    _mm1,
-    _mm2,
-    _mm1,
-    _mm2,
-    _mm3,
-    _mm1,
-    _mm4,
-    _mm2,
-    _mm3,
-    _mm1,
-    _mm4,
-    _mm2,
-    _mm4,
-    _mm2,
-    _mm4,
-    _mm2,
+    _einsum1,
+    _einsum1,
+    _einsum1,
+    _einsum2,
+    _einsum1,
+    _einsum2,
+    _einsum3,
+    _einsum1,
+    _einsum4,
+    _einsum2,
+    _einsum3,
+    _einsum1,
+    _einsum4,
+    _einsum2,
+    _einsum4,
+    _einsum2,
+    _einsum4,
+    _einsum2,
 ]
 
 
@@ -271,20 +281,26 @@ def test_optimization_finds_fsdp_tp_2d(
 
     # check parameters are sharded as expected
     param_nodes = get_param_nodes(autop.gm.graph)
+    assert len(param_nodes) == len(expected_param_placements)
     for node, expected_placement in zip(param_nodes, expected_param_placements):
         assert sharding_placement[node].output_specs.placements == expected_placement
 
-    # chekc that matmul nodes are sharded following FSDP + TP
+    # check that matmul nodes are sharded following FSDP + TP
     mm_nodes = autop.gm.graph.find_nodes(
         op="call_function", target=torch.ops.aten.mm.default
     )
-    for node, expected_placements in zip(mm_nodes, expected_node_placements):
+    einsum_nodes = autop.gm.graph.find_nodes(
+        op="call_function", target=torch.ops.aten.einsum.default
+    )
+    linear_nodes = mm_nodes + einsum_nodes
+    assert len(linear_nodes) == len(expected_node_placements)
+    for node, expected_placements in zip(linear_nodes, expected_node_placements):
         p = sharding_placement[node]
         assert p.input_specs[0].placements == expected_placements[0]
         assert p.input_specs[1].placements == expected_placements[1]
         assert p.output_specs.placements == expected_placements[2]
 
-    # chekc that sdpa nodes (if present) are sharded following FSDP + TP
+    # check that sdpa nodes (if present) are sharded following FSDP + TP
     sdpa_nodes = autop.gm.graph.find_nodes(
         op="call_function",
         target=torch.ops.aten._scaled_dot_product_efficient_attention.default,
