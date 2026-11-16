@@ -161,15 +161,14 @@ DEVICE_LIMITS: Tuple[DeviceLimit, ...] = (
         sm=(9, 0),
         gmem_bandwidth=3.35 * (1024**4),  # NOTE: PCIe is 2 TB/s
         gemm_tflops={
-            torch.float64: 1,
-            # NOTE: NVIDIA gives all numbers "with 2:4 sparsity"
-            # but we want the full GEMM numbers
-            torch.float32: 989 // 2,
-            torch.float16: 1979 // 2,
-            torch.bfloat16: 1979 // 2,
-            torch.float8_e4m3fn: 3958 // 2,
-            torch.float8_e5m2: 3958 // 2,
-            torch.int8: 3958 // 2,
+            # NOTE: the H800 datasheet numbers are already dense
+            torch.float64: 66.91,
+            torch.float32: 535.3,
+            torch.float16: 1070.5,
+            torch.bfloat16: 1070.5,
+            torch.float8_e4m3fn: 2141.1,
+            torch.float8_e5m2: 2141.1,
+            torch.int8: 2141.1,
         },
     ),
     # Per-GPU values from the HGX B300 (8 GPUs) totals. FP64 and INT8
@@ -262,8 +261,8 @@ DEVICE_LIMITS: Tuple[DeviceLimit, ...] = (
         gmem_bandwidth=864 * (1024**3),
         gemm_tflops={
             torch.float32: 183,
-            torch.float16: 362,
-            torch.bfloat16: 362,
+            torch.float16: 366.5,
+            torch.bfloat16: 366.5,
             torch.float8_e4m3fn: 733,
             torch.float8_e5m2: 733,
             torch.int8: 733,
