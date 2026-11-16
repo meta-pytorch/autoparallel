@@ -15,28 +15,16 @@ materialized model with `.to("meta")` or `.to_empty(device="meta")` before
 capture: `nn.Module._apply` replaces each parameter independently and can
 silently untie shared weights such as tied embeddings and decoders. Have
 `input_fn` create global inputs on the mesh device type, not on meta;
-AutoParallel calls it under its fake mode.
-After `apply_placement`, materialize the parallel model with `to_empty` and
-initialize it or load a checkpoint.
+AutoParallel calls it under its fake mode. After `apply_placement`, materialize
+the parallel model with `to_empty` and initialize it or load a checkpoint.
 
-Use a real process group for execution evidence. A fake process group is useful
-for capture and planning experiments, but does not show that real collectives
-execute correctly.
+A fake process group is useful for capture and planning, but execution evidence
+needs a real one.
 
-Before capture, audit the forward with `global-spmd-modeling.md`. In particular,
-code written around `batch_size_per_gpu`, local random permutations, or explicit
-process-group reductions may change meaning when traced over a global logical
-batch. Warn the user and propose an adaptation before proceeding when unclear.
-
-Use a supplied `DeviceMesh`. Otherwise follow `mesh-selection.md`: confirm the
-intended GPU and node allocation rather than inferring it from visible devices,
-then record the inferred shape, dimension roles, and physical-link rationale.
-
-Use the real training boundary when plan quality matters. If the supplied model
-returns logits but the actual loss is outside the captured graph, state that the
-plan excludes the loss and is provisional. Include the representative loss in
-the captured module only when that matches the intended integration and the user
-authorized the adaptation.
+Capture the real training boundary when plan quality matters. If the actual
+loss lies outside the captured graph, say the plan excludes it and is
+provisional; include a representative loss only when that matches the intended
+integration and the user authorized it.
 
 ## Capture and optimize
 
@@ -46,13 +34,8 @@ The basic planning operation is:
 with AutoParallel(model, input_fn, mesh, mp_policy=mp_policy) as autop:
     autop.add_input_constraints(input_placements)
     autop.add_output_constraints(output_placements)
-
     if memory_bounds is not None:
         autop.add_parameter_memory_constraint(*memory_bounds)
-    if prefetch_discount is not None:
-        autop.sharding_optimizer.apply_prefetch_discount(
-            scale=prefetch_discount
-        )
 
     placement = autop.optimize_placement(verbose=True)
     optimizer_json = autop.sharding_optimizer.get_json()
@@ -60,20 +43,19 @@ with AutoParallel(model, input_fn, mesh, mp_policy=mp_policy) as autop:
     parallel_model = autop.apply_placement(placement)
 ```
 
-Output constraints align with the flattened output pytree. Use `None` for
-non-tensor leaves, for example `[(Shard(0),), None]` for `(logits, None)`.
-Use `UNCONSTRAINED`, imported from `autoparallel`, for a tensor leaf whose
-placement the solver should choose. `None` retains the default batch `Shard(0)`
-behavior for tensor leaves, so it is not an unconstrained request. Omit the
-whole constraint call only when every boundary tensor is unconstrained. Each
+Boundary constraints align with the flattened input or output pytree. Use
+`None` for non-tensor leaves, for example `[(Shard(0),), None]` for
+`(logits, None)`. For a tensor leaf, `None` keeps the default batch `Shard(0)`;
+use `UNCONSTRAINED`, imported from `autoparallel`, to let the solver choose, and
+omit the whole call only when every boundary tensor is unconstrained. Each
 boundary can be constrained only once per capture.
 
 Omitting the parameter-memory call leaves replication legal. Calling it with no
 arguments is different: it uses `low=0` and `high=1 / world_size`, and the
 resulting budget pins every parameter to a minimum-local-bytes placement.
-Bounds are normalized fractions of byte-weighted persistent parameter storage.
-Parameters with node constraints are excluded from the budget. Record the
-achieved values from `get_json()["summary"]["parameter_storage"]`.
+Bounds are normalized fractions of byte-weighted persistent parameter storage,
+counting aliased storage once and excluding parameters with node constraints.
+Record the achieved values from `get_json()["summary"]["parameter_storage"]`.
 
 For searches that may grow large, pass `solver_time_limit_seconds` to
 `AutoParallel`. When CBC reaches the limit without proving optimality, the
@@ -82,53 +64,35 @@ covers the PuLP solve, not graph capture or ILP construction in `__enter__`,
 so keep an outer wall-clock budget as well. An infeasible solve logs the
 violated constraints before raising.
 
-Apply a prefetch discount only as an explicit sensitivity assumption and always
-record its scale. Repeated calls replace the objective scale without mutating
-the base communication costs, so endpoint solves can reuse one optimizer. Save
-each placement and JSON result before the next solve. For a full-shard plan,
-follow `full-shard-planning.md` rather than tuning the scale until a desired
-placement appears.
+For a prefetch discount, follow `full-shard-planning.md`.
 
-Record the placement, `get_json()["summary"]`, exact constraints, discount,
-mesh, and cost model before leaving the context. Save the full optimizer with
-`save()` when repeated counterfactual analysis is likely.
+Repeated-subgraph clustering is optional compression of the ILP. AutoParallel
+skips malformed groups atomically and lists them in the JSON clustering
+summary; report them because the solve used less compression. Retry with
+`repeated_subgraphs=False` only for comparison or on an older checkout that
+still aborts.
 
-Repeated-subgraph clustering is optional compression of the ILP, not a reason
-to discard an otherwise supported graph. AutoParallel skips malformed groups
-atomically and records them in the JSON clustering summary. Preserve and report
-those diagnostics because the solve used less compression. Retry with
-`repeated_subgraphs=False` only for comparison or an older checkout that still
-aborts.
-
-`optimize_placement()` also emits `autoparallel_sharding_optimizer_log` and
-`autoparallel_solution` structured trace artifacts. Set `TORCH_TRACE` to a trace
-directory before the run to retain them; use `tlparse` when a parsed trace is
-useful. This is optional and does not replace explicit placement or optimizer
-artifacts.
+`optimize_placement()` emits `autoparallel_sharding_optimizer_log` and
+`autoparallel_solution` structured trace artifacts; set `TORCH_TRACE` before
+the run to keep them.
 
 ## Keep one cost model through evaluation
 
 `AutoParallel.__enter__` installs its communication topology, but `__exit__`
-restores the previous global value. Compilation normally occurs afterward.
-Without an outer lifetime, the ILP can therefore use the NCCL model while the
-reordering pass and `estimate_graph_metrics()` silently use PyTorch's default
-model.
-
-Use the skill helper to keep the exact topology active across planning,
-compilation, and metrics collection:
+restores the previous global value, and compilation normally happens
+afterward. Without an outer lifetime, the ILP can use the NCCL model while the
+reordering pass and `estimate_graph_metrics()` silently use PyTorch's default.
+The skill helper keeps one topology active across planning, compilation, and
+metrics collection:
 
 ```python
 import subprocess
 import sys
-from pathlib import Path
 
-repo_root = Path(
-    subprocess.check_output(
-        ["git", "rev-parse", "--show-toplevel"], text=True
-    ).strip()
-)
-skill_scripts = repo_root / ".agents/skills/autoparallel-optimizer/scripts"
-sys.path.insert(0, str(skill_scripts))
+repo_root = subprocess.check_output(
+    ["git", "rev-parse", "--show-toplevel"], text=True
+).strip()
+sys.path.insert(0, f"{repo_root}/.agents/skills/autoparallel-optimizer/scripts")
 from collect_reordered_metrics import ReorderedMetricsCollector
 
 collector = ReorderedMetricsCollector(mesh, trace_dir=None)
@@ -160,10 +124,20 @@ collector.require_forward_backward()
 collector.write_json("artifacts/metrics.json")
 ```
 
-Resolve the checkout explicitly if the evaluation process starts outside its
-Git worktree. Adapt the loss, inputs, activation-checkpointing setting, and
-reordering options to the workload. Omitted reordering options inherit
-`aten_autobucketing_config`; override them only intentionally.
+Adapt the loss, inputs, and reordering options to the workload. Omitted
+reordering options inherit `aten_autobucketing_config`. Forward and backward
+must both run inside `with collector:`: backward compiles lazily, and the
+helper's post-grad hook is removed when the context exits. The helper refuses
+an already configured `post_grad_custom_post_pass`, records every
+specialization recompile, and writes forward/backward Perfetto traces when
+given `trace_dir=`.
+
+The helper's ATen pass must be the only overlap scheduler. Keep
+`overlap_scheduling=False`: Inductor otherwise schedules again after the custom
+post-grad pass, so the metrics would describe an intermediate graph, and the
+collector raises if it sees Inductor overlap scheduling enabled. The pass
+inserts no overlap control dependencies, so later Inductor scheduling or fusion
+can still move the order that the metrics describe.
 
 Do not infer realized activation checkpointing from `enable_ac=True`. The
 `torch.compile` partition replays the save decisions made inside
@@ -172,38 +146,13 @@ honors only its `MUST_SAVE` tags, so the saved set may not change. Apply the
 model's own checkpoint policy before capture, and verify the save/recompute
 decisions in the partitioned graphs or their memory effect.
 
-The helper's ATen pass is the only overlap scheduler in this workflow. Keep
-`overlap_scheduling=False`: Inductor otherwise runs its scheduler after the
-custom post-grad pass, so the recorded metrics would describe an intermediate
-graph and the graph would be scheduled twice. The collector raises if it sees
-Inductor overlap scheduling enabled. The pass inserts no overlap control
-dependencies, so later Inductor scheduling or fusion can still move the order
-that the metrics describe.
-
-The helper detects the NCCL topology by default, passes that same object to
-AutoParallel through `collector.cost_model`, records whether the result is NCCL
-or a PyTorch fallback, and restores the prior global state. Detection returns
-`None` without CUDA, for an unrecognized GPU, or for a mesh size that is not
-divisible by the GPU's canonical ranks per node, such as a partial-node
-sub-allocation. Pass an
+The helper detects the NCCL topology by default and records whether it fell
+back to PyTorch's model. Detection returns `None` without CUDA, for an
+unrecognized GPU, or for a mesh size that is not divisible by the GPU's
+canonical ranks per node, such as a partial-node sub-allocation. Pass an
 explicit `NCCLTopoConfig` as `nccl_topology=` in those cases, describing the
-allocated communicator rather than the host's unused GPUs.
-Do not treat a multi-node fallback result as a final deployment ranking; obtain
-or construct the topology profile, or report the evaluation as provisional.
-
-The helper refuses an already configured `post_grad_custom_post_pass`; compose a
-model-specific pass explicitly instead of silently changing pass order. It
-identifies backward graphs by `tangents_*` placeholders and treats an
-all-`is_backward` graph as backward when no tangent placeholder is present.
-Mixed partitioner tags can survive recomputation in a partitioned forward
-graph, so they do not make the phase ambiguous by themselves. It records every
-specialization and can emit optional forward/backward Perfetto traces with
-`trace_dir=`. Metrics contain a compact placeholder count by default; pass
-`include_placeholder_signatures=True` only when shapes and dtypes are needed to
-diagnose specialization, because full signatures are large for parameter-heavy
-graphs. Forward and backward must both execute before leaving `with collector:`
-because backward compilation is lazy and the post-grad hook is restored when
-the context exits.
+allocated communicator rather than the host's unused GPUs. A multi-node result
+from the fallback model is provisional.
 
 ## Explore the stable joint graph
 
@@ -224,12 +173,12 @@ opt.remove_constraints(constraint_names)
 restored = opt.resolve()
 ```
 
-Use `explain_placement()` for a placement family and
-`print_costs_for_node()` for a redistribution matrix. Preserve their text when
-it supports the answer. Explore before lowering unless the purpose is to
-compare multiple candidates after scheduling.
+Use `explain_placement()` for a placement family and `print_costs_for_node()`
+for a redistribution matrix, and quote their output when it supports the
+answer. Explore before lowering unless the purpose is to compare candidates
+after scheduling.
 
-For CPU-side exploration, capture on GPU and call
+For repeated or CPU-side exploration, capture on GPU and call
 `autop.sharding_optimizer.save("model.ap")`. For ATen-only graphs,
 `ShardingOptimizer.load("model.ap")` can later inspect and re-solve without
 model code, a live mesh, a process group, or a GPU. `get_json()`,
@@ -239,18 +188,16 @@ optimizer; `explain_placement()` currently needs a live one. Custom ops and some
 before loading. Treat the artifact as trusted pickle data and keep code and
 PyTorch versions aligned.
 
-## Validate and report
+## Validate
 
-For execution, materialize or load initialized parameters after
-`to_empty(device="cuda")`, run compiled forward and backward with local input
-shapes, and check outputs and gradients for finite values. For numerical
+Run compiled forward and backward with local input shapes and initialized
+parameters, and check outputs and gradients for finite values. For a numerical
 comparison, use the same parameters, inputs, seed, dtype, and tolerances as the
-unsharded reference. Call `torch.manual_seed(seed)` on every participating rank
-before DTensor initialization or random DTensor operations; relying on DTensor
-to synchronize rank-zero RNG state is deprecated. LocalTensorMode tests are
-useful diagnosis but are not the public compiled execution path.
+unsharded reference. Call `torch.manual_seed(seed)` on every rank before
+DTensor initialization or random DTensor operations; relying on DTensor to
+synchronize rank-zero RNG state is deprecated. LocalTensorMode tests help
+diagnosis but are not the public compiled execution path.
 
-Typical durable artifacts are `placements.json`, `optimizer.json`,
-`metrics.json`, and `optimizer.log`. Generate full optimizer state and execution
-traces only when repeated exploration or timeline debugging warrants their
-size.
+Typical artifacts are `placements.json`, `optimizer.json`, `metrics.json`, and
+`optimizer.log`. Save full optimizer state and execution traces only when
+repeated exploration or timeline debugging warrants their size.

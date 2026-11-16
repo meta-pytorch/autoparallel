@@ -6,16 +6,15 @@ topology-inverted. Ordinary plans do not need these extra solves.
 
 ## What the solver does and does not establish
 
-A `1 / world_size` parameter bound pins every parameter without a node
-constraint to a minimum-local-bytes placement. It weights tensors by bytes and
-counts aliased storage once, but covers only persistent parameter placement:
-not optimizer state, activations, activation checkpointing, or the lifetime of
-materialized FSDP buffers. Record the achieved local and global bytes from the
-JSON summary after solving.
+A `1 / world_size` parameter bound (`workflow.md`) covers only persistent
+parameter placement: not optimizer state, activations, activation
+checkpointing, or the lifetime of materialized FSDP buffers.
 
-`apply_prefetch_discount(scale)` sets an objective-time scale while preserving
-the base communication costs. Repeated calls replace the prior scale. Save each
-endpoint's placements and JSON before solving the next one.
+`autop.sharding_optimizer.apply_prefetch_discount(scale)` scales eligible
+parameter-derived and terminal-gradient communication in the objective while
+preserving the base costs. Repeated calls replace the prior scale, so endpoint
+solves can reuse one optimizer; save each endpoint's placements and JSON before
+solving the next one.
 
 The discount is candidate-independent even though realizable overlap depends on
 the placement, bucket sizes, available compute, collective resources, and live

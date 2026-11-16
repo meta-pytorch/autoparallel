@@ -1,13 +1,10 @@
 # Global SPMD Modeling for AutoParallel
 
-AutoParallel traces one program over global logical tensors and derives
-per-rank execution by assigning placements. The model must therefore express
-the intended global computation. Merely replacing a local batch size with
-`local_batch * world_size` is insufficient when operations were defined to act
-independently inside each process-local batch.
-
-A model can trace, solve, and execute while implementing the wrong semantics.
-Treat this audit as a prerequisite to interpreting its sharding plan.
+AutoParallel traces one program over global logical tensors, so the model must
+express the intended global computation. Replacing a local batch size with
+`local_batch * world_size` is not enough when operations act independently
+inside each process-local batch, and such a model can trace, solve, and execute
+while computing the wrong thing. Audit it before interpreting a plan.
 
 ## Audit the model
 
