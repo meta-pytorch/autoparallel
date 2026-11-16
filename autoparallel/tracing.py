@@ -28,10 +28,17 @@ def _get_decomp_table():
     decomp_table.pop(torch.ops.aten.addmm.default)
 
     def addmm_decomp(self, mat1, mat2, beta=1, alpha=1):
-        return self + mat1 @ mat2
+        out = mat1 @ mat2
+        if alpha != 1:
+            out = alpha * out
+        # aten.addmm ignores self when beta == 0 (nan/inf are not propagated)
+        if beta == 0:
+            return out
+        if beta != 1:
+            self = beta * self
+        return self + out
 
     decomp_table[torch.ops.aten.addmm.default] = addmm_decomp
-    # decomp_table = None
 
     return decomp_table
 

@@ -487,6 +487,25 @@ def test_correctness_linear_1d_mesh():
     _run_correctness_test(model_fn, input_fn, mesh_shape=(8,))
 
 
+def test_correctness_addmm_scalars():
+    dim = 64
+    batch = 8
+
+    class AddmmModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.randn(dim, dim))
+            self.bias = nn.Parameter(torch.randn(dim))
+
+        def forward(self, x):
+            return torch.addmm(self.bias, x, self.weight, beta=0.5, alpha=2.0)
+
+    def input_fn():
+        return torch.randn(batch, dim, device="cuda")
+
+    _run_correctness_test(AddmmModel, input_fn, mesh_shape=(4, 2))
+
+
 def test_correctness_mlp():
     dim = 64
     hidden = 128
