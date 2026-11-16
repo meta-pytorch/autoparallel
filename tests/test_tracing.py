@@ -174,18 +174,3 @@ def test_addmm_decomp_integral_truncates_scalars():
     ref = torch.addmm(*args, beta=0.5, alpha=2.0)
     assert out.dtype == ref.dtype == torch.int8
     torch.testing.assert_close(out, ref)
-
-
-def test_silu_backward_decomp_override():
-    args = (
-        torch.randn(4, 16, dtype=torch.bfloat16),
-        torch.randn(4, 16, dtype=torch.bfloat16),
-    )
-    gm = make_fx(
-        torch.ops.aten.silu_backward.default, decomposition_table=_get_decomp_table()
-    )(*args)
-    targets = {n.target for n in gm.graph.nodes if n.op == "call_function"}
-    assert torch.ops.aten.exp.default in targets
-    assert torch.ops.aten.sigmoid.default not in targets
-    assert torch.ops.prims.convert_element_type.default in targets
-    torch.testing.assert_close(gm(*args), torch.ops.aten.silu_backward(*args))

@@ -8,9 +8,7 @@ from contextlib import contextmanager
 
 import torch
 from torch._decomp.decompositions import addmm as torch_addmm_decomp
-from torch._decomp.decompositions import pw_cast_for_opmath
 from torch._inductor.decomposition import select_decomp_table
-from torch._prims_common.wrappers import out_wrapper
 from torch._subclasses import FakeTensorMode
 
 
@@ -36,17 +34,6 @@ def _get_decomp_table():
         return torch_addmm_decomp(self, mat1, mat2, beta=beta, alpha=alpha)
 
     decomp_table[torch.ops.aten.addmm.default] = addmm_decomp
-
-    # Keep the silu_backward decomposition from before pytorch/pytorch#185041,
-    # which replaced 1 / (1 + exp(-x)) with sigmoid(x). The ILP sums per-op
-    # costs, so the shorter chain flips LLaMA-3 attention weight placements.
-    @out_wrapper("grad_input")
-    @pw_cast_for_opmath
-    def silu_backward(grad_output, self):
-        sigmoid = 1 / (1 + torch.exp(-self))
-        return grad_output * sigmoid * (1 + self * (1 - sigmoid))
-
-    decomp_table[torch.ops.aten.silu_backward.default] = silu_backward
 
     return decomp_table
 
