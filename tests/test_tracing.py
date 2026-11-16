@@ -3,12 +3,17 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+import pytest
 import torch
 import torch.nn as nn
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx.experimental.proxy_tensor import make_fx
 
 from autoparallel.tracing import _get_decomp_table, move_to_fake
+
+requires_cuda = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="requires CUDA"
+)
 
 
 def _make_fake_mode():
@@ -149,6 +154,26 @@ def test_addmm_decomp_scalars():
     out = gm(nan_bias, *args[1:])
     torch.testing.assert_close(out, torch.addmm(nan_bias, *args[1:], beta=0, alpha=2.0))
     assert not out.isnan().any()
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=requires_cuda)])
+def test_addmm_decomp_fp16_scales_in_opmath(device):
+    args = [
+        torch.tensor(t, dtype=torch.float16, device=device)
+        for t in ([[-40000.0]], [[40000.0]], [[1.0]])
+    ]
+    out = _trace_addmm(1, 2)(*args)(*args)
+    assert out.dtype == torch.float16
+    torch.testing.assert_close(out, torch.addmm(*args, alpha=2))
+
+
+def test_addmm_decomp_integral_truncates_scalars():
+    # aten.addmm has no int8 CUDA kernel, so this is CPU only
+    args = [torch.tensor(t, dtype=torch.int8) for t in ([7], [[2, 3]], [[4], [5]])]
+    out = _trace_addmm(0.5, 2.0)(*args)(*args)
+    ref = torch.addmm(*args, beta=0.5, alpha=2.0)
+    assert out.dtype == ref.dtype == torch.int8
+    torch.testing.assert_close(out, ref)
 
 
 def test_silu_backward_decomp_override():

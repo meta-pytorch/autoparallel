@@ -7,6 +7,7 @@ import copy
 from contextlib import contextmanager
 
 import torch
+from torch._decomp.decompositions import addmm as torch_addmm_decomp
 from torch._decomp.decompositions import pw_cast_for_opmath
 from torch._inductor.decomposition import select_decomp_table
 from torch._prims_common.wrappers import out_wrapper
@@ -30,15 +31,9 @@ def _get_decomp_table():
     decomp_table.pop(torch.ops.aten.addmm.default)
 
     def addmm_decomp(self, mat1, mat2, beta=1, alpha=1):
-        out = mat1 @ mat2
-        if alpha != 1:
-            out = alpha * out
-        # aten.addmm ignores self when beta == 0 (nan/inf are not propagated)
-        if beta == 0:
-            return out
-        if beta != 1:
-            self = beta * self
-        return self + out
+        if beta == 1 and alpha == 1:
+            return self + mat1 @ mat2
+        return torch_addmm_decomp(self, mat1, mat2, beta=beta, alpha=alpha)
 
     decomp_table[torch.ops.aten.addmm.default] = addmm_decomp
 

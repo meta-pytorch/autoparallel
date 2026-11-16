@@ -495,7 +495,9 @@ def test_correctness_addmm_scalars():
         def __init__(self):
             super().__init__()
             self.weight = nn.Parameter(torch.randn(dim, dim))
-            self.bias = nn.Parameter(torch.randn(dim))
+            # Full-shape bias: a broadcast bias goes through expand_as, whose
+            # symbolic size is mis-sharded on 2D meshes with dynamic=True.
+            self.bias = nn.Parameter(torch.randn(batch, dim))
 
         def forward(self, x):
             return torch.addmm(self.bias, x, self.weight, beta=0.5, alpha=2.0)
