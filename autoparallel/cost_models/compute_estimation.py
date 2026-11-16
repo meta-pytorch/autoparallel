@@ -120,6 +120,93 @@ DEVICE_LIMITS: Tuple[DeviceLimit, ...] = (
         },
     ),
     DeviceLimit(
+        "H200",
+        "https://www.nvidia.com/en-us/data-center/h200/",
+        sm=(9, 0),
+        gmem_bandwidth=4.8 * (1024**4),
+        gemm_tflops={
+            torch.float64: 67,
+            # NOTE: NVIDIA gives all numbers "with 2:4 sparsity"
+            # but we want the full GEMM numbers
+            torch.float32: 989 // 2,
+            torch.float16: 1979 // 2,
+            torch.bfloat16: 1979 // 2,
+            torch.float8_e4m3fn: 3958 // 2,
+            torch.float8_e5m2: 3958 // 2,
+            torch.int8: 3958 // 2,
+        },
+    ),
+    DeviceLimit(
+        "GH200",
+        "https://www.nvidia.com/en-us/data-center/grace-hopper-superchip/",
+        sm=(9, 0),
+        # NOTE: 96GB HBM3 ("GH200 480GB"); the 144GB HBM3e variant is 4.9 TB/s
+        gmem_bandwidth=4 * (1024**4),
+        gemm_tflops={
+            torch.float64: 67,
+            # NOTE: NVIDIA gives all numbers "with 2:4 sparsity"
+            # but we want the full GEMM numbers
+            torch.float32: 989 // 2,
+            torch.float16: 1979 // 2,
+            torch.bfloat16: 1979 // 2,
+            torch.float8_e4m3fn: 3958 // 2,
+            torch.float8_e5m2: 3958 // 2,
+            torch.int8: 3958 // 2,
+        },
+    ),
+    # Assuming SXM
+    DeviceLimit(
+        "H800",
+        "https://www.nvidia.cn/data-center/h800/",
+        sm=(9, 0),
+        gmem_bandwidth=3.35 * (1024**4),  # NOTE: PCIe is 2 TB/s
+        gemm_tflops={
+            torch.float64: 1,
+            # NOTE: NVIDIA gives all numbers "with 2:4 sparsity"
+            # but we want the full GEMM numbers
+            torch.float32: 989 // 2,
+            torch.float16: 1979 // 2,
+            torch.bfloat16: 1979 // 2,
+            torch.float8_e4m3fn: 3958 // 2,
+            torch.float8_e5m2: 3958 // 2,
+            torch.int8: 3958 // 2,
+        },
+    ),
+    # Per-GPU values from the HGX B300 (8 GPUs) totals. FP64 and INT8
+    # are reduced on Blackwell Ultra and omitted as unverified.
+    DeviceLimit(
+        "B300",
+        "https://www.nvidia.com/en-us/data-center/hgx/",
+        sm=(10, 3),
+        gmem_bandwidth=8 * (1024**4),
+        gemm_tflops={
+            # NOTE: NVIDIA gives all numbers "with 2:4 sparsity"
+            # but we want the full GEMM numbers
+            torch.float32: 2250 // 2,
+            torch.float16: 4500 // 2,
+            torch.bfloat16: 4500 // 2,
+            torch.float8_e4m3fn: 9000 // 2,
+            torch.float8_e5m2: 9000 // 2,
+        },
+    ),
+    # Per-GPU values from the GB300 NVL72 (72 GPUs) totals. FP64 and INT8
+    # are reduced on Blackwell Ultra and omitted as unverified.
+    DeviceLimit(
+        "GB300",
+        "https://www.nvidia.com/en-us/data-center/gb300-nvl72/",
+        sm=(10, 3),
+        gmem_bandwidth=8 * (1024**4),
+        gemm_tflops={
+            # NOTE: NVIDIA gives all numbers "with 2:4 sparsity"
+            # but we want the full GEMM numbers
+            torch.float32: 2500 // 2,
+            torch.float16: 5000 // 2,
+            torch.bfloat16: 5000 // 2,
+            torch.float8_e4m3fn: 10000 // 2,
+            torch.float8_e5m2: 10000 // 2,
+        },
+    ),
+    DeviceLimit(
         "A100",
         "https://www.nvidia.com/content/dam/en-zz/Solutions/Data-Center/a100/pdf/nvidia-a100-datasheet-us-nvidia-1758950-r4-web.pdf",
         sm=(8, 0),
@@ -166,6 +253,20 @@ DEVICE_LIMITS: Tuple[DeviceLimit, ...] = (
             torch.float32: 8.1,
             torch.float16: 65,
             torch.int8: 130,
+        },
+    ),
+    DeviceLimit(
+        "L40S",
+        "https://www.nvidia.com/en-us/data-center/l40s/",
+        sm=(8, 9),
+        gmem_bandwidth=864 * (1024**3),
+        gemm_tflops={
+            torch.float32: 183,
+            torch.float16: 362,
+            torch.bfloat16: 362,
+            torch.float8_e4m3fn: 733,
+            torch.float8_e5m2: 733,
+            torch.int8: 733,
         },
     ),
     # Assuming SXM2
@@ -282,14 +383,14 @@ DEVICE_LIMITS: Tuple[DeviceLimit, ...] = (
 def _get_device_limit():
     device_name = get_cost_model_device_name()
 
-    # Find matching device limit
-    device_limit = None
-    for limit in DEVICE_LIMITS:
-        if limit.name in device_name or (
-            limit.name == "A100" and "PG509" in device_name
-        ):
-            device_limit = limit
-            break
+    # Longest match wins, so e.g. "GB300" isn't resolved as "B300"
+    matches = [
+        limit
+        for limit in DEVICE_LIMITS
+        if limit.name in device_name
+        or (limit.name == "A100" and "PG509" in device_name)
+    ]
+    device_limit = max(matches, key=lambda limit: len(limit.name), default=None)
 
     if device_limit is None:
         raise ValueError(
