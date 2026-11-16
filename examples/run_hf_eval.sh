@@ -1,4 +1,9 @@
 #!/bin/bash
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# This source code is licensed under the BSD license found in the
+# LICENSE file in the root directory of this source tree.
+
 # Run ~30 HF models through example_hf.py with 1D and 2D meshes.
 # Covers causal LMs (decoder-only), seq2seq (encoder-decoder), and
 # masked LMs (encoder-only).
