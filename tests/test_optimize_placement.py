@@ -3,6 +3,9 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+import math
+
+import pulp
 import pytest
 import torch
 import torch.nn.functional as F
@@ -841,3 +844,103 @@ def test_remove_node_constraint_restores_memory_budget(device_mesh_1d):
         # With memory budget enforced and no node constraint, the optimizer
         # should shard this param again
         assert solution[orig_node].output_specs.placements == (Shard(0),)
+
+
+@apply_cuda_patches
+def test_repeated_input_args_share_producer_placement(device_mesh_1d):
+    """Every argument of a node that consumes the same producer several times
+    (h * h) must be tied to the producer's placement, so the objective matches
+    the cost of the extracted solution."""
+    dim = 1024
+    bs = 8 * device_mesh_1d.shape[0]
+
+    class Model(nn.Module):
+        def forward(self, x):
+            for _ in range(3):
+                h = x.relu()
+                x = h * h
+            return x
+
+    def input_fn():
+        return torch.randn(bs, dim, device="cuda")
+
+    with torch.device("meta"):
+        model = Model()
+
+    with AutoParallel(model, input_fn, device_mesh_1d) as autop:
+        autop.add_input_constraints([(Shard(0),)])
+        autop.add_output_constraints([(Shard(0),)])
+        opt = autop.sharding_optimizer
+        assert opt.cluster_links
+        squares = list(
+            opt.graph.find_nodes(op="call_function", target=torch.ops.aten.mul.Tensor)
+        )
+        assert len(squares) == 3
+        # A sharded producer feeding a replicated square needs an all-gather
+        # for each argument.
+        for n in squares:
+            opt.add_node_constraint(n.args[0], (Shard(0),))
+            opt.add_node_constraint(n, (Replicate(),))
+        solution = autop.optimize_placement()
+
+    mul_idxs = {opt.node_map[n] for n in squares}
+    selected_inp = {}
+    for node_idx, argi, _, inp_idx in opt.selected_keys:
+        if node_idx in mul_idxs:
+            selected_inp.setdefault(node_idx, {})[argi] = inp_idx
+    assert selected_inp.keys() == mul_idxs
+    for inp in selected_inp.values():
+        assert inp[0] == inp[1]
+
+    cost = opt._compute_solution_cost(opt._to_concrete_solution(solution))
+    assert pulp.value(opt.prob.objective) == pytest.approx(cost["total"])
+
+
+@apply_cuda_patches
+def test_inf_redistribute_cost_bans_input_placement(device_mesh_1d, tmp_path):
+    """split_with_sizes bans inputs sharded on the split dim with an infinite
+    redistribute cost; the ban must survive edge cost estimation."""
+    dim = 1024
+    bs = 8 * device_mesh_1d.shape[0]
+
+    class Model(nn.Module):
+        def forward(self, x):
+            a, b = F.relu(x).split([bs // 4, bs - bs // 4], dim=0)
+            return a, b
+
+    def input_fn():
+        return torch.randn(bs, dim, device="cuda")
+
+    with torch.device("meta"):
+        model = Model()
+
+    with AutoParallel(model, input_fn, device_mesh_1d) as autop:
+        autop.add_input_constraints([(Shard(0),)])
+        autop.add_output_constraints([(Replicate(),), (Replicate(),)])
+        autop.optimize_placement()
+        opt = autop.sharding_optimizer
+
+    (split,) = opt.graph.find_nodes(
+        op="call_function", target=torch.ops.aten.split_with_sizes.default
+    )
+    split_idx = opt.node_map[split]
+    producer_strats = opt.strats[split.args[0]].strategies
+    banned = {
+        i
+        for i, s in enumerate(producer_strats)
+        if any(p.is_shard(0) or p.is_partial() for p in s.output_specs.placements)
+    }
+    assert len(banned) > 0
+    for out_idx, strategy in enumerate(opt.strats[split].strategies):
+        for inp_idx in banned:
+            assert strategy.redistribute_cost[0][inp_idx] == math.inf
+            dv = opt.decision_vars[(split_idx, 0, out_idx, inp_idx)]
+            assert dv.comm_cost == math.inf
+            assert dv.var.value() == 0
+
+    opt.save(tmp_path / "opt.ap")
+    loaded = type(opt).load(tmp_path / "opt.ap")
+    assert set(loaded.prob.constraints) == set(opt.prob.constraints)
+    loaded.resolve()
+    for key in loaded.selected_keys:
+        assert math.isfinite(loaded._resolve_decision_var(key).comm_cost)
