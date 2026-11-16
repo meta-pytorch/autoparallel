@@ -89,7 +89,7 @@ DEVICE_LIMITS: Tuple[DeviceLimit, ...] = (
         "H100",
         "https://resources.nvidia.com/en-us-tensor-core/nvidia-tensor-core-gpu-datasheet",
         sm=(9, 0),
-        gmem_bandwidth=3.35 * (1024**4),  # NOTE: PCIe is 2 TB/s
+        gmem_bandwidth=3.35 * (10**12),  # NOTE: PCIe is 2 TB/s
         gemm_tflops={
             torch.float64: 67,
             # NOTE: NVIDIA gives all numbers "with 2:4 sparsity"
@@ -106,7 +106,7 @@ DEVICE_LIMITS: Tuple[DeviceLimit, ...] = (
         "B200",
         "https://nvdam.widen.net/s/wwnsxrhm2w/blackwell-datasheet-3384703",
         sm=(10, 0),
-        gmem_bandwidth=7.7 * (1024**4),
+        gmem_bandwidth=7.7 * (10**12),
         gemm_tflops={
             torch.float64: 37,
             # NOTE: NVIDIA gives all numbers "with 2:4 sparsity"
@@ -123,7 +123,7 @@ DEVICE_LIMITS: Tuple[DeviceLimit, ...] = (
         "H200",
         "https://www.nvidia.com/en-us/data-center/h200/",
         sm=(9, 0),
-        gmem_bandwidth=4.8 * (1024**4),
+        gmem_bandwidth=4.8 * (10**12),
         gemm_tflops={
             torch.float64: 67,
             # NOTE: NVIDIA gives all numbers "with 2:4 sparsity"
@@ -141,7 +141,7 @@ DEVICE_LIMITS: Tuple[DeviceLimit, ...] = (
         "https://www.nvidia.com/en-us/data-center/grace-hopper-superchip/",
         sm=(9, 0),
         # NOTE: 96GB HBM3 ("GH200 480GB"); the 144GB HBM3e variant is 4.9 TB/s
-        gmem_bandwidth=4 * (1024**4),
+        gmem_bandwidth=4 * (10**12),
         gemm_tflops={
             torch.float64: 67,
             # NOTE: NVIDIA gives all numbers "with 2:4 sparsity"
@@ -159,7 +159,7 @@ DEVICE_LIMITS: Tuple[DeviceLimit, ...] = (
         "H800",
         "https://www.nvidia.cn/data-center/h800/",
         sm=(9, 0),
-        gmem_bandwidth=3.35 * (1024**4),  # NOTE: PCIe is 2 TB/s
+        gmem_bandwidth=3.35 * (10**12),  # NOTE: PCIe is 2 TB/s
         gemm_tflops={
             # NOTE: the H800 datasheet numbers are already dense
             torch.float64: 66.91,
@@ -177,7 +177,7 @@ DEVICE_LIMITS: Tuple[DeviceLimit, ...] = (
         "B300",
         "https://www.nvidia.com/en-us/data-center/hgx/",
         sm=(10, 3),
-        gmem_bandwidth=8 * (1024**4),
+        gmem_bandwidth=8 * (10**12),
         gemm_tflops={
             # NOTE: NVIDIA gives all numbers "with 2:4 sparsity"
             # but we want the full GEMM numbers
@@ -194,7 +194,7 @@ DEVICE_LIMITS: Tuple[DeviceLimit, ...] = (
         "GB300",
         "https://www.nvidia.com/en-us/data-center/gb300-nvl72/",
         sm=(10, 3),
-        gmem_bandwidth=8 * (1024**4),
+        gmem_bandwidth=8 * (10**12),
         gemm_tflops={
             # NOTE: NVIDIA gives all numbers "with 2:4 sparsity"
             # but we want the full GEMM numbers
@@ -209,7 +209,7 @@ DEVICE_LIMITS: Tuple[DeviceLimit, ...] = (
         "A100",
         "https://www.nvidia.com/content/dam/en-zz/Solutions/Data-Center/a100/pdf/nvidia-a100-datasheet-us-nvidia-1758950-r4-web.pdf",
         sm=(8, 0),
-        gmem_bandwidth=2 * (1024**4),  # NOTE: PCIe is 1.5 TB/s
+        gmem_bandwidth=2 * (10**12),  # NOTE: PCIe is 1.5 TB/s
         gemm_tflops={
             torch.float64: 19.5,
             torch.float32: 156,
@@ -222,7 +222,7 @@ DEVICE_LIMITS: Tuple[DeviceLimit, ...] = (
         "A30",
         "https://www.nvidia.com/content/dam/en-zz/Solutions/data-center/products/a30-gpu/pdf/a30-datasheet.pdf",
         sm=(8, 0),
-        gmem_bandwidth=933 * (1024**3),
+        gmem_bandwidth=933 * (10**9),
         gemm_tflops={
             torch.float64: 10.3,
             torch.float32: 82,
@@ -235,7 +235,7 @@ DEVICE_LIMITS: Tuple[DeviceLimit, ...] = (
         "A10G",
         "https://www.nvidia.com/content/dam/en-zz/Solutions/Data-Center/a10/pdf/a10-datasheet.pdf",
         sm=(8, 0),
-        gmem_bandwidth=933 * (1024**3),
+        gmem_bandwidth=933 * (10**9),
         gemm_tflops={
             torch.float32: 31.2,
             torch.float16: 125,
@@ -247,7 +247,7 @@ DEVICE_LIMITS: Tuple[DeviceLimit, ...] = (
         "T4",
         "https://www.nvidia.com/content/dam/en-zz/Solutions/Data-Center/tesla-t4/t4-tensor-core-datasheet-951643.pdf",
         sm=(7, 5),
-        gmem_bandwidth=300 * (1024**3),
+        gmem_bandwidth=300 * (10**9),
         gemm_tflops={
             torch.float32: 8.1,
             torch.float16: 65,
@@ -258,7 +258,7 @@ DEVICE_LIMITS: Tuple[DeviceLimit, ...] = (
         "L40S",
         "https://www.nvidia.com/en-us/data-center/l40s/",
         sm=(8, 9),
-        gmem_bandwidth=864 * (1024**3),
+        gmem_bandwidth=864 * (10**9),
         gemm_tflops={
             torch.float32: 183,
             torch.float16: 366.5,
@@ -273,7 +273,7 @@ DEVICE_LIMITS: Tuple[DeviceLimit, ...] = (
         "V100",
         "https://images.nvidia.com/content/technologies/volta/pdf/tesla-volta-v100-datasheet-letter-fnl-web.pdf",
         sm=(7, 0),
-        gmem_bandwidth=900 * (1024**3),
+        gmem_bandwidth=900 * (10**9),
         gemm_tflops={
             torch.float64: 7.8,
             torch.float32: 15.7,
@@ -284,7 +284,7 @@ DEVICE_LIMITS: Tuple[DeviceLimit, ...] = (
         "P100",
         "https://images.nvidia.com/content/tesla/pdf/nvidia-tesla-p100-datasheet.pdf",
         sm=(6, 0),
-        gmem_bandwidth=732 * (1024**3),
+        gmem_bandwidth=732 * (10**9),
         gemm_tflops={
             torch.float64: 5.3,
             torch.float32: 10.6,
@@ -296,7 +296,7 @@ DEVICE_LIMITS: Tuple[DeviceLimit, ...] = (
         "AMD Instinct MI200X",
         "https://www.amd.com/content/dam/amd/en/documents/instinct-business-docs/product-briefs/instinct-mi210-brochure.pdf",
         sm=(-1, -1),  # sm not defined for AMD GPUs
-        gmem_bandwidth=1.6 * (1024**4),
+        gmem_bandwidth=1.6 * (10**12),
         gemm_tflops={
             torch.float64: 45.3,
             torch.float32: 45.3,
@@ -310,7 +310,7 @@ DEVICE_LIMITS: Tuple[DeviceLimit, ...] = (
         "AMD Instinct MI300X",
         "https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/data-sheets/amd-instinct-mi300x-data-sheet.pdf",
         sm=(-1, -1),  # sm not defined for AMD GPUs
-        gmem_bandwidth=5.3 * (1024**4),
+        gmem_bandwidth=5.3 * (10**12),
         gemm_tflops={
             torch.float64: 163.4,
             torch.float32: 653.7,
@@ -324,7 +324,7 @@ DEVICE_LIMITS: Tuple[DeviceLimit, ...] = (
         "AMD Instinct MI325X",
         "https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/product-briefs/instinct-mi325x-datasheet.pdf",
         sm=(-1, -1),  # sm not defined for AMD GPUs
-        gmem_bandwidth=6.0 * (1024**4),
+        gmem_bandwidth=6.0 * (10**12),
         gemm_tflops={
             torch.float64: 163.4,
             torch.float32: 653.7,
@@ -338,7 +338,7 @@ DEVICE_LIMITS: Tuple[DeviceLimit, ...] = (
         "AMD Instinct MI350X",
         "https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/product-briefs/amd-instinct-mi350x-gpu-brochure.pdf",
         sm=(-1, -1),  # sm not defined for AMD GPUs
-        gmem_bandwidth=8.0 * (1024**4),
+        gmem_bandwidth=8.0 * (10**12),
         gemm_tflops={
             torch.float64: 72.1,
             torch.float32: 144.2,
@@ -352,7 +352,7 @@ DEVICE_LIMITS: Tuple[DeviceLimit, ...] = (
         "AMD Instinct MI355X",
         "https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/product-briefs/amd-instinct-mi355x-gpu-brochure.pdf",
         sm=(-1, -1),  # sm not defined for AMD GPUs
-        gmem_bandwidth=8.0 * (1024**4),
+        gmem_bandwidth=8.0 * (10**12),
         gemm_tflops={
             torch.float64: 78.6,
             torch.float32: 157.3,
@@ -367,7 +367,7 @@ DEVICE_LIMITS: Tuple[DeviceLimit, ...] = (
         # Assuming 1600 MHz and torch.xpu.get_device_properties("xpu").max_compute_units=448
         "https://www.intel.com/content/www/us/en/docs/oneapi/optimization-guide-gpu/2025-0/intel-xe-gpu-architecture.html",
         sm=(-1, -1),
-        gmem_bandwidth=3.3 * (1024**4),
+        gmem_bandwidth=3.3 * (10**12),
         gemm_tflops={
             torch.float64: 46,
             torch.float32: 46,
