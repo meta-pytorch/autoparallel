@@ -432,6 +432,36 @@ def test_optimizer_construction_resets_comms_cost_cache(device_mesh_1d):
     reset_cache.assert_called_once_with()
 
 
+class _TensorConstantModel(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.a = nn.Linear(dim, dim, bias=False)
+
+    def forward(self, x):
+        return self.a(x) * torch.tensor(0.5, device=x.device)
+
+
+@apply_cuda_patches
+def test_save_replay_pickles_real_constants_inside_fake_mode(device_mesh_1d):
+    # The lifted constant is a real CUDA tensor, and AutoParallel keeps its
+    # FakeTensorMode active until __exit__.
+    dim = 64
+    with torch.device("meta"):
+        model = _TensorConstantModel(dim)
+
+    autop = _setup_autop(model, dim, device_mesh_1d)
+    with tempfile.NamedTemporaryFile(suffix=".pt.gz") as replay_file:
+        with autop:
+            autop.add_input_constraints([(Shard(0),)])
+            autop.add_output_constraints([(Shard(0),)])
+            autop.optimize_placement()
+            autop.sharding_optimizer.save_replay(replay_file.name)
+
+        loaded = type(autop.sharding_optimizer).load_replay(replay_file.name)
+
+    assert len(loaded.nodes) == len(autop.sharding_optimizer.nodes)
+
+
 # ---- save_placements/load_placements roundtrip tests ----
 
 

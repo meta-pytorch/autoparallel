@@ -241,9 +241,7 @@ class TestPartialRedistribution:
         curr_spec = DTensorSpec(
             device_mesh_2d, (Replicate(), Partial()), tensor_meta=tm
         )
-        tgt_spec = DTensorSpec(
-            device_mesh_2d, (Shard(1), Partial()), tensor_meta=tm
-        )
+        tgt_spec = DTensorSpec(device_mesh_2d, (Shard(1), Partial()), tensor_meta=tm)
 
         graph = torch.fx.Graph()
         node = graph.placeholder("grad")

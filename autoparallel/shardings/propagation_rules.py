@@ -19,7 +19,6 @@ Based on PyTorch DTensor implementation:
 
 import collections
 import itertools
-import math
 import operator
 from typing import cast
 
@@ -377,43 +376,6 @@ def alias_rule(mesh, op_schema):
     return OpStrategy(strats)
 
 
-@register_rule(torch.ops.aten.split_with_sizes.default)
-def split_with_sizes_rule(mesh, op_schema):
-    op_spec = op_schema.args_schema[0]
-    sizes = op_schema.args_schema[1]
-    dim = 0
-    if len(op_schema.args_schema) > 2:
-        dim = op_schema.args_schema[2]
-    strats = []
-
-    banned_idxs = set()
-    for i, ss in enumerate(op_spec.strategies):
-        for placement in ss.output_spec.placements:
-            if placement.is_shard(dim) or placement.is_partial():
-                banned_idxs.add(i)
-    for strat in op_spec.strategies:
-        input_specs = strat.output_spec
-        tensor_meta = input_specs.tensor_meta
-        inp_t = _build_meta_tensor(tensor_meta)
-        out_ts = inp_t.split(sizes, dim)
-        placements = input_specs.placements
-        if any(p.is_shard(dim) or p.is_partial() for p in placements):
-            continue
-        output_specs = tuple(
-            DTensorSpec(mesh, placements, tensor_meta=_gen_tensor_meta(out_t))
-            for out_t in out_ts
-        )
-
-        redistribute_costs = generate_redistribute_costs(op_spec, output_specs[0])
-        for banned in banned_idxs:
-            redistribute_costs[banned] = math.inf
-
-        s = OpSpec(output_specs, input_specs=(input_specs,))
-        s.redistribute_cost = [redistribute_costs]
-        strats.append(s)
-    return OpStrategy(strats)
-
-
 @register_rule(torch.ops.prims.iota.default)
 def iota_rule(mesh, op_schema):
     # Replicate-only: iota's output values are position-dependent
@@ -665,8 +627,9 @@ def stack_strategy(mesh, op_schema: OpSchema):
     common_input_ndim = first_input_strategy.ndim
 
     dim = cast(int, op_schema.args_schema[1]) if len(op_schema.args_schema) > 1 else 0
-    # normalize the dim to be within the common input ndim
-    dim = normalize_dim(dim, common_input_ndim)
+    # normalize the dim to be within the output ndim (input ndim + 1),
+    # since stack inserts a new dimension
+    dim = normalize_dim(dim, common_input_ndim + 1)
 
     possible_input_strategies: PlacementList = [Replicate()] + [  # type: ignore[assignment]
         Shard(i) for i in range(common_input_ndim)

@@ -160,16 +160,18 @@ def _make_replay_graph_module(graph_module):
 
 
 def _encode_replay_graph(graph_module):
+    from torch._subclasses.fake_tensor import unset_fake_temporarily
     from torch.fx._graph_pickler import GraphPickler, Options
 
     replay_graph_module = _make_replay_graph_module(graph_module)
-    return GraphPickler.dumps(
-        replay_graph_module,
-        Options(
-            ops_filter=None,
-            node_metadata_key_filter=lambda key: key in _REPLAY_META_KEYS,
-        ),
-    )
+    with unset_fake_temporarily():
+        return GraphPickler.dumps(
+            replay_graph_module,
+            Options(
+                ops_filter=None,
+                node_metadata_key_filter=lambda key: key in _REPLAY_META_KEYS,
+            ),
+        )
 
 
 def _decode_replay_graph(data, fake_mode):

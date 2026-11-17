@@ -8,6 +8,7 @@ import torch
 import torch._inductor.config
 import torch.fx.traceback as fx_traceback
 from torch import nn
+from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
@@ -1121,3 +1122,38 @@ def test_auto_parallel_forward_inputs(device_mesh_1d):
         positions=torch.zeros(local_bs, dim, device="cuda"),
     )
     assert out.shape == (local_bs, dim)
+
+
+def test_mixed_precision_output_cast_skips_non_floating(device_mesh_1d):
+    class Model(nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            self.linear = nn.Linear(dim, dim)
+
+        def forward(self, x):
+            y = self.linear(x)
+            return y, y.argmax(-1), y.sum(-1) > 0
+
+    dim = 128
+    with torch.device("meta"):
+        model = Model(dim)
+
+    def input_fn():
+        return torch.rand(512, dim, device="cuda")
+
+    mp_policy = MixedPrecisionPolicy(
+        param_dtype=torch.bfloat16,
+        reduce_dtype=torch.float32,
+        output_dtype=torch.float32,
+    )
+    with AutoParallel(model, input_fn, device_mesh_1d, mp_policy) as autop:
+        autop.add_input_constraints([(Shard(0),)])
+        sharding_placement = autop.optimize_placement()
+        parallel_mod = autop.apply_placement(sharding_placement)
+
+    parallel_mod.to_empty(device="cuda")
+    local_batch = 512 // torch.distributed.get_world_size()
+    y, idx, mask = parallel_mod(torch.rand(local_batch, dim, device="cuda"))
+    assert y.dtype == torch.float32
+    assert idx.dtype == torch.int64
+    assert mask.dtype == torch.bool

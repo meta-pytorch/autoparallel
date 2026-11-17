@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 class GpuArch(Enum):
     AMPERE = 0  # A100
     HOPPER = 1  # H100/H200
-    BLACKWELL = 2  # B200/GB200
+    BLACKWELL = 2  # B200/GB200/B300/GB300
 
 
 class NCCLFunc(Enum):
@@ -1440,8 +1440,10 @@ def nccl_cost_coverage(
 # Ordered from most specific to least specific to avoid substring
 # false matches (e.g. "B200" matching inside "GB200").
 _CANONICAL_GPUS_PER_NODE = (
+    ("GB300", 72),
     ("GB200", 72),
-    ("B200", 72),
+    ("B300", 8),
+    ("B200", 8),
     ("H200", 8),
     ("H100", 8),
     ("A100", 8),
@@ -1506,7 +1508,7 @@ def detect_nccl_topo_config(mesh: "DeviceMesh") -> NCCLTopoConfig | None:
         return a100_topo_config(num_nodes=num_nodes, gpus_per_node=gpus_per_node)
     elif matched_name in ("H100", "H200"):
         return h100_topo_config(num_nodes=num_nodes, gpus_per_node=gpus_per_node)
-    elif matched_name in ("B200", "GB200"):
+    elif matched_name in ("B200", "GB200", "B300", "GB300"):
         return gb200_topo_config(num_nodes=num_nodes, gpus_per_node=gpus_per_node)
     return None
 

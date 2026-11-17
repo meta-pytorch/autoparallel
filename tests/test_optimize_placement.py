@@ -205,6 +205,16 @@ _expected_node_placements_ffn = [
 ]
 
 
+# The same placements for the einsums the transformer block's 3D matmuls are
+# converted to: abk,kn->abn (fwd and grad input) and abn,abk->kn (grad weight).
+# Activation dims shift by one due to the extra batch dim, and the grad weight
+# output is kn instead of the mm's nk.
+_einsum1 = [(Shard(0), Replicate()), (Replicate(), Shard(1)), (Shard(0), Shard(2))]
+_einsum2 = [(Shard(0), Shard(2)), (Replicate(), Shard(0)), (Shard(0), Partial("sum"))]
+_einsum3 = [(Shard(0), Replicate()), (Shard(0), Shard(2)), (Partial("sum"), Shard(0))]
+_einsum4 = [(Shard(0), Shard(2)), (Shard(0), Replicate()), (Partial("sum"), Shard(1))]
+
+
 _expected_param_placements_transformer_block = [
     (Shard(0), Shard(0)),
     (Shard(0), Shard(0)),
@@ -215,24 +225,24 @@ _expected_param_placements_transformer_block = [
 ]
 
 _expected_node_placements_transformer_block = [
-    _mm1,
-    _mm1,
-    _mm1,
-    _mm2,
-    _mm1,
-    _mm2,
-    _mm3,
-    _mm1,
-    _mm4,
-    _mm2,
-    _mm3,
-    _mm1,
-    _mm4,
-    _mm2,
-    _mm4,
-    _mm2,
-    _mm4,
-    _mm2,
+    _einsum1,
+    _einsum1,
+    _einsum1,
+    _einsum2,
+    _einsum1,
+    _einsum2,
+    _einsum3,
+    _einsum1,
+    _einsum4,
+    _einsum2,
+    _einsum3,
+    _einsum1,
+    _einsum4,
+    _einsum2,
+    _einsum4,
+    _einsum2,
+    _einsum4,
+    _einsum2,
 ]
 
 
@@ -274,20 +284,26 @@ def test_optimization_finds_fsdp_tp_2d(
 
     # check parameters are sharded as expected
     param_nodes = get_param_nodes(autop.gm.graph)
+    assert len(param_nodes) == len(expected_param_placements)
     for node, expected_placement in zip(param_nodes, expected_param_placements):
         assert sharding_placement[node].output_specs.placements == expected_placement
 
-    # chekc that matmul nodes are sharded following FSDP + TP
+    # check that matmul nodes are sharded following FSDP + TP
     mm_nodes = autop.gm.graph.find_nodes(
         op="call_function", target=torch.ops.aten.mm.default
     )
-    for node, expected_placements in zip(mm_nodes, expected_node_placements):
+    einsum_nodes = autop.gm.graph.find_nodes(
+        op="call_function", target=torch.ops.aten.einsum.default
+    )
+    linear_nodes = mm_nodes + einsum_nodes
+    assert len(linear_nodes) == len(expected_node_placements)
+    for node, expected_placements in zip(linear_nodes, expected_node_placements):
         p = sharding_placement[node]
         assert p.input_specs[0].placements == expected_placements[0]
         assert p.input_specs[1].placements == expected_placements[1]
         assert p.output_specs.placements == expected_placements[2]
 
-    # chekc that sdpa nodes (if present) are sharded following FSDP + TP
+    # check that sdpa nodes (if present) are sharded following FSDP + TP
     sdpa_nodes = autop.gm.graph.find_nodes(
         op="call_function",
         target=torch.ops.aten._scaled_dot_product_efficient_attention.default,
@@ -943,3 +959,55 @@ def test_inf_redistribute_cost_bans_input_placement(device_mesh_1d, tmp_path):
     loaded.resolve()
     for key in loaded.selected_keys:
         assert math.isfinite(loaded._resolve_decision_var(key).comm_cost)
+
+
+@apply_cuda_patches
+def test_split_with_sizes_of_split_dim_sharded_input(device_mesh_1d):
+    """Splitting along a sharded dim must stay feasible by gathering the
+    input before the split."""
+
+    class Model(nn.Module):
+        def forward(self, x):
+            a, b = x.split([512, 1536], dim=0)
+            return a, b
+
+    def input_fn():
+        return torch.randn(2048, 1024, device="cuda")
+
+    with torch.device("meta"):
+        model = Model()
+
+    with AutoParallel(model, input_fn, device_mesh_1d) as autop:
+        autop.add_input_constraints([(Shard(0),)])
+        autop.add_output_constraints([(Replicate(),), (Replicate(),)])
+        solution = autop.optimize_placement()
+        opt = autop.sharding_optimizer
+
+    (split,) = opt.graph.find_nodes(
+        op="call_function", target=torch.ops.aten.split_with_sizes.default
+    )
+    strategy = solution[opt._concrete_to_orig.get(split, split)]
+    assert strategy.input_specs[0].placements == (Replicate(),)
+    assert strategy.input_specs[0].tensor_meta.shape == torch.Size([2048, 1024])
+
+
+@apply_cuda_patches
+def test_split_with_sizes_negative_dim_never_shards_split_dim(device_mesh_2d):
+    class Model(nn.Module):
+        def forward(self, x):
+            a, b = x.split([256, 768], dim=-1)
+            return a, b
+
+    def input_fn():
+        return torch.randn(256, 64, 1024, device="cuda")
+
+    with torch.device("meta"):
+        model = Model()
+
+    with AutoParallel(model, input_fn, device_mesh_2d) as autop:
+        opt = autop.sharding_optimizer
+        (split,) = opt.graph.find_nodes(
+            op="call_function", target=torch.ops.aten.split_with_sizes.default
+        )
+        for strategy in opt.strats[split].strategies:
+            assert not any(p.is_shard(2) for p in strategy.input_specs[0].placements)
