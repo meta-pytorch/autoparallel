@@ -179,9 +179,6 @@ another mesh. Retries and linked baselines for that exact contract continue to
 share one ID. For a sub-allocation that canonical topology detection cannot
 represent, require an explicit NCCL topology for the allocated communicator;
 fallback topology costs and unused visible GPUs are not final routing evidence.
-In the routing response, enumerate local batch, collective scale, and potential
-selected-placement changes, then state explicitly that timing evidence cannot
-be pooled across the meshes.
 
 ```python
 from parallelization_policy import (

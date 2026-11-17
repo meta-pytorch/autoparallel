@@ -15,12 +15,11 @@ metadata, not that the source view is invalid.
 - Inspect every `DTensor.from_local()` reconstruction on the failing path. When
   `tgt_spec.tensor_meta` describes the global tensor, preserve its logical
   `shape` and `stride`, plus the existing shard order.
-- Compute balanced shard extents with `q, r = divmod(logical_size, shard_count)`:
-  `r` ranks have extent `q + 1` and the other ranks have extent `q`. Do not put
-  the entire remainder on one final rank. For 20,005 over 8 ranks, the extents
-  are five ranks of 2,501 and three ranks of 2,500.
-- Check both extent classes and their rank mapping. Do not assume equal local
-  extents.
+- DTensor shards follow `torch.chunk`: each rank gets the ceiling-sized extent
+  except the last ones, which are shorter or empty. 10 elements over 4 ranks
+  give extents 3, 3, 3, 1.
+- Check both the ceiling-sized and the short final extents. Do not assume equal
+  local extents.
 - If the view is still illegal with correct logical metadata, exclude that
   specific placement during strategy enumeration rather than accepting an
   unrealizable low-cost option.
@@ -83,8 +82,6 @@ that boundary executes and passes parity.
 
 Clustering is optional ILP compression. An unclustered retry that solves proves
 recoverability of the base planner, not equivalence, lowering, or performance.
-Begin the retry finding with `clustering role: optional ILP compression` so the
-diagnostic interpretation is not left implicit.
 
 Validate a complete repeated-region group before mutating cluster links:
 corresponding nodes need compatible targets, input arity, metadata, and option
@@ -97,3 +94,14 @@ feasible placement families and objective. Record skipped groups, solve time,
 and ILP variable/constraint counts to quantify lost compression. Preserve the
 normal downstream gates: placement application, numerical checks, target
 execution, and measurement remain separate evidence.
+
+## Operator strategy coverage
+
+When a failure comes from missing strategy generation, reuse an existing
+operator rule only when its schema and in-contract semantics are equivalent;
+otherwise start with an explicitly allowlisted replicate-only strategy. Reject
+invalid input options candidate-locally rather than aborting the whole node,
+account for redistribution, and remap output placements after removed
+dimensions. On both 1D and 2D meshes, lower every emitted strategy and compare
+output structure, shapes, values, and gradients with the native reference.
+Strategy generation alone is only planning coverage.

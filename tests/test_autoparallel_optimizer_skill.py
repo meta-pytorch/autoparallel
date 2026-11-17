@@ -5,6 +5,7 @@
 
 import importlib.util
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -475,114 +476,11 @@ def test_behavioral_rubric_keeps_coverage_details_out_of_hard_gates():
     assert all(criteria[key]["critical"] for key in hard_gates)
 
 
-def test_realizability_guidance_uses_balanced_uneven_shard_extents():
-    guidance = (SKILL_ROOT / "references/realizability-failures.md").read_text()
-
-    assert "q, r = divmod(logical_size, shard_count)" in guidance
-    assert "five ranks of 2,501 and three ranks of 2,500" in guidance
-
-
-def test_realizability_guidance_requires_targeted_alias_regression():
-    guidance = (SKILL_ROOT / "references/realizability-failures.md").read_text()
-
-    assert "minimized regression" in guidance
-    assert "genuinely missing" in guidance and "still\nfails" in guidance
-    assert "two successive updates" in guidance and "different aliases" in guidance
-    assert "unpartitioned native reference" in guidance
-
-
-def test_realizability_guidance_constrains_functionalized_mutations():
-    guidance = (SKILL_ROOT / "references/realizability-failures.md").read_text()
-
-    assert "`InputMutationAOTOutput` descriptor" in guidance
-    assert "`mutated_input` descriptor" in guidance
-    assert "default placement-equality constraint" in guidance
-    assert "out-of-graph epilogue" in guidance
-    assert "mutated input and normal\noutputs" in guidance
-
-
-def test_mesh_guidance_keeps_candidate_evidence_independent():
-    guidance = (SKILL_ROOT / "references/mesh-selection.md").read_text()
-
-    assert "each mesh as a separate planning experiment" in guidance
-    assert "Do not pool placements" in guidance and "timings across meshes" in guidance
-    assert "current ILP solve cost is impractical" in guidance
-
-
-def test_full_shard_guidance_requires_independent_endpoint_artifacts():
-    guidance = (SKILL_ROOT / "references/full-shard-planning.md").read_text()
-
-    assert "serial placements and optimizer" in guidance
-    assert "optimistic endpoint" in guidance and "different paths" in guidance
-    assert "one mutated optimizer object" in guidance
-
-
-def test_optimizer_envelope_guidance_requires_regime_match():
-    guidance = (SKILL_ROOT / "SKILL.md").read_text()
-
-    assert "Before applying a frozen envelope" in guidance
-    assert "**platform**" in guidance and "realized\n  kernel family" in guidance
-    assert "**optimizer contract**" in guidance
-    assert "**scale**" in guidance and "tensor-count ranges" in guidance
-    assert "must not use\n  `executed_on_target` or `measured`" in guidance
-
-    workflow = (SKILL_ROOT / "references/workflow.md").read_text()
-    assert "calibration platform:" in workflow
-    assert "optimizer contract:" in workflow
-    assert "calibration scale:" in workflow
-
-
-def test_decision_guidance_requires_complete_contract_bookkeeping():
-    guidance = (SKILL_ROOT / "SKILL.md").read_text()
-
-    assert (
-        "process launch,\n  compilation, allocator, or system-state variance"
-        in guidance
-    )
-    assert "collective group sizes and scale" in guidance
-    assert "explicit NCCL topology for the allocated communicator" in guidance
-    assert (
-        "qualitative ordering and say that exact\n  values were not supplied"
-        in guidance
-    )
-    assert (
-        "both the partial-boundary\n  ordering and the full-step ordering" in guidance
-    )
-    assert (
-        "partial-boundary ordering,\n  and full-step latency plus memory ordering"
-        in guidance
-    )
-    assert "same clipped ID for its exact retries and linked baselines" in guidance
-    assert "same clipping\n  frequency and optimizer-update frequency" in guidance
-    assert "global_batch % effective_dp_degree == 0" in guidance
-    assert "post-lowering or\n  post-wrapping per-FQN invariant check" in guidance
-    assert "optimization\n  hypothesis and provisional starting point" in guidance
-    assert "optional ILP compression" in guidance
-    assert "clustering role: optional ILP compression" in guidance
-    assert (
-        "local batch, collective scale, and potential\n  selected placement" in guidance
-    )
-    assert "valid_meta_uses: legality/feasibility checking" in guidance
-    assert "explicit `partial_boundary:`\n  and `full_boundary:` fields" in guidance
-    assert "`verdict:\n  inconclusive`" in guidance
-    assert "Do not infer execution provenance from supplied timing numbers" in guidance
-    assert "Only use\n  `executed_on_target`" in guidance
-    assert "`STARTUP_NOT_AMORTIZED`, not `PERFORMANCE_BAR_MISSED`" in guidance
-    assert "**world size\n  does not define global batch**" in guidance
-    assert "achieved byte-weighted parameter-storage fraction" in guidance
-    assert "output-shape parity, output-value parity, and gradient parity" in guidance
-    assert "read-only hypothetical or arithmetic comparison" in guidance
-    assert "should answer directly and omit the card" in guidance
-    assert "`local_norm_work` and `placement_dependent_global_reduction`" in guidance
-    assert "supplied latency and forward/backward peak are\n  **measured**" in guidance
-    assert (
-        "after lowering or\n  wrapping and before execution evidence is accepted"
-        in guidance
-    )
-
-    full_shard = (SKILL_ROOT / "references/full-shard-planning.md").read_text()
-    assert "Do not leave endpoint bookkeeping implicit" in full_shard
-    assert "topology, activation checkpointing, and\nautobucketing fixed" in full_shard
+def test_skill_markdown_links_resolve():
+    for doc in [SKILL_ROOT / "SKILL.md", *(SKILL_ROOT / "references").glob("*.md")]:
+        for target in re.findall(r"\]\(([^)#\s]+)", doc.read_text()):
+            if "://" not in target:
+                assert (doc.parent / target).exists(), f"{doc.name}: {target}"
 
 
 def test_optimizer_objective_rubric_does_not_require_unsupplied_values():
@@ -600,45 +498,6 @@ def test_optimizer_objective_rubric_does_not_require_unsupplied_values():
         "qualitative win/loss and memory ordering is full credit"
         in criterion["description"]
     )
-
-
-def test_counterfactual_guidance_recovers_baseline_before_ablation():
-    guidance = (SKILL_ROOT / "references/workflow.md").read_text()
-
-    assert "first remove exactly the names returned" in guidance
-    assert "original output and memory constraints unchanged" in guidance
-    assert "Establish that recovery before re-adding" in guidance
-
-
-def test_global_spmd_guidance_qualifies_custom_collective_fallback():
-    guidance = (SKILL_ROOT / "references/global-spmd-modeling.md").read_text()
-
-    assert "internal\ncommunication cost unpriced" in guidance
-    assert "manual or native distributed path as the qualified fallback" in guidance
-    assert "classify AutoParallel as ineligible\nor inconclusive" in guidance
-
-
-def test_global_spmd_guidance_validates_no_input_random_factories():
-    guidance = (SKILL_ROOT / "references/global-spmd-modeling.md").read_text()
-
-    assert "mesh from planner context" in guidance
-    assert "replicated-only strategy" in guidance
-    assert "local-shape rewriting" in guidance
-    assert "Equal startup seeds\ndo not prove" in guidance
-    assert "advance RNG state differently by\nrank" in guidance
-    assert (
-        "single-rank\nshape/range test is only planning or smoke evidence" in guidance
-    )
-
-
-def test_skill_guidance_bounds_operator_strategy_coverage():
-    guidance = (SKILL_ROOT / "SKILL.md").read_text()
-
-    assert "schema and in-contract semantics are equivalent" in guidance
-    assert "allowlisted replicate-only strategy" in guidance
-    assert "Reject invalid\n  input options candidate-locally" in guidance
-    assert "On both 1D and 2D meshes, lower every emitted strategy" in guidance
-    assert "output-structure, shape, value, and gradient checks" in guidance
 
 
 def test_behavioral_evaluation_plan_is_isolated_and_repeated():

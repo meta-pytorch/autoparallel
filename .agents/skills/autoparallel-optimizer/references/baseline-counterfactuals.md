@@ -131,15 +131,14 @@ increment-model error. A historical one-launch base is not a zero-error
 constant. Refresh it or classify the composed comparison as schedule-sensitive
 when its applicable drift bound can change the routing result.
 
-Runtime compatibility qualification is template-specific. If a native FSDP
-wrapping boundary warns that a returned view may lose its pre-backward
-all-gather hook, treat that exact template as performance-only until the
-consumer semantics or a warning-free boundary is qualified. Do not select it
-from timing alone. A root-only or output-cloning template may remove the warning
-but must be measured with its real memory, startup, and copy costs. Do not
-disqualify every FSDP template for the model family because one block policy
-warned; keep DDP as the correctness-qualified comparator when warning-free FSDP
-alternatives do not meet the performance bar.
+Runtime compatibility is template-specific. A wrapping template that emits a
+correctness warning, such as a returned view that may lose its pre-backward
+all-gather hook, is performance-only until the warning is resolved or the
+consumer semantics are qualified; do not select it from timing alone. Measure a
+warning-free alternative with its real memory, startup, and copy costs. One
+template's warning does not disqualify other FSDP templates for the model
+family, and DDP remains the correctness-qualified comparator when no
+warning-free FSDP template meets the bar.
 
 Shared parameters constrain nested FSDP ownership. Independently wrapping two
 subtrees that reference the same embedding can create overlapping mesh

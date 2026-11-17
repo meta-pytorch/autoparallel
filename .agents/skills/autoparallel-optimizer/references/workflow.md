@@ -317,8 +317,7 @@ python .agents/skills/autoparallel-optimizer/scripts/validate_evaluation_harness
 
 It rejects a missing collector lifetime, an unshared cost model, duplicate
 scheduler configuration, absent backward coverage, or non-durable metrics.
-Fix every issue and include each returned `handoff_requirements` statement in
-the final response.
+Fix every reported issue.
 
 Resolve the skill scripts directory explicitly when the harness cannot import
 it normally. Keep forward and backward inside the collector context so lazy
@@ -368,27 +367,28 @@ PyTorch versions aligned.
 
 ## Validate and report
 
+Apply `decision-principles.md` to every comparison and acceptance decision.
+
 For a generic routing decision, capture once and derive only the applicable
-DDP/FSDP counterfactuals. Preserve the user's existing configuration when one
-exists; otherwise use a versioned standard template. Record serialized,
-implementation-aware reordered, and optimistic legal-overlap latency estimates
-plus calibration error. Keep memory scopes explicit and do not infer full
-training-memory feasibility from the parameter constraint alone.
+DDP/FSDP counterfactuals (`baseline-counterfactuals.md`). Preserve the user's
+existing configuration when one exists; otherwise use a versioned standard
+template. Record serialized, implementation-aware reordered, and optimistic
+legal-overlap latency estimates plus calibration error. Use the policy
+classifier for the default relative verdict, then call
+`record_competitiveness_assessment()` before accepting AutoParallel.
 
-Use the policy classifier for the default relative verdict, then call
-`record_competitiveness_assessment()` before accepting AutoParallel. A
-schedule-sensitive or unavailable comparison is not an AutoParallel win. Do
-not execute a real baseline merely to resolve uncertainty unless the user
-explicitly authorized the benchmark cost.
+### Execute and compare numerics
 
-For execution, materialize or load initialized parameters after
-`to_empty(device="cuda")`, run compiled forward and backward with local input
-shapes, and check outputs and gradients for finite values. For numerical
-comparison, use the same parameters, inputs, seed, dtype, and tolerances as the
-unsharded reference. Call `torch.manual_seed(seed)` on every participating rank
-before DTensor initialization or random DTensor operations; relying on DTensor
-to synchronize rank-zero RNG state is deprecated. LocalTensorMode tests are
-useful diagnosis but are not the public compiled execution path.
+Materialize or load initialized parameters after `to_empty(device="cuda")`,
+run compiled forward and backward with local input shapes, and check outputs
+and gradients for finite values. For numerical comparison, use the same
+parameters, inputs, seed, dtype, and tolerances as the unsharded reference.
+Call `torch.manual_seed(seed)` on every participating rank before DTensor
+initialization or random DTensor operations; relying on DTensor to synchronize
+rank-zero RNG state is deprecated. LocalTensorMode tests are useful diagnosis
+but are not the public compiled execution path.
+
+### Measure on target
 
 For an AutoParallel-only hardware measurement, set the session to
 `mode="measure"` and pass a complete iteration callable to `measure_step()`.
@@ -397,177 +397,74 @@ full-device completion barrier, captures peak allocated and reserved memory,
 and takes the maximum observation across ranks. It rejects a new graph
 specialization during the measured window, then compares mean step time and
 peak allocated memory with the latest reordered forward/backward estimates.
-The callable owns gradient clearing and must use one stable input specialization.
-Exclude the optimizer update when directly calibrating against the reordered
-graph estimate because that estimate contains only forward/backward. A separate
+The callable owns gradient clearing and must use one stable input
+specialization.
+
+Exclude the optimizer update when calibrating directly against the reordered
+graph estimate, because that estimate covers only forward/backward. A
 production-step measurement may include the update; pass
-`optimizer_update=True` to `measure_step()` to record the wider boundary, and
-do not interpret its ratio to the narrower graph estimate as cost-model error.
-Keep the boundary identical across strategies.
+`optimizer_update=True` to record the wider boundary, and do not interpret its
+ratio to the narrower estimate as cost-model error.
 
-For training acceptance, pair that measurement with an optimizer-memory
-assessment. Record the optimizer, parameter/gradient/moment dtypes, state
-sharding, observed peak, additional persistent bytes absent from the measured
-boundary, projected peak, device limit, and required headroom. For a
-forward/loss/backward boundary that already holds parameters and gradients,
-AdamW's incremental persistent state is normally the two local moment tensors;
-compute their bytes from local element counts and actual moment dtypes rather
-than assuming they equal parameter bytes. Do not label the projection measured,
-and do not accept a plan that only fits before the intended optimizer state is
-materialized.
+Preserve max-rank first-warmup and total-warmup wall times. They include lazy
+compilation and measure time-to-ready, not compiler-only latency.
 
-For production training performance, include the actual optimizer update in
-the measured callable or add a versioned, held-out-calibrated optimizer-cost
-envelope to every strategy. Hold optimizer implementation, foreach/fused mode,
-state dtype, gradient accumulation, and update frequency fixed. If only the
-forward/loss/backward boundary is comparable, report that useful partial result
-but leave end-to-end competitiveness inconclusive.
-Preserve transformations between backward and the update. For global-norm
-gradient clipping, keep the norm definition, threshold, order, and frequency
-fixed and include both local norm work and the placement-dependent global
-reduction in every candidate's boundary. An unclipped measurement is not a
-proxy for a clipped production step. Treat the clipped workload as a new
-decision relative to an unclipped report, but keep exact clipped retries and
-linked clipped baselines under the same clipped `decision_id`. Record clipping
-frequency and optimizer-update frequency explicitly even when both are once per
-accumulation cycle. State that those two frequencies are the same for every
-candidate rather than leaving the equality implicit.
-In the response, report `local_norm_work` and
-`placement_dependent_global_reduction` separately; a reference to the global
-norm does not make its local work explicit.
-Record the trainable-parameter mask and optimizer parameter groups before
-capture. After AutoParallel lowering or native DDP/FSDP wrapping, assert that
-every parameter FQN retains the intended `requires_grad` value and that the
-optimizer contains only the intended parameters. Also preserve exact group
-membership and per-group hyperparameters such as weight decay and learning
-rate; a single-group timing run is not comparable to a grouped production
-optimizer. Record tied-parameter alias groups before capture and assert that
-lowering or wrapping preserves them; silently untying an embedding and output
-weight changes updates and can duplicate optimizer state. Treat a mismatch as
-a semantic failure, not a performance result.
-State the trainability gate in that order: check the per-FQN invariant after
-lowering or wrapping and before accepting execution evidence.
-Record mutable buffer names, shapes, dtypes, placement, and update semantics.
-For BatchNorm over a sharded logical batch, verify whether AutoParallel reduces
-global statistics and keeps replicated running buffers synchronized. Ordinary
-DDP BatchNorm uses rank-local statistics and is not a matched baseline; use
-SyncBatchNorm or an equivalent globally reduced implementation when global
-statistics are the intended contract.
-For memory, count persistent local parameter bytes for frozen and trainable
-parameters, but gradients and optimizer state only for local trainable
-parameters. For FP32 AdamW this is
-`all_local_parameter_bytes + 3 * local_trainable_parameter_bytes` when the
-gradient and two FP32 moments are all resident.
-For gradient accumulation greater than one, the comparable boundary is a full
-accumulation cycle. Measure or model the intermediate no-sync microsteps, the
-final synchronized microstep, and one optimizer update separately at their
-actual frequencies. Report total cycle latency and latency amortized per
-microstep. A synchronized microstep cannot be multiplied by the accumulation
-count, and optimizer work cannot be charged once per microstep.
-Record whether every strategy actually suppresses intermediate reductions.
+### Training-step contract
+
+Before capture, record the trainable-parameter mask, optimizer parameter groups
+with per-group hyperparameters, tied-parameter alias groups, and mutable
+buffers with their update semantics. Check them per FQN after lowering or
+wrapping. For BatchNorm over a sharded logical batch, ordinary DDP BatchNorm
+uses rank-local statistics; use SyncBatchNorm or an equivalent globally reduced
+implementation for a matched baseline when global statistics are intended.
+
+For memory acceptance, record the optimizer, parameter, gradient, and moment
+dtypes, state sharding, observed peak, persistent bytes absent from the
+measured boundary, projected peak, device limit, and required headroom. With
+FP32 AdamW and gradients plus both moments resident, persistent training state
+is `all_local_parameter_bytes + 3 * local_trainable_parameter_bytes`. If the
+measured boundary already holds parameters and gradients, the missing part is
+normally the two moment tensors, computed from local element counts and their
+actual dtypes.
+
 When compiled DDP alternates `no_sync()` and synchronized microsteps, use
-`static_graph=False` unless that exact static-graph template has executed
-successfully; an internal reducer-hook assertion is a template incompatibility,
-not evidence that DDP itself is infeasible.
-Build the optimizer envelope from paired partial-step and full-step evidence.
-Use local parameter or optimizer-state bytes to represent placement-dependent
-work and include a fixed dispatch term where supported. Stratify calibration by
-realized kernel family, dtype policy, framework version, and hardware; do not
-reuse a coefficient merely because the optimizer class has the same name.
-Freeze the fitted parameters and uncertainty before measuring prospective
-architectures. Record prediction errors and winner accuracy afterward without
-retroactively changing the frozen prediction.
+`static_graph=False` unless that exact static-graph template has executed; a
+reducer-hook assertion is a template incompatibility, not evidence that DDP is
+infeasible. When `foreach` or `fused` is left at its default, record both the
+configured value and the kernel family observed for every strategy.
 
-Before using the frozen envelope for a new decision, write an explicit
-applicability block even when the prompt supplies the matches:
+### Calibrate an optimizer-cost envelope
 
-```text
-calibration platform: hardware, framework, dtype policy, realized kernel family
-optimizer contract: groups, update frequency, accumulation, state placement,
-  dispatch
-calibration scale: local parameter-byte and tensor-count ranges
-```
+Build the envelope from paired partial-step and full-step evidence, preferably
+an in-step all-rank optimizer profile from the same process rather than the
+difference of medians from separate launches. Fit the optimizer's descendant
+update kernels, not the enclosing `Optimizer.step` span, which can include
+backward communication still pending when the update began. Use local
+parameter or optimizer-state bytes plus a fixed dispatch term, record tensor
+counts and types, and stratify by kernel family, dtype policy, framework
+version, and hardware. Freeze the fit and its uncertainty before evaluating
+prospective architectures, and record errors afterward without refitting.
 
-Mark every group matched, mismatched, or unknown. Widen or reject the envelope
-for a mismatch or material unknown. A modeled prediction does not mean the
-current candidate executed on target; use the strongest evidence level actually
-reached for that candidate.
-Prefer an in-step all-rank optimizer profile from the same materialized process
-over subtracting partial- and full-step medians from separate launches. Record
-local parameter bytes, optimizer parameter tensor count and tensor types, since
-dispatch and fragmentation can remain material at equal byte size.
-When AutoParallel loses a measured comparison, also compare max-rank collective
-operation counts, bucket counts, and matmul counts with the native baseline.
-Aggregate communication bytes or time alone can hide launch fragmentation. If
-optimizer self time is competitive but AutoParallel emits many more reductions
-or matmul fragments, record that separately rather than blaming the optimizer
-update. Inspect the pre/post bucket counts and dependency-blocked candidates
-before proposing coalescing. Terminal gradient reductions may be compatible;
-tensor-parallel activation reductions whose outputs feed later compute are not.
-When dependency-bound collectives dominate, target placement selection,
-local-kernel cost, or post-lowering candidate reranking instead.
-For multi-dimensional meshes, also group counts by process-group identity.
-All-gather-based discovery can omit process groups that contain only
-all-reduces in a phase. Use one all-group discovery counterfactual when this
-omission is material; require all-rank execution and independent launches
-before proposing it as a default because cross-group ordering is part of the
-runtime contract. Compare launch-level medians, not only the reduced collective
-count. Treat a neutral or slower held-out result as evidence that broader
-discovery needs per-group profitability selection rather than a global default.
-Also compare collective kernel time by rank and mesh coordinate. A stable
-subgroup-correlated max-rank stall indicates cross-communicator launch-order or
-peer-wait skew that a single-rank graph estimate cannot represent; preserve it
-as a separate finding rather than absorbing it into a global launch constant.
-When the user leaves `foreach` or `fused` at its framework default, record both
-the configured value and the kernel family observed for every strategy;
-automatic selection can depend on parameter tensor type and placement.
-Before accepting AutoParallel from a target comparison, use at least three
-independent process launches for every strategy and aggregate launch-level
-medians or envelopes. Also repeat close losses before treating the ranking as
-stable. Warmup repetitions inside one launch establish steady state but do not
-substitute for independent launches.
-Also preserve max-rank first-warmup and total-warmup wall times. These include
-lazy compilation and establish time-to-ready, not compiler-only latency. If the
-user provides an intended step count or job duration, compare startup plus
-steady-state execution for that horizon, report the break-even point, and use
-the native fallback when the run ends before AutoParallel amortizes its startup.
-That finite-job result is a projection unless the full job ran end to end. In a
-decision card, use `executed_on_target` only when its components explicitly came
-from target execution and reserve `measured` for a directly measured decision
-boundary. Do not infer either provenance level from timing numbers alone. When
-every strategy satisfies the acceptance bar but startup is not amortized,
-record `STARTUP_NOT_AMORTIZED`; do not claim `PERFORMANCE_BAR_MISSED`.
-When run length is unknown, report that the steady-state decision is conditional.
-Do not reject a long-running throughput win solely because startup is slower,
-or hide a short-job time-to-solution loss behind steady-state throughput.
+### Diagnose a measured loss
+
+Follow the communication and replication guidance in
+`interpreting-results.md`. When DDP fits and a sharded plan loses, one fully
+replicated AutoParallel counterfactual separates search and reordering quality
+from the native-wrapper gap. If it buckets far more aggressively and wins while
+its objective is worse, record a ranking inversion caused by
+placement-dependent bucketing rather than compensating with a global cost
+multiplier. When reordered metrics recover the measured ordering, rerank a
+bounded shortlist of alternative placements with them before spending target
+runs on a single serial-objective winner.
+
+### Budget the search
 
 Apply the attempt budget to sharding search as well as capture and lowering.
 Pass `solver_time_limit_seconds` for CBC-backed searches that may grow large,
 but do not treat it as a complete wall-clock timeout: MPS serialization,
-import, and presolve can occur outside CBC's timed branch-and-bound phase. A
-non-optimal incumbent after the limit is diagnostic evidence, not an
-acceptable placement. Record `SHARDING_SOLVER_TIMEOUT`, preserve the report,
-and route to the normal fallback when the outer budget expires.
-
-If a partially sharded plan beats full-shard before the update but loses over
-the full step, compare its local parameter-storage fraction with the full-shard
-template. Record `OPTIMIZER_COST_MISSING_FROM_OBJECTIVE` when the gap tracks
-the additional local parameters and optimizer work; preserve both boundaries
-for future objective calibration.
-Use at most one targeted parameter-memory upper-bound counterfactual near the
-full-shard fraction to test that hypothesis before proposing objective work.
-Record the unconstrained plan, constrained plan, and native full-shard result.
-Treat the constraint as diagnostic evidence, not a production default.
-When DDP fits and a sharded AutoParallel plan loses, one fully replicated
-AutoParallel counterfactual can isolate search/reordering quality from the
-native-wrapper gap. Compare collective and matmul counts plus the search
-objective. If the replicated counterfactual buckets far more aggressively and
-beats the selected plan while its objective is worse, record a ranking
-inversion caused by placement-dependent bucketing; do not compensate with a
-global cost multiplier. When post-lowering reordered metrics recover the
-measured ordering, retain or regenerate a bounded alternative-placement
-shortlist and use the reordered ranking before spending target runs on a single
-serial-objective winner.
+import, and presolve can occur outside CBC's timed branch-and-bound phase.
+Record `SHARDING_SOLVER_TIMEOUT`, preserve the report, and route to the normal
+fallback when the outer budget expires.
 
 Typical durable artifacts are `placements.json`, `optimizer.json`,
 `metrics.json`, and `optimizer.log`. The session automatically records plan

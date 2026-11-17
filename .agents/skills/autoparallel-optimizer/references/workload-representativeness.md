@@ -19,11 +19,9 @@ Before planning, record:
 When the user or training configuration specifies the global batch for one
 forward/backward microstep, treat it as authoritative. Construct the global
 logical capture inputs with that exact batch and execute the lowered model with
-`local_batch = global_batch / effective_dp_degree`. Verify divisibility before
-capture; do not round, truncate, substitute world size, or choose a more
-convenient batch. Write the assertion explicitly, for example
-`global_batch % effective_dp_degree == 0`; an integral quotient does not leave
-the contract check implicit.
+`local_batch = global_batch / effective_dp_degree`. Assert
+`global_batch % effective_dp_degree == 0` before capture; do not round,
+truncate, substitute world size, or choose a more convenient batch.
 
 If “global batch” denotes the effective optimizer batch rather than one
 microstep, do not reinterpret it silently. Resolve or record the microbatch and

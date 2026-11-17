@@ -411,6 +411,11 @@ expected interval, `stale_after`, pending and invalid bundle counts, and triage
 candidate counts. Consumers should treat `failed`, `degraded`, or a current time
 after `stale_after` as unhealthy feedback state.
 
+Before reporting a finalized run as visible to the feedback loop, verify a
+successful, non-stale status and then the run's presence in the rebuilt catalog
+and queue inputs. Report `skipped_locked`, degraded, or failed refreshes rather
+than editing the bundle.
+
 For measured estimate comparisons, include entries in the validation result:
 
 ```json

@@ -57,19 +57,12 @@ call the placement overlap-robust within the modeled endpoints. If they differ,
 do not select an intermediate discount as truth. Return the distinct placement
 families as a provisional candidate set and evaluate them after lowering.
 
-Do not leave endpoint bookkeeping implicit. A complete recommendation names
-the serial endpoint pessimistic and the zero-discount endpoint optimistic and
-non-executable, identifies independently saved artifacts, states how placement
-families were deduplicated, separates persistent storage from heavy-operation
-compute placement, and reports effective DP degree and local batch. When the
-families differ, it also holds topology, activation checkpointing, and
-autobucketing fixed during lowering and keeps the result provisional.
-
 ## Inspect storage, compute, and topology separately
 
 For each candidate, report:
 
 - its independently saved placement and optimizer-summary artifact paths;
+- how it was deduplicated against the other endpoint;
 - parameter placements by count and by global parameter bytes;
 - achieved local parameter bytes and byte-weighted fraction;
 - heavy matmul, attention, normalization, embedding, and output placements;

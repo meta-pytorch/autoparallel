@@ -25,17 +25,12 @@ placement does not establish another placement's cost.
 
 Meta or fake-tensor execution can produce this objective without allocating
 the real model. Use it to check capture/lowering legality, explore meshes and
-memory, rank candidates, and decide which target runs are most informative.
-Record those affirmative uses as `valid_meta_uses: legality/feasibility
-checking, candidate ranking, scale/memory exploration, benchmark
-prioritization`; do not leave one implicit merely because the response names
-what meta execution cannot prove.
-When the calibration envelope cannot preserve the modeled advantage, record
-`verdict: inconclusive` explicitly before retaining the production fallback.
-It is not runtime evidence. A calibrated meta-to-target mapping may support a
+memory, rank candidates, and decide which target runs are most informative. It
+is not runtime evidence. A calibrated meta-to-target mapping may support a
 relative claim only when its regime-matched held-out error envelope preserves
 the decision. A broad global fit with large architecture outliers remains
-`META_RUNTIME_ESTIMATE_RANKING_ONLY` even when its median error is modest.
+ranking evidence (`META_RUNTIME_ESTIMATE_RANKING_ONLY`) even when its median
+error is modest.
 
 ## Reordered graph metrics
 
@@ -160,122 +155,15 @@ incumbent even if CBC found a feasible objective. Use a smaller architectural
 canary only to isolate a mechanism; do not present it as evidence that the
 original workload parallelizes successfully.
 
-For each strategy, keep the optimistic legal-overlap estimate, the expected
-reordered estimate, and the pessimistic serialized-communication estimate.
-Expand that envelope by held-out calibration error. The same estimator can
-still have strategy-dependent bias, so applying one reordering pass to every
-candidate does not make the comparison measured or automatically fair.
-
-Use `robustly_competitive` only when AutoParallel's pessimistic calibrated
-bound remains competitive with the strongest baseline's optimistic calibrated
-bound. Use `robustly_worse` only when AutoParallel's optimistic bound loses to
-a baseline's pessimistic bound. Overlapping intervals are
-`schedule_sensitive`; preserve an existing baseline or use the normal fallback
-rather than declaring a win. If a template or calibration is missing, use
-`comparison_unavailable`.
-
-Latency tolerance absorbs uncertainty; it is not a reason to select a plan
-that loses on every acceptance dimension. When one baseline's pessimistic
-latency is no worse than AutoParallel's optimistic latency and it also uses no
-more complete-step peak memory and is no worse on recorded startup or other
-objectives, use `pareto_dominated` and route to that baseline. Require robust
-envelopes for the compared dimensions rather than point-estimate dominance.
+For relative verdicts, use the envelopes, classifier, and Pareto guard in
+`baseline-counterfactuals.md` and the acceptance rules in
+`decision-principles.md`. Applying one reordering pass to every candidate does
+not make the comparison measured or automatically fair: the same estimator can
+have strategy-dependent bias.
 
 Treat memory as a separate hard constraint with an explicit scope. Persistent
-parameter storage alone cannot establish DDP/FSDP feasibility. A baseline OOM
-can establish `baseline_infeasible`, but it does not establish throughput
-parity. Never label a counterfactual as measured unless that implementation ran
-on the stated target.
-
-A measured forward/loss/backward peak also does not establish optimizer-step
-feasibility when the optimizer state was absent. Report the measured peak and
-the projected training peak separately. Add only persistent tensors absent from
-the measured boundary: if parameters and gradients are already live, an AdamW
-projection normally adds its two local moment tensors at their actual dtypes
-and placements. Include an explicit operational reserve. If the projection
-misses the limit, the candidate fails the memory bar even when its measured
-forward/backward latency wins.
-Keep all supplied evidence labels explicit even when memory decides routing:
-label the partial-step latency and forward/backward peak `measured`, the added
-optimizer-state bytes `analytical`, and the complete-step peak `projected`.
-
-Use calibration only for the regime it covers. Record in-sample and held-out
-error, and retain the larger applicable uncertainty for architecture families,
-model sizes, or launch-bound workloads with sparse coverage. A low aggregate
-median does not override a large held-out outlier; use
-`comparison_unavailable` when no conservative comparable error bound exists.
-
-Match the latency boundary to the decision. Forward/loss/backward measurements
-can diagnose the sharding and communication schedule, but parameter placement
-also changes optimizer update work and DTensor overhead. Do not transfer a
-partial-boundary ranking to end-to-end training unless optimizer cost was
-measured or conservatively modeled for every strategy. Record
-`OPTIMIZER_PERFORMANCE_UNMODELED` or `STEP_BOUNDARY_MISMATCH` rather than
-folding the unknown cost into communication-model calibration.
-When gradient accumulation is enabled, match its frequency semantics too. A
-cycle with `G` microsteps generally has `G - 1` reduction-suppressed
-microsteps, one synchronized microstep, and one optimizer update. Compare the
-whole cycle or its correctly amortized latency; a single synchronized sample
-plus update can reverse the production ranking.
-Treat an unset/default foreach or fused option as a configured policy, not an
-observed implementation. Profile or otherwise record the realized optimizer
-kernel family for each strategy before attributing a gap to sharding; tensor
-subclasses and placements may change the framework's automatic choice.
-For a modeled update, a useful placement-dependent feature is local parameter
-or optimizer-state bytes, combined with a fixed dispatch term. Regard the fit
-as valid only for its measured kernel family, dtype policy, framework version,
-hardware, and workload regime. A small in-sample residual is not routing
-evidence: freeze the fit, validate it prospectively on held-out architectures,
-and retain the maximum relevant prediction error in the comparison envelope.
-When using a profiler, fit the optimizer's descendant update kernels rather
-than the enclosing `Optimizer.step` device span. The parent span may include
-backward communication that was still pending when the update began; retain
-that tail in the full-step communication/scheduling analysis.
-
-A composed prediction has two uncertainty sources: the base
-forward/loss/backward envelope and the optimizer increment. Freeze both, not
-just the increment model. Prefer contemporaneous independent launches for the
-base. If a historical base is reused, expand it by a validated temporal-drift
-bound for the same template and regime. When the optimizer kernels predict
-well but a refreshed partial control explains a full-step miss, record
-`COMPOSED_FULL_STEP_BASE_DRIFT`; do not inflate the optimizer-model error or
-claim that the increment model failed.
-
-Iteration samples from one process do not measure launch-to-launch variance.
-They also do not cover separate-process compilation, allocator initialization,
-or system-state variance.
-Before accepting AutoParallel from measured relative performance, run every
-strategy in at least three independent launches and compare the combined launch
-envelope. A close single-launch result is schedule-sensitive or inconclusive.
-Use `MEASURED_LAUNCH_VARIANCE_UNMODELED`; do not call a tight p10-p90 interval
-within one launch robust evidence.
-
-Time-to-ready and steady-state latency answer different questions. The first
-synchronized warmup can include lazy graph compilation, specialization, and
-allocator initialization. Keep it out of CUDA-event step samples, but include
-it when estimating a finite job's time-to-solution. Report the step-count
-break-even when startup and steady-state rankings disagree.
-
-Distinguish an optimizer-objective miss from a propagation failure. If the
-selected plan has broad sharding coverage but retains substantially more local
-parameter bytes than full-shard, meets the forward/backward bar, and loses
-after the optimizer update is included, record
-`OPTIMIZER_COST_MISSING_FROM_OBJECTIVE`. The current sharding objective does
-not price eager optimizer update work. Use the full-step fallback result for
-routing and retain the supplied numeric local/global parameter fractions plus
-every supplied partial- and full-boundary latency and memory result so the
-optimizer cost can later be added to search. If only the ordering is supplied,
-preserve it and note that exact values are unavailable rather than inventing
-them. State the partial-boundary and full-step orderings separately, including
-when the measured full-step fallback is both faster and smaller. Keep a compact
-stable-finding record with the reason code, parameter-storage comparison,
-`partial_boundary:` observed ordering, and `full_boundary:` latency plus memory
-ordering. A statement about what the objective favored is not a record of the
-observed partial-boundary winner.
-When authorized, validate this diagnosis with one narrow parameter-storage
-counterfactual near the full-shard fraction. An improvement in both full-step
-latency and memory despite extra communication isolates the missing optimizer
-term; it does not make a hard storage constraint the new default.
+parameter storage alone cannot establish DDP/FSDP feasibility, and a baseline
+OOM establishes `baseline_infeasible`, not throughput parity.
 
 ## Evidence ladder
 
