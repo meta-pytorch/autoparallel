@@ -69,6 +69,23 @@ def _localize_shape_arg(node, shape_arg, output_spec):
     return local_shape
 
 
+def _restride_like(local, global_stride):
+    """Return ``local`` laid out densely in the dimension order of ``global_stride``."""
+    order = sorted(range(local.ndim), key=lambda d: global_stride[d], reverse=True)
+    expected = [0] * local.ndim
+    step = 1
+    for d in reversed(order):
+        expected[d] = step
+        step *= local.shape[d]
+    if all(
+        size == 1 or stride == want
+        for size, stride, want in zip(local.shape, local.stride(), expected)
+    ):
+        return local
+    inverse = sorted(range(local.ndim), key=order.__getitem__)
+    return local.permute(order).contiguous().permute(inverse)
+
+
 def _compute_shard_order(shard_order, reverse: bool):
     result = []
     for tensor_dim, mesh_dims in shard_order:
@@ -272,20 +289,27 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
         # internally). Not needed in dynamic mode since shape args are already
         # localized above.
         if not self.dynamic and target in _VIEW_OPS and tgt_spec is not None:
+            local = new_args[0]
             global_metadata = {}
             if tgt_spec.tensor_meta is not None:
                 global_metadata = {
                     "shape": tgt_spec.tensor_meta.shape,
                     "stride": tgt_spec.tensor_meta.stride,
                 }
+                # The traced view is legal for the global layout, and later
+                # views can depend on the result keeping it. DTensor trusts the
+                # given global stride, so DTensor.contiguous() cannot fix a
+                # local tensor laid out differently: restride it locally.
+                local = _restride_like(local, tgt_spec.tensor_meta.stride)
+            else:
+                local = local.contiguous()
             new_args[0] = DTensor.from_local(
-                new_args[0],
+                local,
                 tgt_spec.mesh,
                 tgt_spec.placements,
                 **global_metadata,
             )
             new_args[0]._spec.shard_order = tgt_spec.shard_order
-            new_args[0] = new_args[0].contiguous()
 
         return new_args, last_tgt_spec
 

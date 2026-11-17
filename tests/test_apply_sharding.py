@@ -122,6 +122,47 @@ def test_static_view_preserves_uneven_global_shape():
         torch.testing.assert_close(local_tensor.grad, reference_input.grad[:, columns])
 
 
+def test_static_view_preserves_global_layout():
+    # The split view is legal on the permuted layout; the final flatten is only
+    # legal if the earlier views kept that layout instead of copying.
+    def chain(x):
+        x = x.permute(0, 2, 1).view(4, 3, 2, 2).view(4, 3, 4)
+        return x.permute(0, 2, 1).view(16, 3)
+
+    reference_input = torch.arange(48, dtype=torch.float32).reshape(4, 4, 3)
+    reference_input.requires_grad_()
+    reference_output = chain(reference_input)
+    reference_output.sum().backward()
+
+    gm = make_fx(chain)(reference_input.detach())
+    mesh = DeviceMesh("cpu", [0, 1], _init_backend=False)
+    specs = {}
+    placements = {}
+    for node in gm.graph.nodes:
+        if node.op == "output":
+            continue
+        val = node.meta["val"]
+        specs[node] = DTensorSpec(
+            mesh,
+            (Shard(0),),
+            tensor_meta=TensorMeta(val.shape, val.stride(), val.dtype),
+        )
+        producer = node.args[0] if node.args else node
+        placements[node] = OpSpec(
+            output_specs=specs[node], input_specs=(specs[producer],)
+        )
+
+    local_tensor = reference_input.detach()[:2].clone().requires_grad_()
+    parallel_gm = _lower_to_parallel_graph(
+        gm, placements, [local_tensor], param_placement_order={}
+    )
+    actual = parallel_gm(local_tensor)
+    actual.sum().backward()
+
+    torch.testing.assert_close(actual, reference_output.detach()[:8])
+    torch.testing.assert_close(local_tensor.grad, reference_input.grad[:2])
+
+
 class TestOrderedRedistributeFusion:
     """Test that ordered_redistribute_local_tensor fuses multi-dim collectives
     into single flat-mesh operations when possible."""
