@@ -19,6 +19,7 @@ Based on PyTorch DTensor implementation:
 
 import collections
 import itertools
+import math
 import operator
 from typing import cast
 
@@ -383,9 +384,13 @@ def split_with_sizes_rule(mesh, op_schema):
     dim = 0
     if len(op_schema.args_schema) > 2:
         dim = op_schema.args_schema[2]
-    dim = dim % op_spec.strategies[0].output_spec.ndim
     strats = []
 
+    banned_idxs = set()
+    for i, ss in enumerate(op_spec.strategies):
+        for placement in ss.output_spec.placements:
+            if placement.is_shard(dim) or placement.is_partial():
+                banned_idxs.add(i)
     for strat in op_spec.strategies:
         input_specs = strat.output_spec
         tensor_meta = input_specs.tensor_meta
@@ -399,7 +404,9 @@ def split_with_sizes_rule(mesh, op_schema):
             for out_t in out_ts
         )
 
-        redistribute_costs = generate_redistribute_costs(op_spec, input_specs)
+        redistribute_costs = generate_redistribute_costs(op_spec, output_specs[0])
+        for banned in banned_idxs:
+            redistribute_costs[banned] = math.inf
 
         s = OpSpec(output_specs, input_specs=(input_specs,))
         s.redistribute_cost = [redistribute_costs]

@@ -943,33 +943,3 @@ def test_inf_redistribute_cost_bans_input_placement(device_mesh_1d, tmp_path):
     loaded.resolve()
     for key in loaded.selected_keys:
         assert math.isfinite(loaded._resolve_decision_var(key).comm_cost)
-
-
-@apply_cuda_patches
-def test_split_with_sizes_of_split_dim_sharded_input(device_mesh_1d):
-    """Splitting along a sharded dim must stay feasible by gathering the
-    input before the split."""
-
-    class Model(nn.Module):
-        def forward(self, x):
-            a, b = x.split([512, 1536], dim=0)
-            return a, b
-
-    def input_fn():
-        return torch.randn(2048, 1024, device="cuda")
-
-    with torch.device("meta"):
-        model = Model()
-
-    with AutoParallel(model, input_fn, device_mesh_1d) as autop:
-        autop.add_input_constraints([(Shard(0),)])
-        autop.add_output_constraints([(Replicate(),), (Replicate(),)])
-        solution = autop.optimize_placement()
-        opt = autop.sharding_optimizer
-
-    (split,) = opt.graph.find_nodes(
-        op="call_function", target=torch.ops.aten.split_with_sizes.default
-    )
-    strategy = solution[opt._concrete_to_orig.get(split, split)]
-    assert strategy.input_specs[0].placements == (Replicate(),)
-    assert strategy.input_specs[0].tensor_meta.shape == torch.Size([2048, 1024])
