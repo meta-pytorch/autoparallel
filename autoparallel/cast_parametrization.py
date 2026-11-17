@@ -152,6 +152,8 @@ def apply_dtype_cast(model, mp_policy: MixedPrecisionPolicy):
 
     for mod_name, mod in sorted(model.named_modules()):
         params_dict = dict(mod.named_parameters(recurse=False))
+        if mod is not model and not params_dict:
+            continue
 
         # Create new class for this module with all parametrized parameters
         cls = mod.__class__
