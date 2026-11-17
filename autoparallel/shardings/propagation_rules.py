@@ -19,7 +19,6 @@ Based on PyTorch DTensor implementation:
 
 import collections
 import itertools
-import math
 import operator
 from typing import cast
 
@@ -373,43 +372,6 @@ def alias_rule(mesh, op_schema):
         redistribute_costs = [generate_redistribute_costs(op_spec, output_specs)]
         s = OpSpec(output_specs, input_specs=(input_specs,))
         s.redistribute_cost = redistribute_costs
-        strats.append(s)
-    return OpStrategy(strats)
-
-
-@register_rule(torch.ops.aten.split_with_sizes.default)
-def split_with_sizes_rule(mesh, op_schema):
-    op_spec = op_schema.args_schema[0]
-    sizes = op_schema.args_schema[1]
-    dim = 0
-    if len(op_schema.args_schema) > 2:
-        dim = op_schema.args_schema[2]
-    strats = []
-
-    banned_idxs = set()
-    for i, ss in enumerate(op_spec.strategies):
-        for placement in ss.output_spec.placements:
-            if placement.is_shard(dim) or placement.is_partial():
-                banned_idxs.add(i)
-    for strat in op_spec.strategies:
-        input_specs = strat.output_spec
-        tensor_meta = input_specs.tensor_meta
-        inp_t = _build_meta_tensor(tensor_meta)
-        out_ts = inp_t.split(sizes, dim)
-        placements = input_specs.placements
-        if any(p.is_shard(dim) or p.is_partial() for p in placements):
-            continue
-        output_specs = tuple(
-            DTensorSpec(mesh, placements, tensor_meta=_gen_tensor_meta(out_t))
-            for out_t in out_ts
-        )
-
-        redistribute_costs = generate_redistribute_costs(op_spec, output_specs[0])
-        for banned in banned_idxs:
-            redistribute_costs[banned] = math.inf
-
-        s = OpSpec(output_specs, input_specs=(input_specs,))
-        s.redistribute_cost = [redistribute_costs]
         strats.append(s)
     return OpStrategy(strats)
 

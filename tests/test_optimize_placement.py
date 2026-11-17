@@ -857,3 +857,55 @@ def test_remove_node_constraint_restores_memory_budget(device_mesh_1d):
         # With memory budget enforced and no node constraint, the optimizer
         # should shard this param again
         assert solution[orig_node].output_specs.placements == (Shard(0),)
+
+
+@apply_cuda_patches
+def test_split_with_sizes_of_split_dim_sharded_input(device_mesh_1d):
+    """Splitting along a sharded dim must stay feasible by gathering the
+    input before the split."""
+
+    class Model(nn.Module):
+        def forward(self, x):
+            a, b = x.split([512, 1536], dim=0)
+            return a, b
+
+    def input_fn():
+        return torch.randn(2048, 1024, device="cuda")
+
+    with torch.device("meta"):
+        model = Model()
+
+    with AutoParallel(model, input_fn, device_mesh_1d) as autop:
+        autop.add_input_constraints([(Shard(0),)])
+        autop.add_output_constraints([(Replicate(),), (Replicate(),)])
+        solution = autop.optimize_placement()
+        opt = autop.sharding_optimizer
+
+    (split,) = opt.graph.find_nodes(
+        op="call_function", target=torch.ops.aten.split_with_sizes.default
+    )
+    strategy = solution[opt._concrete_to_orig.get(split, split)]
+    assert strategy.input_specs[0].placements == (Replicate(),)
+    assert strategy.input_specs[0].tensor_meta.shape == torch.Size([2048, 1024])
+
+
+@apply_cuda_patches
+def test_split_with_sizes_negative_dim_never_shards_split_dim(device_mesh_2d):
+    class Model(nn.Module):
+        def forward(self, x):
+            a, b = x.split([256, 768], dim=-1)
+            return a, b
+
+    def input_fn():
+        return torch.randn(256, 64, 1024, device="cuda")
+
+    with torch.device("meta"):
+        model = Model()
+
+    with AutoParallel(model, input_fn, device_mesh_2d) as autop:
+        opt = autop.sharding_optimizer
+        (split,) = opt.graph.find_nodes(
+            op="call_function", target=torch.ops.aten.split_with_sizes.default
+        )
+        for strategy in opt.strats[split].strategies:
+            assert not any(p.is_shard(2) for p in strategy.input_specs[0].placements)
