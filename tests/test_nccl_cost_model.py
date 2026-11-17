@@ -757,19 +757,35 @@ class TestDetectNCCLTopoConfig:
         assert config is not None
         assert config.arch == GpuArch.HOPPER
 
-    def test_b200_detected(self):
+    @pytest.mark.parametrize(
+        "device_name,gpus_per_node",
+        [
+            ("NVIDIA B200", 8),
+            ("NVIDIA B300 SXM6 AC", 8),
+            ("NVIDIA GB200", 72),
+            ("NVIDIA GB300", 72),
+        ],
+    )
+    def test_blackwell_gpus_per_node(self, device_name, gpus_per_node):
         from unittest.mock import patch
 
-        mesh = self._make_mock_mesh(72)
-        with (
-            patch("torch.cuda.get_device_name", return_value="NVIDIA B200"),
-            patch("torch.cuda.device_count", return_value=72),
-        ):
+        mesh = self._make_mock_mesh(gpus_per_node * 2)
+        with patch("torch.cuda.get_device_name", return_value=device_name):
             config = detect_nccl_topo_config(mesh)
         assert config is not None
         assert config.arch == GpuArch.BLACKWELL
-        assert config.num_nodes == 1
-        assert config.gpus_per_node == 72
+        assert config.num_nodes == 2
+        assert config.gpus_per_node == gpus_per_node
+
+    def test_b200_mesh_not_multiple_of_72(self):
+        from unittest.mock import patch
+
+        mesh = self._make_mock_mesh(64)
+        with patch("torch.cuda.get_device_name", return_value="NVIDIA B200"):
+            config = detect_nccl_topo_config(mesh)
+        assert config is not None
+        assert config.num_nodes == 8
+        assert config.gpus_per_node == 8
 
     def test_gb200_detected(self):
         from unittest.mock import patch
