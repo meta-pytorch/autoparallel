@@ -496,6 +496,24 @@ def _shard_args_for_node(node, strategy=None, rand_init=False):
     return args, kwargs
 
 
+# _unsafe_view is a view at runtime, but omits the alias annotation so autograd
+# treats its output as a fresh tensor.
+_EMPTY_FACTORY_OPS = {
+    torch.ops.aten.empty.memory_format,
+    torch.ops.aten.empty_strided.default,
+    torch.ops.aten.empty_like.default,
+}
+
+
+def _empty_factories_fill_memory():
+    # Deterministic mode fills uninitialized memory with a kernel that has no
+    # node of its own in the graph.
+    return (
+        torch.are_deterministic_algorithms_enabled()
+        and torch.utils.deterministic.fill_uninitialized_memory
+    )
+
+
 def _has_zero_cost(node):
     if node.op != "call_function":
         return True
@@ -505,8 +523,11 @@ def _has_zero_cost(node):
 
     assert not isinstance(node.target, torch._ops.OpOverloadPacket), f"{node.target}"
 
-    if node.target.is_view:
+    if node.target.is_view or node.target == torch.ops.aten._unsafe_view.default:
         return True
+
+    if node.target in _EMPTY_FACTORY_OPS:
+        return not _empty_factories_fill_memory()
 
     return False
 
