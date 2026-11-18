@@ -28,7 +28,11 @@ from torch.export._trace import _restore_state_dict
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
 from .apply_sharding import apply_sharding_to_model
-from .dtype_cast import canonicalize_mp, make_dtype_cast_forward
+from .dtype_cast import (
+    canonicalize_mp,
+    make_dtype_cast_forward,
+    move_dtype_casts_to_first_use,
+)
 from .graph_passes.activation_checkpointing import mark_fsdp_all_gather_recomputation
 from .graph_passes.graph_utils import (
     _add_alias,
@@ -199,22 +203,7 @@ def build_joint_graph(
         _restore_state_dict(model, torch_ir_with_fqn)
         if mp_policy is not None:
             _restore_nn_module_stack(model, torch_ir_with_fqn)
-            # Cast at first use so AOT does not defer gradient casts until the end.
-            order = {
-                node: index for index, node in enumerate(torch_ir_with_fqn.graph.nodes)
-            }
-            for node in torch_ir_with_fqn.graph.find_nodes(
-                op="call_function", target=torch.ops.autoparallel.dtype_cast
-            ):
-                if node.users:
-                    first_user = min(node.users, key=order.__getitem__)
-                    first_user.prepend(node)
-                    # Clustering uses source attribution to distinguish call sites.
-                    for key in ("stack_trace", "nn_module_stack"):
-                        if key in first_user.meta:
-                            node.meta[key] = first_user.meta[key]
-            torch_ir_with_fqn.graph.lint()
-            torch_ir_with_fqn.recompile()
+            move_dtype_casts_to_first_use(torch_ir_with_fqn)
         _add_unused_params_and_buffers(model, torch_ir_with_fqn)
         # TODO Can't use fake mode here because it clashes with the user level
         # fake mode. Ideally dynamo should reuse the user level fake mode.

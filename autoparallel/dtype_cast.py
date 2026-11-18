@@ -87,3 +87,20 @@ def make_dtype_cast_forward(model: torch.nn.Module, mp_policy: MixedPrecisionPol
         return tree_map(cast_out_fn, output)
 
     return forward
+
+
+def move_dtype_casts_to_first_use(gm: torch.fx.GraphModule) -> None:
+    """Place captured casts at first use before AOT generates their backward."""
+    order = {node: index for index, node in enumerate(gm.graph.nodes)}
+    for node in gm.graph.find_nodes(
+        op="call_function", target=torch.ops.autoparallel.dtype_cast
+    ):
+        if node.users:
+            first_user = min(node.users, key=order.__getitem__)
+            first_user.prepend(node)
+            # Clustering uses source attribution to distinguish call sites.
+            for key in ("stack_trace", "nn_module_stack"):
+                if key in first_user.meta:
+                    node.meta[key] = first_user.meta[key]
+    gm.graph.lint()
+    gm.recompile()
