@@ -90,6 +90,18 @@ optional evidence document accepts facts such as `requested_strategy`,
 by the run. The validator rejects contradictory fields; it does not infer
 missing evidence or replace the routing decision.
 
+An unrecovered attempt error makes the outcome `failed` even when other
+evidence is also missing. When the one permitted targeted retry succeeds, also
+set `attempt_recovered_by_retry`. The outcome then follows the retry's
+evidence, often `inconclusive`, and the decision card records
+`RECOVERED_BY_RETRY`. It should also record the original failure's reason
+code, for example `LOWERING_FAILED`. Recovery applies only to a retry that
+preserves both semantics and the amount of work. A diagnostic rewrite, such as
+evaluating every MoE expert for every token, is not a recovery, and the attempt
+remains `failed`. When the workload is not representative because of
+a semantic or contract mismatch rather than an underfilled smoke input, record
+`WORKLOAD_NOT_REPRESENTATIVE` instead of `SYNTHETIC_UNDERFILLED_WORKLOAD`.
+
 When only a synthetic or inferred workload is available, an AutoParallel run
 may establish smoke evidence but not a production quality decision. For a
 controlled benchmark or authorized tuning task, use the bounded sensitivity

@@ -167,20 +167,31 @@ def validate_routing_classification(
         )
     if facts.get("autoparallel_attempted") is True and disposition != "attempt":
         reject("ATTEMPT_DISPOSITION", "Observed execution requires disposition=attempt")
-    if facts.get("attempt_error_observed") is True and outcome != "failed":
+    error_observed = facts.get("attempt_error_observed") is True
+    recovered = facts.get("attempt_recovered_by_retry") is True
+    # An unrecovered error is the decision's terminal evidence; a recovered one
+    # leaves the outcome to the evidence of the successful retry.
+    unrecovered_error = error_observed and not recovered
+    if recovered and not error_observed:
+        reject(
+            "RETRY_WITHOUT_ERROR",
+            "attempt_recovered_by_retry requires attempt_error_observed",
+        )
+    if unrecovered_error and outcome != "failed":
         reject(
             "OBSERVED_ATTEMPT_FAILURE",
-            "An observed attempt error requires outcome=failed",
+            "An unrecovered attempt error requires outcome=failed",
         )
     if facts.get("semantic_violation_observed") is True and outcome != "failed":
         reject(
             "OBSERVED_SEMANTIC_FAILURE",
             "An observed semantic invariant violation requires outcome=failed",
         )
-    if facts.get("required_evidence_missing") is True and outcome not in {
-        "inconclusive",
-        "ineligible",
-    }:
+    if (
+        facts.get("required_evidence_missing") is True
+        and outcome not in {"inconclusive", "ineligible"}
+        and not (unrecovered_error and outcome == "failed")
+    ):
         reject(
             "MISSING_EVIDENCE_OUTCOME",
             "Missing required evidence cannot prove acceptance, failure, or a missed bar",
@@ -332,11 +343,20 @@ def validate_routing_classification(
             "CARD_OMITS_MISSING_EVIDENCE",
             "Observed missing evidence must be named in decision_card",
         )
-    if facts.get("workload_representative") is False:
+    if facts.get("workload_representative") is False and not {
+        "SYNTHETIC_UNDERFILLED_WORKLOAD",
+        "WORKLOAD_NOT_REPRESENTATIVE",
+    }.intersection(reason_codes):
+        reject(
+            "CARD_OMITS_WORKLOAD_REASON",
+            "decision_card must record SYNTHETIC_UNDERFILLED_WORKLOAD or "
+            "WORKLOAD_NOT_REPRESENTATIVE",
+        )
+    if facts.get("attempt_recovered_by_retry") is True:
         _require_reason_code(
             reason_codes,
-            "SYNTHETIC_UNDERFILLED_WORKLOAD",
-            "CARD_OMITS_WORKLOAD_REASON",
+            "RECOVERED_BY_RETRY",
+            "CARD_OMITS_RETRY_REASON",
             reject,
         )
     if facts.get("optimizer_update_modeled_or_measured") is False:

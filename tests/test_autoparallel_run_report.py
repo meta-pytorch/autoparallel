@@ -624,6 +624,69 @@ def test_parallelization_routing_validator_uses_evidence_invariants():
         "MISSING_EVIDENCE_OUTCOME"
     }
 
+    # An unrecovered attempt error takes precedence over missing evidence.
+    assert validate_routing_classification(
+        decision,
+        {
+            "autoparallel_attempted": True,
+            "attempt_error_observed": True,
+            "required_evidence_missing": True,
+        },
+    )["valid"]
+
+
+def test_parallelization_routing_validator_represents_recovered_retry():
+    decision = {
+        "invoke_skill": True,
+        "autoparallel_disposition": "attempt",
+        "autoparallel_outcome": "inconclusive",
+        "competitiveness_verdict": "comparison_unavailable",
+        "benchmark_action": "skip",
+        "selected_strategy": "ddp",
+        "report_required": True,
+        "decision_card": {
+            "evidence_level": "compiled",
+            "boundary": "forward/backward without optimizer update",
+            "boundary_matched": False,
+            "reason_codes": [
+                "LOWERING_FAILED",
+                "RECOVERED_BY_RETRY",
+                "WORKLOAD_NOT_REPRESENTATIVE",
+            ],
+            "missing_evidence": ["target execution"],
+            "fallback_strategy": "ddp",
+            "next_control": "confirm per-rank sampling semantics",
+        },
+    }
+    facts = {
+        "autoparallel_attempted": True,
+        "attempt_error_observed": True,
+        "attempt_recovered_by_retry": True,
+        "required_evidence_missing": True,
+        "workload_representative": False,
+        "benchmark_needed": True,
+        "benchmark_authorized": False,
+        "qualified_fallback": "ddp",
+    }
+    assert validate_routing_classification(decision, facts, require_decision_card=True)[
+        "valid"
+    ]
+
+    decision["decision_card"]["reason_codes"] = ["LOWERING_FAILED"]
+    result = validate_routing_classification(
+        decision, facts, require_decision_card=True
+    )
+    assert {error["code"] for error in result["errors"]} == {
+        "CARD_OMITS_RETRY_REASON",
+        "CARD_OMITS_WORKLOAD_REASON",
+    }
+
+    decision["decision_card"]["reason_codes"] = ["RECOVERED_BY_RETRY"]
+    result = validate_routing_classification(
+        decision, {"attempt_recovered_by_retry": True}
+    )
+    assert {error["code"] for error in result["errors"]} == {"RETRY_WITHOUT_ERROR"}
+
 
 def test_parallelization_routing_validator_preserves_authority_and_pending_work():
     explicit_fsdp = {
