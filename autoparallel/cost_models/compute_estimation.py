@@ -13,6 +13,8 @@ from torch.utils._mode_utils import no_dispatch
 from torch.utils._pytree import tree_flatten, tree_map_only
 from torch.utils.flop_counter import FlopCounterMode, register_flop_formula
 
+from autoparallel.shardings.propagation_rules import _SHAPE_FACTORY_OPS
+
 _cost_model_device_name: str | None = None
 
 
@@ -460,6 +462,12 @@ def _shard_args_for_node(node, strategy=None, rand_init=False):
 
     if strategy is None:
         return args, kwargs
+
+    if node.target in _SHAPE_FACTORY_OPS:
+        # Factory ops have no tensor inputs: their global size argument is
+        # what the output placement shards.
+        sizes, _ = _get_sharded_shape_stride(strategy.output_specs)
+        return (sizes, *args[1:]), kwargs
 
     # TODO: handle kwargs as well, for now we assume all tensors are
     # in args

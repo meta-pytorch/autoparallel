@@ -5,6 +5,10 @@
 
 import pytest
 import torch
+from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.tensor._dtensor_spec import DTensorSpec, TensorMeta
+from torch.distributed.tensor._op_schema import OpSpec
+from torch.distributed.tensor.placement_types import Replicate, Shard
 
 import autoparallel.cost_models.compute_estimation as compute_estimation
 from autoparallel.cost_models.compute_estimation import (
@@ -67,3 +71,38 @@ def test_estimate_fp8_mm(monkeypatch):
     mm = graph.call_function(torch.ops.aten.mm.default, (lhs, rhs))
 
     assert estimate_strategy_runtime_cost(mm, None) > 0
+
+
+def test_sharded_factory_op_is_priced_at_local_size(monkeypatch):
+    h100 = next(limit for limit in DEVICE_LIMITS if limit.name == "H100")
+    monkeypatch.setattr(compute_estimation, "_get_device_limit", lambda: h100)
+
+    def full_node(shape):
+        graph = torch.fx.Graph()
+        node = graph.call_function(
+            torch.ops.aten.full.default,
+            (shape, 0.0),
+            {"dtype": torch.bfloat16, "device": torch.device("meta")},
+        )
+        node.meta["val"] = torch.empty(shape, dtype=torch.bfloat16, device="meta")
+        return node
+
+    global_shape = [65536, 4096]
+    mesh = DeviceMesh("cpu", list(range(64)), _init_backend=False)
+    tensor_meta = TensorMeta(
+        torch.Size(global_shape), (global_shape[1], 1), torch.bfloat16
+    )
+
+    def cost(placement):
+        spec = DTensorSpec(mesh, (placement,), tensor_meta=tensor_meta)
+        return estimate_strategy_runtime_cost(
+            full_node(global_shape), OpSpec(output_specs=spec, input_specs=[spec])
+        )
+
+    assert cost(Replicate()) == estimate_strategy_runtime_cost(
+        full_node(global_shape), None
+    )
+    assert cost(Shard(0)) == estimate_strategy_runtime_cost(
+        full_node([1024, 4096]), None
+    )
+    assert cost(Shard(0)) < cost(Replicate())
