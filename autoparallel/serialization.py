@@ -448,7 +448,7 @@ def load_optimizer(cls, path):
     No live DeviceMesh or process group is needed.
     """
     # Ensure custom ops are registered before loading
-    import autoparallel.cast_parametrization  # noqa: F401
+    import autoparallel.dtype_cast  # noqa: F401
     from autoparallel.optimize_sharding import DecisionVar
 
     t0 = time.perf_counter()

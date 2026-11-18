@@ -15,7 +15,7 @@ from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor.placement_types import Shard
 
 from autoparallel.api import AutoParallel
-from autoparallel.cast_parametrization import make_dtype_cast_forward
+from autoparallel.dtype_cast import make_dtype_cast_forward
 from autoparallel.input_validation import ForwardInputs
 
 

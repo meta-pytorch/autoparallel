@@ -28,7 +28,7 @@ from torch.export._trace import _restore_state_dict
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
 from .apply_sharding import apply_sharding_to_model
-from .cast_parametrization import canonicalize_mp, make_dtype_cast_forward
+from .dtype_cast import canonicalize_mp, make_dtype_cast_forward
 from .graph_passes.activation_checkpointing import mark_fsdp_all_gather_recomputation
 from .graph_passes.graph_utils import (
     _add_alias,

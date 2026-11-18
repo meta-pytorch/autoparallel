@@ -129,7 +129,7 @@ data = opt.get_json()
 
 ## Requirements and limitations
 
-- **`save()` / `load()`**: Uses `torch.save` (pickle). Same-codebase, same-PyTorch-version only. Custom ops must be registered before loading (the loader imports `autoparallel.cast_parametrization` automatically).
+- **`save()` / `load()`**: Uses `torch.save` (pickle). Same-codebase, same-PyTorch-version only. Custom ops must be registered before loading (the loader imports `autoparallel.dtype_cast` automatically).
 - **`save_replay()` / `load_replay()`**: Uses PyTorch's private FX `GraphPickler` inside a gzip-compressed `torch.save` artifact. Inputs must be trusted and use the exact capture PyTorch revision. A different AutoParallel revision uses its own regeneration logic and can produce different results. Model-defined custom operators must be registered before loading. Loading regenerates the optimizer and can be as expensive as the original optimizer construction.
 - **`save_placements()` / `load_placements()`**: Plain JSON. Portable across runs, but the model graph and mesh must match. `load_placements()` validates mesh shape and dim names, and verifies that every saved node name exists in the current graph.
 - **`get_json()`**: Requires a solved optimizer — call `get_solution()` or `optimize_placement()` first, or load a saved optimizer that already contains a solution. The output is a Python dict, not written to disk — serialize it yourself if needed.

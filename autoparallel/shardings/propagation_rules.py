@@ -51,7 +51,7 @@ from torch.distributed.tensor.placement_types import (
 )
 
 # need to import this to have the dtype_cast registered
-from ..cast_parametrization import dtype_cast  # noqa
+from ..dtype_cast import dtype_cast  # noqa
 
 # need to import this to have doc_packed_attn_op registered
 from ..ops import doc_packed_attn  # noqa: F401
