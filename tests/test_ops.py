@@ -439,6 +439,8 @@ def _per_doc_sdpa_reference(
     v: torch.Tensor,
     per_batch_doc_lens: list[list[int]],
     window_size: tuple[int, int],
+    per_batch_kv_lens: list[list[int]] | None = None,
+    scale: float | None = None,
 ) -> torch.Tensor:
     """Reference implementation: SDPA per document, then concat.
 
@@ -448,32 +450,33 @@ def _per_doc_sdpa_reference(
     import torch.nn.functional as F
 
     is_full = window_size == (-1, -1)
-    is_causal = window_size == (-1, 0)
+    if per_batch_kv_lens is None:
+        per_batch_kv_lens = per_batch_doc_lens
     out = torch.zeros_like(q)
     for b in range(q.shape[0]):
-        offset = 0
-        for L in per_batch_doc_lens[b]:
-            q_doc = q[b, offset : offset + L].transpose(0, 1).unsqueeze(0)
-            k_doc = k[b, offset : offset + L].transpose(0, 1).unsqueeze(0)
-            v_doc = v[b, offset : offset + L].transpose(0, 1).unsqueeze(0)
+        q_offset = k_offset = 0
+        for L_q, L_k in zip(per_batch_doc_lens[b], per_batch_kv_lens[b], strict=True):
+            q_doc = q[b, q_offset : q_offset + L_q].transpose(0, 1).unsqueeze(0)
+            k_doc = k[b, k_offset : k_offset + L_k].transpose(0, 1).unsqueeze(0)
+            v_doc = v[b, k_offset : k_offset + L_k].transpose(0, 1).unsqueeze(0)
             if is_full:
                 o = F.scaled_dot_product_attention(
-                    q_doc, k_doc, v_doc, is_causal=False, enable_gqa=True
-                )
-            elif is_causal:
-                o = F.scaled_dot_product_attention(
-                    q_doc, k_doc, v_doc, is_causal=True, enable_gqa=True
+                    q_doc, k_doc, v_doc, scale=scale, enable_gqa=True
                 )
             else:
-                window_left = window_size[0] + 1  # inclusive of self
-                i_idx = torch.arange(L, device=q.device).unsqueeze(1)
-                j_idx = torch.arange(L, device=q.device).unsqueeze(0)
-                mask = (j_idx <= i_idx) & (i_idx - j_idx < window_left)
+                i_idx = torch.arange(L_q, device=q.device).unsqueeze(1) + L_k - L_q
+                j_idx = torch.arange(L_k, device=q.device).unsqueeze(0)
+                mask = torch.ones((L_q, L_k), dtype=torch.bool, device=q.device)
+                if window_size[0] >= 0:
+                    mask &= j_idx >= i_idx - window_size[0]
+                if window_size[1] >= 0:
+                    mask &= j_idx <= i_idx + window_size[1]
                 o = F.scaled_dot_product_attention(
-                    q_doc, k_doc, v_doc, attn_mask=mask, enable_gqa=True
+                    q_doc, k_doc, v_doc, attn_mask=mask, scale=scale, enable_gqa=True
                 )
-            out[b, offset : offset + L] = o.squeeze(0).transpose(0, 1)
-            offset += L
+            out[b, q_offset : q_offset + L_q] = o.squeeze(0).transpose(0, 1)
+            q_offset += L_q
+            k_offset += L_k
     return out
 
 
@@ -824,7 +827,7 @@ class TestDocPackedAttnShardingStrategy:
             super().__init__()
             self.n_docs = n_docs
 
-        def forward(self, q, k, v, cu_seq_q):
+        def forward(self, q, k, v, cu_seq_q, cu_seq_k=None):
             return doc_packed_attn(
                 q,
                 k,
@@ -833,19 +836,27 @@ class TestDocPackedAttnShardingStrategy:
                 n_docs=self.n_docs,
                 window_size=(-1, 0),
                 enable_gqa=True,
+                cu_seq_k=cu_seq_k,
             )
 
     @staticmethod
-    def _input_fn_factory(B, S, Hq, Hkv, D, n_docs):
+    def _input_fn_factory(B, S, Hq, Hkv, D, n_docs, S_k=None):
         """Returns an input_fn that builds q/k/v plus uniform-doc cu_seq_q."""
 
         def input_fn():
             q = torch.randn(B, S, Hq, D, device="cuda", dtype=torch.bfloat16)
-            k = torch.randn(B, S, Hkv, D, device="cuda", dtype=torch.bfloat16)
-            v = torch.randn(B, S, Hkv, D, device="cuda", dtype=torch.bfloat16)
+            kv_len = S if S_k is None else S_k
+            k = torch.randn(B, kv_len, Hkv, D, device="cuda", dtype=torch.bfloat16)
+            v = torch.randn(B, kv_len, Hkv, D, device="cuda", dtype=torch.bfloat16)
             per_doc = S // n_docs
             base = torch.arange(n_docs + 1, dtype=torch.int32, device="cuda") * per_doc
             cu = base.unsqueeze(0).expand(B, -1).contiguous()
+            if S_k is not None:
+                base_k = torch.arange(n_docs + 1, dtype=torch.int32, device="cuda") * (
+                    S_k // n_docs
+                )
+                cu_k = base_k.unsqueeze(0).expand(B, -1).contiguous()
+                return q, k, v, cu, cu_k
             return q, k, v, cu
 
         return input_fn
@@ -861,24 +872,18 @@ class TestDocPackedAttnShardingStrategy:
                 return node
         raise AssertionError("autoparallel::doc_packed_attn_op not found in graph")
 
-    def test_dp_only_pins_shard0(self, device_mesh_1d):
+    @pytest.mark.parametrize("S_k", [None, 128])
+    def test_dp_only_pins_shard0(self, device_mesh_1d, S_k):
         """1D dp mesh, all inputs pinned Shard(0): op picks Shard(0) end-to-end."""
         # B must be divisible by mesh size (256 in the fixture).
         B, S, Hq, Hkv, D, n_docs = 256, 256, 8, 4, 64, 4
         model = self._JustAttn(n_docs).to(dtype=torch.bfloat16)
-        input_fn = self._input_fn_factory(B, S, Hq, Hkv, D, n_docs)
+        input_fn = self._input_fn_factory(B, S, Hq, Hkv, D, n_docs, S_k)
 
         with AutoParallel(
             model, input_fn, device_mesh_1d, repeated_subgraphs=False
         ) as autop:
-            autop.add_input_constraints(
-                [
-                    (Shard(0),),  # q
-                    (Shard(0),),  # k
-                    (Shard(0),),  # v
-                    (Shard(0),),  # cu_seq_q
-                ]
-            )
+            autop.add_input_constraints([(Shard(0),)] * (4 if S_k is None else 5))
             autop.add_output_constraints([(Shard(0),)])
             sol = autop.optimize_placement()
 
@@ -887,7 +892,7 @@ class TestDocPackedAttnShardingStrategy:
             in_placements = [s.placements for s in spec.input_specs]
             out_placements = [s.placements for s in spec.output_specs]
 
-            # All four inputs must be Shard(0).
+            assert len(in_placements) == (4 if S_k is None else 5)
             for i, p in enumerate(in_placements):
                 assert p == (Shard(0),), f"input {i} placement {p} != (Shard(0),)"
 
@@ -897,7 +902,8 @@ class TestDocPackedAttnShardingStrategy:
             assert out_placements[2] == (Replicate(),), out_placements[2]
             assert spec.output_specs[2].tensor_meta.dtype == torch.uint64
 
-    def test_dp_tp_pins_shard0_shard2(self, device_mesh_2d):
+    @pytest.mark.parametrize("S_k", [None, 128])
+    def test_dp_tp_pins_shard0_shard2(self, device_mesh_2d, S_k):
         """2D dp×tp mesh, q/k/v pinned (Shard(0), Shard(2)).
 
         cu_seq_q has no head dim so it's (Shard(0), Replicate()). Output
@@ -913,18 +919,14 @@ class TestDocPackedAttnShardingStrategy:
             pytest.skip(f"dp_size={dp_size} doesn't divide B={B}")
 
         model = self._JustAttn(n_docs).to(dtype=torch.bfloat16)
-        input_fn = self._input_fn_factory(B, S, Hq, Hkv, D, n_docs)
+        input_fn = self._input_fn_factory(B, S, Hq, Hkv, D, n_docs, S_k)
 
         with AutoParallel(
             model, input_fn, device_mesh_2d, repeated_subgraphs=False
         ) as autop:
             autop.add_input_constraints(
-                [
-                    (Shard(0), Shard(2)),
-                    (Shard(0), Shard(2)),
-                    (Shard(0), Shard(2)),
-                    (Shard(0), Replicate()),
-                ]
+                [(Shard(0), Shard(2))] * 3
+                + [(Shard(0), Replicate())] * (1 if S_k is None else 2)
             )
             autop.add_output_constraints([(Shard(0), Shard(2))])
             sol = autop.optimize_placement()
@@ -938,24 +940,200 @@ class TestDocPackedAttnShardingStrategy:
             assert in_placements[1] == (Shard(0), Shard(2)), in_placements[1]  # k
             assert in_placements[2] == (Shard(0), Shard(2)), in_placements[2]  # v
             assert in_placements[3] == (Shard(0), Replicate()), in_placements[3]  # cu
+            if S_k is not None:
+                assert in_placements[4] == (Shard(0), Replicate())
 
             assert out_placements[0] == (Shard(0), Shard(2)), out_placements[0]  # out
             assert out_placements[1] == (Shard(1), Shard(0)), out_placements[1]  # lse
             assert out_placements[2] == (Replicate(), Replicate()), out_placements[2]
 
-    def test_apply_placement_succeeds(self, device_mesh_1d):
+    @pytest.mark.parametrize("S_k", [None, 128])
+    def test_apply_placement_succeeds(self, device_mesh_1d, S_k):
         """End-to-end smoke test that apply_placement produces a runnable module."""
         B, S, Hq, Hkv, D, n_docs = 256, 256, 8, 4, 64, 4
         model = self._JustAttn(n_docs).to(dtype=torch.bfloat16)
-        input_fn = self._input_fn_factory(B, S, Hq, Hkv, D, n_docs)
+        input_fn = self._input_fn_factory(B, S, Hq, Hkv, D, n_docs, S_k)
 
         with AutoParallel(
             model, input_fn, device_mesh_1d, repeated_subgraphs=False
         ) as autop:
-            autop.add_input_constraints(
-                [(Shard(0),), (Shard(0),), (Shard(0),), (Shard(0),)]
-            )
+            autop.add_input_constraints([(Shard(0),)] * (4 if S_k is None else 5))
             autop.add_output_constraints([(Shard(0),)])
             sol = autop.optimize_placement()
             parallel_mod = autop.apply_placement(sol)
         assert parallel_mod is not None
+
+
+class TestDocPackedCrossAttn:
+    @staticmethod
+    def _inputs(q_lens, kv_lens, n_docs, enable_gqa=True):
+        B, S_q, S_k = len(q_lens), sum(q_lens[0]), sum(kv_lens[0])
+        H_q, H_kv, D = 4, 2 if enable_gqa else 4, 64
+        q = torch.randn(
+            B, S_q, H_q, D, dtype=torch.bfloat16, device="cuda", requires_grad=True
+        )
+        k = torch.randn(
+            B, S_k, H_kv, D, dtype=torch.bfloat16, device="cuda", requires_grad=True
+        )
+        v = torch.randn_like(k, requires_grad=True)
+        cu_q = _build_padded_cu_seq_q(q_lens, n_docs, S_q)
+        cu_k = _build_padded_cu_seq_q(kv_lens, n_docs, S_k)
+        return q, k, v, cu_q, cu_k
+
+    _PARITY_CASES = [
+        ("short_q", [[8, 24], [20, 12]], [[48, 16], [16, 48]], 2, (-1, -1)),
+        ("long_q", [[48, 16], [16, 48]], [[8, 24], [20, 12]], 2, (-1, -1)),
+        ("equal_capacity", [[8, 24], [20, 12]], [[16, 16], [28, 4]], 2, (-1, -1)),
+        (
+            "mixed_docs",
+            [[6, 10, 16], [8, 8, 8, 8]],
+            [[16, 16, 32], [8, 24, 16, 16]],
+            6,
+            (-1, -1),
+        ),
+        ("empty_q", [[0, 32]], [[16, 48]], 3, (-1, -1)),
+        ("empty_kv", [[8, 24]], [[0, 64]], 3, (-1, -1)),
+        ("causal_short_q", [[8, 24]], [[16, 48]], 2, (-1, 0)),
+        ("causal_long_q", [[48, 16]], [[8, 24]], 2, (-1, 0)),
+        ("window_short_q", [[8, 24]], [[16, 48]], 2, (3, 0)),
+        ("window_long_q", [[48, 16]], [[8, 24]], 2, (3, 0)),
+    ]
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("enable_gqa", [False, True])
+    @pytest.mark.parametrize(
+        "name,q_lens,kv_lens,n_docs,window_size",
+        _PARITY_CASES,
+        ids=[case[0] for case in _PARITY_CASES],
+    )
+    def test_parity_vs_per_doc_sdpa(
+        self, name, q_lens, kv_lens, n_docs, window_size, enable_gqa
+    ):
+        torch.manual_seed(0)
+        q, k, v, cu_q, cu_k = self._inputs(q_lens, kv_lens, n_docs, enable_gqa)
+        out = doc_packed_attn(
+            q,
+            k,
+            v,
+            cu_q,
+            n_docs,
+            cu_seq_k=cu_k,
+            window_size=window_size,
+            enable_gqa=enable_gqa,
+            scale=0.2,
+        )
+        grad = torch.randn_like(out)
+        out.backward(grad)
+        reference_inputs = [t.detach().float().requires_grad_(True) for t in (q, k, v)]
+        reference = _per_doc_sdpa_reference(
+            *reference_inputs,
+            q_lens,
+            window_size,
+            per_batch_kv_lens=kv_lens,
+            scale=0.2,
+        )
+        reference.backward(grad.float())
+        tolerance = 4 * torch.finfo(q.dtype).eps
+        relative_tolerance = 2 * torch.finfo(q.dtype).eps
+        torch.testing.assert_close(
+            out.float(), reference, rtol=relative_tolerance, atol=tolerance
+        )
+        for actual, expected in zip((q, k, v), reference_inputs, strict=True):
+            assert actual.grad is not None
+            assert torch.isfinite(actual.grad).all()
+            torch.testing.assert_close(
+                actual.grad.float(),
+                expected.grad,
+                rtol=relative_tolerance,
+                atol=tolerance,
+            )
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_custom_op_registration(self):
+        q, k, v, cu_q, cu_k = self._inputs([[8, 24], [20, 12]], [[48, 16], [16, 48]], 3)
+        torch.library.opcheck(
+            torch.ops.autoparallel.doc_packed_attn_op.default,
+            (q, k, v, cu_q, 3, None, [-1, -1], True, cu_k),
+        )
+
+    def test_fake_metadata_and_flops(self):
+        from torch._subclasses import FakeTensorMode
+        from torch.utils.flop_counter import FlopCounterMode
+
+        with FakeTensorMode():
+            B, S_q, S_k, H_q, H_kv, D = 2, 32, 64, 4, 2, 64
+            q = torch.empty(B, S_q, H_q, D, dtype=torch.bfloat16, device="cuda")
+            k = torch.empty(B, S_k, H_kv, D, dtype=torch.bfloat16, device="cuda")
+            v = torch.empty_like(k)
+            cu_q = torch.empty(B, 3, dtype=torch.int32, device="cuda")
+            cu_k = torch.empty_like(cu_q)
+            with FlopCounterMode(display=False) as counter:
+                out, lse, rng = torch.ops.autoparallel.doc_packed_attn_op(
+                    q,
+                    k,
+                    v,
+                    cu_q,
+                    2,
+                    None,
+                    [-1, -1],
+                    True,
+                    cu_k,
+                )
+            assert out.shape == q.shape
+            assert lse.shape == (H_q, B * S_q)
+            assert counter.get_total_flops() == 4 * B * H_q * S_q * S_k * D
+            with FlopCounterMode(display=False) as counter:
+                dq, dk, dv = torch.ops.autoparallel.doc_packed_attn_backward_op(
+                    torch.empty_like(out),
+                    q,
+                    k,
+                    v,
+                    out,
+                    lse,
+                    cu_q,
+                    rng,
+                    2,
+                    None,
+                    [-1, -1],
+                    cu_k,
+                )
+            assert (dq.shape, dk.shape, dv.shape) == (q.shape, k.shape, v.shape)
+            assert counter.get_total_flops() == 10 * B * H_q * S_q * S_k * D
+
+    @pytest.mark.parametrize(
+        "argument,shape,dtype,message",
+        [
+            ("query", (2, 32, 64), torch.bfloat16, "shape"),
+            ("key", (1, 64, 4, 64), torch.bfloat16, "same shape"),
+            ("value", (2, 65, 4, 64), torch.bfloat16, "same shape"),
+            ("cu_seq_q", (1, 3), torch.int32, "cu_seq_q must have shape"),
+            ("cu_seq_k", (2, 2), torch.int32, "cu_seq_k must have shape"),
+            ("cu_seq_k", (2, 3), torch.int64, "dtype int32"),
+            ("key", (2, 64, 4, 64), torch.float32, "same dtype"),
+        ],
+    )
+    def test_invalid_inputs(self, argument, shape, dtype, message):
+        from torch._subclasses import FakeTensorMode
+
+        with FakeTensorMode():
+            inputs = {
+                "query": torch.empty(2, 32, 4, 64, dtype=torch.bfloat16, device="cuda"),
+                "key": torch.empty(2, 64, 4, 64, dtype=torch.bfloat16, device="cuda"),
+                "value": torch.empty(2, 64, 4, 64, dtype=torch.bfloat16, device="cuda"),
+                "cu_seq_q": torch.empty(2, 3, dtype=torch.int32, device="cuda"),
+                "cu_seq_k": torch.empty(2, 3, dtype=torch.int32, device="cuda"),
+            }
+            inputs[argument] = torch.empty(shape, dtype=dtype, device="cuda")
+            with pytest.raises(ValueError, match=message):
+                doc_packed_attn(**inputs, n_docs=2)
+
+    def test_unequal_capacities_require_kv_boundaries(self):
+        from torch._subclasses import FakeTensorMode
+
+        with FakeTensorMode():
+            q = torch.empty(2, 32, 4, 64, dtype=torch.bfloat16, device="cuda")
+            k = torch.empty(2, 64, 4, 64, dtype=torch.bfloat16, device="cuda")
+            v = torch.empty_like(k)
+            cu = torch.empty(2, 3, dtype=torch.int32, device="cuda")
+            with pytest.raises(ValueError, match="cu_seq_k is required"):
+                doc_packed_attn(q, k, v, cu, 2)

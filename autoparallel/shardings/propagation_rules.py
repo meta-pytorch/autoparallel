@@ -684,16 +684,17 @@ def doc_packed_attn_op_rule(mesh, op_schema):
     """Sharding strategy for autoparallel::doc_packed_attn_op.
 
     Schema:
-        (query, key, value, cu_seq_q, n_docs, scale, window_size, enable_gqa)
+        (query, key, value, cu_seq_q, n_docs, scale, window_size, enable_gqa,
+         cu_seq_k)
         -> (out, lse, rng_state)
 
     Tensor layouts:
-        query : [B, S, H_q,  D]    -- batch dim 0, heads dim 2
-        key   : [B, S, H_kv, D]
-        value : [B, S, H_kv, D]
-        cu_seq_q: [B, MAX_DOCS+1]  -- batch dim 0; MAX_DOCS dim never sharded
+        query : [B, S_q, H_q, D]    -- batch dim 0, heads dim 2
+        key   : [B, S_k, H_kv, D]
+        value : [B, S_k, H_kv, D]
+        cu_seq_q/k: [B, MAX_DOCS+1] -- document slots never sharded
         out   : same as query
-        lse   : [H_q, B*S]         -- heads dim 0, T=B*S dim 1
+        lse   : [H_q, B*S_q]       -- heads dim 0, T=B*S_q dim 1
         rng_state: [2]             -- always Replicate
 
     Per-mesh-dim options:
@@ -751,6 +752,14 @@ def doc_packed_attn_op_rule(mesh, op_schema):
     ]
     # "R" replicate-everywhere.
     r_strat = [R, R, R, R, R, R, R, None, None, None, None]
+    cu_k_schema = (
+        op_schema.args_schema[8]
+        if len(op_schema.args_schema) > 8
+        else op_schema.kwargs_schema.get("cu_seq_k")
+    )
+    b_strat.append(Shard(0) if cu_k_schema is not None else None)
+    h_strat.append(R if cu_k_schema is not None else None)
+    r_strat.append(R if cu_k_schema is not None else None)
 
     single_mesh_dim_strategies = [r_strat]
     if B > 1:
@@ -778,15 +787,15 @@ def doc_packed_attn_backward_op_rule(mesh, op_schema):
 
     Schema:
         (grad_out, query, key, value, out, lse, cu_seq_q, rng_state,
-         n_docs, scale, window_size)
+         n_docs, scale, window_size, cu_seq_k)
         -> (dq, dk, dv)
 
     Tensor layouts (same as the forward — the THD reshape is hidden inside
     the op body):
-        grad_out, q, out : [B, S, H_q,  D]
-        k, v             : [B, S, H_kv, D]
-        lse              : [H_q, B*S]
-        cu_seq_q         : [B, MAX_DOCS+1]
+        grad_out, q, out : [B, S_q, H_q, D]
+        k, v             : [B, S_k, H_kv, D]
+        lse              : [H_q, B*S_q]
+        cu_seq_q/k       : [B, MAX_DOCS+1]
         rng_state        : [2]
 
     Per-mesh-dim options match the forward:
@@ -800,6 +809,7 @@ def doc_packed_attn_backward_op_rule(mesh, op_schema):
     k_strat = op_schema.args_schema[2]
     q_meta = q_strat.strategies[0].output_spec.tensor_meta
     k_meta = k_strat.strategies[0].output_spec.tensor_meta
+    v_meta = op_schema.args_schema[3].strategies[0].output_spec.tensor_meta
     B, S, H_q, _D = q_meta.shape
     H_kv = k_meta.shape[2]
 
@@ -846,6 +856,14 @@ def doc_packed_attn_backward_op_rule(mesh, op_schema):
     ]
     # "R" — replicate everywhere.
     r_strat = [R, R, R, R, R, R, R, R, R, R, R, None, None, None]
+    cu_k_schema = (
+        op_schema.args_schema[11]
+        if len(op_schema.args_schema) > 11
+        else op_schema.kwargs_schema.get("cu_seq_k")
+    )
+    b_strat.append(Shard(0) if cu_k_schema is not None else None)
+    h_strat.append(R if cu_k_schema is not None else None)
+    r_strat.append(R if cu_k_schema is not None else None)
 
     single_mesh_dim_strategies = [r_strat]
     if B > 1:
@@ -857,7 +875,6 @@ def doc_packed_attn_backward_op_rule(mesh, op_schema):
         mesh,
         op_schema,
         single_mesh_dim_strategies,
-        # Outputs are (dq, dk, dv) — same shapes as q, k, v (v has k's shape).
-        output_tensor_meta=(q_meta, k_meta, k_meta),
+        output_tensor_meta=(q_meta, k_meta, v_meta),
         input_index=3,
     )
