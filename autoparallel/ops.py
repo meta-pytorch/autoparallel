@@ -55,9 +55,9 @@ def permutation(x: torch.Tensor, axis: int = 0, independent: bool = False):
 # doc_packed_attn: document-packed variable-length attention with a shape that
 # AutoParallel can shard.
 #
-# The user-facing op takes q/k/v in [B, S, H, D] layout and a cu_seq_q tensor
-# in [B, MAX_DOCS+1] layout. Sharding ``Shard(0)`` on the leading dim of all
-# four inputs gives clean DP across the batch.
+# Q and KV may have different sequence capacities and document boundaries.
+# Their [B, S, H, D] tensors and [B, MAX_DOCS+1] boundaries share a batch axis,
+# so Shard(0) preserves paired documents across DP ranks.
 #
 # Internally we reshape q/k/v to THD layout, build a flat cu_seq_q with
 # per-batch-element offsets of ``b*S``, and dispatch to
@@ -73,24 +73,79 @@ def permutation(x: torch.Tensor, axis: int = 0, independent: bool = False):
 # ---------------------------------------------------------------------------
 
 
-def _build_flat_cu_seq_q(cu_seq_q: torch.Tensor, n_docs: int, S: int) -> torch.Tensor:
-    """Slice ``cu_seq_q`` to ``n_docs+1`` entries per row, then offset and flatten.
+def _build_flat_cu_seq(cu_seq: torch.Tensor, n_docs: int, S: int) -> torch.Tensor:
+    """Slice boundaries to ``n_docs+1`` entries per row, then offset and flatten.
 
     For ``B == 1`` returns a view (no copy, no sync).
     For ``B > 1`` returns ``[0, d0_1, ..., S, S+d1_1, ..., 2S, ...]`` of length
     ``B*n_docs + 1`` — sync-free arithmetic on a tiny tensor.
     """
-    B = cu_seq_q.shape[0]
-    sliced = cu_seq_q[:, : n_docs + 1]  # [B, n_docs+1]
+    B = cu_seq.shape[0]
+    sliced = cu_seq[:, : n_docs + 1]  # [B, n_docs+1]
     if B == 1:
         return sliced[0]
     # Offset each row by b*S so doc boundaries are absolute positions in the
     # flattened T=B*S dimension.
-    offsets = torch.arange(B, dtype=cu_seq_q.dtype, device=cu_seq_q.device) * S
+    offsets = torch.arange(B, dtype=cu_seq.dtype, device=cu_seq.device) * S
     shifted = sliced + offsets.unsqueeze(1)  # [B, n_docs+1]
     # Each row's leading entry equals b*S (== prior row's trailing entry), so
     # drop it from rows 1..B-1 to avoid duplicating boundary positions.
     return torch.cat([shifted[0], shifted[1:, 1:].flatten()])
+
+
+def _validate_doc_packed_attn(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    cu_seq_q: torch.Tensor,
+    n_docs: int,
+    cu_seq_k: torch.Tensor | None,
+    enable_gqa: bool,
+) -> torch.Tensor:
+    if any(t.ndim != 4 for t in (query, key, value)):
+        raise ValueError("query, key and value must have shape [B, S, H, D]")
+    if key.shape != value.shape:
+        raise ValueError("key and value must have the same shape")
+    if query.shape[0] != key.shape[0] or query.shape[3] != key.shape[3]:
+        raise ValueError(
+            "query and key/value must have matching batch size and head dimension"
+        )
+    if cu_seq_k is None:
+        if query.shape[1] != key.shape[1]:
+            raise ValueError(
+                "cu_seq_k is required when query and key/value sequence capacities differ"
+            )
+        cu_seq_k = cu_seq_q
+    if n_docs < 1:
+        raise ValueError("n_docs must be positive")
+    for name, cu in (("cu_seq_q", cu_seq_q), ("cu_seq_k", cu_seq_k)):
+        if cu.ndim != 2 or cu.shape[0] != query.shape[0] or cu.shape[1] < n_docs + 1:
+            raise ValueError(
+                f"{name} must have shape [B, MAX_DOCS+1] with MAX_DOCS >= n_docs"
+            )
+        if cu.dtype != torch.int32:
+            raise ValueError(f"{name} must have dtype int32")
+    if any(t.device != query.device for t in (key, value, cu_seq_q, cu_seq_k)):
+        raise ValueError(
+            "query, key, value and document boundaries must share a device"
+        )
+    if key.dtype != query.dtype or value.dtype != query.dtype:
+        raise ValueError("query, key and value must have the same dtype")
+    num_heads_q, num_heads_k = query.shape[2], key.shape[2]
+    if num_heads_q < 1 or num_heads_k < 1:
+        raise ValueError("query and key/value must have at least one head")
+    if not enable_gqa and num_heads_q != num_heads_k:
+        raise ValueError(
+            f"Expect query and key/value to have the same number of heads "
+            f"but got Hq={num_heads_q} and Hkv={num_heads_k}. "
+            f"Try setting enable_gqa=True for GQA."
+        )
+    if enable_gqa and num_heads_q % num_heads_k != 0:
+        raise ValueError(
+            f"Expect number of query heads to be a multiple of kv heads for GQA "
+            f"but got Hq={num_heads_q} and Hkv={num_heads_k}."
+        )
+    return cu_seq_k
 
 
 @torch.library.custom_op("autoparallel::doc_packed_attn_op", mutates_args=())
@@ -103,6 +158,7 @@ def _doc_packed_attn_op(
     scale: float | None = None,
     window_size: list[int] | None = None,
     enable_gqa: bool = False,
+    cu_seq_k: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Custom op: returns ``(out, lse, rng_state)``.
 
@@ -110,19 +166,24 @@ def _doc_packed_attn_op(
     straight from the underlying flash-attention kernel and are passed back
     into ``torch_attn::_varlen_attn_backward`` during backward.
     """
-    B, S = query.shape[:2]
-    cu = _build_flat_cu_seq_q(cu_seq_q, n_docs, S)
+    cu_seq_k = _validate_doc_packed_attn(
+        query, key, value, cu_seq_q, n_docs, cu_seq_k, enable_gqa
+    )
+    B, S_q = query.shape[:2]
+    S_k = key.shape[1]
+    cu_q = _build_flat_cu_seq(cu_seq_q, n_docs, S_q)
+    cu_k = cu_q if cu_seq_k is cu_seq_q else _build_flat_cu_seq(cu_seq_k, n_docs, S_k)
 
     ws = list(window_size) if window_size is not None else [-1, -1]
     is_causal = ws == [-1, 0]
     out_thd, lse, rng_state = torch.ops.torch_attn._varlen_attn(
-        query.reshape(B * S, *query.shape[2:]),
-        key.reshape(B * S, *key.shape[2:]),
-        value.reshape(B * S, *value.shape[2:]),
-        cu,
-        cu,
-        S,
-        S,
+        query.reshape(B * S_q, *query.shape[2:]),
+        key.reshape(B * S_k, *key.shape[2:]),
+        value.reshape(B * S_k, *value.shape[2:]),
+        cu_q,
+        cu_k,
+        S_q,
+        S_k,
         is_causal,
         scale,
         ws,
@@ -144,7 +205,9 @@ def _doc_packed_attn_op_fake(
     scale: float | None = None,
     window_size: list[int] | None = None,
     enable_gqa: bool = False,
+    cu_seq_k: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    _validate_doc_packed_attn(query, key, value, cu_seq_q, n_docs, cu_seq_k, enable_gqa)
     B, S, Hq = query.shape[:3]
     out = torch.empty_like(query)
     # Matches torch_attn::_varlen_attn fake shapes (after THD flatten):
@@ -178,10 +241,20 @@ def _doc_packed_attn_setup_context(ctx: Any, inputs: tuple, output: Any) -> None
         scale,
         window_size,
         enable_gqa,
+        cu_seq_k,
     ) = inputs
     out, lse, rng_state = output
     ctx.mark_non_differentiable(lse, rng_state)
-    ctx.save_for_backward(query, key, value, cu_seq_q, out, lse, rng_state)
+    ctx.save_for_backward(
+        query,
+        key,
+        value,
+        cu_seq_q,
+        out,
+        lse,
+        rng_state,
+        cu_seq_k,
+    )
     ctx.n_docs = n_docs
     ctx.scale = scale
     ctx.window_size = window_size
@@ -200,6 +273,7 @@ def _doc_packed_attn_backward_op(
     n_docs: int,
     scale: float | None = None,
     window_size: list[int] | None = None,
+    cu_seq_k: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Backward custom op for ``doc_packed_attn``.
 
@@ -209,22 +283,27 @@ def _doc_packed_attn_backward_op(
     can reason about the natural ``[B, S, H, D]`` layout symmetrically with
     the forward, and the divisibility check uses B directly.
     """
-    B, S = query.shape[:2]
+    cu_seq_k = _validate_doc_packed_attn(
+        query, key, value, cu_seq_q, n_docs, cu_seq_k, enable_gqa=True
+    )
+    B, S_q = query.shape[:2]
+    S_k = key.shape[1]
     ws = list(window_size) if window_size is not None else [-1, -1]
     is_causal = ws == [-1, 0]
-    cu = _build_flat_cu_seq_q(cu_seq_q, n_docs, S)
+    cu_q = _build_flat_cu_seq(cu_seq_q, n_docs, S_q)
+    cu_k = cu_q if cu_seq_k is cu_seq_q else _build_flat_cu_seq(cu_seq_k, n_docs, S_k)
 
     dq_thd, dk_thd, dv_thd = torch.ops.torch_attn._varlen_attn_backward(
-        grad_out.reshape(B * S, *grad_out.shape[2:]),
-        query.reshape(B * S, *query.shape[2:]),
-        key.reshape(B * S, *key.shape[2:]),
-        value.reshape(B * S, *value.shape[2:]),
-        out.reshape(B * S, *out.shape[2:]),
+        grad_out.reshape(B * S_q, *grad_out.shape[2:]),
+        query.reshape(B * S_q, *query.shape[2:]),
+        key.reshape(B * S_k, *key.shape[2:]),
+        value.reshape(B * S_k, *value.shape[2:]),
+        out.reshape(B * S_q, *out.shape[2:]),
         lse,
-        cu,
-        cu,
-        S,
-        S,
+        cu_q,
+        cu_k,
+        S_q,
+        S_k,
         is_causal,
         rng_state,
         scale,
@@ -250,7 +329,11 @@ def _doc_packed_attn_backward_op_fake(
     n_docs: int,
     scale: float | None = None,
     window_size: list[int] | None = None,
+    cu_seq_k: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    _validate_doc_packed_attn(
+        query, key, value, cu_seq_q, n_docs, cu_seq_k, enable_gqa=True
+    )
     return torch.empty_like(query), torch.empty_like(key), torch.empty_like(value)
 
 
@@ -280,7 +363,7 @@ def _doc_packed_attn_backward(
     Routes to the ``doc_packed_attn_backward_op`` custom op so that the
     THD reshape stays hidden from AutoParallel.
     """
-    query, key, value, cu_seq_q, out, lse, rng_state = ctx.saved_tensors
+    query, key, value, cu_seq_q, out, lse, rng_state, cu_seq_k = ctx.saved_tensors
     dq, dk, dv = torch.ops.autoparallel.doc_packed_attn_backward_op(
         grad_out,
         query,
@@ -293,10 +376,11 @@ def _doc_packed_attn_backward(
         ctx.n_docs,
         ctx.scale,
         ctx.window_size,
+        cu_seq_k,
     )
     # Match the forward signature: query, key, value, cu_seq_q, n_docs,
-    # scale, window_size, enable_gqa. Only q/k/v get gradients.
-    return (dq, dk, dv, None, None, None, None, None)
+    # scale, window_size, enable_gqa, cu_seq_k. Only q/k/v get gradients.
+    return (dq, dk, dv, None, None, None, None, None, None)
 
 
 torch.library.register_autograd(
@@ -313,6 +397,7 @@ def doc_packed_attn(
     cu_seq_q: torch.Tensor,
     n_docs: int,
     *,
+    cu_seq_k: torch.Tensor | None = None,
     scale: float | None = None,
     window_size: tuple[int, int] = (-1, -1),
     enable_gqa: bool = False,
@@ -321,45 +406,41 @@ def doc_packed_attn(
 
     Mirrors :func:`torch.nn.attention.varlen.varlen_attn`'s API, but takes
     ``query``/``key``/``value`` in ``[B, S, H, D]`` layout and ``cu_seq_q`` as
-    a padded ``[B, MAX_DOCS+1]`` tensor so the leading dim can be sharded as
-    ``Shard(0)`` by AutoParallel. ``cu_seq_k`` is assumed to equal ``cu_seq_q``
-    (self-attention) and ``max_q == max_k == S``.
+    padded ``[B, MAX_DOCS+1]`` boundary tensors so the leading dim can be sharded
+    as ``Shard(0)`` by AutoParallel. Document slot ``i`` in Q attends only to
+    slot ``i`` in KV, which must refer to the same example. Q and KV may have
+    different sequence capacities and document lengths.
 
     Args:
-        query: ``[B, S, H_q, D]`` query tensor.
-        key:   ``[B, S, H_kv, D]`` key tensor.
-        value: ``[B, S, H_kv, D]`` value tensor.
+        query: ``[B, S_q, H_q, D]`` query tensor.
+        key:   ``[B, S_k, H_kv, D]`` key tensor.
+        value: ``[B, S_k, H_kv, D]`` value tensor.
         cu_seq_q: ``[B, MAX_DOCS+1]`` int32 padded cumulative sequence positions.
-            ``cu_seq_q[b, 0] == 0`` and ``cu_seq_q[b, n_docs] == S``. Real
+            Each row is nondecreasing, starts at zero and ends at ``S_q``. Real
             document boundaries occupy entries ``1..n_real_docs[b]``; entries
-            ``n_real_docs[b]..n_docs`` should be padded with ``S`` so the
+            ``n_real_docs[b]..n_docs`` should be padded with ``S_q`` so the
             trailing slots appear as zero-length documents (which the kernel
             skips). ``n_docs`` is uniform across batch elements.
         n_docs: Document count per batch element (SymInt under ``dynamic=True``).
             Batches with fewer real documents pad as described above.
+        cu_seq_k: Optional KV boundaries, with the same ordered document slots
+            as ``cu_seq_q``. Each row starts at zero and ends at ``S_k``;
+            boundaries must be nondecreasing. Trailing unused slots repeat
+            ``S_k``. Defaults to ``cu_seq_q``, requiring ``S_q == S_k``.
+            Tensor padding must be assigned separate document slots so it
+            cannot participate in a real document's attention.
         scale: Softmax scale. ``None`` uses ``1 / sqrt(D)``.
         window_size: ``(left, right)`` sliding-window sizes per token.
             ``(-1, -1)`` is full attention (default), ``(-1, 0)`` is causal,
             ``(W, 0)`` is causal sliding window of size ``W``.
+            For unequal document lengths, windows use Flash Attention's
+            bottom-right alignment: query position ``i`` aligns with key
+            position ``i + length_k - length_q``.
         enable_gqa: Allow ``H_kv != H_q`` via grouped-query attention.
 
     Returns:
         Output tensor of the same shape as ``query``.
     """
-    num_heads_q = query.size(2)
-    num_heads_k = key.size(2)
-    if not enable_gqa and num_heads_q != num_heads_k:
-        raise ValueError(
-            f"Expect query and key/value to have the same number of heads "
-            f"but got Hq={num_heads_q} and Hkv={num_heads_k}. "
-            f"Try setting enable_gqa=True for GQA."
-        )
-    if enable_gqa and num_heads_q % num_heads_k != 0:
-        raise ValueError(
-            f"Expect number of query heads to be a multiple of kv heads for GQA "
-            f"but got Hq={num_heads_q} and Hkv={num_heads_k}."
-        )
-
     out, _lse, _rng = torch.ops.autoparallel.doc_packed_attn_op(
         query,
         key,
@@ -369,5 +450,6 @@ def doc_packed_attn(
         scale,
         list(window_size),
         enable_gqa,
+        cu_seq_k,
     )
     return out
