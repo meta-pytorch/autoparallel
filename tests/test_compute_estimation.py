@@ -106,3 +106,63 @@ def test_sharded_factory_op_is_priced_at_local_size(monkeypatch):
         full_node([1024, 4096]), None
     )
     assert cost(Shard(0)) < cost(Replicate())
+
+
+def _metadata_only_cost_nodes():
+    shape = [4096, 16384]
+    graph = torch.fx.Graph()
+    x = graph.placeholder("x")
+    x.meta["val"] = torch.empty(shape, dtype=torch.bfloat16, device="meta")
+
+    def call(target, args, kwargs=None):
+        node = graph.call_function(target, args, kwargs or {})
+        node.meta["val"] = torch.empty(shape, dtype=torch.bfloat16, device="meta")
+        return node
+
+    factory_kwargs = {"dtype": torch.bfloat16, "device": torch.device("meta")}
+    unsafe_view = call(torch.ops.aten._unsafe_view.default, (x, shape))
+    empties = [
+        call(torch.ops.aten.empty.memory_format, (shape,), factory_kwargs),
+        call(
+            torch.ops.aten.empty_strided.default, (shape, [shape[1], 1]), factory_kwargs
+        ),
+        call(torch.ops.aten.empty_like.default, (x,)),
+    ]
+    clone = call(torch.ops.aten.clone.default, (x,))
+    full = call(torch.ops.aten.full.default, (shape, 0.0), factory_kwargs)
+    return unsafe_view, empties, [clone, full]
+
+
+def test_metadata_only_ops_are_free(monkeypatch):
+    h100 = next(limit for limit in DEVICE_LIMITS if limit.name == "H100")
+    monkeypatch.setattr(compute_estimation, "_get_device_limit", lambda: h100)
+    unsafe_view, empties, memory_ops = _metadata_only_cost_nodes()
+
+    for node in [unsafe_view, *empties]:
+        assert estimate_strategy_runtime_cost(node, None) == 0, node.target
+    for node in memory_ops:
+        assert estimate_strategy_runtime_cost(node, None) > 0, node.target
+
+
+def test_empty_factories_are_priced_when_deterministic_fill_is_enabled(monkeypatch):
+    h100 = next(limit for limit in DEVICE_LIMITS if limit.name == "H100")
+    monkeypatch.setattr(compute_estimation, "_get_device_limit", lambda: h100)
+    monkeypatch.setattr(torch.utils.deterministic, "fill_uninitialized_memory", True)
+    unsafe_view, empties, _ = _metadata_only_cost_nodes()
+
+    previous = torch.are_deterministic_algorithms_enabled()
+    torch.use_deterministic_algorithms(True)
+    try:
+        assert estimate_strategy_runtime_cost(unsafe_view, None) == 0
+        for node in empties:
+            assert estimate_strategy_runtime_cost(node, None) > 0, node.target
+    finally:
+        torch.use_deterministic_algorithms(previous)
+
+    monkeypatch.setattr(torch.utils.deterministic, "fill_uninitialized_memory", False)
+    torch.use_deterministic_algorithms(True)
+    try:
+        for node in empties:
+            assert estimate_strategy_runtime_cost(node, None) == 0, node.target
+    finally:
+        torch.use_deterministic_algorithms(previous)
