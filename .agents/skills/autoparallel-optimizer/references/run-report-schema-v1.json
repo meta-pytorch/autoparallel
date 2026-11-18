@@ -1,0 +1,371 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pytorch.org/autoparallel/run-report-schema-v1.json",
+  "title": "AutoParallel run report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "run_id",
+    "status",
+    "stage",
+    "created_at",
+    "completed_at",
+    "cluster",
+    "request",
+    "provenance",
+    "evidence",
+    "planning",
+    "evaluation",
+    "validation",
+    "findings",
+    "failure",
+    "artifacts"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "run_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"},
+    "status": {"enum": ["running", "completed", "failed"]},
+    "stage": {
+      "enum": [
+        "started",
+        "captured",
+        "planned",
+        "lowered",
+        "compiled",
+        "numerically_checked",
+        "executed_on_target",
+        "measured"
+      ]
+    },
+    "created_at": {"type": "string"},
+    "completed_at": {"type": ["string", "null"]},
+    "cluster": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "profile",
+        "selection_source",
+        "report_root_source",
+        "config_sources",
+        "resolved"
+      ],
+      "properties": {
+        "profile": {"type": "string"},
+        "selection_source": {
+          "enum": ["explicit", "environment", "environment_match", "default"]
+        },
+        "report_root_source": {"enum": ["explicit", "environment", "profile"]},
+        "config_sources": {"type": "array", "items": {"type": "string"}},
+        "resolved": {"type": "object"}
+      }
+    },
+    "request": {"type": "object"},
+    "provenance": {"type": "object"},
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["highest_level", "completed"],
+      "properties": {
+        "highest_level": {"$ref": "#/$defs/evidenceLevel"},
+        "completed": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/evidenceLevel"},
+          "uniqueItems": true
+        }
+      }
+    },
+    "planning": {"type": "object"},
+    "evaluation": {"type": "object"},
+    "validation": {"type": "object"},
+    "findings": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/finding"}
+    },
+    "parallelization": {
+      "oneOf": [
+        {"type": "null"},
+        {"$ref": "#/$defs/parallelization"}
+      ]
+    },
+    "failure": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["stage", "type", "message", "artifact"],
+          "properties": {
+            "stage": {"type": "string"},
+            "substage": {"type": ["string", "null"]},
+            "type": {"type": "string"},
+            "message": {"type": "string"},
+            "signature": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+            "artifact": {"type": "string"}
+          }
+        }
+      ]
+    },
+    "artifacts": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/artifact"}
+    }
+  },
+  "$defs": {
+    "evidenceLevel": {
+      "enum": [
+        "none",
+        "captured",
+        "ilp_feasible",
+        "lowered",
+        "compiled",
+        "numerically_checked",
+        "executed_on_target",
+        "measured"
+      ]
+    },
+    "finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "severity", "message", "context"],
+      "properties": {
+        "code": {"type": "string", "pattern": "^[A-Z][A-Z0-9_]*$"},
+        "severity": {"enum": ["info", "warning", "error"]},
+        "message": {"type": "string"},
+        "context": {"type": "object"},
+        "suggested_action": {"type": "string"}
+      }
+    },
+    "parallelization": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "decision_id",
+        "intent",
+        "acceptance_criteria",
+        "autoparallel",
+        "fallback",
+        "decision"
+      ],
+      "properties": {
+        "decision_id": {"type": "string"},
+        "intent": {"type": "object", "minProperties": 1},
+        "acceptance_criteria": {"type": "object", "minProperties": 1},
+        "autoparallel": {
+          "oneOf": [
+            {"type": "null"},
+            {"$ref": "#/$defs/autoparallelOutcome"}
+          ]
+        },
+        "competitiveness": {
+          "oneOf": [
+            {"type": "null"},
+            {"$ref": "#/$defs/competitivenessAssessment"}
+          ]
+        },
+        "fallback": {
+          "oneOf": [
+            {"type": "null"},
+            {"$ref": "#/$defs/fallbackOutcome"}
+          ]
+        },
+        "decision": {
+          "oneOf": [
+            {"type": "null"},
+            {"$ref": "#/$defs/parallelizationDecision"}
+          ]
+        }
+      }
+    },
+    "autoparallelOutcome": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "outcome",
+        "reason_codes",
+        "evidence_level",
+        "stage",
+        "details",
+        "related_run_id",
+        "recorded_at"
+      ],
+      "properties": {
+        "outcome": {
+          "enum": ["accepted", "below_bar", "failed", "ineligible", "inconclusive"]
+        },
+        "reason_codes": {"$ref": "#/$defs/reasonCodes"},
+        "evidence_level": {"$ref": "#/$defs/evidenceLevel"},
+        "stage": {"type": "string"},
+        "details": {"type": "object"},
+        "related_run_id": {"type": ["string", "null"]},
+        "recorded_at": {"type": "string"}
+      }
+    },
+    "fallbackOutcome": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "strategy",
+        "outcome",
+        "reason_codes",
+        "evidence_level",
+        "details",
+        "related_run_id",
+        "recorded_at"
+      ],
+      "properties": {
+        "strategy": {"enum": ["ddp", "fsdp"]},
+        "outcome": {"enum": ["accepted", "below_bar", "failed", "inconclusive"]},
+        "reason_codes": {"$ref": "#/$defs/reasonCodes"},
+        "evidence_level": {"$ref": "#/$defs/evidenceLevel"},
+        "details": {"type": "object"},
+        "related_run_id": {"type": ["string", "null"]},
+        "recorded_at": {"type": "string"}
+      }
+    },
+    "competitivenessAssessment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "verdict",
+        "evidence",
+        "autoparallel_estimate",
+        "baselines",
+        "reason_codes",
+        "details",
+        "recorded_at"
+      ],
+      "properties": {
+        "verdict": {
+          "enum": [
+            "robustly_competitive",
+            "robustly_worse",
+            "pareto_dominated",
+            "schedule_sensitive",
+            "baseline_infeasible",
+            "comparison_unavailable",
+            "user_accepted_tradeoff"
+          ]
+        },
+        "evidence": {"enum": ["none", "modeled", "measured", "mixed"]},
+        "autoparallel_estimate": {
+          "oneOf": [
+            {"type": "null"},
+            {"$ref": "#/$defs/strategyEstimate"}
+          ]
+        },
+        "baselines": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/baselineEstimate"}
+        },
+        "reason_codes": {"$ref": "#/$defs/reasonCodes"},
+        "details": {"type": "object"},
+        "recorded_at": {"type": "string"}
+      }
+    },
+    "strategyEstimate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["latency", "memory"],
+      "properties": {
+        "latency": {
+          "oneOf": [
+            {"type": "null"},
+            {"$ref": "#/$defs/latencyEnvelope"}
+          ]
+        },
+        "memory": {"type": "object"}
+      }
+    },
+    "baselineEstimate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "strategy",
+        "template_id",
+        "template_version",
+        "configuration_hash",
+        "feasibility",
+        "latency",
+        "memory"
+      ],
+      "properties": {
+        "strategy": {"enum": ["ddp", "fsdp"]},
+        "template_id": {"type": "string"},
+        "template_version": {"type": "string"},
+        "configuration_hash": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "feasibility": {"enum": ["feasible", "infeasible", "unknown"]},
+        "latency": {
+          "oneOf": [
+            {"type": "null"},
+            {"$ref": "#/$defs/latencyEnvelope"}
+          ]
+        },
+        "memory": {"type": "object"}
+      }
+    },
+    "latencyEnvelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "unit",
+        "optimistic",
+        "expected",
+        "pessimistic",
+        "calibration_relative_error",
+        "schedule_model"
+      ],
+      "properties": {
+        "unit": {"type": "string", "minLength": 1},
+        "optimistic": {"type": "number", "minimum": 0},
+        "expected": {"type": "number", "minimum": 0},
+        "pessimistic": {"type": "number", "minimum": 0},
+        "calibration_relative_error": {"type": "number", "minimum": 0},
+        "schedule_model": {"type": "string", "minLength": 1}
+      }
+    },
+    "parallelizationDecision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["selected_strategy", "status", "reason_codes", "recorded_at"],
+      "properties": {
+        "selected_strategy": {"enum": ["autoparallel", "ddp", "fsdp", "none"]},
+        "status": {"enum": ["accepted", "fallback_selected", "failed", "inconclusive"]},
+        "reason_codes": {"$ref": "#/$defs/reasonCodes"},
+        "recorded_at": {"type": "string"}
+      }
+    },
+    "reasonCodes": {
+      "type": "array",
+      "items": {"type": "string", "pattern": "^[A-Z][A-Z0-9_]*$"},
+      "uniqueItems": true
+    },
+    "artifact": {
+      "type": "object",
+      "required": ["name", "role", "storage", "media_type"],
+      "properties": {
+        "name": {"type": "string"},
+        "role": {"type": "string"},
+        "storage": {"enum": ["bundle", "external"]},
+        "path": {"type": "string"},
+        "uri": {"type": "string"},
+        "media_type": {"type": "string"},
+        "sha256": {"type": "string"},
+        "size_bytes": {"type": "integer", "minimum": 0}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"storage": {"const": "bundle"}}},
+          "then": {"required": ["path", "sha256", "size_bytes"]}
+        },
+        {
+          "if": {"properties": {"storage": {"const": "external"}}},
+          "then": {"required": ["uri"]}
+        }
+      ]
+    }
+  }
+}
