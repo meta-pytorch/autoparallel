@@ -81,6 +81,7 @@ def _patch_fsdp_bucketing():
         is_fsdp_all_gather,
     )
     from torch._inductor.fx_passes.utils import BitsetAncestors
+    from torch.distributed.distributed_c10d import _resolve_process_group
 
     def _merge_creates_cycle(aug_graph, wait_of, head, node):
         # Merging node into head's bucket fuses their starts and their waits.
@@ -122,6 +123,21 @@ def _patch_fsdp_bucketing():
                     _get_group_name(node) for node in _find_all_reduces(gm.graph)
                 )
                 selection_mode = "all-all-reduce-groups"
+        elif aten_autobucketing_config.bucket_all_all_reduce_groups:
+            # Pure data-parallel plans have no FSDP all-gathers to identify
+            # groups from, but their gradient all-reduces still need buckets.
+            fsdp_groups = OrderedSet(
+                _get_group_name(node) for node in _find_all_reduces(gm.graph)
+            )
+            primary_group = None
+            selection_mode = "all-reduce-groups-only" if fsdp_groups else "none"
+            if fsdp_groups:
+                # all_reduce carries no group_size: size the bucket cap from
+                # the first group, or fall back to the upstream default cap.
+                try:
+                    group_size = _resolve_process_group(next(iter(fsdp_groups))).size()
+                except RuntimeError:
+                    group_size = None
         else:
             fsdp_groups = OrderedSet()
             primary_group = None
@@ -452,7 +468,8 @@ class aten_autobucketing_config:
         the dep graph and stable_topological_sort runs afterwards. Set to
         None to disable the span bound (only bytes cap applies).
     - bucket_all_all_reduce_groups: include every process group containing an
-        all-reduce in all-reduce bucketing. Does not affect all-gather or
+        all-reduce in all-reduce bucketing, including graphs without FSDP
+        all-gathers (pure data parallelism). Does not affect all-gather or
         reduce-scatter selection.
     """
 
