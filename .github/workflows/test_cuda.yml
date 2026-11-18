@@ -14,10 +14,10 @@ concurrency:
 jobs:
   test-cuda-single-gpu:
     name: Test CUDA Single GPU (cuda13.0-py3.12)
-    uses: pytorch/test-infra/.github/workflows/linux_job_v2.yml@main
+    uses: pytorch/test-infra/.github/workflows/linux_job_v3.yml@main
     with:
       timeout: 60
-      runner: linux.g5.4xlarge.nvidia.gpu
+      runner: mt-l-x86aavx2-11-41-a10g
       gpu-arch-type: cuda
       gpu-arch-version: "13.0"
       submodules: recursive
@@ -35,10 +35,10 @@ jobs:
 
   examples-cuda-single-gpu:
     name: Examples CUDA Single GPU (cuda13.0-py3.12)
-    uses: pytorch/test-infra/.github/workflows/linux_job_v2.yml@main
+    uses: pytorch/test-infra/.github/workflows/linux_job_v3.yml@main
     with:
       timeout: 60
-      runner: linux.g5.4xlarge.nvidia.gpu
+      runner: mt-l-x86aavx2-11-41-a10g
       gpu-arch-type: cuda
       gpu-arch-version: "13.0"
       submodules: recursive
@@ -61,14 +61,16 @@ jobs:
 
   test-cuda-multi-gpu:
     name: Test CUDA Multi GPU (cuda13.0-py3.12)
-    uses: pytorch/test-infra/.github/workflows/linux_job_v2.yml@main
+    uses: pytorch/test-infra/.github/workflows/linux_job_v3.yml@main
     with:
       timeout: 60
-      runner: linux.g5.12xlarge.nvidia.gpu
+      runner: mt-l-x86aavx2-45-167-a10g-4
       gpu-arch-type: cuda
       gpu-arch-version: "13.0"
       submodules: recursive
       script: |
+        echo "127.0.0.1 $(hostname)" >> /etc/hosts
+
         conda create --yes --quiet --name py312 python=3.12
         source $(conda info --base)/etc/profile.d/conda.sh
         conda activate py312
