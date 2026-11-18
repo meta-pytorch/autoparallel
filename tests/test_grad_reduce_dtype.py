@@ -60,12 +60,16 @@ def test_backward_dtype_casts_follow_gradient_producers(device_mesh_1d, tie_weig
         order = {node: index for index, node in enumerate(graph.nodes)}
         casts = [
             node
-            for node in graph.find_nodes(
-                op="call_function", target=torch.ops.autoparallel.dtype_cast.default
+            for target in (
+                torch.ops.autoparallel.dtype_cast.default,
+                torch.ops.prims.convert_element_type.default,
             )
-            if node.args[1] == torch.float32
+            for node in graph.find_nodes(op="call_function", target=target)
+            if node.meta.get("partitioner_tag") == "is_backward"
+            and node.meta["val"].dtype == torch.float32
+            and node.args[0].meta["val"].dtype != torch.float32
         ]
-        assert len(casts) == len(list(model.parameters()))
+        assert len(casts) >= len(list(model.parameters()))
         for node in casts:
             assert node.meta["partitioner_tag"] == "is_backward"
             assert 1 <= order[node] - order[node.args[0]] <= 2
@@ -97,6 +101,72 @@ def test_parameter_casts_preserve_distinct_call_sites(device_mesh_1d):
             placement = Shard(0) if desc.target == "first.weight" else Shard(1)
             autop.sharding_optimizer.add_node_constraint(param, (placement,))
         autop.optimize_placement()
+
+
+@apply_cuda_patches
+@pytest.mark.parametrize(
+    "storage_dtype, param_dtype, reduce_dtype",
+    [
+        (torch.float32, torch.bfloat16, torch.float32),
+        (torch.bfloat16, torch.bfloat16, torch.float32),
+        (torch.float32, torch.float32, torch.bfloat16),
+        (torch.float32, torch.float32, torch.float32),
+    ],
+)
+def test_reused_parameter_reduction_dtype(
+    device_mesh_1d, storage_dtype, param_dtype, reduce_dtype
+):
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(512, dtype=storage_dtype))
+
+        def forward(self, x, y):
+            return x * self.weight + y * self.weight
+
+    with torch.device("meta"):
+        model = Model()
+
+    def inputs():
+        return (
+            torch.randn(512, 512, device="cuda"),
+            torch.randn(512, 512, device="cuda"),
+        )
+
+    policy = MixedPrecisionPolicy(param_dtype=param_dtype, reduce_dtype=reduce_dtype)
+    with AutoParallel(
+        model, inputs, device_mesh_1d, policy, repeated_subgraphs=False
+    ) as autop:
+        autop.add_input_constraints([(Shard(0),), (Shard(0),)])
+        autop.add_output_constraints([(Shard(0),)])
+        for param, _ in get_param_and_grad_nodes(autop.gm.graph).values():
+            autop.sharding_optimizer.add_node_constraint(param, (Shard(0),))
+        for node in autop.gm.graph.find_nodes(
+            op="call_function", target=torch.ops.aten.mul.Tensor
+        ):
+            if node.meta.get("partitioner_tag") == "is_forward":
+                autop.sharding_optimizer.add_node_constraint(node, (Shard(0),))
+        autop.apply_placement(autop.optimize_placement())
+        reductions = [
+            node
+            for target in (
+                torch.ops._c10d_functional.reduce_scatter_tensor,
+                torch.ops._c10d_functional.reduce_scatter_tensor.default,
+                torch.ops._c10d_functional.all_reduce,
+                torch.ops._c10d_functional.all_reduce.default,
+            )
+            for node in autop.parallel_gm.graph.find_nodes(
+                op="call_function", target=target
+            )
+        ]
+        assert reductions, [
+            node.target
+            for node in autop.parallel_gm.graph.nodes
+            if "c10d" in str(node.target)
+        ]
+        assert all(
+            node.args[0].meta["val"].dtype == reduce_dtype for node in reductions
+        )
 
 
 def test_grad_reduce_dtype_accepts_serialized_tensor_metadata(monkeypatch):
@@ -145,63 +215,34 @@ def _assert_no_pre_cast_redistribution(
     This directly validates the solver constraint: no redistribution
     should occur on unary-chain edges before the dtype_cast node.
     """
-    from torch._functorch._aot_autograd.fx_utils import get_param_and_grad_nodes
-
     opt = autop.sharding_optimizer
     validated_pre_cast_keys = 0
     validated_linked_keys = 0
 
-    for param, grad in get_param_and_grad_nodes(opt.graph).values():
-        if grad is None:
+    casts = {
+        opt.node_map[node]: node
+        for target in (
+            torch.ops.autoparallel.dtype_cast.default,
+            torch.ops.prims.convert_element_type.default,
+        )
+        for node in opt.graph.find_nodes(op="call_function", target=target)
+        if node.meta.get("partitioner_tag") == "is_backward"
+        and node.meta["val"].dtype == torch.float32
+        and node.args[0].meta["val"].dtype != torch.float32
+    }
+    for key in opt.selected_keys:
+        node_idx, argi, out_idx, inp_idx = key
+        if node_idx not in casts or argi != 0:
             continue
-
-        # Build the pre-cast node set (same logic as the constraint)
-        chain = [grad]
-        n = grad
-        while len(n.all_input_nodes) == 1:
-            parent = n.all_input_nodes[0]
-            if len(parent.all_input_nodes) != 1:
-                break
-            chain.append(parent)
-            n = parent
-
-        cast_idx = None
-        for i, node in enumerate(chain):
-            if node.target == torch.ops.autoparallel.dtype_cast.default:
-                cast_idx = i
-                break
-
-        if cast_idx is None:
-            continue
-
-        pre_cast_node_idxs = set()
-        for node in chain[cast_idx:]:
-            if node in opt.node_map:
-                pre_cast_node_idxs.add(opt.node_map[node])
-
-        # Check that no chosen decision var on a pre-cast node has comm_cost > 0
-        for key in opt.selected_keys:
-            node_idx, argi, out_idx, inp_idx = key
-            if node_idx not in pre_cast_node_idxs:
-                continue
-            dv = opt._resolve_decision_var(key)
-            validated_pre_cast_keys += 1
-            if key in opt.cluster_links:
-                validated_linked_keys += 1
-            assert dv.comm_cost == 0, (
-                f"Pre-cast node {opt.nodes[node_idx].name} has chosen decision var "
-                f"with comm_cost={dv.comm_cost} > 0 (strategy {dv.strategy}). "
-                f"Redistribution should not happen before the dtype_cast."
-            )
-
-        # Also check dtype_cast output has Partial (indirect but readable check)
-        dtype_cast_node = chain[cast_idx]
-        spec = sharding_placement.get(dtype_cast_node)
-        if spec is not None:
-            assert any(p.is_partial() for p in spec.output_specs.placements), (
-                f"dtype_cast {dtype_cast_node.name} should have Partial output "
-                f"(no pre-cast reduction), but got {spec.output_specs.placements}"
-            )
+        dv = opt._resolve_decision_var(key)
+        validated_pre_cast_keys += 1
+        if key in opt.cluster_links:
+            validated_linked_keys += 1
+        assert dv.comm_cost == 0, (
+            f"Gradient redistribution before FP32 conversion at {casts[node_idx]}: "
+            f"{dv.comm_cost}"
+        )
+        assert any(p.is_partial() for p in dv.output_spec.placements)
 
     assert validated_pre_cast_keys > 0, "Expected to validate at least one pre-cast key"
     if require_linked_validation:

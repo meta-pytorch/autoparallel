@@ -1744,11 +1744,13 @@ class ShardingOptimizer:
 
             primals (storage_dtype) -> [unary ops] -> dtype_cast (param_dtype)
 
-        **Backward** (when reduce_dtype > param_dtype):
-        Forces reduce-scatter to happen after the cast (in reduce_dtype, e.g.
-        f32) rather than before it (in param_dtype, e.g. bf16).
-
-            einsum (param_dtype) -> [unary ops] -> dtype_cast -> alias (grad_param)
+        **Backward**:
+        Parameter casts declare their accumulation/reduction dtype. Follow
+        gradient additions and unary nodes back to their producers, forbidding
+        communication on input edges with a different dtype. This covers
+        autograd's generated conversions and casts back to the storage dtype.
+        Older graphs use the storage dtype when higher-precision reduction
+        was requested.
 
         Both are enforced by disabling decision variables on pre-cast edges
         that would imply a placement change.
@@ -1759,6 +1761,7 @@ class ShardingOptimizer:
         # increases precision (e.g. bf16 storage → f32 compute), we want the
         # allgather in the smaller storage dtype, which is already the default.
         fwd_pre_cast_node_idxs: set[int] = set()
+        param_grad_dtypes = {}
         for param, _grad in get_param_and_grad_nodes(self.graph).values():
             # Walk forward from param through single-user unary nodes
             n = param
@@ -1775,6 +1778,8 @@ class ShardingOptimizer:
 
             if n.target != torch.ops.autoparallel.dtype_cast.default:
                 continue
+            if len(n.args) > 2 and n.args[2] is not None:
+                param_grad_dtypes[param] = n.args[2]
 
             # Only constrain if it downcasts
             storage_meta = param.meta.get("val")
@@ -1808,45 +1813,49 @@ class ShardingOptimizer:
                     self._get_next_name("fwd_param_dtype"),
                 )
 
-        # --- Backward: forbid redistribution before grad dtype_cast ---
-        if not self.force_grad_reduce_in_higher_precision:
-            return
-
-        pre_cast_node_idxs: set[int] = set()
+        # --- Backward: communicate parameter gradients in the declared dtype ---
+        blocked_edges: set[tuple[int, int]] = set()
         for param, grad in get_param_and_grad_nodes(self.graph).values():
             if grad is None:
                 continue
+            reduce_dtype = param_grad_dtypes.get(param)
+            if reduce_dtype is None:
+                if not self.force_grad_reduce_in_higher_precision:
+                    continue
+                param_meta = param.meta.get("val")
+                if param_meta is None:
+                    param_meta = param.meta["tensor_meta"]
+                reduce_dtype = param_meta.dtype
 
-            # Walk backward from grad through the unary chain, excluding
-            # the first non-unary producer.
-            chain = [grad]
-            n = grad
-            while len(n.all_input_nodes) == 1:
-                parent = n.all_input_nodes[0]
-                if len(parent.all_input_nodes) != 1:
-                    break
-                chain.append(parent)
-                n = parent
+            pending = [grad]
+            visited = set()
+            while pending:
+                node = pending.pop()
+                if node in visited:
+                    continue
+                visited.add(node)
+                parents = self._all_input_nodes(node)
+                if len(parents) != 1 and not node.meta.get("is_gradient_acc"):
+                    continue
+                for argi, parent in enumerate(parents):
+                    parent_meta = parent.meta.get("val")
+                    if parent_meta is None:
+                        parent_meta = parent.meta["tensor_meta"]
+                    if parent_meta.dtype != reduce_dtype:
+                        blocked_edges.add((self.node_map[node], argi))
+                pending.extend(parents)
 
-            # Find the dtype_cast node in the chain
-            cast_idx = None
-            for i, node in enumerate(chain):
-                if node.target == torch.ops.autoparallel.dtype_cast.default:
-                    cast_idx = i
-                    break
-
-            if cast_idx is None:
-                continue
-
-            # Mark dtype_cast and all pre-cast unary nodes
-            for node in chain[cast_idx:]:
-                if node in self.node_map:
-                    pre_cast_node_idxs.add(self.node_map[node])
-
-        # Disable decision vars on pre-cast edges that imply redistribution
+        if not blocked_edges:
+            return
+        # A constrained linked edge also constrains its representative variable.
+        blocked_edges.update(
+            (root[0], root[1])
+            for linked, root in self.cluster_links.items()
+            if (linked[0], linked[1]) in blocked_edges
+        )
         for key, dv in self.decision_vars.items():
             node_idx, argi, out_idx, inp_idx = key
-            if node_idx not in pre_cast_node_idxs:
+            if (node_idx, argi) not in blocked_edges:
                 continue
             if dv.comm_cost > 0:
                 self.prob += (

@@ -8,7 +8,7 @@ import json
 import logging
 import operator
 import time
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, Callable, Optional, Union
@@ -191,12 +191,12 @@ def build_joint_graph(
     with (
         enable_local_map_wrapping(),
         torch._dynamo.utils._disable_saved_tensors_hooks_during_tracing(),
-    ):
-        forward = (
+        (
             make_dtype_cast_forward(model, mp_policy)
             if mp_policy is not None
-            else model
-        )
+            else nullcontext(model)
+        ) as forward,
+    ):
         torch_ir_with_fqn = _dynamo_graph_capture_for_export(forward)(
             *traced_inputs.args, **traced_inputs.kwargs
         )

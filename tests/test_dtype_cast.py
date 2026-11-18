@@ -15,7 +15,7 @@ from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor.placement_types import Shard
 
 from autoparallel.api import AutoParallel
-from autoparallel.dtype_cast import make_dtype_cast_forward
+from autoparallel.dtype_cast import dtype_cast, make_dtype_cast_forward
 from autoparallel.input_validation import ForwardInputs
 
 
@@ -51,13 +51,12 @@ def test_cast_preserves_types_outputs_and_gradients(root_parameter):
     policy = MixedPrecisionPolicy(
         param_dtype=torch.bfloat16, output_dtype=torch.float32
     )
-    forward = make_dtype_cast_forward(model, policy)
-    assert inspect.signature(forward) == inspect.signature(model.forward)
-
     x = torch.randn(3, 4, requires_grad=True)
     ref_x = x.detach().clone().requires_grad_()
     labels = torch.arange(3)
-    actual = forward(x, labels=labels)
+    with make_dtype_cast_forward(model, policy) as forward:
+        assert inspect.signature(forward) == inspect.signature(model.forward)
+        actual = forward(x, labels=labels)
     y = nn.functional.linear(
         ref_x.to(torch.bfloat16), reference.layers[0].weight.to(torch.bfloat16)
     ) + reference.offset.to(torch.bfloat16)
@@ -90,7 +89,7 @@ def test_parameter_free_root_casts_nested_inputs_and_outputs(cast_forward_inputs
             return inputs[0] + extra["value"], inputs[1], extra["mask"]
 
     model = Model()
-    forward = make_dtype_cast_forward(
+    forward_context = make_dtype_cast_forward(
         model,
         MixedPrecisionPolicy(
             param_dtype=torch.bfloat16,
@@ -100,9 +99,10 @@ def test_parameter_free_root_casts_nested_inputs_and_outputs(cast_forward_inputs
     )
     labels = torch.arange(3)
     mask = labels > 0
-    values, actual_labels, actual_mask = forward(
-        (torch.ones(3), labels), extra={"value": torch.ones(3), "mask": mask}
-    )
+    with forward_context as forward:
+        values, actual_labels, actual_mask = forward(
+            (torch.ones(3), labels), extra={"value": torch.ones(3), "mask": mask}
+        )
     torch.testing.assert_close(values, torch.full((3,), 2.0, dtype=torch.float64))
     assert actual_labels is labels
     assert actual_mask is mask
@@ -113,13 +113,94 @@ def test_parameter_free_root_casts_nested_inputs_and_outputs(cast_forward_inputs
 def test_cast_accepts_unchanged_parameter_dtype(param_dtype):
     model = nn.Linear(4, 4)
     x = torch.randn(2, 4, requires_grad=True)
-    forward = make_dtype_cast_forward(
+    forward_context = make_dtype_cast_forward(
         model, MixedPrecisionPolicy(param_dtype=param_dtype, output_dtype=torch.float64)
     )
-    actual = forward(x)
+    with forward_context as forward:
+        actual = forward(x)
     torch.testing.assert_close(actual, model(x).double())
     actual.sum().backward()
     assert model.weight.grad.dtype == torch.float32
+
+
+@pytest.mark.parametrize(
+    "reduce_dtype, expected", [(torch.bfloat16, 1.0), (torch.float32, 1.00390625)]
+)
+def test_reused_weight_accumulates_in_reduce_dtype(reduce_dtype, expected):
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(1))
+
+        def forward(self, x, y):
+            assert self.weight is self.weight
+            return self.weight * x + self.weight * y
+
+    model = Model()
+    policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=reduce_dtype)
+    with make_dtype_cast_forward(model, policy) as forward:
+        output = forward(torch.ones(1), torch.full((1,), 1 / 256))
+    output.sum().backward()
+    torch.testing.assert_close(
+        model.weight.grad, torch.tensor([expected]), rtol=0, atol=0
+    )
+
+
+@pytest.mark.parametrize("grad_dtype", [None, torch.bfloat16, torch.float32])
+def test_dtype_cast_operator_contract(grad_dtype):
+    x = torch.randn(3, requires_grad=True)
+    args = (x, torch.bfloat16)
+    if grad_dtype is not None:
+        args = (*args, grad_dtype)
+    torch.library.opcheck(dtype_cast, args)
+
+
+@pytest.mark.parametrize("instance_override", [False, True])
+def test_root_hook_boundaries_and_forward_restoration(instance_override):
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = nn.Linear(2, 2, bias=False)
+
+        def forward(self, x, *, scale):
+            assert type(self) is Model
+            assert x.dtype == scale.dtype == torch.bfloat16
+            return self.linear(x) * scale
+
+    model = Model()
+    if instance_override:
+        model.forward = model.forward
+    original_instance_forward = model.__dict__.get("forward")
+    observed = []
+
+    def pre_hook(module, args, kwargs):
+        observed.append(("input", args[0].dtype, kwargs["scale"].dtype))
+        return (args[0].double(),), {"scale": kwargs["scale"].double()}
+
+    def post_hook(module, args, kwargs, output):
+        observed.append(("output", output.dtype))
+        return output.double()
+
+    model.register_forward_pre_hook(pre_hook, with_kwargs=True)
+    model.register_forward_hook(post_hook, with_kwargs=True)
+    policy = MixedPrecisionPolicy(
+        param_dtype=torch.bfloat16, output_dtype=torch.float32
+    )
+    with make_dtype_cast_forward(model, policy) as forward:
+        output = forward(torch.ones(1, 2), scale=torch.ones(1))
+    assert output.dtype == torch.float64
+    assert observed == [
+        ("input", torch.float32, torch.float32),
+        ("output", torch.float32),
+    ]
+    assert ("forward" in model.__dict__) == instance_override
+    assert model.__dict__.get("forward") is original_instance_forward
+
+    with pytest.raises(RuntimeError, match="capture failed"):
+        with make_dtype_cast_forward(model, policy):
+            raise RuntimeError("capture failed")
+    assert ("forward" in model.__dict__) == instance_override
+    assert model.__dict__.get("forward") is original_instance_forward
 
 
 def test_cast_restores_tied_parameters_after_exception():
@@ -138,15 +219,16 @@ def test_cast_restores_tied_parameters_after_exception():
 
     model = Model()
     weight = model.left.weight
-    forward = make_dtype_cast_forward(
+    forward_context = make_dtype_cast_forward(
         model, MixedPrecisionPolicy(param_dtype=torch.bfloat16)
     )
-    for _ in range(2):
-        with pytest.raises(ValueError, match="forward failed"):
-            forward(torch.randn(2, 4))
-        assert model.left.weight is weight
-        assert model.right.weight is weight
-        assert weight.dtype == torch.float32
+    with forward_context as forward:
+        for _ in range(2):
+            with pytest.raises(ValueError, match="forward failed"):
+                forward(torch.randn(2, 4))
+            assert model.left.weight is weight
+            assert model.right.weight is weight
+            assert weight.dtype == torch.float32
     replica = copy.deepcopy(model)
     assert type(replica) is Model
     assert replica.left.weight is replica.right.weight
@@ -174,21 +256,22 @@ def test_cast_preserves_aliased_buffer_updates_and_training_modes():
     modes = {name: mod.training for name, mod in model.named_modules()}
     keys = list(model.state_dict())
     counter = model.counter
-    forward = make_dtype_cast_forward(
+    forward_context = make_dtype_cast_forward(
         model, MixedPrecisionPolicy(param_dtype=torch.bfloat16)
     )
-    for step in (1, 2):
-        x = torch.randn(2, 4)
-        expected = (
-            nn.functional.linear(
-                x.to(torch.bfloat16), reference.linear.weight.to(torch.bfloat16)
+    with forward_context as forward:
+        for step in (1, 2):
+            x = torch.randn(2, 4)
+            expected = (
+                nn.functional.linear(
+                    x.to(torch.bfloat16), reference.linear.weight.to(torch.bfloat16)
+                )
+                + step
             )
-            + step
-        )
-        torch.testing.assert_close(forward(x), expected)
-        assert model.counter.item() == step
-        assert model.counter is counter
-        assert model.observer.counter is counter
+            torch.testing.assert_close(forward(x), expected)
+            assert model.counter.item() == step
+            assert model.counter is counter
+            assert model.observer.counter is counter
     assert list(model.state_dict()) == keys
     assert {name: mod.training for name, mod in model.named_modules()} == modes
 
@@ -240,7 +323,6 @@ def test_type_dispatch_survives_capture_and_sharding(
             op="call_function", target=torch.ops.autoparallel.dtype_cast.default
         )
         assert sum(node.args[1] == torch.bfloat16 for node in casts) == len(pairs)
-        assert sum(node.args[1] == torch.float32 for node in casts) == len(pairs)
         autop.add_input_constraints([(Shard(0),), (Shard(0),)])
         parallel = autop.apply_placement(autop.optimize_placement())
 
@@ -353,3 +435,54 @@ def test_cast_capture_preserves_repeated_module_attribution(device_mesh_1d):
         assert all(
             list(stack.values())[-1] == ("layers.0", nn.Linear) for stack in stacks
         )
+
+
+@apply_cuda_patches
+def test_root_hook_boundaries_survive_capture(device_mesh_1d):
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = nn.Linear(2, 2, bias=False)
+
+        def forward(self, x, *, scale):
+            assert x.dtype == scale.dtype == torch.bfloat16
+            return self.linear(x) * scale
+
+    def pre_hook(module, args, kwargs):
+        assert args[0].dtype == kwargs["scale"].dtype == torch.float32
+        return (args[0].double(),), {"scale": kwargs["scale"].double()}
+
+    def post_hook(module, args, kwargs, output):
+        assert output.dtype == torch.float32
+        return output.double()
+
+    with torch.device("meta"):
+        model = Model()
+    model.register_forward_pre_hook(pre_hook, with_kwargs=True)
+    model.register_forward_hook(post_hook, with_kwargs=True)
+
+    def inputs():
+        return ForwardInputs(
+            args=(torch.ones(512, 2, device="cuda"),),
+            kwargs={"scale": torch.ones(512, 1, device="cuda")},
+        )
+
+    policy = MixedPrecisionPolicy(
+        param_dtype=torch.bfloat16,
+        reduce_dtype=torch.float32,
+        output_dtype=torch.float32,
+    )
+    with AutoParallel(
+        model, inputs, device_mesh_1d, policy, repeated_subgraphs=False
+    ) as autop:
+        assert "forward" not in autop.model.__dict__
+        autop.add_input_constraints([(Shard(0),), (Shard(0),)])
+        parallel = autop.apply_placement(autop.optimize_placement())
+    parallel.to_empty(device="cuda")
+    with torch.no_grad():
+        parallel.linear.weight.fill_(1)
+    output = parallel(
+        torch.ones(2, 2, device="cuda"), scale=torch.ones(2, 1, device="cuda")
+    )
+    assert output.dtype == torch.float64
+    torch.testing.assert_close(output, torch.full_like(output, 2))
