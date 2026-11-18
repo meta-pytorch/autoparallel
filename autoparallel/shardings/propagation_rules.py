@@ -476,9 +476,8 @@ def factory_rule(mesh, op_schema: OpSchema) -> OpStrategy:
         dtype = op_schema.args_schema[2]
         assert isinstance(dtype, torch.dtype), dtype
 
-    # TODO: ensure the solver knows that it is more expensive to Replicate factory functions than shard
-    # for now, put replicate last since this might encourage sharding.  (Experimentally it seemed so, but definitely
-    # this is not a stable gaurantee and we should fix this properly.)
+    # The compute cost model prices each strategy at its local output size, so
+    # sharded factories are cheaper than replicated ones.
     single_mesh_dim_strategies = [[Shard(i)] for i in range(len(shape))] + [
         [Replicate()]
     ]
