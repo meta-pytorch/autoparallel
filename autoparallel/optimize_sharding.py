@@ -551,7 +551,11 @@ class ShardingOptimizer:
             if node.target == operator.getitem:
                 src_spec = src_spec[node.args[1]]
             tgt_spec = output_strategy.input_specs[argi]
-            if isinstance(src_spec, DTensorSpec) and isinstance(tgt_spec, DTensorSpec):
+            if (
+                isinstance(src_spec, DTensorSpec)
+                and isinstance(tgt_spec, DTensorSpec)
+                and math.isfinite(default_comm_cost)
+            ):
                 comm_cost = estimate_strategy_comms_cost(src_spec, tgt_spec)
                 if src_spec.placements != tgt_spec.placements:
                     sharding_transition_cost = 1
@@ -825,13 +829,10 @@ class ShardingOptimizer:
                 # the root-to-root edge already covers this.
                 if producer_is_linked and user_idx in self._cluster_linked_node_idxs:
                     continue
-                user_argi = [
+                user_argis = [
                     i for i, n in enumerate(self._all_input_nodes(user)) if n == node
                 ]
-                assert len(user_argi) >= 1
-                # Use the first matching arg; the same-output-across-args
-                # constraint already ensures all args agree.
-                user_argi = user_argi[0]
+                assert len(user_argis) >= 1
 
                 vars_producer = self._collect_vars(
                     node, node_idx, argi=0, group_by="out_idx"
@@ -845,40 +846,44 @@ class ShardingOptimizer:
                         resolve_clusters=True,
                     )
 
-                vars_consumer = self._collect_vars(
-                    user, user_idx, argi=user_argi, group_by="inp_idx"
-                )
-                if not vars_consumer:
+                # A user consuming the same producer several times (e.g. x * x)
+                # chooses its input placement independently for each argument.
+                for user_argi in user_argis:
                     vars_consumer = self._collect_vars(
-                        user,
-                        user_idx,
-                        argi=user_argi,
-                        group_by="inp_idx",
-                        resolve_clusters=True,
+                        user, user_idx, argi=user_argi, group_by="inp_idx"
                     )
+                    if not vars_consumer:
+                        vars_consumer = self._collect_vars(
+                            user,
+                            user_idx,
+                            argi=user_argi,
+                            group_by="inp_idx",
+                            resolve_clusters=True,
+                        )
 
-                # Skip edges where the consumer arg has no sharding decision
-                # (e.g. None input_specs for HOP SymInt args).
-                if not vars_consumer or not vars_producer:
-                    user_strat = self.strats[user]
+                    # Skip edges where the consumer arg has no sharding decision
+                    # (e.g. None input_specs for HOP SymInt args).
+                    if not vars_consumer or not vars_producer:
+                        user_strat = self.strats[user]
+                        assert (
+                            user_argi < len(user_strat.strategies[0].input_specs)
+                            and user_strat.strategies[0].input_specs[user_argi] is None
+                        ), (
+                            f"Missing variables for non-None input_spec at "
+                            f"{user}[{user_argi}]"
+                        )
+                        continue
+
                     assert (
-                        user_argi < len(user_strat.strategies[0].input_specs)
-                        and user_strat.strategies[0].input_specs[user_argi] is None
-                    ), (
-                        f"Missing variables for non-None input_spec at "
-                        f"{user}[{user_argi}]"
-                    )
-                    continue
+                        vars_producer.keys() == vars_consumer.keys()
+                    ), f"{vars_producer}, {vars_consumer}"
 
-                assert (
-                    vars_producer.keys() == vars_consumer.keys()
-                ), f"{vars_producer}, {vars_consumer}"
-
-                for k in vars_producer:
-                    self.prob += (
-                        pulp.lpSum(vars_producer[k]) == pulp.lpSum(vars_consumer[k]),
-                        self._get_next_name("output_input_consistent"),
-                    )
+                    for k in vars_producer:
+                        self.prob += (
+                            pulp.lpSum(vars_producer[k])
+                            == pulp.lpSum(vars_consumer[k]),
+                            self._get_next_name("output_input_consistent"),
+                        )
 
     def add_inf_cost_constraint(self):
         """COST (Category 4): Variables with infinite cost (invalid configurations)

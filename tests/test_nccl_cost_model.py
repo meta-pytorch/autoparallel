@@ -757,19 +757,35 @@ class TestDetectNCCLTopoConfig:
         assert config is not None
         assert config.arch == GpuArch.HOPPER
 
-    def test_b200_detected(self):
+    @pytest.mark.parametrize(
+        "device_name,gpus_per_node",
+        [
+            ("NVIDIA B200", 8),
+            ("NVIDIA B300 SXM6 AC", 8),
+            ("NVIDIA GB200", 72),
+            ("NVIDIA GB300", 72),
+        ],
+    )
+    def test_blackwell_gpus_per_node(self, device_name, gpus_per_node):
         from unittest.mock import patch
 
-        mesh = self._make_mock_mesh(72)
-        with (
-            patch("torch.cuda.get_device_name", return_value="NVIDIA B200"),
-            patch("torch.cuda.device_count", return_value=72),
-        ):
+        mesh = self._make_mock_mesh(gpus_per_node * 2)
+        with patch("torch.cuda.get_device_name", return_value=device_name):
             config = detect_nccl_topo_config(mesh)
         assert config is not None
         assert config.arch == GpuArch.BLACKWELL
-        assert config.num_nodes == 1
-        assert config.gpus_per_node == 72
+        assert config.num_nodes == 2
+        assert config.gpus_per_node == gpus_per_node
+
+    def test_b200_mesh_not_multiple_of_72(self):
+        from unittest.mock import patch
+
+        mesh = self._make_mock_mesh(64)
+        with patch("torch.cuda.get_device_name", return_value="NVIDIA B200"):
+            config = detect_nccl_topo_config(mesh)
+        assert config is not None
+        assert config.num_nodes == 8
+        assert config.gpus_per_node == 8
 
     def test_gb200_detected(self):
         from unittest.mock import patch
@@ -1043,6 +1059,42 @@ class TestNVSwitchEmpiricalPath:
 
 
 class TestNICAggregation:
+    @pytest.mark.parametrize("algo", [NCCLAlgo.RING, NCCLAlgo.TREE])
+    def test_sparse_two_node_bw_is_inter_node_limited(self, algo):
+        config_50 = h100_topo_config(num_nodes=2, bw_inter=50.0)
+        config_25 = h100_topo_config(num_nodes=2, bw_inter=25.0)
+        topo_50 = derive_mesh_dim_topo(config_50, (2, 8), 0)
+        topo_25 = derive_mesh_dim_topo(config_25, (2, 8), 0)
+
+        bw_50 = _compute_algo_bw(
+            NCCLFunc.ALLREDUCE, algo, NCCLProto.SIMPLE, topo_50, config_50
+        )
+        bw_25 = _compute_algo_bw(
+            NCCLFunc.ALLREDUCE, algo, NCCLProto.SIMPLE, topo_25, config_25
+        )
+
+        assert topo_50.n_nodes == 2
+        assert topo_50.ppn == 1
+        assert bw_50 == pytest.approx(2 * bw_25)
+
+    @pytest.mark.parametrize("algo", [NCCLAlgo.RING, NCCLAlgo.TREE])
+    def test_dense_two_node_bw_saturates_at_intra_node_limit(self, algo):
+        config_50 = h100_topo_config(num_nodes=2, bw_inter=50.0)
+        config_80 = h100_topo_config(num_nodes=2, bw_inter=80.0)
+        topo_50 = derive_mesh_dim_topo(config_50, (16,), 0)
+        topo_80 = derive_mesh_dim_topo(config_80, (16,), 0)
+
+        bw_50 = _compute_algo_bw(
+            NCCLFunc.ALLREDUCE, algo, NCCLProto.SIMPLE, topo_50, config_50
+        )
+        bw_80 = _compute_algo_bw(
+            NCCLFunc.ALLREDUCE, algo, NCCLProto.SIMPLE, topo_80, config_80
+        )
+
+        assert topo_50.n_nodes == 2
+        assert topo_50.ppn == 8
+        assert bw_50 == pytest.approx(bw_80)
+
     def test_ring_bw_increases_with_nvswitch_multi_node(self):
         """Ring BW should increase when NVSwitch aggregates NICs at 4+ nodes."""
         config_nvs = h100_topo_config(num_nodes=4)

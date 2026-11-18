@@ -7,6 +7,7 @@ import copy
 from contextlib import contextmanager
 
 import torch
+from torch._decomp.decompositions import addmm as torch_addmm_decomp
 from torch._inductor.decomposition import select_decomp_table
 from torch._subclasses import FakeTensorMode
 
@@ -21,17 +22,18 @@ def _get_decomp_table():
     decomp_table.pop(torch.ops.aten.embedding_dense_backward.default)
     decomp_table.pop(torch.ops.aten.native_layer_norm_backward.default, None)
     decomp_table.pop(torch.ops.aten._softmax_backward_data.default)
-    decomp_table.pop(torch.ops.aten._softmax.default)
+    decomp_table.pop(torch.ops.aten._softmax.default, None)
     decomp_table.pop(torch.ops.aten.stack.default)
 
     # decompose addmm to allow for TP on mm
     decomp_table.pop(torch.ops.aten.addmm.default)
 
     def addmm_decomp(self, mat1, mat2, beta=1, alpha=1):
-        return self + mat1 @ mat2
+        if beta == 1 and alpha == 1:
+            return self + mat1 @ mat2
+        return torch_addmm_decomp(self, mat1, mat2, beta=beta, alpha=alpha)
 
     decomp_table[torch.ops.aten.addmm.default] = addmm_decomp
-    # decomp_table = None
 
     return decomp_table
 

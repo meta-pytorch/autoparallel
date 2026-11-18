@@ -3,13 +3,23 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+import pytest
 import torch
 from torch import nn
+from torch.distributed._tensor.placement_types import DTensorSpec, TensorMeta
 from torch.distributed.fsdp import MixedPrecisionPolicy
-from torch.distributed.tensor.placement_types import Shard
+from torch.distributed.tensor._op_schema import (
+    OpSchema,
+    OpSpec,
+    OpStrategy,
+    RuntimeSchemaInfo,
+    TupleStrategy,
+)
+from torch.distributed.tensor.placement_types import Replicate, Shard
 
 from autoparallel.api import AutoParallel
 from autoparallel.compile import autoparallel_backend
+from autoparallel.shardings.propagation_rules import stack_strategy
 
 
 def test_permute_layernorm_stride_handling(device_mesh_1d):
@@ -180,3 +190,96 @@ def test_index_put(device_mesh_1d):
         autop.add_input_constraints([(Shard(0),)])
         sharding_placement = autop.optimize_placement()
         autop.apply_placement(sharding_placement)
+
+
+def _stack_strategy_placements(mesh, shape, dim, num_inputs=2):
+    t = torch.empty(shape, device="meta")
+    tm = TensorMeta(t.shape, t.stride(), t.dtype)
+    inputs = TupleStrategy(
+        [
+            OpStrategy(
+                [
+                    OpSpec(
+                        DTensorSpec(mesh, (Replicate(),), tensor_meta=tm),
+                        input_specs=(),
+                        redistribute_cost=[],
+                    )
+                ]
+            )
+            for _ in range(num_inputs)
+        ]
+    )
+    op_schema = OpSchema(
+        torch.ops.aten.stack.default,
+        (inputs, dim),
+        {},
+        schema_info=RuntimeSchemaInfo(1, needs_pytree=True),
+    )
+    strategy = stack_strategy(mesh, op_schema)
+    return {
+        (s.output_specs.placements, tuple(spec.placements for spec in s.input_specs))
+        for s in strategy.strategies
+    }
+
+
+@pytest.mark.parametrize("neg_dim", [-1, -2, -4])
+def test_stack_negative_dim(device_mesh_1d, neg_dim):
+    shape = (256, 512, 1024)
+    pos_dim = neg_dim + len(shape) + 1
+    neg = _stack_strategy_placements(device_mesh_1d, shape, neg_dim)
+    pos = _stack_strategy_placements(device_mesh_1d, shape, pos_dim)
+    assert neg == pos
+    # input dims at or after the stacked dim shift by one in the output
+    for i in range(len(shape)):
+        out_dim = i if i < pos_dim else i + 1
+        assert ((Shard(out_dim),), ((Shard(i),),) * 2) in pos
+
+
+def test_stack_negative_dim_end_to_end(device_mesh_1d):
+    """Sharding the last input dim must map to the second-to-last output dim
+    of stack(..., dim=-1), not to the new stacked dim."""
+    batch_size = 32
+    dim = 512
+
+    class StackModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.scale = nn.Parameter(torch.empty(dim))
+
+        def forward(self, x):
+            return torch.stack([x * self.scale, x + self.scale], dim=-1)
+
+    def input_fn():
+        return torch.rand(batch_size, dim, device="cuda")
+
+    with torch.device("meta"):
+        model = StackModel()
+
+    mp_policy = MixedPrecisionPolicy(
+        param_dtype=torch.float32, reduce_dtype=torch.float32
+    )
+
+    with AutoParallel(model, input_fn, device_mesh_1d, mp_policy) as autop:
+        autop.add_input_constraints([(Shard(1),)])
+        autop.add_output_constraints([(Shard(1),)])
+        sharding_placement = autop.optimize_placement()
+        parallel_mod = autop.apply_placement(sharding_placement)
+
+    (stack_spec,) = [
+        s
+        for n, s in sharding_placement.items()
+        if n.target == torch.ops.aten.stack.default
+    ]
+    assert stack_spec.output_specs.placements == (Shard(1),)
+    assert all(spec.placements == (Shard(1),) for spec in stack_spec.input_specs)
+
+    parallel_mod.to_empty(device="cuda")
+    torch.nn.init.constant_(parallel_mod.scale, 2.0)
+
+    local_dim = dim // torch.distributed.get_world_size()
+    x = torch.ones(batch_size, local_dim, device="cuda")
+    out = parallel_mod(x)
+
+    assert out.shape == (batch_size, local_dim, 2)
+    assert torch.allclose(out[..., 0], torch.full_like(out[..., 0], 2.0))
+    assert torch.allclose(out[..., 1], torch.full_like(out[..., 1], 3.0))

@@ -3,6 +3,9 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+import math
+
+import pulp
 import pytest
 import torch
 import torch.nn.functional as F
@@ -202,6 +205,16 @@ _expected_node_placements_ffn = [
 ]
 
 
+# The same placements for the einsums the transformer block's 3D matmuls are
+# converted to: abk,kn->abn (fwd and grad input) and abn,abk->kn (grad weight).
+# Activation dims shift by one due to the extra batch dim, and the grad weight
+# output is kn instead of the mm's nk.
+_einsum1 = [(Shard(0), Replicate()), (Replicate(), Shard(1)), (Shard(0), Shard(2))]
+_einsum2 = [(Shard(0), Shard(2)), (Replicate(), Shard(0)), (Shard(0), Partial("sum"))]
+_einsum3 = [(Shard(0), Replicate()), (Shard(0), Shard(2)), (Partial("sum"), Shard(0))]
+_einsum4 = [(Shard(0), Shard(2)), (Shard(0), Replicate()), (Partial("sum"), Shard(1))]
+
+
 _expected_param_placements_transformer_block = [
     (Shard(0), Shard(0)),
     (Shard(0), Shard(0)),
@@ -212,24 +225,24 @@ _expected_param_placements_transformer_block = [
 ]
 
 _expected_node_placements_transformer_block = [
-    _mm1,
-    _mm1,
-    _mm1,
-    _mm2,
-    _mm1,
-    _mm2,
-    _mm3,
-    _mm1,
-    _mm4,
-    _mm2,
-    _mm3,
-    _mm1,
-    _mm4,
-    _mm2,
-    _mm4,
-    _mm2,
-    _mm4,
-    _mm2,
+    _einsum1,
+    _einsum1,
+    _einsum1,
+    _einsum2,
+    _einsum1,
+    _einsum2,
+    _einsum3,
+    _einsum1,
+    _einsum4,
+    _einsum2,
+    _einsum3,
+    _einsum1,
+    _einsum4,
+    _einsum2,
+    _einsum4,
+    _einsum2,
+    _einsum4,
+    _einsum2,
 ]
 
 
@@ -271,20 +284,26 @@ def test_optimization_finds_fsdp_tp_2d(
 
     # check parameters are sharded as expected
     param_nodes = get_param_nodes(autop.gm.graph)
+    assert len(param_nodes) == len(expected_param_placements)
     for node, expected_placement in zip(param_nodes, expected_param_placements):
         assert sharding_placement[node].output_specs.placements == expected_placement
 
-    # chekc that matmul nodes are sharded following FSDP + TP
+    # check that matmul nodes are sharded following FSDP + TP
     mm_nodes = autop.gm.graph.find_nodes(
         op="call_function", target=torch.ops.aten.mm.default
     )
-    for node, expected_placements in zip(mm_nodes, expected_node_placements):
+    einsum_nodes = autop.gm.graph.find_nodes(
+        op="call_function", target=torch.ops.aten.einsum.default
+    )
+    linear_nodes = mm_nodes + einsum_nodes
+    assert len(linear_nodes) == len(expected_node_placements)
+    for node, expected_placements in zip(linear_nodes, expected_node_placements):
         p = sharding_placement[node]
         assert p.input_specs[0].placements == expected_placements[0]
         assert p.input_specs[1].placements == expected_placements[1]
         assert p.output_specs.placements == expected_placements[2]
 
-    # chekc that sdpa nodes (if present) are sharded following FSDP + TP
+    # check that sdpa nodes (if present) are sharded following FSDP + TP
     sdpa_nodes = autop.gm.graph.find_nodes(
         op="call_function",
         target=torch.ops.aten._scaled_dot_product_efficient_attention.default,
@@ -841,3 +860,154 @@ def test_remove_node_constraint_restores_memory_budget(device_mesh_1d):
         # With memory budget enforced and no node constraint, the optimizer
         # should shard this param again
         assert solution[orig_node].output_specs.placements == (Shard(0),)
+
+
+@apply_cuda_patches
+def test_repeated_input_args_share_producer_placement(device_mesh_1d):
+    """Every argument of a node that consumes the same producer several times
+    (h * h) must be tied to the producer's placement, so the objective matches
+    the cost of the extracted solution."""
+    dim = 1024
+    bs = 8 * device_mesh_1d.shape[0]
+
+    class Model(nn.Module):
+        def forward(self, x):
+            for _ in range(3):
+                h = x.relu()
+                x = h * h
+            return x
+
+    def input_fn():
+        return torch.randn(bs, dim, device="cuda")
+
+    with torch.device("meta"):
+        model = Model()
+
+    with AutoParallel(model, input_fn, device_mesh_1d) as autop:
+        autop.add_input_constraints([(Shard(0),)])
+        autop.add_output_constraints([(Shard(0),)])
+        opt = autop.sharding_optimizer
+        assert opt.cluster_links
+        squares = list(
+            opt.graph.find_nodes(op="call_function", target=torch.ops.aten.mul.Tensor)
+        )
+        assert len(squares) == 3
+        # A sharded producer feeding a replicated square needs an all-gather
+        # for each argument.
+        for n in squares:
+            opt.add_node_constraint(n.args[0], (Shard(0),))
+            opt.add_node_constraint(n, (Replicate(),))
+        solution = autop.optimize_placement()
+
+    mul_idxs = {opt.node_map[n] for n in squares}
+    selected_inp = {}
+    for node_idx, argi, _, inp_idx in opt.selected_keys:
+        if node_idx in mul_idxs:
+            selected_inp.setdefault(node_idx, {})[argi] = inp_idx
+    assert selected_inp.keys() == mul_idxs
+    for inp in selected_inp.values():
+        assert inp[0] == inp[1]
+
+    cost = opt._compute_solution_cost(opt._to_concrete_solution(solution))
+    assert pulp.value(opt.prob.objective) == pytest.approx(cost["total"])
+
+
+@apply_cuda_patches
+def test_inf_redistribute_cost_bans_input_placement(device_mesh_1d, tmp_path):
+    """DTensor bans converting between Partial reduce types with an infinite
+    redistribute cost; the ban must survive edge cost estimation."""
+    dim = 1024
+    bs = 8 * device_mesh_1d.shape[0]
+
+    class Model(nn.Module):
+        def forward(self, x, y):
+            return x.sum(-1, keepdim=True) + y.mean(-1, keepdim=True)
+
+    def input_fn():
+        return torch.randn(bs, dim, device="cuda"), torch.randn(bs, dim, device="cuda")
+
+    with torch.device("meta"):
+        model = Model()
+
+    with AutoParallel(model, input_fn, device_mesh_1d) as autop:
+        autop.add_input_constraints([(Shard(1),), (Shard(1),)])
+        autop.add_output_constraints([(Replicate(),)])
+        autop.optimize_placement()
+        opt = autop.sharding_optimizer
+
+    (add,) = opt.graph.find_nodes(op="call_function", target=torch.ops.aten.add.Tensor)
+    add_idx = opt.node_map[add]
+    n_banned = 0
+    for argi, producer in enumerate(add.args):
+        producer_strats = opt.strats[producer].strategies
+        for out_idx, strategy in enumerate(opt.strats[add].strategies):
+            tgt = strategy.input_specs[argi].placements
+            for inp_idx, src in enumerate(producer_strats):
+                src = src.output_specs.placements
+                if not (src[0].is_partial() and tgt[0].is_partial() and src != tgt):
+                    continue
+                n_banned += 1
+                assert strategy.redistribute_cost[argi][inp_idx] == math.inf
+                dv = opt.decision_vars[(add_idx, argi, out_idx, inp_idx)]
+                assert dv.comm_cost == math.inf
+                assert dv.var.value() == 0
+    assert n_banned > 0
+
+    opt.save(tmp_path / "opt.ap")
+    loaded = type(opt).load(tmp_path / "opt.ap")
+    assert set(loaded.prob.constraints) == set(opt.prob.constraints)
+    loaded.resolve()
+    for key in loaded.selected_keys:
+        assert math.isfinite(loaded._resolve_decision_var(key).comm_cost)
+
+
+@apply_cuda_patches
+def test_split_with_sizes_of_split_dim_sharded_input(device_mesh_1d):
+    """Splitting along a sharded dim must stay feasible by gathering the
+    input before the split."""
+
+    class Model(nn.Module):
+        def forward(self, x):
+            a, b = x.split([512, 1536], dim=0)
+            return a, b
+
+    def input_fn():
+        return torch.randn(2048, 1024, device="cuda")
+
+    with torch.device("meta"):
+        model = Model()
+
+    with AutoParallel(model, input_fn, device_mesh_1d) as autop:
+        autop.add_input_constraints([(Shard(0),)])
+        autop.add_output_constraints([(Replicate(),), (Replicate(),)])
+        solution = autop.optimize_placement()
+        opt = autop.sharding_optimizer
+
+    (split,) = opt.graph.find_nodes(
+        op="call_function", target=torch.ops.aten.split_with_sizes.default
+    )
+    strategy = solution[opt._concrete_to_orig.get(split, split)]
+    assert strategy.input_specs[0].placements == (Replicate(),)
+    assert strategy.input_specs[0].tensor_meta.shape == torch.Size([2048, 1024])
+
+
+@apply_cuda_patches
+def test_split_with_sizes_negative_dim_never_shards_split_dim(device_mesh_2d):
+    class Model(nn.Module):
+        def forward(self, x):
+            a, b = x.split([256, 768], dim=-1)
+            return a, b
+
+    def input_fn():
+        return torch.randn(256, 64, 1024, device="cuda")
+
+    with torch.device("meta"):
+        model = Model()
+
+    with AutoParallel(model, input_fn, device_mesh_2d) as autop:
+        opt = autop.sharding_optimizer
+        (split,) = opt.graph.find_nodes(
+            op="call_function", target=torch.ops.aten.split_with_sizes.default
+        )
+        for strategy in opt.strats[split].strategies:
+            assert not any(p.is_shard(2) for p in strategy.input_specs[0].placements)

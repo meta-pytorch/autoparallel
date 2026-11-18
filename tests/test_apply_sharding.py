@@ -52,13 +52,20 @@ class TestComputeShardOrder:
 
 def _count_collectives(gm):
     """Count collective ops in a traced graph by type."""
-    counts = {"all_gather": 0, "reduce_scatter": 0, "alltoall": 0}
+    counts = {
+        "all_gather": 0,
+        "all_reduce": 0,
+        "reduce_scatter": 0,
+        "alltoall": 0,
+    }
     for n in gm.graph.nodes:
         if n.op != "call_function":
             continue
         name = getattr(n.target, "__name__", "")
         if "all_gather" in name:
             counts["all_gather"] += 1
+        elif "all_reduce" in name:
+            counts["all_reduce"] += 1
         elif "reduce_scatter" in name:
             counts["reduce_scatter"] += 1
         elif "alltoall" in name:
@@ -113,6 +120,103 @@ def test_static_view_preserves_uneven_global_shape():
 
         torch.testing.assert_close(actual, reference_output.detach()[:, columns])
         torch.testing.assert_close(local_tensor.grad, reference_input.grad[:, columns])
+
+
+def _shard0_placements(gm):
+    """Shard(0) on a 2-rank CPU mesh for a single-input chain of ops."""
+    mesh = DeviceMesh("cpu", [0, 1], _init_backend=False)
+    specs = {}
+    placements = {}
+    for node in gm.graph.nodes:
+        if node.op == "output":
+            continue
+        val = node.meta["val"]
+        specs[node] = DTensorSpec(
+            mesh,
+            (Shard(0),),
+            tensor_meta=TensorMeta(val.shape, val.stride(), val.dtype),
+        )
+        producer = node.args[0] if node.args else node
+        placements[node] = OpSpec(
+            output_specs=specs[node], input_specs=(specs[producer],)
+        )
+    return placements
+
+
+def test_static_view_preserves_global_layout():
+    # The split view is legal on the permuted layout; the final flatten is only
+    # legal if the earlier views kept that layout instead of copying.
+    def chain(x):
+        x = x.permute(0, 2, 1).view(4, 3, 2, 2).view(4, 3, 4)
+        return x.permute(0, 2, 1).view(16, 3)
+
+    reference_input = torch.arange(48, dtype=torch.float32).reshape(4, 4, 3)
+    reference_input.requires_grad_()
+    reference_output = chain(reference_input)
+    reference_output.sum().backward()
+
+    gm = make_fx(chain)(reference_input.detach())
+    placements = _shard0_placements(gm)
+
+    local_tensor = reference_input.detach()[:2].clone().requires_grad_()
+    parallel_gm = _lower_to_parallel_graph(
+        gm, placements, [local_tensor], param_placement_order={}
+    )
+    actual = parallel_gm(local_tensor)
+    actual.sum().backward()
+
+    torch.testing.assert_close(actual, reference_output.detach()[:8])
+    torch.testing.assert_close(local_tensor.grad, reference_input.grad[:2])
+
+
+def test_static_view_keeps_stride_one_for_expanded_input():
+    # Densifying an expanded layout must not move stride 1 off the last dim.
+    def chain(x):
+        return torch.view_as_real(
+            torch.view_as_complex(x.expand(4, 3, 4).view(4, 3, 2, 2))
+        )
+
+    reference_input = torch.arange(16, dtype=torch.float32).reshape(4, 1, 4)
+    reference_input.requires_grad_()
+    reference_output = chain(reference_input)
+    reference_output.sum().backward()
+
+    gm = make_fx(chain)(reference_input.detach())
+    placements = _shard0_placements(gm)
+    local_tensor = reference_input.detach()[:2].clone().requires_grad_()
+    parallel_gm = _lower_to_parallel_graph(
+        gm, placements, [local_tensor], param_placement_order={}
+    )
+    actual = parallel_gm(local_tensor)
+    actual.sum().backward()
+
+    torch.testing.assert_close(actual, reference_output.detach()[:2])
+    torch.testing.assert_close(local_tensor.grad, reference_input.grad[:2])
+
+
+def test_static_view_merges_partially_materialized_broadcast_dims():
+    # The local input materializes a broadcast dim that is still stride 0 in the
+    # global trace; the merged view needs both broadcast dims laid out alike.
+    def chain(x):
+        return x.expand(4, 3, 4, 5).view(4, 12, 5)
+
+    base = torch.arange(20, dtype=torch.float32).reshape(4, 1, 1, 5)
+    reference_input = base.expand(4, 1, 4, 5)
+    reference_input.requires_grad_()
+    reference_output = chain(reference_input)
+    reference_output.sum().backward()
+
+    gm = make_fx(chain)(reference_input.detach())
+    placements = _shard0_placements(gm)
+    local_tensor = reference_input.detach()[:2].clone().requires_grad_()
+    parallel_gm = _lower_to_parallel_graph(
+        gm, placements, [local_tensor], param_placement_order={}
+    )
+    actual = parallel_gm(local_tensor)
+    actual.sum().backward()
+
+    torch.testing.assert_close(actual, reference_output.detach()[:2])
+    torch.testing.assert_close(local_tensor.grad, reference_input.grad[:2])
 
 
 class TestOrderedRedistributeFusion:
@@ -218,6 +322,38 @@ class TestOrderedRedistributeFusion:
         gm = make_fx(trace_fn, tracing_mode="real")(local)
         counts = _count_collectives(gm)
         assert counts["all_gather"] >= 1
+
+
+class TestPartialRedistribution:
+    def test_partial_to_partial_does_not_reduce(self, device_mesh_2d):
+        """Redistributing another mesh dim must preserve an unchanged Partial.
+
+        This models a CP weight-gradient edge where (R, P) -> (S(1), P).
+        Materializing the CP Partial as Replicate here would insert an early
+        all-reduce, and the planned P -> R transition would reduce it again.
+        """
+        from autoparallel.apply_sharding import ApplyShardingInterpreter
+
+        tm = _make_tensor_meta([512, 128])
+        curr_spec = DTensorSpec(
+            device_mesh_2d, (Replicate(), Partial()), tensor_meta=tm
+        )
+        tgt_spec = DTensorSpec(device_mesh_2d, (Shard(1), Partial()), tensor_meta=tm)
+
+        graph = torch.fx.Graph()
+        node = graph.placeholder("grad")
+        graph.output(node)
+        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+        interp = ApplyShardingInterpreter(gm, {}, param_placement_order={})
+
+        local = torch.randn(512, 128, device="meta")
+
+        def trace_fn(x):
+            return interp.redistribute_tensor(x, curr_spec, tgt_spec, node)
+
+        traced = make_fx(trace_fn, tracing_mode="real")(local)
+        counts = _count_collectives(traced)
+        assert counts["all_reduce"] == 0
 
 
 class TestShardOrderSpecIsolation:

@@ -196,7 +196,7 @@ class DTypeCastModule(torch.nn.Module):
         output = super().forward(*args, **kwargs)
 
         def cast_out_fn(x):
-            if not isinstance(x, torch.Tensor):
+            if not isinstance(x, torch.Tensor) or not torch.is_floating_point(x):
                 return x
             return x.to(self._mp_policy.output_dtype)
 
