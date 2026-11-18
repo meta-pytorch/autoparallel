@@ -10,7 +10,7 @@ from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor.placement_types import Shard
 
 from autoparallel.api import AutoParallel
-from autoparallel.optimize_sharding import ShardingOptimizer
+from autoparallel.optimize_sharding import ShardingOptimizer, _is_grad_reduce_cast
 
 
 class SimpleLinear(nn.Module):
@@ -20,6 +20,18 @@ class SimpleLinear(nn.Module):
 
     def forward(self, x):
         return self.linear(x)
+
+
+class AutocastLinear(nn.Module):
+    """Mixed precision through torch.autocast rather than MixedPrecisionPolicy."""
+
+    def __init__(self, dim):
+        super().__init__()
+        self.linear = nn.Linear(dim, dim)
+
+    def forward(self, x):
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            return self.linear(x).float()
 
 
 class StackedLinear(nn.Module):
@@ -103,11 +115,9 @@ def _assert_no_pre_cast_redistribution(
             chain.append(parent)
             n = parent
 
-        cast_idx = None
-        for i, node in enumerate(chain):
-            if node.target == torch.ops.autoparallel.dtype_cast.default:
-                cast_idx = i
-                break
+        cast_idx = next(
+            (i for i, node in enumerate(chain) if _is_grad_reduce_cast(node)), None
+        )
 
         if cast_idx is None:
             continue
@@ -165,6 +175,52 @@ def test_grad_reduce_dtype_f32_reduces_after_cast(device_mesh_1d):
     )
     sharding_placement, autop = _run_autop(mesh, model_fn, input_fn, mp_policy)
     _assert_no_pre_cast_redistribution(sharding_placement, autop)
+
+
+def _pre_cast_redistributions(autop):
+    """Count chosen redistributions before each gradient's upcast."""
+    from torch._functorch._aot_autograd.fx_utils import get_param_and_grad_nodes
+
+    opt = autop.sharding_optimizer
+    pre_cast = set()
+    for _param, grad in get_param_and_grad_nodes(opt.graph).values():
+        chain = [grad]
+        while grad is not None and len(chain[-1].all_input_nodes) == 1:
+            parent = chain[-1].all_input_nodes[0]
+            if len(parent.all_input_nodes) != 1:
+                break
+            chain.append(parent)
+        cast_idx = next(
+            (i for i, node in enumerate(chain) if _is_grad_reduce_cast(node)), None
+        )
+        if grad is not None and cast_idx is not None:
+            pre_cast.update(opt.node_map[n] for n in chain[cast_idx:])
+    return sum(
+        opt._resolve_decision_var(key).comm_cost > 0
+        for key in opt.selected_keys
+        if key[0] in pre_cast
+    )
+
+
+@apply_cuda_patches
+def test_grad_reduce_dtype_f32_under_autocast(device_mesh_1d):
+    """reduce_dtype without param_dtype reduces autocast gradients after the upcast."""
+    dim = 1024
+    mesh = device_mesh_1d
+
+    def model_fn():
+        return AutocastLinear(dim)
+
+    def input_fn():
+        return torch.randn(2048 * mesh.shape[0], dim, device="cuda")
+
+    _, autop = _run_autop(mesh, model_fn, input_fn, None)
+    assert _pre_cast_redistributions(autop) > 0, "expected bf16 reductions by default"
+
+    mp_policy = MixedPrecisionPolicy(reduce_dtype=torch.float32)
+    sharding_placement, autop = _run_autop(mesh, model_fn, input_fn, mp_policy)
+    _assert_no_pre_cast_redistribution(sharding_placement, autop)
+    assert _pre_cast_redistributions(autop) == 0
 
 
 @apply_cuda_patches

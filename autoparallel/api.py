@@ -267,7 +267,9 @@ class AutoParallel:
         # in dtype casting and move_to_fake
         model = copy.deepcopy(model)
 
-        if self.mp_policy is not None:
+        # Without a param_dtype (e.g. torch.autocast in the model) there are
+        # no parameter casts to insert; reduce_dtype still applies.
+        if self.mp_policy is not None and self.mp_policy.param_dtype is not None:
             apply_dtype_cast(model, self.mp_policy)
 
         self.model = move_to_fake(model, self.fake_mode, device)
@@ -335,9 +337,11 @@ class AutoParallel:
             force_grad_reduce_in_higher_precision = (
                 self.mp_policy is not None
                 and self.mp_policy.reduce_dtype is not None
-                and self.mp_policy.param_dtype is not None
-                and self.mp_policy.reduce_dtype.itemsize
-                > self.mp_policy.param_dtype.itemsize
+                and (
+                    self.mp_policy.param_dtype is None
+                    or self.mp_policy.reduce_dtype.itemsize
+                    > self.mp_policy.param_dtype.itemsize
+                )
             )
             sharding_optimizer = ShardingOptimizer(
                 self.gm,

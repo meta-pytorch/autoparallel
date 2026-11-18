@@ -244,6 +244,23 @@ def _assert_has_tensor_meta(spec_or_specs, node, label):
         ), f"{node} {label} doesn't have a tensor_meta"
 
 
+def _node_dtype(node):
+    meta = node.meta.get("val")
+    if meta is None:
+        meta = node.meta["tensor_meta"]
+    return meta.dtype
+
+
+def _is_grad_reduce_cast(node):
+    """Whether ``node`` casts a gradient up to its reduction dtype."""
+    if node.target == torch.ops.autoparallel.dtype_cast.default:
+        return True
+    return node.target in (
+        torch.ops.prims.convert_element_type.default,
+        torch.ops.aten._to_copy.default,
+    ) and (_node_dtype(node).itemsize > _node_dtype(node.all_input_nodes[0]).itemsize)
+
+
 class ShardingOptimizer:
     def __init__(
         self,
@@ -1744,11 +1761,15 @@ class ShardingOptimizer:
 
             primals (storage_dtype) -> [unary ops] -> dtype_cast (param_dtype)
 
-        **Backward** (when reduce_dtype > param_dtype):
+        **Backward** (when reduce_dtype > param_dtype, or reduce_dtype is set
+        without param_dtype):
         Forces reduce-scatter to happen after the cast (in reduce_dtype, e.g.
         f32) rather than before it (in param_dtype, e.g. bf16).
 
             einsum (param_dtype) -> [unary ops] -> dtype_cast -> alias (grad_param)
+
+        Under torch.autocast there is no dtype_cast; the upcasting
+        convert_element_type nearest the gradient plays its role.
 
         Both are enforced by disabling decision variables on pre-cast edges
         that would imply a placement change.
@@ -1828,12 +1849,10 @@ class ShardingOptimizer:
                 chain.append(parent)
                 n = parent
 
-            # Find the dtype_cast node in the chain
-            cast_idx = None
-            for i, node in enumerate(chain):
-                if node.target == torch.ops.autoparallel.dtype_cast.default:
-                    cast_idx = i
-                    break
+            cast_idx = next(
+                (i for i, node in enumerate(chain) if _is_grad_reduce_cast(node)),
+                None,
+            )
 
             if cast_idx is None:
                 continue
