@@ -69,6 +69,41 @@ def _localize_shape_arg(node, shape_arg, output_spec):
     return local_shape
 
 
+def _restride_like(local, global_stride):
+    """Return ``local`` laid out densely in the dimension order of ``global_stride``.
+
+    ``local`` is kept as is when it is broadcast (stride 0) on exactly the same
+    dims as the global layout and dense in order elsewhere. Otherwise it is
+    copied with the broadcast dims outermost, in index order: views only merge
+    broadcast dims with each other, and the other dims keep their relative
+    order (in particular a unit last-dim stride).
+    """
+    broadcast = {
+        d for d in range(local.ndim) if global_stride[d] == 0 and local.shape[d] != 1
+    }
+    local_broadcast = {
+        d for d in range(local.ndim) if local.stride(d) == 0 and local.shape[d] != 1
+    }
+    order = sorted(
+        range(local.ndim),
+        key=lambda d: global_stride[d] or float("inf"),
+        reverse=True,
+    )
+    expected = [0] * local.ndim
+    step = 1
+    for d in reversed(order):
+        if d not in broadcast:
+            expected[d] = step
+            step *= local.shape[d]
+    if local_broadcast == broadcast and all(
+        size == 1 or d in broadcast or stride == expected[d]
+        for d, (size, stride) in enumerate(zip(local.shape, local.stride()))
+    ):
+        return local
+    inverse = sorted(range(local.ndim), key=order.__getitem__)
+    return local.permute(order).contiguous().permute(inverse)
+
+
 def _compute_shard_order(shard_order, reverse: bool):
     result = []
     for tensor_dim, mesh_dims in shard_order:
@@ -272,20 +307,27 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
         # internally). Not needed in dynamic mode since shape args are already
         # localized above.
         if not self.dynamic and target in _VIEW_OPS and tgt_spec is not None:
+            local = new_args[0]
             global_metadata = {}
             if tgt_spec.tensor_meta is not None:
                 global_metadata = {
                     "shape": tgt_spec.tensor_meta.shape,
                     "stride": tgt_spec.tensor_meta.stride,
                 }
+                # The traced view is legal for the global layout, and later
+                # views can depend on the result keeping it. DTensor trusts the
+                # given global stride, so DTensor.contiguous() cannot fix a
+                # local tensor laid out differently: restride it locally.
+                local = _restride_like(local, tgt_spec.tensor_meta.stride)
+            else:
+                local = local.contiguous()
             new_args[0] = DTensor.from_local(
-                new_args[0],
+                local,
                 tgt_spec.mesh,
                 tgt_spec.placements,
                 **global_metadata,
             )
             new_args[0]._spec.shard_order = tgt_spec.shard_order
-            new_args[0] = new_args[0].contiguous()
 
         return new_args, last_tgt_spec
 

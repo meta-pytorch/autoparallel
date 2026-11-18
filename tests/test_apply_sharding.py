@@ -122,6 +122,103 @@ def test_static_view_preserves_uneven_global_shape():
         torch.testing.assert_close(local_tensor.grad, reference_input.grad[:, columns])
 
 
+def _shard0_placements(gm):
+    """Shard(0) on a 2-rank CPU mesh for a single-input chain of ops."""
+    mesh = DeviceMesh("cpu", [0, 1], _init_backend=False)
+    specs = {}
+    placements = {}
+    for node in gm.graph.nodes:
+        if node.op == "output":
+            continue
+        val = node.meta["val"]
+        specs[node] = DTensorSpec(
+            mesh,
+            (Shard(0),),
+            tensor_meta=TensorMeta(val.shape, val.stride(), val.dtype),
+        )
+        producer = node.args[0] if node.args else node
+        placements[node] = OpSpec(
+            output_specs=specs[node], input_specs=(specs[producer],)
+        )
+    return placements
+
+
+def test_static_view_preserves_global_layout():
+    # The split view is legal on the permuted layout; the final flatten is only
+    # legal if the earlier views kept that layout instead of copying.
+    def chain(x):
+        x = x.permute(0, 2, 1).view(4, 3, 2, 2).view(4, 3, 4)
+        return x.permute(0, 2, 1).view(16, 3)
+
+    reference_input = torch.arange(48, dtype=torch.float32).reshape(4, 4, 3)
+    reference_input.requires_grad_()
+    reference_output = chain(reference_input)
+    reference_output.sum().backward()
+
+    gm = make_fx(chain)(reference_input.detach())
+    placements = _shard0_placements(gm)
+
+    local_tensor = reference_input.detach()[:2].clone().requires_grad_()
+    parallel_gm = _lower_to_parallel_graph(
+        gm, placements, [local_tensor], param_placement_order={}
+    )
+    actual = parallel_gm(local_tensor)
+    actual.sum().backward()
+
+    torch.testing.assert_close(actual, reference_output.detach()[:8])
+    torch.testing.assert_close(local_tensor.grad, reference_input.grad[:2])
+
+
+def test_static_view_keeps_stride_one_for_expanded_input():
+    # Densifying an expanded layout must not move stride 1 off the last dim.
+    def chain(x):
+        return torch.view_as_real(
+            torch.view_as_complex(x.expand(4, 3, 4).view(4, 3, 2, 2))
+        )
+
+    reference_input = torch.arange(16, dtype=torch.float32).reshape(4, 1, 4)
+    reference_input.requires_grad_()
+    reference_output = chain(reference_input)
+    reference_output.sum().backward()
+
+    gm = make_fx(chain)(reference_input.detach())
+    placements = _shard0_placements(gm)
+    local_tensor = reference_input.detach()[:2].clone().requires_grad_()
+    parallel_gm = _lower_to_parallel_graph(
+        gm, placements, [local_tensor], param_placement_order={}
+    )
+    actual = parallel_gm(local_tensor)
+    actual.sum().backward()
+
+    torch.testing.assert_close(actual, reference_output.detach()[:2])
+    torch.testing.assert_close(local_tensor.grad, reference_input.grad[:2])
+
+
+def test_static_view_merges_partially_materialized_broadcast_dims():
+    # The local input materializes a broadcast dim that is still stride 0 in the
+    # global trace; the merged view needs both broadcast dims laid out alike.
+    def chain(x):
+        return x.expand(4, 3, 4, 5).view(4, 12, 5)
+
+    base = torch.arange(20, dtype=torch.float32).reshape(4, 1, 1, 5)
+    reference_input = base.expand(4, 1, 4, 5)
+    reference_input.requires_grad_()
+    reference_output = chain(reference_input)
+    reference_output.sum().backward()
+
+    gm = make_fx(chain)(reference_input.detach())
+    placements = _shard0_placements(gm)
+    local_tensor = reference_input.detach()[:2].clone().requires_grad_()
+    parallel_gm = _lower_to_parallel_graph(
+        gm, placements, [local_tensor], param_placement_order={}
+    )
+    actual = parallel_gm(local_tensor)
+    actual.sum().backward()
+
+    torch.testing.assert_close(actual, reference_output.detach()[:2])
+    torch.testing.assert_close(local_tensor.grad, reference_input.grad[:2])
+
+
 class TestOrderedRedistributeFusion:
     """Test that ordered_redistribute_local_tensor fuses multi-dim collectives
     into single flat-mesh operations when possible."""
