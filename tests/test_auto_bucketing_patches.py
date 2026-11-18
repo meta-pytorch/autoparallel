@@ -122,6 +122,39 @@ def test_identify_fsdp_groups_can_include_all_all_reduce_groups():
     assert list(groups) == ["dp", "tp"]
 
 
+def _all_reduce_only_gm(group_names):
+    g = torch.fx.Graph()
+    for i, group_name in enumerate(group_names):
+        x = g.placeholder(f"grad{i}")
+        x.meta["val"] = _make_fake_tensor_meta((1024,), torch.float32)
+        _make_wait_node(g, _make_ar_node(g, x, group_name))
+    g.output(())
+    return _build_gm(g)
+
+
+def test_identify_fsdp_groups_all_reduce_only_graph(device_mesh_1d):
+    dp_group = device_mesh_1d.get_group(0).group_name
+    gm = _all_reduce_only_gm([dp_group, dp_group, "unregistered"])
+
+    groups, group_size = fsdp_mod.identify_fsdp_groups(gm)
+    assert len(groups) == 0 and group_size is None
+
+    saved = ab.aten_autobucketing_config.bucket_all_all_reduce_groups
+    ab.aten_autobucketing_config.bucket_all_all_reduce_groups = True
+    try:
+        groups, group_size = fsdp_mod.identify_fsdp_groups(gm)
+        assert list(groups) == [dp_group, "unregistered"]
+        assert group_size == device_mesh_1d.size()
+
+        groups, group_size = fsdp_mod.identify_fsdp_groups(
+            _all_reduce_only_gm(["unregistered"])
+        )
+        assert list(groups) == ["unregistered"]
+        assert group_size is None
+    finally:
+        ab.aten_autobucketing_config.bucket_all_all_reduce_groups = saved
+
+
 def test_identify_fsdp_groups_handles_no_fsdp_ags():
     """Empty graph or graphs with no FSDP AGs return an empty OrderedSet."""
     g = torch.fx.Graph()
