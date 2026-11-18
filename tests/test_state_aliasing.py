@@ -11,6 +11,7 @@ from conftest import apply_cuda_patches
 from torch import nn
 from torch._functorch._aot_autograd.descriptors import BufferAOTInput, ParamAOTInput
 from torch._functorch._aot_autograd.fx_utils import get_named_buffer_nodes
+from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
 from autoparallel.api import AutoParallel
@@ -204,7 +205,18 @@ def test_lowering_preserves_unused_trainable_parameter(device_mesh_1d):
 
 
 @apply_cuda_patches
-def test_tied_weight_executes_with_summed_gradient(device_mesh_1d):
+@pytest.mark.parametrize(
+    "mp_policy",
+    [
+        None,
+        MixedPrecisionPolicy(
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.float32,
+            output_dtype=torch.float32,
+        ),
+    ],
+)
+def test_tied_weight_executes_with_summed_gradient(device_mesh_1d, mp_policy):
     class Model(nn.Module):
         def __init__(self):
             super().__init__()
@@ -225,7 +237,7 @@ def test_tied_weight_executes_with_summed_gradient(device_mesh_1d):
         return torch.randint(0, 16, (device_mesh_1d.size(), 2), device="cuda")
 
     with AutoParallel(
-        model, input_fn, device_mesh_1d, repeated_subgraphs=False
+        model, input_fn, device_mesh_1d, mp_policy, repeated_subgraphs=False
     ) as autop:
         autop.add_input_constraints([(Shard(0),)])
         autop.add_output_constraints([(Shard(0),)])

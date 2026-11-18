@@ -28,7 +28,7 @@ from torch.export._trace import _restore_state_dict
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
 from .apply_sharding import apply_sharding_to_model
-from .cast_parametrization import apply_dtype_cast, canonicalize_mp, set_dtype_cast
+from .cast_parametrization import canonicalize_mp, make_dtype_cast_forward
 from .graph_passes.activation_checkpointing import mark_fsdp_all_gather_recomputation
 from .graph_passes.graph_utils import (
     _add_alias,
@@ -52,6 +52,7 @@ from .shardings.placement_options import _get_device_from_mesh
 from .tracing import (
     _add_unused_params_and_buffers,
     _get_decomp_table,
+    _restore_nn_module_stack,
     enable_local_map_wrapping,
     move_to_fake,
 )
@@ -160,6 +161,7 @@ def build_joint_graph(
     input_fn: Callable,
     fake_mode: FakeTensorMode,
     stack: ExitStack,
+    mp_policy: Optional[MixedPrecisionPolicy] = None,
 ) -> JointGraphResult:
     t0 = time.perf_counter()
     decomp_table = _get_decomp_table()
@@ -183,14 +185,36 @@ def build_joint_graph(
         traced_inputs = ForwardInputs(args=args, kwargs=kwargs)
 
     with (
-        set_dtype_cast(True),
         enable_local_map_wrapping(),
         torch._dynamo.utils._disable_saved_tensors_hooks_during_tracing(),
     ):
-        torch_ir_with_fqn = _dynamo_graph_capture_for_export(model)(
+        forward = (
+            make_dtype_cast_forward(model, mp_policy)
+            if mp_policy is not None
+            else model
+        )
+        torch_ir_with_fqn = _dynamo_graph_capture_for_export(forward)(
             *traced_inputs.args, **traced_inputs.kwargs
         )
         _restore_state_dict(model, torch_ir_with_fqn)
+        if mp_policy is not None:
+            _restore_nn_module_stack(model, torch_ir_with_fqn)
+            # Cast at first use so AOT does not defer gradient casts until the end.
+            order = {
+                node: index for index, node in enumerate(torch_ir_with_fqn.graph.nodes)
+            }
+            for node in torch_ir_with_fqn.graph.find_nodes(
+                op="call_function", target=torch.ops.autoparallel.dtype_cast
+            ):
+                if node.users:
+                    first_user = min(node.users, key=order.__getitem__)
+                    first_user.prepend(node)
+                    # Clustering uses source attribution to distinguish call sites.
+                    for key in ("stack_trace", "nn_module_stack"):
+                        if key in first_user.meta:
+                            node.meta[key] = first_user.meta[key]
+            torch_ir_with_fqn.graph.lint()
+            torch_ir_with_fqn.recompile()
         _add_unused_params_and_buffers(model, torch_ir_with_fqn)
         # TODO Can't use fake mode here because it clashes with the user level
         # fake mode. Ideally dynamo should reuse the user level fake mode.
@@ -263,12 +287,8 @@ class AutoParallel:
         self.cost_model = cost_model
         self.repeated_subgraphs = repeated_subgraphs
         self.solver_time_limit_seconds = solver_time_limit_seconds
-        # copy user model to avoid modifying it in-place
-        # in dtype casting and move_to_fake
+        # Moving to fake tensors must not modify the user model.
         model = copy.deepcopy(model)
-
-        if self.mp_policy is not None:
-            apply_dtype_cast(model, self.mp_policy)
 
         self.model = move_to_fake(model, self.fake_mode, device)
         self.param_aliases = _build_alias_map(self.model.named_parameters)
@@ -384,7 +404,7 @@ class AutoParallel:
 
     def build_model_graph(self):
         result = build_joint_graph(
-            self.model, self.input_fn, self.fake_mode, self.stack
+            self.model, self.input_fn, self.fake_mode, self.stack, self.mp_policy
         )
         self.gm = result.gm
         self.joint_with_descriptors = result.joint_with_descriptors

@@ -3,9 +3,11 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+import pytest
 import torch
 from conftest import apply_cuda_patches
 from torch import nn
+from torch._functorch._aot_autograd.fx_utils import get_param_and_grad_nodes
 from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor.placement_types import Shard
 
@@ -35,6 +37,66 @@ class StackedLinear(nn.Module):
         for layer in self.layers:
             x = layer(x)
         return x
+
+
+@apply_cuda_patches
+@pytest.mark.parametrize("tie_weights", [False, True])
+def test_backward_dtype_casts_follow_gradient_producers(device_mesh_1d, tie_weights):
+    with torch.device("meta"):
+        model = StackedLinear(64, n_layers=4)
+        if tie_weights:
+            model.layers[-1].weight = model.layers[0].weight
+
+    def inputs():
+        return torch.randn(512, 64, device="cuda")
+
+    policy = MixedPrecisionPolicy(
+        param_dtype=torch.bfloat16, reduce_dtype=torch.float32
+    )
+    with AutoParallel(
+        model, inputs, device_mesh_1d, policy, repeated_subgraphs=False
+    ) as autop:
+        graph = autop.gm.graph
+        order = {node: index for index, node in enumerate(graph.nodes)}
+        casts = [
+            node
+            for node in graph.find_nodes(
+                op="call_function", target=torch.ops.autoparallel.dtype_cast.default
+            )
+            if node.args[1] == torch.float32
+        ]
+        assert len(casts) == len(list(model.parameters()))
+        for node in casts:
+            assert node.meta["partitioner_tag"] == "is_backward"
+            assert 1 <= order[node] - order[node.args[0]] <= 2
+
+
+@apply_cuda_patches
+def test_parameter_casts_preserve_distinct_call_sites(device_mesh_1d):
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.first = nn.Linear(512, 512, bias=False)
+            self.last = nn.Linear(512, 512, bias=False)
+
+        def forward(self, x):
+            hidden = self.first(x)
+            return self.last(hidden)
+
+    with torch.device("meta"):
+        model = Model()
+
+    def inputs():
+        return torch.randn(512, 512, device="cuda")
+
+    policy = MixedPrecisionPolicy(
+        param_dtype=torch.bfloat16, reduce_dtype=torch.float32
+    )
+    with AutoParallel(model, inputs, device_mesh_1d, policy) as autop:
+        for desc, (param, _) in get_param_and_grad_nodes(autop.gm.graph).items():
+            placement = Shard(0) if desc.target == "first.weight" else Shard(1)
+            autop.sharding_optimizer.add_node_constraint(param, (placement,))
+        autop.optimize_placement()
 
 
 def test_grad_reduce_dtype_accepts_serialized_tensor_metadata(monkeypatch):
