@@ -201,8 +201,8 @@ def build_joint_graph(
             *traced_inputs.args, **traced_inputs.kwargs
         )
         _restore_state_dict(model, torch_ir_with_fqn)
+        _restore_nn_module_stack(model, torch_ir_with_fqn)
         if mp_policy is not None:
-            _restore_nn_module_stack(model, torch_ir_with_fqn)
             move_dtype_casts_to_first_use(torch_ir_with_fqn)
         _add_unused_params_and_buffers(model, torch_ir_with_fqn)
         # TODO Can't use fake mode here because it clashes with the user level

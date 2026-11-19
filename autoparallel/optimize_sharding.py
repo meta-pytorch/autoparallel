@@ -1834,16 +1834,25 @@ class ShardingOptimizer:
                 if node in visited:
                     continue
                 visited.add(node)
+                if node.meta.get("is_gradient_acc"):
+                    node_meta = node.meta.get("val")
+                    if node_meta is None:
+                        node_meta = node.meta.get("tensor_meta")
+                    if getattr(node_meta, "dtype", None) != reduce_dtype:
+                        continue
                 parents = self._all_input_nodes(node)
                 if len(parents) != 1 and not node.meta.get("is_gradient_acc"):
                     continue
                 for argi, parent in enumerate(parents):
                     parent_meta = parent.meta.get("val")
                     if parent_meta is None:
-                        parent_meta = parent.meta["tensor_meta"]
-                    if parent_meta.dtype != reduce_dtype:
+                        parent_meta = parent.meta.get("tensor_meta")
+                    parent_dtype = getattr(parent_meta, "dtype", None)
+                    if parent_dtype is None:
+                        continue
+                    if parent_dtype != reduce_dtype:
                         blocked_edges.add((self.node_map[node], argi))
-                pending.extend(parents)
+                    pending.append(parent)
 
         if not blocked_edges:
             return

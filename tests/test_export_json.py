@@ -69,6 +69,10 @@ def test_get_layer_index_from_nn_module_stack(device_mesh_1d, mp_policy):
     found_layers = set()
     found_non_layer = False
     for node in graph.nodes:
+        stack = node.meta.get("nn_module_stack") or node.meta.get("fwd_nn_module_stack")
+        if stack:
+            for path, cls in stack.values():
+                assert cls is type(autop.model.get_submodule(path))
         idx = _get_layer_index(node)
         if idx is not None:
             found_layers.add(idx)

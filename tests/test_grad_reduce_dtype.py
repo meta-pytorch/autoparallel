@@ -3,6 +3,8 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+import operator
+
 import pytest
 import torch
 from conftest import apply_cuda_patches
@@ -167,6 +169,87 @@ def test_reused_parameter_reduction_dtype(
         assert all(
             node.args[0].meta["val"].dtype == reduce_dtype for node in reductions
         )
+
+
+@apply_cuda_patches
+@pytest.mark.parametrize("layer", ["layer_norm", "conv"])
+@pytest.mark.parametrize("reduce_dtype", [None, torch.float32])
+def test_multi_output_backward_gradient_dtype(device_mesh_1d, layer, reduce_dtype):
+    mesh = torch.distributed.device_mesh.DeviceMesh(
+        "cuda", list(range(8)), mesh_dim_names=("dp",)
+    )
+    with torch.device("meta"):
+        if layer == "layer_norm":
+            model = nn.Sequential(nn.Linear(16, 16), nn.LayerNorm(16))
+            shape = (16, 16)
+        else:
+            model = nn.Conv2d(3, 8, 3, padding=1)
+            shape = (16, 3, 8, 8)
+
+    def inputs():
+        return torch.randn(shape, device="cuda")
+
+    policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=reduce_dtype)
+    with AutoParallel(model, inputs, mesh, policy, repeated_subgraphs=False) as autop:
+        projections = [
+            node
+            for node in autop.gm.graph.find_nodes(
+                op="call_function", target=operator.getitem
+            )
+            if node.meta.get("partitioner_tag") == "is_backward"
+            and isinstance(node.args[0].meta.get("val"), tuple)
+        ]
+        assert projections
+        autop.optimize_placement()
+
+
+@apply_cuda_patches
+def test_positional_parameter_does_not_constrain_residual_accumulations(device_mesh_1d):
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.pos_embed = nn.Parameter(torch.ones(1, 16, 32))
+            self.layers = nn.ModuleList([nn.Linear(32, 32) for _ in range(4)])
+
+        def forward(self, x):
+            x = x + self.pos_embed
+            for layer in self.layers:
+                x = x + torch.relu(layer(x))
+            return x
+
+    with torch.device("meta"):
+        model = Model()
+
+    def inputs():
+        return torch.randn(256, 16, 32, device="cuda")
+
+    policy = MixedPrecisionPolicy(
+        param_dtype=torch.bfloat16, reduce_dtype=torch.float32
+    )
+    with AutoParallel(
+        model, inputs, device_mesh_1d, policy, repeated_subgraphs=False
+    ) as autop:
+        opt = autop.sharding_optimizer
+        accumulations = [
+            node
+            for node in opt.graph.nodes
+            if node.meta.get("is_gradient_acc")
+            and node.meta["val"].dtype == torch.bfloat16
+        ]
+        assert accumulations
+        blocked_variables = {
+            variable
+            for name, constraint in opt.prob.constraints.items()
+            if name.startswith("grad_reduce_dtype")
+            for variable in constraint
+        }
+        assert blocked_variables
+        residual_variables = {
+            opt._get_pulp_variable((opt.node_map[node], argi, out_idx, inp_idx))
+            for node in accumulations
+            for argi, out_idx, inp_idx in opt.walk_over_options(node)
+        }
+        assert blocked_variables.isdisjoint(residual_variables)
 
 
 def test_grad_reduce_dtype_accepts_serialized_tensor_metadata(monkeypatch):
