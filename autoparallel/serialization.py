@@ -238,6 +238,7 @@ def save_optimizer_replay(opt, path):
             "force_grad_reduce_in_higher_precision": (
                 opt.force_grad_reduce_in_higher_precision
             ),
+            "grad_reduce_dtype": opt.grad_reduce_dtype,
             "repeated_subgraphs": opt.repeated_subgraphs,
             "persistent_aliases": opt.persistent_aliases,
             "solver_time_limit_seconds": opt.solver_time_limit_seconds,
@@ -313,6 +314,7 @@ def load_optimizer_replay(cls, path):
                 repeated_subgraphs=config["repeated_subgraphs"],
                 persistent_aliases=config["persistent_aliases"],
                 solver_time_limit_seconds=config["solver_time_limit_seconds"],
+                grad_reduce_dtype=config.get("grad_reduce_dtype"),
             )
     finally:
         set_nccl_topo_config(previous_topology)
@@ -413,6 +415,7 @@ def save_optimizer(opt, path):
             list(opt.mesh.mesh_dim_names) if opt.mesh.mesh_dim_names else None
         ),
         "force_grad_reduce_in_higher_precision": opt.force_grad_reduce_in_higher_precision,
+        "grad_reduce_dtype": opt.grad_reduce_dtype,
         "persistent_aliases": opt.persistent_aliases,
         "prefetch_discount": opt._prefetch_discount,
         "solver_time_limit_seconds": opt.solver_time_limit_seconds,
@@ -489,6 +492,7 @@ def load_optimizer(cls, path):
     opt.force_grad_reduce_in_higher_precision = save_dict[
         "force_grad_reduce_in_higher_precision"
     ]
+    opt.grad_reduce_dtype = save_dict.get("grad_reduce_dtype")
     opt.persistent_aliases = save_dict.get("persistent_aliases", {})
     opt._prefetch_discount = save_dict.get("prefetch_discount", 1.0)
     opt.solver_time_limit_seconds = save_dict.get("solver_time_limit_seconds")

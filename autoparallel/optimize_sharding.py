@@ -253,6 +253,7 @@ class ShardingOptimizer:
         repeated_subgraphs=False,
         persistent_aliases=None,
         solver_time_limit_seconds: float | None = None,
+        grad_reduce_dtype: torch.dtype | None = None,
     ):
         reset_placement_options_cache()
         reset_compute_cost_cache()
@@ -271,6 +272,7 @@ class ShardingOptimizer:
         self.force_grad_reduce_in_higher_precision = (
             force_grad_reduce_in_higher_precision
         )
+        self.grad_reduce_dtype = grad_reduce_dtype
         self.repeated_subgraphs = repeated_subgraphs
         self.persistent_aliases = persistent_aliases or {}
         self.cost_model_device_name = get_cost_model_device_name()
@@ -1730,11 +1732,10 @@ class ShardingOptimizer:
             )
 
     def add_grad_reduce_dtype_constraints(self):
-        """Forbid redistribution on the wrong side of dtype_cast nodes.
+        """Constrain parameter gathers and gradient reductions by dtype.
 
-        When MixedPrecisionPolicy inserts dtype_cast nodes to convert between
-        storage dtype and compute dtype, we want collectives to run in the
-        smaller dtype. This method enforces two independent constraints:
+        Parameter gathers favor the smaller dtype across parameter casts.
+        Gradient reductions use the requested dtype. These are independent:
 
         **Forward** (unconditional when dtype_cast nodes exist):
         Forces allgather to happen after the cast (in param_dtype, e.g. bf16)
@@ -1745,7 +1746,8 @@ class ShardingOptimizer:
             primals (storage_dtype) -> [unary ops] -> dtype_cast (param_dtype)
 
         **Backward**:
-        Parameter casts declare their accumulation/reduction dtype. Follow
+        Use the requested reduction dtype, or the dtype declared by parameter
+        casts when no policy was passed to the optimizer. Follow
         gradient additions and unary nodes back to their producers, forbidding
         communication on input edges with a different dtype. This covers
         autograd's generated conversions and casts back to the storage dtype.
@@ -1815,10 +1817,10 @@ class ShardingOptimizer:
 
         # --- Backward: communicate parameter gradients in the declared dtype ---
         blocked_edges: set[tuple[int, int]] = set()
-        for param, grad in get_param_and_grad_nodes(self.graph).values():
+        for desc, (param, grad) in get_param_and_grad_nodes(self.graph).items():
             if grad is None:
                 continue
-            reduce_dtype = param_grad_dtypes.get(param)
+            reduce_dtype = self.grad_reduce_dtype or param_grad_dtypes.get(param)
             if reduce_dtype is None:
                 if not self.force_grad_reduce_in_higher_precision:
                     continue
@@ -1829,16 +1831,19 @@ class ShardingOptimizer:
 
             pending = [grad]
             visited = set()
+            has_reduce_dtype = False
             while pending:
                 node = pending.pop()
                 if node in visited:
                     continue
                 visited.add(node)
+                node_meta = node.meta.get("val")
+                if node_meta is None:
+                    node_meta = node.meta.get("tensor_meta")
+                node_dtype = getattr(node_meta, "dtype", None)
+                has_reduce_dtype |= node_dtype == reduce_dtype
                 if node.meta.get("is_gradient_acc"):
-                    node_meta = node.meta.get("val")
-                    if node_meta is None:
-                        node_meta = node.meta.get("tensor_meta")
-                    if getattr(node_meta, "dtype", None) != reduce_dtype:
+                    if node_dtype != reduce_dtype:
                         continue
                 parents = self._all_input_nodes(node)
                 if len(parents) != 1 and not node.meta.get("is_gradient_acc"):
@@ -1853,6 +1858,11 @@ class ShardingOptimizer:
                     if parent_dtype != reduce_dtype:
                         blocked_edges.add((self.node_map[node], argi))
                     pending.append(parent)
+            if self.grad_reduce_dtype is not None and not has_reduce_dtype:
+                raise ValueError(
+                    f"Parameter {desc.target!r} has no gradient tensor in the "
+                    f"requested reduction dtype {reduce_dtype}"
+                )
 
         if not blocked_edges:
             return

@@ -341,20 +341,15 @@ class AutoParallel:
             )
             torch._inductor.config.comprehensive_padding = False
 
-            force_grad_reduce_in_higher_precision = (
-                self.mp_policy is not None
-                and self.mp_policy.reduce_dtype is not None
-                and self.mp_policy.param_dtype is not None
-                and self.mp_policy.reduce_dtype.itemsize
-                > self.mp_policy.param_dtype.itemsize
-            )
             sharding_optimizer = ShardingOptimizer(
                 self.gm,
                 self.mesh,
-                force_grad_reduce_in_higher_precision,
                 repeated_subgraphs=self.repeated_subgraphs,
                 persistent_aliases={**self.param_aliases, **self.buffer_aliases},
                 solver_time_limit_seconds=self.solver_time_limit_seconds,
+                grad_reduce_dtype=(
+                    self.mp_policy.reduce_dtype if self.mp_policy is not None else None
+                ),
             )
 
             self.sharding_optimizer = sharding_optimizer

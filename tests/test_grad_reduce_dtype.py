@@ -42,6 +42,90 @@ class StackedLinear(nn.Module):
 
 
 @apply_cuda_patches
+@pytest.mark.parametrize(
+    "storage_dtype, reduce_dtype, layer_norm, reuse",
+    [
+        (torch.float32, torch.float32, False, False),
+        (torch.bfloat16, torch.float32, False, False),
+        (torch.float32, torch.bfloat16, False, False),
+        (torch.float32, torch.bfloat16, True, False),
+        (torch.float32, torch.float32, False, True),
+    ],
+)
+def test_autocast_reduction_dtype_without_param_dtype(
+    device_mesh_1d, storage_dtype, reduce_dtype, layer_norm, reuse
+):
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = nn.Linear(1024, 1024)
+            self.norm = nn.LayerNorm(1024) if layer_norm else nn.Identity()
+
+        def forward(self, x):
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                output = self.linear(x)
+                if reuse:
+                    output = output + self.linear(x)
+                return self.norm(output).float()
+
+    mesh = torch.distributed.device_mesh.DeviceMesh(
+        "cuda", list(range(8)), mesh_dim_names=("dp",)
+    )
+    with torch.device("meta"):
+        model = Model().to(storage_dtype)
+
+    def inputs():
+        return torch.randn(2048 * mesh.size(), 1024, device="cuda")
+
+    policy = MixedPrecisionPolicy(reduce_dtype=reduce_dtype)
+    with AutoParallel(model, inputs, mesh, policy, repeated_subgraphs=False) as autop:
+        autop.add_input_constraints([(Shard(0),)])
+        autop.add_output_constraints([(Shard(0),)])
+        placement = autop.optimize_placement()
+        opt = autop.sharding_optimizer
+        producers = [
+            opt.nodes[key[0]].all_input_nodes[key[1]]
+            for key in opt.selected_keys
+            if opt._resolve_decision_var(key).comm_cost > 0
+        ]
+        assert producers
+        assert all(node.meta["val"].dtype == reduce_dtype for node in producers)
+
+        autop.apply_placement(placement)
+        reductions = [
+            node
+            for target in (
+                torch.ops._c10d_functional.all_reduce,
+                torch.ops._c10d_functional.all_reduce.default,
+                torch.ops._c10d_functional.reduce_scatter_tensor,
+                torch.ops._c10d_functional.reduce_scatter_tensor.default,
+            )
+            for node in autop.parallel_gm.graph.find_nodes(
+                op="call_function", target=target
+            )
+        ]
+        assert reductions
+        assert all(
+            node.args[0].meta["val"].dtype == reduce_dtype for node in reductions
+        )
+
+
+@apply_cuda_patches
+def test_grad_reduce_dtype_rejects_unavailable_dtype(device_mesh_1d):
+    with torch.device("meta"):
+        model = SimpleLinear(64)
+
+    def inputs():
+        return torch.randn(512, 64, device="cuda")
+
+    with AutoParallel(model, inputs, device_mesh_1d, repeated_subgraphs=False) as autop:
+        with pytest.raises(ValueError, match="linear.weight.*torch.bfloat16"):
+            ShardingOptimizer(
+                autop.gm, device_mesh_1d, grad_reduce_dtype=torch.bfloat16
+            )
+
+
+@apply_cuda_patches
 @pytest.mark.parametrize("tie_weights", [False, True])
 def test_backward_dtype_casts_follow_gradient_producers(device_mesh_1d, tie_weights):
     with torch.device("meta"):
