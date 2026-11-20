@@ -60,9 +60,12 @@ def _get_decomp_table():
         samples = torch.rand(
             [shape[d] for d in perm], dtype=dtype, device=device, **kwargs
         )
+        # Scale before permuting: fake pointwise ops on empty tensors return
+        # contiguous strides
+        samples = (high - low) * samples + low
         if perm != list(range(len(shape))):
             samples = samples.permute([perm.index(d) for d in range(len(shape))])
-        return (high - low) * samples + low
+        return samples
 
     decomp_table[torch.ops.prims.uniform.default] = uniform_decomp
 

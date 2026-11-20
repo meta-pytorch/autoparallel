@@ -59,8 +59,23 @@ class TransposedUniformNoise(nn.Module):
         return self.linear(x + noise)
 
 
+class EmptyPermutedUniform(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.linear = nn.Linear(dim, dim)
+
+    def forward(self, x):
+        noise = torch.empty(2, 0, 4, device=x.device).permute(1, 2, 0)
+        noise = noise.uniform_(-1.0, 2.0)
+        # The dtype view needs a unit last-dim stride, i.e. the permuted layout
+        y = noise.permute(2, 0, 1).view(torch.float64)
+        return self.linear(x) + y.sum()
+
+
 @apply_cuda_patches
-@pytest.mark.parametrize("model_cls", [UniformScale, TransposedUniformNoise])
+@pytest.mark.parametrize(
+    "model_cls", [UniformScale, TransposedUniformNoise, EmptyPermutedUniform]
+)
 def test_in_place_uniform_lowers_and_executes(device_mesh_1d, model_cls):
     dim = 64
     batch_size = 512
