@@ -98,6 +98,23 @@ def enable_local_map_wrapping():
         yield
 
 
+def _restore_nn_module_stack(model, graph_module):
+    """Recover module FQNs from Dynamo's inline module identities."""
+    modules_by_id = {
+        str(id(module)): (name, type(module)) for name, module in model.named_modules()
+    }
+    for gm in graph_module.modules():
+        if not isinstance(gm, torch.fx.GraphModule):
+            continue
+        for node in gm.graph.nodes:
+            if stack := node.meta.get("nn_module_stack"):
+                # Dynamo adds @<call index> when a module is called repeatedly.
+                node.meta["nn_module_stack"] = {
+                    key: modules_by_id.get(key.partition("@")[0], entry)
+                    for key, entry in stack.items()
+                }
+
+
 def _add_unused_params_and_buffers(model, graph_module):
     """Register parameters/buffers from model that are missing from graph_module.
 

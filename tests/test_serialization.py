@@ -8,9 +8,11 @@ import json
 import tempfile
 from unittest.mock import patch
 
+import pytest
 import torch
 from conftest import apply_cuda_patches
 from torch import nn
+from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
 from autoparallel.api import AutoParallel
@@ -173,6 +175,163 @@ def test_replay_graph_pickler_preserves_deep_graph():
 
 
 @apply_cuda_patches
+@pytest.mark.parametrize("replay", [False, True])
+@pytest.mark.parametrize("reduce_dtype", [torch.float32, torch.bfloat16])
+def test_save_load_preserves_grad_reduce_dtype(
+    device_mesh_1d, tmp_path, replay, reduce_dtype
+):
+    class Model(_SimpleModel):
+        def forward(self, x):
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                return super().forward(x).float()
+
+    with torch.device("meta"):
+        model = Model(64)
+    policy = MixedPrecisionPolicy(reduce_dtype=reduce_dtype)
+    with _setup_autop(model, 64, device_mesh_1d, mp_policy=policy) as autop:
+        autop.add_input_constraints([(Shard(0),)])
+        autop.add_output_constraints([(Shard(0),)])
+        opt = autop.sharding_optimizer
+        assert opt.grad_reduce_dtype == reduce_dtype
+
+        path = tmp_path / "optimizer.ap"
+        if replay:
+            opt.save_replay(path)
+            with gzip.open(path, "rb") as replay_file:
+                payload = torch.load(replay_file, weights_only=False)
+            loaded = type(opt).load_replay(path)
+        else:
+            opt.save(path)
+            with _patch_op_overload_pickle():
+                payload = torch.load(path, weights_only=False)
+            loaded = type(opt).load(path)
+
+        config = payload["optimizer"] if replay else payload
+        assert payload["version"] == 2
+        assert "force_grad_reduce_in_higher_precision" not in config
+        assert loaded.grad_reduce_dtype == reduce_dtype
+        assert not hasattr(loaded, "force_grad_reduce_in_higher_precision")
+        assert set(loaded.prob.constraints) == set(opt.prob.constraints)
+        assert any(
+            name.startswith("grad_reduce_dtype") for name in loaded.prob.constraints
+        )
+        loaded.get_solution()
+
+
+@apply_cuda_patches
+@pytest.mark.parametrize("replay", [False, True])
+def test_save_load_defaults_missing_grad_reduce_dtype(device_mesh_1d, tmp_path, replay):
+    with torch.device("meta"):
+        model = _SimpleModel(64)
+    with _setup_autop(model, 64, device_mesh_1d) as autop:
+        opt = autop.sharding_optimizer
+        path = tmp_path / "legacy.ap"
+        original_save = torch.save
+
+        def save_legacy(payload, *args, **kwargs):
+            payload["version"] = 1
+            config = payload["optimizer"] if replay else payload
+            del config["grad_reduce_dtype"]
+            config["force_grad_reduce_in_higher_precision"] = False
+            return original_save(payload, *args, **kwargs)
+
+        with patch("torch.save", side_effect=save_legacy):
+            if replay:
+                opt.save_replay(path)
+            else:
+                opt.save(path)
+        if replay:
+            loaded = type(opt).load_replay(path)
+        else:
+            loaded = type(opt).load(path)
+
+        assert loaded.grad_reduce_dtype is None
+        assert set(loaded.prob.constraints) == set(opt.prob.constraints)
+
+
+@apply_cuda_patches
+@pytest.mark.parametrize("replay", [False, True])
+@pytest.mark.parametrize("mode", ["storage", "declared", "explicit", "mixed"])
+def test_save_load_migrates_legacy_reduction_flag(
+    device_mesh_1d, tmp_path, replay, mode
+):
+    class Model(_SimpleModel):
+        def forward(self, x):
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                return super().forward(x).float()
+
+    with torch.device("meta"):
+        model = Model(64)
+        if mode == "mixed":
+            model.b.to(torch.bfloat16)
+    policy = None
+    if mode in ("declared", "explicit"):
+        policy = MixedPrecisionPolicy(
+            reduce_dtype=torch.bfloat16 if mode == "declared" else torch.float32
+        )
+    with _setup_autop(model, 64, device_mesh_1d, mp_policy=policy) as autop:
+        autop.add_input_constraints([(Shard(0),)])
+        autop.add_output_constraints([(Shard(0),)])
+        opt = autop.sharding_optimizer
+        path = tmp_path / "legacy.ap"
+        original_save = torch.save
+
+        def save_legacy(payload, *args, **kwargs):
+            payload["version"] = 1
+            config = payload["optimizer"] if replay else payload
+            config["force_grad_reduce_in_higher_precision"] = True
+            if mode == "explicit":
+                config["grad_reduce_dtype"] = torch.bfloat16
+            else:
+                del config["grad_reduce_dtype"]
+            return original_save(payload, *args, **kwargs)
+
+        with patch("torch.save", side_effect=save_legacy):
+            if replay:
+                opt.save_replay(path)
+            else:
+                opt.save(path)
+        load = type(opt).load_replay if replay else type(opt).load
+        if mode == "mixed":
+            with pytest.raises(ValueError, match="legacy optimizer.*multiple.*dtypes"):
+                load(path)
+        else:
+            loaded = load(path)
+            expected = torch.float32 if mode == "storage" else torch.bfloat16
+            assert loaded.grad_reduce_dtype == expected
+            assert not hasattr(loaded, "force_grad_reduce_in_higher_precision")
+            loaded.get_solution()
+            assert any(
+                name.startswith("grad_reduce_dtype") for name in loaded.prob.constraints
+            )
+
+
+@apply_cuda_patches
+@pytest.mark.parametrize("replay", [False, True])
+def test_current_save_requires_grad_reduce_dtype(device_mesh_1d, tmp_path, replay):
+    with torch.device("meta"):
+        model = _SimpleModel(64)
+    with _setup_autop(model, 64, device_mesh_1d) as autop:
+        opt = autop.sharding_optimizer
+        path = tmp_path / "missing-dtype.ap"
+        original_save = torch.save
+
+        def save_without_dtype(payload, *args, **kwargs):
+            config = payload["optimizer"] if replay else payload
+            del config["grad_reduce_dtype"]
+            return original_save(payload, *args, **kwargs)
+
+        with patch("torch.save", side_effect=save_without_dtype):
+            if replay:
+                opt.save_replay(path)
+            else:
+                opt.save(path)
+        load = type(opt).load_replay if replay else type(opt).load
+        with pytest.raises(KeyError, match="grad_reduce_dtype"):
+            load(path)
+
+
+@apply_cuda_patches
 def test_save_load_roundtrip(device_mesh_1d):
     dim = 64
     with torch.device("meta"):
@@ -293,7 +452,7 @@ def test_save_load_replay_regenerates_optimizer(device_mesh_1d):
         "optimizer",
         "nccl_topology_config",
     }
-    assert payload["version"] == 1
+    assert payload["version"] == 2
     assert payload["torch_git_version"] == torch.version.git_version
     assert isinstance(payload["graph_module"], bytes)
     assert payload["cost_model_device"] == {"name": "H100", "count": 8}

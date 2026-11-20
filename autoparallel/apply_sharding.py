@@ -407,9 +407,9 @@ def rename_placeholder_node(
 def _get_inductor_decomp_table():
     decomp_table = copy.copy(select_decomp_table())
     # desugar our custom operator now that we've computed the sharding decision
-    decomp_table[torch.ops.autoparallel.dtype_cast.default] = lambda x, dtype: x.to(
-        dtype
-    )
+    decomp_table[
+        torch.ops.autoparallel.dtype_cast.default
+    ] = lambda x, dtype, grad_dtype=None: x.to(dtype, copy=True)
     return decomp_table
 
 

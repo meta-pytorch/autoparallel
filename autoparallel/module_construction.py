@@ -8,7 +8,6 @@ from typing import Any, Callable
 import torch
 from torch.export.unflatten import _AttrKind
 
-from .cast_parametrization import DTypeCastModule
 from .init_weights import wrap_init_weights
 
 _NN_MODULE_KEYS = set(torch.nn.Module().__dict__.keys())
@@ -145,9 +144,8 @@ def make_parallel_module(
 ) -> torch.nn.Module:
     """Create a parallel module populated with sharded params/buffers.
 
-    Handles UserModelClass resolution (stripping DTypeCastModule), user attribute
-    copying, param/buffer registration, alias re-establishment, orphan submodule
-    copying, and init_weights wrapping.
+    Handles user attribute copying, param/buffer registration, alias
+    re-establishment, orphan submodule copying, and init_weights wrapping.
 
     Alias detection (param, buffer, and module aliases) is performed automatically
     from ref_model, which must preserve aliasing (e.g. move_to_fake does this).
@@ -162,8 +160,6 @@ def make_parallel_module(
     buffer_alias_map = _build_alias_map(ref_model.named_buffers)
     module_alias_map = _build_module_alias_map(ref_model)
     UserModelClass = type(ref_model)
-    if issubclass(UserModelClass, DTypeCastModule):
-        UserModelClass = UserModelClass.__bases__[1]
 
     class ParallelModule(UserModelClass):  # type: ignore[valid-type,misc]
         def __init__(self):

@@ -8,7 +8,7 @@ import json
 import logging
 import operator
 import time
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, Callable, Optional, Union
@@ -28,7 +28,11 @@ from torch.export._trace import _restore_state_dict
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
 from .apply_sharding import apply_sharding_to_model
-from .cast_parametrization import apply_dtype_cast, canonicalize_mp, set_dtype_cast
+from .dtype_cast import (
+    canonicalize_mp,
+    make_dtype_cast_forward,
+    move_dtype_casts_to_first_use,
+)
 from .graph_passes.activation_checkpointing import mark_fsdp_all_gather_recomputation
 from .graph_passes.graph_utils import (
     _add_alias,
@@ -52,6 +56,7 @@ from .shardings.placement_options import _get_device_from_mesh
 from .tracing import (
     _add_unused_params_and_buffers,
     _get_decomp_table,
+    _restore_nn_module_stack,
     enable_local_map_wrapping,
     move_to_fake,
 )
@@ -160,6 +165,7 @@ def build_joint_graph(
     input_fn: Callable,
     fake_mode: FakeTensorMode,
     stack: ExitStack,
+    mp_policy: Optional[MixedPrecisionPolicy] = None,
 ) -> JointGraphResult:
     t0 = time.perf_counter()
     decomp_table = _get_decomp_table()
@@ -183,14 +189,21 @@ def build_joint_graph(
         traced_inputs = ForwardInputs(args=args, kwargs=kwargs)
 
     with (
-        set_dtype_cast(True),
         enable_local_map_wrapping(),
         torch._dynamo.utils._disable_saved_tensors_hooks_during_tracing(),
+        (
+            make_dtype_cast_forward(model, mp_policy)
+            if mp_policy is not None
+            else nullcontext(model)
+        ) as forward,
     ):
-        torch_ir_with_fqn = _dynamo_graph_capture_for_export(model)(
+        torch_ir_with_fqn = _dynamo_graph_capture_for_export(forward)(
             *traced_inputs.args, **traced_inputs.kwargs
         )
         _restore_state_dict(model, torch_ir_with_fqn)
+        _restore_nn_module_stack(model, torch_ir_with_fqn)
+        if mp_policy is not None:
+            move_dtype_casts_to_first_use(torch_ir_with_fqn)
         _add_unused_params_and_buffers(model, torch_ir_with_fqn)
         # TODO Can't use fake mode here because it clashes with the user level
         # fake mode. Ideally dynamo should reuse the user level fake mode.
@@ -263,12 +276,8 @@ class AutoParallel:
         self.cost_model = cost_model
         self.repeated_subgraphs = repeated_subgraphs
         self.solver_time_limit_seconds = solver_time_limit_seconds
-        # copy user model to avoid modifying it in-place
-        # in dtype casting and move_to_fake
+        # Moving to fake tensors must not modify the user model.
         model = copy.deepcopy(model)
-
-        if self.mp_policy is not None:
-            apply_dtype_cast(model, self.mp_policy)
 
         self.model = move_to_fake(model, self.fake_mode, device)
         self.param_aliases = _build_alias_map(self.model.named_parameters)
@@ -332,20 +341,15 @@ class AutoParallel:
             )
             torch._inductor.config.comprehensive_padding = False
 
-            force_grad_reduce_in_higher_precision = (
-                self.mp_policy is not None
-                and self.mp_policy.reduce_dtype is not None
-                and self.mp_policy.param_dtype is not None
-                and self.mp_policy.reduce_dtype.itemsize
-                > self.mp_policy.param_dtype.itemsize
-            )
             sharding_optimizer = ShardingOptimizer(
                 self.gm,
                 self.mesh,
-                force_grad_reduce_in_higher_precision,
                 repeated_subgraphs=self.repeated_subgraphs,
                 persistent_aliases={**self.param_aliases, **self.buffer_aliases},
                 solver_time_limit_seconds=self.solver_time_limit_seconds,
+                grad_reduce_dtype=(
+                    self.mp_policy.reduce_dtype if self.mp_policy is not None else None
+                ),
             )
 
             self.sharding_optimizer = sharding_optimizer
@@ -384,7 +388,7 @@ class AutoParallel:
 
     def build_model_graph(self):
         result = build_joint_graph(
-            self.model, self.input_fn, self.fake_mode, self.stack
+            self.model, self.input_fn, self.fake_mode, self.stack, self.mp_policy
         )
         self.gm = result.gm
         self.joint_with_descriptors = result.joint_with_descriptors

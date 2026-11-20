@@ -6,9 +6,11 @@
 import json
 from types import SimpleNamespace
 
+import pytest
 import torch
 from conftest import apply_cuda_patches
 from torch import nn
+from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor.placement_types import Shard
 
 from autoparallel.api import AutoParallel
@@ -35,25 +37,30 @@ class _RepeatedLayerModel(nn.Module):
         return self.head(x)
 
 
-def _setup_autop(model, dim, device_mesh):
+def _setup_autop(model, dim, device_mesh, mp_policy=None):
     batch_size = 2 * device_mesh.shape[0]
 
     def input_fn():
         return torch.rand(batch_size, dim, device="cuda")
 
-    return AutoParallel(model, input_fn, device_mesh, repeated_subgraphs=True)
+    return AutoParallel(
+        model, input_fn, device_mesh, mp_policy=mp_policy, repeated_subgraphs=True
+    )
 
 
 # ---- _get_layer_index tests ----
 
 
 @apply_cuda_patches
-def test_get_layer_index_from_nn_module_stack(device_mesh_1d):
+@pytest.mark.parametrize(
+    "mp_policy", [None, MixedPrecisionPolicy(param_dtype=torch.bfloat16)]
+)
+def test_get_layer_index_from_nn_module_stack(device_mesh_1d, mp_policy):
     dim = 64
     with torch.device("meta"):
         model = _RepeatedLayerModel(dim, n_layers=3)
 
-    autop = _setup_autop(model, dim, device_mesh_1d)
+    autop = _setup_autop(model, dim, device_mesh_1d, mp_policy=mp_policy)
     with autop:
         autop.add_input_constraints([(Shard(0),)])
         autop.add_output_constraints([(Shard(0),)])
@@ -62,6 +69,10 @@ def test_get_layer_index_from_nn_module_stack(device_mesh_1d):
     found_layers = set()
     found_non_layer = False
     for node in graph.nodes:
+        stack = node.meta.get("nn_module_stack") or node.meta.get("fwd_nn_module_stack")
+        if stack:
+            for path, cls in stack.values():
+                assert cls is type(autop.model.get_submodule(path))
         idx = _get_layer_index(node)
         if idx is not None:
             found_layers.add(idx)

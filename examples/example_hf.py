@@ -135,8 +135,6 @@ def main():
 
     if task == "seq2seq":
         # T5/BART forward: (input_ids, attention_mask, decoder_input_ids, ...)
-        # Must provide attention_mask as a tensor (not None) because AutoParallel's
-        # DTypeCastModule applies tree_map over args and calls torch.is_floating_point.
         def input_fn():
             input_ids = torch.randint(
                 0, vocab_size, (batch_size, seq_len), device="cuda"
