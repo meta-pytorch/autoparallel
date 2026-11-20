@@ -11,7 +11,7 @@ from conftest import apply_cuda_patches
 from torch import nn
 from torch._functorch._aot_autograd.fx_utils import get_param_and_grad_nodes
 from torch.distributed.fsdp import MixedPrecisionPolicy
-from torch.distributed.tensor.placement_types import Shard
+from torch.distributed.tensor.placement_types import Replicate, Shard
 
 from autoparallel.api import AutoParallel
 from autoparallel.optimize_sharding import ShardingOptimizer
@@ -39,6 +39,114 @@ class StackedLinear(nn.Module):
         for layer in self.layers:
             x = layer(x)
         return x
+
+
+def _selected_gradient_reduction_dtypes(opt):
+    dtypes = []
+    for key in opt.selected_keys:
+        node = opt.nodes[key[0]]
+        if node.meta.get("partitioner_tag") != "is_backward":
+            continue
+        if opt._resolve_decision_var(key).comm_cost == 0:
+            continue
+        parent = opt._all_input_nodes(node)[key[1]]
+        source = opt.strats[parent].strategies[key[3]].output_specs
+        if node.target == operator.getitem:
+            source = source[node.args[1]]
+        if any(placement.is_partial() for placement in source.placements):
+            dtypes.append(source.tensor_meta.dtype)
+    return dtypes
+
+
+@apply_cuda_patches
+@pytest.mark.parametrize(
+    "layer, param_dtype, reduce_dtype",
+    [
+        ("layer_norm", torch.bfloat16, torch.float32),
+        ("conv", torch.bfloat16, torch.float32),
+        ("layer_norm", torch.bfloat16, torch.bfloat16),
+        ("conv", torch.bfloat16, torch.bfloat16),
+        ("layer_norm", None, torch.float32),
+        ("conv", None, torch.float32),
+        ("layer_norm", None, torch.bfloat16),
+        ("conv", None, torch.bfloat16),
+    ],
+)
+def test_tuple_gradient_reduction_dtype(tmp_path, layer, param_dtype, reduce_dtype):
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer = (
+                nn.LayerNorm(1024)
+                if layer == "layer_norm"
+                else nn.Conv2d(3, 32, 3, padding=1)
+            )
+
+        def forward(self, x):
+            with torch.autocast(
+                "cuda", dtype=torch.bfloat16, enabled=param_dtype is None
+            ):
+                return self.layer(x).float()
+
+    mesh = torch.distributed.device_mesh.DeviceMesh(
+        "cuda", list(range(8)), mesh_dim_names=("dp",)
+    )
+    with torch.device("meta"):
+        model = Model()
+    shape = (16384, 1024) if layer == "layer_norm" else (512, 3, 32, 32)
+
+    def inputs():
+        return torch.randn(shape, device="cuda")
+
+    policy = MixedPrecisionPolicy(param_dtype=param_dtype, reduce_dtype=reduce_dtype)
+    with AutoParallel(
+        model, inputs, mesh, policy, repeated_subgraphs=False, cost_model="default"
+    ) as autop:
+        autop.add_input_constraints([(Shard(0),)])
+        autop.add_output_constraints([(Shard(0),)])
+        opt = autop.sharding_optimizer
+        for param, _ in get_param_and_grad_nodes(autop.gm.graph).values():
+            opt.add_node_constraint(param, (Replicate(),))
+        placement = autop.optimize_placement()
+        dtypes = _selected_gradient_reduction_dtypes(opt)
+        assert dtypes and set(dtypes) == {reduce_dtype}
+
+        for replay in (False, True):
+            path = tmp_path / f"optimizer-{replay}.ap"
+            if replay:
+                opt.save_replay(path)
+                loaded = type(opt).load_replay(path)
+            else:
+                opt.save(path)
+                loaded = type(opt).load(path)
+            loaded.get_solution()
+            restored_dtypes = _selected_gradient_reduction_dtypes(loaded)
+            assert restored_dtypes and set(restored_dtypes) == {reduce_dtype}
+
+        autop.apply_placement(placement)
+        reductions = [
+            node
+            for target in (
+                torch.ops._c10d_functional.all_reduce,
+                torch.ops._c10d_functional.all_reduce.default,
+                torch.ops._c10d_functional.reduce_scatter_tensor,
+                torch.ops._c10d_functional.reduce_scatter_tensor.default,
+            )
+            for node in autop.parallel_gm.graph.find_nodes(
+                op="call_function", target=target
+            )
+        ]
+        assert reductions
+        assert all(
+            node.args[0].meta["val"].dtype == reduce_dtype for node in reductions
+        )
+
+
+def test_optimizer_options_are_keyword_only():
+    with pytest.raises(TypeError, match="positional"):
+        ShardingOptimizer(None, None, True)
+    with pytest.raises(TypeError, match="unexpected keyword"):
+        ShardingOptimizer(None, None, force_grad_reduce_in_higher_precision=True)
 
 
 @apply_cuda_patches
@@ -349,7 +457,7 @@ def test_grad_reduce_dtype_accepts_serialized_tensor_metadata(monkeypatch):
     optimizer.nodes = [cast]
     optimizer.node_map = {cast: 0}
     optimizer.decision_vars = {}
-    optimizer.force_grad_reduce_in_higher_precision = False
+    optimizer.grad_reduce_dtype = None
 
     monkeypatch.setattr(
         "autoparallel.optimize_sharding.get_param_and_grad_nodes",

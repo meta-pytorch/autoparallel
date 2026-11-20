@@ -220,7 +220,7 @@ def save_optimizer_replay(opt, path):
         )
 
     payload = {
-        "version": 1,
+        "version": 2,
         "torch_git_version": torch.version.git_version,
         "graph_module": _encode_replay_graph(opt.gm),
         "mesh": {
@@ -235,9 +235,6 @@ def save_optimizer_replay(opt, path):
             "count": opt.cost_model_device_count,
         },
         "optimizer": {
-            "force_grad_reduce_in_higher_precision": (
-                opt.force_grad_reduce_in_higher_precision
-            ),
             "grad_reduce_dtype": opt.grad_reduce_dtype,
             "repeated_subgraphs": opt.repeated_subgraphs,
             "persistent_aliases": opt.persistent_aliases,
@@ -249,6 +246,49 @@ def save_optimizer_replay(opt, path):
     }
     with gzip.open(path, "wb") as replay_file:
         torch.save(payload, replay_file)
+
+
+def _load_grad_reduce_dtype(config, graph, version):
+    """Translate legacy reduction flags into an explicit dtype when unambiguous."""
+    if version == 2:
+        return config["grad_reduce_dtype"]
+    dtype = config.get("grad_reduce_dtype")
+    if dtype is not None or not config.get(
+        "force_grad_reduce_in_higher_precision", False
+    ):
+        return dtype
+
+    from torch._functorch._aot_autograd.fx_utils import get_param_and_grad_nodes
+
+    dtypes = set()
+    for desc, (param, grad) in get_param_and_grad_nodes(graph).items():
+        if grad is None:
+            continue
+        meta = param.meta.get("val")
+        if meta is None:
+            meta = param.meta.get("tensor_meta")
+        dtype = getattr(meta, "dtype", None)
+        node = param
+        while node.target != torch.ops.autoparallel.dtype_cast.default:
+            users = list(node.users)
+            if len(users) != 1 or len(users[0].all_input_nodes) != 1:
+                break
+            node = users[0]
+        if node.target == torch.ops.autoparallel.dtype_cast.default:
+            if len(node.args) > 2 and node.args[2] is not None:
+                dtype = node.args[2]
+        if dtype is None:
+            raise ValueError(
+                f"Cannot migrate legacy optimizer: missing dtype for {desc.target!r}. "
+                "Recreate it with an explicit grad_reduce_dtype and save it again."
+            )
+        dtypes.add(dtype)
+    if len(dtypes) > 1:
+        raise ValueError(
+            "Cannot migrate legacy optimizer with multiple gradient reduction dtypes. "
+            "Recreate it with an explicit grad_reduce_dtype and save it again."
+        )
+    return next(iter(dtypes), None)
 
 
 def load_optimizer_replay(cls, path):
@@ -269,7 +309,7 @@ def load_optimizer_replay(cls, path):
     with gzip.open(path, "rb") as replay_file:
         payload = torch.load(replay_file, weights_only=False)
     version = payload.get("version")
-    if version != 1:
+    if version not in (1, 2):
         raise RuntimeError(f"Unsupported optimizer replay version: {version}")
     if payload.get("torch_git_version") != torch.version.git_version:
         raise RuntimeError(
@@ -298,6 +338,7 @@ def load_optimizer_replay(cls, path):
         node.meta = tree_map_only(_ReplayMeshRef, lambda _: mesh, node.meta)
 
     config = payload["optimizer"]
+    grad_reduce_dtype = _load_grad_reduce_dtype(config, graph_module.graph, version)
     device_config = payload["cost_model_device"]
     previous_topology = get_nccl_topo_config()
     try:
@@ -310,11 +351,10 @@ def load_optimizer_replay(cls, path):
             opt = cls(
                 graph_module,
                 mesh,
-                config["force_grad_reduce_in_higher_precision"],
                 repeated_subgraphs=config["repeated_subgraphs"],
                 persistent_aliases=config["persistent_aliases"],
                 solver_time_limit_seconds=config["solver_time_limit_seconds"],
-                grad_reduce_dtype=config.get("grad_reduce_dtype"),
+                grad_reduce_dtype=grad_reduce_dtype,
             )
     finally:
         set_nccl_topo_config(previous_topology)
@@ -408,13 +448,12 @@ def save_optimizer(opt, path):
         node.meta = meta
 
     save_dict = {
-        "version": 1,
+        "version": 2,
         "graph": graph_copy,
         "mesh_shape": list(opt.mesh.shape),
         "mesh_dim_names": (
             list(opt.mesh.mesh_dim_names) if opt.mesh.mesh_dim_names else None
         ),
-        "force_grad_reduce_in_higher_precision": opt.force_grad_reduce_in_higher_precision,
         "grad_reduce_dtype": opt.grad_reduce_dtype,
         "persistent_aliases": opt.persistent_aliases,
         "prefetch_discount": opt._prefetch_discount,
@@ -459,10 +498,11 @@ def load_optimizer(cls, path):
         save_dict = torch.load(path, weights_only=False)
     t1 = time.perf_counter()
     logger.debug("load: torch.load took %.3fs", t1 - t0)
-    if save_dict["version"] != 1:
+    if save_dict["version"] not in (1, 2):
         raise RuntimeError(f"Unsupported save file version: {save_dict['version']}")
 
     graph = save_dict["graph"]
+    grad_reduce_dtype = _load_grad_reduce_dtype(save_dict, graph, save_dict["version"])
     strats_by_name = save_dict["strats_by_name"]
     cluster_links_node_by_name = save_dict["cluster_links_node_by_name"]
 
@@ -489,10 +529,7 @@ def load_optimizer(cls, path):
     opt.strats = strats
     opt.nodes = list(strats.keys())
     opt.node_map = {node: i for i, node in enumerate(opt.nodes)}
-    opt.force_grad_reduce_in_higher_precision = save_dict[
-        "force_grad_reduce_in_higher_precision"
-    ]
-    opt.grad_reduce_dtype = save_dict.get("grad_reduce_dtype")
+    opt.grad_reduce_dtype = grad_reduce_dtype
     opt.persistent_aliases = save_dict.get("persistent_aliases", {})
     opt._prefetch_discount = save_dict.get("prefetch_discount", 1.0)
     opt.solver_time_limit_seconds = save_dict.get("solver_time_limit_seconds")

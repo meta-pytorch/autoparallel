@@ -249,7 +249,7 @@ class ShardingOptimizer:
         self,
         gm,
         mesh,
-        force_grad_reduce_in_higher_precision=False,
+        *,
         repeated_subgraphs=False,
         persistent_aliases=None,
         solver_time_limit_seconds: float | None = None,
@@ -269,9 +269,6 @@ class ShardingOptimizer:
         self.gm = concrete_gm
         self.graph = concrete_gm.graph
         self.mesh = mesh
-        self.force_grad_reduce_in_higher_precision = (
-            force_grad_reduce_in_higher_precision
-        )
         self.grad_reduce_dtype = grad_reduce_dtype
         self.repeated_subgraphs = repeated_subgraphs
         self.persistent_aliases = persistent_aliases or {}
@@ -1751,8 +1748,6 @@ class ShardingOptimizer:
         gradient additions and unary nodes back to their producers, forbidding
         communication on input edges with a different dtype. This covers
         autograd's generated conversions and casts back to the storage dtype.
-        Older graphs use the storage dtype when higher-precision reduction
-        was requested.
 
         Both are enforced by disabling decision variables on pre-cast edges
         that would imply a placement change.
@@ -1822,12 +1817,7 @@ class ShardingOptimizer:
                 continue
             reduce_dtype = self.grad_reduce_dtype or param_grad_dtypes.get(param)
             if reduce_dtype is None:
-                if not self.force_grad_reduce_in_higher_precision:
-                    continue
-                param_meta = param.meta.get("val")
-                if param_meta is None:
-                    param_meta = param.meta["tensor_meta"]
-                reduce_dtype = param_meta.dtype
+                continue
 
             pending = [grad]
             visited = set()
@@ -1853,11 +1843,20 @@ class ShardingOptimizer:
                     if parent_meta is None:
                         parent_meta = parent.meta.get("tensor_meta")
                     parent_dtype = getattr(parent_meta, "dtype", None)
+                    is_tuple_projection = (
+                        parent_dtype is None and node.target == operator.getitem
+                    )
+                    if is_tuple_projection:
+                        # Projection preserves the selected tensor's dtype.
+                        projected_spec = self.strats[node].strategies[0].output_spec
+                        parent_dtype = projected_spec.tensor_meta.dtype
                     if parent_dtype is None:
                         continue
+                    has_reduce_dtype |= parent_dtype == reduce_dtype
                     if parent_dtype != reduce_dtype:
                         blocked_edges.add((self.node_map[node], argi))
-                    pending.append(parent)
+                    if not is_tuple_projection:
+                        pending.append(parent)
             if self.grad_reduce_dtype is not None and not has_reduce_dtype:
                 raise ValueError(
                     f"Parameter {desc.target!r} has no gradient tensor in the "
