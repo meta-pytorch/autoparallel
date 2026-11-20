@@ -123,6 +123,120 @@ def test_cast_accepts_unchanged_parameter_dtype(param_dtype):
     assert model.weight.grad.dtype == torch.float32
 
 
+@pytest.mark.parametrize("trainable", [False, True])
+@pytest.mark.parametrize(
+    "storage_dtype, param_dtype, reduce_dtype, frozen_cast, trainable_cast",
+    [
+        (torch.bfloat16, None, torch.float32, False, True),
+        (torch.float32, None, torch.bfloat16, False, True),
+        (torch.bfloat16, torch.bfloat16, torch.float32, False, True),
+        (torch.float32, torch.float32, torch.bfloat16, False, True),
+        (torch.float32, torch.bfloat16, torch.float32, True, True),
+        (torch.bfloat16, torch.float32, torch.float32, True, True),
+        (torch.float32, None, torch.float32, False, False),
+        (torch.bfloat16, None, torch.bfloat16, False, False),
+    ],
+)
+def test_frozen_parameters_only_cast_for_computation(
+    trainable, storage_dtype, param_dtype, reduce_dtype, frozen_cast, trainable_cast
+):
+    model = nn.Linear(4, 4, bias=False, dtype=storage_dtype)
+    model.requires_grad_(trainable)
+    with torch.no_grad():
+        model.weight.copy_(torch.arange(16, dtype=storage_dtype).reshape(4, 4) / 16)
+    weight = model.weight
+    reference_weight = weight.detach().clone().requires_grad_(trainable)
+    x = torch.randn(2, 4, dtype=storage_dtype, requires_grad=True)
+    reference_x = x.detach().clone().requires_grad_()
+    observed = []
+
+    def observe(module, args):
+        observed.append(
+            (
+                module.weight is weight,
+                module.weight.data_ptr() == weight.data_ptr(),
+                module.weight.dtype,
+            )
+        )
+
+    model.register_forward_pre_hook(observe)
+    policy = MixedPrecisionPolicy(
+        param_dtype=param_dtype, reduce_dtype=reduce_dtype, output_dtype=torch.float32
+    )
+    with make_dtype_cast_forward(model, policy) as forward:
+        actual = forward(x)
+    compute_dtype = param_dtype or storage_dtype
+    expected = nn.functional.linear(
+        reference_x.to(compute_dtype), reference_weight.to(compute_dtype)
+    ).float()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    needs_cast = trainable_cast if trainable else frozen_cast
+    assert observed == [(not needs_cast, not needs_cast, compute_dtype)]
+    assert model.weight is weight
+    actual.sum().backward()
+    expected.sum().backward()
+    torch.testing.assert_close(x.grad, reference_x.grad, rtol=0, atol=0)
+    if trainable:
+        expected_grad = reference_weight.grad.to(reduce_dtype).to(storage_dtype)
+        torch.testing.assert_close(weight.grad, expected_grad, rtol=0, atol=0)
+    else:
+        assert weight.grad is None
+
+
+@apply_cuda_patches
+@pytest.mark.parametrize(
+    "storage_dtype, param_dtype, reduce_dtype, frozen_cast",
+    [
+        (torch.bfloat16, None, torch.float32, False),
+        (torch.float32, None, torch.bfloat16, False),
+        (torch.float32, torch.bfloat16, torch.float32, True),
+        (torch.bfloat16, torch.float32, torch.float32, True),
+    ],
+)
+def test_capture_skips_frozen_gradient_only_casts(
+    storage_dtype, param_dtype, reduce_dtype, frozen_cast
+):
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.frozen = nn.Linear(64, 64, bias=False, dtype=storage_dtype)
+            self.frozen.requires_grad_(False)
+            self.trainable = nn.Linear(64, 64, bias=False, dtype=storage_dtype)
+
+        def forward(self, x):
+            return self.trainable(self.frozen(x))
+
+    with torch.device("meta"):
+        model = Model()
+    mesh = torch.distributed.device_mesh.DeviceMesh(
+        "cuda", list(range(8)), mesh_dim_names=("dp",)
+    )
+
+    def inputs():
+        return torch.randn(
+            512, 64, device="cuda", dtype=storage_dtype, requires_grad=True
+        )
+
+    policy = MixedPrecisionPolicy(param_dtype=param_dtype, reduce_dtype=reduce_dtype)
+    with AutoParallel(model, inputs, mesh, policy, repeated_subgraphs=False) as autop:
+        forward_casts = [
+            node
+            for node in autop.gm.graph.find_nodes(
+                op="call_function", target=torch.ops.autoparallel.dtype_cast.default
+            )
+            if node.meta.get("partitioner_tag") == "is_forward"
+        ]
+        assert len(forward_casts) == 1 + frozen_cast
+        for desc, (param, grad) in get_param_and_grad_nodes(autop.gm.graph).items():
+            casts = [node for node in forward_casts if node.args[0] is param]
+            if desc.target == "frozen.weight":
+                assert grad is None
+                assert len(casts) == frozen_cast
+            else:
+                assert grad is not None
+                assert len(casts) == 1
+
+
 @pytest.mark.parametrize(
     "reduce_dtype, expected", [(torch.bfloat16, 1.0), (torch.float32, 1.00390625)]
 )

@@ -75,7 +75,9 @@ def make_dtype_cast_forward(model: torch.nn.Module, mp_policy: MixedPrecisionPol
         dtype = mp_policy.param_dtype or param.dtype
         grad_dtype = mp_policy.reduce_dtype
         if dtype != param.dtype or (
-            grad_dtype is not None and grad_dtype != param.grad_dtype
+            param.requires_grad
+            and grad_dtype is not None
+            and grad_dtype != param.grad_dtype
         ):
             cast_dtypes[name] = (dtype, grad_dtype)
 
