@@ -9,6 +9,8 @@ from contextlib import contextmanager
 import torch
 from torch._decomp.decompositions import addmm as torch_addmm_decomp
 from torch._inductor.decomposition import select_decomp_table
+from torch._inductor.decomposition import uniform as inductor_uniform_decomp
+from torch._prims_common import K, _is_non_overlapping_and_dense_or_false
 from torch._subclasses import FakeTensorMode
 
 
@@ -34,6 +36,35 @@ def _get_decomp_table():
         return torch_addmm_decomp(self, mat1, mat2, beta=beta, alpha=alpha)
 
     decomp_table[torch.ops.aten.addmm.default] = addmm_decomp
+
+    # Inductor samples the flat storage and as_strided's it into `stride`, and
+    # as_strided has no sharding rule. For dense layouts, sample in storage
+    # order and permute back: views traced later rely on the layout.
+    def uniform_decomp(shape, *, low, high, dtype, device, stride, generator=None):
+        if not _is_non_overlapping_and_dense_or_false(shape, stride):
+            return inductor_uniform_decomp(
+                shape,
+                low=low,
+                high=high,
+                dtype=dtype,
+                device=device,
+                stride=stride,
+                generator=generator,
+            )
+        # Passing generator=None would select aten.rand.generator, which
+        # factory_rule does not handle
+        kwargs = {} if generator is None else {"generator": generator}
+        perm = sorted(
+            range(len(shape)), key=lambda d: K(shape[d], stride[d]), reverse=True
+        )
+        samples = torch.rand(
+            [shape[d] for d in perm], dtype=dtype, device=device, **kwargs
+        )
+        if perm != list(range(len(shape))):
+            samples = samples.permute([perm.index(d) for d in range(len(shape))])
+        return (high - low) * samples + low
+
+    decomp_table[torch.ops.prims.uniform.default] = uniform_decomp
 
     return decomp_table
 

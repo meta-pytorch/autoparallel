@@ -174,3 +174,62 @@ def test_addmm_decomp_integral_truncates_scalars():
     ref = torch.addmm(*args, beta=0.5, alpha=2.0)
     assert out.dtype == ref.dtype == torch.int8
     torch.testing.assert_close(out, ref)
+
+
+def _trace_uniform(x, tracing_mode="real", **kwargs):
+    def f(t):
+        return torch.ops.aten.uniform(t, -1.0, 2.0, **kwargs)
+
+    return make_fx(
+        f, decomposition_table=_get_decomp_table(), tracing_mode=tracing_mode
+    )(x)
+
+
+def _call_targets(gm):
+    return {n.target for n in gm.graph.nodes if n.op == "call_function"}
+
+
+@pytest.mark.parametrize("tracing_mode", ["real", "symbolic"])
+@pytest.mark.parametrize(
+    "x",
+    [
+        torch.empty(()),
+        torch.empty(1),
+        torch.empty(4, 8),
+        torch.empty(8, 4).t(),
+        torch.empty(2, 3, 4, 5, memory_format=torch.channels_last),
+        torch.empty(4, 1, 8).transpose(0, 1),
+    ],
+    ids=["0d", "one_element", "contiguous", "transposed", "channels_last", "unit_dim"],
+)
+def test_uniform_decomp_keeps_dense_layout_without_as_strided(x, tracing_mode):
+    gm = _trace_uniform(x, tracing_mode)
+    targets = _call_targets(gm)
+    assert torch.ops.aten.as_strided.default not in targets
+    assert torch.ops.aten.rand.default in targets
+
+    out = gm(x)
+    assert out.shape == x.shape
+    # Strides of size-1 dims don't constrain later views
+    assert [s for s, n in zip(out.stride(), x.shape) if n > 1] == [
+        s for s, n in zip(x.stride(), x.shape) if n > 1
+    ]
+    assert ((out >= -1.0) & (out < 2.0)).all()
+
+
+def test_uniform_decomp_non_dense_falls_back_to_inductor():
+    x = torch.empty(4, 8)[:, :4]
+    gm = _trace_uniform(x)
+    assert torch.ops.aten.as_strided.default in _call_targets(gm)
+    assert gm(x).stride() == x.stride()
+
+
+def test_uniform_decomp_generator():
+    x = torch.empty(4, 8)
+    generator = torch.Generator()
+    gm = _trace_uniform(x, generator=generator)
+    assert torch.ops.aten.rand.generator in _call_targets(gm)
+    generator.manual_seed(0)
+    out = gm(x)
+    generator.manual_seed(0)
+    torch.testing.assert_close(gm(x), out)
