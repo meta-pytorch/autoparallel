@@ -1,0 +1,6 @@
+interface:
+  display_name: "AutoParallel Optimizer"
+  short_description: "Plan and evaluate AutoParallel sharding"
+  default_prompt: "Use $autoparallel-optimizer to plan or evaluate this distributed PyTorch model and select a qualified fallback when needed."
+policy:
+  allow_implicit_invocation: true

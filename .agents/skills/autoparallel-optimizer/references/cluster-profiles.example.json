@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "default_profile": "site-default",
+  "profiles": {
+    "site-default": {
+      "report_root": "/path/to/private/shared/report-root",
+      "topology_profile": "runtime_detected_nccl",
+      "capture_level": "standard",
+      "retention_days": 90,
+      "feedback": {
+        "refresh_interval_seconds": 300,
+        "minimum_occurrences": 2,
+        "measurement_relative_error_threshold": 0.2,
+        "max_representatives": 3
+      },
+      "diagnostics": {
+        "high_communication_fraction": 0.2,
+        "replicated_parameter_fraction": 0.999,
+        "selected_replication_with_sharded_options_fraction": 0.5
+      },
+      "routing": {
+        "autoparallel_first": true,
+        "unmodified_attempts": 1,
+        "targeted_semantics_preserving_retries": 1,
+        "minutes_without_progress": 10,
+        "competitiveness_gate": "modeled_envelope",
+        "modeled_latency_tolerance_fraction": 0.05,
+        "reject_when_baseline_pareto_dominates": true,
+        "baseline_benchmarking": "explicit_authorization_only"
+      },
+      "policies": {
+        "fallback_costs": "reject",
+        "opaque_regions": "warn",
+        "replicate_only": "warn"
+      }
+    }
+  }
+}
