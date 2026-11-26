@@ -440,8 +440,18 @@ def _replace_view_mm_view_with_einsum(gm):
 
 
 def all_input_nodes(node: torch.fx.Node) -> list[torch.fx.Node]:
-    """Variant of node.all_input_nodes that preserves duplicate nodes."""
-    return [x for x in tree_flatten(node.args)[0] if isinstance(x, torch.fx.Node)]
+    """Variant of node.all_input_nodes that preserves duplicate nodes.
+
+    Nodes are listed in ``(node.args, node.kwargs)`` order, matching the
+    input order of the node's ``OpSpec.input_specs``. Most ops take their
+    tensors positionally, but higher-order ops such as
+    ``auto_functionalized_v2`` take them all as kwargs.
+    """
+    return [
+        x
+        for x in tree_flatten((node.args, node.kwargs))[0]
+        if isinstance(x, torch.fx.Node)
+    ]
 
 
 def build_param_derived_set(graph: torch.fx.Graph) -> set[torch.fx.Node]:

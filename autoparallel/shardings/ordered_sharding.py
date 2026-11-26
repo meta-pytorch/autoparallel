@@ -18,7 +18,8 @@ from torch.distributed.tensor.placement_types import (  # noqa
     Replicate,
     Shard,
 )
-from torch.utils._pytree import tree_flatten
+
+from autoparallel.graph_passes.graph_utils import all_input_nodes as _all_input_nodes
 
 # Supported placement patterns for the ordered sharding optimization
 _PARAM_PLACEMENT = (Shard(0), Shard(0))
@@ -110,9 +111,7 @@ def get_redistributed_input_placements(
     placements, for the inputs that need to be redistributed.
     """
     # use this instead of node.all_input_nodes as it handles repeated nodes
-    all_input_nodes = [
-        x for x in tree_flatten(node.args)[0] if isinstance(x, torch.fx.Node)
-    ]
+    all_input_nodes = _all_input_nodes(node)
     num_input_nodes = len(all_input_nodes)
     curr_specs: list[Union[DTensorSpec, tuple[Optional[DTensorSpec], ...], None]] = [
         sharding_placement[n].output_specs for n in all_input_nodes

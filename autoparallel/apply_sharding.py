@@ -235,7 +235,7 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
 
         return [tuple(new_args_0), idx], tgt_spec
 
-    def _redistribute_and_adjust_args(self, target, args):
+    def _redistribute_and_adjust_args(self, target, args, kwargs):
         node = self._curr_node
         all_input_nodes = self._get_input_nodes(node)
         num_input_nodes = len(all_input_nodes)
@@ -246,7 +246,10 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
             self.sharding_placement[node].input_specs[c] for c in range(num_input_nodes)
         ]
 
-        flat_args, treespec = tree_flatten(args)
+        # Tensors are normally positional, but higher-order ops such as
+        # auto_functionalized_v2 take all of them as kwargs: all_input_nodes
+        # (and so the specs) follow (args, kwargs) order.
+        flat_args, treespec = tree_flatten((args, kwargs))
         flat_args_t = [x for x in flat_args if isinstance(x, torch.Tensor)]
         if len(flat_args_t) < len(curr_specs):
             # HOPs have mixed arg types (tensors, SymInts, etc.).
@@ -286,7 +289,8 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
                 counter += 1
             new_flat_args.append(x)
 
-        new_args = list(treespec.unflatten(new_flat_args))
+        new_args, new_kwargs = treespec.unflatten(new_flat_args)
+        new_args = list(new_args)
 
         # Localize shape args for factory and view ops.
         # In static mode, shape args are concrete global values baked into the
@@ -329,7 +333,7 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
             )
             new_args[0]._spec.shard_order = tgt_spec.shard_order
 
-        return new_args, last_tgt_spec
+        return new_args, new_kwargs, last_tgt_spec
 
     def call_function(self, target, args, kwargs):
         if self._curr_node not in self.sharding_placement:
@@ -339,10 +343,13 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
 
         if self._curr_node.target == operator.getitem:
             new_args, tgt_spec = self._call_getitem(args)
+            new_kwargs = kwargs
         else:
-            new_args, tgt_spec = self._redistribute_and_adjust_args(target, args)
+            new_args, new_kwargs, tgt_spec = self._redistribute_and_adjust_args(
+                target, args, kwargs
+            )
 
-        out = super().call_function(target, tuple(new_args), kwargs)
+        out = super().call_function(target, tuple(new_args), new_kwargs)
         out = tree_map_only(DTensor, lambda x: x.to_local(), out)
         return out
 
