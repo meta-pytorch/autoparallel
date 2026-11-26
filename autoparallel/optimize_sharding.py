@@ -244,6 +244,46 @@ def _assert_has_tensor_meta(spec_or_specs, node, label):
         ), f"{node} {label} doesn't have a tensor_meta"
 
 
+_logged_invalid_strategies: set[tuple[str, str]] = set()
+
+
+def _drop_invalid_strategies(node, op_strategy):
+    """Remove the strategies of ``node`` whose cost estimation raises.
+
+    Estimating a strategy's cost runs the op on the sharded fake inputs, and a kernel can
+    refuse a shape that only some placements produce (``_grouped_mm`` needs 16-byte aligned
+    strides, so a sharding that leaves 12 bytes fails). That is a property of the placement,
+    not of the graph: the strategy is not available, the others are. Dropping it here, before
+    the node's consumers read its strategy list, keeps their redistribute costs aligned.
+    Logs each distinct (op, error) once; raises if no strategy is left.
+    """
+    kept = []
+    first_error = None
+    for strategy in op_strategy.strategies:
+        try:
+            estimate_strategy_runtime_cost(node, strategy)
+        except (RuntimeError, ValueError) as error:
+            first_error = first_error or error
+            key = (str(node.target), str(error).splitlines()[0][:200])
+            if key not in _logged_invalid_strategies:
+                _logged_invalid_strategies.add(key)
+                logger.warning(
+                    "dropping a sharding strategy of %s: its cost estimation raised %s",
+                    node.target,
+                    key[1],
+                )
+            continue
+        kept.append(strategy)
+    if not kept:
+        raise RuntimeError(
+            f"every sharding strategy of {node.target} is invalid on its sharded "
+            f"inputs; the first error was: {first_error}"
+        ) from first_error
+    if len(kept) != len(op_strategy.strategies):
+        op_strategy.strategies = kept
+    return op_strategy
+
+
 class ShardingOptimizer:
     def __init__(
         self,
@@ -383,8 +423,11 @@ class ShardingOptimizer:
                 user_kwargs = tree_map_only(
                     torch.fx.Node, lambda x: x.meta.get("val"), node.kwargs
                 )
-                strats[node] = get_placement_options_for_node(
-                    self.mesh, node, user_strats, user_args, user_kwargs
+                strats[node] = _drop_invalid_strategies(
+                    node,
+                    get_placement_options_for_node(
+                        self.mesh, node, user_strats, user_args, user_kwargs
+                    ),
                 )
             elif node.op == "output":
                 user_strats = tree_map_only(
