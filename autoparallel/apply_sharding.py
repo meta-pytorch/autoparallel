@@ -21,7 +21,12 @@ from torch._subclasses.fake_tensor import FakeTensor, unset_fake_temporarily
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor._dtensor_spec import DTensorSpec, ShardOrderEntry
 from torch.distributed.tensor._redistribute import use_min_cost_redistribution_plan
-from torch.distributed.tensor.placement_types import Partial, Replicate, Shard  # noqa
+from torch.distributed.tensor.placement_types import (  # noqa
+    Partial,
+    Replicate,
+    Shard,
+    _StridedShard,
+)
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.utils._pytree import tree_flatten, tree_map_only
 
@@ -116,6 +121,20 @@ def _compute_shard_order(shard_order, reverse: bool):
     return tuple(result)
 
 
+def _spec_with_shard_order(mesh, placements, tensor_meta, shard_order):
+    """A ``DTensorSpec`` of ``placements`` carrying ``shard_order``.
+
+    A spec that holds a ``_StridedShard`` encodes its shard order in the placements, and
+    ``DTensorSpec`` rejects an explicit ``shard_order`` beside one (it sets
+    ``use_strided_shard_as_shard_order``), so none is passed then.
+    """
+    if any(isinstance(p, _StridedShard) for p in placements):
+        return DTensorSpec(mesh, placements, tensor_meta=tensor_meta)
+    return DTensorSpec(
+        mesh, placements, tensor_meta=tensor_meta, shard_order=shard_order
+    )
+
+
 class ApplyShardingInterpreter(torch.fx.Interpreter):
     def __init__(
         self,
@@ -191,17 +210,17 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
             curr_spec.placements != tgt_spec.placements
             or curr_shard_order != tgt_shard_order
         ):
-            curr_spec_c = DTensorSpec(
+            curr_spec_c = _spec_with_shard_order(
                 curr_spec.mesh,
                 curr_spec.placements,
-                tensor_meta=curr_spec.tensor_meta,
-                shard_order=curr_shard_order,
+                curr_spec.tensor_meta,
+                curr_shard_order,
             )
-            tgt_spec_c = DTensorSpec(
+            tgt_spec_c = _spec_with_shard_order(
                 tgt_spec.mesh,
                 tgt_placements,
-                tensor_meta=tgt_spec.tensor_meta,
-                shard_order=tgt_shard_order,
+                tgt_spec.tensor_meta,
+                tgt_shard_order,
             )
             x = ordered_redistribute_local_tensor(
                 arg,
