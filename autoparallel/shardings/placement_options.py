@@ -30,6 +30,10 @@ from torch.utils._pytree import tree_flatten, tree_map_only
 
 from autoparallel.shardings.propagation_rules import generate_dummy_redistribute_costs
 
+from .auto_functionalize import (
+    get_auto_functionalized_placement_option,
+    is_auto_functionalized_v2,
+)
 from .dtensor_sharding_helpers import get_op_strategy, with_implicit_strategies
 from .propagation_rules import _op_rules, remove_invalid_configs
 
@@ -309,9 +313,11 @@ def get_placement_options(mesh, op, specs, user_args, user_kwargs):
             op,
             tuple(_fingerprint_arg(s) for s in specs),
             tuple(_fingerprint_arg(a) for a in user_args),
-            tuple(_fingerprint_arg(v) for v in user_kwargs.values())
-            if user_kwargs
-            else (),
+            (
+                tuple(_fingerprint_arg(v) for v in user_kwargs.values())
+                if user_kwargs
+                else ()
+            ),
         )
         hash(cache_key)  # fail fast if key contains unhashable types (e.g. SymInts)
     except TypeError:
@@ -684,7 +690,16 @@ def get_flex_attention_placement_option(mesh, specs, user_args, node):
     return OpStrategy(strategies)
 
 
-def get_placement_options_for_node(mesh, node, specs, user_args, user_kwargs):
+def get_placement_options_for_node(
+    mesh, node, specs, user_args, user_kwargs, kwarg_specs=None
+):
+    """``specs`` / ``kwarg_specs`` are ``node.args`` / ``node.kwargs`` with each producer
+    node replaced by its OpStrategy; ``user_args`` / ``user_kwargs`` by its example value.
+    """
+    if is_auto_functionalized_v2(node):
+        return get_auto_functionalized_placement_option(
+            mesh, node, kwarg_specs or {}, user_kwargs
+        )
     if local_map_kwargs := node.meta.get("local_map_kwargs", {}):
         assert not user_kwargs
         return get_local_map_placement_option(

@@ -3,6 +3,7 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+import math
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Dict, Tuple
@@ -13,6 +14,7 @@ from torch.utils._mode_utils import no_dispatch
 from torch.utils._pytree import tree_flatten, tree_map_only
 from torch.utils.flop_counter import FlopCounterMode, register_flop_formula
 
+from autoparallel.shardings.auto_functionalize import is_auto_functionalized_v2
 from autoparallel.shardings.propagation_rules import _SHAPE_FACTORY_OPS
 
 _cost_model_device_name: str | None = None
@@ -587,6 +589,34 @@ def _make_hashable(x):
     return x
 
 
+def _auto_functionalized_runtime_cost(node, strategy):
+    """Memory-bound estimate for an auto_functionalized_v2 node: the wrapped op is an opaque
+    custom op (no flop formula), so like any such op it costs the time to read its sharded
+    inputs and write its sharded outputs. An updated base is both an input and an output
+    (read-modify-write once Inductor re-inplaces the mutation)."""
+
+    def spec_bytes(spec):
+        shape, _ = _get_sharded_shape_stride(spec)
+        return math.prod(shape) * spec.tensor_meta.dtype.itemsize
+
+    if strategy is None:
+        flat = tree_flatten(
+            (
+                tree_map_only(torch.fx.Node, lambda x: x.meta["val"], node.kwargs),
+                node.meta["val"],
+            )
+        )[0]
+        nbytes = sum(
+            x.numel() * x.element_size() for x in flat if isinstance(x, torch.Tensor)
+        )
+    else:
+        specs = list(strategy.input_specs) + [
+            spec for spec in strategy.output_specs if spec is not None
+        ]
+        nbytes = sum(spec_bytes(spec) for spec in specs)
+    return compute_read_write_time(nbytes)
+
+
 def estimate_strategy_runtime_cost(node, strategy):
     """
     This function estimates the runtime cost of a given strategy
@@ -595,6 +625,9 @@ def estimate_strategy_runtime_cost(node, strategy):
     inputs according to the strategy. It then uses the device
     specifications to estimate the runtime cost of the node.
     """
+    if is_auto_functionalized_v2(node):
+        return _auto_functionalized_runtime_cost(node, strategy)
+
     if _has_zero_cost(node):
         return 0
 
