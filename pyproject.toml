@@ -23,6 +23,10 @@ dependencies = [
     "pulp==3.2.1"
 ]
 
+[project.optional-dependencies]
+# HiGHS for the sharding MILP (ShardingOptimizer(milp_backend="highs")).
+highs = ["highspy>=1.7"]
+
 [project.urls]
 Homepage = "https://github.com/meta-pytorch/autoparallel"
 Issues = "https://github.com/meta-pytorch/autoparallel/issues"

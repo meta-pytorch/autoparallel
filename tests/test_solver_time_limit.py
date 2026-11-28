@@ -25,6 +25,7 @@ def _optimizer(problem):
     return SimpleNamespace(
         prob=problem,
         solver_time_limit_seconds=7,
+        milp_backend="cbc",
         _apply_memory_constraint=lambda: None,
         get_violated_constraints_log=lambda: "",
     )

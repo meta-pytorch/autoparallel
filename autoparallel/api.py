@@ -247,9 +247,11 @@ class AutoParallel:
     Args:
         mesh: Defines placement options.
         The meta model is moved to a fake device based on mesh.device_type.
-        solver_time_limit_seconds: Optional CBC optimality deadline. The solve
+        solver_time_limit_seconds: Optional MILP optimality deadline. The solve
         raises ``TimeoutError`` instead of accepting an unproven incumbent when
         the deadline expires.
+        milp_backend: ``"cbc"`` (default, PuLP's bundled CBC) or ``"highs"``
+        (HiGHS through ``highspy``; ``pip install autoparallel[highs]``).
     """
 
     def __init__(
@@ -263,6 +265,7 @@ class AutoParallel:
         cost_model: Any = "nccl",
         repeated_subgraphs: bool = True,
         solver_time_limit_seconds: float | None = None,
+        milp_backend: str = "cbc",
     ):
         self.stack = ExitStack()
         self.fake_mode = (
@@ -276,6 +279,7 @@ class AutoParallel:
         self.cost_model = cost_model
         self.repeated_subgraphs = repeated_subgraphs
         self.solver_time_limit_seconds = solver_time_limit_seconds
+        self.milp_backend = milp_backend
         # Moving to fake tensors must not modify the user model.
         model = copy.deepcopy(model)
 
@@ -347,6 +351,7 @@ class AutoParallel:
                 repeated_subgraphs=self.repeated_subgraphs,
                 persistent_aliases={**self.param_aliases, **self.buffer_aliases},
                 solver_time_limit_seconds=self.solver_time_limit_seconds,
+                milp_backend=self.milp_backend,
                 grad_reduce_dtype=(
                     self.mp_policy.reduce_dtype if self.mp_policy is not None else None
                 ),

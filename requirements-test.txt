@@ -1,6 +1,7 @@
 torch >= 2.7.0
 numpy
 pulp == 3.2.1
+highspy >= 1.7
 pytest >= 8.1
 expecttest
 psutil
