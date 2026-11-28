@@ -21,11 +21,13 @@ from torch._subclasses.fake_tensor import FakeTensor, unset_fake_temporarily
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor._dtensor_spec import DTensorSpec, ShardOrderEntry
 from torch.distributed.tensor._redistribute import use_min_cost_redistribution_plan
+from torch.distributed.tensor._utils import compute_local_stride
 from torch.distributed.tensor.placement_types import Partial, Replicate, Shard  # noqa
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.utils._pytree import tree_flatten, tree_map_only
 
 from .graph_passes.graph_utils import all_input_nodes, cleanup_graph
+from .shardings.dtensor_sharding_helpers import get_shape_and_stride_arg_indices
 from .shardings.ordered_sharding import (
     compute_optimal_placement_order_for_parameters,
     ordered_redistribute_local_tensor,
@@ -301,6 +303,21 @@ class ApplyShardingInterpreter(torch.fx.Interpreter):
         elif self.dynamic and target in _VIEW_OPS:
             spec = self.sharding_placement[node].output_specs
             new_args[1] = _localize_shape_arg(node, new_args[1], spec)
+        elif target not in _VIEW_OPS:
+            # Other ops that take their output size as an argument, such as
+            # slice_backward, the upsample backward ops and new_empty_strided:
+            # localize it as DTensor would.
+            indices = get_shape_and_stride_arg_indices(target)
+            spec = self.sharding_placement[node].output_specs
+            if indices is not None and any(p.is_shard() for p in spec.placements):
+                shape_idx, stride_idx = indices
+                local_shape = _localize_shape_arg(node, new_args[shape_idx], spec)
+                new_args[shape_idx] = local_shape
+                if stride_idx is not None:
+                    global_stride = _concretize_shape(node.meta["val"].stride())
+                    new_args[stride_idx] = list(
+                        compute_local_stride(global_stride, local_shape)
+                    )
 
         # In static mode, view ops use DTensor wrapping to convert global
         # shape args to local (DTensor handles the global→local conversion

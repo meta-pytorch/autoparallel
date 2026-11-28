@@ -3,6 +3,7 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+import pytest
 import torch
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor._dtensor_spec import (
@@ -16,6 +17,8 @@ from torch.fx.experimental.proxy_tensor import make_fx
 
 from autoparallel.apply_sharding import _compute_shard_order, _lower_to_parallel_graph
 from autoparallel.shardings.ordered_sharding import ordered_redistribute_local_tensor
+
+aten = torch.ops.aten
 
 
 class TestComputeShardOrder:
@@ -217,6 +220,53 @@ def test_static_view_merges_partially_materialized_broadcast_dims():
 
     torch.testing.assert_close(actual, reference_output.detach()[:2])
     torch.testing.assert_close(local_tensor.grad, reference_input.grad[:2])
+
+
+@pytest.mark.parametrize(
+    "op,input_shape,args",
+    [
+        (aten.slice_backward.default, (4, 3), ([4, 6], 1, 0, 3, 1)),
+        (aten.select_backward.default, (4,), ([4, 5], 1, 2)),
+        (
+            aten._upsample_bilinear2d_aa_backward.default,
+            (4, 3, 2, 2),
+            ([2, 2], [4, 3, 4, 4], False, None, None),
+        ),
+    ],
+)
+def test_static_shape_arg_is_localized_for_sharded_output(op, input_shape, args):
+    # These ops take their global output size as an argument; lowered on a
+    # Shard(0) local tensor, they must produce the local output.
+    def chain(x):
+        return op(x, *args)
+
+    reference_input = torch.randn(input_shape)
+    reference_output = chain(reference_input)
+
+    gm = make_fx(chain)(reference_input)
+    placements = _shard0_placements(gm)
+    local_tensor = reference_input[:2].clone()
+    parallel_gm = _lower_to_parallel_graph(
+        gm, placements, [local_tensor], param_placement_order={}
+    )
+
+    torch.testing.assert_close(parallel_gm(local_tensor), reference_output[:2])
+
+
+def test_static_new_empty_strided_is_localized_for_sharded_output():
+    def chain(x):
+        return x.new_empty_strided((4, 3), (1, 4)).fill_(1.0)
+
+    gm = make_fx(chain)(torch.randn(4, 3))
+    placements = _shard0_placements(gm)
+    local_tensor = torch.randn(2, 3)
+    parallel_gm = _lower_to_parallel_graph(
+        gm, placements, [local_tensor], param_placement_order={}
+    )
+    actual = parallel_gm(local_tensor)
+
+    torch.testing.assert_close(actual, torch.ones(2, 3))
+    assert actual.stride() == (1, 2)
 
 
 class TestOrderedRedistributeFusion:

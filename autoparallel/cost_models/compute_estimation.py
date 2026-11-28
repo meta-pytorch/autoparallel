@@ -9,10 +9,15 @@ from typing import Dict, Tuple
 
 import torch
 from torch._subclasses.fake_tensor import unset_fake_temporarily
+from torch.distributed.tensor._dtensor_spec import DTensorSpec
+from torch.distributed.tensor._utils import compute_local_stride
 from torch.utils._mode_utils import no_dispatch
 from torch.utils._pytree import tree_flatten, tree_map_only
 from torch.utils.flop_counter import FlopCounterMode, register_flop_formula
 
+from autoparallel.shardings.dtensor_sharding_helpers import (
+    get_shape_and_stride_arg_indices,
+)
 from autoparallel.shardings.propagation_rules import _SHAPE_FACTORY_OPS
 
 _cost_model_device_name: str | None = None
@@ -493,6 +498,25 @@ def _shard_args_for_node(node, strategy=None, rand_init=False):
             counter += 1
         new_flat_args.append(x)
     args = treespec.unflatten(new_flat_args)
+
+    # Ops that take their global output size as an argument would otherwise
+    # be run on the sharded inputs with the global size.
+    indices = get_shape_and_stride_arg_indices(node.target)
+    output_spec = strategy.output_specs
+    if (
+        indices is not None
+        and isinstance(output_spec, DTensorSpec)
+        and any(p.is_shard() for p in output_spec.placements)
+    ):
+        shape_idx, stride_idx = indices
+        sizes, _ = _get_sharded_shape_stride(output_spec)
+        args = list(args)
+        args[shape_idx] = sizes
+        if stride_idx is not None:
+            args[stride_idx] = list(
+                compute_local_stride(output_spec.tensor_meta.stride, sizes)
+            )
+        args = tuple(args)
     return args, kwargs
 
 

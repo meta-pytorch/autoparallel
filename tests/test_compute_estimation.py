@@ -108,6 +108,59 @@ def test_sharded_factory_op_is_priced_at_local_size(monkeypatch):
     assert cost(Shard(0)) < cost(Replicate())
 
 
+@pytest.mark.parametrize(
+    "op,make_args,grad_shape,output_shape",
+    [
+        (
+            torch.ops.aten.slice_backward.default,
+            lambda grad, size: (grad, size, 1, 0, 2048, 1),
+            [4096, 2048],
+            [4096, 4096],
+        ),
+        (
+            torch.ops.aten._upsample_bilinear2d_aa_backward.default,
+            lambda grad, size: (grad, [64, 64], size, False, None, None),
+            [512, 16, 64, 64],
+            [512, 16, 128, 128],
+        ),
+    ],
+)
+def test_sharded_output_size_arg_is_priced_at_local_size(
+    monkeypatch, op, make_args, grad_shape, output_shape
+):
+    # slice_backward's input_sizes and upsample backward's input_size are the
+    # global output size: a Shard(0) strategy must run the op at local size.
+    h100 = next(limit for limit in DEVICE_LIMITS if limit.name == "H100")
+    monkeypatch.setattr(compute_estimation, "_get_device_limit", lambda: h100)
+
+    def node(grad_shape, output_shape):
+        graph = torch.fx.Graph()
+        grad = graph.placeholder("grad")
+        grad.meta["val"] = torch.empty(grad_shape, device="meta")
+        out = graph.call_function(op, make_args(grad, output_shape))
+        out.meta["val"] = torch.empty(output_shape, device="meta")
+        return out
+
+    mesh = DeviceMesh("cpu", list(range(8)), _init_backend=False)
+
+    def shard0(shape):
+        stride = torch.empty(shape, device="meta").stride()
+        tensor_meta = TensorMeta(torch.Size(shape), stride, torch.float32)
+        return DTensorSpec(mesh, (Shard(0),), tensor_meta=tensor_meta)
+
+    strategy = OpSpec(
+        output_specs=shard0(output_shape), input_specs=[shard0(grad_shape)]
+    )
+    local_grad_shape = [grad_shape[0] // 8, *grad_shape[1:]]
+    local_output_shape = [output_shape[0] // 8, *output_shape[1:]]
+
+    assert estimate_strategy_runtime_cost(
+        node(grad_shape, output_shape), strategy
+    ) == estimate_strategy_runtime_cost(
+        node(local_grad_shape, local_output_shape), None
+    )
+
+
 def _metadata_only_cost_nodes():
     shape = [4096, 16384]
     graph = torch.fx.Graph()
