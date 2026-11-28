@@ -48,6 +48,27 @@ _current_stack = None
 replicate_op_strategy = torch.distributed.tensor._ops.utils.replicate_op_strategy
 
 
+def get_shape_and_stride_arg_indices(
+    op,
+) -> Optional[tuple[int, Optional[int]]]:
+    """Return the positions of ``op``'s global output size and stride args.
+
+    Some ops take the size of their output as an argument, such as
+    ``slice_backward``'s ``input_sizes``, the upsample backward ops'
+    ``input_size`` and ``new_empty_strided``'s ``size`` and ``stride``. When
+    such an op's output is sharded, DTensor rewrites these arguments from the
+    global to the local output (``ShardingPropagator._adjust_shape_and_stride_args``).
+    AutoParallel runs ops on local tensors without DTensor's dispatch, so it
+    has to apply the same rewrite. Returns ``(shape_idx, stride_idx)``, with
+    ``stride_idx`` ``None`` for ops without a stride argument, or ``None`` for
+    ops DTensor does not rewrite.
+    """
+    idx = propagator.op_to_shape_and_stride_idx.get(op)
+    if idx is None or isinstance(idx, tuple):
+        return idx
+    return idx, None
+
+
 # TODO: remove and refer to
 # https://github.com/pytorch/pytorch/blob/9c107606629de6383f55e3b48b42e594d23407b1/test/distributed/tensor/test_op_strategy.py#L446
 # once the function is moved outside of the test folder in upstream
