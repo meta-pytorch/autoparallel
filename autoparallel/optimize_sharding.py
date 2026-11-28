@@ -244,6 +244,18 @@ def _assert_has_tensor_meta(spec_or_specs, node, label):
         ), f"{node} {label} doesn't have a tensor_meta"
 
 
+MILP_BACKENDS = ("cbc", "highs")
+
+
+def _make_milp_solver(
+    backend: str, *, msg: bool, time_limit: float | None
+) -> pulp.LpSolver:
+    """PuLP's bundled CBC binary, or HiGHS in process through ``highspy``."""
+    if backend == "highs":
+        return pulp.HiGHS(msg=msg, timeLimit=time_limit)
+    return pulp.PULP_CBC_CMD(msg=msg, timeLimit=time_limit)
+
+
 class ShardingOptimizer:
     def __init__(
         self,
@@ -254,7 +266,16 @@ class ShardingOptimizer:
         persistent_aliases=None,
         solver_time_limit_seconds: float | None = None,
         grad_reduce_dtype: torch.dtype | None = None,
+        milp_backend: str = "cbc",
     ):
+        if milp_backend not in MILP_BACKENDS:
+            raise ValueError(
+                f"milp_backend must be one of {MILP_BACKENDS}, got {milp_backend!r}"
+            )
+        if milp_backend == "highs" and not pulp.HiGHS(msg=False).available():
+            raise RuntimeError(
+                "milp_backend='highs' needs highspy (pip install autoparallel[highs])"
+            )
         reset_placement_options_cache()
         reset_compute_cost_cache()
         reset_comms_cost_cache()
@@ -278,6 +299,7 @@ class ShardingOptimizer:
         if solver_time_limit_seconds is not None and solver_time_limit_seconds <= 0:
             raise ValueError("solver_time_limit_seconds must be positive")
         self.solver_time_limit_seconds = solver_time_limit_seconds
+        self.milp_backend = milp_backend
         self._constraint_log: list[tuple[str, dict]] = []
         self._memory_constraint: tuple[float, float] | None = None
         self._prefetch_discount = 1.0
@@ -1039,9 +1061,8 @@ class ShardingOptimizer:
 
     def _solve(self, verbose=False):
         self._apply_memory_constraint()
-        solver = pulp.PULP_CBC_CMD(
-            msg=verbose,
-            timeLimit=self.solver_time_limit_seconds,
+        solver = _make_milp_solver(
+            self.milp_backend, msg=verbose, time_limit=self.solver_time_limit_seconds
         )
         # Use a dedicated temp directory for PuLP's intermediate files (.mps,
         # .sol, etc.) so they are always cleaned up, even if the process is
@@ -1065,12 +1086,16 @@ class ShardingOptimizer:
             raise TimeoutError(
                 "AutoParallel sharding solve did not prove an optimal solution "
                 f"within {self.solver_time_limit_seconds:g} seconds "
-                f"(status={status}, solution_status={solution_status}). "
+                f"(backend={self.milp_backend}, status={status}, "
+                f"solution_status={solution_status}). "
                 "PuLP elapsed time includes problem-file setup; retry with a "
                 "larger limit to distinguish a near-deadline solver result."
             )
         if self.prob.status == pulp.LpStatusInfeasible:
-            logger.warning(self.get_violated_constraints_log())
+            # HiGHS proves infeasibility without returning a point, so there are no
+            # values to check the constraints against.
+            if self.milp_backend == "cbc":
+                logger.warning(self.get_violated_constraints_log())
             raise RuntimeError(
                 "The sharding optimizer could not find a feasible solution. "
                 "This typically means the user-specified constraints are "
@@ -1091,8 +1116,12 @@ class ShardingOptimizer:
                 f"(solution_status={solution_status})"
             )
 
+        # CBC returns exact integers; HiGHS returns binaries within its integrality
+        # tolerance (e.g. 0.9999999), which `== 1` would drop.
         self.selected_keys = [
-            key for key, dv in self.decision_vars.items() if dv.var.value() == 1
+            key
+            for key, dv in self.decision_vars.items()
+            if dv.var.value() is not None and dv.var.value() > 0.5
         ]
         for root_key in list(self.selected_keys):
             self.selected_keys.extend(self._root_to_linked.get(root_key, []))
@@ -1117,6 +1146,19 @@ class ShardingOptimizer:
                     f"solutions: {[str(dv.strategy) for dv in selected_by_node[node]]}"
                 )
             seen.add(node_arg)
+
+        # Validate: every node with decision variables got a strategy. Without this
+        # check a dropped selection only surfaces later, far from its cause.
+        missing = [
+            self.nodes[i]
+            for i in sorted({key[0] for key in self.decision_vars})
+            if self.nodes[i] not in selected_by_node
+        ]
+        if missing:
+            raise RuntimeError(
+                f"The solution selects no strategy for {len(missing)} nodes, e.g. "
+                f"{[str(n) for n in missing[:5]]}"
+            )
 
         # Validate: all args of a node agree on the same strategy
         for node, dvs in selected_by_node.items():

@@ -239,6 +239,7 @@ def save_optimizer_replay(opt, path):
             "repeated_subgraphs": opt.repeated_subgraphs,
             "persistent_aliases": opt.persistent_aliases,
             "solver_time_limit_seconds": opt.solver_time_limit_seconds,
+            "milp_backend": opt.milp_backend,
             "prefetch_discount": opt._prefetch_discount,
             "constraint_log": opt._constraint_log,
         },
@@ -354,6 +355,7 @@ def load_optimizer_replay(cls, path):
                 repeated_subgraphs=config["repeated_subgraphs"],
                 persistent_aliases=config["persistent_aliases"],
                 solver_time_limit_seconds=config["solver_time_limit_seconds"],
+                milp_backend=config.get("milp_backend", "cbc"),
                 grad_reduce_dtype=grad_reduce_dtype,
             )
     finally:
@@ -458,6 +460,7 @@ def save_optimizer(opt, path):
         "persistent_aliases": opt.persistent_aliases,
         "prefetch_discount": opt._prefetch_discount,
         "solver_time_limit_seconds": opt.solver_time_limit_seconds,
+        "milp_backend": opt.milp_backend,
         "skipped_clusters": opt.skipped_clusters,
         "strats_by_name": strats_by_name,
         "dv_costs_node_names": save_node_names,
@@ -533,6 +536,7 @@ def load_optimizer(cls, path):
     opt.persistent_aliases = save_dict.get("persistent_aliases", {})
     opt._prefetch_discount = save_dict.get("prefetch_discount", 1.0)
     opt.solver_time_limit_seconds = save_dict.get("solver_time_limit_seconds")
+    opt.milp_backend = save_dict.get("milp_backend", "cbc")
     opt._prefetchable_keys = None
     opt.skipped_clusters = save_dict.get("skipped_clusters", [])
     opt._constraint_log = []
